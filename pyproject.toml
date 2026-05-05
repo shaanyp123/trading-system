@@ -1,0 +1,143 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "trading-system"
+version = "0.1.0"
+description = "Solo-operator algorithmic trading system (Phase 0 scaffold)"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+license = { text = "Proprietary" }
+authors = [{ name = "shaanyp123" }]
+
+# Runtime dependencies shared across services. Per-service Dockerfiles install
+# only what each container needs at build time.
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.32",
+  "pydantic>=2.9",
+  "pydantic-settings>=2.6",
+  "sqlalchemy[asyncio]>=2.0.36",
+  "asyncpg>=0.30",
+  "alembic>=1.14",
+  "structlog>=24.4",
+  "argon2-cffi>=23.1",
+  "pyotp>=2.9",
+  "uuid-utils>=0.10",
+  "discord.py>=2.4",
+  "httpx>=0.28",
+  "apscheduler>=3.11",
+  "resend>=2.4",
+  "anthropic>=0.39",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "pytest-cov>=6.0",
+  "pytest-xdist>=3.6",
+  "mypy>=1.13",
+  "ruff>=0.7.4",
+  "testcontainers[postgres]>=4.8",
+  "respx>=0.21",
+  "freezegun>=1.5",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = [
+  "services",
+  "infrastructure",
+  "strategies",
+]
+
+# ---------- ruff ----------
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [
+  ".venv",
+  "Archive",
+  "Prompts",
+  "apps",          # JS/TS
+  "packages",      # JS/TS
+  "lean",          # QC LEAN code (different conventions)
+]
+
+[tool.ruff.lint]
+# Conservative starter set; widen as code lands.
+select = [
+  "E",      # pycodestyle errors
+  "W",      # pycodestyle warnings
+  "F",      # pyflakes
+  "I",      # isort
+  "B",      # bugbear
+  "UP",     # pyupgrade
+  "ASYNC",  # async-specific lints
+  "S",      # bandit security
+  "RUF",    # ruff-specific
+]
+ignore = [
+  "S101",  # asserts ok in tests
+  "E501",  # line length handled by formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S", "B"]
+"scripts/**/*.py" = ["S"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+# ---------- mypy ----------
+# `--strict` is the contract per dev-guide §3.1. Empty repo passes; tightens automatically as code lands.
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+disallow_untyped_defs = true
+disallow_any_generics = true
+warn_return_any = true
+exclude = [
+  "Archive/",
+  "Prompts/",
+  "apps/",
+  "packages/",
+  "lean/",
+  "alembic/versions/",   # generated migration files
+]
+
+# ---------- pytest ----------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = [
+  "--strict-markers",
+  "--strict-config",
+  "-ra",
+]
+markers = [
+  "unit: fast in-process tests (default)",
+  "integration: spins up testcontainers (postgres etc.)",
+  "golden: byte-exact parity tests",
+  "e2e: full-stack browser tests (Playwright)",
+]
+
+# ---------- coverage ----------
+# Per dev-guide §3.1: 90% on audit/risk/execution; 70% elsewhere.
+# Enforced via `make test` once first service code lands; CI gate added in same PR.
+[tool.coverage.run]
+branch = true
+source = ["services", "infrastructure", "strategies"]
+omit = ["**/__init__.py", "**/main.py"]
+
+[tool.coverage.report]
+fail_under = 70
+exclude_also = [
+  "if TYPE_CHECKING:",
+  "raise NotImplementedError",
+  "@(abc\\.)?abstractmethod",
+]

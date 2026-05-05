@@ -1,0 +1,57 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.Python
+.venv/
+venv/
+env/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+
+# Node / Next.js
+node_modules/
+.next/
+.pnpm-debug.log
+.npm/
+.yarn/
+.turbo/
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Local env files (NEVER commit)
+.env
+.env.local
+.env.*.local
+
+# Secrets — only sops-encrypted files are allowed in `secrets/`
+# (see secrets/.gitignore for the inverted rule)
+
+# Build artifacts
+*.log
+*.tmp
+*.bak
+
+# Local SQLite (dev)
+*.db
+*.sqlite
+*.sqlite3

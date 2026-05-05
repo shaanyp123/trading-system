@@ -1,0 +1,84 @@
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install ruff
+        run: pip install 'ruff>=0.7.4'
+      - name: ruff format --check
+        run: ruff format --check .
+      - name: ruff check
+        run: ruff check .
+
+  gitleaks:
+    name: gitleaks (secret scan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # Jobs below are commented out in the initial scaffold. Each is re-enabled
+  # in the PR that introduces the first code requiring it. This way CI stays
+  # green during scaffold and tightens as services land.
+  # ---------------------------------------------------------------------------
+
+  # typecheck:
+  #   name: typecheck (mypy --strict)
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: actions/setup-python@v5
+  #       with:
+  #         python-version: '3.11'
+  #         cache: 'pip'
+  #     - run: pip install -e ".[dev]"
+  #     - run: mypy services infrastructure strategies scripts
+
+  # test:
+  #   name: test (pytest --cov)
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: actions/setup-python@v5
+  #       with:
+  #         python-version: '3.11'
+  #         cache: 'pip'
+  #     - run: pip install -e ".[dev]"
+  #     - run: pytest --cov --cov-report=xml --cov-fail-under=70
+
+  # docker-build:
+  #   name: docker build (matrix per service)
+  #   runs-on: ubuntu-latest
+  #   strategy:
+  #     fail-fast: false
+  #     matrix:
+  #       service: [api, signal, risk, execution, reconciliation, audit, calibration, scheduler, qc_adapter, discord_bot, webhook_pusher, monitoring, agent]
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: docker/setup-buildx-action@v3
+  #     - run: docker buildx build --file services/${{ matrix.service }}/Dockerfile --tag local/${{ matrix.service }}:${{ github.sha }} services/${{ matrix.service }}

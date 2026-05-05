@@ -1,0 +1,24 @@
+# CODEOWNERS — solo-operator project
+# Anti-pattern A02: any change to forbidden whitelist paths requires `risk-review-approved` PR label.
+# Pre-merge linter (added later) will block merges without that label on these paths.
+#
+# Owner @shaanyp123 on every entry. Sentinel only — review discipline is enforced by the
+# operator-review workflow described in dev-guide §13, not by GitHub's required-reviewer feature
+# (would require a second account on a private personal repo).
+
+# Catch-all
+* @shaanyp123
+
+# Forbidden whitelist (PR + risk-review-approved label required)
+/services/risk/**                       @shaanyp123
+/services/signal/**                     @shaanyp123
+/services/audit/**                      @shaanyp123
+/services/execution/**                  @shaanyp123
+/services/reconciliation/**             @shaanyp123
+/services/calibration/**                @shaanyp123
+/services/agent/decisions/**            @shaanyp123
+/services/agent/risk_actions/**         @shaanyp123
+/services/agent/parameter_changes/**    @shaanyp123
+/services/agent/prompts/decision/**     @shaanyp123
+/strategies/**                          @shaanyp123
+/alembic/**                             @shaanyp123
