@@ -86,6 +86,53 @@ No exceptions. If CI is the only gate, a broken test blocks the PR and wastes ti
 
 ---
 
+# 1.5 Locked Decisions Quick Reference
+
+These are decisions you must NOT re-derive or contradict. Memorize:
+
+**Authentication & session:**
+- WebAuthn user-verification: **`required`** for register and login (NOT `preferred`)
+- Backup codes: **8 single-use codes**, format **10-char base32 in 2 groups of 5** (`ABCDE-FGHIJ`); Argon2id-hashed via `argon2-cffi` (NOT bcrypt)
+- TOTP: `pyotp`; secrets AES-encrypted at column-level (separate key from sops)
+- Re-auth window: **5 min** of `last_uv_at` for risk-loosening actions; web-only by construction
+- Session lifetime: **30 min idle / 24h absolute / 7d refresh token**
+- CSRF: SameSite=Strict cookies + double-submit pattern with `X-CSRF-Token` header
+- TOTP-only weak session: in-place upgrade when WebAuthn added; `auth_strength: weak → strong` server-side, no re-login
+
+**SSE / web push:**
+- Single multiplexed channel: `GET /api/sse/events`
+- Envelope: `{type, sequence_no, server_now, data}` where `sequence_no` is GLOBAL monotonic across all event types
+- `server_now`: RFC 3339 UTC ms-precision (`2026-05-04T17:30:00.123Z`)
+- Replay buffer: **24h** backend retention; client resumes via `last-event-id` header
+- Tab limit: **N=4** connections per user; eviction via `session_evicted` control event
+
+**Endpoints:**
+- External watchdog push: `POST /api/internal/watchdog` (Bearer auth + Caddy IP allowlist)
+- Deep health for watchdog: `GET /internal/health/deep` (Bearer auth)
+- Public health: `GET /api/health`
+- WebAuthn ceremonies are JS-driven via `navigator.credentials.*`; NO OAuth-style `/auth/callback`
+
+**Phase 1 architecture (CRITICAL):**
+- Backend has **NO direct IBKR connection**. Market data + broker state via QC ObjectStore push.
+- Defensive trims via instruction protocol (`/instructions/<seq>.json` + 5s poll + ack); Phase 1 round-trip ~20s p99
+- Phase 2 transitions to direct `ib-async`; instruction protocol retired
+
+**Backtest authority:**
+- LEAN authoritative for PR review surface backtest delta
+- vectorbt research-only (parameter sweeps, fast iteration)
+- Weekly cron parity test: per-trade slippage ≤5bps, aggregate cumulative P&L ≤0.5% starting equity, trade count within 5%
+
+**Domain placeholder:**
+- Use `<your-domain>` (NOT bare `<domain>`) — operator substitutes apex registrable domain at deployment
+- WebAuthn `rpID = <your-domain>` (apex); credentials work at production + `paper.<your-domain>` staging via suffix matching
+
+**Email:**
+- **Resend** is locked (NOT SES, NOT SendGrid)
+
+If a session asks you to deviate from any of these, escalate per §1.3 — do NOT decide unilaterally.
+
+---
+
 # 2. Repo Layout
 
 ## 2.1 Full Structure
@@ -2437,14 +2484,14 @@ async def approve_signal(
 
 | Week | Build first | Integration points | Test gate |
 |---|---|---|---|
-| 1 | FastAPI `/health` + `/api/health`; Postgres connection pool; structlog setup | DB connectivity test | `GET /api/health` returns 200 |
-| 2 | `audit_log` DDL migration; `append_audit_event()` with retry loop; immutability triggers | No external deps | `test_audit_append_concurrent_writers_serialize_correctly` |
-| 3 | QC ObjectStore client scaffold; qc_adapter cursor table; reconciliation service skeleton | QC mock | Reconciliation against QC mock passes |
-| 4 | Golden-test harness; QC parity fixtures for 5 session events; instruction round-trip mock | QC mock + instruction mock | Golden test passes for all 5 fixtures |
-| 5 | REST scaffolding for Phase 1 endpoints; SSE channel; structlog metrics | DB | SSE connection + replay works; `/api/sse/events` emits |
-| 6 | Next.js scaffold; WebAuthn registration/login backend handlers; route phase-gate middleware | Web ↔ API | `/setup` + `/login` passkey flow works end-to-end |
-| 7 | Signal-to-paper-fill end-to-end; 30th paper session completed | QC paper trading | 30 CME sessions clean; audit chain verified |
-| 8 | Frontend Today + Trades minimal; System minimal; Phase 1 surfaces shipped | Full stack | Operator can read logs, deploy, restart, invoke kill-switch from Discord |
+| 1 | Repo scaffold (pnpm workspace, ruff/mypy/pytest CI, pre-commit hooks); v1 strategy code authored on QC by Claude Code with operator review; Hetzner VPS provisioned (Ashburn primary + Falkenstein watchdog) | None (mostly setup) | Pre-commit passes; v1 strategy commits clean; VPS reachable via SSH; CI green on first PR |
+| 2 | Phase 1 sub-universe verification (data executability + 50% single-contract-notional rule per current equity); sops + age key generated, encrypted env files committed; QC paper trading kicks off (paper-day clock starts) | QC paper data | Active universe enumerated for current equity tier; `sops -d secrets/dev.enc.yaml` decrypts; first QC paper session logged |
+| 3 | FastAPI `/api/health` + `/internal/health/deep`; Postgres connection pool (asyncpg); structlog JSON setup; `audit_log` DDL migration with hash chain; `append_audit_event()` with advisory lock + SERIALIZABLE retry loop; immutability triggers + EVENT TRIGGER for TRUNCATE | DB connectivity | `GET /api/health` returns 200; `test_audit_append_concurrent_writers_serialize_correctly` passes; TRUNCATE on `audit_log` blocked by EVENT TRIGGER |
+| 4 | QC ObjectStore client scaffold; `qc_adapter_cursor` table; golden-test harness; QC parity fixtures for 5 session event types; JCS canonicalization helper | QC mock + ObjectStore | Golden test passes for all 5 fixtures byte-for-byte modulo `{ingest_clock_ts, ingest_uuid, sequence_no}` |
+| 5 | REST scaffolding for Phase 1 endpoints; SSE channel `/api/sse/events` with multiplexed event types; instruction round-trip processor (Phase 1); reconciliation service skeleton | DB + QC mock | SSE connection + 24h replay via `last-event-id` works; instruction round-trip < 20s p99 against mock |
+| 6 | Next.js scaffold; WebAuthn registration/login backend handlers (UV `required`); route phase-gate middleware via `routes.config.ts`; Caddy reverse proxy with SSE flush directives | Web ↔ API | `/setup` + `/login` passkey flow works end-to-end; tab eviction (N=4) emits `session_evicted` |
+| 7 | Signal-to-paper-fill end-to-end via QC instruction protocol; Discord bot scaffold (`/positions`, `/halt`); 30th CME paper session completed | QC paper trading + Discord | 30 CME paper sessions clean; audit chain verified end-to-end; Discord `/positions` returns live data |
+| 8 | Frontend Today + Trades minimal + System minimal; operator competence assessment (deploy, restart, read logs, invoke kill-switch from Discord) | Full stack | Operator passes competence checklist; Phase 1 surfaces ship; ready for live trading month 2 |
 
 Build order within each week: **tests first** (write failing tests), then implementation.
 
