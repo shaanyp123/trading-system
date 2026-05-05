@@ -19,7 +19,7 @@ You will produce a comprehensive technical specification for the FRONTEND of a s
 
 ## DOMAIN PLACEHOLDER
 
-Throughout this spec, `<domain>` is a placeholder for the actual production domain (operator selects at Phase 0 — e.g., `mytrading.com`). Substitute at deployment. The parent registrable domain is also the WebAuthn `rpID` (see Auth section). Staging environment is `paper.<domain>`; same `rpID` works for both because WebAuthn matches on registrable-domain suffix.
+Throughout this spec, `<domain>` is a placeholder for the **registrable apex domain** (e.g., `mytrading.com`) — NOT a subdomain. This constraint is binding: WebAuthn `rpID` must equal `<domain>`, and the suffix-matching guarantee (production at `<domain>`, staging at `paper.<domain>`) only holds when `<domain>` is the registrable apex. If operator at Phase 0 wants to host the app at `app.mytrading.com`, then `<domain>` = `mytrading.com` and the public hostname is decoupled from the rpID; production is then served at `app.mytrading.com` and staging at `paper.mytrading.com`, with both sharing rpID = `mytrading.com`. Substitute at deployment.
 
 ## COMPANION BACKEND
 
@@ -34,7 +34,11 @@ This frontend integrates with a Python backend (specced in a parallel session �
 - Discord bot service + Discord webhook-pusher service (separate processes, internal Docker network)
 - External watchdog (separate region)
 
-**Surface parity (clarified):** signal approval, decision diary entry, query commands (positions/exposure/P&L), kill-switch INVOKE, vacation START, **manual position close during NORMAL** (mirror of signal flow; both surfaces; no re-auth) — all available from BOTH web and Discord per phasing tables. Risk-loosening actions (RESUME, parameter PR submission, deploy approval, env tag override, backup code regen, tax election toggle, **vacation END**, **manual close during HALT_NEW**) are **WEB-ONLY** because they require WebAuthn UV which Discord cannot perform. Single principle: **risk-loosening OR manual order action while system is in halt state = web-only by construction**; everything else = both surfaces. Calendar ratification is on Discord in Phase 1; web in Phase 2.
+**Surface parity (clarified — asymmetric by design):** parity is partial, not blanket. The asymmetric rule:
+- **Risk-tightening AND routine actions:** BOTH surfaces; no re-auth. Includes signal approval, decision diary entry, query commands (positions/exposure/P&L), kill-switch INVOKE, vacation START, manual close during NORMAL.
+- **Risk-loosening OR exceptional manual order action:** WEB-ONLY by construction (requires WebAuthn UV which Discord cannot perform). Includes kill-switch RESUME, parameter PR submission, deploy approval, env tag override, backup code regen, tax election toggle, vacation END, manual close during HALT_NEW.
+
+Calendar ratification: Discord in Phase 1; web in Phase 2.
 
 ## ARCHITECTURE / TOPOLOGY (LOCKED — SELF-HOSTED)
 
@@ -54,19 +58,31 @@ Browser ──── HTTPS ──── <domain> (single VPS, Hetzner Ashburn)
                            ├── Discord bot service
                            └── Discord webhook-pusher service
 
-External watchdog (separate region — Hetzner Falkenstein)
+External watchdog (separate region — Hetzner Helsinki or Falkenstein, NOT Ashburn)
    ├── pings <domain>/health every 5 min
-   ├── pushes ping result to <domain>/internal/watchdog (Authorization: Bearer <shared-secret>; secret in sops; rotated quarterly)
+   ├── pushes ping result to <domain>/internal/watchdog (Authorization: Bearer <shared-secret>; secret in sops; rotated quarterly via `services/security/rotate-secrets.sh`; 1h overlap window where both old and new tokens accepted before old invalidated, for graceful handover)
    └── emails operator if unreachable >15 min during CME session
 ```
 
 **Locked:**
 - **Reverse proxy: Caddy** (auto-cert; sufficient feature set)
 - **Caddy backend ports:** Next.js on `127.0.0.1:3000`; FastAPI on `127.0.0.1:8000`
-- **Caddy SSE directives:** `/api/sse/events` route configured with `flush_interval -1`, `transport.read_timeout 24h`, `transport.write_timeout 24h`, no buffering
+- **Caddy SSE config (actual Caddyfile syntax, locked):**
+  ```
+  handle /api/sse/events {
+    reverse_proxy 127.0.0.1:8000 {
+      flush_interval -1
+      transport http {
+        read_timeout 24h
+        write_timeout 24h
+      }
+    }
+  }
+  ```
+- **Caddy `/internal/watchdog` exposure:** IP-allowlisted to watchdog VPS static IP (Caddy matcher `@watchdog remote_ip <static-ip>`) AND Bearer token auth at FastAPI layer. Defense-in-depth: both required.
 - **Rendering: Next.js Node server** (App Router; SSG shell + client-side hydration + client-side data fetching). NOT static SPA + nginx.
 - **Single origin:** bare `<domain>`. Same-origin cookies. `credentials: 'same-origin'` (default) suffices.
-- **WebAuthn `rpID`: parent registrable domain** (= `<domain>` itself — the registered domain, e.g., `mytrading.com`). Credentials registered at `rpID = <domain>` work at both `<domain>` (production) and `paper.<domain>` (staging) via registrable-domain suffix matching. **Single enrollment, both environments — by design** (solo operator simplification). If stricter env separation desired in future, add separate enrollments per env at the cost of double setup work.
+- **WebAuthn `rpID`: registrable apex domain** (= `<domain>`, e.g., `mytrading.com`). Credentials registered at `rpID = <domain>` work at `<domain>`, `app.<domain>`, `paper.<domain>`, etc., via WebAuthn registrable-domain suffix matching. **Single enrollment, both environments — by design** (solo operator simplification). If `<domain>` placeholder is set to a subdomain (e.g., `app.mytrading.com`), the rpID must still be the apex (`mytrading.com`) — see Domain Placeholder section.
 - **SSE endpoint canonical path: `GET /api/sse/events`**
 - **Maintenance / deploy-time UX:** during planned deploys, Caddy serves `/maintenance` static page (~5KB; generic "back shortly" message); 502 from upstream during unplanned outage triggers `/maintenance` fallback via Caddy `handle_errors`; SSE reconnect storm on recovery handled by client-side jittered backoff (5s + random 0–10s).
 - **Frontend ↔ backend version skew:** `GET /api/version` returns `{ backend_version, expected_frontend_version }`; frontend polls on tab focus + every 60s; on mismatch, displays "New version available — refresh" banner with reload button.
@@ -76,7 +92,7 @@ External watchdog (separate region — Hetzner Falkenstein)
 - Use **`@microsoft/fetch-event-source`** library, NOT native `EventSource`
 - Single multiplexed channel; client filters/dispatches by event `type`
 - Server enforces N-connection limit per user (default N=4, per-user across devices); on connection N+1, server closes oldest with control event (canonical envelope shape — see SSE Event Format below); browser displays banner. **No client-side cross-tab coordination needed.** Brief auth-only connections (e.g., `/login` from phone) don't usually evict — they auth then disconnect.
-- **Web SSE replay buffer: 1h backend retention.** Beyond 1h gap, client falls back to full re-fetch of canonical state per page.
+- **Web SSE replay buffer: 24h backend retention** (aligned with Discord IPC buffer; both consume from same backend store). Beyond 24h gap, client falls back to full re-fetch of canonical state per page.
 
 ## TECH STACK (LOCKED)
 
@@ -91,15 +107,23 @@ External watchdog (separate region — Hetzner Falkenstein)
 - **react-hook-form + zod** for forms
 - **Auth:** WebAuthn (passkey) primary + TOTP backup + 8 single-use printed backup codes (10-char base32 in 2 groups of 5; e.g., `ABCDE-FGHIJ`; server-stored as Argon2id hashes)
 - **Authorization (RBAC):** schema present from day 1; "owner" role active initially; "reader" role planned for CPA in year 2; investor role NEVER (PDF reports only)
-- **Reader role permission matrix:**
-  - Reader CAN view: Performance metrics in % of starting NAV (no absolute dollar amounts), Trades read-only with per-trade detail and decision diary entries authored by **operator only** (agent-authored entries hidden — rationale leak prevention), Tax artifacts and tax widget detail in absolute dollars (locked exception — tax outputs inherently dollar-denominated)
-  - Reader CANNOT view: System (risk envelope, deployments, agent activity prompts/responses), Research, Calendar ratification controls, account numbers, strategy code/PR contents, decision diary entries authored by agent
-  - Reader CANNOT do: any writes
+- **Reader role permission matrix (LOCKED — dollar-redaction applied consistently):**
+  - **Performance page:** all metrics in **% of starting NAV** (no absolute dollar amounts)
+  - **Trades read-only:** per-trade detail visible, but **dollar fields (`realized_pnl`, `expected_pnl`) redacted to % of starting NAV**; `fill_price` and `fill_qty` preserved (needed for tax provenance); decision diary entries authored by **operator only** (agent-authored entries hidden — rationale leak prevention)
+  - **Tax widget + Tax CSV exports:** **absolute dollars preserved** (locked exception — tax outputs inherently dollar-denominated; CPA needs them to do tax work)
+  - **Stress test:** OWNER-ONLY (locked — risk-strategic content reader doesn't need)
+  - **System, Research, Calendar ratification controls, account numbers, strategy code/PR contents, agent prompts/responses:** reader CANNOT view
+  - **Reader CANNOT do** any writes
+  - **Reader-forbidden routes return 403** with explainer ("Your role does not permit access to this page; contact owner if needed"). NOT 404 — distinguishes "you can't see this" (403) from "this doesn't exist yet" (Phase 0 hidden routes = 404).
 - **PDF rendering:** Typst on VPS (layout/typography); charts pre-rendered SVG via headless Recharts. Async (POST → 202 + jobId + SSE progress on `job` channel — see SSE event types below — → terminal payload with signed download URL; 1h TTL; one-time use; download logged to audit).
-- **Error tracking + RUM:** **Sentry** free tier for errors; Sentry Performance Monitoring upgraded only when 30-day event volume exceeds **100k events/month**.
-- **Feature flagging — Phase 1/2/3 gates:**
+- **Error tracking + RUM:** **Sentry free tier** (5k errors/month, 10k performance units, 50 replays — sufficient for solo-operator low-volume). Upgrade to Sentry **Team plan ($26/mo)** when monthly volume exceeds free-tier quotas (driven by error rate in production; trip wire = 30-day rolling > 4k errors → upgrade signal).
+- **Feature flagging — Phase 1/2/3 gates (LOCKED):**
   - Coarse phase env var: `NEXT_PUBLIC_PHASE=1|2|3` (read at boot)
-  - **Per-route availability** via `routes.config.ts` consulted by Next.js middleware: `{ path: string, available_from: 0|1|2|3, hidden_in_nav: boolean }`. Phase 0 routes return 404; Phase 1+ unlock progressively. NO PostHog/LaunchDarkly.
+  - **Per-route availability** via `routes.config.ts`: typed array of `{ path: string, available_from: 0|1|2|3, hidden_in_nav: boolean }`
+  - **Consulted by BOTH server (Next.js middleware) AND client (nav component).** Server: route returns 404 if `current_phase < available_from`. Client: nav menu omits routes where `hidden_in_nav: true`.
+  - Independent semantics: a route can be `available_from: 1, hidden_in_nav: true` → deep-linkable but not in menu (e.g., `/trades/:id` post-Phase-1 — accessible from Discord deep-link, not in main nav)
+  - **Phase transitions: deployment-controlled.** Operator (or Claude Code) edits `routes.config.ts` + `NEXT_PUBLIC_PHASE` env var, deploys via standard procedure. Logged to `audit_log` as `phase_transition_deployed`. NO runtime phase flipping.
+  - NO PostHog/LaunchDarkly.
 - **Browser support:** latest 2 stable Chrome, Firefox, Safari. Edge implicit (Chromium). WebAuthn detection with explainer.
 - **Project layout (locked):** pnpm workspace.
   - `apps/web/` — Next.js + TypeScript
@@ -141,7 +165,9 @@ For Discord:
 - Numeric formatting: US locale; tabular figures via `font-feature-settings: 'tnum'` (also applied to Inter for prose-numeric contexts; for monospaced fonts already tabular this is a no-op but harmless). Negatives: leading minus + red color + small downward arrow icon (color-blind safe). Positives: green + upward arrow on emphasized values; bare otherwise.
 - **Time-zone:** ALL UI in `America/New_York` via `formatET()` helper. Backend stores UTC.
 - Numeric precision: read from backend's `instrument_metadata` (see Loading Model below) — never hardcoded.
-- **`server_now` format:** RFC 3339 UTC with `Z` suffix and millisecond precision (e.g., `2026-05-04T17:30:00.123Z`). Browser clock NEVER trusted for stale calculations.
+- **`server_now` format:** RFC 3339 UTC with `Z` suffix and millisecond precision (e.g., `2026-05-04T17:30:00.123Z`). Browser absolute clock NEVER trusted for stale calculations.
+- **Stale-data math (locked):** each cached payload stores `received_at_monotonic_ms = performance.now()` at receive time. Stale check uses `performance.now() - received_at_monotonic_ms > threshold_ms`. Browser monotonic clock (`performance.now()`) is trusted for ELAPSED time only, not absolute time. The `server_now` field is used for cross-payload reasoning and for rendering "last update" timestamps in UI.
+- **No-events-arriving fallback:** if no SSE event of any type arrives within 60s during CME session, TanStack Query's own staleness detection fires; UI shows degraded indicator; client triggers polling fallback.
 - Empty-state visual language: muted text-only with single optional CTA button; no illustrations; austere; "No <noun> yet" + short explainer + optional CTA.
 
 ### Design Tokens (LOCKED — reference palette)
@@ -279,9 +305,17 @@ MIN of multipliers (do NOT compound). Per Prompt A.
 
 Backend computes; frontend renders summary table (locked columns: scenario, P&L impact $, max position-level loss $, DD %, worst-hit market) + per-scenario tab.
 
-### Decision Diary Tag Vocabulary
+### Decision Diary
 
-`data_concern` | `regime_concern` | `size_concern` | `manual_judgment` | `other`
+**Tag vocabulary:** `data_concern` | `regime_concern` | `size_concern` | `manual_judgment` | `other`
+
+**Author enum:** `operator` | `agent` (reader cannot author; reader-mode UI hides authoring controls)
+
+**Input sanitization (locked):**
+- Min: 10 characters; Max: 2000 characters
+- Allowed character set: printable Unicode (`\p{L}`, `\p{N}`, `\p{P}`, `\p{S}`, `\p{Z}`); control characters disallowed
+- XSS strategy: render via React (auto-escapes); store as plaintext UTF-8 in Postgres TEXT column
+- Backend validates length + character set on ingestion; rejects with 400 + reason if violated
 
 ### Trade State Enumeration
 
@@ -396,6 +430,7 @@ If WebAuthn unavailable at `/setup`, TOTP-only enrollment allowed but session ha
 - Effectively read-only; can view but cannot mutate
 - Operator forced to add WebAuthn on first compatible browser to unlock full privileges
 - Session badge shows "Reduced — add WebAuthn"
+- **Upgrade path (locked):** when operator adds WebAuthn credential while signed in with TOTP-only weak session, the existing session UPGRADES IN PLACE. `auth_strength` flips from `weak` to `strong` server-side; UI reflects on next render. **No re-login required.** Session row's `auth_strength` is mutated atomically alongside the credential registration.
 
 ### Strategy Health Score (formula inlined from Prompt A for completeness)
 
@@ -488,11 +523,12 @@ Approves all signals in queue that are NOT `anomaly_flagged`. Anomaly-flagged si
 }
 ```
 
-### SSE Event Ordering
+### SSE Event Ordering & Replay (LOCKED)
 - `sequence_no` GLOBAL monotonic across the multiplexed channel (single sequence space)
-- Client tracks last-received `sequence_no`; on gap, requests replay via `last-event-id` header
+- Client tracks last-received `sequence_no` via `last-event-id` header on reconnect
+- **Replay semantics:** server replays ALL events since `last-event-id`, NOT filtered. Client filters by `type` after delivery.
 - Out-of-order events buffered up to 5s; older arrivals applied in order
-- Backend SSE replay buffer: 1h; beyond → full re-fetch of canonical state
+- **Backend SSE replay buffer: 24h** (aligned with Discord IPC replay buffer; both consume from the same backend buffer). Beyond 24h gap → full re-fetch of canonical state per page. Resolves the prior 1h-vs-24h asymmetry.
 
 ### Polling Fallback (intervals clarified)
 - If SSE fails to connect after 3 retries (5s, 15s, 30s backoff), client falls back to **per-resource REST polling** at intervals matching the corresponding stale-data threshold (5s for P&L, 30s for positions, etc.). Backend exposes a `is_session_active` flag in poll responses so client knows whether to use the "during session" or "outside session" threshold.
@@ -656,7 +692,7 @@ For each of 6 post-auth pages: layout, component hierarchy, data displayed (with
 | Page | Phase 1 ships | Phase 2 adds |
 |---|---|---|
 | Today | Health score (insufficient-data graceful), positions table, P&L summary D/W/M/Y, exposure breakdown vs. ring + cluster limits, queued signals (individual approve/reject WITH decision diary modal on rejection; **anomaly badge present in Phase 1 — revised**; NO bulk-approve), recent fills feed, P0/P1 alerts, paused-state distinction | Stress test button (six scenarios), anomalies quick-link list, P2 alerts integration, bulk-approve "standard" |
-| Trades | Filterable summary table (date/market filters); CSV export | Per-trade detail drawer/page, decision-diary view in Trades, attribution view, all filters, advanced search |
+| Trades | Filterable summary table (date/market filters); CSV export; **minimal per-trade detail PAGE at `/trades/:id`** (full-page; basic info: signal, market, direction, status, fill_price, fill_qty, P&L; ensures Discord deep-links don't 404) | Per-trade detail DRAWER (in-table preview), full decision-diary view in Trades, full attribution view, all filters, advanced search |
 | Performance | Equity curve (no benchmark overlay yet), monthly returns table; CSV export | Drawdown underwater, attribution, actual-vs-rule compare, tax estimate widget, PDF export, benchmark overlay, print stylesheet, environment-segregation toggle |
 | Research | (not in Phase 1) | Backtest viewer, parameter sandbox, regime analysis, A/B compare, walk-forward visualizer (strip chart) |
 | System | Kill-switch UI + state, **read-only Risk Envelope tile**, audit log basic table (date + event type + environment filter), reconciliation status (Phase 1 source: QC; Phase 2: TWS + FlexQuery), watchdog status, **minimal Account section: regenerate backup codes (re-auth)** | Risk envelope + propose-PR, deployments log + rollback, agent activity feed, full audit explorer with FTS + actor + hash-validity + repaired-events filters, operator-friendly PR review surface, convalescent banner refinements, operating cost dashboard, full operator account management |
@@ -747,8 +783,8 @@ For each of 6 post-auth pages: layout, component hierarchy, data displayed (with
 - Mobile-accessible
 
 ##### `/setup` (first-run bootstrap, security-hardened)
-- **Token NOT in URL.** Backend prints one-time token to stdout at first boot. Operator visits `/setup` (no query params); enters token in **password-style form field** (NOT visible in plaintext, NOT in browser history, NOT in Caddy access logs).
-- Backend `/api/setup/verify-token` validates; rate-limited (5 attempts then 1h lock)
+- **Token NOT in URL.** Backend prints one-time token to stdout at first boot via structured log line: `[SETUP_TOKEN] <token>` (greppable). Token persisted in Postgres `setup_tokens` table with `consumed_at` field. **Token regenerated on every boot if previous token is unconsumed**, invalidating the old one (limits exposure window). Operator visits `/setup` (no query params); enters token in **password-style form field** (NOT visible in plaintext, NOT in browser history, NOT in Caddy access logs).
+- Backend `/api/setup/verify-token` validates; rate-limited (5 attempts then 1h lock); on success marks `consumed_at`
 - On success, wizard:
   1. Enroll WebAuthn passkey (or TOTP-only with prominent warning if WebAuthn unsupported; reduced session privileges)
   2. Enroll TOTP (QR + manual entry)
@@ -793,7 +829,7 @@ WebAuthn is a JS-driven `navigator.credentials.*` flow. NO OAuth-style redirect 
 ### 4. Real-Time Update Mechanism
 - Single multiplexed `/api/sse/events` via `@microsoft/fetch-event-source`
 - Per-page update strategy
-- **Polling fallback:** SSE fails after 3 retries → REST polling per-resource at intervals matching stale-data thresholds (using backend-supplied `is_session_active` flag); "DEGRADED — polling mode" indicator; retry SSE every 60s
+- **Polling fallback:** SSE fails after 3 retries → REST polling per-resource at intervals matching stale-data thresholds (using backend-supplied `is_session_active` flag — locked: backend computes from CME futures session hours Sun 18:00 ET → Fri 17:00 ET with daily 17:00–18:00 maintenance break; clients consume the boolean, never compute it); "DEGRADED — polling mode" indicator; retry SSE every 60s
 - Reconnection: exponential backoff with jitter (5s + random 0–10s); resume via `last-event-id` header
 - Multi-tab: server-side eviction
 - Retry/backoff on 429: exponential with jitter; max 5 retries
@@ -870,7 +906,7 @@ Backend posts events to bot's local HTTP listener on Docker internal network. Re
 Beyond shadcn/ui defaults, spec custom components:
 - Trade row (states from locked enumeration including `cancelled`)
 - Signal approval card with buttons
-- Anomaly badge (Phase 1 + Phase 2 web; tooltip listing `anomaly_reasons`)
+- Anomaly badge (ships Phase 1; persists thereafter; tooltip listing `anomaly_reasons`)
 - Health score indicator (G/Y/R + expandable; insufficient-data graceful)
 - Equity curve chart wrapper (Lightweight Charts; benchmark overlay support)
 - Drawdown chart (Recharts; underwater plot)
@@ -908,7 +944,8 @@ For each: purpose, props, states, accessibility, tabular-num CSS application.
 
 ### 8. Data Fetching and State Strategy
 - TanStack Query patterns (staleness, refetch policies per stale-data thresholds)
-- `instrument_metadata` boot-time bulk fetch with 24h SWR caching
+- **Cache layer (locked): in-memory only Phase 1.** TanStack Query default in-memory cache; cold reload re-fetches everything including `instrument_metadata`. Phase 2+ may add IndexedDB persistence (`@tanstack/query-async-storage-persister`) for offline tolerance; not Phase 1.
+- `instrument_metadata` boot-time bulk fetch with 24h SWR caching (in-memory; re-fetched on cold load)
 - Zustand store organization
 - Optimistic updates per failure UX rule
 - Cache invalidation rules
@@ -965,7 +1002,9 @@ Each phase: deliverables, success criteria, kill criteria.
 - Visual regression (Chromatic)
 - Accessibility (axe-core in CI; WCAG 2.1 AA; ARIA live region behavior)
 - Discord bot tests (command response, button payloads, IPC ingestion, replay buffer)
-- Cross-environment segregation tests
+- Cross-environment segregation tests (with health-score current-env-scoping and tax-artifact reader-redaction-bypass carve-outs)
+- **PDF-vs-UI equity curve parity test:** at fixed sample data, render PDF (Recharts SVG) and UI (Lightweight Charts) equity curves; visual regression tolerance ≤ 5% pixel difference (allows legitimate library differences; catches major divergence). Run weekly in CI.
+- **Reader role redaction tests:** assert dollar fields converted to %-of-NAV in Trades/Performance for reader; assert tax artifacts retain $; assert stress test returns 403 to reader; assert decision diary agent-authored entries hidden from reader
 - CI: GitHub Actions; bundle analyzer via `@next/bundle-analyzer`; PR fails if bundle exceeds budget by >10%
 
 ### 13. Investor PDF Report Layout (year-2)

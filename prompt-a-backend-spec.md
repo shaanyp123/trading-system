@@ -42,6 +42,7 @@ Both calendars read from `pandas_market_calendars` (or equivalent). Implementer 
 - **Phase 1 sub-universe:** verified during Phase 0 weeks 0–2 (single window; finalized by end of week 2). Two filters apply:
   - **(a) Data executability:** market must have sufficient QC bundled data; failure → exclude (likely /M6E)
   - **(b) Per-position-cap-feasibility (see Per-Position Cap Override below):** market must satisfy 1-contract-notional ≤ 50% of current equity; failure → exclude at this equity tier
+- **Per-market session calendar (locked):** each market reads its own session schedule from `pandas_market_calendars` (or equivalent) using its specific exchange code (CME for index/commodity micros and `/MBT`; NYSE for ETFs; CME Globex for FX micros). "Next session start" for order placement is per-market, not asset-class-fallback (`/MCL` and `/MGC` have slightly different schedules; `/MBT` is nearly 24/7 with brief breaks). Implementer maintains a `market_calendar` mapping (in code, locked) of `{market_symbol: exchange_calendar_code}`.
 - **Signal type:** time-series momentum / breakout (Donchian channels, MA crossovers); vol-targeted sizing; daily bars
 - **Daily bar definition (locked, per asset class):**
   - Futures: close = **CME daily settlement, 17:00 ET**
@@ -122,10 +123,11 @@ The denominator EXCLUDES signals for markets currently outside the active univer
 - `Sharpe = mean(daily_returns) × sqrt(252) / stdev(daily_returns)`
 - "X-day rolling Sharpe" uses last X CME sessions
 
-#### Signal Acceptance Rate Definition (locked, fixed for math feasibility)
-`signal_acceptance_rate = orders_placed / signals_emitted_post_data_quality_filter_AND_post_universe_filter`
-- **Numerator:** signals that resulted in actual broker order placement (NOT capacity-constrained-to-zero, NOT operator-rejected, NOT refused by PDT/risk pre-check, NOT macro-window-dropped, NOT sub-minimum-size-after-rounding)
-- **Denominator:** signals emitted by strategy after data-quality validation AND after universe filter (universe-excluded markets generate no signal; not in denominator); includes `unsettled`-flag signals
+#### Signal Acceptance Rate Definition (locked, refined again for sub-minimum-size structural fragility)
+`signal_acceptance_rate = orders_placed / signals_eligible_for_placement`
+- **Numerator:** signals that resulted in actual broker order placement (NOT operator-rejected, NOT refused by PDT/risk pre-check, NOT macro-window-dropped)
+- **Denominator (`signals_eligible_for_placement`):** signals emitted by strategy that survive ALL of: data-quality validation, active universe filter, AND Stage 5 lot-rounding (sub-minimum-size signals are excluded — they represent "vol-targeting wanted < 0.5 contract; equity-tier-infeasible"; same logical exclusion as universe filter, applied per-signal rather than per-market). `unsettled`-flag signals included.
+- This makes the ≥ 90% target structurally achievable at small equity tiers where sub-minimum-size is common.
 - Target: ≥ 90% (Phase 1)
 
 ### Path / Phasing
@@ -140,7 +142,9 @@ The denominator EXCLUDES signals for markets currently outside the active univer
 
 - **Language:** Python 3.11+ end to end
 - **Engine:** LEAN (QC Cloud Phase 1; LEAN Local Phase 2). LEAN authoritative for backtest PR review surface. vectorbt research-only.
-- **Storage:** DuckDB on Parquet (analytics); PostgreSQL 16 (transactional; asyncpg + SQLAlchemy 2.x async; Alembic)
+- **Storage:** DuckDB on Parquet (analytics); PostgreSQL 16 (transactional; asyncpg + SQLAlchemy 2.x async; Alembic migrations)
+- **Postgres tuning baseline (CCX13: 2 vCPU / 8 GB):** `shared_buffers=2GB`, `effective_cache_size=4GB`, `max_connections=50`, `statement_timeout=30s` for app, `60s` for slippage-calibration jobs; isolation level: `READ COMMITTED` default, `SERIALIZABLE` for `audit_log` writes (per audit concurrency rules above). **VPS sizing note:** if telemetry shows sustained CPU > 70% or memory > 80% during CME session, upgrade to CCX23 (4 vCPU / 16 GB; ~$25/mo more); CCX13 baseline is acceptable but tight.
+- **Migration policy (live trading):** additive-only migrations deploy without downtime. Destructive or transformative migrations require **maintenance window (Sat 17:00 ET → Sun 18:00 ET, outside CME session)**; system enters HALT_NEW (severity=routine, `reason=maintenance_window`); operator manually resumes after migration verified. Audit log partition addition (yearly) is additive; cron Dec 31. All migrations logged to `audit_log`.
 - **Broker library:** `ib-async >= 0.9.x, < 2.0`. **Phase 1: NO direct IBKR connection** (market data + broker state via QC algorithm push to ObjectStore). **Phase 2: direct via `ib-async` to IB Gateway in Docker.**
 - **Margin model:** SPAN for futures (broker-computed); Reg T for ETFs.
 - **"Used margin" canonical:** `used_margin_pct = 1 − (ExcessLiquidity / NetLiquidation)` from IBKR `accountSummary`.
@@ -159,17 +163,17 @@ The denominator EXCLUDES signals for markets currently outside the active univer
 
 ### Data Sources (locked, with criticality flags)
 
-- **Phase 1:** QuantConnect bundled equities + futures data (Phase 1 sub-universe verified at Phase 0 weeks 0–2); IBKR real-time market data **routed through QC** (Phase 1 backend has no direct IBKR connection); **economic calendar via Forex Factory or Trading Economics — IS critical-path from Phase 1** (used for tier-1 macro pause auto-detection); **FRED — non-critical from Phase 1** (macro context display only).
+- **Phase 1:** QuantConnect bundled equities + futures data; IBKR real-time market data **routed through QC** (Phase 1 backend has no direct IBKR connection); **economic calendar — Forex Factory primary, Trading Economics secondary fallback** (locked; verify schemas Phase 0 weeks 0–2; IS critical-path from Phase 1); FRED — non-critical (macro context display only).
 - **Phase 2 additions:** Polygon.io Stocks Starter ($30/mo) **only if** QC bundled equity data has notable gaps in Phase 1 live (else $0); direct IBKR market data via TWS API.
 - **CRITICALITY:**
   - FRED: NICE-TO-HAVE. Outage → degraded macro context display only. No halt.
-  - Economic calendar: CRITICAL from Phase 1. Outage > 48h → hard halt new orders (severity=routine HALT_NEW) next session until manual ratification.
+  - Economic calendar: CRITICAL from Phase 1. Outage > 48h → HALT_NEW (severity=routine, `reason=calendar_service_outage`) next session until manual ratification. **EXCEPTION: during vacation mode, ratification gate is suspended; calendar outage during vacation does NOT trigger HALT_NEW** (no entries to halt; precedence: vacation > calendar-outage halt).
 - **Tier-1 macro event taxonomy (source-agnostic):** system maintains its own tier-1 list (FOMC, CPI, NFP, GDP, PCE, ECB/BOJ/BOE if exposed, OPEC if /MCL exposed); matches against feeds by event-name pattern.
 - **NOT in scope:** Norgate, alt data, NLP feeds, Bloomberg, Databento, multi-tier feeds.
 - **Data correctness claims (per leg):**
   - **ETFs/equities:** QC bundled is survivorship-bias-free
   - **Futures:** roll methodology (Panama / open-interest); LEAN execution uses physical contracts; backtest continuous-vs-physical reconciliation at roll dates is mandatory test
-- **ETF dividend handling (locked, on-the-fly):** dividends back-adjusted **on-the-fly at signal time** from raw bars + `dividend_history` table; raw bars never restated. Reinvested into MTM at ex-date; tracked separately as `dividend_pnl` in attribution. Reconciliation tolerance widens 2× during ex-dates for +24h.
+- **ETF dividend handling (locked, on-the-fly):** dividends back-adjusted **on-the-fly at signal time** from raw bars + `dividend_history` table; raw bars never restated. Reinvested into MTM at ex-date; tracked separately as `dividend_pnl` in attribution. **Reconciliation tolerance widens 2× during ex-dates for +24h, anchored to 17:00 ET MTM anchor on ex-date** (locked anchor; window = ex-date 17:00 ET to ex-date+1 17:00 ET).
 
 ### Risk Framework (concrete math; locked)
 
@@ -190,7 +194,7 @@ For each active market i:
   unconstrained_notional_i = unconstrained_weight_i × (effective_vol_target / portfolio_realized_vol_at_unconstrained_weights) × equity
 ```
 
-**Covariance / Σ estimator (locked):** 60-day rolling sample covariance matrix from daily log returns; **no shrinkage Phase 1** (Ledoit-Wolf consideration Phase 2+); asynchronous closes handled by using each market's own daily-close return series with its asset-class anchor (futures 17:00 ET, ETFs 16:00 ET); missing data dropped from estimation pair-wise. Same Σ used for portfolio realized vol (Stage 1) and the realized-correlation kill-switch ring.
+**Covariance / Σ estimator (locked, with PSD repair):** 60-day rolling sample covariance matrix from daily log returns; no shrinkage Phase 1 (Ledoit-Wolf consideration Phase 2+); asynchronous closes handled by using each market's own daily-close return series with its asset-class anchor (futures 17:00 ET, ETFs 16:00 ET); missing data dropped pair-wise. **PSD repair (locked):** if pair-wise estimate is non-positive-semi-definite (eigenvalue check), apply Higham's nearest-PSD projection (`scipy.linalg` or `numpy` implementation; algorithm: clip negative eigenvalues to 0, reconstruct). Log every PSD repair invocation to `audit_log` with diagnostic info. Same Σ used for portfolio realized vol (Stage 1) and the realized-correlation kill-switch ring.
 
 `effective_vol_target = m_combined × VOL_TARGET_PCT_ANNUAL / sqrt(252)` (daily target). See Vol-Target Multiplier Composition.
 
@@ -295,6 +299,12 @@ Mode-active flag persists for sessions 6–30 (after vol multiplier normalizes) 
 4. Post-incident review write-up (separate `incident_reviews` table — see schemas) logged before resume
 5. Resume: explicit operator override + audit justification, OR new strategy version deployment (resets `paper_days_for_version`; 30 new CME paper sessions required)
 
+**Decommission with mid-life positions (locked):** when a strategy version is decommissioned with positions still open:
+- Open positions are **managed by the version that opened them until natural exit** (their stop levels, profit-target levels, `MIN_HOLDING_DAYS` rules, etc. follow the decommissioned version's logic — these were committed at signal-emit time and remain in force)
+- New entries are blocked at the head version (whatever ships next)
+- Open positions tagged in attribution with `managed_by_version=<decommissioned_short_hash>` for audit clarity
+- Cutover state in `positions` table preserves the version-of-record for each position
+
 #### Vol Regime Detector
 - Metric: 60-day rolling realized vol of portfolio daily returns
 - Z-score: vs. own 60-day historical distribution (250 samples)
@@ -395,7 +405,47 @@ Transitions:
 
 Two paths:
 1. **Parameter changes** (within range, tighten direction): take effect at NEXT signal cycle, never mid-session
-2. **Defensive position trims:** mid-session direct order action; capped at -30% gross per session; **causally agent-initiated, mechanically placed by risk engine** (which holds broker creds in Phase 2; Phase 1 trims execute via QC algorithm-side trim logic triggered by audit-driven instruction)
+2. **Defensive position trims:** mid-session direct order action; capped at -30% gross per session; causally agent-initiated; mechanically placed via path that depends on phase (see Phase 1 Defensive Trim Protocol below)
+
+#### Phase 1 Defensive Trim Protocol (LOCKED — wire format and cadence)
+
+In Phase 1, backend has no direct IBKR connection. Defensive trims execute via QC algorithm. Wire protocol:
+
+**1. Backend writes instruction to QC ObjectStore:**
+- Path: `/instructions/<sequence_no>.json` (BIGSERIAL sequence_no per session)
+- Payload (canonical JSON, JCS-serialized):
+  ```json
+  {
+    "instruction_id": "<UUIDv7>",
+    "instruction_type": "defensive_trim" | "kill_switch_halt" | "kill_switch_resume" | "vacation_start" | "vacation_end" | "parameter_update",
+    "issued_at_utc": "<RFC 3339>",
+    "expires_at_utc": "<issued_at + 5 min>",
+    "payload": { ...type-specific... },
+    "audit_log_sequence_no": <int>
+  }
+  ```
+- For `defensive_trim` payload: `{positions_to_trim: [{market, contracts_to_close, momentum_score}], session_cap_pct_remaining}`
+
+**2. QC algorithm polls instructions every 5 seconds during CME session** (in addition to its bar-event-driven main loop). On new instruction:
+- Idempotent dedup via `instruction_id`
+- Validate `expires_at_utc > now`; if expired, write ack with status `expired`
+- Execute action via QC's IBKR-mediated order placement (marketable-limit per execution mechanics)
+- Write acknowledgment to `/instruction_acks/<sequence_no>.json`:
+  ```json
+  {
+    "instruction_id": "<UUIDv7>",
+    "status": "completed" | "partial" | "failed" | "expired",
+    "executed_at_utc": "<RFC 3339>",
+    "result": { ...e.g., orders_placed, fills_observed... },
+    "error_message": "<if failed>"
+  }
+  ```
+
+**3. Backend polls acks every 5 seconds.** On ack received: log to `audit_log`; update agent-action record; if `failed` → alert + escalate to HALT_NEW (incident_review for repeated failures).
+
+**Phase 1 round-trip target: p99 ≤ 20s (5s instruction-write delay + 5s QC poll + execution + 5s ack write + 5s backend poll).** Phase 1 kill-switch SLO of ≤30s reflects this.
+
+**Phase 2:** direct backend → IBKR via `ib-async`. Same instruction format used internally for audit, but mechanical execution is direct. SLO returns to ≤5s.
 
 #### Per-Parameter "Tighten" Direction (LOCKED)
 
@@ -413,16 +463,18 @@ Two paths:
 
 Agent moves WITHIN Min/Max AND in tighten direction. Loosening or n/a → human/PR.
 
-### Auto-Revert Thresholds (parameter changes — refined for feasibility)
+### Auto-Revert Thresholds (parameter changes — simplified to portfolio-wide)
+
+All parameters in the Parameter Ranges Table are **portfolio-wide in effect** (they apply identically to all markets in the active universe). The earlier "globally-applicable vs. market-specific" distinction was rhetorical, not real — corrected here.
 
 Auto-reverts when **any**:
-- 30-day rolling live Sharpe drops > 2 SD from pre-change baseline within 30 sessions, AND minimum 30 trades on changed market(s) **for globally-applicable params only** (refined per below)
-- Max DD breaches -10% within 5 CME sessions of the change
-- Consecutive losing trades:
-  - **Globally-applicable params** (`VOL_TARGET_PCT_ANNUAL`, `INSTRUMENT_VOL_LOOKBACK_DAYS`): Sharpe-drop AND 30-trade-window AND 5+ consecutive losers portfolio-wide
-  - **Market-specific params** (lookbacks, MA, ATR, Hurst, roll, holding): Sharpe condition uses **5+ consecutive losers on affected market within window** (drops the 30-trade threshold which is structurally unreachable given `MIN_HOLDING_DAYS=14` on a single market within 30 sessions); DD condition still applies
+- 30-day rolling live PORTFOLIO Sharpe drops > 2 SD from pre-change baseline within 30 sessions, AND minimum 30 portfolio-wide trades in window
+- Portfolio max DD breaches -10% within 5 CME sessions of the change
+- 5+ consecutive losing trades portfolio-wide within 30 sessions of the change
 
 Auto-revert: parameter restored; full audit; alert; no further auto-changes to that parameter for 14 days.
+
+SD baseline (locked to remove ambiguity): pool ALL 30-day rolling-window Sharpes from ALL walk-forward folds during backtesting into a single distribution; SD of that pooled distribution is the baseline. Number of folds = however many rolling 3-year-train / 6-month-test windows fit in available history (5–10 typical). Live track record post-day-180 transitions to using 30-day rolling windows from live data only.
 
 ### Logic-Change vs. Parameter-Change Boundary
 
@@ -442,7 +494,7 @@ Auto-revert: parameter restored; full audit; alert; no further auto-changes to t
 | `STOP_DISTANCE_ATR_MULT` | 1.5 | 3.5 | 2.5 | Stop distance in ATR multiples |
 | `HURST_THRESHOLD` | 0.45 | 0.65 | 0.55 | Hurst exponent floor for trend signal |
 | `ROLL_DAYS_BEFORE_EXPIRY` | 5 | 7 | 7 | Days before expiry to roll futures |
-| `MIN_HOLDING_DAYS` | 5 | 21 | **14** (locked single value) | Minimum holding period before exit eligible |
+| `MIN_HOLDING_DAYS` | n/a | n/a | **14** (LOCKED constant in code; NOT agent-mutable; PR required to change) | Minimum holding period — removed from agent-mutable surface |
 
 Agent-mutable within Min/Max AND in tighten direction. Outside Min/Max OR loosening direction → PR.
 
@@ -460,7 +512,7 @@ Agent-mutable within Min/Max AND in tighten direction. Outside Min/Max OR loosen
 - **Functional form:** per-market, `slippage_bps = α_market + β_market × (order_size / ADV)` (linear-in-vol-adjusted-size)
 - **Data source:** realized fills compared to decision price (LEAN-emitted expected_price at signal time); per-fill `realized_slippage_bps = 10000 × (actual_price − expected_price) / expected_price` (signed for buy/sell)
 - **Estimator:** OLS fit of `realized_slippage_bps ~ (order_size / ADV)` per market; coefficients are α_market, β_market
-- **Bootstrap (Phase 1 first month, before live fills accumulate):** initial α, β derived from QC backtest fills using the same OLS procedure on backtest data
+- **Bootstrap (Phase 1 first month, before live fills accumulate; circular-dependency fix):** **disable LEAN's built-in slippage model** in the bootstrap backtest run. Bootstrap backtest emits `expected_price = decision_price` (e.g., bar close at signal time); realized fill in bootstrap = decision_price (no slippage applied). Initial α = 0, β = 0 (zero-slippage prior). After 30 days of LIVE Phase 1 fills, run first real OLS calibration with α and β estimated from the live data. Without this fix, fitting OLS on LEAN-modeled fills recovers LEAN's own slippage assumption, which is not what we want.
 - **Cadence:** monthly cron during Phase 1; quarterly Phase 2+ (APScheduler job)
 - **Trigger condition for unscheduled recalibration:** realized > 2× modeled for any single market for 3 consecutive months → strategy review (NOT automatic recalibration; human-initiated)
 
@@ -559,27 +611,39 @@ On resume:
 - Cancelled working orders NOT re-instantiated
 - New signals at next cycle reflect current state under `m_convalescent = 0.5` (composed via MIN with other active multipliers)
 
-### SLO Budgets (timing definitions clarified to fix designed-delay conflict)
+### SLO Budgets (timing definitions clarified; Phase-split kill-switch SLO)
 
-`t_0` = **order placement attempted** (scheduler dispatches order to broker after queueing window has cleared, including any macro pause and CME maintenance pause); clock starts here
+`t_0` = **order placement attempted** (scheduler dispatches order to broker after queueing window has cleared); clock starts here
 `t_1` = broker order acknowledged (order ID issued or rejection received)
 
-- **Signal-to-order placement latency: p50 ≤ 60s, p99 ≤ 5 min (`t_1 − t_0`)** — measures the actual placement-to-ack time only, NOT the intentional queue wait between signal emission and next-session-open
-- **Signal-emit-to-placement-attempt time** (`t_0 − signal_emit_time`) is NOT a bounded SLO — it can be hours (overnight queue from 17:30 ET futures signal to 18:00 ET CME re-open; ETF signals from 17:30 ET to next-day 09:30 NYSE)
-- Kill-switch invocation: ≤ 5s from trigger to broker cancellation request
+- **Signal-to-order placement latency: p50 ≤ 60s, p99 ≤ 5 min (`t_1 − t_0`)** — measures placement-to-ack only, NOT queue wait
+- **Signal-emit-to-placement-attempt time** is NOT a bounded SLO — can be hours (overnight queue)
+- **Kill-switch invocation latency (Phase-split, locked):**
+  - **Phase 1: ≤ 30s** from backend trigger to QC-algorithm-executed cancellation. Limited by QC instruction polling (5s) + algorithm execution + IBKR ack via QC. Honest about Phase 1 architecture.
+  - **Phase 2: ≤ 5s** from trigger to direct broker cancellation request via `ib-async`.
 - Reconciliation freshness during CME session: ≤ 60s
 - Discord webhook delivery: ≤ 10s p99
-- Backtest queue: p99 ≤ 30 min on QC tier
+- **Backtest queue is a TARGET METRIC, not an SLO** (QC's queue is not under our control): aspirational p99 ≤ 30 min; if persistently exceeded, upgrade tier or investigate
 
 The 30-min CME settlement wait is BEFORE order queueing, not part of latency budget.
 
 ### Audit & Track Record
 
-- **Immutability mechanism:**
-  - Postgres `BEFORE UPDATE OR DELETE on audit_log` trigger raises exception. **INSERT is permitted** (chain is append-only). UPDATE/DELETE blocked even by app_owner.
-  - **TRUNCATE blocking:** Postgres EVENT TRIGGER on `ddl_command_start` aborts any TRUNCATE targeting `audit_log` AND `REVOKE TRUNCATE` from all roles except `dba_breakglass`. (Row triggers do NOT fire on TRUNCATE.)
+- **Immutability mechanism (with canonicalization + concurrency, locked):**
+  - Postgres `BEFORE UPDATE OR DELETE on audit_log` trigger raises exception. **INSERT is permitted** (append-only). UPDATE/DELETE blocked even by app_owner.
+  - **TRUNCATE blocking:** Postgres EVENT TRIGGER on `ddl_command_start` aborts TRUNCATE targeting `audit_log` AND `REVOKE TRUNCATE` from all roles except `dba_breakglass`.
   - Service role: `INSERT, SELECT` on `audit_log`; `REVOKE UPDATE, DELETE, TRUNCATE`
-  - Hash chain: SHA-256 single-linked, ordered by INSERTION sequence; `prev_hash`, `record_hash = SHA-256(prev_hash || record_payload)`. Genesis `prev_hash` = 32 zero bytes.
+  - **Canonical serialization for hashing: JCS (RFC 8785) — JSON Canonicalization Scheme.** Implementer uses `pyjcs` or equivalent. Two services serializing the same payload MUST produce identical bytes. NO ad-hoc serialization allowed for audit records.
+  - **Ordering primitive: Postgres `BIGSERIAL sequence_no` column** on `audit_log` table. Strict monotonic insertion order. UUIDv7's 48-bit timestamp is NOT used for chain ordering (not strict-monotone under concurrent inserts).
+  - **Concurrency control on audit writes (locked):** every audit-write transaction:
+    1. `BEGIN ISOLATION LEVEL SERIALIZABLE`
+    2. `SELECT pg_advisory_xact_lock(<audit_chain_lock_id>)` — application-defined fixed bigint
+    3. `SELECT prev_hash FROM audit_log ORDER BY sequence_no DESC LIMIT 1`
+    4. Compute `record_hash = SHA-256(prev_hash || JCS(record_payload))`
+    5. `INSERT INTO audit_log ...`
+    6. `COMMIT`
+    7. On `serialization_failure`: retry up to 5× with exponential backoff (10ms, 50ms, 250ms, 1.25s, 6s). After 5 failures → HALT_NEW (incident_review).
+  - Hash chain: SHA-256 single-linked. `prev_hash`, `record_hash = SHA-256(prev_hash || JCS(record_payload))`. Genesis `prev_hash` = 32 zero bytes.
   - Backfill/repair: APPEND at chain tail with `repaired_for_sequence_no` and `repaired_for_event_timestamp` provenance. Original gap visible.
   - Backups: S3 Object Lock (Compliance mode); retention 7 daily / 4 weekly / 12 monthly / permanent annual; quarterly restore drill.
 - **Postgres role hierarchy:**
@@ -601,7 +665,7 @@ The 30-min CME settlement wait is BEFORE order queueing, not part of latency bud
 - **Trade-level attribution schema:**
   - Same row, two field groups; `expected_*` immutable post-emit (BEFORE UPDATE trigger allows updates only to `realized_*` columns); `realized_*` nullable until trade closes
   - Audit log: `signal_emitted` and `trade_realized` event types
-- **audit_log partitioning (locked, day-1):** schema partitions by year from day 1 with empty future partitions (one Alembic op creates partitions for current year + next 5 years); new yearly partitions added annually via Alembic op; Year 5+ cold tier (S3 only, dropped from live DB)
+- **audit_log partitioning + retention (locked, day-1):** schema partitions by year from day 1 with empty future partitions (one Alembic op creates partitions for current year + next 5 years); new yearly partitions added annually via Alembic op; Year 5+ cold tier (S3 only, dropped from live DB). **Same partitioning + retention policy applies to `trades`, `orders`, `fills`, `attribution` tables** (IRS requires 6–7 years record retention; 5 years hot + indefinite S3 cold satisfies this).
 - **`incident_reviews` table:** separate table FK to `audit_log` and optionally `alerts`; stores write-up text, author, timestamp, resolved status; required entry before incident_review HALT_NEW resume
 
 ### vectorbt-vs-LEAN Parity (locked trade-count rule)
@@ -612,13 +676,14 @@ The 30-min CME settlement wait is BEFORE order queueing, not part of latency bud
 
 ### QuantConnect Audit Adapter (Phase 1 critical path)
 
-- QC algorithm writes audit events to QC ObjectStore as JSONL with monotonic sequence numbers per session
+- QC algorithm writes audit events to QC ObjectStore as JSONL with monotonic sequence numbers per session (JCS canonical for hash chain)
 - QC algorithm ALSO pushes intraday state (positions, cash, day-trade count, margin) every 60s during CME session for reconciliation source
-- Backend polls QC ObjectStore every 60s during CME session; cursor-based; resumes from last cursor on restart
-- Schema identical to custom-emitted records; weekly golden-test parity (byte-for-byte)
+- QC algorithm polls `/instructions/` ObjectStore directory every 5s during CME session for defensive trim / kill-switch / vacation / parameter instructions (per Phase 1 Defensive Trim Protocol above)
+- Backend polls QC ObjectStore every 60s for audit events + state; every 5s for `/instruction_acks/`; cursor-based; resumes from last cursor on restart
+- **Schema parity (clarified):** "byte-for-byte parity" applies to canonicalized payload only — the comparison excludes `{ingest_clock_ts, ingest_uuid, sequence_no}` (which are necessarily different per write). Golden-test compares the JCS-canonicalized `record_payload` byte-for-byte; metadata fields are validated for shape only.
 - Loss handling: gap → alert + pull from QC's logs; backfilled records APPENDED at current tail with provenance
 - Failure mode: unavailable > 10 min → HALT_NEW (defensive_envelope)
-- Clock skew: every event carries `source_clock_ts` (QC) and `ingest_clock_ts` (backend); chain hashed by `ingest_clock_ts`
+- Clock skew: every event carries `source_clock_ts` (QC) and `ingest_clock_ts` (backend); chain hashed using `ingest_clock_ts` for deterministic ordering across services
 
 ### Tax Handling
 
@@ -627,7 +692,11 @@ The 30-min CME settlement wait is BEFORE order queueing, not part of latency bud
 - CPA consultation required before any election; UI gate (verbatim text capture per frontend spec)
 - Wash sale tracking across all `account_id`s
 - Year-end harvest flagging
-- Tax export: CSVs for Form 6781, Schedule D, Form 8949; PDF summary; annual Jan 31
+- Tax export: CSVs for Form 6781, Schedule D, Form 8949; PDF summary; annual Jan 31. **Plus a reconciliation pass after Feb 15** (when broker 1099-B forms are issued): system pulls 1099-B from IBKR FlexQuery; computes delta against own export; generates `tax_export_reconciliation` report flagging any divergence > $1; operator + CPA review.
+- **CSV hash-chain footer format (locked):**
+  - For audit CSV: `chain_start_hash, chain_end_hash, record_count, exported_at_utc, export_signature` where `export_signature = SHA-256(JCS({chain_start_hash, chain_end_hash, record_count, exported_at_utc}))` — anchors the export to a specific point in the audit chain, verifiable
+  - For trades CSV: single `audit_chain_anchor_hash` = current chain tail hash at export time (allows verifier to confirm trades export corresponds to a known audit state); `record_count, exported_at_utc, export_signature` same format
+  - Verification tool: `services/audit/verify_export.py` provided; takes CSV file, recomputes hashes, compares to footer
 
 ### Claude Ops Agent — Authority Matrix
 
@@ -713,6 +782,48 @@ For parameter-only PRs: same git SHA, different `parameter_set_hash`. Backtest d
   - `author`: `operator` | `agent`
   - `reasoning_text`: free text, min 10 chars when author=operator
 
+### Audit Event Taxonomy (LOCKED — central enumeration)
+
+All `audit_log` `event_type` values are drawn from this enum. New event types require schema migration + PR. Implementer must produce a Python `Enum` mirroring this list.
+
+**Lifecycle / state:**
+- `system_started`, `system_stopped`, `migration_applied`, `phase_cutover_started`, `phase_cutover_completed`
+
+**Strategy / signals:**
+- `signal_emitted`, `signal_approved`, `signal_rejected`, `signal_deferred`, `signal_expired`, `bulk_approve_invoked`, `trade_realized` (close), `signal_anomaly_flagged`, `market_drop_settlement_unavailable`, `macro_window_drop`
+
+**Orders / execution:**
+- `order_placed`, `order_filled`, `order_partially_filled`, `order_cancelled`, `order_rejected`, `order_retry_attempted`, `manual_close_invoked`, `roll_initiated`, `roll_completed`
+
+**Risk / state machine:**
+- `state_transition_normal_to_halt`, `state_transition_halt_to_convalescent`, `state_transition_convalescent_to_normal`, `kill_switch_triggered` (with severity), `defensive_trim_invoked`, `margin_auto_trim_invoked`, `convalescent_counter_reset`, `decommission_floor_triggered`
+
+**Capital / equity:**
+- `capital_event_deposit`, `capital_event_withdrawal`, `capital_event_mode_started`, `capital_event_mode_ended`, `dd_baseline_reset`, `peak_mtm_updated`
+
+**Universe / parameters:**
+- `universe_exclusion`, `universe_inclusion`, `parameter_change_proposed` (PR), `parameter_change_applied` (auto), `parameter_change_reverted` (auto-revert), `pr_drafted`, `pr_approved`, `pr_rejected`, `pr_merged`, `strategy_version_deployed`, `strategy_version_decommissioned`, `slippage_calibration_recalibrated`
+
+**Reconciliation / data quality:**
+- `reconciliation_check_passed`, `reconciliation_break_detected`, `reconciliation_break_resolved`, `data_quality_reject`, `data_quality_quarantine`, `psd_repair_applied`
+
+**Communications / engagement:**
+- `liveness_probe_sent`, `liveness_probe_acknowledged`, `engagement_timeout_triggered`, `discord_delivery_failed`, `email_backup_sent`
+
+**Vacation / calendar:**
+- `vacation_started`, `vacation_ended`, `calendar_imported`, `calendar_ratified`, `calendar_unratified`, `calendar_service_outage`
+
+**Auth / security:**
+- `webauthn_registered`, `webauthn_login`, `totp_login`, `backup_code_used`, `session_evicted`, `re_auth_required`, `re_auth_passed`, `breakglass_invoked`, `secrets_rotated`
+
+**Agent:**
+- `agent_decision_made`, `agent_hot_fix_deployed`, `agent_hot_fix_rolled_back`, `agent_pr_drafted`, `agent_action_failed`
+
+**System health:**
+- `service_degraded`, `service_recovered`, `cost_alert_soft_ceiling`, `cost_alert_hard_ceiling`, `external_watchdog_alert`, `incident_review_logged`, `audit_chain_integrity_verified`, `audit_repair_applied`
+
+**Implementer note:** if a needed event type is missing from this list, flag with `[QUESTION FOR OPERATOR: new event type "X" needed for case Y]` rather than silently inventing.
+
 ### Communications
 
 - Primary: Discord bot via `discord.py`. Channels: `#daily-brief`, `#signals`, `#fills`, `#alerts`, `#critical`, `#ops`, `#ask-agent`, `#audit`
@@ -725,7 +836,7 @@ For parameter-only PRs: same git SHA, different `parameter_set_hash`. Backtest d
 - Daily liveness probe: 09:00 ET each CME session; "system is alive — react/reply to acknowledge" to `#daily-brief` + email backup
 - Vacation: per Vacation Mode section
 - NO SMS, NO voice escalation
-- External watchdog: separate region; pings backend `/health` every 5 min; emails on >15 min unreachable during CME session
+- External watchdog: separate region (Hetzner Helsinki or Falkenstein, NOT Ashburn — Hetzner US is essentially Ashburn-only, so "different region" requires their EU datacenters; ~$5/mo CX11; auth to backend `/internal/watchdog` via Bearer token from sops); pings `/health` every 5 min; emails on >15 min unreachable during CME session
 
 ### Security
 
@@ -740,10 +851,19 @@ For parameter-only PRs: same git SHA, different `parameter_set_hash`. Backtest d
 - Re-auth (WebAuthn UV) within 5 min for risk-loosening (web-only by construction)
 - Session lifetime: 30 min idle / 24h absolute / 7d refresh
 - Container hardening: non-root, read-only fs where compatible, no privileged, Trivy in CI, distroless where compatible
-- Network egress allowlist: IBKR endpoints (Phase 2 only), Anthropic API, S3, NTP, package mirrors, GitHub, QC API endpoints (Phase 1)
+- **Container registry: GHCR (GitHub Container Registry), private**; auth via GitHub App token at deploy
+- **Secrets at runtime:** age key stored on VPS via **systemd credential storage** (`LoadCredentialEncrypted=`), readable only by service user. Sops decrypts encrypted files at container-start via init container; decrypted secrets injected as environment variables (never written to disk in plaintext); init container exits before main container starts.
+- **WebAuthn library: `py_webauthn`** (server-side); attestation policy `none` (single-operator; we trust the operator's authenticator); user-verification `required` for register and risk-loosening flows
+- Network egress allowlist: IBKR endpoints (Phase 2 only), Anthropic API, S3, NTP, package mirrors, GitHub (incl. GHCR), QC API endpoints (Phase 1), Forex Factory + Trading Economics (calendar)
 - Network ingress: Caddy HTTPS public + SSH (key-only); internal Docker network only otherwise
 - Repo / build-chain DR: self-hosted Gitea on VPS (full GitHub mirror, daily sync); weekly encrypted repo archive to S3
-- GitHub workflow: branch protection on `main` requires CI pass + ≥1 approval; agent commits to `agent/...` feature branches; operator self-approves agent PRs via in-app review surface (sync via GitHub App install token)
+- **GitHub workflow (corrected — single-operator reality):**
+  - Branch protection on `main` requires **CI pass only** (NOT GitHub native ≥1 approval — impossible to satisfy in single-operator system without admin-bypass theater)
+  - **The actual approval gate is the in-app PR review surface** in `/system` (operator sees plain-English summary + risk impact + backtest delta + tests; clicks Approve / Reject / Request Changes)
+  - On in-app Approve: backend's GitHub App install token merges the PR via GitHub API
+  - The in-app approval is logged to `audit_log` with: operator session ID, `last_uv_at` (re-auth proof), in-app decision rationale (if rejection: feedback modal text)
+  - Agent commits to `agent/...` feature branches; operator's commits to `human/...` branches
+  - This is documented as "in-app approval supersedes GitHub native review" — security audit reviewers should see the in-app trail, not GitHub's review surface
 
 ### Time and Clock
 
@@ -769,7 +889,7 @@ For parameter-only PRs: same git SHA, different `parameter_set_hash`. Backtest d
 ### `session_evicted` SSE Event (LOCKED)
 
 Server emits `session_evicted` to a session in the following cases:
-- **Tab-limit eviction:** N+1 connection from same user; oldest existing connection receives event
+- **Tab-limit eviction:** N+1 connection from same user; oldest existing connection receives event. **N=4** (locked, mirroring frontend spec).
 - **Explicit logout:** user logs out from another tab/device
 - **Breakglass session kill:** dba_breakglass action terminates user sessions
 - **Credentials rotation:** WebAuthn or TOTP credentials rotated; existing sessions invalidated
@@ -787,7 +907,12 @@ Frontend behavior: display banner appropriate to reason; on `tab_limit`, banner 
 - Tax modeling post-hoc on trade log
 - Capacity analysis at 1×, 5×, 10×, 25× current capital
 - 30 CME session paper minimum per strategy version (CI gate)
-- vectorbt-vs-LEAN parity (weekly cron) per locked rule above
+- **vectorbt-vs-LEAN parity (weekly cron, reworked thresholds):**
+  - Per-trade tolerance: |slippage difference per fill| ≤ 5 bps acceptable
+  - Aggregate tolerance: cumulative-since-inception P&L divergence ≤ 0.5% of starting equity
+  - Trade-count tolerance: |trade_count_lean − trade_count_vectorbt| / trade_count_lean ≤ 5% (allowing legitimate fill-semantics differences around session boundaries)
+  - Any single tolerance breach → P0 investigation (not auto-block); two of three → block strategy deploy until resolved
+  - **Earlier "0.1% blanket" threshold was too tight** (smaller than typical fee+slippage noise); replaced with this multi-tolerance scheme
 
 ### Testing Discipline
 
@@ -795,6 +920,7 @@ Frontend behavior: display banner appropriate to reason; on `tab_limit`, banner 
 - **Integration tests:** strategy logic against historical data, broker connectivity (mock + live-paper Phase 2; QC ObjectStore mock Phase 1), full kill-switch flow incl. all severity branches, signal-to-fill round trip, order placement at next-session-open delay, QC adapter golden-test parity (weekly), vectorbt-vs-LEAN parity (weekly; trade definition entry-to-exit), per-service degradation matrix scenarios, continuous-vs-physical contract reconciliation at futures rolls, hot-fix auto-rollback simulation, DST transition handling, PDT pre-check edge cases, cluster-shrink convergence + non-convergence handling, universe filter at multiple equity tiers
 - CI gates ALL PRs
 - Pre-merge gates: tests pass, `ruff`, `mypy --strict`, `gitleaks`, no risk-engine modification without `risk-review-approved` label, hot-fix forbidden-path linter
+- **CI runner (locked):** GitHub Actions free tier for normal PRs (typical PR uses < 30 min). For weekly parity tests + full integration suite that approach free-tier limits, **self-hosted runner on a separate cheap VPS** (Hetzner CX11 ~$5/mo, dedicated to CI; isolated from trading VPS for security). Self-hosted runner registered to operator's GitHub repo; ephemeral job pattern (job-per-runner-instance) to limit blast radius.
 
 ### Performance Targets
 
