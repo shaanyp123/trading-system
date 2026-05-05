@@ -21,32 +21,55 @@ You are producing a comprehensive technical specification for the BACKEND of a s
 
 The decisions below are not advisory. They are constraints. Architect within them. If a section appears underspecified, default to the conservative interpretation and flag with `[CONSERVATIVE DEFAULT: ...]` rather than substituting your own preference.
 
+### Canonical Session Calendar (referenced throughout)
+
+**The canonical session calendar is CME RTH** (Sun 18:00 ET → Fri 17:00 ET, with daily 17:00–18:00 ET maintenance pause). This is the calendar used for:
+- 17:00 ET daily MTM anchor
+- CONVALESCENT 5-session counter
+- Capital-event mode 30-session counter
+- Trading-day counts in general
+
+Where a behavior is specifically ETF-related (PDT rule, ETF order placement), the **NYSE calendar** (9:30–16:00 ET, Mon–Fri excluding NYSE holidays) is used. Half-days follow NYSE's published early-close schedule.
+
+The two calendars differ on a small number of days per year (Black Friday early close, day after Thanksgiving, MLK day in some configurations). Implementer must read both calendars from a maintained source (e.g., `pandas_market_calendars`).
+
 ### Strategy
 
 - **Phase 1 strategy:** multi-asset systematic trend-following on micro futures + bond ETFs
-- **Universe:** ~8–12 markets — equity index micros (/MES, /MNQ, /M2K, /MYM), commodity micros (/MCL, /MGC, /MSI), Bitcoin micro (/MBT), bond ETFs (TLT, IEF, SHY); optional FX micros (/M6E)
+- **Universe:** ~8–12 markets — equity index micros (`/MES`, `/MNQ`, `/M2K`, `/MYM`), commodity micros (`/MCL`, `/MGC`, `/SIL` — CME micro silver; **NOT `/MSI` which is non-standard**), Bitcoin micro (`/MBT`), bond ETFs (TLT, IEF, SHY); optional FX micros (`/M6E`)
 - **Signal type:** time-series momentum / breakout (Donchian channels, MA crossovers); vol-targeted sizing; daily bars
 - **Daily bar definition (locked, per asset class):**
-  - Futures (CME-listed: equity index micros, commodity micros, /MBT, /M6E): close = **CME daily settlement, 17:00 ET**
+  - Futures (CME-listed: equity index micros, commodity micros, `/MBT`, `/M6E`): close = **CME daily settlement, 17:00 ET**
   - ETFs (TLT, IEF, SHY): close = **NYSE close, 16:00 ET**
-- **Signal generation cadence:** runs once daily at **17:30 ET** (after both close anchors); processes all markets together using that day's settles/closes
+- **Signal generation cadence:** scheduler runs at **17:30 ET** after both close anchors. **Settlement publication tolerance:** scheduler waits up to 30 min for missing CME settlement prints; if prints not available by 18:00 ET, use last available bid/ask midpoint with `unsettled` flag and proceed; if prints unavailable >60 min, halt signal generation for affected market that day.
 - **Holding period:** 2 weeks to 6 months
 - **Phase 2+:** add second uncorrelated strategy (likely defined-risk vol carry on SPX) only after Phase 1 live validation; sequential strategy addition, never parallel cold-start
-- **Base currency:** USD only. No FX hedging. Foreign instruments (if any FX micros are added) settle and convert at IBKR's standard rate.
-- **Account model:** single live IBKR Pro account in operator's name. No sub-accounts, no prop-firm splits in Phase 1. Schema must support multi-account in future without migration (use `account_id` foreign key throughout).
+- **Base currency:** USD only. No FX hedging. `/M6E` settles in USD via IBKR auto-conversion at end of day; intraday IBKR-side FX rounding may produce non-zero EUR balance briefly (covered by Reconciliation Tolerances Table FX-cash row).
+- **Account model:** single live IBKR Pro account. Schema supports multi-account via `account_id` foreign key throughout.
 - **PDT / Reg T constraints (locked):**
   - Futures use SPAN margin; PDT does not apply.
-  - ETFs use Reg T (50% initial, 25% maintenance). PDT rule (no more than 3 day-trades in 5 rolling days) applies while account equity < $25k.
-  - **Risk engine MUST refuse any ETF order that would create a 4th day-trade within a 5-day rolling window if account equity < $25k.** This is a hard pre-trade check.
-  - Portfolio Margin not in scope (requires $125k+; revisit only when family capital lands).
+  - ETFs use Reg T (50% initial, 25% maintenance). PDT rule applies while account equity < $25k.
+  - **PDT pre-check (specified):** before placing any new ETF entry order, if `account_equity < $25,000` AND `rolling_5_day_day_trade_count >= 3`, **refuse the entry**. Day-trade count maintained from FlexQuery + intraday TWS state. Conservative interpretation — under-trades rather than risk a PDT violation.
+  - Portfolio Margin not in scope (requires $125k+).
+- **Sharpe definition (canonical, used by all triggers):**
+  - Annualization factor: 252
+  - Risk-free rate: 0
+  - Returns: daily close-to-close based on 17:00 ET MTM
+  - `Sharpe = mean(daily_returns) × sqrt(252) / stdev(daily_returns)`
+  - "X-day rolling Sharpe" uses last X CME RTH sessions
 
 ### Path / Phasing
 
-- **Phase 0 (weeks 0–7, extended again):** foundation — operator upskilling, IBKR Pro account opening, QC subscription, repo + CI scaffolding, secrets management (sops), Hetzner VPS provisioned, audit schema designed and migrated, **paper trading begins on QuantConnect in week 1 with the v1 strategy**, **QC ObjectStore audit adapter coded and golden-tested against custom-format target by week 4**, **30 NYSE trading days of paper completed by end of week 6** (week 7 is buffer + Phase 1 handover).
-- **Phase 1 (months 2–5):** live trading on QuantConnect Cloud (LEAN). Real money, small size (`live-small`). Track record begins immediately. $20/month QC Quant Researcher tier (upgrade to $80 only if backtest queue bottlenecks). Custom backend skeleton runs in parallel, ingesting QC audit events.
-- **Phase 2 (months 5–9):** custom infrastructure built and hardened; strategy execution migrates to LEAN Local (Docker-hosted) with vectorbt as fast research/sweep layer; track record is unbroken via continuous audit log schema.
+- **Phase 0 (weeks 0–8, extended to absorb holiday risk):** foundation — operator upskilling, IBKR Pro account opening, QC subscription, repo + CI scaffolding, secrets management (sops), Hetzner VPS provisioned, audit schema designed and migrated. **Paper trading begins on QuantConnect in week 1 with the v1 strategy. QC ObjectStore audit adapter coded and golden-tested against custom-format target by week 4. 30 NYSE trading days of paper completed within weeks 1–7 (calendar buffer absorbs typical 1–2 holidays in window). Week 8 is buffer + Phase 1 handover.** If 30-day paper minimum slips past week 7 due to extended holiday cluster, Phase 0 extends until met (the CI gate is hard).
+- **Phase 1 (months 2–5):** live trading on QuantConnect Cloud (LEAN). Real money, small size (`live-small`). Track record begins immediately.
+- **Phase 2 (months 5–9):** custom infrastructure built and hardened; strategy execution migrates to LEAN Local (Docker-hosted) with vectorbt as fast research/sweep layer.
 - **Phase 3 (months 9–12):** capital scaling, second-strategy preparation, family-money legal structure work.
-- **Phase 1 → Phase 2 cutover for open positions:** flatten all open positions on QC at end of cutover session; reconcile audit log to terminal state; restart fresh on LEAN Local the following morning. **No position transfer across execution venues.** Audit log remains continuous; physical positions reset to flat.
+- **Phase 1 → Phase 2 cutover (scheduled, not ad-hoc):**
+  - Operator selects cutover date at least 5 trading days in advance via web UI
+  - Pre-cutover automated checklist: positions reconciled (zero break in last 24h), no open stop-orders > 5σ from current price, all parameter sets canonicalized, custom backend passing all integration tests
+  - **Abort condition:** any pre-cutover check fails OR any HALT_NEW state active in 24h prior — cutover deferred to next selected date
+  - Cutover executes at session close on selected date: flatten all open positions on QC; reconcile audit log to terminal state; restart fresh on LEAN Local the following morning
+  - **No position transfer across execution venues.** Audit log remains continuous; physical positions reset to flat.
 
 ### Tech Stack (locked)
 
@@ -56,156 +79,216 @@ The decisions below are not advisory. They are constraints. Architect within the
 - **Storage:** DuckDB on Parquet for historical/research/analytics; PostgreSQL 16 (containerized) for transactional state
 - **Postgres driver:** asyncpg with SQLAlchemy 2.x async
 - **Migrations:** Alembic
-- **Broker library:** `ib-async` (community-maintained fork of the now-unmaintained `ib_insync`; same API surface). Phase 1 routes via QC's IBKR integration; Phase 2 direct via `ib-async` to IB Gateway in Docker.
-- **Margin model:** SPAN for futures (broker-computed); Reg T for ETFs.
-- **Orchestration:** cron + APScheduler within Python services. **Scheduler and calendar service are co-located in a single APScheduler-backed Python process.** Job store is **persistent (Postgres-backed)** so scheduled jobs survive restarts. NO Airflow/Prefect/Dagster.
+- **Broker library:** `ib-async` (community-maintained fork of `ib_insync`). Phase 1 routes via QC's IBKR integration; Phase 2 direct via `ib-async` to IB Gateway in Docker.
+- **Margin model:** SPAN for futures; Reg T for ETFs.
+- **"Used margin" definition (canonical):** `used_margin_pct = 1 − (ExcessLiquidity / NetLiquidation)`, both pulled from IBKR's `accountSummary`. Used in margin protocol thresholds.
+- **Orchestration:** cron + APScheduler within Python services. **Scheduler and calendar service co-located in a single APScheduler-backed Python process** with **persistent (Postgres-backed) job store**. NO Airflow/Prefect/Dagster.
 - **Real-time push:** SSE for browser one-way push; REST for everything else; **NO WebSocket.**
-- **Deployment:** Single VPS, Hetzner Cloud Ashburn (US East), Ubuntu LTS, Docker Compose. NO Kubernetes. **Single-host accepted; see RPO/RTO below.**
+- **Deployment:** Single VPS, Hetzner Cloud Ashburn (US East), Ubuntu LTS, Docker Compose. NO Kubernetes.
 - **Process supervision:** Docker Compose restart policies + systemd for the host; chrony for NTP
-- **Logging:** `structlog` with JSON renderer. OpenTelemetry tracing optional Phase 2+, not required Phase 1.
-- **Validation:** pydantic v2 for all schema-bound data models
+- **Logging:** `structlog` with JSON renderer
+- **Validation:** pydantic v2
 - **API exposure:** FastAPI on the VPS
 
 ### Data Sources (locked)
 
-- **Phase 1:** QuantConnect bundled equities + futures data (sufficient for backtest + live signal). IBKR real-time market data (free to account holders for our universe).
-- **Phase 2 additions (Polygon.io is CONTINGENT, not committed):** Polygon.io Stocks Starter ($30/mo) **only if** QC bundled equity data has gaps the strategy notices in Phase 1 live. Default Phase 2 = no Polygon. **FRED** (free) for macro context. Economic calendar via **Forex Factory or Trading Economics** (free tier or low-cost).
-- **NOT in scope:** Norgate Data (Linux Docker friction), alt data, NLP feeds, Bloomberg, Databento, multi-tier feeds.
-- **Survivorship-bias / continuity claims (precise):** QC's bundled data is survivorship-bias-handled for the equity/ETF leg (delisted instruments included). For the futures leg, the relevant correctness criterion is **roll methodology**, not survivorship; QC uses continuous-contract construction with documented roll rules (typically Panama-method / open-interest-based). LEAN execution uses physical contracts, so backtest continuous-contract returns must reconcile to physical-fill returns at cutover dates — this reconciliation is part of testing.
+- **Phase 1:** QuantConnect bundled equities + futures data; IBKR real-time market data (free to account holders for our universe).
+- **Phase 2 additions (Polygon.io is CONTINGENT, not committed):** Polygon.io Stocks Starter ($30/mo) **only if** QC bundled equity data has gaps the strategy notices in Phase 1 live. Default Phase 2 = no Polygon. **FRED** (free) for macro context. Economic calendar via Forex Factory or Trading Economics.
+- **NOT in scope:** Norgate Data, alt data, NLP feeds, Bloomberg, Databento, multi-tier feeds.
+- **Data correctness claims (precise, per leg):**
+  - **ETFs/equities:** QC bundled data is **survivorship-bias-free** (delisted instruments included; corporate actions handled).
+  - **Futures:** survivorship is not the relevant correctness criterion (futures contracts have finite life by design). The relevant criterion is **roll methodology**: QC uses Panama-method or open-interest-based continuous-contract construction. **LEAN execution uses physical contracts**, so backtest continuous-contract returns must reconcile to physical-fill returns at cutover dates. This reconciliation is a mandatory test (see Testing).
 
 ### Risk Framework (concrete math; locked)
 
-#### Position sizing
-- Volatility-targeted per position
-- Portfolio annualized vol target: **14%** (locked single value)
-- Instrument vol estimate: rolling 60-day standard deviation of daily log returns
-- Position size formula: `position_notional_i = (per_position_vol_target × equity) / (instrument_daily_vol_pct × sqrt(252))`
-- `per_position_vol_target` allocates the portfolio target across active markets via inverse-vol weighting, capped by per-position and per-cluster ceilings
+#### Position sizing — full algorithm (locked)
+
+Stage 1 — **Inverse-vol weighting (unconstrained):**
+```
+For each active market i:
+  σ_i = rolling 60-day stdev of daily log returns
+  raw_weight_i = 1 / σ_i
+  total = Σ raw_weight_j (over all active j)
+  unconstrained_weight_i = raw_weight_i / total
+  unconstrained_notional_i = unconstrained_weight_i × (portfolio_vol_target / portfolio_realized_vol_at_unconstrained_weights) × equity
+```
+Where `portfolio_vol_target = VOL_TARGET_PCT_ANNUAL / sqrt(252)` (daily target).
+
+Stage 2 — **Apply per-position cap:** for each i, `capped_notional_i = min(unconstrained_notional_i, 0.25 × equity)`.
+
+Stage 3 — **Apply per-cluster cap (iterative shrink-to-fit):**
+```
+For each cluster c with cap C_c:
+  cluster_total = Σ |capped_notional_i| for i in cluster c
+  if cluster_total > C_c × equity:
+    scale = (C_c × equity) / cluster_total
+    for i in cluster c: capped_notional_i *= scale
+Re-apply per-position cap after cluster scaling.
+Iterate until all caps satisfied (typically converges in 1–2 passes).
+If still infeasible: drop the lowest-momentum signal in the binding cluster; restart Stage 3.
+```
+
+Stage 4 — **Apply gross/net caps:**
+```
+gross = Σ |capped_notional_i|
+if gross > 3.0 × equity: uniform shrink all positions by (3.0 × equity / gross)
+net = Σ capped_notional_i (signed)
+if |net| > 1.5 × equity: uniform shrink all positions by (1.5 × equity / |net|)
+Re-apply per-position and per-cluster caps after rescale.
+```
+
+Stage 5 — **Lot-size rounding:**
+```
+For each market i:
+  contract_count_i = capped_notional_i / (point_value_i × multiplier_i)
+  rounded_contract_count_i = round_to_nearest_integer(contract_count_i, banker's_rounding)
+  if rounded_contract_count_i == 0: drop signal; tag as 'sub_minimum_size'
+  realized_notional_i = rounded_contract_count_i × point_value_i × multiplier_i
+  rounding_deviation_i = (realized_notional_i - capped_notional_i) / capped_notional_i
+  Track rounding_deviation in attribution
+```
 
 #### Equity and DD anchors (locked)
-- **Daily-start MTM anchor:** **17:00 ET** (CME daily settlement boundary), portfolio-wide. Daily P&L = `MTM(t) − MTM(prior 17:00 ET snapshot)`. NOT NYSE 09:30; CME settle is the relevant boundary for our predominantly-futures book.
+- **Daily-start MTM anchor:** **17:00 ET** (CME daily settlement boundary), portfolio-wide. Daily P&L = `MTM(t) − MTM(prior 17:00 ET snapshot)`.
 - **Trailing DD reference:** peak intraday MTM equity since system inception, including unrealized.
-- **Capital-event handling (deposit / withdrawal):** on any deposit ≥ 5% of current equity (specifically including the eventual $250k family deposit):
-  - Trailing DD reference (peak MTM) **resets to current equity at deposit time**
-  - System enters "capital event mode" for **30 sessions**: peak MTM tracked from deposit date forward; convalescent-style 50% vol target for first 5 sessions to dampen sizing whiplash
-  - Audit log entry for capital event with full provenance (timestamp, amount, source, new peak MTM baseline)
-  - All historical track record preserved; environment tag transitions according to new equity (see Environment Tagging)
-- **Withdrawals:** symmetric; peak MTM does NOT reset on withdrawal (would otherwise create perverse incentive to withdraw to reset DD).
+- **Capital-event handling (deposit/withdrawal ≥ 5% of current equity):**
+  - Trailing DD reference resets to current equity at deposit time
+  - System enters "capital event mode" for **30 CME RTH sessions**: peak MTM tracked from deposit date forward; convalescent-style 50% vol target for first 5 sessions
+  - Audit log entry with full provenance
+- **Withdrawals:** symmetric except peak MTM does NOT reset on withdrawal.
+- **Capital-event mode + CONVALESCENT stacking:** counters run independently; vol-target multipliers compose via MIN (not multiplied). E.g., capital-event-mode 50% AND CONVALESCENT 50% → effective multiplier = 0.5, not 0.25.
 
 #### Risk rings (all units explicit)
-All rings measured against **mark-to-market equity**, **gross/net in instrument notional terms** (not margin), unless stated otherwise.
+All rings measured against **mark-to-market equity**, **gross/net in instrument notional terms** (not margin).
 
 | Ring | Limit | Measurement Basis |
 |---|---|---|
 | Per-position max | 25% of equity notional | Sum of \|notional\| for that single market |
 | Gross portfolio max | 300% of equity notional | Sum of \|notional\| across all positions |
 | Net portfolio max | 150% of equity notional | Signed sum of notional across all positions |
-| Equity-index cluster max | 60% of equity notional gross | Combined /MES, /MNQ, /M2K, /MYM |
-| Commodity cluster max | 80% of equity notional gross | Combined /MCL, /MGC, /MSI |
-| Rates/bonds cluster max | 80% of equity notional gross | Combined TLT, IEF, SHY |
-| Crypto cluster max | 40% of equity notional gross | /MBT |
+| Equity-index cluster max | 60% gross | Combined `/MES`, `/MNQ`, `/M2K`, `/MYM` |
+| Commodity cluster max | 80% gross | Combined `/MCL`, `/MGC`, `/SIL` |
+| Rates/bonds cluster max | 80% gross | Combined TLT, IEF, SHY |
+| Crypto cluster max | 40% gross | `/MBT` |
+| FX cluster max | 30% gross | `/M6E` and any future FX micros |
 | Realized cross-portfolio correlation | Alert at avg pairwise > 0.7; HALT_NEW at > 0.85 | 60-day rolling realized correlation matrix across open positions |
 | Daily loss limit | -5% of daily-start MTM (17:00 ET anchor) | Portfolio-wide |
 | Trailing drawdown limit | -20% from peak intraday MTM equity | Subject to capital-event reset rule |
-| Monthly DD threshold | -10% in calendar month | Triggers vol-target halving (to 7%) for remainder of month |
-| Strategy decommission floor | Auto-halt + human review required | (a) live 30-day Sharpe < 0, OR (b) live max DD breach -25%, OR (c) 60-day live Sharpe underperforms backtest by > 2 SD |
+| Monthly DD threshold | -10% in calendar month | Triggers vol-target halving (0.5×) for remainder of month |
+| Strategy decommission floor | Auto-halt + human review (HALT_NEW) | (a) live 30-day Sharpe < 0, OR (b) live max DD breach -25%, OR (c) 60-day live Sharpe underperforms backtest by > 2 SD where SD is empirical SD of 30-day rolling Sharpes from walk-forward folds (pre-Phase-1) or from 30-day rolling windows in live track record (≥ 6 months live) |
+
+**Decommission floor → workflow:**
+1. State transitions to HALT_NEW with `reason = decommission_floor_<a|b|c>`
+2. Strategy version flagged `decommissioned` in `strategy_versions` table with full reason
+3. Audit entry with provenance
+4. Resume requires either: explicit operator override (re-auth + audit entry justifying continuation) OR deployment of new strategy version (which resets `paper_days_for_version` counter; 30 new paper days required before live)
 
 #### Vol regime detector
 - Metric: 60-day rolling realized volatility of portfolio daily returns
-- Z-score: current value vs. its own 60-day historical distribution
+- Z-score: current value vs. its own 60-day historical distribution (250 days of 60-day windows)
 - Trigger: z-score > 2 → kill-switch fires (HALT_NEW)
 
-#### Signal storm detector
-- Metric: portfolio total trade count in current session vs. rolling 30-day mean daily trade count
-- Trigger: current session count > 3× the mean → kill-switch fires
+#### Signal storm detector (recalibrated for actual trade frequency)
+For our daily-bar, 8–12-market, 2-week-to-6-month-holding strategy, baseline mean daily trade count is small (often <1). Naive 3× multiplier would trip on normal days.
+
+- Metric: portfolio total trade count in current CME RTH session
+- Trigger: `session_count > max(5, 3 × rolling_90_day_mean_daily_trade_count)`
+- The hard floor of 5 prevents spurious trips on low-baseline days; the 3×-90d guard catches genuine storms once the strategy has more activity
 
 #### Margin protocol — graduated defensive de-leverage (NOT panic-flatten)
 
-Margin auto-trim is a graduated reduction of weakest positions to maintain margin headroom. **It is explicitly carved out from the "no auto-flatten" principle because it is bounded, ordered, and capped — not a full unwind.**
+- 70% used → warn alert (no action)
+- 85% used → auto-trim sequence:
+  1. Compute momentum score for each open position: rolling 60-day z-score of price returns (instrument's own distribution). Lower z-score = weaker.
+  2. Rank ascending; tie-break by largest absolute margin contribution.
+  3. Cut via marketable-limit orders (1× spread, escalating to 2× on retry).
+  4. **Hard cap per session: -30% of gross exposure across the entire sweep.**
+  5. Cut until used margin < 60% OR session cap reached.
+  6. If margin still > 80% after one full sweep, escalate to HALT_NEW — no further system-initiated trims.
 
-- 70% of available margin used → warn alert (no action)
-- 85% of available margin used → auto-trim sequence:
-  1. Compute **momentum score** for each open position: rolling 60-day z-score of price returns (relative to instrument's own distribution). Lower z-score = weaker.
-  2. Rank by momentum score ascending (weakest first); tie-break by largest absolute margin contribution.
-  3. Cut positions in rank order via **marketable-limit orders** (1× spread, escalating to 2× spread on retry; NOT pure market orders — avoids panic-execution dynamics).
-  4. **Hard cap per session: -30% of gross exposure across the entire sweep.** No full unwind in one shot.
-  5. Cut until used margin < 60% OR session cap reached, whichever comes first.
-  6. If margin still > 80% after one full sweep, escalate to HALT_NEW (no further trims; force human review).
-  7. Log every cut to audit_log with `reason: margin_auto_trim` and full provenance.
+**Acknowledged residual risk (locked, made explicit):** if HALT_NEW is reached with used margin still > 80%, **IBKR may issue a margin call and force-liquidate positions outside system control.** This is the broker's right; the system does not prevent it. The "no system-initiated panic-flatten" principle is preserved at the system layer; broker-mandated liquidation is outside scope. Operator alert language must explicitly call this risk out at HALT_NEW entry due to margin (different alert text from other HALT_NEW triggers).
 
 #### Capacity tracking
 - Rolling 30-day average daily volume (ADV) computed per market
 - Order size as % of ADV computed at signal-emit time
 - Alert at 0.5% ADV; partial-fill cap at 2% ADV
-- **Capacity refusal at 2% ADV → partial fill at the cap, not refuse.** If signal demands more, fill what's possible; tag remainder as `capacity_constrained` in attribution; position then sized at actual filled fraction of intended.
+- **Capacity refusal at 2% ADV → partial fill at the cap** (size to 2% of ADV; tag remainder as `capacity_constrained`; position sized at actual filled fraction)
 
 ### Kill-Switch State Machine (explicit)
 
 States:
-- **NORMAL** — full operation; all entry and exit signals processed
-- **HALT_NEW** — cancel all working orders; hold all existing positions (no liquidation); no new entries; only stop-out exits permitted; alerts to all channels; **manual human resume only**
-- **CONVALESCENT** — 50% vol target (7% portfolio vol); entries permitted; remains for 5 trading sessions portfolio-wide (counted by NYSE session days); auto-transitions to NORMAL on completion
+- **NORMAL** — full operation
+- **HALT_NEW** — cancel all working orders; hold all existing positions (no system-initiated liquidation; broker-mandated possible at margin extremes); no new entries; **all exit logic continues normally** (stops, profit-targets, manual close); manual human resume only
+- **CONVALESCENT** — 50% vol target (or compose-via-MIN with capital-event mode); entries permitted; remains for **5 CME RTH sessions** portfolio-wide; auto-transitions to NORMAL on completion
+
+**HALT_NEW maximum dwell time:** no auto-flatten. After **7 trading days in HALT_NEW**, system escalates to operator with daily reminder (Discord + email backup); operator can extend, manually flatten, or resume. Designed to never auto-flatten; operator stays in control.
 
 Transitions:
 - `NORMAL → HALT_NEW`: any kill-switch trigger fires
-- `HALT_NEW → CONVALESCENT`: human invokes resume via web app or Discord (with re-auth)
-- `CONVALESCENT → NORMAL`: 5 trading sessions complete without breach
-- `CONVALESCENT → HALT_NEW`: any kill-switch trigger fires; 5-session counter resets on next resume
-- **No HALT_ALL or auto-liquidate state.** Carve-out: graduated margin auto-trim (above) is NOT a panic-flatten and is the sole sanctioned auto-de-leverage path.
+- `HALT_NEW → CONVALESCENT`: human resume (re-auth required; web-only)
+- `CONVALESCENT → NORMAL`: 5 CME RTH sessions complete without breach
+- `CONVALESCENT → HALT_NEW`: any kill-switch trigger fires; counter resets on next resume
+- **No HALT_ALL or auto-liquidate state.** Margin auto-trim is graduated de-leverage (above), NOT panic-flatten.
 
-#### CONVALESCENT counter reset events (locked)
+#### CONVALESCENT counter reset events (locked, corrected for internal consistency)
 
 | Event | Resets 5-session counter? |
 |---|---|
-| Kill-switch trigger fires while in CONVALESCENT | YES (returns to HALT_NEW; counter reset on next resume) |
-| Reconciliation false-positive resolved within tolerance | NO |
-| Calendar ratification grace window | NO |
-| Heartbeat engagement timeout | NO (this triggers Defensive Risk Envelope path; see Communications) |
-| Capital event (deposit triggering capital-event mode) | YES |
+| Any kill-switch trigger fires while in CONVALESCENT (returns to HALT_NEW) | YES — counter reset on next resume |
+| Heartbeat engagement timeout (Defensive Risk Envelope path; transitions to HALT_NEW) | YES — heartbeat timeout IS a kill-switch trigger; consistent with row 1 |
+| Reconciliation false-positive resolved within tolerance (no state transition) | NO — no state transition occurred |
+| Calendar ratification grace window (no state transition) | NO — no state transition occurred |
+| Capital event (deposit ≥ 5% of equity → triggers capital-event mode) | YES — independent reset; both modes active simultaneously, vol multiplier composes via MIN |
 
-#### Kill-switch triggers (any of the following → `→ HALT_NEW`)
-- Trailing DD breach (-20% from peak MTM equity, subject to capital-event reset)
+#### Kill-switch triggers (any → `→ HALT_NEW`)
+- Trailing DD breach (-20% from peak MTM, capital-event-reset-aware)
 - Daily loss breach (-5% of daily-start MTM, 17:00 ET anchor)
-- Signal storm (above)
-- Reconciliation mismatch (delta exceeds tolerance band — see Reconciliation Tolerances table)
-- Broker disconnect persisting > 5 minutes during market hours
-- Vol regime detector trip (above)
-- Realized cross-portfolio correlation > 0.85 (above)
-- Decommission floor trigger (above)
-- Audit log write failure (audit integrity is non-negotiable)
+- Signal storm (recalibrated formula above)
+- Reconciliation mismatch (delta exceeds Reconciliation Tolerances Table)
+- Broker disconnect persisting > 5 minutes during CME RTH
+- Vol regime detector trip
+- Realized cross-portfolio correlation > 0.85
+- Decommission floor trigger
+- Audit log write failure
 - Any unhandled exception in execution path
-- **Heartbeat engagement failure (= Defensive Risk Envelope path; identical state, distinct alert routing — see below)**
+- **Heartbeat engagement failure (Defensive Risk Envelope path; identical state, escalated alert routing)**
 
-### Defensive Risk Envelope (clarified — same state, different label and routing)
+### Defensive Risk Envelope (clarified)
 
-Defensive Risk Envelope is the term used when the kill-switch trigger is **comms breakdown** specifically (heartbeat engagement failure). Behavior is identical to other HALT_NEW transitions; only the trigger name and **alert routing differ** (Defensive Envelope escalates more aggressively via email backup and external watchdog).
+Heartbeat engagement failure is a kill-switch trigger that transitions to HALT_NEW. "Defensive Risk Envelope" is the **label and alert routing** applied when the trigger reason is comms breakdown specifically: alerts escalate via email backup with higher priority, external watchdog also notified, retry cadence on Discord delivery increased. The state itself is identical to other HALT_NEW transitions.
 
-The earlier "Defensive Envelope is NOT a kill-switch" framing was wrong; corrected here to: comms-breakdown trigger fires the standard kill-switch flow, but with the Defensive Envelope label and routing.
+### Vacation Mode
+
+- Operator runs `/vacation start [days]` in Discord
+- Engagement timeout extends to 7 days
+- **NEW position entries auto-disabled.** All EXIT logic (stops, profit-targets, manual close) continues normally.
+- Daily summary still posts; daily liveness probe still posted (see Communications)
+- **Macro-event ratification gate suspended** (no entries to halt)
+- On `/vacation end` or expiry, normal operation resumes
 
 ### Risk-Tightening Boundary (parameter changes vs. position trims)
 
-The agent's "tighten risk" authority is implemented via TWO distinct paths to avoid the parameter-change-vs-mid-session collision:
+Two distinct paths:
+1. **Parameter changes** (within range): take effect at NEXT signal cycle, never mid-session. Used for sustained tightening.
+2. **Defensive position trims:** mid-session direct order action via momentum-ranked auto-trim path; capped at -30% gross per session. Causally agent-initiated, **mechanically placed by the risk engine** (which holds broker credentials, not the agent). Audit records both the agent's trigger and the risk engine's placement.
 
-1. **Parameter changes** (e.g., reducing vol target multiplier within range): take effect at NEXT signal cycle, never mid-session. Used for sustained tightening.
-2. **Defensive position trims**: direct order action mid-session that reduces exposure without touching parameters. Uses the same auto-trim algorithm as margin auto-trim (momentum-ranked, marketable-limit, capped at -30% of gross per session). Used for immediate tightening.
+### Auto-Revert Thresholds (parameter changes — recalibrated and parameter-aware)
 
-Agent authority covers both paths under "tighten risk = AUTO with notification." Audit log distinguishes the path used.
+A parameter change auto-reverts when **any**:
+- 30-day rolling live Sharpe drops > **2 SD** (where SD baseline = empirical SD of 30-day rolling Sharpes from walk-forward folds pre-Phase-1, or from rolling 30-day windows in live track record post-6-months-live), AND minimum 30 trades on changed market(s) in window
+- Max DD breaches -10% within 5 CME RTH sessions of the change
+- **Consecutive losing trades attribution (parameter-aware):**
+  - For *globally-applicable* params (e.g., `VOL_TARGET_PCT_ANNUAL`, `INSTRUMENT_VOL_LOOKBACK_DAYS`): 5+ consecutive losing trades portfolio-wide within window
+  - For *market-specific or signal-specific* params (e.g., `LOOKBACK_DAYS_DONCHIAN`, `MA_FAST_DAYS`): 5+ consecutive losing trades on any affected market within window. If window doesn't yield 5 trades for that market (consequence of `MIN_HOLDING_DAYS`), this condition cannot fire — other revert conditions still apply.
 
-### Auto-Revert Thresholds (parameter changes — widened to be robust against noise)
-
-A parameter change made by the agent (within pre-approved code-defined ranges) auto-reverts when **any** of the following:
-- 30-day rolling live Sharpe drops > **2 SD** (not 1 SD — was a hair trigger) from pre-change 30-day baseline within 30 sessions of the change, AND minimum 30 trades on changed market(s) in window
-- Max DD breaches -10% within 5 sessions of the change
-- 5+ consecutive losing trades attributable to the changed parameter (deterministic attribution: trades where the changed parameter directly affected signal generation for that market — i.e., the signal computation reads the changed parameter)
-
-Auto-revert action: parameter restored to pre-change value; full audit entry; alert to operator; no further auto-changes to that parameter for 14 days.
+Auto-revert action: parameter restored to pre-change value; full audit entry; alert; no further auto-changes to that parameter for 14 days.
 
 ### Logic-Change vs. Parameter-Change Boundary (clarified)
 
-- **Logic change** (requires PR + human merge): changes to *which signals fire* — rule logic, indicator selection, market universe, strategy structure, sizing model, risk-ring values, cluster definitions, parameter ranges themselves.
-- **Parameter change** (auto with audit, within pre-approved range): changes to *parameters governing existing signals* — values within the ranges defined in the Parameter Ranges table below.
-- **Pre-approved range itself is logic.** Changing a range requires a PR.
-- **Parameter changes take effect at next signal cycle (next session), never mid-session.** Hard-coded.
+- **Logic change** (PR + human merge): rule logic, indicator selection, market universe, strategy structure, sizing model, risk-ring values, cluster definitions, parameter ranges themselves, hot-fix-whitelist itself
+- **Parameter change** (auto with audit, within range): values within Parameter Ranges Table
+- **Pre-approved range itself is logic.** Changing a range requires PR.
+- **Parameter changes take effect at next signal cycle, never mid-session.**
 
 ### Parameter Ranges Table (LOCKED — full agent-mutable surface)
 
@@ -221,20 +304,30 @@ Auto-revert action: parameter restored to pre-change value; full audit entry; al
 | `ROLL_DAYS_BEFORE_EXPIRY` | 5 | 7 | 7 | Days before expiry to roll futures |
 | `MIN_HOLDING_DAYS` | 5 | 21 | 10 | Minimum holding period before exit eligible |
 
-**These are agent-mutable within Min/Max.** Any change outside Min/Max requires a PR.
+**These are agent-mutable within Min/Max.** Outside Min/Max requires PR.
 
-**Risk-ring values (per-position 25%, gross 300%, net 150%, cluster caps) are NOT in this table.** They are constants in code; agent CANNOT modify them; PR required.
+**`parameter_set_hash` SCOPE:** the hash is computed over **only the parameters in this table**. Risk-ring values, cluster caps, hot-fix whitelist, and all other code constants ride `strategy_hash` (changing them changes git SHA and thus `strategy_hash`).
+
+### Slippage Calibration as Versioned Artifact (locked, separates from strategy version)
+
+LEAN's slippage model parameters are recalibrated empirically from Phase 1 live fills. Recalibration:
+- Lives in a separate `slippage_calibration` versioned table (`slippage_calibration_version`)
+- Recalibration is logged as an audit event but **does NOT trigger paper-day counter reset** (it doesn't change live execution behavior, only the model of historical fills used in backtest)
+- PR backtest delta computation always uses the **current `slippage_calibration_version` at PR-creation time**; the same delta with a different calibration version would produce different numbers, but the version is fixed at PR creation and re-used if PR is re-run later
+- Trade records carry `slippage_calibration_version` alongside `strategy_hash` and `parameter_set_hash` for full reproducibility
+- Recalibration cadence: monthly during Phase 1; quarterly Phase 2+
+- Alert if realized > 2× modeled for any single market for 3 consecutive months → strategy review
 
 ### Reconciliation Tolerances Table (LOCKED)
 
-A delta exceeding the tolerance band → kill-switch trigger. Within tolerance → benign, logged, no action.
+A delta exceeding tolerance → kill-switch trigger.
 
 | Metric | Tolerance | Grace Period |
 |---|---|---|
 | Position quantities (per instrument) | 0 (exact) | None |
 | Cash balance (USD) | greater of $5 absolute or 1 bps of equity | T+1 grace for fees, dividends, interest postings |
 | Margin balance | $10 absolute | None |
-| FX-denominated cash (e.g., for /M6E) | $1 absolute | T+1 for FX rounding |
+| FX-denominated cash (intraday for `/M6E` before USD auto-conversion) | $1 absolute | T+1 for FX rounding |
 | Realized P&L (cumulative) | $1 absolute | T+1 |
 | Unrealized P&L | $5 absolute | None |
 
@@ -242,37 +335,42 @@ A delta exceeding the tolerance band → kill-switch trigger. Within tolerance �
 
 ### Per-Service Degradation Matrix (LOCKED)
 
+"Market hours" disambiguation per row:
+- "CME RTH" = Sun 18:00 ET → Fri 17:00 ET (per canonical session calendar above)
+- "NYSE hours" = 9:30–16:00 ET, Mon–Fri, NYSE-holiday-aware
+
 | Failure | System Response |
 |---|---|
-| Risk engine down | Signal engine halts; no signals can pass risk check; HALT_NEW |
-| Reconciliation stale > 60s during market hours | HALT_NEW (kill-switch trigger) |
+| Risk engine down | Signal engine halts; HALT_NEW |
+| Reconciliation stale > 60s during CME RTH | HALT_NEW (kill-switch trigger) |
 | Calendar service can't reach FRED/Forex Factory | Use last successful import; alert; if last successful > 48h, hard halt new orders next session until manual ratification |
 | QC ObjectStore poll fails 5–9 min | Alert only; transient is expected |
 | QC ObjectStore poll fails > 10 min | Defensive Risk Envelope (HALT_NEW + escalated routing) |
-| Backend can't reach IBKR > 5 min during market | HALT_NEW (kill-switch trigger) |
+| Backend can't reach IBKR > 5 min during CME RTH | HALT_NEW |
 | Discord delivery fails | Email backup automatic; external watchdog covers VPS-down case |
 | Database write fails (non-audit) | Retry 3× with backoff; on persistent failure, HALT_NEW |
-| Database write fails (audit_log) | HARD HALT immediately; audit integrity non-negotiable |
-| Anthropic Claude API down | Agent service degrades to read-only mode; no agent-driven actions; alert; trading continues unaffected (agent is supervisory, not in critical path) |
-| External watchdog unreachable | Alert; system continues; if + Discord delivery also failing, defensive risk envelope |
+| Database write fails (audit_log) | HARD HALT immediately |
+| Anthropic Claude API down | Agent service degrades to read-only; trading continues; alert |
+| External watchdog unreachable | Alert; if + Discord delivery also failing, defensive risk envelope |
+| CME settlement prints unavailable > 60 min past 17:00 ET | Halt signal generation for affected market that day; resume next session |
 
 ### Data Quality Handling (LOCKED)
 
-Per-bar validation at ingestion (data feed boundary):
+Per-bar validation at ingestion:
 
-**Reject (do not act on, log + alert) if any:**
+**Reject** (do not act on, log + alert):
 - Close price = 0 or negative
 - OHLC contains NaN
 - High < Low
 - Volume = 0 for futures during the relevant session window
-- Bar timestamp is outside expected range (more than 2× normal bar period late)
+- **Bar arrived > 60 min past relevant close anchor** (17:00 ET CME or 16:00 ET NYSE)
 
-**Quarantine (don't act on, log, no alert escalation) if any:**
+**Quarantine** (don't act on, log, no alert escalation):
 - |close − prev_close| > 10× rolling 30-day daily range (price spike)
 - Volume < 10% of rolling 30-day average for that market
-- Bar arrived > 30 min late but within 2× period
+- **Bar arrived 30–60 min past close anchor**
 
-**On rejected or quarantined bar:** skip signal generation for that market that day; log to `audit_log` and to a `data_quality_events` table; continue normal processing for other markets.
+**On rejected or quarantined bar:** skip signal generation for that market that day; log to `audit_log` and `data_quality_events`; continue normal processing for other markets.
 
 ### Execution Mechanics
 
@@ -281,121 +379,150 @@ Per-bar validation at ingestion (data feed boundary):
   - Exits (stop): stop-market for execution certainty
   - Profit-target exits: limit at target
   - Futures rolls: calendar spread orders when broker supports; otherwise leg with 60s stagger
-  - Kill-switch action: cancel all working orders; **hold positions** (no liquidation, no flatten)
+  - Kill-switch action: cancel all working orders; **hold positions**
   - Margin auto-trim and defensive position trims: marketable-limit (1× spread, escalating to 2× on retry); never pure market
-- **Retry logic:** order rejection → 3 retries with exponential backoff (1s, 4s, 16s); after 3 failures, halt that market only, alert
+- **Retry logic:** rejection → 3 retries with exponential backoff (1s, 4s, 16s); after 3 failures, halt that market only, alert
 - **Reconciliation source-of-truth (locked):**
   - Intraday risk decisions: TWS API real-time portfolio snapshot
   - End-of-day reconciliation and tax: IBKR FlexQuery (XML)
-  - Both reconciled at session close; FlexQuery is authoritative for tax + audit reporting
-  - Tolerance bands per Reconciliation Tolerances Table above
-- **Reconciliation cadence:** every session open + close + EOD full cross-check; weekly summary report
-- **Roll discipline:** futures rolled per `ROLL_DAYS_BEFORE_EXPIRY` parameter, off-peak liquidity scheduling
+  - Both reconciled at session close; FlexQuery authoritative for tax + audit
+  - Tolerance bands per Reconciliation Tolerances Table
+- **Reconciliation cadence:** every session open + close + EOD; weekly summary report
+- **Roll discipline:** futures rolled per `ROLL_DAYS_BEFORE_EXPIRY`, off-peak liquidity scheduling
 - **Macro event handling:**
-  - Auto-pause order placement from 5 min before through 30 min after scheduled tier-1 events (FOMC, CPI, NFP, GDP, PCE, ECB/BOJ/BOE if exposed, OPEC if /MCL exposed)
-  - **NO manual event mode override.** Rules-based only.
-  - Calendar auto-imported nightly
-  - User ratifies tomorrow's events via Discord by **23:00 ET nightly**
-  - **Default if no ratification by 23:00 ET:** hard halt new orders for next session until ratified (forces engagement)
-  - **EXCEPTION during vacation mode:** ratification gate is suspended (vacation already disables new entries; no entries to halt). Calendar still imported nightly; ratification not required.
-  - **Macro window vs. session boundary collision:** pause wins. New signals deferred to next session if pause window straddles close.
+  - Auto-pause order placement from 5 min before through 30 min after scheduled tier-1 events (FOMC, CPI, NFP, GDP, PCE, ECB/BOJ/BOE if exposed, OPEC if `/MCL` exposed)
+  - NO manual event mode override
+  - Calendar imported nightly; user ratifies via Discord by 23:00 ET; default if no ratification: hard halt new orders next session until ratified
+  - **Vacation mode exception:** ratification gate suspended (no entries to halt)
+  - Macro window vs. session boundary collision: pause wins
 
 ### Audit & Track Record
 
-- **Immutability mechanism (explicit):**
-  - `audit_log` table protected by Postgres triggers blocking `UPDATE`, `DELETE`, `TRUNCATE` operations
-  - Service role granted only `INSERT, SELECT` on `audit_log`; `REVOKE UPDATE, DELETE, TRUNCATE`
-  - **Hash chain:** SHA-256 single-linked list **ordered by INSERTION sequence, NOT by event time**. Each record's `prev_hash` references prior record's full hash; `record_hash` is SHA-256 over `(prev_hash || record_payload)`. Genesis record has `prev_hash` = 32 zero bytes.
-  - **Backfill / repair handling (e.g., from QC log gap-fill):** backfilled records APPEND at chain tail (current sequence number), carrying `repaired_for_sequence_no` and `repaired_for_event_timestamp` provenance. **The original gap remains visible.** No retro-insertion. The hash chain integrity is preserved because the chain is over insertion order, not event order. Audit explorer renders the relationship visually.
-  - Backups: written to S3 with **Object Lock (Compliance mode)**; retention 7 daily / 4 weekly / 12 monthly / permanent annual; quarterly restore drill mandatory. Backups themselves immutable for the lock period.
+- **Immutability mechanism (corrected for TRUNCATE):**
+  - `audit_log` row triggers block `INSERT` modifications and prevent `UPDATE` and `DELETE` via `BEFORE` trigger that raises exception
+  - **Row triggers do NOT fire on `TRUNCATE`. To block TRUNCATE: use a Postgres EVENT TRIGGER on `ddl_command_start` that aborts any `TRUNCATE` targeting `audit_log` AND `REVOKE TRUNCATE` from all roles except `dba_breakglass`.** Belt-and-suspenders.
+  - Service role grants: `INSERT, SELECT` on `audit_log`; explicitly `REVOKE UPDATE, DELETE, TRUNCATE`
+  - **Hash chain:** SHA-256 single-linked list ordered by INSERTION sequence (NOT event time). `prev_hash` references prior record's full hash; `record_hash = SHA-256(prev_hash || record_payload)`. Genesis record has `prev_hash` = 32 zero bytes.
+  - **Backfill / repair handling:** backfilled records APPEND at chain tail with `repaired_for_sequence_no` and `repaired_for_event_timestamp` provenance. Original gap remains visible.
+  - Backups: S3 with Object Lock (Compliance mode); retention 7 daily / 4 weekly / 12 monthly / permanent annual; quarterly restore drill
 
-- **Postgres role hierarchy (locked):**
-  - `app_service` — used by all application services. Grants: `INSERT, SELECT` on `audit_log`; `SELECT, INSERT, UPDATE, DELETE` on non-audit tables. Cannot bypass audit triggers.
-  - `app_owner` — schema owner; runs Alembic migrations. Cannot bypass audit triggers (triggers use SECURITY DEFINER and check role; even owner blocked from `UPDATE`/`DELETE` on `audit_log`).
-  - `dba_breakglass` — separate credential, kept offline, sops-encrypted. Superuser. **Use only via documented break-glass procedure**: login generates a high-severity audit entry (out-of-band, written before any other action), requires post-event review write-up, all session activity logged via session_replication_role for full audit trail.
+- **Postgres role hierarchy:**
+  - `app_service` — `INSERT, SELECT` on `audit_log`; `SELECT, INSERT, UPDATE, DELETE` on non-audit tables
+  - `app_owner` — schema owner; runs Alembic migrations; cannot bypass audit triggers
+  - `dba_breakglass` — superuser; offline credential; documented break-glass procedure with high-severity audit entry on use; only role with TRUNCATE on `audit_log`
 
-- **Strategy version + parameter set composite identity (locked):**
-  - `strategy_hash` = git commit SHA of strategy code at signal time
-  - `parameter_set_hash` = SHA-256 over canonical-serialized active parameter values at signal time
-  - `parameters` table is event-sourced with `valid_from`/`valid_to` per-row; queryable by timestamp
-  - Every trade tagged with **both** `strategy_hash` AND `parameter_set_hash`; queries can filter by either or by composite
+- **Strategy version + parameter set + slippage calibration composite identity:**
+  - `strategy_hash` = git commit SHA at signal time
+  - `parameter_set_hash` = SHA-256 over canonical-serialized active parameter values from Parameter Ranges Table at signal time
+  - `slippage_calibration_version` = current calibration artifact version
+  - Every trade tagged with all three; queryable by any
+  - `parameters` table event-sourced with `valid_from`/`valid_to`
 
-- **Track record portability:** identical audit schema between QC Phase 1 and custom Phase 2; QC adapter must emit audit records in the custom-target schema with byte-for-byte identical structure (golden-test parity required, see Testing)
+- **Track record portability:** identical audit schema between QC Phase 1 and custom Phase 2; QC adapter emits in custom-target schema; golden-test parity verified weekly
 
-- **Environment tagging (locked transition rules):**
-  - `paper` = any non-real-money trade, regardless of capital
+- **Environment tagging:**
+  - `paper` = any non-real-money trade
   - `live-small` = real money, account equity < $50k at signal time
   - `live-scale` = real money, account equity ≥ $50k at signal time
-  - **Transition is determined at signal-emit time** based on account equity at that instant (read from latest reconciliation snapshot)
-  - Tag is immutable per trade; never re-stamped later
-  - **Never blended in any reporting** — see frontend spec
+  - Determined at signal-emit time; immutable per trade
+  - Per-strategy-version: decommission floor and signal-storm thresholds applied per strategy version
 
-- **Paper minimum:** 30 NYSE trading days paper before any live deployment of a new strategy version (per strategy version)
+- **Paper minimum:** 30 NYSE trading days paper before live deployment of new strategy version (per strategy version); CI gate
 
-- **Trade-level attribution:** computed at signal-emit time by strategy code (vol regime, trend regime, expected P&L, expected slippage); realized values fill in post-trade. Captured fields are immutable post-emit.
+- **Trade-level attribution schema (mutability clarified):**
+  - `attribution` table has two field groups on the same row:
+    - `expected_*` columns (`expected_pnl`, `expected_slippage`, `vol_regime_at_emit`, `trend_regime_at_emit`): computed at signal-emit time; **immutable post-emit, enforced by Postgres trigger**
+    - `realized_*` columns (`realized_pnl`, `realized_slippage`, `realized_holding_days`): nullable until trade closes; filled in post-trade
+  - Audit log captures both stages with separate event types (`signal_emitted`, `trade_realized`)
 
 ### QuantConnect Audit Adapter (Phase 1 critical path)
 
-The Phase 1 audit log lives in our backend, not QC. The adapter must be loss-tolerant.
+- **Mechanism:** QC algorithm writes audit events to QC ObjectStore as JSONL with monotonic sequence numbers per session
+- **Backend ingestion:** custom service polls QC ObjectStore via QC API every 60s during CME RTH; cursor-based; resumes from last cursor on restart
+- **Schema:** identical to custom-emitted audit records; golden-test parity verified weekly (byte-for-byte)
+- **Loss handling:** sequence gap → alert + pull from QC's own logs to fill; backfilled records APPENDED at current chain tail with provenance
+- **Failure mode:** unavailable > 10 min → Defensive Risk Envelope (HALT_NEW)
+- **Clock skew:** every event carries `source_clock_ts` (QC) and `ingest_clock_ts` (backend); monotonic ordering via `ingest_clock_ts` for chain hashing
 
-- **Mechanism:** QC algorithm writes audit events to **QC ObjectStore** (durable, project-scoped storage) as JSONL with monotonic sequence numbers per session. NOT QC's `Notify.Web` (rate-limited, no retry, lossy).
-- **Backend ingestion:** custom service polls QC ObjectStore via QC API every 60s during market hours; reads incrementally with cursor (last sequence number persisted to Postgres); resumes from last cursor on backend restart
-- **Schema:** identical to custom-emitted audit records. Golden-test parity verified weekly: same input event produces byte-for-byte identical record from QC adapter and from native custom emitter.
-- **Loss handling:** if cursor gap detected (sequence number jump):
-  - Alert; pull from QC's own logs to fill gap
-  - Backfilled records APPENDED at current chain tail with `repaired_for_sequence_no` provenance (per hash-chain repair procedure above)
-  - Affected trades flagged `audit_repaired` in attribution
-- **Failure mode:** if QC ObjectStore unavailable for > 10 min, Defensive Risk Envelope (HALT_NEW) — audit integrity is non-negotiable
-- **Clock skew handling:** every ingested event carries both `source_clock_ts` (QC-side timestamp) and `ingest_clock_ts` (backend ingestion timestamp); monotonic ordering preserved via `ingest_clock_ts` for chain hashing
+### Tax Handling
 
-### Tax Handling (corrected)
+- **Futures (Section 1256):** automatic 60/40 LTCG/STCG with mandatory year-end MTM; no election; system reports Form 6781
+- **ETFs:** standard capital gains/losses with wash sale tracking; no 475(f) election by default; system supports both modes
+- **CPA consultation REQUIRED before any election;** UI gate: election toggle requires "I have consulted a CPA" acknowledgment
+- **Wash sale tracking** across all accounts via `account_id` linkage
+- **Year-end harvest flagging:** unrealized losses with low-strategy-impact harvest opportunities surfaced
+- **Tax export:** CSVs for Form 6781, Schedule D, Form 8949; PDF summary; importable by Drake/ProSeries/TurboTax. Annual Jan 31.
 
-- **Futures (Section 1256 contracts):** treatment is automatic 60% LTCG / 40% STCG with mandatory year-end mark-to-market. **No election required.** System reports Form 6781 data.
-- **ETFs (securities):** standard capital gains/losses with wash sale tracking. **No 475(f) trader-status election by default**; system supports both modes for future flexibility but defaults to non-elected.
-- **CPA consultation REQUIRED** before any tax election; system documentation and onboarding flow must explicitly surface this. No election toggle in the UI without an "I have consulted a CPA" acknowledgment.
-- **Wash sale tracking** across all accounts via `account_id` linkage in trade records
-- **Year-end harvest flagging:** system surfaces unrealized losses with low-strategy-impact harvest opportunities
-- **Tax export:** CSVs structured for Form 6781, Schedule D, Form 8949; PDF summary; importable by Drake / ProSeries / TurboTax. Annual export triggered Jan 31 each year.
-
-### Claude Ops Agent — Authority Matrix and Boundaries
-
-A separate long-running Python service alongside the trading engine.
+### Claude Ops Agent — Authority Matrix
 
 | Category | Agent Authority | Implementation Note |
 |---|---|---|
-| Tighten risk via parameter change (within range, next-cycle) | AUTO with notification | Goes through risk engine API; parameter store update; effective next signal cycle |
-| Tighten risk via defensive position trim (mid-session) | AUTO with notification | Direct order action via momentum-ranked auto-trim path; capped at -30% gross per session |
-| Loosen risk (raise sizes, increase caps, restart after halt) | HUMAN APPROVAL REQUIRED | Hard-coded as denied capability; only operator-authenticated requests can loosen |
-| Hot-fix infrastructure (logging, retry, monitoring, dependency, broker reconnect) | AUTO-DEPLOY with notification + automatic rollback if metrics degrade within 30 min | Whitelist of allowed file paths; any file outside whitelist requires PR |
-| Strategy logic changes (signal rules, indicator selection, universe, sizing model, risk-ring values, parameter ranges themselves) | DRAFTS PR; human reviews and merges | See Operator-Friendly PR Review Surface |
-| Place / modify / cancel orders directly (i.e., order placement as a primary action) | NEVER, hard-coded block | Agent service has no broker API credentials; physically cannot place orders. *Note:* defensive position trims are placed by the **risk engine** in response to agent's "tighten risk" call, not by the agent itself. |
+| Tighten risk via parameter change (within range, next-cycle) | AUTO with notification | Goes through risk engine API; effective next signal cycle |
+| Tighten risk via defensive position trim (mid-session) | AUTO with notification | Causally agent-initiated; **mechanically placed by risk engine** (which holds broker creds). Agent has zero broker creds. Audit records both. |
+| Loosen risk | HUMAN APPROVAL REQUIRED | Hard-coded denial |
+| Hot-fix infrastructure (within whitelist) | AUTO-DEPLOY with notification + auto-rollback if metrics degrade within 30 min | Whitelist below |
+| Strategy logic changes | DRAFTS PR; human reviews and merges | See Operator-Friendly PR Review Surface |
+| Place / modify / cancel orders directly (as primary action) | NEVER, hard-coded block | Agent has no broker credentials physically |
 | Invoke kill switch | AUTO on hard threshold breach | |
-| Un-invoke kill switch | HUMAN APPROVAL ONLY (with re-auth) | |
-| Modify strategy parameters within pre-approved range | AUTO with full audit log + auto-revert per thresholds (above) | Effective only at next signal cycle |
+| Un-invoke kill switch | HUMAN APPROVAL ONLY (re-auth, web-only) | |
+| Modify strategy parameters within pre-approved range | AUTO with full audit log + auto-revert | Effective only at next signal cycle |
 | Generate reports, alerts, briefings, run diagnostics | AUTO | |
 
-The agent reads logs/metrics, calls Claude API on triggers, takes bounded actions, generates morning briefings and weekly reports, drafts PRs for review. **Never any direct trading authority.** Agent service has zero broker credentials.
+#### Hot-Fix Whitelist (LOCKED)
 
-### Operator-Friendly PR Review Surface (critical — operator is non-coding)
+**ALLOWED for agent auto-deploy** (file paths; agent may modify and deploy without PR):
+- `services/observability/**`
+- `services/monitoring/**`
+- `services/agent/**` (excluding decision-path code)
+- `infrastructure/retry/**`
+- `infrastructure/broker_reconnect/**`
+- `infrastructure/logging/**`
+- `Dockerfile`, `docker-compose.yml`
+- `requirements*.txt`, `pyproject.toml`
+- `deploy/**` (deploy configs, not strategy code)
 
-Every PR (agent-drafted or human-drafted) that touches strategy logic or risk parameters must surface the following review artifacts to the operator. The diff is reference; the actionable artifact is the first three items.
+**FORBIDDEN — PR required:**
+- `services/risk/**`, `services/signal/**`, `services/audit/**`, `services/execution/**`, `services/reconciliation/**`
+- `services/calibration/**` (slippage calibration)
+- `alembic/**` (any DB migration)
+- Any file containing constants matching `RISK_RING_*`, `KILL_SWITCH_*`, `MARGIN_*`, `CLUSTER_CAP_*`, `PARAMETER_RANGE_*` (enforced by pre-merge linter)
 
-1. **Plain-English summary** (max 200 words) — written by agent: what changed, why, what behavior changes. Required.
-2. **Risk impact summary** (auto-generated) — which risk metrics affected, by how much, in plain numbers (e.g., "expected daily P&L variance increases from $180 to $220 at current capital").
-3. **Backtest delta** — produced by **LEAN (authoritative)**; current strategy version vs. proposed: equity curve overlay, key statistics delta table, ten worst-divergence trades highlighted.
-4. **Test results** — unit + integration + linting + type-check, all visible with pass/fail.
-5. **Diff view** — collapsed by default, expandable on click.
-6. **Files affected** — list with one-line summary per file.
-7. **In-app Approve / Reject / Request Changes buttons** — sync to GitHub via API.
+#### Hot-Fix Auto-Rollback Metrics (LOCKED)
 
-The operator's review competence is on the plain-English + risk impact + backtest delta. Spec the rendering of these clearly.
+Auto-rollback triggers within 30 min of hot-fix deploy if **any**:
+
+| Metric | Threshold |
+|---|---|
+| Service error rate (5xx + uncaught exceptions) | > 2× 7-day pre-deploy baseline |
+| p99 critical-path latency (signal-to-order, kill-switch invocation) | > 2× 7-day baseline |
+| Kill-switch invocation frequency | > 2× 7-day baseline |
+| Reconciliation break rate | > 2× 7-day baseline |
+| Audit log write failure rate | > 0 (any failure → revert) |
+
+Auto-rollback restores prior commit; alert; deploy disabled for that whitelist subtree for 24h.
+
+### Operator-Friendly PR Review Surface
+
+Every PR (agent-drafted or human) touching strategy logic or risk parameters surfaces:
+
+1. **Plain-English summary** (≤ 200 words; agent-written): what changed, why, what behavior changes
+2. **Risk impact summary** (auto-generated): which risk metrics affected, by how much, in plain numbers
+3. **Backtest delta** (LEAN authoritative; uses current `slippage_calibration_version` at PR creation): equity curve overlay, key statistics delta table, ten worst-divergence trades
+4. **Test results** (unit + integration + linting + type-check): pass/fail visible
+5. **Diff view** (collapsed by default)
+6. **Files affected** (one-line summary per file)
+7. **In-app Approve / Reject / Request Changes** buttons (sync to GitHub via API)
+
+For PRs that change *only parameters* (no code change): same git SHA, different `parameter_set_hash`. Backtest delta is computed by re-running LEAN with the proposed parameter set against the same code at the same `slippage_calibration_version`.
+
+The operator's review competence is on items 1-3.
 
 ### Decision Diary
 
 - **Operator writes:** mandatory minimum-10-character reasoning on every signal rejection, defer, or override
 - **Agent writes:** suggestions / commentary, optional
-- **Required fields per entry:**
-  - `tag`: enum of `data_concern` | `regime_concern` | `size_concern` | `manual_judgment` | `other`
+- **Required fields:**
+  - `tag`: `data_concern` | `regime_concern` | `size_concern` | `manual_judgment` | `other`
   - `timestamp`: UTC + monotonic
   - `author`: `operator` | `agent`
   - `reasoning_text`: free text, min 10 chars when author = operator
@@ -403,96 +530,91 @@ The operator's review competence is on the plain-English + risk impact + backtes
 
 ### Communications
 
-- **Primary user surface (mobile):** Discord bot via `discord.py`. Channels: `#daily-brief`, `#signals`, `#fills`, `#alerts`, `#critical`, `#ops`, `#ask-agent`, `#audit`. Slash commands and button interactions.
-- **Backup channel:** email (silent fallback if Discord delivery fails)
-- **Discord-bot-as-service architecture:** the Discord bot inbound (gateway WS) and the backend's outbound event push to Discord run as **two services on the same Docker network sharing a sops-decrypted secret bundle**, NOT in one container. Backend posts events to bot's local HTTP listener (internal IPC, not public webhook).
-- **Heartbeat — split semantics (locked, accounting for backup channel):**
-  - **Delivery** = HTTP 2xx ack from Discord webhook on push. Failure → automatic email backup; alert operator out-of-band.
+- **Primary:** Discord bot via `discord.py`. Channels: `#daily-brief`, `#signals`, `#fills`, `#alerts`, `#critical`, `#ops`, `#ask-agent`, `#audit`
+- **Backup:** email
+- **Discord-bot-as-service architecture:** bot service (gateway WS inbound) and webhook-pusher service (backend → Discord outbound) run as separate services on shared internal Docker network with sops-decrypted secret bundle
+- **Heartbeat — split semantics:**
+  - **Delivery** = HTTP 2xx ack from Discord on push. Failure → email backup automatic.
   - **Engagement** = ANY of:
     - Discord reaction or reply on critical alerts
-    - **Email reply** to email-backup notifications
+    - Email reply to email-backup notifications
     - Web app authenticated activity within session
-  - No engagement for > 24h on any critical alert → Defensive Risk Envelope (HALT_NEW with escalated routing). Email reply DOES count as engagement; system does not halt purely because Discord is down if operator is engaging via email.
-- **Vacation mode:** operator runs `/vacation start [days]` in Discord
-  - Engagement timeout extends to 7 days
-  - New strategy entries auto-disabled (only stop-out exits permitted)
-  - Daily summary still posts
-  - **Macro-event ratification gate suspended** (no entries to halt; calendar still imported nightly)
-  - On `/vacation end` or expiry, normal operation resumes
-- **NO SMS, NO voice escalation.** Operator treats Discord like text/calls.
-- **External watchdog (mandatory):** separate-region tiny VPS or AWS Lambda pings backend `/health` every 5 min. Unreachable > 15 min during market hours → email to operator. ~$5/month.
+    - Reply/reaction on **daily liveness probe** (see below)
+  - No engagement for > 24h on any critical alert OR no engagement to daily liveness probe → Defensive Risk Envelope (HALT_NEW with escalated routing)
+- **Daily liveness probe (locked):** at 09:00 ET each CME RTH session, post a short "system is alive — react/reply to acknowledge" message to `#daily-brief` (and email backup). Operator reaction or reply within 24h = engagement. Solves quiet-day false-positive halts.
+- **Vacation mode:** `/vacation start [days]`: engagement timeout extends to 7 days; new entries disabled; exits continue; daily summary + liveness probe still post; ratification gate suspended; `/vacation end` or expiry resumes
+- **NO SMS, NO voice escalation**
+- **External watchdog (mandatory):** separate-region tiny VPS or AWS Lambda pings backend `/health` every 5 min. Unreachable > 15 min during CME RTH → email to operator. ~$5/month.
 
 ### Security
 
-- **Secrets management:** Mozilla **sops** with **age** encryption. Encrypted secret files committed to repo; decrypted at deploy time on the VPS. Avoids running a Vault server. **Age key backup: printed paper copy in offline cold storage** (operator's safe).
-- **Secret rotation cadence:** quarterly forced; immediate on compromise
-- **Database backups:** daily encrypted to S3 with Object Lock (Compliance mode); retention tier above; quarterly restore drill mandatory
-- **Encryption at rest:** Hetzner volume encryption for live DB; application-level encryption for high-sensitivity columns
-- **Auth (web frontend):** WebAuthn (passkey) primary + TOTP backup + 8 single-use printed backup codes generated at enrollment (recovery path; codes regenerable from authenticated session). **If both passkey device AND TOTP device AND backup codes are lost: full system reset required via dba_breakglass break-glass procedure + sops-encrypted backup restore + manual identity re-establishment. Document this procedure explicitly.**
-- **Auth tokens:** JWT access (15-min lifetime) + refresh token (7-day lifetime). HttpOnly + Secure + SameSite=Strict cookies. Server-side session records in Postgres for revocation. Sensitive actions require re-auth (WebAuthn UV re-prompt) within last 5 minutes.
-- **Container hardening:** non-root users, read-only filesystem where compatible, no privileged containers, **Trivy** image scanning in CI, distroless base images where compatible
-- **Network egress allowlist on host:** IBKR endpoints, Anthropic API, AWS S3 (or Backblaze B2), NTP pool, Ubuntu/Debian package mirrors, GitHub. Everything else denied via UFW/iptables.
-- **Network ingress:** only FastAPI public endpoint (HTTPS via Caddy or Traefik with Let's Encrypt) and SSH (key-only). Internal services on internal Docker network only.
-- **Repo / build-chain DR:** mirror to **self-hosted Gitea on the VPS** (full repo mirror, daily sync from GitHub); weekly encrypted repo archive to S3. If GitHub unreachable during a Hetzner-rebuild scenario, restoration possible from Gitea + sops + S3.
+- **Secrets management:** Mozilla **sops** with **age** encryption. Encrypted files committed to repo. **Separate sops files per environment:** `secrets/dev.enc.yaml`, `secrets/paper.enc.yaml`, `secrets/live.enc.yaml`. Live and paper IBKR credentials are in different files; environment selects which.
+- **Age key backup:** printed paper copy in offline cold storage
+- **Rotation:** quarterly forced; immediate on compromise
+- **Database backups:** daily encrypted to S3 with Object Lock (Compliance mode); quarterly restore drill
+- **Encryption at rest:** Hetzner volume encryption + application-level for high-sensitivity columns
+- **Auth (web):** WebAuthn primary + TOTP backup + 8 single-use printed backup codes
+- **All-factors-lost recovery:** dba_breakglass + sops backup restore + manual identity re-establishment
+- **Auth tokens:** JWT access (15 min) + refresh (7 days), HttpOnly + Secure + SameSite=Strict cookies, server-side session records, re-auth (WebAuthn UV) within last 5 min for risk-loosening actions only
+- **Container hardening:** non-root, read-only fs where compatible, no privileged, Trivy in CI, distroless where compatible
+- **Network egress allowlist:** IBKR endpoints, Anthropic API, S3, NTP, package mirrors, GitHub
+- **Network ingress:** FastAPI public + SSH (key-only); internal services on internal Docker network
+- **Repo / build-chain DR:** self-hosted Gitea on VPS (full GitHub mirror, daily sync); weekly encrypted repo archive to S3
+- **GitHub workflow:** branch protection on `main` requires CI pass + at least one approval (operator self-approves agent-drafted PRs via in-app review surface, sync'd via backend's GitHub App install token); no CODEOWNERS (single operator); agent commits to feature branches `agent/...`
 
 ### Time and Clock
 
-- **NTP:** chrony daemon, primary `pool.ntp.org`, fallback `time.cloudflare.com`
+- **NTP:** chrony, primary `pool.ntp.org`, fallback `time.cloudflare.com`
 - **Clock skew tolerance:** log warn at > 100ms; defensive halt at > 1s
-- **Audit ordering:** records carry `timestamp_utc` AND `monotonic_ns` (`time.monotonic_ns()`) within process; monotonic for relative ordering within process; UTC for cross-service ordering with skew tolerance; QC-ingested events additionally carry `source_clock_ts` and `ingest_clock_ts`
-- **All schema timestamps:** `TIMESTAMPTZ` in Postgres, stored as UTC, rendered in `America/New_York` at presentation layer
+- **Audit ordering:** `timestamp_utc` + `monotonic_ns` (within process); QC events also carry `source_clock_ts` and `ingest_clock_ts`
+- **All schema timestamps:** `TIMESTAMPTZ` UTC, rendered `America/New_York`
 
 ### Idempotency
 
-- **All writes:** UUIDv7 primary keys (time-ordered, sortable, unique)
-- **Order placement:** `client_order_id = "{strategy_short_hash}-{paramset_short_hash}-{signal_uuid}-{retry_n}"` — IBKR-side dedup
+- **All writes:** UUIDv7 PKs
+- **Order placement `client_order_id` (LOCKED budget under IBKR's ~50-char practical limit):**
+  - Format: `{strategy_short}-{paramset_short}-{signal_short}-{retry_n}`
+  - `strategy_short` = first 8 hex chars of `strategy_hash` (8 chars)
+  - `paramset_short` = first 8 hex chars of `parameter_set_hash` (8 chars)
+  - `signal_short` = last 12 hex chars of `signal_uuid` (12 chars; sufficient uniqueness within a session)
+  - `retry_n` = 1-2 digit integer
+  - Total: 8 + 1 + 8 + 1 + 12 + 1 + 2 = **33 chars** (well under 50)
+  - Collision behavior: 8-char hash collisions extremely unlikely at our trade volume; on detected collision, signal_uuid is regenerated and prepend retry suffix
 - **Audit writes:** UUIDv7
-- **Webhook re-delivery:** receiver dedupes by `event_uuid` for 7-day window via Postgres unique constraint
+- **Webhook re-delivery:** dedupe by `event_uuid` for 7-day window via Postgres unique constraint
 
 ### SLO Budgets
 
-- **Signal-to-order latency:** p50 ≤ 60s, p99 ≤ 5min
-- **Kill-switch invocation latency:** ≤ 5s from trigger to broker order cancellation request
-- **Reconciliation freshness during market hours:** ≤ 60s from broker state to internal mirror
-- **Discord webhook delivery:** ≤ 10s p99
-- **Backtest queue:** acceptable p99 ≤ 30 min on QC tier; if exceeded persistently, upgrade tier
+- Signal-to-order latency: p50 ≤ 60s, p99 ≤ 5min
+- Kill-switch invocation latency: ≤ 5s
+- Reconciliation freshness during CME RTH: ≤ 60s
+- Discord webhook delivery: ≤ 10s p99
+- Backtest queue: p99 ≤ 30 min on QC tier; upgrade if persistently exceeded
 
 ### RPO / RTO
 
-- **RPO:** 15 minutes (Postgres WAL ship to S3 every 15 min via `wal-g` or equivalent)
-- **RTO during market hours:** 4 hours
-- **RTO outside market hours:** 24 hours
-- **Single VPS accepted; no warm standby.**
-- **DR runbook (mandatory deliverable):** Hetzner-Ashburn outage:
-  1. External watchdog email triggers within 15 min
-  2. Operator opens TWS desktop on personal laptop
-  3. Manually closes risky positions per documented playbook
-  4. Calls IBKR phone trading desk if web/desktop also unavailable
-  5. Restores VPS from latest backup on recovery
-  6. Reconciles audit log against IBKR FlexQuery for outage period; flag affected trades as `outage_period`
+- RPO: 15 minutes (Postgres WAL ship to S3 every 15 min via `wal-g` or equivalent)
+- RTO during CME RTH: 4 hours
+- RTO outside CME RTH: 24 hours
+- Single VPS accepted; no warm standby
+- DR runbook: external watchdog email → TWS desktop → IBKR phone trading desk → restore from backup → reconcile audit log; flag affected trades `outage_period`
 
 ### Backtesting Validation
 
-- **Walk-forward analysis:** rolling 3-year train, 6-month out-of-sample, advance, repeat
-- **70/30 in-sample / held-out test split.** Held-out touched ONCE at end of strategy development; documented in audit
-- **Survivorship-bias / continuity:** see Data Sources section for precise per-leg claims
-- **Realistic fills (calibration procedure, locked):**
-  - For each Phase 1 live fill: log `expected_price` (from LEAN's slippage model) and `actual_price`
-  - Compute `realized_slippage = (actual − expected) / expected` per fill
-  - Aggregate by market and order type
-  - Update LEAN slippage model parameters (in vectorbt and LEAN Local) using Phase 1's empirical distribution
-  - **Recalibration cadence:** monthly during Phase 1; quarterly during Phase 2+
-  - **Alert if** realized > 2× modeled for any single market for 3 consecutive months → strategy review
-- **Tax modeling:** computed post-hoc on trade log
-- **Capacity analysis:** simulate at 1×, 5×, 10×, 25× current capital; flag Sharpe degradation due to slippage; refuse migration to higher capital tier if degradation > 30%
-- **30 trading-day paper minimum** before live (per strategy version) — gate enforced mechanically: deploy-to-live blocked by CI if `paper_days_for_version < 30`
+- Walk-forward: rolling 3-year train, 6-month out-of-sample, advance, repeat
+- 70/30 in-sample / held-out test split; held-out touched ONCE
+- Survivorship-bias / continuity per Data Sources section (precise per-leg)
+- Realistic fills via slippage calibration artifact (versioned; recalibrated monthly Phase 1, quarterly Phase 2+)
+- Tax modeling computed post-hoc on trade log
+- Capacity analysis at 1×, 5×, 10×, 25× current capital; refuse migration if degradation > 30%
+- 30 NYSE trading-day paper minimum per strategy version; CI gate
 
 ### Testing Discipline
 
-- **Unit tests required:** risk engine (every state transition, every kill-switch trigger), position sizing, order routing, audit log immutability + hash-chain integrity (including backfill provenance), version governance + parameter_set_hash composition, reconciliation logic with tolerance bands, capacity calculator, momentum-score auto-trim ranking, decision diary writer, vacation mode handler, capital-event reset logic, data quality validation
-- **Integration tests required:** strategy logic against historical data, broker connectivity (mock and live-paper), full kill-switch flow including state transitions, full signal-to-fill round trip, QC adapter golden-test parity (weekly cron), vectorbt-vs-LEAN parity (weekly cron — flag P&L divergence > 0.1% or trade count mismatch as P0 bug), per-service degradation matrix scenarios
-- **CI gates ALL PRs (agent-drafted included).** Failed tests block merge.
-- **Pre-merge gates:** tests pass, linting clean (`ruff`), type-check clean (`mypy --strict`), no secrets in diff (`gitleaks`), no risk-engine modification without explicit `risk-review-approved` label set by operator
+- **Unit tests required:** risk engine (every state transition, every kill-switch trigger, every cluster-shrink iteration), position sizing (full algorithm including lot rounding), order routing, audit log immutability + hash-chain integrity (including backfill provenance and TRUNCATE blocking), version governance + composite-hash composition, reconciliation logic with tolerance bands, capacity calculator, momentum-score auto-trim ranking, decision diary writer, vacation mode handler (entries blocked, exits continue), capital-event reset logic, data quality validation, signal storm threshold formula, vol regime detector, daily liveness probe handler
+- **Integration tests required:** strategy logic against historical data, broker connectivity (mock and live-paper), full kill-switch flow including all state transitions, full signal-to-fill round trip, QC adapter golden-test parity (weekly cron), vectorbt-vs-LEAN parity (weekly cron — flag P&L divergence > 0.1% or trade count mismatch as P0), per-service degradation matrix scenarios, **continuous-vs-physical contract reconciliation at futures roll dates**, hot-fix auto-rollback simulation
+- **CI gates ALL PRs.** Failed tests block merge.
+- **Pre-merge gates:** tests pass, `ruff` linting, `mypy --strict`, `gitleaks` for secrets, no risk-engine modification without `risk-review-approved` label, **hot-fix forbidden-path linter** blocks PRs from agent that touch FORBIDDEN paths
 
 ### Performance Targets
 
@@ -500,7 +622,7 @@ The operator's review competence is on the plain-English + risk impact + backtes
 - Phase 2 portfolio: live Sharpe ≥ 1.2
 - Phase 3 portfolio: live Sharpe ≥ 1.5
 - Drift alerts when live underperforms backtest by > 1 SD over 30+ days
-- Auto-decommission floor: live 30-day Sharpe < 0 OR live max DD breach -25% OR 60-day live Sharpe < backtest by > 2 SD → HALT_NEW
+- Auto-decommission floor (above)
 
 ### Operating Cost Envelope (LOCKED)
 
@@ -517,158 +639,121 @@ The operator's review competence is on the plain-English + risk impact + backtes
 | IBKR market data | $0–30 | Most free; specific exchange subs as needed |
 | GitHub | $0 | Personal account |
 | **Total target** | **$80–290/month** | |
-| **Soft alert ceiling** | **$200/month** | Alert operator if 30-day rolling > $200 |
-| **Hard alert (operator review required)** | **$300/month** | Alert + system enters review state if 30-day rolling > $300 |
+| **Soft alert ceiling** | **$200/month** | Alert if 30-day rolling > $200 |
+| **Hard alert** | **$300/month** | System enters cost-review state if 30-day rolling > $300 |
 
-System tracks actual spend monthly via integration with each provider's billing API or CSV export; surfaces in System page.
+System tracks actual spend monthly via provider billing API or CSV; surfaces in System page.
 
 ## YOUR DELIVERABLE
 
-Produce a complete, production-grade backend technical specification covering ALL sections below. Use Mermaid for diagrams. Be specific and concrete; do NOT punt with phrases like "use industry best practices" — name the practice, the library, the configuration, the file path. Where genuine implementation choices remain, present 2–3 options with tradeoffs and a recommendation.
+Produce a complete, production-grade backend technical specification covering ALL sections below. Use Mermaid for diagrams. Be specific and concrete; do NOT punt with phrases like "use industry best practices" — name the practice, the library, the configuration. Where genuine implementation choices remain, present 2–3 options with tradeoffs and a recommendation.
+
+**For frontend contract dependencies (page list, component data needs, action surface):** the parallel frontend spec (Prompt B) defines six post-auth pages (Today, Trades, Performance, Research, System, Calendar) plus pre-auth surfaces (`/login`, `/setup`, `/recover`), a Discord bot with specific slash commands, and a single multiplexed SSE channel `/api/sse/events` with event types (`signal`, `fill`, `position`, `pnl`, `risk_state`, `health`, `alert`, `audit`, `agent`, `vacation`, `watchdog`). Reference these by name. Where the frontend contract is genuinely undefined, flag with `[CONTRACT — verify against Prompt B]` and proceed with expected contract.
 
 ### 1. System Architecture Overview
-- High-level system diagram (Mermaid) showing all services, data flow, external integrations
-- Service inventory (each service's responsibility, lifecycle, dependencies)
-- Phase 1 vs. Phase 2 architectures shown explicitly
-- Migration path from Phase 1 to Phase 2 step-by-step with explicit position-flatten cutover
-- External watchdog topology shown explicitly
+- High-level system diagram (Mermaid) showing all services, data flow, external integrations, external watchdog topology
+- Service inventory
+- Phase 1 vs. Phase 2 architectures explicitly
+- Migration path step-by-step including pre-cutover checklist and abort conditions
 
 ### 2. Component Breakdown
-For each component (data ingestion, storage, signal engine, risk engine, execution engine, reconciliation, monitoring, agent, scheduler+calendar combined service, audit service, QC adapter, watchdog, Gitea mirror, etc.):
-- Purpose and responsibilities
-- Inputs and outputs
-- Dependencies
-- Configuration model
-- Failure modes and recovery behavior (cross-reference Per-Service Degradation Matrix)
-- Implementation notes (libraries, key algorithms, gotchas)
+For each component (data ingestion, storage, signal engine, risk engine including position sizing algorithm, execution engine, reconciliation, monitoring, agent, scheduler+calendar combined, audit service, QC adapter, watchdog, Gitea mirror, slippage calibration service):
+- Purpose, inputs, outputs, dependencies, configuration, failure modes (cross-ref Per-Service Degradation Matrix), implementation notes
 
 ### 3. Data Models and Schemas
-Full schemas (Postgres DDL via Alembic migration scripts) for every persistent entity:
-- `audit_log` (with hash-chain fields: `prev_hash`, `record_hash`, `sequence_no`, `repaired_for_sequence_no`, `repaired_for_event_timestamp`, `source_clock_ts`, `ingest_clock_ts`)
-- `trades`, `orders`, `fills`
-- `positions` (current and historical snapshots)
-- `signals` (generated, approved, rejected, deferred; with `anomaly_flagged` boolean and reasons)
-- `strategy_versions` (git hash, deployed_at, retired_at)
-- `parameters` (event-sourced with `valid_from`/`valid_to`; pre-approved range constraints)
-- `parameter_sets` (computed `parameter_set_hash` per active set)
-- `alerts` (status: open / acknowledged / resolved; severity P0/P1/P2)
-- `accounts` and `balances` over time
-- `macro_events` (calendar with ratification status)
-- `reconciliation_breaks` (with tolerance band reference)
-- `data_quality_events`
-- `decision_diary`
-- `attribution` metadata
-- `agent_actions` (every bounded action; prompt + response captured)
-- `vacation_mode` state
-- `qc_adapter_cursor` (last sequence number ingested)
-- `capital_events` (deposits/withdrawals with peak-MTM-reset records)
-- `cost_events` (monthly cost tracking per provider)
+Postgres DDL via Alembic migrations for every persistent entity (full list in original spec, plus `slippage_calibration_versions`, `parameter_sets`, `liveness_probes`)
 
 ### 4. API Contracts
-- REST endpoints (path, method, request/response schema with pydantic models, auth)
-- SSE channels for real-time data flowing to web frontend
-- Discord bot commands and button-payload schemas
-- Internal HTTP-IPC payloads (backend → bot service)
-- Webhook payloads (QC ObjectStore poll → backend ingestion; backend → email backup; external watchdog ping)
-- Internal service-to-service contracts
-- Idempotency key conventions (including the composite `client_order_id`)
+- REST endpoints (path, method, pydantic schemas, auth)
+- SSE single multiplexed channel `/api/sse/events` with all event types specified
+- Discord bot commands and button payloads
+- Internal HTTP-IPC payloads (backend → bot)
+- Webhook payloads (QC ObjectStore poll, backend → email backup, external watchdog ping push)
+- Idempotency key conventions including locked `client_order_id` format
 
 ### 5. Sequence Diagrams (Mermaid)
-At minimum:
-- Signal generation → risk check → human approval (web AND Discord paths) → order placement → fill → reconciliation
-- Kill-switch state transitions: NORMAL → HALT_NEW → CONVALESCENT → NORMAL (including counter-reset events)
-- Defensive Risk Envelope path (heartbeat engagement failure → HALT_NEW with escalated routing)
-- Capital event handling (deposit → peak MTM reset → capital-event mode 30 sessions)
-- Manual override / decision diary capture (web AND Discord)
-- Agent hot-fix deployment with auto-rollback
-- Agent-drafted PR for strategy logic change → operator-friendly review surface render → human review → merge → deploy
-- End-of-day reconciliation (TWS real-time vs. FlexQuery, with tolerance-band check)
-- Phase 1 → Phase 2 cutover (position flatten, audit continuation)
-- Database backup and restore drill
-- Data feed staleness detection and recovery
-- Data-quality reject / quarantine handling
-- Discord delivery failure → email backup → email-reply engagement → no halt
-- QC ObjectStore audit ingestion with cursor advance and gap repair (showing append-only chain with provenance)
-- Vacation mode start (incl. ratification gate suspension), end
-- Macro event auto-pause straddling session boundary
-- Margin auto-trim graduated de-leverage (NOT panic-flatten)
-- Defensive position trim mid-session (agent-initiated)
-- VPS outage → external watchdog email → operator manual recovery via TWS / IBKR phone
+At minimum (full list in deliverable; augment with):
+- Position sizing full algorithm: inverse-vol → per-position cap → cluster shrink-iterate → gross/net cap → lot rounding
+- Slippage recalibration as versioned event (no paper-day reset)
+- Daily liveness probe → engagement registration
+- Hot-fix auto-deploy → 30-min metric watch → rollback or commit
+- HALT_NEW max-dwell escalation at 7 trading days
+- IBKR margin-call edge case (system at HALT_NEW, broker force-liquidates outside system control)
+- Cutover scheduling and abort flow
+- Phase 1 → Phase 2 cutover execution
 
 ### 6. Error Handling Strategy
 - Categorization (transient / persistent / catastrophic)
-- Per-category response (retry, halt, alert, escalate)
-- Per-Service Degradation Matrix realization (above)
-- Idempotency requirements for order placement and audit writes
-- Reconciliation procedures after recovery from outages
-- Specific handling: IB Gateway daily restart, broker disconnect, data feed dropout, exchange halts, Claude API outage, QC ObjectStore unavailability, Hetzner outage, dividend ex-date tolerance widening
+- Per-Service Degradation Matrix realization
+- Idempotency for order placement and audit writes
+- Specific handling: IB Gateway daily restart, broker disconnect, data feed dropout, exchange halts, Claude API outage, QC ObjectStore unavailability, Hetzner outage, dividend ex-date tolerance widening, CME settlement delay
 
 ### 7. Observability
 - Logging schema (structlog JSON, fields per category)
-- Metrics inventory (Prometheus or equivalent; what's measured, frequency, retention)
-- Health check endpoints (consumed by external watchdog)
-- Dashboard recommendation (specific tool, what's on it)
+- Metrics inventory (Prometheus or equivalent)
+- Health check endpoints consumed by external watchdog
+- Dashboard recommendation (specific tool)
 - How Claude ops agent consumes telemetry
-- Alert routing logic by severity (including escalated routing for Defensive Risk Envelope)
-- Cost tracking integration (provider billing APIs / CSV ingestion)
+- Alert routing logic by severity (P0/P1/P2; Defensive Risk Envelope escalated routing)
+- Cost tracking integration
 
 ### 8. Security
-- Secrets management implementation (sops + age, file layout, age key backup procedure, rotation procedure)
-- Postgres role hierarchy (app_service / app_owner / dba_breakglass) with break-glass procedure
+- sops + age implementation, file layout, age key backup, rotation
+- Postgres role hierarchy with break-glass procedure
 - File permissions / service user model
-- Network exposure (public vs. internal services explicitly)
-- API authentication for the web frontend (JWT + cookie scheme)
-- Audit log immutability mechanism (Postgres triggers + role grants + hash chain + backfill provenance)
-- Backup encryption keys management
-- Repo / build-chain DR (Gitea mirror, S3 archive)
-- Account recovery procedure when all factors lost (break-glass + restore + identity re-establishment)
+- Network exposure
+- API authentication for web frontend
+- **Audit log immutability via row triggers + EVENT TRIGGER for TRUNCATE + REVOKE TRUNCATE; explicit acknowledgment of row-trigger TRUNCATE limitation**
+- Backup encryption keys
+- Repo / build-chain DR (Gitea + S3)
+- Account recovery procedure
+- GitHub workflow (branch protection, agent feature-branch flow, GitHub App install token for PR sync)
+- sops file structure (separate per environment)
 
 ### 9. Deployment Topology
 - VPS specs (Hetzner Ashburn — recommend size with justification)
 - External watchdog topology
-- Docker Compose layout (services, networks, volumes, including separate Discord-bot service and webhook-pusher service on shared internal network)
+- Docker Compose layout (separate Discord-bot service + webhook-pusher service on shared internal network)
 - Environment configuration (dev local, paper, live)
-- Deployment procedure (manual + agent-driven hot-fix paths; whitelist enforcement)
+- Deployment procedure (manual + agent-driven hot-fix paths; whitelist enforcement; pre-merge linter for forbidden paths)
 - Rollback procedure
-- DR runbook including IBKR phone trading desk path, TWS manual override, Gitea-based rebuild
+- DR runbook (TWS, IBKR phone, Gitea-based rebuild)
 
 ### 10. Testing Strategy
-- Unit test inventory (what's covered, what's not, why)
-- Integration test inventory
-- CI/CD pipeline (GitHub Actions recommended)
-- Pre-merge gates with specifics
-- Strategy validation pipeline (paper-minimum mechanical enforcement)
+- Unit and integration test inventory (full list above)
+- CI/CD pipeline (GitHub Actions)
+- Pre-merge gates including hot-fix forbidden-path linter
+- Strategy validation pipeline (paper-minimum mechanical enforcement; CI blocks deploy-to-live on `paper_days_for_version < 30`)
 - vectorbt-vs-LEAN parity test design
 - QC adapter golden-test parity design
-- Per-service degradation matrix scenario tests
+- Continuous-vs-physical contract reconciliation at futures rolls
 - Slippage calibration verification
 
 ### 11. Phased Build Plan
-Aligned to operator's 6–12 month runway:
-- **Phase 0 (weeks 0–7):** foundation; paper trading begins week 1; QC adapter coded + golden-tested by week 4; 30 paper days complete by end of week 6; week 7 buffer
+- **Phase 0 (weeks 0–8):** foundation; paper begins week 1; QC adapter coded + golden-tested by week 4; 30 paper days complete within weeks 1–7; week 8 buffer; extends if 30-day minimum slips due to holidays
 - **Phase 1 (months 2–5):** live track record on QC; custom backend skeleton in parallel
-- **Phase 2 (months 5–9):** custom infra hardening, LEAN Local deployment, ib-async integration, paper validation, migrate execution
-- **Phase 3 (months 9–12):** capital scaling, second-strategy preparation, family-money legal structure
-- Each phase: deliverables, success criteria (objective metrics), kill criteria (when to abandon)
+- **Phase 2 (months 5–9):** custom infra hardening; LEAN Local; ib-async; paper validation; cutover with pre-cutover checklist
+- **Phase 3 (months 9–12):** capital scaling; second-strategy preparation; legal structure
+- Each phase: deliverables, success criteria, kill criteria
 
 ### 12. Claude Ops Agent Detailed Spec
 - Trigger model (cron, event-driven, on-demand from Discord)
-- Tool inventory (specific bounded actions with parameters; whitelist of file paths for hot-fix; defensive trim invocation)
-- Prompt-cache strategy (system prompt, codebase context, market state — what's cached, TTLs)
-- Cost budget and monitoring (~$30–100/mo target; alert if exceeded; tied into Operating Cost Envelope monitoring)
-- Failure mode handling (Claude API outage degrades agent to read-only, trading continues; hallucination detection via constrained outputs; rate limits)
-- Audit trail of every agent decision with prompt + response captured
-- Rollback mechanism for agent-deployed hot-fixes (auto-revert at 30-min metric check)
-- Operator-friendly PR review surface — full rendering spec for the seven review artifacts
+- Tool inventory (bounded actions with parameters; hot-fix whitelist; defensive trim invocation)
+- Prompt-cache strategy
+- Cost budget and monitoring (~$30–100/mo target; alert if exceeded)
+- Failure mode handling (Claude API outage degrades to read-only; trading continues; hallucination detection; rate limits)
+- Audit trail of every agent decision with prompt + response
+- Rollback mechanism for hot-fixes (auto-rollback metrics above)
+- Operator-Friendly PR Review Surface — full rendering spec
 
 ## FORMAT REQUIREMENTS
 
 - Markdown with clear section headers
 - Mermaid for ALL diagrams
 - Concrete library/tool/version recommendations
-- Where genuine implementation choices remain, present 2–3 options with tradeoffs and a recommendation
+- Where implementation choices remain, present 2–3 options with tradeoffs and recommendation
 - Length will be substantial; favor completeness over brevity
-- Never invent strategic decisions; if context is missing, flag with `[QUESTION FOR OPERATOR: ...]`
-- This spec must interlock with the frontend spec; reference shared decisions explicitly so contracts align — name the REST endpoints, SSE channels, and Discord command schemas that the frontend will consume
+- Never invent strategic decisions; flag missing context with `[QUESTION FOR OPERATOR: ...]`
+- For frontend contract dependencies, flag with `[CONTRACT — verify against Prompt B]` and proceed with expected contract; reference Prompt B's IA (six post-auth pages + pre-auth surfaces), SSE event types, and Discord command schemas by name
 
 Begin.
