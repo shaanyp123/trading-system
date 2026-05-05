@@ -67,8 +67,9 @@ The Decision-Point Register (§8) uses this structure for each entry:
 
 This guide does not re-define locked architectural decisions. Where a rule originates in a spec, it is cited as:
 
-- `backend-spec §N.N` — references `/Users/shaanpatel/Documents/GitHub/Trading/backend-spec.md`
-- `frontend-spec §N.N` — references `/Users/shaanpatel/Documents/GitHub/Trading/frontend-spec.md`
+- `backend-spec §N.N` — references `Docs/backend-spec.md`
+- `frontend-spec §N.N` — references `Docs/frontend-spec.md`
+- `claude-dev-guide §N.N` — references `Docs/claude-dev-guide.md`
 
 When this guide's instruction conflicts with a spec, the spec wins. File a note in the Decision-Point Register with rationale.
 
