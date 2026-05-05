@@ -80,7 +80,7 @@ A pre-merge linter enforces the **Hot-Fix Whitelist** path classification by enu
 
 ```mermaid
 graph TB
-  subgraph Hetzner_Helsinki["Hetzner Helsinki/Falkenstein (~$5/mo)"]
+  subgraph Hetzner_Falkenstein["Hetzner Falkenstein (~$5/mo)"]
     WD[External Watchdog<br/>CX11 / Ubuntu LTS<br/>cron 5min ping]
   end
 
@@ -162,7 +162,7 @@ graph TB
 
 ```mermaid
 graph TB
-  subgraph Hetzner_Helsinki["Hetzner Helsinki (~$5/mo)"]
+  subgraph Hetzner_Falkenstein2["Hetzner Falkenstein (~$5/mo)"]
     WD[External Watchdog<br/>CX11]
   end
 
@@ -242,7 +242,7 @@ graph TB
 | 18 | `ib_gateway` | gnzsnz/ib-gateway | n/a | ❌ | ✅ | `unless-stopped` |
 | 19 | `lean_local` | quantconnect/lean | n/a | ❌ | ✅ on-demand | `no` |
 
-External (separate VPS): `watchdog` on Hetzner Helsinki/Falkenstein.
+External (separate VPS): `watchdog` on Hetzner **Falkenstein** (locked).
 
 ## 1.5 Phase 1 → Phase 2 Cutover (locked checklist)
 
@@ -291,14 +291,15 @@ flowchart TD
 | Property | Value |
 |---|---|
 | Provider | Hetzner Cloud (separate from Ashburn) |
-| Region | Helsinki or Falkenstein (NOT Ashburn — Hetzner US is Ashburn-only; "different region" requires EU DCs) |
+| Region | **Falkenstein** (locked — different region from Ashburn) |
 | Spec | CX11 (1 vCPU, 2 GB RAM) |
+| Static IP | `<watchdog_static_ip>` (substitute Falkenstein VPS static IPv4 at provisioning; required by Caddy IP-allowlist for `POST /api/internal/watchdog`) |
 | Cost | ~$5/mo |
 | OS | Ubuntu LTS, hardened (CIS L1) |
 | Runtime | Single Python script via systemd timer; `cron` 5-min interval |
 | Auth to backend | Bearer token from sops; rotates with full secrets quarterly |
 | Action on `/health` 4xx/5xx | Increment counter |
-| Action on counter ≥ 3 (15 min unreachable) | Email operator via SES + Discord webhook to `#critical` |
+| Action on counter ≥ 3 (15 min unreachable) | Email operator via **Resend** + Discord webhook to `#critical` |
 | Logs | systemd journal; daily ship to S3 |
 
 The watchdog **does not have authority to halt the system** — it only alerts. This is a deliberate constraint: a watchdog with halt authority compounds operational risk.
@@ -610,7 +611,7 @@ Reconciliation evaluates whether the system's understanding of state matches the
 | Property | Value |
 |---|---|
 | Endpoint | `GET /api/health` — returns 200 if all critical services healthy; 503 with `{degraded_services: [...]}` otherwise |
-| Internal endpoint | `GET /internal/watchdog` — same check + extended diagnostics; Bearer auth; consumed by external watchdog |
+| Internal endpoint | `GET /internal/health/deep` — same check + extended diagnostics (full service heartbeat map); Bearer auth; consumed by external watchdog. Distinct from `POST /api/internal/watchdog` (push endpoint receiving watchdog pings) |
 | Health criteria | All services responsive (last heartbeat < 30s); Postgres connection healthy; QC adapter cursor advancing within last 120s during session; reconciliation last-success < 90s during session |
 | Liveness probes | systemd watchdog + Docker healthcheck per container |
 | Failure modes | `/health` 503 → external watchdog increments counter, alerts at 3 (15 min) |
@@ -751,7 +752,7 @@ See §1.6. Component-level summary:
 | Property | Value |
 |---|---|
 | Inputs | `GET /api/health` from backend (5-min cron) |
-| Outputs | Email via SES + Discord webhook on 3 consecutive failures (15 min unreachable) |
+| Outputs | Email via Resend + Discord webhook on 3 consecutive failures (15 min unreachable) |
 | Authority | NONE — alerts only; cannot halt or modify state |
 
 ## 2.13 Gitea Mirror
@@ -821,11 +822,30 @@ CREATE TABLE accounts (
   reg_t_eligible BOOLEAN NOT NULL DEFAULT TRUE,
   span_eligible BOOLEAN NOT NULL DEFAULT TRUE,
   pdt_eligible BOOLEAN NOT NULL DEFAULT TRUE,
+  -- Reader-role schema lands in Phase 0 (column lands now to avoid future destructive migration);
+  -- reader-redaction middleware + invite flow are a Phase 3 deliverable.
+  role TEXT NOT NULL DEFAULT 'owner' CHECK (role IN ('owner', 'reader')),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   active_from TIMESTAMPTZ NOT NULL,
   active_to TIMESTAMPTZ
 );
 CREATE UNIQUE INDEX accounts_active_unique ON accounts(external_account_id) WHERE active_to IS NULL;
+```
+
+### 3.1.1 `setup_tokens` (first-run bootstrap; Phase 0)
+
+One-time tokens emitted at first boot for `/api/setup/verify-token`. The raw token is printed to `stdout` exactly once (and only at boot); only the Argon2id hash is persisted.
+
+```sql
+CREATE TABLE setup_tokens (
+    token_uuid UUID PRIMARY KEY,                    -- UUIDv7
+    token_hash TEXT NOT NULL,                       -- Argon2id hash (argon2-cffi); raw token only in stdout at boot
+    intended_role TEXT NOT NULL CHECK (intended_role IN ('owner', 'reader')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at TIMESTAMPTZ NOT NULL,                -- created_at + 24h
+    consumed_at TIMESTAMPTZ
+);
+CREATE INDEX idx_setup_tokens_unconsumed ON setup_tokens(consumed_at) WHERE consumed_at IS NULL;
 ```
 
 ## 3.2 `audit_log` (PARTITIONED BY YEAR; hash-chained)
@@ -1111,19 +1131,30 @@ CREATE INDEX balances_snapshot ON balances(snapshot_ts DESC);
 
 ## 3.10 `strategy_versions`
 
+Flattened to structured columns to match the frontend's flat `StrategyVersion` type (mirrored by `StrategyVersionResponse` in §4.1.5b). `short_hash` is **7 chars** to match `git rev-parse --short` default and the frontend type.
+
 ```sql
 CREATE TABLE strategy_versions (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
-  strategy_hash CHAR(40) NOT NULL UNIQUE,           -- git SHA
-  short_hash CHAR(8) NOT NULL,                      -- prefix
+  strategy_hash CHAR(40) NOT NULL UNIQUE,           -- git SHA (full)
+  short_hash CHAR(7) NOT NULL UNIQUE,               -- 7-char prefix; matches frontend StrategyVersion.short_hash
   strategy_name TEXT NOT NULL,                      -- 'v1_trend_following'
+  branch TEXT NOT NULL,                             -- e.g. 'main', 'agent/hot-fix-2026-04-12'
   deployed_at_utc TIMESTAMPTZ NOT NULL,
-  decommissioned_at_utc TIMESTAMPTZ,
-  decommission_reason TEXT,
+  deployed_by TEXT NOT NULL CHECK (deployed_by IN ('operator', 'agent')),
+  deploy_method TEXT NOT NULL CHECK (deploy_method IN ('pr_merge', 'agent_hot_fix')),
+  parent_version_short_hash CHAR(7) REFERENCES strategy_versions(short_hash),
+  backtest_baseline_id UUID,                        -- FK target may live in research subsystem
+  parameter_set_hash TEXT NOT NULL,                 -- sha256 of canonical parameter set
+  slippage_calibration_version TEXT NOT NULL,       -- e.g. 'v17'
   paper_days_required INTEGER NOT NULL DEFAULT 30,  -- CME sessions
   paper_days_completed INTEGER NOT NULL DEFAULT 0,
-  metadata JSONB NOT NULL DEFAULT '{}'
+  decommissioned BOOLEAN NOT NULL DEFAULT false,
+  decommissioned_at_utc TIMESTAMPTZ,
+  decommissioned_reason TEXT
+  -- (no JSONB metadata column; all fields explicit and frontend-mirrored)
 );
+CREATE INDEX strategy_versions_short_hash ON strategy_versions(short_hash);
 ```
 
 ## 3.11 `parameters` and `parameter_sets` (event-sourced)
@@ -1448,21 +1479,59 @@ CREATE INDEX universe_active ON universe_state(account_id, is_active, evaluated_
 
 ## 3.27 `alerts`
 
+`alerts.category` is locked to a Postgres ENUM (`alert_category`). The Pydantic `AlertCategory` Literal in §4.1.5b mirrors this enum exactly; new categories require a schema migration AND a corresponding Pydantic update.
+
 ```sql
+CREATE TYPE alert_category AS ENUM (
+    'kill_switch_invoked',
+    'kill_switch_resumed',
+    'halt_dwell_warning',
+    'audit_write_failure',
+    'audit_chain_break',
+    'qc_objectstore_degraded',
+    'broker_disconnect',
+    'reconciliation_break',
+    'margin_warn',
+    'margin_auto_trim',
+    'data_quality_reject',
+    'data_quality_quarantine',
+    'vol_regime_z_high',
+    'capacity_warning',
+    'slippage_drift',
+    'model_decay',
+    'capital_event',
+    'parameter_change_proposed',
+    'parameter_change_reverted',
+    'pr_drafted',
+    'pr_rejected',
+    'liveness_probe_missed',
+    'engagement_timeout',
+    'cost_alert_soft',
+    'cost_alert_hard',
+    'external_watchdog_alert',
+    'incident_review_required',
+    'phase_cutover_started',
+    'maintenance_window'
+);
+
 CREATE TABLE alerts (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
   account_id UUID NOT NULL,
   fired_at_utc TIMESTAMPTZ NOT NULL DEFAULT now(),
   severity TEXT NOT NULL CHECK (severity IN ('P0','P1','P2')),
-  category TEXT NOT NULL,
+  category alert_category NOT NULL,                 -- locked enum, NOT free-form text
   message TEXT NOT NULL,
   detail JSONB,
   delivery_status JSONB,                            -- {discord: 'ok', email: 'ok'}
   acknowledged BOOLEAN NOT NULL DEFAULT FALSE,
   acknowledged_at_utc TIMESTAMPTZ,
+  resolved_at_utc TIMESTAMPTZ,
   triggering_audit_event_uuid UUID
 );
 CREATE INDEX alerts_severity_unack ON alerts(severity, acknowledged) WHERE NOT acknowledged;
+
+-- Migration note: when retrofitting an existing alerts table:
+--   ALTER TABLE alerts ALTER COLUMN category TYPE alert_category USING category::alert_category;
 ```
 
 ## 3.28 `macro_events`
@@ -1626,16 +1695,19 @@ All endpoints live under `/api/*`. All state-changing endpoints require CSRF tok
 
 ### 4.1.1 Auth
 
-| Method | Path | Auth | Re-Auth? | Description |
-|---|---|---|---|---|
-| POST | `/api/auth/webauthn/challenge` | none | — | Start login ceremony. Returns `{publicKeyCredentialRequestOptions}`. |
-| POST | `/api/auth/webauthn/verify` | none | — | Complete login. Sets HttpOnly session cookie + CSRF cookie. |
-| POST | `/api/auth/webauthn/register/challenge` | session (within `/setup`) | — | Start registration. |
-| POST | `/api/auth/webauthn/register/verify` | session | — | Complete registration. |
-| POST | `/api/auth/totp/verify` | none | — | TOTP fallback login. **Reduced privileges** (no risk-loosening). |
-| POST | `/api/auth/recover` | none | — | Backup code recovery (8 single-use codes). |
-| POST | `/api/auth/logout` | session | — | Invalidate current session. Emits `session_evicted` to all other tabs of same user with reason `explicit_logout`. |
-| POST | `/api/auth/backup-codes/regenerate` | session | YES | Regenerates 8 backup codes. Old codes invalidated. |
+| Method | Path | Auth | Re-Auth? | Phase | Description |
+|---|---|---|---|---|---|
+| POST | `/api/auth/webauthn/challenge` | none | — | 0 | Start login ceremony. Returns `{publicKeyCredentialRequestOptions}`. **`userVerification: "required"`** (locked). |
+| POST | `/api/auth/webauthn/verify` | none | — | 0 | Complete login. Sets HttpOnly session cookie + CSRF cookie. |
+| POST | `/api/auth/webauthn/register/challenge` | session (within `/setup`) | — | 0 | Start registration. **`userVerification: "required"`** (locked). |
+| POST | `/api/auth/webauthn/register/verify` | session | — | 0 | Complete registration. |
+| POST | `/api/auth/totp/verify` | none | — | 0 | TOTP fallback login. **Reduced privileges** (no risk-loosening). |
+| POST | `/api/auth/totp/setup-verify` | ceremony_session | — | 0 | During enrollment, verify operator's TOTP code before locking the secret. |
+| POST | `/api/auth/recover` | none | — | 0 | Backup code recovery (8 single-use codes; Argon2id-hashed at rest). |
+| POST | `/api/auth/logout` | session | — | 0 | Invalidate current session. Emits `session_evicted` to all other tabs of same user with reason `explicit_logout`. |
+| POST | `/api/auth/backup-codes/regenerate` | session | YES | 0 | Regenerates 8 backup codes. Old codes invalidated. |
+| GET  | `/api/auth/me` | session | — | 1 | Returns current session info (user, role, auth-strength, expiry, enrollment flags). |
+| POST | `/api/setup/verify-token` | none | — | 0 | First-run bootstrap token verification. Consumes one-time `setup_tokens` row; returns ceremony session for WebAuthn registration. |
 
 ```python
 # services/api/schemas/auth.py
@@ -1652,6 +1724,34 @@ class TotpVerifyRequest(BaseModel):
 class RecoverRequest(BaseModel):
     username: str
     backup_code: str = Field(min_length=10, max_length=20)
+
+# GET /api/auth/me — Phase 1 — returns current session info
+class AuthMeResponse(BaseModel):
+    user_id: str
+    username: str
+    role: Literal["owner", "reader"]
+    auth_strength: Literal["weak", "strong"]
+    last_uv_at: datetime | None
+    session_expires_at: datetime
+    webauthn_enrolled: bool
+    totp_enrolled: bool
+
+# POST /api/setup/verify-token — Phase 0 — first-run bootstrap
+class SetupTokenVerifyRequest(BaseModel):
+    token: str
+
+class SetupTokenVerifyResponse(BaseModel):
+    valid: bool
+    intended_role: Literal["owner", "reader"]
+    ceremony_session_id: str  # short-lived; permits WebAuthn registration
+
+# POST /api/auth/totp/setup-verify — Phase 0 — verify TOTP before locking
+class TotpSetupVerifyRequest(BaseModel):
+    ceremony_session_id: str
+    totp_code: str = Field(min_length=6, max_length=6)
+
+class TotpSetupVerifyResponse(BaseModel):
+    success: bool
 ```
 
 ### 4.1.2 Signals & Trades
@@ -1663,10 +1763,11 @@ class RecoverRequest(BaseModel):
 | POST | `/api/signals/:id/reject` | session | — | Reject. Body REQUIRED `decision_diary_entry: {tag, reasoning_text}`. |
 | POST | `/api/signals/:id/defer` | session | — | Defer to next session. Body `decision_diary_entry`. |
 | POST | `/api/signals/bulk-approve-standard` | session | — | (Phase 2) Bulk approves all non-anomaly pending signals. |
-| GET | `/api/trades?from=&to=&market=&state=&cursor=` | session | — | List trades. |
+| GET | `/api/trades?from=&to=&market=&state=&id_prefix=&cursor=` | session | — | List trades. `id_prefix` (alongside existing date/market/state filters) supports the command-palette ID-prefix search; matches against `trade_uuid::text` prefix. |
 | GET | `/api/trades/:id` | session | — | Trade detail. |
 | POST | `/api/trades/:id/close` | session | YES IF HALT_NEW | Manual close. |
 | GET | `/api/trades/export.csv?from=&to=` | session | — | CSV export with hash-chain footer (single anchor). |
+| POST | `/api/decision-diary` | session | — | (Phase 1) Create diary entry (`forward_looking` or `general`). For signal-linked entries use `/api/signals/:id/reject` or `/api/signals/:id/defer` with embedded `decision_diary_entry`. |
 
 ```python
 class SignalListResponse(BaseModel):
@@ -1708,6 +1809,19 @@ class DecisionDiaryEntry(BaseModel):
     tag: Literal["data_concern", "regime_concern", "size_concern",
                  "manual_judgment", "other"]
     reasoning_text: str = Field(min_length=10, max_length=2000)
+
+# POST /api/decision-diary — Phase 1 — standalone (non-signal) diary entry
+class DecisionDiaryCreateRequest(BaseModel):
+    entry_class: Literal["signal_response", "forward_looking", "general"]
+    linked_signal_id: str | None = None       # required when entry_class == 'signal_response'
+    linked_market_id: str | None = None       # used when entry_class == 'forward_looking'
+    tag: Literal["data_concern", "regime_concern", "size_concern",
+                 "manual_judgment", "other"]
+    reasoning_text: str = Field(min_length=10, max_length=2000)
+
+class DecisionDiaryCreateResponse(BaseModel):
+    diary_uuid: str
+    audit_event_uuid: str
 ```
 
 ### 4.1.3 System & Risk
@@ -1772,11 +1886,206 @@ class ReconciliationSummary(BaseModel):
 
 | Method | Path | Auth | Re-Auth? | Description |
 |---|---|---|---|---|
-| POST | `/api/stress-test/run` | session | — | Async stress test run; returns `{job_id}`. SSE progress on `job` channel. |
+| POST | `/api/stress-test/run` | session | — | Async stress test run; returns `{job_id}`. SSE progress on `job` channel; terminal `job` event payload includes `result_url`. **No separate `/api/stress-test/results/:job_id` endpoint** — frontend reads result via `result_url`. |
 | GET | `/api/jobs/:job_id` | session | — | Fallback poll. |
 | GET | `/api/health` | none | — | External watchdog endpoint. Returns 200 OR 503 with `degraded_services`. |
 | GET | `/api/version` | session | — | `{backend_version, expected_frontend_version, git_sha}`. |
 | GET | `/api/metadata/instruments` | session | — | Bulk instrument metadata for frontend. |
+
+### 4.1.5b Today / Health Score / Positions / Orders / Fills / Alerts / Agent / Strategy Versions
+
+These endpoints back the Today landing page, command-palette, agent surface, and per-deployment metadata used by the frontend.
+
+| Method | Path | Auth | Re-Auth? | Phase | Description |
+|---|---|---|---|---|---|
+| GET | `/api/health-score` | session | — | 1 | Composite health score + components (Sharpe vs backtest, slippage drift, hit rate, capacity headroom, days-since-recon-break). Primary source for `<HealthScoreIndicator />`. |
+| GET | `/api/today/digest` | session | — | 1 | Aggregate Today-page first-paint payload (denormalized: includes `health_score` body for landing-page paint without an extra round-trip). |
+| GET | `/api/positions/current` | session | — | 1 | Active positions: per (instrument, contract_month) for futures, per symbol for ETFs. |
+| GET | `/api/orders?status=working\|filled\|cancelled&limit=20&cursor=` | session | — | 1 | List working / recent orders, cursor paginated. |
+| GET | `/api/fills?limit=20&cursor=` | session | — | 1 | Recent fills, cursor paginated. |
+| GET | `/api/alerts?status=open\|acknowledged\|resolved&severity=P0\|P1\|P2&limit=&cursor=` | session | — | 1 | List alerts, cursor paginated. |
+| POST | `/api/agent/ask` | session | — | 2 | Send query to Claude agent. Streamed via SSE on `agent` channel when response > N tokens; otherwise inline JSON. **Phase 2 only** — depends on `#ask-agent` Discord channel + agent answer surface. |
+| GET | `/api/strategy-versions/:short_hash` | session | — | 1 | Returns flat StrategyVersion (matches frontend type). `short_hash` is 7 chars (CHAR(7); `git rev-parse --short` default). |
+
+```python
+# services/api/schemas/health_score.py
+class HealthScoreComponent(BaseModel):
+    name: Literal[
+        "live_sharpe_vs_backtest",
+        "slippage_drift",
+        "hit_rate",
+        "capacity_headroom",
+        "days_since_recon_break",
+    ]
+    weight_pct: int                         # 0-100; sums to 100 across components
+    window: str                             # e.g. "60-day rolling", "current"
+    score: int | None                       # 0-100; null when insufficient_data
+    insufficient_data: bool
+
+class HealthScoreResponse(BaseModel):
+    composite: int                          # 0-100
+    traffic_light: Literal["green", "yellow", "red"]
+    components: list[HealthScoreComponent]
+    insufficient_data: bool                 # true if any component insufficient AND composite would be misleading
+    computed_at: datetime
+
+# services/api/schemas/today.py
+class PnLSummary(BaseModel):
+    daily_pnl: Decimal
+    weekly_pnl: Decimal
+    monthly_pnl: Decimal
+    yearly_pnl: Decimal
+
+class ExposureBreakdown(BaseModel):
+    by_cluster: dict[Literal["equity_index","commodity","rates_bonds","crypto","fx"], Decimal]
+    gross_exposure_pct_nav: Decimal
+    net_exposure_pct_nav: Decimal
+
+class TodayDigestResponse(BaseModel):
+    health_score: HealthScoreResponse       # denormalized for landing-page first paint
+    pnl: PnLSummary                         # D / W / M / Y
+    exposure: ExposureBreakdown
+    queued_signals_count: int
+    active_alerts_count_by_severity: dict[Literal["P0","P1","P2"], int]
+    state: Literal["NORMAL", "HALT_NEW", "CONVALESCENT", "VACATION"]
+    state_severity: Literal["routine", "defensive_envelope", "incident_review"] | None  # only when HALT_NEW
+    agent_status: Literal["idle", "working", "degraded", "disabled", "errored"]
+    environment: Literal["paper", "live-small", "live-scale"]
+    deployed_strategy_version: str          # 7-char short_hash
+
+# services/api/schemas/positions.py
+class Position(BaseModel):
+    instrument_id: str
+    symbol: str                             # e.g. "/MES Mar26", "TLT"
+    contract_month: str | None              # futures only
+    qty: int
+    avg_entry_price: Decimal
+    current_price: Decimal
+    unrealized_pnl: Decimal
+    unrealized_pnl_pct_of_nav: Decimal
+    cluster: Literal["equity_index", "commodity", "rates_bonds", "crypto", "fx"] | None
+    managed_by_strategy_version: str        # 7-char short_hash
+
+class PositionsResponse(BaseModel):
+    positions: list[Position]
+    as_of: datetime
+
+# services/api/schemas/orders.py
+class Order(BaseModel):
+    order_uuid: str
+    client_order_id: str
+    broker_order_id: str | None
+    signal_uuid: str | None
+    instrument_id: str
+    side: Literal["buy", "sell"]
+    qty: int
+    order_type: Literal["limit_marketable", "stop_market", "limit"]
+    limit_price: Decimal | None
+    status: Literal["working", "partially_filled", "filled", "cancelled", "rejected"]
+    submitted_at: datetime
+    filled_qty: int
+    filled_avg_price: Decimal | None
+
+class OrdersResponse(BaseModel):
+    orders: list[Order]
+    next_cursor: str | None
+    has_more: bool
+
+# services/api/schemas/fills.py
+class Fill(BaseModel):
+    fill_uuid: str
+    order_uuid: str
+    signal_uuid: str
+    instrument_id: str
+    side: Literal["buy", "sell"]
+    qty: int
+    price: Decimal
+    slippage_bps: Decimal
+    expected_price: Decimal
+    filled_at: datetime
+
+class FillsResponse(BaseModel):
+    fills: list[Fill]
+    next_cursor: str | None
+    has_more: bool
+
+# services/api/schemas/alerts.py — AlertCategory mirrors the locked Postgres enum (§3.27).
+AlertCategory = Literal[
+    "kill_switch_invoked",
+    "kill_switch_resumed",
+    "halt_dwell_warning",
+    "audit_write_failure",
+    "audit_chain_break",
+    "qc_objectstore_degraded",
+    "broker_disconnect",
+    "reconciliation_break",
+    "margin_warn",
+    "margin_auto_trim",
+    "data_quality_reject",
+    "data_quality_quarantine",
+    "vol_regime_z_high",
+    "capacity_warning",
+    "slippage_drift",
+    "model_decay",
+    "capital_event",
+    "parameter_change_proposed",
+    "parameter_change_reverted",
+    "pr_drafted",
+    "pr_rejected",
+    "liveness_probe_missed",
+    "engagement_timeout",
+    "cost_alert_soft",
+    "cost_alert_hard",
+    "external_watchdog_alert",
+    "incident_review_required",
+    "phase_cutover_started",
+    "maintenance_window",
+]
+
+class Alert(BaseModel):
+    alert_uuid: str
+    severity: Literal["P0", "P1", "P2"]
+    category: AlertCategory
+    title: str
+    body_md: str
+    status: Literal["open", "acknowledged", "resolved"]
+    fired_at: datetime
+    acknowledged_at: datetime | None
+    resolved_at: datetime | None
+    audit_event_uuid: str | None
+
+class AlertsResponse(BaseModel):
+    alerts: list[Alert]
+    next_cursor: str | None
+    has_more: bool
+
+# services/api/schemas/agent.py — Phase 2
+class AgentAskRequest(BaseModel):
+    query: str = Field(max_length=2000)
+    context_hint: Literal["positions", "performance", "audit", "general"] | None = None
+
+class AgentAskResponse(BaseModel):
+    request_id: str
+    response_streamed_via_sse: bool          # true if response > N tokens (server-tuned)
+    response_text: str | None                # null when streamed; full text when inline
+
+# services/api/schemas/strategy_versions.py
+class StrategyVersionResponse(BaseModel):
+    short_hash: str                          # 7 chars; matches CHAR(7) column
+    full_sha: str                            # 40-char git SHA
+    branch: str
+    deployed_at: datetime
+    deployed_by: Literal["operator", "agent"]
+    deploy_method: Literal["pr_merge", "agent_hot_fix"]
+    parent_version_short_hash: str | None
+    backtest_baseline_id: str | None
+    parameter_set_hash: str
+    slippage_calibration_version: str
+    decommissioned: bool
+    decommissioned_reason: str | None
+```
+
+All endpoints in §4.1.5b conform to the standard error envelope (`{error_code, message, details?}`) and cursor-pagination conventions defined in §4.1.6 / §4.1.7.
 
 ### 4.1.6 REST Conventions
 
@@ -1843,10 +2152,10 @@ handle /api/sse/events {
 | `position` | Position changed (intraday tick or fill) | `{market, contract_id, quantity, avg_cost, unrealized_pnl, margin_held, last_mark_ts}` |
 | `pnl` | MTM tick (every 60s during session) | `{net_liquidation, daily_pnl, daily_pnl_pct, peak_mtm, trailing_dd_pct}` |
 | `risk_state` | State transition / multiplier change | `{state, severity, reason, m_combined, m_capital_event, m_convalescent, m_monthly_dd, capital_event_session_count, convalescent_session_count, halt_dwell_session_count}` |
-| `health` | Service status change | `{services: [{name, healthy, last_heartbeat_ts, message}]}` |
-| `alert` | New alert fired | `{alert_id, severity, category, message, ts}` |
+| `health` | Service status change OR health-score change | `{services: [{name, healthy, last_heartbeat_ts, message}], score: HealthScoreResponse}` — `score` carries the full composite + components (same shape as `GET /api/health-score`); frontend invalidates its cached health-score on receipt. |
+| `alert` | New alert fired | `{alert_id, severity, category, message, ts}` (`category` mirrors `alert_category` enum in §3.27) |
 | `audit` | Audit event of interest to UI (subset; full audit via `/api/system/audit`) | `{audit_event_uuid, event_type, sequence_no, ts}` |
-| `agent` | Agent decision/action | `{action_type, result, summary, audit_event_uuid, cost_usd}` |
+| `agent` | Agent decision/action | `{action_type, result, summary, audit_event_uuid, cost_usd, state}` — `state ∈ {idle, working, degraded, disabled, errored}` reflects the current agent status at emit time; frontend uses this to drive the agent indicator. |
 | `vacation` | Vacation start/end | `{active, started_at_utc, scheduled_end_utc}` |
 | `watchdog` | Watchdog alert / recovery | `{state: 'healthy'\|'unhealthy', last_ping_utc, message}` |
 | `session_evicted` | Connection evicted (4 reasons) | `{reason: 'tab_limit'\|'explicit_logout'\|'breakglass_kill'\|'creds_rotated'}` |
@@ -1877,7 +2186,7 @@ Discord interaction via `discord.py` (gateway WS) + `webhook_pusher` (HTTP webho
 
 > **Phasing reference:** the exact per-phase command set is defined in `prompt-b-frontend-spec.md` §6 Discord Bot Specification. Below is the canonical schema each command must conform to.
 
-### 4.3.1 Slash Commands (Phase 1)
+### 4.3.1 Slash Commands (per-phase)
 
 | Command | Args | Phase | Re-Auth? | Internal route |
 |---|---|---|---|---|
@@ -1889,7 +2198,7 @@ Discord interaction via `discord.py` (gateway WS) + `webhook_pusher` (HTTP webho
 | `/vacation start` | `days: int (1-30)` | 1 | — | `POST /api/system/vacation/start` |
 | `/ratify` | `event_ids: comma-list \| 'all'` | 1 | — | `POST /api/calendar/ratify` |
 | `/diary` | `tag: enum, reasoning: str (10-2000)` | 1 | — | `POST /api/decision-diary` |
-| `/ask` | `question: str` | 1 | — | `POST /api/agent/ask` |
+| `/ask` | `question: str` | **2** | — | `POST /api/agent/ask` (Phase 2 only — depends on `#ask-agent` channel which is Phase 2) |
 
 **Re-auth note:** Discord cannot perform WebAuthn UV. Therefore risk-loosening commands are **forbidden** in Discord:
 - `/resume` (kill-switch resume) — web-only
@@ -2010,7 +2319,7 @@ Acknowledgment from QC:
 
 ```json
 {
-  "to": "operator@example.com",
+  "to": "<operator_email>",
   "subject": "[CRITICAL] HALT_NEW invoked: trailing_dd_breach",
   "body_text": "...",
   "body_html": "...",
@@ -3043,7 +3352,7 @@ The Claude Ops agent reads telemetry as follows (full detail in §12):
 | QuantConnect | CSV from billing portal | Manual monthly upload OR API if available |
 | Hetzner | API | Daily |
 | AWS S3 | Cost Explorer API | Weekly |
-| Resend / SES | API | Daily |
+| Resend | API | Daily |
 | GitHub | n/a (free tier) | n/a |
 
 Aggregation in `cost_events` table; rolling-30d totals computed on insert. Soft alert at $200/mo, hard at $300/mo. Hard alert triggers `cost_alert_hard_ceiling` audit event AND posts to `#critical` (does NOT halt trading; cost is operational, not safety).
@@ -3123,8 +3432,11 @@ internal:
   watchdog_bearer_token: <encrypted>
   ipc_bearer_token: <encrypted>
 webauthn:
-  rp_id: trading.example.com
-  origin: https://trading.example.com
+  rp_id: <your-domain>             # substitute with operator's registered apex domain (e.g., mytrading.com); needed for Caddy auto-cert + WebAuthn rpID
+  origin: https://<your-domain>
+resend:
+  api_key: <encrypted>             # email backup provider (locked: Resend, NOT SES)
+  from_address: <operator_email>   # operator's email for sender + recipient
 ```
 
 ### 8.1.2 Age Key Backup (locked)
@@ -3263,7 +3575,7 @@ ufw allow out 443/tcp                      # everything HTTPS
 
 - Library: `py_webauthn` (Python server-side); `@simplewebauthn/browser` on frontend
 - Attestation: `none` (single-operator; we trust the operator's authenticator)
-- User verification: `required` for register and risk-loosening flows; `preferred` for routine login
+- User verification: **`required` for ALL WebAuthn ceremonies** — registration, routine login, AND risk-loosening flows (locked; matches frontend §5.1). No `preferred` fallback.
 - Allowed credentials: stored per-user in `webauthn_credentials` table
 
 ```sql
@@ -3286,7 +3598,8 @@ CREATE TABLE webauthn_credentials (
 - Library: `pyotp`
 - Stored secret: AES-encrypted via app-level encryption key (separate from sops; column-encrypted)
 - **Reduced privileges:** TOTP-bootstrap session has `risk_loosening_blocked = true`; operator must register WebAuthn within session to lift the block
-- 8 single-use printed backup codes; stored as bcrypt hashes; replaced on each use
+- 8 single-use printed backup codes; stored as **Argon2id** hashes (via `argon2-cffi` — `argon2.PasswordHasher` from the `argon2` package); replaced on each use
+- **Code generation format (locked):** 10-char base32 (uppercase, RFC 4648), hyphen-separated as `ABCDE-FGHIJ` (2 groups of 5). Generated server-side via `secrets.token_bytes(8)` then base32-encoded and split. Format must match the frontend `/setup` print acknowledgment template.
 
 ```sql
 CREATE TABLE totp_secrets (
@@ -3299,7 +3612,7 @@ CREATE TABLE totp_secrets (
 CREATE TABLE backup_codes (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
   account_id UUID NOT NULL,
-  code_hash BYTEA NOT NULL,                          -- bcrypt
+  code_hash TEXT NOT NULL,                           -- Argon2id encoded hash (argon2-cffi PasswordHasher)
   used_at_utc TIMESTAMPTZ,
   generation_id UUID NOT NULL                        -- ties to a regen batch
 );
@@ -3454,7 +3767,7 @@ Each Dockerfile must:
 
 ### 9.1.2 External Watchdog VPS
 
-Per §1.6: Hetzner CX11 in Helsinki or Falkenstein, ~$5/mo, single Python script via systemd timer, alerts only.
+Per §1.6: Hetzner CX11 in **Falkenstein** (locked), ~$5/mo, single Python script via systemd timer, alerts only. Static IPv4 substituted as `<watchdog_static_ip>` in Caddy IP-allowlist.
 
 ## 9.2 Docker Compose Layout
 
@@ -3634,7 +3947,7 @@ secrets:
 ```caddy
 # deploy/Caddyfile
 {
-  email operator@example.com
+  email <operator_email>          # Caddy auto-cert account contact (substitute at deployment)
   servers {
     timeouts {
       read_body 10s
@@ -3645,7 +3958,9 @@ secrets:
   }
 }
 
-trading.example.com {
+# Caddy auto-cert (HTTP-01 / TLS-ALPN) requires the apex domain to resolve to this VPS.
+# substitute <your-domain> with operator's registered apex domain (e.g., mytrading.com); needed for Caddy auto-cert + WebAuthn rpID
+<your-domain> {
   encode gzip zstd
   header {
     Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
@@ -3662,6 +3977,16 @@ trading.example.com {
         read_timeout 24h
       }
     }
+  }
+
+  # External watchdog push — IP-allowlisted to the Hetzner Falkenstein VPS static IP.
+  # Substitute <watchdog_static_ip> at deployment.
+  @watchdog {
+    path /api/internal/watchdog
+    remote_ip <watchdog_static_ip>
+  }
+  handle @watchdog {
+    reverse_proxy api:8000
   }
 
   handle /api/* {
@@ -3953,7 +4278,7 @@ jobs:
     steps:
       - run: |
           curl -X POST -H "Authorization: Bearer ${{ secrets.DEPLOY_HOOK_TOKEN }}" \
-            https://trading.example.com/api/internal/deploy \
+            https://<your-domain>/api/internal/deploy \
             -d '{"git_sha": "${{ github.sha }}"}'
 ```
 
@@ -4010,15 +4335,15 @@ flowchart TD
 
 | Week | Deliverable |
 |---|---|
-| 0 | Operator upskilling kickoff (Python basics, git, deploy workflow); IBKR Pro account opening initiated; QC subscription started; repo + CI scaffolding (Claude Code authors v1 strategy with operator review/approval); Hetzner VPS provisioned |
-| 1 | Paper trading begins on QC week 1 with v1; sops + age secrets management initialized; audit schema migrated (initial Alembic ops); risk engine + signal engine PR-merged; Postgres + Caddy + base Compose up |
+| 0 | Operator upskilling kickoff (Python basics, git, deploy workflow); IBKR Pro account opening initiated; QC subscription started; repo + CI scaffolding (Claude Code authors v1 strategy with operator review/approval); Hetzner Ashburn VPS provisioned; Hetzner Falkenstein external watchdog VPS provisioned (capture `<watchdog_static_ip>`); operator email Resend account created with `<operator_email>` as sender |
+| 1 | **Register apex domain `<your-domain>` and create QuantConnect organization (operator's choice — fresh org)**; operator's `<operator_username>` chosen; Paper trading begins on QC week 1 with v1; sops + age secrets management initialized; audit schema migrated (initial Alembic ops); risk engine + signal engine PR-merged; Postgres + Caddy + base Compose up; operator's break-glass DBA contact `<dba_breakglass_contact>` documented in paper safe |
 | 2 | Phase 1 sub-universe verification completed (data executability + per-position cap feasibility per current equity); decision diary writer; vacation mode handler; calendar import (FF + TE) |
 | 3 | Reconciliation service against QC ObjectStore mock; alerts pipeline (Discord + email); webhook pusher; FastAPI scaffolding |
 | 4 | QC adapter coded; golden test parity passes for 5 representative session events; instruction protocol round-trip working in mock |
 | 5 | Slippage calibration bootstrap (zero-slippage prior); LEAN backtest pipeline operational; backtest delta surface for PR review |
-| 6 | Frontend Phase 1 surfaces shipped (Today, Trades minimal, System minimal); WebAuthn registration + login |
+| 6 | (Frontend Phase 0 scaffolding complete at frontend week 3; backend integration continues — frontend Phase 1 surfaces ship at backend week 8 / start of Phase 1 month 2.) WebAuthn registration + login backend handlers ready |
 | 7 | 30th paper session completed (CME-counted); end-to-end signal-to-paper-fill cycle clean; audit chain integrity verified end-to-end |
-| 8 | Buffer + Phase 1 handover; pre-flight checklist for live cutover; final operator sign-off |
+| 8 | **Frontend Phase 1 surfaces shipped (Today, Trades minimal, System minimal) — coincident with backend Phase 0 → Phase 1 cutover**; Buffer + Phase 1 handover; pre-flight checklist for live cutover; final operator sign-off |
 
 ### Success Criteria
 
@@ -4294,6 +4619,8 @@ response = await client.messages.create(
 
 Expected cache hit rate ≥ 80% on follow-up calls within the same session. Tracked via `prompt_cache_hit_pct` field in `agent_actions`.
 
+**LOCKED: PR-rejection prompt-cache priming = NO.** When an in-app PR rejection occurs, the rejected PR is **NOT** included in subsequent prompt-cache priming. Rationale: cleaner re-discovery on later proposals; avoids reinforcement of operator-rejected approaches.
+
 ## 12.5 Cost Budget
 
 | Cost | Monthly target | Alert |
@@ -4483,12 +4810,12 @@ YOUR PRIMARY OBJECTIVES:
 
 > All marked with `[QUESTION FOR OPERATOR: ...]` — items where the spec defaults conservatively and the operator may want to over-rule:
 
-- `[QUESTION FOR OPERATOR: confirm Hetzner Helsinki vs Falkenstein for external watchdog. Both qualify as "different region" from Ashburn; Helsinki has slightly better inter-DC latency but Falkenstein is closer to other Hetzner DC choices. Recommend Helsinki — confirm?]`
-- `[QUESTION FOR OPERATOR: email backup provider — Resend vs SES. Resend simpler API, $1–5/mo target; SES cheaper at scale ($0.10/1k) but more setup. Recommend Resend for Phase 1 simplicity — confirm?]`
-- `[QUESTION FOR OPERATOR: in Phase 0 week 1, do you want the v1 strategy paper-deployed via a new QC organization or the operator's existing QC subscription? Affects audit-tagging granularity.]`
+- `[LOCKED — external watchdog region: Hetzner Falkenstein.]`
+- `[LOCKED — email backup provider: Resend (NOT SES).]`
+- `[LOCKED — Phase 0 week 1: v1 strategy paper-deployed via a freshly created QC organization (operator's choice). See §11.1 week 0 task.]`
 - `[QUESTION FOR OPERATOR: when an in-app PR rejection occurs, should the agent's prompt cache be primed with the rejection rationale (faster convergence, risk of reinforcement) or not (slower convergence, cleaner re-discovery)? Recommend NOT (current spec) — confirm?]`
-- `[QUESTION FOR OPERATOR: TOTP backup — would you prefer Aegis Authenticator (Android-friendly) or 1Password TOTP (cross-platform, password-manager integrated)? Either works.]`
-- `[QUESTION FOR OPERATOR: in Phase 3 with second strategy added, should `m_combined` compose ACROSS strategies (each strategy gets the global `m_combined`) or BE PER-STRATEGY (each strategy can be CONVALESCENT independently)? Default in current spec is global; per-strategy adds complexity.]`
+- `[LOCKED — TOTP backup: any TOTP-compatible app (Authy / 1Password / Google Authenticator). Operator picks at enrollment.]`
+- `[QUESTION FOR OPERATOR AT PHASE 3 — Phase 3 multi-strategy `m_combined` composition: ACROSS strategies (global) or PER-STRATEGY (each can be CONVALESCENT independently)? Default in current spec is global; per-strategy adds complexity. Decision deferred to Phase 3.]`
 - `[CONSERVATIVE DEFAULT: cost-review state on hard ceiling does NOT halt trading — only flags. Per spec philosophy, cost is operational, not safety. If you want cost ceiling to halt trading, override here.]`
 - `[CONSERVATIVE DEFAULT: agent's `invoke_kill_switch` tool is included even though risk engine independently invokes kill-switch on triggers. The agent path is "belt and suspenders" — fires if agent observes condition risk engine has not yet caught (e.g., qualitative regime concern). Confirm you want this dual path?]`
 

@@ -3,7 +3,15 @@
 
 **Companion to:** `backend-spec.md` (Prompt A output). API contracts in this document reference and conform to backend-spec.md §4. Where divergence is necessary it is flagged inline with `[CONTRACT — verify against Prompt A]`.
 
-**Domain placeholder:** `<domain>` is the **registrable apex domain** (e.g., `mytrading.com`). Production at `<domain>`; staging at `paper.<domain>`. WebAuthn `rpID = <domain>` — identical at both environments via registrable-domain suffix matching. If the operator hosts the app at `app.<domain>`, the rpID still equals the apex.
+**Domain placeholder:** `<your-domain>` is the **registrable apex domain** (e.g., `mytrading.com`). Production at `<your-domain>`; staging at `paper.<your-domain>`. WebAuthn `rpID = <your-domain>` — identical at both environments via registrable-domain suffix matching. If the operator hosts the app at `app.<your-domain>`, the rpID still equals the apex.
+
+> **Operator placeholders (substitute consistently at deployment):**
+> - `<your-domain>` — substitute with operator's registered apex domain (e.g., `mytrading.com`); needed for Caddy auto-cert + WebAuthn rpID
+> - `<operator_username>` — operator's chosen username (used in TOTP / recovery; single-user system but stored)
+> - `<operator_email>` — operator's email for backups (Resend) + Sentry user-feedback routing
+> - `<watchdog_static_ip>` — Hetzner Falkenstein VPS static IP for Caddy IP-allowlist on `/api/internal/watchdog`
+> - `<discord_guild_id>` — Discord server ID for the bot
+> - `<dba_breakglass_contact>` — operator's documented break-glass runbook contact (paper safe location, etc.)
 
 **Phasing terminology used throughout:**
 - **Phase 0 (frontend weeks 0–3):** scaffold, auth surfaces, mocked Today, Discord skeleton
@@ -43,7 +51,7 @@
 ## 1.1 Full IA Tree
 
 ```
-<domain>/
+<your-domain>/
 ├── (pre-auth)
 │   ├── /login                 — WebAuthn primary + TOTP fallback + backup-code link
 │   ├── /setup                 — first-run bootstrap (one-time token from Postgres)
@@ -208,7 +216,7 @@ Every post-auth page renders this bar via `apps/web/src/components/TopBar.tsx`. 
 | Element | Binding | Stale threshold |
 |---|---|---|
 | Strategy version badge | SSE `agent` (deploy events) + initial `GET /api/system/status` | n/a (immutable per deploy) |
-| Health score pill | SSE `health` + initial `GET /api/system/status` | 60s session / 5min off |
+| Health score pill | SSE `health` (carries full `score`) + initial `GET /api/health-score` | 60s session / 5min off |
 | Portfolio P&L | SSE `pnl` (60s during session) | 5s session / 60s off |
 | Agent status | SSE `agent` | 60s |
 | Environment + state pill | SSE `risk_state` + initial `GET /api/system/status` | n/a (state-driven) |
@@ -288,7 +296,7 @@ Every post-auth page renders this bar via `apps/web/src/components/TopBar.tsx`. 
   Composite                       ████████░░  87
   ```
 - Insufficient-data: gray "—" + tooltip "insufficient data — track record under construction" (per locked rule: <50% expected data points per component → component "—"; <50% total weight available → composite "—")
-- Backend: `GET /api/system/status` includes health score + components. Updated via SSE `health` events.
+- Backend: **primary source `GET /api/health-score`** returns composite + components. The `GET /api/today/digest` payload includes the health-score body as a denormalized convenience for landing-page first paint. Updated via SSE `health` events (which carry a full `score` object — frontend invalidates the cached health-score on receipt).
 
 #### B. P&L Summary
 - 4-column grid: Day / Week / Month / Year
@@ -318,7 +326,7 @@ Every post-auth page renders this bar via `apps/web/src/components/TopBar.tsx`. 
 - Each bar: filled portion = current %; gray remainder to limit; vertical tick at limit
 - Color: emerald if >50% headroom, amber 25–50%, red <25%
 - Charts: simple HTML/CSS bars (no chart library on Today — bundle budget); reserve Recharts for `/performance`
-- Backend: `GET /api/system/status` returns nested exposure object; SSE `position` events trigger refetch (debounced 1s)
+- Backend: `GET /api/today/digest` returns nested exposure object (`exposure` field); SSE `position` events trigger refetch (debounced 1s)
 
 #### E. Positions Table
 - Columns: Market | Qty | Avg Cost | Mark | uPnL | Cluster | Strategy Version
@@ -755,7 +763,7 @@ Monthly DD vol-halve:      -10%
 - "Test ping" button (Phase 2; admin-only): triggers backend to request immediate ping from watchdog VPS
 
 ### 2.6.7 Operating Cost Dashboard (Phase 2)
-- Provider tiles: VPS (Hetzner), DB (Postgres self-hosted = $0), QuantConnect, Claude API, Sentry, SMS (Twilio for backup), data feeds (per Prompt A inventory)
+- Provider tiles: VPS (Hetzner Ashburn primary + Hetzner Falkenstein watchdog), DB (Postgres self-hosted = $0), QuantConnect, Claude API, Sentry, **Resend** (email backup; locked — NOT SES), SMS (tile reserved; **NOT wired** — Sentry alert routing is locked Discord-only, no SMS), data feeds (per Prompt A inventory)
 - Per-tile: current month spend, rolling 30d, 90d trend mini-sparkline
 - Total monthly $ at top
 - Backend: `GET /api/system/costs?days=N` (90d default)
@@ -1026,9 +1034,9 @@ Composite = weighted sum. Thresholds: **G ≥75, Y 50–74, R <50.**
 
 **UI:**
 - TopBar pill: G/Y/R + numeric (e.g., `87`)
-- `/today` Health tile: large pill + click-expand to component bars (cached payload — no extra fetch; backend returns components in same response as composite via `GET /api/system/status`)
+- `/today` Health tile: large pill + click-expand to component bars (cached payload — no extra fetch; backend returns components in same response as composite via `GET /api/health-score`, and `GET /api/today/digest` includes the same body denormalized for first-paint)
 
-**Backend:** `GET /api/health-score` returns `{ composite: int|null, components: [{name, weight, value: int|null, days_available: int}] }`.
+**Backend:** **`GET /api/health-score` is the canonical primary source** (full schema in backend §4.1.5b — `HealthScoreResponse`); `GET /api/today/digest` includes the same body denormalized for landing-page first paint; SSE `health` events carry the full `score` object so the cached value can be invalidated without an extra round-trip. There is **no** `/api/system/status`-sourced health score (deprecated reference removed).
 
 ## 3.4 Benchmark Overlay
 
@@ -1102,7 +1110,7 @@ Detailed in §2.4.4.
 
 **Reader access:** OWNER-ONLY (locked). Reader request → 403 + explainer.
 
-**Backend:** `POST /api/stress-test/run` returns `{ job_id }`; `GET /api/stress-test/results/:job_id` for terminal payload.
+**Backend:** `POST /api/stress-test/run` returns `{ job_id }`. **Result is delivered via the `result_url` field of the terminal `job` SSE event** (status=complete) — there is **no** separate `GET /api/stress-test/results/:job_id` endpoint. Use `GET /api/jobs/:job_id` only as a polling fallback when SSE is unavailable.
 
 ---
 
@@ -1258,14 +1266,14 @@ Dispatch via `announce(msg, severity)` helper. Messages truncated to 200 chars; 
 
 **Library: `@simplewebauthn/browser` v9+** (browser-side helpers); backend uses `@simplewebauthn/server` (or Python `webauthn` package, per Prompt A choice).
 
-**rpID = `<domain>` (registrable apex).** Same credentials work at `<domain>`, `app.<domain>`, `paper.<domain>` via WebAuthn registrable-domain suffix matching.
+**rpID = `<your-domain>` (registrable apex).** Same credentials work at `<your-domain>`, `app.<your-domain>`, `paper.<your-domain>` via WebAuthn registrable-domain suffix matching.
 
 **Login flow (no OAuth-style redirect):**
 1. User clicks "Sign in with passkey" on `/login`
 2. Frontend captures intended `targetUrl` (default `/`)
 3. POST `/api/auth/webauthn/challenge` with `{ targetUrl }`
 4. Backend generates challenge; stores `(challenge, targetUrl)` in server-side ceremony row keyed by transient `ceremonyId`; returns `{ ceremonyId, challengeBase64, allowedCredentials }`
-5. Frontend calls `navigator.credentials.get({ publicKey: { challenge, allowCredentials, rpId: '<domain>', userVerification: 'required' } })`
+5. Frontend calls `navigator.credentials.get({ publicKey: { challenge, allowCredentials, rpId: '<your-domain>', userVerification: 'required' } })`
 6. Browser prompts user for passkey
 7. POST `/api/auth/webauthn/verify` with `{ ceremonyId, assertion }`
 8. Backend verifies; sets HttpOnly + Secure + SameSite=Strict session cookie + non-HttpOnly CSRF cookie; updates `last_uv_at`; returns `{ targetUrl }` from server-side ceremony state
@@ -1377,11 +1385,11 @@ Dispatch via `announce(msg, severity)` helper. Messages truncated to 200 chars; 
 
 ## 5.7 RBAC
 
-**Schema present from day 1.** `users.role` column: `'owner'` | `'reader'`. Sessions inherit role.
+**Schema column lands in Phase 0** (`accounts.role` per backend §3.1 — the canonical column; check backend §3 if you see `users.role` in older docs, the canonical name is `accounts.role`). Sessions inherit role. Reader-redaction middleware + invite flow are a **Phase 3 deliverable** — both specs agree on the Phase 3 functional rollout. The column lands in Phase 0 to avoid future destructive migration.
 
-**Phase 1:** only `'owner'` role active.
-
-**Phase 3 (year 2):** `'reader'` role activated for CPA.
+**Phase 0:** schema column present (`accounts.role NOT NULL DEFAULT 'owner'`); only `'owner'` ever assigned.
+**Phase 1:** only `'owner'` role active in production.
+**Phase 3 (year 2):** `'reader'` role activated for CPA — redaction middleware + invite flow ship here.
 
 **Reader role permission matrix (LOCKED):**
 
@@ -1423,11 +1431,11 @@ Detailed in §5.3 + `/recover` surface in §2.8.3.
 5. CPA completes WebAuthn enrollment + TOTP + backup codes (same flow as operator)
 6. Reader role active immediately; redaction rules enforced server-side per RBAC
 
-**Schema** (in users/sessions tables; from day 1):
-- `users.role: text NOT NULL DEFAULT 'owner'`
-- `sessions.role: text NOT NULL` (snapshot from users.role at session creation; tracks role changes for audit)
+**Schema** (in `accounts` / sessions tables; column lands Phase 0):
+- `accounts.role: text NOT NULL DEFAULT 'owner'` (canonical; see backend §3.1)
+- `sessions.role: text NOT NULL` (snapshot from `accounts.role` at session creation; tracks role changes for audit)
 
-**Functional flow is Phase 3.**
+**Functional flow (redaction middleware + invite UI) is Phase 3.** Schema column landing in Phase 0 avoids a future destructive migration.
 
 ## 5.10 `/setup` Token Security (LOCKED)
 
@@ -3034,7 +3042,7 @@ sequenceDiagram
     Web->>API: POST /api/auth/webauthn/challenge { targetUrl: "/system" }
     API->>PG: INSERT ceremonies (ceremonyId, challenge, targetUrl)
     API-->>Web: 200 { ceremonyId, challengeBase64, allowedCredentials }
-    Web->>Op: navigator.credentials.get({ publicKey: { challenge, rpId: "<domain>", userVerification: "required" } })
+    Web->>Op: navigator.credentials.get({ publicKey: { challenge, rpId: "<your-domain>", userVerification: "required" } })
     Op->>Web: Provides UV (Touch ID / Windows Hello / etc.)
     Web->>API: POST /api/auth/webauthn/verify { ceremonyId, assertion }
     API->>PG: SELECT FROM ceremonies WHERE ceremony_id=$1 (lookup challenge + targetUrl)
@@ -3408,11 +3416,12 @@ sequenceDiagram
     Worker->>API: ... 50%, 66%, 83%, 100%
     API->>SSE: emit job
     Worker->>API: complete; results stored
-    API->>SSE: emit job { status: "complete", result_url: "/api/stress-test/results/j_abc123" }
+    API->>SSE: emit job { status: "complete", result_url: "/api/jobs/j_abc123/result" }
     SSE-->>Web: Drawer closes; auto-open StressTestResultsModal with fetched results
-    Web->>API: GET /api/stress-test/results/j_abc123
+    Web->>API: GET <result_url from SSE event>
     API-->>Web: 200 { results }
     Web-->>Op: Modal opens with tabbed view
+    Note over Web,API: result_url is delivered via the terminal job SSE event;<br/>there is NO /api/stress-test/results/:job_id endpoint.
 ```
 
 ## 10.17 PDF Export Async Flow
@@ -3552,8 +3561,8 @@ sequenceDiagram
 sequenceDiagram
     autonumber
     participant VPS as Hetzner Ashburn VPS
-    participant WD as Watchdog (Helsinki)
-    participant Email as Email Service
+    participant WD as Watchdog (Hetzner Falkenstein)
+    participant Email as Resend (email backup)
     actor Op as Operator
 
     Note over VPS: VPS goes offline (kernel panic, network outage)
@@ -3854,13 +3863,15 @@ sequenceDiagram
 - WebAuthn library has unfixable bug in operator's browser → fall back to TOTP-only as primary, defer WebAuthn
 - Caddy SSE behavior (`flush_interval -1`) failing in dev → swap to nginx (with locked equivalent config)
 
-## 11.2 Phase 1 (months 2–5; ships before live trading)
+## 11.2 Phase 1 (months 2–5; first surfaces ship at backend week 8 / start of month 2)
 
 **Goal:** full Phase 1 surface set per §2 and §6 phasing tables. System operates in paper + live-small.
 
+> **Timing alignment with backend:** frontend Phase 0 = weeks 0–3 (scaffolding only). Frontend Phase 1 surfaces (Today, Trades minimal, System minimal) ship by **end of backend Phase 0 / start of backend Phase 1 = month 2 calendar / week 8 backend**, ready for live trading begin month 2. The "Month 2 (Today complete)" deliverable below is therefore aligned to backend week 8, not later.
+
 ### Deliverables (per-page rollout schedule)
 
-**Month 2 (Today complete):**
+**Month 2 (Today complete — coincident with backend week 8 cutover to live-small):**
 - Health score (insufficient-data graceful)
 - Positions table (virtualized)
 - P&L summary D/W/M/Y
@@ -4072,7 +4083,7 @@ describe('DecisionDiaryModal', () => {
 
 **Run cadence:**
 - Per-PR: smoke set (~10 critical flows; <5 min)
-- Nightly: full suite against staging (`paper.<domain>`)
+- Nightly: full suite against staging (`paper.<your-domain>`)
 - Pre-deploy: full suite must pass before promoting to production
 
 **WebAuthn virtual authenticator setup:**
@@ -4475,6 +4486,8 @@ US Letter portrait. Page-break-inside: avoid on charts. Header + footer per page
 
 ## 16.1 Sentry (Error Tracking + RUM)
 
+**Alert routing (LOCKED): Discord-only. NO SMS.** All Sentry alerts (errors above threshold, replay-on-error notifications, etc.) post to the operator's Discord `#critical` channel. SMS / Twilio integration is explicitly **not** wired up; the SMS provider tile in `/system` Operating Cost Dashboard is reserved for backup-channel cost tracking only and is unused in Phases 1–3 unless the operator overrides this lock at a later phase.
+
 **Plan (LOCKED):** Free tier (5k errors / month, 10k performance units, 50 replays). Sufficient for solo-operator low-volume.
 
 **Upgrade trigger:** 30-day rolling > 4k errors → Team plan ($26/mo).
@@ -4548,11 +4561,11 @@ Every `announce(msg, severity)` call adds a Sentry breadcrumb (`category: 'aria-
 ```caddy
 {
   # Global options
-  email ops@<domain>
-  default_sni <domain>
+  email <operator_email>          # Caddy auto-cert account contact
+  default_sni <your-domain>
 }
 
-<domain> {
+<your-domain> {
   encode zstd gzip
   
   # Security headers
@@ -4577,9 +4590,13 @@ Every `announce(msg, severity)` call adds a Sentry breadcrumb (`category: 'aria-
     }
   }
   
-  # Watchdog internal endpoint (IP-allowlisted)
-  @watchdog remote_ip <watchdog-static-ip>
-  handle /internal/watchdog @watchdog {
+  # External watchdog push endpoint — IP-allowlisted to Hetzner Falkenstein VPS.
+  # Path is /api/internal/watchdog (matches backend §4.1.3); substitute <watchdog_static_ip> at deployment.
+  @watchdog {
+    path /api/internal/watchdog
+    remote_ip <watchdog_static_ip>
+  }
+  handle @watchdog {
     reverse_proxy 127.0.0.1:8000
   }
   
@@ -4610,7 +4627,7 @@ Every `announce(msg, severity)` call adds a Sentry breadcrumb (`category: 'aria-
   }
   
   log {
-    output file /var/log/caddy/<domain>.log {
+    output file /var/log/caddy/<your-domain>.log {
       roll_size 100mb
       roll_keep 30
     }
@@ -4638,7 +4655,7 @@ Every `announce(msg, severity)` call adds a Sentry breadcrumb (`category: 'aria-
 
 ## 17.3 HSTS
 
-`max-age=31536000; includeSubDomains; preload` — operator submits `<domain>` to HSTS preload list after Phase 1 stabilization.
+`max-age=31536000; includeSubDomains; preload` — operator submits `<your-domain>` to HSTS preload list after Phase 1 stabilization.
 
 ## 17.4 Cookie Hardening
 
@@ -4672,29 +4689,29 @@ Every `announce(msg, severity)` call adds a Sentry breadcrumb (`category: 'aria-
 
 | Environment | Host | Backend |
 |---|---|---|
-| Production | `<domain>` | reads/writes production Postgres + live broker (Phase 2+) |
-| Staging | `paper.<domain>` | reads/writes paper-environment Postgres + paper broker only |
-| (Optional) Dev | `dev.<domain>` | local-only; Docker Compose |
+| Production | `<your-domain>` | reads/writes production Postgres + live broker (Phase 2+) |
+| Staging | `paper.<your-domain>` | reads/writes paper-environment Postgres + paper broker only |
+| (Optional) Dev | `dev.<your-domain>` | local-only; Docker Compose |
 
 ## 18.2 WebAuthn rpID
 
-**`rpID = <domain>` for both production AND staging.**
+**`rpID = <your-domain>` for both production AND staging.**
 
-**Why:** WebAuthn registrable-domain suffix matching means a credential registered at `<domain>` works at `paper.<domain>` automatically — single enrollment, both environments. By design (solo operator simplification).
+**Why:** WebAuthn registrable-domain suffix matching means a credential registered at `<your-domain>` works at `paper.<your-domain>` automatically — single enrollment, both environments. By design (solo operator simplification).
 
-If `<domain>` is the apex (`mytrading.com`), then:
+If `<your-domain>` is the apex (`mytrading.com`), then:
 - Production: `mytrading.com` (rpID=`mytrading.com`)
 - Staging: `paper.mytrading.com` (rpID=`mytrading.com`)
 - Both share credentials.
 
-If operator hosts at `app.<domain>`:
+If operator hosts at `app.<your-domain>`:
 - Production: `app.mytrading.com` (rpID still `mytrading.com`)
 - Staging: `paper.mytrading.com` (rpID still `mytrading.com`)
 - Both share credentials.
 
 ## 18.3 Staging Backend
 
-`paper.<domain>/api/*` → FastAPI configured with `ENV=paper`:
+`paper.<your-domain>/api/*` → FastAPI configured with `ENV=paper`:
 - Reads/writes paper-environment Postgres database (separate cluster or schema)
 - No live broker integration (uses paper trading endpoint only — QC paper mode in Phase 1; IBKR paper account in Phase 2)
 - Same audit chain logic but separate `audit_log` table per environment
@@ -4707,15 +4724,15 @@ sequenceDiagram
     actor Op as Operator
     participant GH as GitHub
     participant CI as CI / Actions
-    participant Staging as paper.<domain> VPS
-    participant Prod as <domain> VPS
+    participant Staging as paper.<your-domain> VPS
+    participant Prod as <your-domain> VPS
 
     Op->>GH: Push to main branch
     GH->>CI: Trigger workflow
     CI->>CI: Run typecheck + lint + tests + build
     CI->>Staging: Deploy via SSH + docker compose
     Staging->>Staging: docker compose pull && up -d
-    CI->>CI: Run E2E suite against paper.<domain>
+    CI->>CI: Run E2E suite against paper.<your-domain>
     
     alt All pass
         CI->>Op: Notify "Staging deploy successful; ready for production cut"
@@ -4752,7 +4769,7 @@ Quarterly reset of staging Postgres:
 - Postgres database (separate)
 - Broker endpoint (paper vs. live)
 - Sentry environment tag (`paper` vs. `production`)
-- Watchdog targets `<domain>/health` only (NOT staging — staging outage non-critical)
+- Watchdog targets `<your-domain>/health` only (NOT staging — staging outage non-critical)
 - Cost data (staging tagged separately if surfaced in operating cost dashboard)
 
 ---
@@ -4761,16 +4778,21 @@ Quarterly reset of staging Postgres:
 
 The following are NOT inferable from prompt context and require explicit operator answers:
 
-1. **`[QUESTION FOR OPERATOR]`** What is the exact value of `<domain>`? (e.g., `mytrading.com`, `myname-trading.com`). Affects Caddy config, WebAuthn rpID, watchdog targets.
-2. **`[QUESTION FOR OPERATOR]`** Watchdog VPS static IP for Caddy `@watchdog` matcher? Required for `/internal/watchdog` IP-allowlist.
-3. **`[QUESTION FOR OPERATOR]`** Operator's preferred username for login (used in TOTP / recovery)? Single-user system but stored.
-4. **`[QUESTION FOR OPERATOR]`** Operator's marginal tax rate for tax-estimate widget? (Used in Phase 2 widget for "estimated annual liability" — operator can update later but needed at /setup.)
-5. **`[QUESTION FOR OPERATOR]`** Operator's contact email for watchdog email backup + Sentry user-feedback routing?
-6. **`[QUESTION FOR OPERATOR]`** Operator-configured `dba_breakglass` contact for total-factor-loss recovery?
-7. **`[QUESTION FOR OPERATOR]`** Brand assets for investor PDF (logo, color override)? Phase 3 deliverable; can be deferred.
-8. **`[QUESTION FOR OPERATOR]`** Operator's preferred benchmark for Phase 2 (default SPY but configurable)? 
-9. **`[QUESTION FOR OPERATOR]`** Discord guild ID + invite link for bot deployment? Required for bot setup.
-10. **`[QUESTION FOR OPERATOR]`** Notification preference for Sentry breaches (email-only vs. SMS via Twilio)?
+All operator inputs below are substituted at deployment via the placeholders defined at the top of this document (`<your-domain>`, `<operator_username>`, `<operator_email>`, `<watchdog_static_ip>`, `<discord_guild_id>`, `<dba_breakglass_contact>`).
+
+1. **`[OPERATOR DEPLOYMENT INPUT]`** Substitute `<your-domain>` (registered apex domain, e.g., `mytrading.com`). Affects Caddy config, WebAuthn rpID, watchdog targets.
+2. **`[OPERATOR DEPLOYMENT INPUT]`** Substitute `<watchdog_static_ip>` (Hetzner Falkenstein static IPv4) into the Caddy `@watchdog` IP-allowlist on `/api/internal/watchdog`.
+3. **`[OPERATOR DEPLOYMENT INPUT]`** Substitute `<operator_username>` (preferred login username; used in TOTP / recovery).
+4. **`[QUESTION FOR OPERATOR AT PHASE 2 — default 37% federal + 8.97% NJ state if unset]`** Operator's marginal tax rate for the Phase 2 tax-estimate widget. Operator can update later via `/system` Account; default applies if unset.
+5. **`[OPERATOR DEPLOYMENT INPUT]`** Substitute `<operator_email>` (contact email; used by the Resend email-backup provider AND for Sentry user-feedback routing).
+6. **`[OPERATOR DEPLOYMENT INPUT]`** Substitute `<dba_breakglass_contact>` (documented runbook contact — paper safe location, sealed-envelope owner, etc.) for total-factor-loss recovery.
+7. **`[QUESTION FOR OPERATOR AT PHASE 3]`** Brand assets for investor PDF (logo, color override). Preserve `<organization_name>` placeholder until Phase 3 sign-off.
+8. **`[LOCKED]`** Default benchmark = **SPY**. Operator may override at any time via `/system`.
+9. **`[OPERATOR DEPLOYMENT INPUT]`** Substitute `<discord_guild_id>` (Discord server ID + invite link) for bot deployment.
+10. **`[LOCKED]`** Sentry alert routing = **Discord-only**, no SMS. (Lock confirmed; supersedes earlier email-vs-SMS question.)
+11. **`[LOCKED]`** Email backup provider = **Resend** (NOT SES). Sender = `<operator_email>`.
+12. **`[LOCKED]`** TOTP app = any TOTP-compatible authenticator (Authy / 1Password / Google Authenticator). Operator picks at enrollment.
+13. **`[LOCKED]`** Agent prompt cache priming on PR rejection = **NO**. Rejected PRs are not included in subsequent prompt-cache priming.
 
 # APPENDIX B — Library Inventory & Versions
 
@@ -4931,7 +4953,7 @@ This section enumerates the locked backend decisions consumed by the frontend, w
 | 24h Discord IPC replay buffer | Same; aligned for Discord parity |
 | N=4 SSE connection limit | Client handles `session_evicted` gracefully |
 | Decimal-string monetary values | `decimal.js` for arithmetic; `Number` only for chart libs |
-| WebAuthn rpID = `<domain>` | Production + staging share credentials |
+| WebAuthn rpID = `<your-domain>` | Production + staging share credentials |
 | Audit chain SHA-256 hash | UI renders integrity badge per row |
 | Hash-chain repair on backfill | UI shows "↳ repaired @ #seq" provenance |
 | Tax artifacts inherently $-denominated | Reader-mode locked exception preserved server-side |
