@@ -1,0 +1,191 @@
+# docker-compose.yml — production stack (Hetzner Ashburn primary VPS).
+# Service inventory: backend-spec §1.4 (19 services). Phase 2 services gated by `phase2` profile.
+# Image tag substitution: GHCR_OWNER + RELEASE_SHA come from `deploy/.env` on the VPS.
+# Anti-pattern A18: never bare placeholders like <domain>; substitute via env at deploy.
+
+networks:
+  internal:
+    driver: bridge
+    internal: true       # no internet egress except via the `egress` network
+  egress:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  caddy_data:
+  caddy_config:
+  prometheus_data:
+  grafana_data:
+  gitea_data:
+  secrets_volume:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+
+services:
+
+  # ---- Reverse proxy / TLS ----------------------------------------------
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    networks: [internal, egress]
+    ports:
+      - '80:80'
+      - '443:443'
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+
+  # ---- Application services (one container per service) ----------------
+  api:
+    image: ghcr.io/${GHCR_OWNER:?set GHCR_OWNER in deploy/.env}/trading-api:${RELEASE_SHA:-latest}
+    restart: unless-stopped
+    networks: [internal]
+    depends_on: [postgres, sops_init]
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', 'http://localhost:8000/api/health']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  signal:
+    image: ghcr.io/${GHCR_OWNER}/trading-signal:${RELEASE_SHA:-latest}
+    restart: unless-stopped
+    networks: [internal]
+    depends_on: [postgres, sops_init]
+
+  risk:
+    image: ghcr.io/${GHCR_OWNER}/trading-risk:${RELEASE_SHA:-latest}
+    restart: unless-stopped
+    networks: [internal]
+    depends_on: [postgres, sops_init]
+
+  execution:
+    image: ghcr.io/${GHCR_OWNER}/trading-execution:${RELEASE_SHA:-latest}
+    restart: unless-stopped
+    networks: [internal, egress]   # Phase 1 needs QC ObjectStore reach
+    depends_on: [postgres, sops_init, qc_adapter]
+
+  reconciliation:
+    image: ghcr.io/${GHCR_OWNER}/trading-reconciliation:${RELEASE_SHA:-latest}
+    restart: unless-stopped
+    networks: [internal]
+    depends_on: [postgres, qc_adapter]
+
+  audit:
+    image: ghcr.io/${GHCR_OWNER}/trading-audit:${RELEASE_SHA:-latest}
+    restart: unless-stopped
+    networks: [internal]
+    depends_on: [postgres]
+
+  calibration:
+    image: ghcr.io/${GHCR_OWNER}/trading-calibration:${RELEASE_SHA:-latest}
+    restart: 'on-failure:3'
+    networks: [internal]
+    depends_on: [postgres]
+
+  scheduler:
+    image: ghcr.io/${GHCR_OWNER}/trading-scheduler:${RELEASE_SHA:-latest}
+    restart: unless-stopped
+    networks: [internal]
+    depends_on: [postgres]
+
+  qc_adapter:
+    image: ghcr.io/${GHCR_OWNER}/trading-qc-adapter:${RELEASE_SHA:-latest}
+    restart: unless-stopped
+    networks: [internal, egress]
+    depends_on: [postgres, sops_init]
+
+  discord_bot:
+    image: ghcr.io/${GHCR_OWNER}/trading-discord-bot:${RELEASE_SHA:-latest}
+    restart: unless-stopped
+    networks: [internal, egress]
+    depends_on: [api, sops_init]
+
+  webhook_pusher:
+    image: ghcr.io/${GHCR_OWNER}/trading-webhook-pusher:${RELEASE_SHA:-latest}
+    restart: unless-stopped
+    networks: [internal, egress]
+    depends_on: [sops_init]
+
+  monitoring:
+    image: ghcr.io/${GHCR_OWNER}/trading-monitoring:${RELEASE_SHA:-latest}
+    restart: unless-stopped
+    networks: [internal]
+    depends_on: [postgres]
+
+  agent:
+    image: ghcr.io/${GHCR_OWNER}/trading-agent:${RELEASE_SHA:-latest}
+    restart: unless-stopped
+    networks: [internal, egress]
+    depends_on: [postgres, sops_init]
+
+  # ---- Datastores --------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    networks: [internal]
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./deploy/postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+    environment:
+      POSTGRES_USER_FILE: /run/secrets/postgres_user
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_DB: trading
+    depends_on: [sops_init]
+
+  # ---- Source mirror ----------------------------------------------------
+  gitea:
+    image: gitea/gitea:1.21
+    restart: unless-stopped
+    networks: [internal, egress]
+    volumes:
+      - gitea_data:/data
+
+  # ---- Observability (Phase 1 month 2 — keep in compose so a single
+  #      `docker compose up` brings the full stack) ------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    networks: [internal]
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    networks: [internal]
+    volumes:
+      - ./deploy/grafana:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+
+  # ---- sops decrypt sidecar (runs once at compose-up) -------------------
+  sops_init:
+    image: getsops/sops:latest
+    restart: 'no'
+    networks: [egress]
+    volumes:
+      - secrets_volume:/run/secrets
+      - ./secrets:/secrets:ro
+      - ${SOPS_AGE_KEY_FILE:-/etc/credstore.encrypted/age_key}:/age_key:ro
+    environment:
+      SOPS_AGE_KEY_FILE: /age_key
+    entrypoint: ['/bin/sh', '-c']
+    command: ['sops -d /secrets/${ENV_FILE:-paper.enc.yaml} > /run/secrets/decrypted.yaml']
+
+  # ---- Phase 2 only (profile-gated; never start in Phase 1) -------------
+  ib_gateway:
+    image: gnzsnz/ib-gateway:latest
+    restart: unless-stopped
+    networks: [internal]
+    profiles: ['phase2']
+
+  lean_local:
+    image: quantconnect/lean:latest
+    restart: 'no'
+    networks: [internal]
+    profiles: ['phase2']

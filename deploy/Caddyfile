@@ -1,0 +1,83 @@
+# Caddyfile — Hetzner Ashburn primary VPS reverse proxy.
+# - Auto-cert via Let's Encrypt (HTTP-01 / TLS-ALPN). Requires DNS A record + ports 80/443 open.
+# - Anti-pattern A18: <your-domain> and <watchdog_static_ip> remain literal placeholders;
+#   they are substituted at deploy time via Caddy's env-var support
+#   (operator's apex domain is registered separately and held in `secrets/<env>.enc.yaml`).
+
+{
+	email <operator_email>          # Caddy account contact for ACME (substituted at deploy)
+	servers {
+		timeouts {
+			read_body 10s
+			read_header 5s
+			write 30s
+			idle 24h                    # long-lived SSE connections need this
+		}
+	}
+}
+
+# Apex domain. <your-domain> is replaced with the operator's registered apex (e.g. spratcapital.com)
+# at deployment via `caddy run --envfile deploy/.env`, where DOMAIN=spratcapital.com is set.
+{$DOMAIN:<your-domain>} {
+	encode gzip zstd
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Content-Security-Policy "default-src 'self'; script-src 'self'; connect-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'"
+	}
+
+	# Server-Sent Events — must not buffer; long read timeout for 24h replay window.
+	handle /api/sse/events {
+		reverse_proxy api:8000 {
+			flush_interval -1
+			transport http {
+				read_timeout 24h
+			}
+		}
+	}
+
+	# Watchdog push endpoint — IP-allowlisted to the Hetzner Falkenstein static IP.
+	# Substitute <watchdog_static_ip> at deploy via env: WATCHDOG_IP=...
+	@watchdog {
+		path /api/internal/watchdog
+		remote_ip {$WATCHDOG_IP:<watchdog_static_ip>}
+	}
+	handle @watchdog {
+		reverse_proxy api:8000
+	}
+
+	# All other API traffic
+	handle /api/* {
+		reverse_proxy api:8000
+	}
+
+	# Internal admin tools (basicauth credentials live in sops; substituted at deploy)
+	handle_path /grafana/* {
+		reverse_proxy grafana:3000
+	}
+
+	handle_path /gitea/* {
+		reverse_proxy gitea:3000
+	}
+
+	# Maintenance fallback for 502s
+	handle_errors {
+		@502 expression `{http.error.status_code} == 502`
+		handle @502 {
+			respond "Service temporarily unavailable. Watchdog has been notified." 503
+		}
+	}
+
+	# Default → Next.js frontend
+	handle {
+		reverse_proxy nextjs:3000
+	}
+}
+
+# www → apex redirect (for visitors typing www.spratcapital.com)
+www.{$DOMAIN:<your-domain>} {
+	redir https://{$DOMAIN:<your-domain>}{uri} permanent
+}

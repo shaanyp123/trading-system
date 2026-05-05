@@ -1,0 +1,25 @@
+# gitleaks config — runs in CI and as a pre-commit hook.
+# Anti-pattern A11 (dev-guide §11): inline secrets in any file.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Scaffold allowlist — narrow as code lands"
+paths = [
+  '''^secrets/.*\.enc\.yaml$''',          # sops-encrypted files are not plaintext leaks
+  '''^deploy/\.env\.example$''',          # template only; no real values
+  '''^Docs/.*\.md$''',                    # spec/dev-guide may show illustrative tokens with obvious placeholders
+  '''^Prompts/.*''',                      # archived generation prompts
+  '''^Archive/.*''',
+  '''^README\.md$''',
+  '''^CLAUDE\.md$''',
+  '''^implementation-guide\.md$''',
+]
+regexes = [
+  '''<your-domain>''',
+  '''<operator_email>''',
+  '''<watchdog_static_ip>''',
+  '''<discord_guild_id>''',
+  '''<operator_username>''',
+]
