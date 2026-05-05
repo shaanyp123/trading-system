@@ -290,11 +290,11 @@ flowchart TD
 
 | Property | Value |
 |---|---|
-| Provider | Hetzner Cloud (separate from Ashburn) |
-| Region | **Falkenstein** (locked — different region from Ashburn) |
-| Spec | CX11 (1 vCPU, 2 GB RAM) |
-| Static IP | `<watchdog_static_ip>` (substitute Falkenstein VPS static IPv4 at provisioning; required by Caddy IP-allowlist for `POST /api/internal/watchdog`) |
-| Cost | ~$5/mo |
+| Provider | Hetzner Cloud (separate Hetzner project from Ashburn) |
+| Region | **EU DC, geographically separated from US Ashburn** (Falkenstein preferred; Nuremberg as substitute if Falkenstein unavailable). The "locked" property is the geographic isolation, not the specific DC. See `Docs/decisions-log.md` 2026-05-05 entry. |
+| Spec | CX23 (2 vCPU, 4 GB RAM) — note: spec previously listed CX11; that SKU has been retired by Hetzner. CX23 is the current entry tier. |
+| Static IP | `<watchdog_static_ip>` (substitute watchdog VPS static IPv4 at provisioning; required by Caddy IP-allowlist for `POST /api/internal/watchdog`) |
+| Cost | ~$5.59/mo (CX23 + IPv4) |
 | OS | Ubuntu LTS, hardened (CIS L1) |
 | Runtime | Single Python script via systemd timer; `cron` 5-min interval |
 | Auth to backend | Bearer token from sops; rotates with full secrets quarterly |

@@ -6,8 +6,9 @@ You are working on a solo-operator algorithmic trading system. The operator is n
 
 1. **`Docs/claude-dev-guide.md` §1 (Session Protocol)** — how to start/end a session, ambiguity protocol, test-before-commit rule
 2. **`Docs/claude-dev-guide.md` §1.5 (Locked Decisions Quick Reference)** — auth, SSE, endpoints, Phase 1 architecture, backtest authority, domain placeholder, email provider. Memorize these; never deviate without escalation.
-3. **The relevant section of `implementation-guide.md`** for the current week/task (operator tells you which)
-4. **The relevant `Docs/backend-spec.md` or `Docs/frontend-spec.md` section** if you're implementing against a specific subsystem
+3. **`Docs/decisions-log.md`** — canonical log of where reality differs from the specs. Read before assuming a spec value (monthly costs, Hetzner DC, hardware SKUs, third-party pricing) is current.
+4. **The relevant section of `implementation-guide.md`** for the current week/task (operator tells you which)
+5. **The relevant `Docs/backend-spec.md` or `Docs/frontend-spec.md` section** if you're implementing against a specific subsystem
 
 ## Critical constraints
 
@@ -48,6 +49,7 @@ For pattern ambiguity within already-allowed scope (naming, file organization wi
 | `Docs/backend-spec.md` | Backend architecture: schemas, APIs, risk framework, audit log, security |
 | `Docs/frontend-spec.md` | Frontend architecture: pages, components, real-time, auth |
 | `Docs/claude-dev-guide.md` | YOUR canonical patterns + conventions + anti-patterns + session protocol |
+| `Docs/decisions-log.md` | Append-only log of decisions + deviations from specs as the build progresses |
 | `Prompts/` | Generation prompts (archived; do not reference for current work) |
 | `Archive/` | Reserved for superseded versions |
 

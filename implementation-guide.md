@@ -96,8 +96,8 @@ Complete every item in this checklist before Week 1 day-tasks begin. The IBKR Pr
 | # | Provider | Why Needed | Plan / Tier | Estimated Cost | Expected Turnaround | Blocker? |
 |---|---|---|---|---|---|---|
 | 1 | **IBKR Pro** (interactivebrokers.com) | Futures brokerage; QC connects here in Phase 1; direct connection in Phase 2 | Individual account, Pro tier; enable futures + Level 2 options; defer market data subscriptions until TWS install | $0 account min (commissions only) | **1–2 weeks for approval + funding** | **YES — critical path; start Day 1** |
-| 2 | **QuantConnect** (quantconnect.com) | LEAN Cloud execution for Phase 1; paper-day clock starts Week 1 | Quant Researcher ($20/mo); create fresh organization (do not reuse any existing org) | $20/mo | Same-day | YES — needed Week 1 |
-| 3 | **Hetzner Cloud** (hetzner.com/cloud) | Primary VPS (Ashburn CCX13) + external watchdog VPS (Falkenstein CX11) | CCX13 Ashburn + CX11 Falkenstein; separate servers, separate projects recommended | ~$25 + $5 = ~$30/mo | Same-day | YES — needed Week 1 |
+| 2 | **QuantConnect** (quantconnect.com) | LEAN Cloud execution for Phase 1; paper-day clock starts Week 1 | **Researcher** tier (~$60/mo as of 2026-05; spec's "$20" was outdated — see `Docs/decisions-log.md`); create fresh organization (do not reuse any existing org) | $60/mo | Same-day | YES — needed Week 1 |
+| 3 | **Hetzner Cloud** (hetzner.com/cloud) | Primary VPS (Ashburn CCX13) + external watchdog VPS (EU; **Nuremberg** if Falkenstein unavailable) | CCX13 Ashburn + CX23 EU (CX11 retired; CX23 is current entry tier). Separate Hetzner projects required. | ~$25 + $5.59 = ~$30.59/mo | Same-day | YES — needed Week 1 |
 | 4 | **Cloudflare** (cloudflare.com) or **Namecheap** (namecheap.com) | Domain registrar; apex domain needed for Caddy auto-cert + WebAuthn rpID | Free registrar account; domain registration ~$10–15/yr | $10–15/yr | Same-day | YES — needed Week 1 |
 | 5 | **GitHub** (github.com) | Source control, CI/CD (GitHub Actions), GHCR image registry, in-app PR review surface | Free personal account; create GitHub App for in-app PR review surface | $0 | Same-day | YES — needed Week 1 |
 | 6 | **Discord** (discord.com) | Operational alert delivery; slash command interface; liveness check | Free; create a **private server** (operator-only); do not use an existing personal server | $0 | Same-day | YES — needed Week 2 |
@@ -130,17 +130,18 @@ Expected: no errors; each prints a version string.
 
 Monthly fixed cost estimate at Phase 0 start:
 
-| Item | Monthly Cost |
-|---|---|
-| Hetzner CCX13 (Ashburn primary) | ~$25 |
-| Hetzner CX11 (Falkenstein watchdog) | ~$5 |
-| QuantConnect Quant Researcher | $20 |
-| Domain (amortized) | ~$1 |
-| S3/Backblaze B2 | ~$2 |
-| Resend (free tier) | $0 |
-| Sentry (free tier) | $0 |
-| Anthropic API (agent; minimal Phase 0) | ~$5–20 |
-| **Total Phase 0 estimate** | **$58–73/mo** |
+| Item | Spec estimate | Actual (as of 2026-05-05) |
+|---|---|---|
+| Hetzner CCX13 (Ashburn primary) | ~$25 | $25 (matches) |
+| Hetzner watchdog (EU, CX23 — CX11 retired) | ~$5 | $5.59 |
+| QuantConnect (Researcher tier — was "$20 Quant Researcher" in spec) | $20 | **$60** (see `Docs/decisions-log.md`) |
+| GitHub Pro (required for branch protection on private repo) | $0 | **$4** (see `Docs/decisions-log.md`) |
+| Domain (amortized) | ~$1 | $1 |
+| S3/Backblaze B2 | ~$2 | $2 (not yet provisioned) |
+| Resend (free tier) | $0 | $0 |
+| Sentry (free tier) | $0 | $0 |
+| Anthropic API (agent; minimal Phase 0) | ~$5–20 | ~$5–20 |
+| **Total Phase 0 estimate** | **$58–73/mo** | **$103–118/mo** |
 
 At Phase 1 live start, Anthropic API usage increases. Monitor via `GET /api/system/costs`.
 
@@ -790,6 +791,9 @@ Maintain this table throughout the build. For each decision made: fill in **Date
 | **DP-014** | Vacation start (any time) | Duration: 1–7 days / 8–14 days / 15–30 days | Use minimum duration; system auto-halts new signals; existing positions continue to be managed | `/vacation start [days]` in Discord (Phase 1). Web-only resume (`/vacation end` not supported via Discord). Set calendar reminder for return. | Yes — `vacation_mode_toggled` | | | |
 | **DP-015** | IBKR margin call (broker-mandated liquidation outside system control) | Manual review and decide on position rebuild plan / halt + wait | Invoke kill switch immediately after liquidation; do not attempt to re-enter positions same day | `/halt margin-call-YYYYMMDD` in Discord; acknowledge in audit; 24h minimum reflection before any resume; review position sizing parameters with Claude Code | Yes — `kill_switch_triggered` reason `ibkr_margin_call` | | | |
 | **DP-016** | Parameter range expansion proposal (operator wants to widen agent-mutable range) | Widen range / keep current range | Keep current range; do not widen under drawdown | File as PR (must be PR; agent cannot loosen risk without human approval). Claude Code authors `PARAMETER_RANGE_*` constant update. CI linter verifies change. | Yes — `parameter_range_changed` | | | |
+| **DP-017** | Hetzner Falkenstein watchdog capacity unavailable at provisioning | Pick alternate EU DC (Nuremberg / Helsinki) OR pick US-West (Hillsboro) OR wait | Nuremberg (closest substitute to Falkenstein — same Hetzner DE region) | Provision watchdog in chosen DC; capture static IPv4; substitute into `<watchdog_static_ip>` Caddy allowlist at deploy | No (infra) | 2026-05-05 | Nuremberg (NBG1) | Falkenstein had no CX-line capacity; Nuremberg matches the spec's intent of EU watchdog geographically separated from US Ashburn. CX23 ($5.59/mo) replaces retired CX11 SKU. See `Docs/decisions-log.md`. |
+| **DP-018** | Branch protection on `main` requires GitHub Pro on private repos | Upgrade to Pro $4/mo / make repo public / skip branch protection | Upgrade to Pro | Upgrade in GitHub Billing; apply branch protection rule via `gh api PUT /repos/.../branches/main/protection` | No (infra) | 2026-05-05 | Upgraded GitHub Pro $4/mo | Public repo would expose strategy/risk/audit code — wrong trade for $4/mo. Skipping protection misses Week 1 mechanical gate. See `Docs/decisions-log.md`. |
+| **DP-019** | QuantConnect "Quant Researcher $20/mo" tier from spec doesn't exist at that price | Use Researcher $60 / build direct-IBKR (Phase 2 architecture) early / skip live trading | Use Researcher $60 | Subscribe to Researcher tier in QC org settings; capture Org ID + User ID + API token | No (infra) | 2026-05-05 | Researcher $60/mo | $40/mo over spec but inside soft alert ceiling. Direct-IBKR-from-start would push live trading back 3+ months. See `Docs/decisions-log.md`. |
 
 ---
 
@@ -1086,6 +1090,8 @@ sops -d secrets/live.enc.yaml | grep -A3 webauthn
 # 11. Plan of Action — First 2 Weeks
 
 Specific, ordered, time-approximate tasks. All tasks reference the pre-Phase-0 checklist (§2) for account prereqs.
+
+> **Day 1 status:** ✅ COMPLETED 2026-05-05. All tasks executed. Concrete values captured in `Docs/decisions-log.md`. The procedural steps below remain the canonical template; deviations and actuals (Hetzner DC, watchdog DC, QC pricing, GitHub Pro) are in the decisions log.
 
 ---
 
