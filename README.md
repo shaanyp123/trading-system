@@ -2,7 +2,20 @@
 
 A solo-operator algorithmic trading system. Multi-asset systematic trend-following on micro futures + bond ETFs. Built over 12 months across four phases (Phase 0 = 8-week foundation; Phase 1 = live track record on QuantConnect; Phase 2 = custom infrastructure migration; Phase 3 = capital scaling).
 
-This repo currently contains **documentation only**. Code lands during Phase 0 (week 1+).
+## Build status
+
+| Phase | Window | Status |
+|---|---|---|
+| Phase 0 — foundation | Weeks 0–8 | 🔄 Week 1 in progress (Day 1 ✅ 2026-05-05) |
+| Phase 1 — QC live | Months 2–5 | ⏳ Not started |
+| Phase 2 — direct IBKR | Months 5–9 | ⏳ Not started |
+| Phase 3 — capital scaling | Months 9–12 | ⏳ Not started |
+
+**Day 1 close (2026-05-05):** all account/infra prereqs done. IBKR submitted (account `U25655583`, $1 funded for priority review). Domain `spratcapital.com` (Cloudflare). Hetzner servers `trading-primary` (Ashburn CCX13) + `trading-watchdog` (Nuremberg CX23 — Falkenstein had no capacity). GitHub repo `trading-system` scaffolded (PR #1 merged), branch protection live on `main`. Cloudflare DNS apex+www → 178.156.239.84. Ashburn VPS bootstrapped (Docker, trading user, UFW). QuantConnect org "SPRAT Capital" on Researcher tier ($60/mo).
+
+Concrete deviations from spec (Hetzner DC, QC pricing, GitHub Pro): see [`Docs/decisions-log.md`](Docs/decisions-log.md).
+
+Code structure now exists in `apps/`, `services/`, `packages/`, `alembic/`, `deploy/`, `secrets/`, `scripts/`, `tests/`, `infrastructure/`, `strategies/`, `lean/`, `watchdog/`. Phase 0 Day 2 onward fills these with real code.
 
 ---
 
@@ -13,23 +26,35 @@ This repo currently contains **documentation only**. Code lands during Phase 0 (
 ├── README.md                          # This file — start here
 ├── CLAUDE.md                          # Orientation for Claude Code sessions (auto-discovered)
 ├── implementation-guide.md            # Operator's daily handbook ← OPEN THIS DAILY
+├── Makefile                           # make lint / typecheck / test / ci / all
+├── pyproject.toml                     # Python 3.11 + ruff/mypy/pytest config
+├── docker-compose.yml                 # 19-service stack; phase2 profile gates ib_gateway + lean_local
+├── .github/workflows/ci.yml           # ruff + gitleaks (typecheck/test/docker-build commented until code lands)
+├── .github/CODEOWNERS                 # forbidden-whitelist enforcement sentinel
+├── .gitleaks.toml                     # secret-scan rules + allowlist
 │
 ├── Docs/                              # Reference documentation
-│   ├── backend-spec.md                # Backend architecture (~4500 lines)
+│   ├── backend-spec.md                # Backend architecture (~4800 lines)
 │   ├── frontend-spec.md               # Frontend architecture (~4900 lines)
-│   └── claude-dev-guide.md            # Coding patterns + anti-patterns (read by Claude Code)
+│   ├── claude-dev-guide.md            # Coding patterns + anti-patterns (read by Claude Code)
+│   └── decisions-log.md               # Decisions and deviations from specs (append-only)
+│
+├── apps/web/                          # Next.js frontend (scaffold only; built Week 6)
+├── services/                          # 13 Python services (audit, risk, signal, execution, ...) — see services/README.md
+├── infrastructure/                    # retry, broker_reconnect, logging
+├── strategies/v1_trend_following/     # v1 Donchian/MA strategy (built Day 2+)
+├── lean/                              # QC LEAN config (built Day 4)
+├── watchdog/                          # External watchdog Python script (deployed Day 4)
+├── packages/                          # api-types, discord-types
+├── alembic/versions/                  # DB migrations (built Week 3)
+├── deploy/                            # Caddyfile + .env.example
+├── secrets/                           # sops-encrypted *.enc.yaml only (plaintext blocked by .gitignore)
+├── scripts/                           # helper scripts
+├── tests/                             # unit / integration / golden / e2e
 │
 ├── Prompts/                           # Generation prompts (archived; reproducibility)
-│   ├── prompt-a-backend-spec.md
-│   ├── prompt-b-frontend-spec.md
-│   ├── prompt-c-implementation-guide.md
-│   ├── prompt-d-claude-dev-guide.md
-│   └── prompt-e-tandem-review.md
-│
 └── Archive/                           # Reserved for superseded versions
 ```
-
-When code lands in Phase 0 week 1, additional top-level directories will appear: `apps/`, `services/`, `packages/`, `alembic/`, `deploy/`, `secrets/`, `scripts/`, `tests/`.
 
 ---
 
@@ -88,22 +113,28 @@ Common reasons you (the operator) open it:
 
 **Living-doc updates:** new canonical pattern → add to §5; new anti-pattern from postmortem → add to §11; tooling change → §3 or §4.
 
+### `Docs/decisions-log.md` (decisions + deviations)
+
+**Append-only log of where reality differs from the specs.** Each entry: date, topic, spec reference, what spec said, what we actually did, rationale, cost/scope impact.
+
+**You open it when:**
+- Reading a spec value (cost, hardware, vendor, pricing) and want to know if it's still current
+- A future session wants to understand "why is X done this way when the spec says Y?"
+- Annual review of how the build diverged from the original plan
+
+**Update protocol:** every session that makes a non-trivial decision adds an entry. Entries are append-only — if a decision is reversed, add a new entry referencing the old one.
+
 ---
 
-## How to start (Day 1, Monday)
+## Day 1 status (2026-05-05) — DONE
 
-Pre-Day-1: spend 30 min reading **`implementation-guide.md` §1, §2, §11**. That's it. Don't try to read everything.
+Day 1 of Phase 0 Week 1 is complete. See [`Docs/decisions-log.md`](Docs/decisions-log.md) for actuals.
 
-Then execute `implementation-guide.md` §11 day-by-day. Day 1 actions in priority order:
+Day 2 work begins next session — see `implementation-guide.md` §11 Day 2.
 
-1. **08:00** — Open IBKR Pro account application ([interactivebrokers.com](https://www.interactivebrokers.com/en/index.php?f=4969)). 1–2 week turnaround. **Critical path** — start first.
-2. **09:00** — Register apex domain at Cloudflare or Namecheap (~$10–15/yr). This becomes `<your-domain>` everywhere in the docs.
-3. **10:00** — Provision Hetzner Cloud accounts: Ashburn primary VPS (CCX13 ~$25/mo) + Falkenstein watchdog (CX11 ~$5/mo).
-4. **11:00** — Initialize GitHub repo + create GitHub App for in-app PR review surface.
-5. **Afternoon** — Create QuantConnect organization (fresh org; Quant Researcher tier $20/mo).
-6. **End of day** — Check off Day 1 verification gate in `implementation-guide.md` §11.
+The original Day-1-Monday-priority-list is preserved in `implementation-guide.md` §11 as the canonical template; this section's old "How to start" walkthrough was Day-1-specific and is now historical.
 
-Open ONE Claude Code session at a time. Each new session: it auto-reads `CLAUDE.md`, which points it at `Docs/claude-dev-guide.md` §1 (Session Protocol). Tell it which `implementation-guide.md` section you're working on. It does the implementation work; you review.
+Open ONE Claude Code session at a time. Each new session: it auto-reads `CLAUDE.md`, which points it at `Docs/claude-dev-guide.md` §1 (Session Protocol) and `Docs/decisions-log.md`. Tell it which `implementation-guide.md` section you're working on. It does the implementation work; you review.
 
 ---
 
