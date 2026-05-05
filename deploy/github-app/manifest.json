@@ -1,0 +1,19 @@
+{
+  "name": "trading-system-pr-review",
+  "url": "https://spratcapital.com/system",
+  "description": "Backend service identity for the in-app PR review surface. Reads pull-request diffs and metadata; merges on operator approval via the in-app surface (per backend-spec.md §8.10). Single-account, single-repo install on shaanyp123/trading-system.",
+  "public": false,
+  "default_permissions": {
+    "contents": "write",
+    "pull_requests": "write",
+    "metadata": "read",
+    "actions": "read",
+    "checks": "read",
+    "issues": "read",
+    "members": "none",
+    "administration": "none",
+    "secrets": "none",
+    "workflows": "none"
+  },
+  "default_events": []
+}
