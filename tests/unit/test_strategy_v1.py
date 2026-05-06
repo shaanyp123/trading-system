@@ -89,7 +89,7 @@ class TestV1Parameters:
         assert "LOOKBACK_DAYS_DONCHIAN" in canonical
         assert "MIN_HOLDING_DAYS" in canonical
         # Values are stringified (Decimal precision preservation).
-        assert canonical["HURST_THRESHOLD"] == "0.50"
+        assert canonical["HURST_THRESHOLD"] == "0.55"
         assert canonical["LOOKBACK_DAYS_DONCHIAN"] == "60"
 
     def test_invalid_ma_pair_rejected(self) -> None:

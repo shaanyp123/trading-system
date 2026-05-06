@@ -36,7 +36,13 @@ V1_DEFAULTS: Final[dict[str, int | str]] = {
     "LOOKBACK_DAYS_DONCHIAN": 60,
     "MA_FAST_DAYS": 50,
     "MA_SLOW_DAYS": 200,
-    "HURST_THRESHOLD": "0.50",
+    # HURST_THRESHOLD = 0.55, not 0.50, to compensate for the R/S estimator's
+    # known small-sample upward bias on a 60-bar window (typically inflates H
+    # by ~0.05). 0.55 is what 0.50 buys you on a 60-bar lookback after
+    # de-biasing — i.e. "moderate persistence" rather than "any positive
+    # autocorrelation." Agent can tighten further (up direction = stricter)
+    # via tighten_parameter; PR required to loosen below 0.50.
+    "HURST_THRESHOLD": "0.55",
     # Stop / exit. ATR_LOOKBACK_DAYS and MIN_HOLDING_DAYS are LOCKED at the values
     # in backend-spec §2.3 — agent cannot tighten; PR required to change.
     "STOP_DISTANCE_ATR_MULT": "3.0",
@@ -49,26 +55,30 @@ V1_DEFAULTS: Final[dict[str, int | str]] = {
     "ROLL_DAYS_BEFORE_EXPIRY": 5,
 }
 
-# Phase 1 candidate sub-universe — DRAFT, gated on Week 2 verification.
+# Phase 1 candidate sub-universe — LOCKED on 2026-05-05 per Docs/decisions-log.md.
 #
-# Each line: market symbol + one-line rationale. The active universe at runtime
-# is the output of services/risk/sizing.py Stage 0 (1-contract-notional <= 50% x
-# equity per backend-spec §2.4.1). Phase 1 sub-universe verification
-# (implementation-guide §3 Week 2 Tue) confirms each candidate has executable
-# QC bundled data; that verification may shrink this list.
+# Each line: market symbol + one-line rationale. This is the CANDIDATE POOL that
+# Stage 0 of position sizing (services/risk/sizing.py per backend-spec §2.4.1)
+# filters at runtime via the 1-contract-notional <= 50% x equity rule. The
+# active set at $15k-$25k starting equity will be a subset; at higher equity
+# tiers more candidates qualify. Week 2 verification (implementation-guide §3
+# Week 2 Tue) is a data-executability check (QC bundled data availability
+# per market) — it may flag specific markets as data-unavailable but the
+# locked candidate pool below is the universe the strategy code targets.
 #
 # Source for inclusion: backend-spec §2.3 ("micro futures + bond ETFs") +
-# implementation-guide §3 Week 2 Mon + frontend-spec illustrative examples
-# (/MES, /MNQ, TLT). Operator approves final set after Week 2 dry-run.
+# implementation-guide §3 Week 2 Mon. Coverage rationale: 4 micro families
+# (equity index, rates-via-ETF, commodity, crypto) at the smallest available
+# CME contract sizes plus the standard 4-point bond-ETF curve.
 V1_CANDIDATE_UNIVERSE: Final[tuple[str, ...]] = (
     # CME micro futures.
     "/MES",  # E-mini S&P 500 Micro      ($5 x index;     ~$26k notional @ 5235)
-    "/MNQ",  # E-mini Nasdaq-100 Micro   ($2 x index;     ~$36k notional @ 18000) — may be excluded at $15k tier
+    "/MNQ",  # E-mini Nasdaq-100 Micro   ($2 x index;     ~$36k notional @ 18000)
     "/MYM",  # E-mini Dow Micro          ($0.50 x index;  ~$20k notional @ 40000)
     "/M2K",  # E-mini Russell 2000 Micro ($5 x index;     ~$10k notional @ 2000)
     "/MGC",  # Gold Micro                (10 oz x $;      ~$24k notional @ $2400)
     "/MCL",  # WTI Crude Micro           (100 bbl x $;    ~$8k notional  @ $80)
-    "/MBT",  # Bitcoin Micro             (0.1 BTC x $;    ~$10k notional @ $100k) — Stage 0 sensitivity high
+    "/MBT",  # Bitcoin Micro             (0.1 BTC x $;    ~$10k notional @ $100k)
     # NYSE bond ETFs (cash equity, no contract roll).
     "TLT",  # 20+ Year Treasury  — long-duration anchor
     "IEF",  # 7-10 Year Treasury — intermediate
