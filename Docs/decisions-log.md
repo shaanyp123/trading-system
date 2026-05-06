@@ -305,6 +305,30 @@ text remains unchanged and this log records the deviations.
 
 ---
 
+### 2026-05-05 — Day 3 — `risk-review-approved` label created; `forbidden-paths` CI gate shipped
+
+- **Spec reference:** `Docs/claude-dev-guide.md` §2.2 (forbidden whitelist), §11 [A02] ("The pre-merge linter is mechanical and will block the merge"); CLAUDE.md "Forbidden file path whitelist".
+- **Pre-existing gap (discovered Day 3):** the `risk-review-approved` label and the "pre-merge linter" referenced in dev-guide §11 [A02] never actually existed. The label wasn't created in the GitHub repo (only the 9 default labels — `bug`, `enhancement`, etc.); `.github/workflows/ci.yml` had four jobs (lint, gitleaks, typecheck, test) but none of them gated on the label. Day 3's PR #9 was the first to touch a forbidden-whitelist path (`alembic/**`), so the gap was invisible until then.
+- **Decision (this entry):** create the label + ship the CI gate as a follow-up to PR #9.
+  - **Label:** `risk-review-approved`, color `0e8a16` (green = approved), description `Operator approves forbidden-whitelist PR for merge (dev-guide §11 [A02]).` Created Day 3 via `gh label create`. Applied to PR #9 by the operator after review.
+  - **CI gate:** new `.github/workflows/forbidden-paths.yml` workflow. On every PR to `main`, diffs against the base SHA, matches changed files against the eleven forbidden-whitelist regexes, and — if any match — fails the check unless `risk-review-approved` is on the PR. The `pull_request.types: [labeled, unlabeled]` filter means applying the label re-runs the check automatically. Failure message includes the file list, a pointer to dev-guide §2.2 + §11 [A02], and the exact `gh pr edit ... --add-label` command to unblock.
+- **Operator action required (one-time):** add the `forbidden-paths (risk-review-approved gate)` check to the required-status-checks list in `main`'s branch protection. Without that, the gate is advisory rather than blocking. Procedure: GitHub repo → Settings → Branches → main rule → "Require status checks to pass" → add by name. Or via API: see `deploy/github-app/README.md` patterns.
+- **Cost / scope impact:** none. CI run-time addition is ~20s (single Ubuntu runner with `actions/checkout` + `git diff` + `gh pr view`).
+
+---
+
+### 2026-05-05 — Day 3 — Migration filename convention LOCKED (hybrid: numeric foundational + date operational)
+
+- **Spec reference:** `Docs/claude-dev-guide.md` §7.1 (Alembic migration conventions); `implementation-guide.md` §11 Day 3 (numeric `0001_audit_log.py` … `0006_roles.py`).
+- **Decision (operator-confirmed 2026-05-05):** hybrid convention.
+  - **Foundational migrations** (initial schema bootstrap, applied as one closed batch): `NNNN_<short_description>.py`, monotonic from `0001_`. Used for Day 3 migrations 0001–0006. **Closed set** — do NOT extend with `0007_` later; the next migration starts the operational scheme.
+  - **Operational migrations** (every migration authored Day 4 onward): `YYYY-MM-DD_<short_description>.py`. Filename carries the authorship date; same-day migrations disambiguate by suffix (`_part2`, `_v2`).
+- **Rationale:** the foundational set is one-shot batch bootstrap with stable ordering implied by the numeric prefix; operational migrations are time-sequenced and the date is the more useful sort key. Hybrid is the lowest-friction option — zero churn on already-shipped Day 3 files, and no merge-conflict risk for solo-operator workflow either way.
+- **Resolution:** dev-guide §7.1 updated to document both schemes with the cutoff explicit. The example block (formerly the single date-based example) now serves as the operational-scheme example.
+- **Cost / scope impact:** none.
+
+---
+
 ## Open follow-ups (post-Day-3)
 
 ### From Day 1 (carried)
@@ -323,7 +347,8 @@ text remains unchanged and this log records the deviations.
 - [ ] **Operator (anytime post-merge)** — fill the actually-sensitive secret values via `sops secrets/<env>.enc.yaml` for each env (per the Day 3 sops decision-log entry above). Minimum set for paper VPS bringup (Day 3 13:00+): `postgres.app_service_password`, `postgres.app_owner_password`, `discord.bot_token`, `discord.guild_id`, `discord.webhook_urls.*`, `github.app_private_key`, `internal.watchdog_bearer_token`, `internal.ipc_bearer_token`, QC tokens.
 - [ ] **Operator (Day 3 13:00 or whenever paper VPS is provisioned)** — bootstrap Postgres roles' passwords: `openssl rand -hex 32` × 2 → paste into `secrets/paper.enc.yaml` AND run `ALTER ROLE app_service WITH LOGIN PASSWORD '<value>'; ALTER ROLE app_owner WITH LOGIN PASSWORD '<value>';` on the paper VPS as superuser. Migration 0006 created the roles NOLOGIN with no passwords.
 - [ ] **Partition-rollover cron (Dec 31 each year)** — when adding `audit_log_y<next>`, ALSO attach the no-truncate trigger: `CREATE TRIGGER audit_log_y<next>_no_truncate BEFORE TRUNCATE ON audit_log_y<next> FOR EACH STATEMENT EXECUTE FUNCTION block_audit_truncate();`. Easy to forget and silently break TRUNCATE blocking on the new partition. Cron lands later (Phase 1 ops).
-- [ ] **Optional dev-guide update** — §7.1 migration filename convention (`YYYY-MM-DD_<short>.py`) is at odds with the implementation-guide-prescribed numeric scheme (`0001_<topic>.py`) used in this PR. Recommendation: numeric for the foundational set (Day 3 schema), date-based for everything after. Pending operator decision before §7.1 is edited.
+- [x] ~~**Optional dev-guide update** — §7.1 migration filename convention~~ — resolved 2026-05-05 (hybrid scheme adopted; see entry above).
+- [ ] **Operator (anytime post-`forbidden-paths` PR merge)** — add `forbidden-paths (risk-review-approved gate)` to the required-status-checks list in `main`'s branch protection so the gate becomes blocking rather than advisory.
 
 ---
 

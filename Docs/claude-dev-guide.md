@@ -1889,12 +1889,21 @@ CI runs unit + integration on every PR. Weekly cron runs golden-test + vectorbt-
 
 ## 7.1 Alembic Migration Conventions
 
-- Filename: `YYYY-MM-DD_<short_description>.py`
+**Filename convention (hybrid; locked 2026-05-05 Day 3):**
+
+- **Foundational migrations** — initial schema bootstrap, applied as one closed batch. Filename: `NNNN_<short_description>.py`, monotonic from `0001_`. Used for the Day 3 Phase 0 migrations 0001–0006 (`audit_log`, core tables, risk tables, ops tables, immutability, roles). Do NOT extend the numeric series with `0007_` later — append-only filenames continue under the operational scheme below.
+- **Operational migrations** — every migration authored Day 4 onward. Filename: `YYYY-MM-DD_<short_description>.py`. The filename carries the authorship date; same-day migrations disambiguate by suffix (`_part2`, `_v2`).
+
+**Other rules:**
+
 - One logical change per migration.
 - Both `upgrade()` AND `downgrade()` always implemented and tested.
 - Additive changes (add column with default, add index) deploy without downtime.
 - Transformative changes (rename column, change type, drop column) require maintenance window: Saturday 17:00 ET → Sunday 18:00 ET.
 - Migration runner MUST abort if a CME session is active outside the maintenance window.
+- All `alembic/**` paths are forbidden-whitelist (§2.2). Every migration PR requires the `risk-review-approved` label; the `forbidden-paths` CI workflow gates the merge.
+
+Example operational migration (numeric foundational migrations look the same modulo filename):
 
 ```python
 # alembic/versions/2026-05-05_add_reconciliation_breaks.py
@@ -2486,7 +2495,7 @@ async def approve_signal(
 |---|---|---|---|
 | 1 | Repo scaffold (pnpm workspace, ruff/mypy/pytest CI, pre-commit hooks); v1 strategy code authored on QC by Claude Code with operator review; Hetzner VPS provisioned (Ashburn primary + Falkenstein watchdog) | None (mostly setup) | Pre-commit passes; v1 strategy commits clean; VPS reachable via SSH; CI green on first PR |
 | 2 | Phase 1 sub-universe verification (data executability + 50% single-contract-notional rule per current equity); sops + age key generated, encrypted env files committed; QC paper trading kicks off (paper-day clock starts) | QC paper data | Active universe enumerated for current equity tier; `sops -d secrets/dev.enc.yaml` decrypts; first QC paper session logged |
-| 3 | FastAPI `/api/health` + `/internal/health/deep`; Postgres connection pool (asyncpg); structlog JSON setup; `audit_log` DDL migration with hash chain; `append_audit_event()` with advisory lock + SERIALIZABLE retry loop; immutability triggers + EVENT TRIGGER for TRUNCATE | DB connectivity | `GET /api/health` returns 200; `test_audit_append_concurrent_writers_serialize_correctly` passes; TRUNCATE on `audit_log` blocked by EVENT TRIGGER |
+| 3 | FastAPI `/api/health` + `/internal/health/deep`; Postgres connection pool (asyncpg); structlog JSON setup; `audit_log` DDL migration with hash chain; `append_audit_event()` with advisory lock + SERIALIZABLE retry loop; immutability triggers (BEFORE UPDATE/DELETE per row + BEFORE TRUNCATE per statement on parent + every yearly partition; spec §2.10.2's EVENT TRIGGER pattern doesn't fire on TRUNCATE — see `Docs/decisions-log.md` 2026-05-05 Day 3) | DB connectivity | `GET /api/health` returns 200; `test_audit_append_concurrent_writers_serialize_correctly` passes; TRUNCATE on `audit_log` (parent + any yearly partition) blocked by `BEFORE TRUNCATE` trigger |
 | 4 | QC ObjectStore client scaffold; `qc_adapter_cursor` table; golden-test harness; QC parity fixtures for 5 session event types; JCS canonicalization helper | QC mock + ObjectStore | Golden test passes for all 5 fixtures byte-for-byte modulo `{ingest_clock_ts, ingest_uuid, sequence_no}` |
 | 5 | REST scaffolding for Phase 1 endpoints; SSE channel `/api/sse/events` with multiplexed event types; instruction round-trip processor (Phase 1); reconciliation service skeleton | DB + QC mock | SSE connection + 24h replay via `last-event-id` works; instruction round-trip < 20s p99 against mock |
 | 6 | Next.js scaffold; WebAuthn registration/login backend handlers (UV `required`); route phase-gate middleware via `routes.config.ts`; Caddy reverse proxy with SSE flush directives | Web ↔ API | `/setup` + `/login` passkey flow works end-to-end; tab eviction (N=4) emits `session_evicted` |
