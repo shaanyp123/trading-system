@@ -1,0 +1,91 @@
+name: forbidden-paths
+
+# Mechanical enforcement of dev-guide §2.2 + §11 [A02]: any PR that touches
+# a forbidden-whitelist path must carry the `risk-review-approved` label
+# before it can merge into main.
+#
+# The label says "operator has reviewed this PR for risk impact and approves
+# merge." Without it, this job fails and branch protection blocks the merge.
+#
+# To unblock a flagged PR:
+#   1. Operator reviews the diff (per dev-guide §13 operator review checklist)
+#   2. Apply the label: `gh pr edit <num> --add-label risk-review-approved`
+#   3. This job re-runs automatically on label change and turns green.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  forbidden-paths-gate:
+    name: forbidden-paths (risk-review-approved gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changes against forbidden-whitelist
+        id: detect
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          # Whitelist patterns — keep in sync with dev-guide §2.2 and CLAUDE.md.
+          # Each entry is a POSIX regex matching from the start of the path.
+          FORBIDDEN_REGEX='^(services/risk/|services/signal/|services/audit/|services/execution/|services/reconciliation/|services/calibration/|services/agent/decisions/|services/agent/risk_actions/|services/agent/parameter_changes/|services/agent/prompts/decision/|alembic/)'
+
+          # `git diff --name-only base..head` lists changed files in this PR.
+          # `|| true` so an empty match doesn't fail under `set -e`.
+          CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep -E "$FORBIDDEN_REGEX" || true)
+
+          if [ -n "$CHANGED" ]; then
+            {
+              echo "forbidden_touched=true"
+              echo 'forbidden_files<<EOF'
+              echo "$CHANGED"
+              echo 'EOF'
+            } >> "$GITHUB_OUTPUT"
+            echo "::notice title=Forbidden-whitelist files changed::This PR touches paths that require the 'risk-review-approved' label."
+            echo "Changed forbidden-whitelist files:"
+            echo "$CHANGED" | sed 's/^/  - /'
+          else
+            echo "forbidden_touched=false" >> "$GITHUB_OUTPUT"
+            echo "No forbidden-whitelist files changed; gate is a no-op."
+          fi
+
+      - name: Verify risk-review-approved label
+        if: steps.detect.outputs.forbidden_touched == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          LABELS=$(gh pr view "$PR_NUMBER" --json labels --jq '.labels[].name')
+
+          if echo "$LABELS" | grep -qx 'risk-review-approved'; then
+            echo "✓ risk-review-approved label present; gate passes."
+            exit 0
+          fi
+
+          # Failure path — emit a useful message for the operator.
+          echo "::error title=risk-review-approved label required::This PR touches forbidden-whitelist paths but lacks the 'risk-review-approved' label."
+          echo
+          echo "Forbidden-whitelist files changed:"
+          echo '${{ steps.detect.outputs.forbidden_files }}' | sed 's/^/  - /'
+          echo
+          echo "Policy: Docs/claude-dev-guide.md §2.2 (forbidden whitelist) and §11 [A02] (anti-pattern)."
+          echo
+          echo "To unblock: review the diff for risk impact (per dev-guide §13 operator"
+          echo "review checklist), then run:"
+          echo
+          echo "  gh pr edit $PR_NUMBER --add-label risk-review-approved"
+          echo
+          exit 1
