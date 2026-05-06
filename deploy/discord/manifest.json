@@ -1,0 +1,93 @@
+{
+  "$schema": "internal — not a Discord-published manifest format",
+  "purpose": "Canonical declaration of the Discord server + bot config the operator creates in the developer portal UI on Day 2 14:00. Source-of-truth if the server or bot needs to be re-created.",
+  "guild": {
+    "name": "trading-system",
+    "type": "private; operator-only",
+    "channels": [
+      {
+        "name": "daily-brief",
+        "type": "text",
+        "purpose": "Daily morning briefing and weekly/monthly summaries. Posted by the agent (Phase 1+) at the configured cadence.",
+        "audit_event_types": ["liveness_probe_sent", "liveness_probe_acknowledged"],
+        "phase_introduced": 0
+      },
+      {
+        "name": "signals",
+        "type": "text",
+        "purpose": "Per-signal-cycle posts: each candidate signal (long/short/flat) and operator-decision summary at 17:30 ET.",
+        "audit_event_types": ["signal_emitted", "signal_approved", "signal_rejected", "signal_deferred", "signal_expired", "bulk_approve_invoked"],
+        "phase_introduced": 0
+      },
+      {
+        "name": "fills",
+        "type": "text",
+        "purpose": "Order fills (full + partial), cancellations, rejections. One post per fill event.",
+        "audit_event_types": ["order_filled", "order_partially_filled", "order_cancelled", "order_rejected", "order_retry_attempted"],
+        "phase_introduced": 0
+      },
+      {
+        "name": "alerts",
+        "type": "text",
+        "purpose": "P1/P2 operational alerts: reconciliation breaks, vol-regime trips, margin warnings, calendar-unratified reminders.",
+        "audit_event_types": ["reconciliation_break_detected", "reconciliation_break_resolved", "calendar_unratified", "service_degraded", "service_recovered", "engagement_timeout_triggered"],
+        "phase_introduced": 0
+      },
+      {
+        "name": "critical",
+        "type": "text",
+        "purpose": "P0 alerts requiring immediate operator attention: kill-switch triggered, audit chain break, hash-chain integrity failures, halt-new transitions.",
+        "audit_event_types": ["kill_switch_triggered", "state_transition_normal_to_halt", "external_watchdog_alert", "incident_review_logged", "audit_chain_integrity_verified"],
+        "phase_introduced": 0
+      },
+      {
+        "name": "ops",
+        "type": "text",
+        "purpose": "Slash-command surface for operator-invoked actions: /positions, /halt, /resume, /ratify, /vacation, /diary. Bot responses thread here.",
+        "audit_event_types": ["manual_close_invoked", "vacation_started", "vacation_ended", "calendar_ratified"],
+        "phase_introduced": 0
+      },
+      {
+        "name": "audit",
+        "type": "text",
+        "purpose": "Append-only mirror of selected audit_log events (never the entire stream — high-signal subset). Useful for at-a-glance integrity verification on mobile.",
+        "audit_event_types": ["pr_approved", "pr_rejected", "pr_merged", "parameter_change_applied", "strategy_version_deployed", "secrets_rotated", "breakglass_invoked"],
+        "phase_introduced": 0
+      }
+    ],
+    "phase_2_additions": [
+      {
+        "name": "ask-agent",
+        "purpose": "Q&A surface for /ask command (frontend-spec.md §1615). NOT created on Day 2 — added when Phase 2 agent-Q&A surface ships per implementation-guide.md month 5+.",
+        "phase_introduced": 2
+      }
+    ]
+  },
+  "bot": {
+    "name": "Trading System Bot",
+    "description": "Posts signals/fills/alerts to the trading-system server; processes operator slash commands. Owned by operator.",
+    "oauth_scopes": ["bot", "applications.commands"],
+    "permissions_bitfield": 84992,
+    "permissions_breakdown": {
+      "VIEW_CHANNEL": 1024,
+      "SEND_MESSAGES": 2048,
+      "EMBED_LINKS": 16384,
+      "READ_MESSAGE_HISTORY": 65536
+    },
+    "permissions_explicitly_NOT_granted": [
+      "MANAGE_MESSAGES (no message deletion — operator-deletes only; preserves audit-style append-only feel)",
+      "MENTION_EVERYONE (no @everyone pings — too noisy)",
+      "MANAGE_CHANNELS (no channel mutation — channels are managed manually)",
+      "ADMINISTRATOR (defense in depth; never grant)"
+    ],
+    "intents_required": [
+      "GUILDS (channel + guild metadata)",
+      "GUILD_MESSAGES (process slash command interactions)"
+    ],
+    "intents_explicitly_NOT_required": [
+      "MESSAGE_CONTENT (we use slash commands, not message-content parsing — privileged intent unnecessary)",
+      "GUILD_PRESENCES, GUILD_MEMBERS (privileged; not used)"
+    ]
+  },
+  "secrets_schema_target": "deploy/sops/secret_schemas/{paper,live}.template.yaml under the `discord:` key. The operator captures values during Day 2 14:00 runbook execution and they're encrypted into secrets/{paper,live}.enc.yaml on Day 3."
+}
