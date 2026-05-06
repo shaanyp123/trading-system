@@ -1,0 +1,29 @@
+# sops encryption rules — canonical reference at repo root.
+#
+# One age recipient per environment. Loss of an env's private key means loss
+# of that env's encrypted secrets only — that's the intended blast radius
+# (backend-spec §8.1.2). There is no master key. Recovery is paper-in-safe.
+#
+# Placeholders are substituted on Day 2 15:00 (or any time after operator
+# runs `age-keygen`) via:
+#
+#   bash scripts/sops_init.sh \
+#     "$(awk '/^# public key:/ {print $4}' ~/dev-key.txt)" \
+#     "$(awk '/^# public key:/ {print $4}' ~/paper-key.txt)" \
+#     "$(awk '/^# public key:/ {print $4}' ~/live-key.txt)"
+#
+# After substitution, each `secrets/<env>.enc.yaml` can be edited with
+# `sops secrets/<env>.enc.yaml` and is automatically encrypted on save with
+# only that env's recipient.
+#
+# Operator runbook: deploy/sops/README.md.
+
+creation_rules:
+  - path_regex: ^secrets/dev\.enc\.yaml$
+    age: age1f5mmkn6st8694n36wulj8emzjf5pl0a8herqfr9lqwmcpak5yeqqsfwujj
+
+  - path_regex: ^secrets/paper\.enc\.yaml$
+    age: age1dth25vwm75fpc32an0e77y39je2q8uyqe4sx3ysxjlamnlu6n43qrpa4wh
+
+  - path_regex: ^secrets/live\.enc\.yaml$
+    age: age1srnd3y9sx2ze0w2258v7dda3pvqw26r665uhr64kz50jw3w7sazqr63mrf

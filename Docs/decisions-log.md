@@ -115,6 +115,28 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ---
 
+### 2026-05-05 — Day 2 — sops 3.12 macOS: explicit `SOPS_AGE_KEY_FILE` required
+
+- **Spec reference:** `deploy/sops/README.md` Step 3 (original wording: "sops looks up age keys at this path by default"); `Docs/backend-spec.md` §8.1 (sops/age threat & recovery model).
+- **Spec said:** sops auto-resolves `~/.config/sops/age/keys.txt` as the default age identity file — no env var or config required.
+- **Actual decision:** sops 3.12.2 on macOS does NOT auto-resolve that path. Empirically: `sops -e -i secrets/dev.enc.yaml` succeeded (encryption only needs the public recipient from `.sops.yaml`), but `sops -d secrets/dev.enc.yaml` failed with `age: identity did not match any of the recipients` plus a fallback list mentioning only SSH-related env vars (`SOPS_AGE_SSH_PRIVATE_KEY_FILE`, `SOPS_AGE_KEY_FILE`, etc.) — notably no mention of the `~/.config/sops/age/keys.txt` default path. Workaround: `export SOPS_AGE_KEY_FILE="$HOME/.config/sops/age/keys.txt"` in `~/.zshrc`. Decryption then succeeded (`foo: bar` round-trip).
+- **Rationale:** unclear whether this is a sops 3.12 regression, a long-standing macOS-specific behavior, or our particular install (Homebrew sops 3.12.2 on Darwin 25.3) somehow disabled the default lookup. The empirical fix (explicit env var) is reliable and version-agnostic; we add it to the runbook as a required step rather than relying on the buggy default.
+- **Cost / scope impact:** none. One line in `~/.zshrc` per operator laptop. Not a deploy concern (CI/Hetzner contexts will set `SOPS_AGE_KEY_FILE` explicitly in their own env). Runbook updated in same PR (`deploy/sops/README.md` Step 3 split into 3a-install / 3b-export, Troubleshooting section now leads with this issue).
+
+---
+
+### 2026-05-05 — Day 2 — Three age keys generated, `.sops.yaml` populated, paper backups in safe
+
+- **Spec reference:** `deploy/sops/README.md` (full runbook); `Docs/backend-spec.md` §8.1.2 (paper-in-safe recovery model).
+- **Decision:** completed the Day 2 15:00 sops setup task. Three age keypairs generated (dev / paper / live); public keys substituted into `.sops.yaml` via `scripts/sops_init.sh`; private keys concatenated into `~/.config/sops/age/keys.txt` (perms 600); three printed copies on acid-free archival paper placed in fireproof safe (separate sleeves; not co-located with WebAuthn backup-codes paper); plaintext source files (`~/<env>-key.txt`) deleted. Annual rotation reminder set for 2027-05-05. Smoke test (encrypt → decrypt round-trip) passed after the env-var fix above.
+- **Public key fingerprints (for safe-to-digital cross-check during rotations):**
+  - dev: `age1f5mmkn6st8694n36wulj8emzjf5pl0a8herqfr9lqwmcpak5yeqqsfwujj`
+  - paper: `age1dth25vwm75fpc32an0e77y39je2q8uyqe4sx3ysxjlamnlu6n43qrpa4wh`
+  - live: `age1srnd3y9sx2ze0w2258v7dda3pvqw26r665uhr64kz50jw3w7sazqr63mrf`
+- **Cost / scope impact:** none. Day 3 09:00 sops initialization (encrypting GitHub App private key + Discord bot token + initial schema into `secrets/{dev,paper,live}.enc.yaml`) is now a 15-minute follow-on per the runbook's "What Day 3 will do" section.
+
+---
+
 ## Open follow-ups from Day 1
 
 - [ ] Watchdog Python script + systemd timer not yet deployed to Nuremberg (Day 4 work).

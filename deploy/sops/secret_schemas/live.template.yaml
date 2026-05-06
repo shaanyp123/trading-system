@@ -1,0 +1,84 @@
+# live.template.yaml — Hetzner Ashburn live environment (Phase 1+).
+#
+# Copy to `secrets/live.enc.yaml` and encrypt with sops on Day 8 (per
+# secrets/README.md — `live.enc.yaml` is created Day 8; live values added
+# at Week 8 IBKR cutover).
+#
+# `live` matches `paper` schema-wise. The ONLY differences are:
+#   - account_number (live vs paper)
+#   - flex_query_token (different IBKR token for live data)
+#   - quantconnect organization_id (live trading node, separate from paper)
+#   - rp_id/origin (apex spratcapital.com vs paper.spratcapital.com)
+#   - bearer tokens (independently generated; do not share with paper)
+#
+# All other values (Discord channels, Resend, S3, GitHub App) ARE shared
+# with paper — same Discord server, same Resend account, same S3 bucket,
+# same GitHub App. Only the broker-facing and auth-facing surfaces fork.
+
+postgres:
+  # Generated Week 8 via `openssl rand -hex 32` on the live VPS.
+  # MUST be different from paper passwords; live VPS isolation is critical.
+  app_service_password: <TODO_FROM_WEEK_8_POSTGRES_BOOTSTRAP>
+  app_owner_password: <TODO_FROM_WEEK_8_POSTGRES_BOOTSTRAP>
+
+ibkr:
+  account_number: <TODO_FROM_WEEK_8_IBKR_LIVE_ACCOUNT>
+  flex_query_token: <TODO_FROM_WEEK_8_IBKR_FLEX_LIVE>
+
+quantconnect:
+  # Live algorithm runs on QC's live trading node (Researcher tier; one node
+  # included). Token MAY be shared with paper if same QC organization holds
+  # both backtest and live algos; spec is silent. Default: same token, single org.
+  api_token: <TODO_FROM_DAY_3_QC_TOKEN_REGEN>
+  organization_id: <TODO_FROM_DAY_3_QC_ORG>
+
+anthropic:
+  # Same Anthropic workspace as paper; agent operates against both envs.
+  api_key: <TODO_FROM_WEEK_5_AGENT_BRINGUP>
+  workspace_id: <TODO_FROM_WEEK_5_AGENT_BRINGUP>
+
+discord:
+  # Same Discord server as paper. The bot posts to the same channels in both
+  # envs but tags the embed with env=paper or env=live so the operator can
+  # tell at a glance (frontend-spec §1.5: cross-environment segregation).
+  bot_token: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
+  guild_id: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
+  webhook_urls:
+    daily_brief: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
+    signals: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
+    fills: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
+    alerts: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
+    critical: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
+    ops: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
+    audit: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
+
+forex_factory:
+  api_token: null
+trading_economics:
+  api_token: <TODO_FROM_WEEK_2_CALENDAR_IMPORT>
+fred:
+  api_key: null
+
+s3:
+  access_key_id: <TODO_FROM_DAY_5_S3_PROVISION>
+  secret_access_key: <TODO_FROM_DAY_5_S3_PROVISION>
+  bucket: <TODO_FROM_DAY_5_S3_PROVISION>
+
+github:
+  app_id: <TODO_FROM_DAY_2_GITHUB_APP_RUNBOOK>
+  installation_id: <TODO_FROM_DAY_2_GITHUB_APP_RUNBOOK>
+  app_private_key: <TODO_FROM_DAY_2_GITHUB_APP_RUNBOOK>
+
+internal:
+  # MUST be regenerated independently from paper. Watchdog calls live VPS at
+  # the live `<your-domain>` apex with this bearer.
+  watchdog_bearer_token: <TODO_FROM_WEEK_8_BEARER_GENERATE>
+  ipc_bearer_token: <TODO_FROM_WEEK_8_BEARER_GENERATE>
+
+webauthn:
+  rp_id: spratcapital.com                   # apex (NOT paper subdomain)
+  origin: https://spratcapital.com
+
+resend:
+  api_key: <TODO_FROM_DAY_3_RESEND_PROVISION>
+  from_address: shaanrpatel2@gmail.com
