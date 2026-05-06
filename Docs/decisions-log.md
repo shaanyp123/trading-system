@@ -215,19 +215,22 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ---
 
-### 2026-05-05 — Day 2 — GitHub App creation status
+### 2026-05-05 — Day 2 — GitHub App created and installed (complete)
 
 - **Spec reference:** `implementation-guide.md` §11 Day 2 09:30; `deploy/github-app/README.md`.
-- **Status:** **operator-confirm pending.** Operator's working assumption is that the runbook was executed but is not certain. Claude Code cannot independently verify because GitHub's `GET /user/installations` endpoint requires a JWT signed by the app's own private key (chicken-and-egg) and there is no operator-token-accessible "list my apps" endpoint.
-- **Operator action to close this entry:** visit https://github.com/settings/apps . If `trading-system-pr-review` (or the suffix-variant the operator chose) is listed, capture the App ID and append below. Then visit https://github.com/settings/installations to capture the Installation ID. If the runbook was NOT executed, schedule it (~10 min) — non-blocking for any other Day 2 work.
-- **App ID:** `<TODO_FROM_OPERATOR>`
-- **Installation ID:** `<TODO_FROM_OPERATOR>`
+- **Status:** complete. Operator ran Steps 1–3 of the runbook end-to-end.
+- **App name:** `trading-system-pr-review`
+- **App ID:** `3615825`
+- **Installation ID:** `129868686` (single install on `shaanyp123/trading-system`, repo-scoped)
+- **Private key** (1.7 KB RSA `.pem`): generated 2026-05-05; structurally valid (`openssl rsa -check -noout` returned `RSA key ok`); attached to 1Password Secure Note `github-app-pr-review-private-key`; original local download deleted with `rm -P` (overwrite-then-unlink). Migrates to `secrets/{dev,paper,live}.enc.yaml github.app_private_key` on Day 3 09:00 sops setup per backend-spec §8.1.1.
+- **Permissions in effect** (per `deploy/github-app/manifest.json`): `contents:write`, `pull_requests:write`, `metadata:read`, `actions:read`, `checks:read`, `issues:read`. No webhooks. Privileged scopes (admin, secrets, workflows, members) explicitly NOT granted. 
+- **Annual rotation reminder:** add a 2027-05-05 calendar event to rotate the private key (procedure in `deploy/github-app/README.md` Step 6).
 
 ---
 
 ## Day 2 verdict
 
-All Day 2 implementation-guide §11 tasks complete pending one operator confirmation (GitHub App). Both [CLAUDE_CODE] tasks (09:30 GitHub App runbook, 11:00 v1 strategy) shipped via PRs #3 and #4. Both [OPERATOR] tasks (14:00 Discord, 15:00 sops/age) executed by operator on the canonical runbooks in `deploy/`. DNS verification passed.
+All Day 2 implementation-guide §11 tasks complete. Both [CLAUDE_CODE] tasks (09:30 GitHub App runbook, 11:00 v1 strategy) shipped via PRs #3 and #4. Both [OPERATOR] tasks (14:00 Discord, 15:00 sops/age) executed by operator on the canonical runbooks in `deploy/`. DNS verification passed. GitHub App created + installed (App ID 3615825 / Installation ID 129868686).
 
 ---
 
@@ -239,8 +242,7 @@ All Day 2 implementation-guide §11 tasks complete pending one operator confirma
 - [ ] **Optional** — Ashburn root SSH still allowed (B9 hardening; can disable any time).
 
 ### New from Day 2
-- [ ] **[OPERATOR]** Confirm GitHub App status; append App ID + Installation ID to the entry above. Non-blocking.
-- [ ] **Day 3 09:00** — populate `secrets/{dev,paper,live}.enc.yaml` from `deploy/sops/secret_schemas/*.template.yaml`; encrypt with sops; commit. Captured Day 2 values that land here: GitHub App private key (from 1Password), Discord bot token + guild_id + 7 channel_ids (from operator notes / 1Password).
+- [ ] **Day 3 09:00** — populate `secrets/{dev,paper,live}.enc.yaml` from `deploy/sops/secret_schemas/*.template.yaml`; encrypt with sops; commit. Captured Day 2 values that land here: GitHub App private key (from 1Password attachment `github-app-pr-review-private-key`), GitHub App ID `3615825` + Installation ID `129868686` (not secret but co-located per spec schema), Discord bot token + guild_id + 7 channel_ids (from operator notes / 1Password).
 - [ ] **Week 2 Mon** — `services/risk/sizing.py` Stage 0 implementation (forbidden whitelist; `risk-review-approved` label required).
 - [ ] **Week 2 Tue** — sub-universe data-executability check (QC bundled data availability per locked candidate); active universe at $15k–$25k tier emerges from Stage 0 dynamically (no manual finalization needed since the candidate pool is already locked).
 - [ ] **Week 3–4** — implement `V1TrendFollowing.generate_exit_candidates` (currently scaffolded with `NotImplementedError`).
