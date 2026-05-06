@@ -1192,6 +1192,8 @@ Open Claude Code session. Describe:
 > - Installation ID
 > - Instructions for adding private key to sops secrets"
 
+> **2026-05-05 deviation:** `POST /user/apps` is not a real GitHub endpoint; the manifest flow requires a live HTTP redirect URL the backend doesn't have on Day 2. Manual UI walkthrough is the correct path. Canonical artifacts now live at `deploy/github-app/manifest.json` (declared permissions) and `deploy/github-app/README.md` (operator click-by-click). See `Docs/decisions-log.md` 2026-05-05 Day 2 — "GitHub App created via UI walkthrough, not API" + "GitHub App created and installed (complete)".
+
 **11:00 [CLAUDE_CODE]** Author v1 strategy skeleton.
 Open Claude Code session. Describe:
 

@@ -2,6 +2,8 @@
 
 This directory holds sops-encrypted YAML files. **Plaintext secrets are blocked by `.gitignore`** and additionally rejected by the `gitleaks` CI gate (anti-pattern A11, dev-guide §11).
 
+The canonical schema for each env's secret file is in `deploy/sops/secret_schemas/{dev,paper,live}.template.yaml` — those are the unencrypted shapes the Day 3 09:00 sops setup copies here and encrypts. The setup procedure (age-keygen, `.sops.yaml` wiring, paper-in-safe backup, `SOPS_AGE_KEY_FILE` env var) is in `deploy/sops/README.md`.
+
 ## Files
 
 | File | Environment | Status |
