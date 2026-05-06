@@ -6,16 +6,18 @@ A solo-operator algorithmic trading system. Multi-asset systematic trend-followi
 
 | Phase | Window | Status |
 |---|---|---|
-| Phase 0 — foundation | Weeks 0–8 | 🔄 Week 1 in progress (Day 1 ✅ 2026-05-05) |
+| Phase 0 — foundation | Weeks 0–8 | 🔄 Week 1 in progress (Day 1 ✅ 2026-05-05; Day 2 ✅ 2026-05-05) |
 | Phase 1 — QC live | Months 2–5 | ⏳ Not started |
 | Phase 2 — direct IBKR | Months 5–9 | ⏳ Not started |
 | Phase 3 — capital scaling | Months 9–12 | ⏳ Not started |
 
 **Day 1 close (2026-05-05):** all account/infra prereqs done. IBKR submitted (account `U25655583`, $1 funded for priority review). Domain `spratcapital.com` (Cloudflare). Hetzner servers `trading-primary` (Ashburn CCX13) + `trading-watchdog` (Nuremberg CX23 — Falkenstein had no capacity). GitHub repo `trading-system` scaffolded (PR #1 merged), branch protection live on `main`. Cloudflare DNS apex+www → 178.156.239.84. Ashburn VPS bootstrapped (Docker, trading user, UFW). QuantConnect org "SPRAT Capital" on Researcher tier ($60/mo).
 
-Concrete deviations from spec (Hetzner DC, QC pricing, GitHub Pro): see [`Docs/decisions-log.md`](Docs/decisions-log.md).
+**Day 2 close (2026-05-05):** v1 trend-following strategy skeleton authored (Donchian + MA + Hurst R/S + ATR stop) with 16 unit tests passing, mypy --strict clean, parameters + Phase 1 sub-universe locked (PRs #4 + parameter-lock follow-up). GitHub App `trading-system-pr-review` created (App ID `3615825`, Installation ID `129868686`); private key in 1Password. Sops + age keys generated for dev/paper/live; `.sops.yaml` populated; paper backups in safe; `SOPS_AGE_KEY_FILE` workaround documented (sops 3.12 macOS). Discord server + 7 channels + bot created. DNS propagation verified. CI tightened to include typecheck + test (PR #8). Day 3 09:00 sops setup encrypts the captured Day 2 values into `secrets/{dev,paper,live}.enc.yaml`.
 
-Code structure now exists in `apps/`, `services/`, `packages/`, `alembic/`, `deploy/`, `secrets/`, `scripts/`, `tests/`, `infrastructure/`, `strategies/`, `lean/`, `watchdog/`. Phase 0 Day 2 onward fills these with real code.
+Concrete deviations from spec (Hetzner DC, QC pricing, GitHub Pro, sops macOS env-var, GitHub App UI not API, Hurst R/S choice, sub-universe lock, HURST_THRESHOLD = 0.55): see [`Docs/decisions-log.md`](Docs/decisions-log.md).
+
+Code now lives in `strategies/v1_trend_following/` (real strategy code) and `lean/v1_qc_algorithm.py` (QC LEAN wrapper skeleton). Operator runbooks for the ongoing operational surfaces live in `deploy/{github-app,discord,sops}/`. Other top-level dirs (`apps/`, `services/`, `packages/`, `alembic/`, `infrastructure/`, `watchdog/`) are scaffolded only and fill in over Phase 0 Days 3–8.
 
 ---
 
@@ -126,11 +128,11 @@ Common reasons you (the operator) open it:
 
 ---
 
-## Day 1 status (2026-05-05) — DONE
+## Day 1 + Day 2 status (2026-05-05) — DONE
 
-Day 1 of Phase 0 Week 1 is complete. See [`Docs/decisions-log.md`](Docs/decisions-log.md) for actuals.
+Both days of Phase 0 Week 1 are complete. See [`Docs/decisions-log.md`](Docs/decisions-log.md) for actuals (10 Day 2 entries + Day 2 verdict).
 
-Day 2 work begins next session — see `implementation-guide.md` §11 Day 2.
+Day 3 work begins next session — see `implementation-guide.md` §11 Day 3 (sops initialization: encrypt the GitHub App private key + Discord bot token + initial schema; then dev/paper/live `.enc.yaml` ship in encrypted form).
 
 The original Day-1-Monday-priority-list is preserved in `implementation-guide.md` §11 as the canonical template; this section's old "How to start" walkthrough was Day-1-specific and is now historical.
 

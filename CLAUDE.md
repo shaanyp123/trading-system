@@ -41,6 +41,7 @@ For pattern ambiguity within already-allowed scope (naming, file organization wi
 
 ## File index
 
+### Reference docs (read at session start)
 | Path | Purpose |
 |---|---|
 | `README.md` | Operator-facing top-level index |
@@ -53,4 +54,18 @@ For pattern ambiguity within already-allowed scope (naming, file organization wi
 | `Prompts/` | Generation prompts (archived; do not reference for current work) |
 | `Archive/` | Reserved for superseded versions |
 
-When code lands during Phase 0: `apps/web/`, `services/<name>/`, `packages/api-types/`, `alembic/`, `deploy/`, `secrets/` (sops-encrypted), `scripts/`, `tests/`. See dev guide §2 for the canonical layout.
+### Code + ops surfaces (current state as of Day 2)
+| Path | Purpose | Status |
+|---|---|---|
+| `strategies/v1_trend_following/` | V1 Donchian/MA/Hurst/ATR strategy logic; `parameters.py`, `indicators.py`, `signals.py`, `audit_events.py`, `sizing_trace.py`, `strategy.py` | Day 2 — entry pipeline real; exit pipeline scaffolded for Week 3–4 |
+| `lean/v1_qc_algorithm.py` | QC LEAN wrapper for the strategy | Day 2 — heartbeat-only; full wiring Week 4 |
+| `tests/unit/test_strategy_v1.py` | 16 tests covering entry pipeline + indicators + parameter validation | Day 2 |
+| `deploy/github-app/` | Canonical manifest + operator runbook for the in-app PR review surface app | Day 2 — app created (App ID 3615825 / Installation ID 129868686) |
+| `deploy/discord/` | Canonical manifest + operator runbook for the Discord guild + bot (7 channels) | Day 2 — guild + bot created |
+| `deploy/sops/` | Operator runbook + per-env secret schema templates (`secret_schemas/{dev,paper,live}.template.yaml`) | Day 2 — runbook executed; templates ready for Day 3 encryption |
+| `.sops.yaml` | sops creation rules with 3 real age recipients (dev/paper/live) | Day 2 |
+| `scripts/sops_init.sh` | Helper that substitutes age pubkeys into `.sops.yaml` (idempotent) | Day 2 |
+| `secrets/` | sops-encrypted env files; plaintext blocked by `.gitignore` | Day 3 fills `{dev,paper,live}.enc.yaml` |
+| `services/`, `infrastructure/`, `apps/web/`, `packages/`, `alembic/`, `watchdog/` | Scaffolded directories with `__init__.py` only | filled Days 3–8 + Week 5+ per `implementation-guide.md` §3 |
+
+See `Docs/claude-dev-guide.md` §2 for the canonical full-repo layout.

@@ -52,34 +52,37 @@ jobs:
         run: gitleaks detect --source . --no-git --redact --config .gitleaks.toml --verbose
 
   # ---------------------------------------------------------------------------
-  # Jobs below are commented out in the initial scaffold. Each is re-enabled
-  # in the PR that introduces the first code requiring it. This way CI stays
-  # green during scaffold and tightens as services land.
+  # typecheck + test were enabled 2026-05-05 once the first real code (v1
+  # strategy skeleton, PR #4) landed. docker-build stays commented until
+  # any service has a Dockerfile (Phase 0 Week 5+).
   # ---------------------------------------------------------------------------
 
-  # typecheck:
-  #   name: typecheck (mypy --strict)
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: actions/setup-python@v5
-  #       with:
-  #         python-version: '3.11'
-  #         cache: 'pip'
-  #     - run: pip install -e ".[dev]"
-  #     - run: mypy services infrastructure strategies scripts
+  typecheck:
+    name: typecheck (mypy --strict)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - run: pip install -e ".[dev]"
+      - run: mypy services infrastructure strategies scripts
 
-  # test:
-  #   name: test (pytest --cov)
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: actions/setup-python@v5
-  #       with:
-  #         python-version: '3.11'
-  #         cache: 'pip'
-  #     - run: pip install -e ".[dev]"
-  #     - run: pytest --cov --cov-report=xml --cov-fail-under=70
+  test:
+    name: test (pytest --cov)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - run: pip install -e ".[dev]"
+      # Coverage floor is set in pyproject.toml [tool.coverage.report]
+      # fail_under (currently 70). Per dev-guide §3.1 it tightens to 90 for
+      # services/audit, services/risk, services/execution once those land.
+      - run: pytest --cov --cov-report=xml
 
   # docker-build:
   #   name: docker build (matrix per service)
