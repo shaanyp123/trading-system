@@ -20,10 +20,10 @@
 
 creation_rules:
   - path_regex: ^secrets/dev\.enc\.yaml$
-    age: <DEV_AGE_PUBKEY_PLACEHOLDER>
+    age: age1f5mmkn6st8694n36wulj8emzjf5pl0a8herqfr9lqwmcpak5yeqqsfwujj
 
   - path_regex: ^secrets/paper\.enc\.yaml$
-    age: <PAPER_AGE_PUBKEY_PLACEHOLDER>
+    age: age1dth25vwm75fpc32an0e77y39je2q8uyqe4sx3ysxjlamnlu6n43qrpa4wh
 
   - path_regex: ^secrets/live\.enc\.yaml$
-    age: <LIVE_AGE_PUBKEY_PLACEHOLDER>
+    age: age1srnd3y9sx2ze0w2258v7dda3pvqw26r665uhr64kz50jw3w7sazqr63mrf

@@ -88,9 +88,11 @@ Commit the populated `.sops.yaml` on a feature branch — public keys are not se
 
 ---
 
-## Step 3 — Install private keys to `~/.config/sops/age/keys.txt`
+## Step 3 — Install private keys + point sops at them
 
-sops looks up age keys at this path by default. All three private keys go in the same file, one per line:
+All three private keys go in one file at the conventional path. **You must also export `SOPS_AGE_KEY_FILE` in your shell rc** — sops 3.12+ does not auto-resolve `~/.config/sops/age/keys.txt` on macOS (see `Docs/decisions-log.md` 2026-05-05 Day 2 entry).
+
+### 3a. Install the keys file
 
 ```bash
 mkdir -p ~/.config/sops/age
@@ -110,7 +112,31 @@ chmod 600 ~/.config/sops/age/keys.txt
 wc -l ~/.config/sops/age/keys.txt
 ```
 
-sops decrypts by trying every key in `keys.txt` against each file's recipient list — so having all three live in the same file is fine and necessary (you'll edit `live.enc.yaml` from the same laptop that runs `sops dev.enc.yaml`).
+### 3b. Point sops at the file via shell rc
+
+```bash
+# zsh (macOS default):
+echo 'export SOPS_AGE_KEY_FILE="$HOME/.config/sops/age/keys.txt"' >> ~/.zshrc
+source ~/.zshrc
+
+# bash equivalent:
+# echo 'export SOPS_AGE_KEY_FILE="$HOME/.config/sops/age/keys.txt"' >> ~/.bashrc
+# source ~/.bashrc
+
+# Verify the env var is set and the keys derive correctly:
+echo "$SOPS_AGE_KEY_FILE"                       # absolute path to keys.txt
+age-keygen -y < "$SOPS_AGE_KEY_FILE"            # three age1... public keys
+```
+
+The three public keys from the second verify command must match the three recipients in `.sops.yaml`. Cross-check with:
+
+```bash
+diff <(age-keygen -y < "$SOPS_AGE_KEY_FILE" | sort) \
+     <(grep -E "^    age: age1" .sops.yaml | awk '{print $2}' | sort)
+# (no output = match)
+```
+
+If they match, sops can decrypt anything encrypted under `.sops.yaml`'s rules. sops decrypts by trying every key in `keys.txt` against each file's recipient list — so having all three live in the same file is fine and necessary (you'll edit `live.enc.yaml` from the same laptop that runs `sops dev.enc.yaml`).
 
 ---
 
@@ -192,7 +218,15 @@ The schema templates already in `deploy/sops/secret_schemas/` (this PR) document
 
 ## Troubleshooting
 
-**`sops: failed to decrypt`** — most often `~/.config/sops/age/keys.txt` is missing one of the three private keys, or the `.sops.yaml` `age:` recipient doesn't match what's in `keys.txt`. Verify:
+**`sops -d` fails with "identity did not match any of the recipients" + "Did not find keys in locations 'SOPS_AGE_SSH_PRIVATE_KEY_FILE'..."** — sops 3.12+ on macOS does not auto-resolve `~/.config/sops/age/keys.txt`. Confirm `SOPS_AGE_KEY_FILE` is set in your current shell:
+
+```bash
+echo "$SOPS_AGE_KEY_FILE"
+```
+
+If empty, follow Step 3b — add the export to your shell rc and `source` it (or open a new terminal). This is the most common cause of decrypt failure on a fresh laptop.
+
+**`sops: failed to decrypt`** (other variants) — `~/.config/sops/age/keys.txt` is missing one of the three private keys, or the `.sops.yaml` `age:` recipient doesn't match what's in `keys.txt`. Verify:
 
 ```bash
 # Public keys in .sops.yaml:
