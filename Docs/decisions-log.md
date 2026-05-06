@@ -348,7 +348,24 @@ text remains unchanged and this log records the deviations.
 - [ ] **Operator (Day 3 13:00 or whenever paper VPS is provisioned)** — bootstrap Postgres roles' passwords: `openssl rand -hex 32` × 2 → paste into `secrets/paper.enc.yaml` AND run `ALTER ROLE app_service WITH LOGIN PASSWORD '<value>'; ALTER ROLE app_owner WITH LOGIN PASSWORD '<value>';` on the paper VPS as superuser. Migration 0006 created the roles NOLOGIN with no passwords.
 - [ ] **Partition-rollover cron (Dec 31 each year)** — when adding `audit_log_y<next>`, ALSO attach the no-truncate trigger: `CREATE TRIGGER audit_log_y<next>_no_truncate BEFORE TRUNCATE ON audit_log_y<next> FOR EACH STATEMENT EXECUTE FUNCTION block_audit_truncate();`. Easy to forget and silently break TRUNCATE blocking on the new partition. Cron lands later (Phase 1 ops).
 - [x] ~~**Optional dev-guide update** — §7.1 migration filename convention~~ — resolved 2026-05-05 (hybrid scheme adopted; see entry above).
-- [ ] **Operator (anytime post-`forbidden-paths` PR merge)** — add `forbidden-paths (risk-review-approved gate)` to the required-status-checks list in `main`'s branch protection so the gate becomes blocking rather than advisory.
+- [x] ~~**Operator (anytime post-`forbidden-paths` PR merge)** — add `forbidden-paths` to required-status-checks~~ — resolved 2026-05-05 (see entry below; operator confirmed merge of PR #10/#11; required-status-checks list updated via `gh api` to include all 5 checks).
+
+---
+
+### 2026-05-05 — Day 3 close-out — branch protection required-checks gap closed
+
+- **Spec reference:** `implementation-guide.md` §11 Day 1 ("require CI to pass; no direct push to `main`"); 2026-05-05 Day 1 decisions-log entry "Branch protection rules applied to `main`".
+- **Pre-existing gap (discovered Day 3 close-out):** Day 1's branch protection setup added `lint (ruff)` + `gitleaks (secret scan)` to the required-status-checks list. Day 2 added two more CI jobs (`typecheck (mypy --strict)` + `test (pytest --cov)`) to `.github/workflows/ci.yml` but never updated branch protection. Result: those jobs were running on every PR but were NOT actually blocking merge — a PR with a typecheck failure or a test regression could have squeezed through if the operator merged before reading the check status. Visible only when inspecting protection state via `gh api .../branches/main/protection`.
+- **Decision (this entry):** updated branch protection's required-status-checks via `gh api repos/.../branches/main/protection/required_status_checks/contexts -X POST` to include all five current CI jobs.
+- **Final required-status-checks list:**
+  1. `lint (ruff)` (Day 1)
+  2. `gitleaks (secret scan)` (Day 1)
+  3. `typecheck (mypy --strict)` (Day 2 — gap fix Day 3)
+  4. `test (pytest --cov)` (Day 2 — gap fix Day 3)
+  5. `forbidden-paths (risk-review-approved gate)` (Day 3, just shipped via PR #10)
+- **Rationale:** every CI job that runs SHOULD also block. If we trust a check enough to run it on every PR, we trust it enough to gate merge on it. The gap was a Day-2-PR-author oversight, not a deliberate "advisory check" choice.
+- **Lesson for future sessions:** every PR that adds a new CI job MUST also add the job's check name to required-status-checks in the same PR. Add as a one-line operator-action item to the PR template and to the dev-guide §1.2 commit-discipline checklist.
+- **Cost / scope impact:** none.
 
 ---
 
