@@ -344,7 +344,8 @@ text remains unchanged and this log records the deviations.
 - [ ] **2027-05-05** — annual rotation: regenerate age keys, `sops updatekeys` all `secrets/*.enc.yaml`, print new papers, destroy old papers.
 
 ### New from Day 3
-- [ ] **Operator (anytime post-merge)** — fill the actually-sensitive secret values via `sops secrets/<env>.enc.yaml` for each env (per the Day 3 sops decision-log entry above). Minimum set for paper VPS bringup (Day 3 13:00+): `postgres.app_service_password`, `postgres.app_owner_password`, `discord.bot_token`, `discord.guild_id`, `discord.webhook_urls.*`, `github.app_private_key`, `internal.watchdog_bearer_token`, `internal.ipc_bearer_token`, QC tokens.
+- [x] ~~**Operator (anytime post-merge)** — fill paper env Day-2/3 captured set via sops~~ — resolved 2026-05-05 via PR #11. Filled: `discord.bot_token`, `discord.guild_id`, all 7 `discord.webhook_urls.*`, `github.app_private_key`, `internal.watchdog_bearer_token`, `internal.ipc_bearer_token`. Verified via `sops -d --extract` + gitleaks.
+- [ ] **Operator (rolling, by checkpoint)** — fill the remaining `<TODO>` fields in `paper.enc.yaml` (and `live.enc.yaml` at Week 8) at their respective day checkpoints: `postgres.*` (Day 5 paper VPS bootstrap), `quantconnect.*` (when QC token is regenerated post Day 1 leak), `resend.api_key` (when Resend account is created), `anthropic.*` (Week 5 agent bringup), `s3.*` (Day 5 S3 provision), `trading_economics.api_token` (Week 2 calendar import), `ibkr.flex_query_token` (Week 2 IBKR flex setup). Runtime fail-closes on placeholder strings; nothing breaks until a service tries to use the field.
 - [ ] **Operator (Day 3 13:00 or whenever paper VPS is provisioned)** — bootstrap Postgres roles' passwords: `openssl rand -hex 32` × 2 → paste into `secrets/paper.enc.yaml` AND run `ALTER ROLE app_service WITH LOGIN PASSWORD '<value>'; ALTER ROLE app_owner WITH LOGIN PASSWORD '<value>';` on the paper VPS as superuser. Migration 0006 created the roles NOLOGIN with no passwords.
 - [ ] **Partition-rollover cron (Dec 31 each year)** — when adding `audit_log_y<next>`, ALSO attach the no-truncate trigger: `CREATE TRIGGER audit_log_y<next>_no_truncate BEFORE TRUNCATE ON audit_log_y<next> FOR EACH STATEMENT EXECUTE FUNCTION block_audit_truncate();`. Easy to forget and silently break TRUNCATE blocking on the new partition. Cron lands later (Phase 1 ops).
 - [x] ~~**Optional dev-guide update** — §7.1 migration filename convention~~ — resolved 2026-05-05 (hybrid scheme adopted; see entry above).
@@ -374,5 +375,19 @@ text remains unchanged and this log records the deviations.
 When a spec claim is now wrong or incomplete because of an entry above, the spec gets a one-line annotation pointing here. We do NOT rewrite specs to match reality — specs remain the canonical "what we agreed to build"; this log is the canonical "what we actually did."
 
 Cross-references in current edits:
+
+**Day 1:**
 - `Docs/backend-spec.md` §1.6 → "Falkenstein (locked)" annotated with pointer to the Nuremberg deviation entry above.
 - `implementation-guide.md` §2.1, §2.3 → cost table updated in-place to reflect actual prices; original spec ranges retained in this log for archaeology.
+
+**Day 2:**
+- `Docs/backend-spec.md` §2.3 (Hurst exponent) → R/S estimator (not DFA) is the implementation choice; `HURST_THRESHOLD` raised from 0.50 to 0.55 to compensate for R/S small-sample bias.
+- `Docs/backend-spec.md` §2.3 + §2.4.1 (sub-universe) → V1 candidate universe LOCKED to /MES, /MNQ, /MYM, /M2K, /MGC, /MCL, /MBT + TLT, IEF, SHY, TIP. Active set is dynamic per equity tier via Stage 0 sizing.
+
+**Day 3:**
+- `Docs/backend-spec.md` §3.2 (audit_log) → `CREATE UNIQUE INDEX ... ON audit_log(sequence_no)` is invalid SQL on a partitioned table; replaced with non-unique index in migration 0001. BIGSERIAL still guarantees global uniqueness.
+- `Docs/backend-spec.md` §2.10.2 (TRUNCATE block) → spec's `EVENT TRIGGER ... ON ddl_command_start WHEN TAG IN ('TRUNCATE TABLE')` is unsupported by Postgres; replaced with statement-level `BEFORE TRUNCATE` triggers attached to parent + each yearly partition in migration 0005.
+- `Docs/backend-spec.md` §3.26 (universe_state) → `CHECK (... IN (..., NULL))` is invalid SQL semantically; rewritten as `IS NULL OR IN (...)` in migration 0004.
+- `Docs/claude-dev-guide.md` §7.1 → updated to document hybrid migration filename convention (numeric `NNNN_` for foundational set 0001-0006, date-based `YYYY-MM-DD_` for everything Day 4+).
+- `Docs/claude-dev-guide.md` §10.1 Week 3 → annotated to describe the `BEFORE TRUNCATE` trigger mechanism (replaces the spec's `EVENT TRIGGER` wording).
+- `Docs/claude-dev-guide.md` §11 [A02] → previously asserted "Pre-merge linter is mechanical and will block the merge"; now actually true after `.github/workflows/forbidden-paths.yml` shipped in PR #10 + `risk-review-approved` label created Day 3.

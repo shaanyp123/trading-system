@@ -8,9 +8,9 @@ The canonical schema for each env's secret file is in `deploy/sops/secret_schema
 
 | File | Environment | Status |
 |---|---|---|
-| `dev.enc.yaml` | Local laptop dev | created Day 3 (Wed Week 1) |
-| `paper.enc.yaml` | Hetzner paper VPS | created Day 3 (Wed Week 1) |
-| `live.enc.yaml` | Hetzner live VPS | created Day 8 (Wed Week 2); live values added at Week 8 IBKR cutover |
+| `dev.enc.yaml` | Local laptop dev | created Day 3 (Wed Week 1); mock values throughout |
+| `paper.enc.yaml` | Hetzner paper VPS | created Day 3 (Wed Week 1); Day 2/3 captured set filled (PR #11); checkpoint-deferred fields land at their respective day checkpoints |
+| `live.enc.yaml` | Hetzner live VPS | created Day 3 (Wed Week 1) with placeholder values; live-specific values (account_number, flex_query_token, postgres passwords, bearer tokens, webauthn rp_id/origin) land at Week 8 IBKR cutover |
 
 ## Workflow
 
