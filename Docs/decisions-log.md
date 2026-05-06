@@ -137,15 +137,115 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ---
 
-## Open follow-ups from Day 1
+### 2026-05-05 — Day 2 — GitHub App created via UI walkthrough, not API
 
-- [ ] Watchdog Python script + systemd timer not yet deployed to Nuremberg (Day 4 work).
-- [ ] Caddy / TLS / `/api/health` not yet running on Ashburn (Day 5 work).
-- [ ] Ashburn root SSH still allowed (B9 hardening optional; can disable any time).
-- [ ] Discord server + bot not yet created (Day 2 work).
-- [ ] Sops + age keys not yet generated; `secrets/*.enc.yaml` not yet populated (Day 3 work).
-- [ ] v1 Donchian/MA strategy skeleton not yet authored (Day 2 [CLAUDE_CODE] work).
-- [ ] GitHub App for in-app PR review surface not yet created (Day 2 work).
+- **Spec reference:** `implementation-guide.md` §11 Day 2 09:30 ("Create the GitHub App via gh CLI: `gh api POST /user/apps` or walk through the GitHub Apps settings UI").
+- **Spec said:** create via gh CLI OR walk through the UI.
+- **Actual decision:** UI walkthrough only. There is no `POST /user/apps` endpoint on GitHub (the spec's example is fictitious). The two real options are (a) the manifest flow, which requires a live HTTP redirect URL the backend doesn't yet have on Day 2, and (b) the GitHub Apps settings UI. We went with the latter and shipped a canonical declaration (`deploy/github-app/manifest.json`) + an operator click-by-click runbook (`deploy/github-app/README.md`).
+- **Rationale:** non-existent API can't be used; manifest flow's redirect requirement is incompatible with current state (backend not deployed). Manual UI walkthrough is the correct path. The manifest.json in the repo is the source-of-truth the operator fills against.
+- **Cost / scope impact:** none. ~10 minutes of operator time when they execute the runbook (Day 2 14:00 or later — operator's choice; non-blocking).
+
+---
+
+### 2026-05-05 — Day 2 — Hurst exponent estimator: R/S (rescaled-range), not DFA
+
+- **Spec reference:** `Docs/backend-spec.md §2.3` ("Hurst exponent ≥ HURST_THRESHOLD over the same lookback").
+- **Spec said:** use the Hurst exponent — does not specify the estimator.
+- **Actual decision:** classical R/S (rescaled-range) analysis. Implemented in `strategies/v1_trend_following/indicators.py:hurst_exponent_rs`. Tuned for the 60-bar default lookback: `min_chunks=4`, `min_chunk_size=4`, `min_closes=40`. Two regression points at the 60-bar window (chunks of 14 and 7); more at longer windows.
+- **Rationale:** R/S is the textbook Hurst estimator and matches QC's standard library; choosing it gives byte-for-byte parity between LEAN and our backend backtester (the weekly parity gate per backend-spec §10.2 cares about this). DFA (detrended fluctuation analysis) is more robust on short series and is a credible Phase 2 swap, but that's a strategy logic change requiring a `risk-review-approved` PR; deferring until calibration evidence supports it.
+- **Cost / scope impact:** none. Documented small-sample bias (R/S over-estimates H on short windows); HURST_THRESHOLD is configurable so the operator/agent can compensate.
+
+---
+
+### 2026-05-05 — Day 2 — Phase 1 candidate sub-universe LOCKED (operator-confirmed)
+
+- **Spec reference:** `Docs/backend-spec.md §2.3` ("micro futures + bond ETFs"); `implementation-guide.md` §3 Week 2 Tue (sub-universe verification).
+- **Spec said:** Phase 1 trades a sub-universe of CME micro futures + NYSE bond ETFs; specific markets not enumerated.
+- **Actual decision (LOCKED):** the candidate pool below is the strategy's target universe. `strategies/v1_trend_following/parameters.py:V1_CANDIDATE_UNIVERSE`:
+  - **Micros:** /MES, /MNQ, /MYM, /M2K, /MGC, /MCL, /MBT
+  - **Bond ETFs:** TLT, IEF, SHY, TIP
+- **Rationale:** smallest plausible sub-universe covering equity-index (4 micros), commodity (gold + crude), crypto (BTC), and rates (4-point bond ETF curve). Each candidate carries a one-line notional rationale in the source. The active set at runtime is the OUTPUT of `services/risk/sizing.py` Stage 0 (1-contract-notional ≤ 50% × equity per backend-spec §2.4.1) — that filter is dynamic per equity tier and accomplishes the per-equity-tier filtering automatically. Week 2 verification (§3 Week 2 Tue) is a separate concern: a data-executability check (QC bundled data availability per market) that may flag specific markets as unavailable; it does NOT drive the candidate list.
+- **Operator confirmation 2026-05-05:** locked. Per-tier exclusion expectations recorded for Week 2 reference: at $15k equity, Stage 0 likely admits only the bond ETFs + /MCL (~$8k notional) + possibly /M2K/MBT (~$10k each); /MES /MNQ /MYM /MGC excluded at $15k tier. /MES gets the spec's explicit 50%-override at $20k (backend-spec §2.4.1 Stage 2). /MNQ likely needs ≥$72k equity. Cost / scope impact: none.
+
+---
+
+### 2026-05-05 — Day 2 — HURST_THRESHOLD locked at 0.55 (was 0.50 in Day 2 morning skeleton)
+
+- **Spec reference:** `Docs/backend-spec.md §2.3` (HURST_THRESHOLD configurable); `Docs/backend-spec.md §12.3` (`tighten_parameter` enum — agent-mutable, tighten direction is up).
+- **Decision:** raised default from 0.50 to **0.55** to compensate for the R/S estimator's small-sample upward bias on the V1 60-bar lookback (~+0.05 typical inflation). 0.55 is what 0.50 buys you on noise after de-biasing — i.e. "moderate persistence" rather than "any positive autocorrelation." Direction is tightening (up = stricter) so it's within the agent-mutable surface; further tightening to 0.60+ does not require a PR. Loosening below 0.50 does require a PR.
+- **Operator confirmation 2026-05-05:** locked. Decision made on PR #4 review.
+- **Cost / scope impact:** modestly fewer signals expected vs. 0.50 floor; signal acceptance rate should still clear the spec's 90% target (the post-Stage-0/post-Stage-5 denominator) since Hurst is one of three entry filters and the others (Donchian, MA) typically bind first.
+
+---
+
+### 2026-05-05 — Day 2 — DNS propagation verified for spratcapital.com
+
+- **Spec reference:** `implementation-guide.md` §11 Day 2 09:00 ("Verify DNS propagation").
+- **Verification (operator laptop, 20:23 ET):**
+  - `dig +short spratcapital.com` → `178.156.239.84`
+  - `dig +short www.spratcapital.com` → `178.156.239.84`
+  - whois on the IP → `Hetzner Online GmbH` (matches expected Ashburn primary owner)
+  - Authoritative NS → `brit.ns.cloudflare.com` (matches Cloudflare-managed DNS per operator identifier memory)
+  - `curl http://spratcapital.com` → connection timed out on port 80 (no service listening yet; expected — Caddy lands Day 5).
+- **Outcome:** DNS is propagated and resolves to the expected Hetzner-owned IP. The implementation-guide's Day 2 verification bar ("DNS working = anything other than NXDOMAIN") is met. Caddy/TLS deploy at Day 5 will start serving on port 443; until then port 80/443 timeouts are expected.
+
+---
+
+### 2026-05-05 — Day 2 — Added `strategies/__init__.py` (was missing)
+
+- **Spec reference:** `Docs/claude-dev-guide.md §2.1` (repo layout — `strategies/` is a top-level package).
+- **Decision:** added an empty (with module docstring) `strategies/__init__.py`. Without it, mypy reports "Source file found twice under different module names" because the file is reachable both via the repo root and via the `strategies/` subdirectory. Pure plumbing fix discovered while typechecking the v1 strategy module.
+- **Rationale:** standard Python packaging hygiene; should have been in the Day 1 scaffold but wasn't caught because no Python code referenced `strategies.*` until Day 2.
+- **Cost / scope impact:** none.
+
+---
+
+### 2026-05-05 — Day 2 — Discord server + bot setup complete
+
+- **Spec reference:** `implementation-guide.md` §11 Day 2 14:00; `Docs/backend-spec.md §8.1.1` (`discord:` secret schema).
+- **Status:** complete. Operator ran `deploy/discord/README.md` Steps 1–6 end-to-end.
+- **Confirmed (operator-reported, captured in 1Password):**
+  - Private guild created.
+  - Seven Phase 0–1 channels exist (`#daily-brief`, `#signals`, `#fills`, `#alerts`, `#critical`, `#ops`, `#audit`).
+  - Bot application `Trading System Bot` created; OAuth invite executed; bot is a member of the guild.
+  - Bot token stored in 1Password as `discord-bot-token` (interim); migrates to `secrets/{paper,live}.enc.yaml discord.bot_token` on Day 3 sops setup.
+  - Guild ID + 7 channel IDs captured (operator's notes / 1Password).
+  - Privileged Gateway Intents all OFF (Presence, Server Members, Message Content) — minimum surface.
+- **Not in this log:** the actual Guild ID and channel IDs are not secrets but are co-located with the bot token in `secrets/{paper,live}.enc.yaml` per the spec schema. They land there on Day 3.
+
+---
+
+### 2026-05-05 — Day 2 — GitHub App creation status
+
+- **Spec reference:** `implementation-guide.md` §11 Day 2 09:30; `deploy/github-app/README.md`.
+- **Status:** **operator-confirm pending.** Operator's working assumption is that the runbook was executed but is not certain. Claude Code cannot independently verify because GitHub's `GET /user/installations` endpoint requires a JWT signed by the app's own private key (chicken-and-egg) and there is no operator-token-accessible "list my apps" endpoint.
+- **Operator action to close this entry:** visit https://github.com/settings/apps . If `trading-system-pr-review` (or the suffix-variant the operator chose) is listed, capture the App ID and append below. Then visit https://github.com/settings/installations to capture the Installation ID. If the runbook was NOT executed, schedule it (~10 min) — non-blocking for any other Day 2 work.
+- **App ID:** `<TODO_FROM_OPERATOR>`
+- **Installation ID:** `<TODO_FROM_OPERATOR>`
+
+---
+
+## Day 2 verdict
+
+All Day 2 implementation-guide §11 tasks complete pending one operator confirmation (GitHub App). Both [CLAUDE_CODE] tasks (09:30 GitHub App runbook, 11:00 v1 strategy) shipped via PRs #3 and #4. Both [OPERATOR] tasks (14:00 Discord, 15:00 sops/age) executed by operator on the canonical runbooks in `deploy/`. DNS verification passed.
+
+---
+
+## Open follow-ups (post-Day-2)
+
+### From Day 1 (carried)
+- [ ] **Day 4** — Watchdog Python script + systemd timer not yet deployed to Nuremberg.
+- [ ] **Day 5** — Caddy / TLS / `/api/health` not yet running on Ashburn.
+- [ ] **Optional** — Ashburn root SSH still allowed (B9 hardening; can disable any time).
+
+### New from Day 2
+- [ ] **[OPERATOR]** Confirm GitHub App status; append App ID + Installation ID to the entry above. Non-blocking.
+- [ ] **Day 3 09:00** — populate `secrets/{dev,paper,live}.enc.yaml` from `deploy/sops/secret_schemas/*.template.yaml`; encrypt with sops; commit. Captured Day 2 values that land here: GitHub App private key (from 1Password), Discord bot token + guild_id + 7 channel_ids (from operator notes / 1Password).
+- [ ] **Week 2 Mon** — `services/risk/sizing.py` Stage 0 implementation (forbidden whitelist; `risk-review-approved` label required).
+- [ ] **Week 2 Tue** — sub-universe data-executability check (QC bundled data availability per locked candidate); active universe at $15k–$25k tier emerges from Stage 0 dynamically (no manual finalization needed since the candidate pool is already locked).
+- [ ] **Week 3–4** — implement `V1TrendFollowing.generate_exit_candidates` (currently scaffolded with `NotImplementedError`).
+- [ ] **Week 4** — full LEAN/QC algorithm wiring (`lean/v1_qc_algorithm.py` is heartbeat-only on Day 2).
+- [ ] **2027-05-05** — annual rotation: regenerate age keys, `sops updatekeys` all `secrets/*.enc.yaml`, print new papers, destroy old papers.
 
 ---
 
