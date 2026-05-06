@@ -54,18 +54,26 @@ For pattern ambiguity within already-allowed scope (naming, file organization wi
 | `Prompts/` | Generation prompts (archived; do not reference for current work) |
 | `Archive/` | Reserved for superseded versions |
 
-### Code + ops surfaces (current state as of Day 2)
+### Code + ops surfaces (current state as of Day 3)
 | Path | Purpose | Status |
 |---|---|---|
 | `strategies/v1_trend_following/` | V1 Donchian/MA/Hurst/ATR strategy logic; `parameters.py`, `indicators.py`, `signals.py`, `audit_events.py`, `sizing_trace.py`, `strategy.py` | Day 2 — entry pipeline real; exit pipeline scaffolded for Week 3–4 |
 | `lean/v1_qc_algorithm.py` | QC LEAN wrapper for the strategy | Day 2 — heartbeat-only; full wiring Week 4 |
 | `tests/unit/test_strategy_v1.py` | 16 tests covering entry pipeline + indicators + parameter validation | Day 2 |
+| `tests/integration/test_audit_immutability.py` | testcontainers Postgres 16; 6 tests verifying audit_log UPDATE/DELETE/TRUNCATE blocked + attribution.expected_* immutable | Day 3 — passes when Docker is up; skips cleanly otherwise |
 | `deploy/github-app/` | Canonical manifest + operator runbook for the in-app PR review surface app | Day 2 — app created (App ID 3615825 / Installation ID 129868686) |
 | `deploy/discord/` | Canonical manifest + operator runbook for the Discord guild + bot (7 channels) | Day 2 — guild + bot created |
 | `deploy/sops/` | Operator runbook + per-env secret schema templates (`secret_schemas/{dev,paper,live}.template.yaml`) | Day 2 — runbook executed; templates ready for Day 3 encryption |
 | `.sops.yaml` | sops creation rules with 3 real age recipients (dev/paper/live) | Day 2 |
 | `scripts/sops_init.sh` | Helper that substitutes age pubkeys into `.sops.yaml` (idempotent) | Day 2 |
-| `secrets/` | sops-encrypted env files; plaintext blocked by `.gitignore` | Day 3 fills `{dev,paper,live}.enc.yaml` |
-| `services/`, `infrastructure/`, `apps/web/`, `packages/`, `alembic/`, `watchdog/` | Scaffolded directories with `__init__.py` only | filled Days 3–8 + Week 5+ per `implementation-guide.md` §3 |
+| `secrets/{dev,paper,live}.enc.yaml` | Encrypted env files. App ID + Installation ID + IBKR account + webauthn rp_id substituted; remaining values are `<TODO>` placeholders, operator pastes via `sops <file>` later | Day 3 |
+| `alembic.ini`, `alembic/env.py`, `alembic/script.py.mako` | Migration runner config; reads `DATABASE_URL` from env (sops at deploy time) | Day 3 |
+| `alembic/versions/0001_audit_log.py` | `audit_log` partitioned by `ingest_clock_ts`; yearly partitions 2026–2031; `uuid_generate_v7()` SQL function | Day 3 |
+| `alembic/versions/0002_core_tables.py` | accounts, setup_tokens, contracts, signals, orders, fills, trades, attribution, positions, balances; orders/fills/trades/attribution partitioned by year | Day 3 |
+| `alembic/versions/0003_risk_tables.py` | strategy_versions, parameters, parameter_sets, slippage_calibration_versions, decision_diary, risk_state; closes deferred FKs from 0002 | Day 3 |
+| `alembic/versions/0004_ops_tables.py` | reconciliation_breaks, data_quality_events, agent_actions, vacation_mode, qc_adapter_cursor, capital_events, cost_events, liveness_probes, pdt_day_trade_log, dividend_history, incident_reviews, universe_state, alerts (+`alert_category` enum), macro_events | Day 3 |
+| `alembic/versions/0005_immutability.py` | audit_log BEFORE UPDATE/DELETE blocker, BEFORE TRUNCATE blockers (parent + each yearly partition), attribution expected_* lock, REVOKE TRUNCATE FROM PUBLIC | Day 3 |
+| `alembic/versions/0006_roles.py` | app_service, app_service_readonly, app_owner (NOLOGIN), dba_breakglass (SUPERUSER NOLOGIN); per-role grants; per-role audit_log REVOKEs; passwords set out-of-band from sops | Day 3 |
+| `services/`, `infrastructure/`, `apps/web/`, `packages/`, `watchdog/` | Scaffolded directories with `__init__.py` only | filled Days 4–8 + Week 5+ per `implementation-guide.md` §3 |
 
 See `Docs/claude-dev-guide.md` §2 for the canonical full-repo layout.

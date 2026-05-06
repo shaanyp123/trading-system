@@ -234,20 +234,96 @@ All Day 2 implementation-guide §11 tasks complete. Both [CLAUDE_CODE] tasks (09
 
 ---
 
-## Open follow-ups (post-Day-2)
+### 2026-05-05 — Day 3 — sops files encrypted with placeholder secrets; operator fills via `sops <file>` later
+
+- **Spec reference:** `implementation-guide.md` §11 Day 3 09:00; `deploy/sops/secret_schemas/*.template.yaml`; `Docs/backend-spec.md` §8.1.1 (canonical schema).
+- **Spec said:** "Fill in actual values for `secrets/paper.enc.yaml`: QC API token + organization ID, Discord bot token, Resend API key (after creating Resend account), Postgres password (choose a strong random password)."
+- **Actual decision:** Day 3 09:00 encrypted only the values that are **not secret** (GitHub App ID `3615825`, Installation ID `129868686`, IBKR account `U25655583`, webauthn `rp_id`/`origin`, Resend `from_address`). Every actually-sensitive value was left as its `<TODO_FROM_DAY_X>` placeholder string in the encrypted file. The operator backfills these via `sops secrets/paper.enc.yaml` (which decrypts to `$EDITOR`, accepts the paste, and re-encrypts on save).
+- **Rationale:** Day 1's QC-token-leak entry (this log, 2026-05-05) established that token-grade secrets must NEVER pass through the chat session. Pasting the GitHub App private key, Discord bot token, Discord webhook URLs, etc. into the prompt would re-create that exposure. The template's design ("sops will still encrypt the placeholder string... runtime will reject loudly — fail-closed") is built for this workflow.
+- **Verification:** all three files round-trip cleanly (`sops -d --extract '["github"]["app_id"]' secrets/<env>.enc.yaml` returns the expected substituted values); `gitleaks detect --no-git --source secrets` reports no leaks.
+- **Cost / scope impact:** none. Operator's filling-in workload moves from "all values at once on Day 3" to "by checkpoint as services come online" (Discord secrets via `sops` after the Discord runbook landed Day 2; QC tokens after re-rotation; Postgres passwords on Day 3 13:00 when the paper VPS is bootstrapped; Resend key after account creation).
+- **Day 3 11:00 follow-up:** before any service first connects to Postgres, operator runs `openssl rand -hex 32` on the paper VPS twice and `sops secrets/paper.enc.yaml` to paste under `postgres.app_service_password` and `postgres.app_owner_password`; then `ALTER ROLE ... LOGIN PASSWORD '<sops-value>'` from a `psql` shell so pg_authid matches the encrypted file.
+
+---
+
+### 2026-05-05 — Day 3 — Alembic migrations 0001-0006: numeric naming, 6-file split, raw SQL throughout
+
+- **Spec reference:** `implementation-guide.md` §11 Day 3 11:00; `Docs/backend-spec.md` §3 (schemas), §2.10.2 (immutability), §8.2 (roles); `Docs/claude-dev-guide.md` §7.1 (migration conventions).
+- **Naming convention deviation:** dev-guide §7.1 example uses `YYYY-MM-DD_<short>.py`; implementation-guide §11 Day 3 explicitly names migrations `0001_audit_log.py` … `0006_roles.py`. **Adopted the implementation-guide numeric scheme** for this initial set — it gives Alembic a stable ordering, surfaces the migration count in `ls`, and tracks the operator's daily handbook verbatim. The two conventions can coexist (Alembic orders by `down_revision` chain, not filename), but mixing within one repo is confusing. Recommendation: update dev-guide §7.1 to `0001_<topic>.py` for the first N initial migrations and `YYYY-MM-DD_<topic>.py` once the schema stabilizes (subsequent migrations are by date because the next dev iteration is calendar-driven, not foundational).
+- **0005/0006 ordering deviation:** spec §2.10.2 lists `REVOKE ... ON audit_log FROM app_service, app_owner` together with the trigger DDL. Implementation-guide §11 Day 3 puts immutability in 0005 and roles in 0006. Roles must exist before role-named REVOKEs apply. **Resolution:** 0005 carries the triggers + EVENT TRIGGER + `REVOKE TRUNCATE ... FROM PUBLIC` (default-deny), and 0006 (after `CREATE ROLE`) adds the per-role REVOKEs and the `GRANT TRUNCATE ... TO dba_breakglass`. End state matches the spec; the implementation guide's split is honored.
+- **Raw SQL via `op.execute(...)` throughout:** dev-guide §7.1 example uses `op.create_table(...)`. The migrations here use raw SQL exclusively. Reason: backend-spec §3 IS the source of truth and uses SQL DDL verbatim; comparing the migration block side-by-side with §3.x is the review path. SQLAlchemy's higher-level API would translate (and obscure) features like declarative partitioning, `EVENT TRIGGER`, and `ALTER DEFAULT PRIVILEGES`. The migrations are 1:1 with the spec, which is the property a forbidden-whitelist `risk-review-approved` reviewer needs.
+- **`uuid_generate_v7()`:** Postgres 16 ships v4 (`gen_random_uuid()`) but not v7. Defined a pure-PL/pgSQL function in 0001 using pgcrypto's `gen_random_bytes(10)` + `clock_timestamp()` to assemble RFC 9562 §5.7 layout. Self-contained — no third-party `pg_uuidv7` extension required in the runtime image. App-side UUIDv7 generation per dev-guide §3.9 (uuid-utils library) remains the primary path; the SQL function exists for `DEFAULT uuid_generate_v7()` server-side fallback only.
+- **Yearly partitions 2026–2031:** matches spec §3 prelude ("Empty future partitions for 5 years; cron Dec 31 adds new partition"). Cron job to add 2032 etc. lands later (TODO).
+- **Forward-FK deferral:** signals → slippage_calibration_versions and signals → decision_diary are referenced by columns created in 0002 but the target tables are only created in 0003. The columns exist in 0002 without FK; the FK constraint is added in 0003 via `ALTER TABLE signals ADD CONSTRAINT ...`. Same pattern for trades.slippage_calibration_version_id.
+- **Spec wording fix:** universe_state.exclusion_reason CHECK clause in spec §3.26 includes `NULL` inside the `IN (...)` list, which is invalid SQL semantically (`column IN (NULL)` evaluates to NULL, not TRUE/FALSE — so the constraint never blocks anything). Migration 0004 rewrites as `CHECK (exclusion_reason IS NULL OR exclusion_reason IN (...))`. Behavior matches intent. Spec text not updated; this log records the deviation.
+- **Postgres roles created NOLOGIN with no plaintext passwords.** Passwords are set out-of-band by a deploy bootstrap step that decrypts `secrets/<env>.enc.yaml` and runs `ALTER ROLE ... WITH LOGIN PASSWORD '<from-sops>'` from `psql`. The migration carries zero credentials; sops carries them. `dba_breakglass` is `SUPERUSER NOLOGIN`; the operator activates it manually with the paper credential per spec §8.2.1.
+- **Cost / scope impact:** none.
+
+---
+
+### 2026-05-05 — Day 3 — Integration test skips cleanly when Docker daemon is down
+
+- **Spec reference:** `Docs/claude-dev-guide.md` §6.3 (integration testcontainers pattern); `tests/integration/test_audit_immutability.py`.
+- **Decision:** the `pg_engine` fixture probes `docker.from_env().ping()` before constructing a `PostgresContainer`; on `DockerException` (or any failure) the module skips with a clear message. Without this, `testcontainers` raises `Cannot connect to the Docker daemon` at fixture entry and produces 6 errors instead of 6 skips on a runner that doesn't have Docker (laptop with Docker Desktop closed, or CI without `docker:dind`).
+- **Why this matters:** the integration test gate is meaningful only when Docker is available. Errors-as-skip leaks signal noise into the green-vs-red split; explicit skips keep `make test` green on environments that legitimately can't run them. Operator runs the integration tests on a workstation with Docker Desktop on; CI is configured to provide a Docker daemon.
+- **Local verification status (Day 3, this branch):** unit tests 16/16 + integration tests 6/6 PASS against `postgres:16` (Docker Desktop on). Migrations apply cleanly; trigger-blocked UPDATE/DELETE/TRUNCATE all raise the expected exceptions.
+- **Cost / scope impact:** none.
+
+---
+
+### 2026-05-05 — Day 3 — Two real spec bugs found by the integration test
+
+The integration test surface (real Postgres 16 via testcontainers) caught two
+spec bugs that would have shipped silently if migrations had been merged on
+typecheck-only verification. Both bugs are corrected in this PR; the spec
+text remains unchanged and this log records the deviations.
+
+#### Bug 1 — `CREATE UNIQUE INDEX audit_log_sequence_no_uniq ON audit_log(sequence_no)` is invalid on a partitioned table
+
+- **Spec reference:** `Docs/backend-spec.md` §3.2 ("CREATE UNIQUE INDEX audit_log_sequence_no_uniq ON audit_log(sequence_no)").
+- **Spec said:** unique index on `sequence_no`.
+- **Postgres reality:** `audit_log` is `PARTITION BY RANGE (ingest_clock_ts)`. Postgres rejects any UNIQUE index on a partitioned table that doesn't include every partition-key column:
+  ```
+  ERROR: unique constraint on partitioned table must include all partitioning columns
+  DETAIL: UNIQUE constraint on table "audit_log" lacks column "ingest_clock_ts" which is part of the partition key.
+  ```
+- **Resolution in 0001:** replaced with a non-unique `CREATE INDEX audit_log_sequence_no_idx ON audit_log(sequence_no)` for lookup speed. Global `sequence_no` uniqueness is already guaranteed by the `BIGSERIAL` sequence (atomic, monotonic, never reused across partitions or transactions). No application-visible behavior change; the property "sequence_no is globally unique across all rows in audit_log" still holds, just enforced by the sequence rather than by an index.
+- **Cost / scope impact:** none.
+
+#### Bug 2 — Postgres EVENT TRIGGER does not support TRUNCATE TABLE tag
+
+- **Spec reference:** `Docs/backend-spec.md` §2.10.2 ("CREATE EVENT TRIGGER block_audit_truncate ON ddl_command_start WHEN TAG IN ('TRUNCATE TABLE') ...").
+- **Spec said:** EVENT TRIGGER on `ddl_command_start` filtered by `TAG IN ('TRUNCATE TABLE')`.
+- **Postgres reality:** `TRUNCATE TABLE` is NOT a supported tag for `ddl_command_start` event triggers:
+  ```
+  ERROR: event triggers are not supported for TRUNCATE TABLE
+  ```
+  Per the [supported-tag matrix](https://www.postgresql.org/docs/current/event-trigger-matrix.html), `ddl_command_start` covers CREATE/ALTER/DROP/COMMENT/GRANT/REVOKE etc., but explicitly excludes TRUNCATE.
+- **Resolution in 0005:** replaced the EVENT TRIGGER with a statement-level `BEFORE TRUNCATE` trigger (which IS supported per [Postgres trigger docs](https://www.postgresql.org/docs/current/sql-createtrigger.html)), attached to the parent `audit_log` AND each yearly partition `audit_log_y2026..audit_log_y2031`. Reason for attaching to partitions: TRUNCATE on the parent fires the parent's trigger, but TRUNCATE on a specific partition (e.g. `TRUNCATE audit_log_y2026`) does NOT fire the parent's trigger — it fires only the partition's own trigger. End state matches spec intent (all TRUNCATE attempts on the audit chain are blocked); mechanism differs.
+- **Trade-off:** the partition list is hardcoded to 2026–2031 in two migrations now (0001 creates partitions; 0005 attaches triggers). When the Dec-31 cron rolls a 2032 partition, that cron must ALSO attach the trigger (`CREATE TRIGGER audit_log_y2032_no_truncate BEFORE TRUNCATE ON audit_log_y2032 ...`). Documented as a follow-up.
+- **Cost / scope impact:** none. The partition rollover cron picks up the trigger requirement when it lands.
+
+---
+
+## Open follow-ups (post-Day-3)
 
 ### From Day 1 (carried)
 - [ ] **Day 4** — Watchdog Python script + systemd timer not yet deployed to Nuremberg.
 - [ ] **Day 5** — Caddy / TLS / `/api/health` not yet running on Ashburn.
 - [ ] **Optional** — Ashburn root SSH still allowed (B9 hardening; can disable any time).
 
-### New from Day 2
-- [ ] **Day 3 09:00** — populate `secrets/{dev,paper,live}.enc.yaml` from `deploy/sops/secret_schemas/*.template.yaml`; encrypt with sops; commit. Captured Day 2 values that land here: GitHub App private key (from 1Password attachment `github-app-pr-review-private-key`), GitHub App ID `3615825` + Installation ID `129868686` (not secret but co-located per spec schema), Discord bot token + guild_id + 7 channel_ids (from operator notes / 1Password).
+### From Day 2 (carried)
 - [ ] **Week 2 Mon** — `services/risk/sizing.py` Stage 0 implementation (forbidden whitelist; `risk-review-approved` label required).
 - [ ] **Week 2 Tue** — sub-universe data-executability check (QC bundled data availability per locked candidate); active universe at $15k–$25k tier emerges from Stage 0 dynamically (no manual finalization needed since the candidate pool is already locked).
 - [ ] **Week 3–4** — implement `V1TrendFollowing.generate_exit_candidates` (currently scaffolded with `NotImplementedError`).
 - [ ] **Week 4** — full LEAN/QC algorithm wiring (`lean/v1_qc_algorithm.py` is heartbeat-only on Day 2).
 - [ ] **2027-05-05** — annual rotation: regenerate age keys, `sops updatekeys` all `secrets/*.enc.yaml`, print new papers, destroy old papers.
+
+### New from Day 3
+- [ ] **Operator (anytime post-merge)** — fill the actually-sensitive secret values via `sops secrets/<env>.enc.yaml` for each env (per the Day 3 sops decision-log entry above). Minimum set for paper VPS bringup (Day 3 13:00+): `postgres.app_service_password`, `postgres.app_owner_password`, `discord.bot_token`, `discord.guild_id`, `discord.webhook_urls.*`, `github.app_private_key`, `internal.watchdog_bearer_token`, `internal.ipc_bearer_token`, QC tokens.
+- [ ] **Operator (Day 3 13:00 or whenever paper VPS is provisioned)** — bootstrap Postgres roles' passwords: `openssl rand -hex 32` × 2 → paste into `secrets/paper.enc.yaml` AND run `ALTER ROLE app_service WITH LOGIN PASSWORD '<value>'; ALTER ROLE app_owner WITH LOGIN PASSWORD '<value>';` on the paper VPS as superuser. Migration 0006 created the roles NOLOGIN with no passwords.
+- [ ] **Partition-rollover cron (Dec 31 each year)** — when adding `audit_log_y<next>`, ALSO attach the no-truncate trigger: `CREATE TRIGGER audit_log_y<next>_no_truncate BEFORE TRUNCATE ON audit_log_y<next> FOR EACH STATEMENT EXECUTE FUNCTION block_audit_truncate();`. Easy to forget and silently break TRUNCATE blocking on the new partition. Cron lands later (Phase 1 ops).
+- [ ] **Optional dev-guide update** — §7.1 migration filename convention (`YYYY-MM-DD_<short>.py`) is at odds with the implementation-guide-prescribed numeric scheme (`0001_<topic>.py`) used in this PR. Recommendation: numeric for the foundational set (Day 3 schema), date-based for everything after. Pending operator decision before §7.1 is edited.
 
 ---
 

@@ -41,6 +41,10 @@ dev = [
   "mypy>=1.13",
   "ruff>=0.7.4",
   "testcontainers[postgres]>=4.8",
+  # Sync Postgres driver — required by Alembic (sync) and the testcontainers
+  # `PostgresContainer.get_connection_url()` default (psycopg2). Runtime
+  # services use asyncpg per dev-guide §7.2; this is migrations / tests only.
+  "psycopg2-binary>=2.9",
   "respx>=0.21",
   "freezegun>=1.5",
 ]
