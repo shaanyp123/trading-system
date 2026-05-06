@@ -329,10 +329,65 @@ text remains unchanged and this log records the deviations.
 
 ---
 
-## Open follow-ups (post-Day-3)
+### 2026-05-06 — Day 4 09:00 — QC live broker = QC Paper, brokerage MODEL = IBKR Margin
+
+- **Spec reference:** `implementation-guide.md` §11 Day 4 09:00 ("QC algorithm file `lean/v1_qc_algorithm.py` should use QC's paper broker"); `Docs/backend-spec.md` §1 (Phase 1 architecture: QC paper); `Docs/backend-spec.md` §2.14 (slippage calibration uses LEAN-emitted `expected_price`).
+- **Spec said (implicitly):** "use QC's paper broker." Did not specify which of QC's two paper-broker options (built-in PaperBrokerage vs IBKR Paper) to pick, nor what brokerage MODEL to set in algorithm code.
+- **Decision (this PR):**
+  1. **Live broker (operator-pickable in QC dashboard):** `Quant Connect Paper Trading` — QC's built-in zero-dep paper broker. NOT `Interactive Brokers Paper`. Reason: IBKR Pro is still pending approval (Day 1 entry); IBKR-Paper requires linking a real IBKR username. QC's built-in option starts cleanly with no upstream dependency.
+  2. **Brokerage MODEL in algorithm code:** `SetBrokerageModel(InteractiveBrokersBrokerage, Margin)`. This controls fee/slippage simulation in BACKTESTS, not the live broker. Setting it to IBKR keeps backtest fee assumptions aligned with Phase 2 production (which cuts over to direct IBKR). Avoids a discontinuity in the LEAN-vs-vbt parity test (claude-dev-guide §1.5) at the phase boundary.
+  3. **LEAN Local environments map (`lean.json` `environments` block):** ships two — `live-paper-qc` (live-mode = true, brokerage = `PaperBrokerage`) and `live-paper-ibkr` (reserved for Phase 2, all values placeholder). `backtesting` env intentionally minimal — LEAN engine fills defaults.
+- **Rationale:** the spec's "use QC paper broker" wording wasn't specific enough to disambiguate broker (live runtime) from brokerage model (backtest fees). Splitting the two avoids forcing an IBKR dependency in Phase 0 while keeping cost realism in backtests. Both halves are documented in `lean/v1_qc_algorithm.py` Initialize docstring + the operator runbook in `lean/README.md`.
+- **Cost / scope impact:** none.
+
+---
+
+### 2026-05-06 — Day 4 09:00 — `lean.json` `parameters` block adds `STARTING_CASH_USD`
+
+- **Spec reference:** `strategies/v1_trend_following/parameters.py` `V1_DEFAULTS` (canonical parameter set).
+- **Decision:** `lean/lean.json` and `V1_PARAMETER_DEFAULTS` (in `v1_qc_algorithm.py`) include `STARTING_CASH_USD = "15000"`, which is NOT in `V1_DEFAULTS`. It's a deploy-time configuration knob (initial cash for `self.SetCash(...)`), not a strategy parameter.
+- **Rationale:** strategy parameters (signal lookbacks, ATR mults, vol target) belong in `parameter_sets` and flow through the agent's `tighten_parameter` enum. Starting cash is a one-time deploy concern that QC's UI naturally surfaces in the parameter map. Keeping it adjacent in `lean.json` means the operator can change starting cash via the QC Live Trading deploy form instead of editing source. The two are persisted differently — `STARTING_CASH_USD` does NOT belong in `parameter_sets` and the agent must NOT propose `tighten_parameter` against it.
+- **Lesson for future sessions:** when a parameter is deploy-time-only (no strategy semantics), surface it via QC's parameter map but do NOT add it to `V1_DEFAULTS` or the agent enum. Add a comment in `V1_PARAMETER_DEFAULTS` to make the distinction explicit if more such knobs land.
+- **Cost / scope impact:** none.
+
+---
+
+### 2026-05-06 — Day 4 13:00 — External watchdog: stdlib-only (deviates from dev-guide §3.5)
+
+- **Spec reference:** `Docs/claude-dev-guide.md` §3.5 ("Always use `structlog`. Never `print()`. Never `import logging` in service code."); `Docs/backend-spec.md` §1.6 + §2.12 (watchdog topology).
+- **Spec said:** all service code uses `structlog` for logging.
+- **Actual decision:** `watchdog/watchdog.py` uses **stdlib only** — `urllib.request`, `json`, stdlib `logging` with a custom JSON formatter. NO `structlog`, NO `httpx`, NO `requests`, no pip dependencies of any kind.
+- **Rationale:** the watchdog runs on a separate VPS (Hetzner Nuremberg CX23) whose only job is `curl /api/health` every 5 min. Adding pip dependencies imports a maintenance surface (CVE tracking, venv lifecycle, pip-install reliability on a 1-vCPU host) wildly disproportionate to the feature set we need. Stdlib `urllib.request` is more than sufficient for one GET + two POSTs per tick. Logs are JSON-formatted by a 20-line custom `logging.Formatter` shipped in the same file — output shape matches the backend's `structlog` JSON renderer (`timestamp_utc`, `level`, `service_name`, `event` keys) so the same shipper can consume them at the journald-to-S3 hand-off.
+- **Resolution:** module-level docstring in `watchdog/watchdog.py` documents the deviation explicitly. `pyproject.toml` does not add any new deps for the watchdog. `dev-guide §3.5` keeps its hard rule; the watchdog is documented as an explicit exception in this log.
+- **Cost / scope impact:** none. Saves ~3 min/quarter of pip dep maintenance on a host the operator otherwise never logs into.
+
+---
+
+### 2026-05-06 — Day 4 13:00 — Watchdog adds `ALERT_COOLDOWN_MINUTES=60` (not in spec)
+
+- **Spec reference:** `Docs/backend-spec.md` §1.6 ("Action on counter ≥ 3 (15 min unreachable) → Email operator via Resend + Discord webhook to `#critical`").
+- **Spec said:** alert on 3rd consecutive failure; did not specify what to do on the 4th, 5th, ..., Nth failure if the system stays down.
+- **Decision:** suppress repeat alerts for 60 minutes after a fired alert. Implementation: `state.last_alert_sent_at_utc` + `decide_alerts` cooldown branch.
+- **Rationale:** without the cooldown, a 4-hour outage would generate 48 separate identical email + Discord alerts (one per 5-min tick × 48 ticks), drowning the operator's inbox and the `#critical` channel. 60 min is long enough that the operator can read + acknowledge the first alert before the next one fires; short enough that a "sorry I missed the first one" recovery path still triggers within an hour. `decide_alerts` records `cooldown_active=true` in the suppressed-alert log line so post-incident review can still see every cooldown-suppressed tick in the systemd journal.
+- **Reset semantics:** if the operator manually deletes `/var/lib/trading-watchdog/state.json`, both the failure counter AND the alert cooldown reset — the next failure starts fresh. Documented in `watchdog/README.md` "Forcing a state reset".
+- **Cost / scope impact:** none.
+
+---
+
+### 2026-05-06 — Day 4 13:00 — Watchdog Day-4 scope: GET `/api/health` only; `POST /api/internal/watchdog` deferred
+
+- **Spec reference:** `Docs/backend-spec.md` §4.5.3 (`POST /api/internal/watchdog` push payload schema); §1.6 (watchdog topology).
+- **Spec said:** watchdog GETs `/api/health` AND optionally POSTs `/api/internal/watchdog` (push-style liveness signal so the backend learns the watchdog is up).
+- **Decision:** Day 4 implementation does GET `/api/health` only. The POST endpoint doesn't exist on the backend yet (FastAPI skeleton lands Day 5; this push endpoint is not on Day 5's deliverable list either — likely Week 5+ when the backend is feature-complete enough to consume the push). The `internal.watchdog_bearer_token` is captured in `secrets/paper.enc.yaml` (Day 3 PR #11) but unused at runtime; documented in the runbook as reserved for the future POST.
+- **Rationale:** building the POST against a non-existent endpoint would either (a) fail every tick until the endpoint lands (defeats the point of the watchdog) or (b) require feature-flagging that's harder to remove later than to add now. Wait until the endpoint exists, then extend `watchdog.py` in a small follow-up PR.
+- **Cost / scope impact:** none. The POST is additive — extending later doesn't change the current contract.
+
+---
+
+## Open follow-ups (post-Day-4)
 
 ### From Day 1 (carried)
-- [ ] **Day 4** — Watchdog Python script + systemd timer not yet deployed to Nuremberg.
+- [x] ~~**Day 4** — Watchdog Python script + systemd timer not yet deployed to Nuremberg.~~ — code shipped 2026-05-06; operator deploy follow-up below.
 - [ ] **Day 5** — Caddy / TLS / `/api/health` not yet running on Ashburn.
 - [ ] **Optional** — Ashburn root SSH still allowed (B9 hardening; can disable any time).
 
@@ -340,16 +395,22 @@ text remains unchanged and this log records the deviations.
 - [ ] **Week 2 Mon** — `services/risk/sizing.py` Stage 0 implementation (forbidden whitelist; `risk-review-approved` label required).
 - [ ] **Week 2 Tue** — sub-universe data-executability check (QC bundled data availability per locked candidate); active universe at $15k–$25k tier emerges from Stage 0 dynamically (no manual finalization needed since the candidate pool is already locked).
 - [ ] **Week 3–4** — implement `V1TrendFollowing.generate_exit_candidates` (currently scaffolded with `NotImplementedError`).
-- [ ] **Week 4** — full LEAN/QC algorithm wiring (`lean/v1_qc_algorithm.py` is heartbeat-only on Day 2).
+- [ ] **Week 4** — full LEAN/QC algorithm wiring (`lean/v1_qc_algorithm.py` is heartbeat-only as of Day 4; brokerage model + warmup + parameter-map are in place but `OnDailySignalCycle` still emits heartbeat-only — strategy module imports remain commented out).
 - [ ] **2027-05-05** — annual rotation: regenerate age keys, `sops updatekeys` all `secrets/*.enc.yaml`, print new papers, destroy old papers.
 
-### New from Day 3
-- [x] ~~**Operator (anytime post-merge)** — fill paper env Day-2/3 captured set via sops~~ — resolved 2026-05-05 via PR #11. Filled: `discord.bot_token`, `discord.guild_id`, all 7 `discord.webhook_urls.*`, `github.app_private_key`, `internal.watchdog_bearer_token`, `internal.ipc_bearer_token`. Verified via `sops -d --extract` + gitleaks.
-- [ ] **Operator (rolling, by checkpoint)** — fill the remaining `<TODO>` fields in `paper.enc.yaml` (and `live.enc.yaml` at Week 8) at their respective day checkpoints: `postgres.*` (Day 5 paper VPS bootstrap), `quantconnect.*` (when QC token is regenerated post Day 1 leak), `resend.api_key` (when Resend account is created), `anthropic.*` (Week 5 agent bringup), `s3.*` (Day 5 S3 provision), `trading_economics.api_token` (Week 2 calendar import), `ibkr.flex_query_token` (Week 2 IBKR flex setup). Runtime fail-closes on placeholder strings; nothing breaks until a service tries to use the field.
+### From Day 3 (carried)
+- [x] ~~**Operator (anytime post-merge)** — fill paper env Day-2/3 captured set via sops~~ — resolved 2026-05-05 via PR #11.
+- [ ] **Operator (rolling, by checkpoint)** — fill the remaining `<TODO>` fields in `paper.enc.yaml` (and `live.enc.yaml` at Week 8) at their respective day checkpoints: `postgres.*` (Day 5 paper VPS bootstrap), `quantconnect.*` (when QC token is regenerated post Day 1 leak), `resend.api_key` (Day 4 13:00 — see new follow-up below), `anthropic.*` (Week 5 agent bringup), `s3.*` (Day 5 S3 provision), `trading_economics.api_token` (Week 2 calendar import), `ibkr.flex_query_token` (Week 2 IBKR flex setup). Runtime fail-closes on placeholder strings; nothing breaks until a service tries to use the field.
 - [ ] **Operator (Day 3 13:00 or whenever paper VPS is provisioned)** — bootstrap Postgres roles' passwords: `openssl rand -hex 32` × 2 → paste into `secrets/paper.enc.yaml` AND run `ALTER ROLE app_service WITH LOGIN PASSWORD '<value>'; ALTER ROLE app_owner WITH LOGIN PASSWORD '<value>';` on the paper VPS as superuser. Migration 0006 created the roles NOLOGIN with no passwords.
 - [ ] **Partition-rollover cron (Dec 31 each year)** — when adding `audit_log_y<next>`, ALSO attach the no-truncate trigger: `CREATE TRIGGER audit_log_y<next>_no_truncate BEFORE TRUNCATE ON audit_log_y<next> FOR EACH STATEMENT EXECUTE FUNCTION block_audit_truncate();`. Easy to forget and silently break TRUNCATE blocking on the new partition. Cron lands later (Phase 1 ops).
-- [x] ~~**Optional dev-guide update** — §7.1 migration filename convention~~ — resolved 2026-05-05 (hybrid scheme adopted; see entry above).
-- [x] ~~**Operator (anytime post-`forbidden-paths` PR merge)** — add `forbidden-paths` to required-status-checks~~ — resolved 2026-05-05 (see entry below; operator confirmed merge of PR #10/#11; required-status-checks list updated via `gh api` to include all 5 checks).
+- [x] ~~**Optional dev-guide update** — §7.1 migration filename convention~~ — resolved 2026-05-05.
+- [x] ~~**Operator (anytime post-`forbidden-paths` PR merge)** — add `forbidden-paths` to required-status-checks~~ — resolved 2026-05-05.
+
+### New from Day 4
+- [ ] **Operator (Day 4 10:00 or whenever the QC PR merges)** — execute `lean/README.md` Steps 1–7 in QC dashboard: create `v1_trend_following_paper` project, paste `v1_qc_algorithm.py`, populate parameter map (11 keys per the table), smoke-backtest, deploy Live Paper, capture **QC project ID + Live Algorithm ID + deploy timestamp + broker pick + starting cash** into a Day 4 close-out entry below.
+- [ ] **Operator (Day 4 13:00 — blocks watchdog deploy)** — provision Resend account at [resend.com](https://resend.com). Sign up (free tier sufficient for Phase 0), grab API key from dashboard, `sops secrets/paper.enc.yaml` and replace `<TODO_FROM_DAY_3_RESEND_PROVISION>` under `resend.api_key` with the real value. Until done: watchdog will deploy and log ticks, but email alerts will be suppressed (Discord still fires).
+- [ ] **Operator (Day 4 13:00 post-Resend)** — execute `watchdog/README.md` Steps 1–8 on Hetzner Nuremberg VPS (`188.245.37.16`): create `trading-watchdog` user, scp script + systemd files, populate `/opt/trading-watchdog/watchdog.env`, smoke-test the script manually, enable `trading-watchdog.timer`, verify alert wiring via the Step 7 forced-503 test. Capture the test-alert message ID + Discord message link in a Day 4 close-out entry below.
+- [ ] **Week 5+ (when `POST /api/internal/watchdog` lands on the backend)** — extend `watchdog/watchdog.py` to also push to that endpoint after each successful GET. Add `WATCHDOG_BEARER_TOKEN` to `/opt/trading-watchdog/watchdog.env` (sourced from `secrets/paper.enc.yaml` `internal.watchdog_bearer_token`, already encrypted Day 3 via PR #11). Bearer token is captured + ready; just unused until the endpoint exists.
 
 ---
 
@@ -391,3 +452,9 @@ Cross-references in current edits:
 - `Docs/claude-dev-guide.md` §7.1 → updated to document hybrid migration filename convention (numeric `NNNN_` for foundational set 0001-0006, date-based `YYYY-MM-DD_` for everything Day 4+).
 - `Docs/claude-dev-guide.md` §10.1 Week 3 → annotated to describe the `BEFORE TRUNCATE` trigger mechanism (replaces the spec's `EVENT TRIGGER` wording).
 - `Docs/claude-dev-guide.md` §11 [A02] → previously asserted "Pre-merge linter is mechanical and will block the merge"; now actually true after `.github/workflows/forbidden-paths.yml` shipped in PR #10 + `risk-review-approved` label created Day 3.
+
+**Day 4:**
+- `implementation-guide.md` §11 Day 4 09:00 ("use QC's paper broker") → resolved to two distinct decisions (live broker = QC Paper at deploy; brokerage model = IBKR/Margin in code). Documented in `lean/README.md` operator runbook + this log.
+- `Docs/backend-spec.md` §1.6 (alert behavior) → spec describes "alert at 3 consecutive failures" but does not specify repeat-alert behavior on tick 4–N during a sustained outage. Watchdog implementation adds a 60-min cooldown to suppress duplicate alerts; operator can manually reset state to force the next failure to alert immediately.
+- `Docs/backend-spec.md` §1.6 + §4.5.3 (watchdog endpoints) → Day 4 watchdog uses GET `/api/health` only. POST `/api/internal/watchdog` (push) is wired in spec but not implemented Day 4 since the endpoint doesn't exist on the backend yet. Bearer token captured Day 3 (PR #11), held for Week 5+ when the endpoint lands.
+- `Docs/claude-dev-guide.md` §3.5 (`structlog` mandate) → watchdog explicitly opts out (stdlib `logging` with JSON formatter). Documented as an exception in this log; rule remains in effect for backend service code.
