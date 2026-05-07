@@ -608,11 +608,53 @@ text remains unchanged and this log records the deviations.
 
 ---
 
+### 2026-05-07 — Day 5 close-out — api healthy on Ashburn; Day 5 closed at loopback level
+
+- **Spec reference:** `implementation-guide.md` §3 Week 1 verification gate (`curl https://<your-domain>` returns 200); `deploy/api/README.md` Day 5 deploy runbook.
+- **Deliverable achieved:** the api container is **healthy** on the Hetzner Ashburn primary VPS (`178.156.239.84`). The Day 5 verification gate is **closed at the loopback level** — `docker compose exec api curl http://localhost:8000/api/health` returns the expected `{"status":"ok","db_connected":true,...}` shape. The TLS-path verification (`curl https://spratcapital.com/api/health` from the operator's laptop) is **deferred to Day 6 morning** by operator decision; everything below the TLS layer is working.
+- **What landed end-to-end on Ashburn (operator-confirmed 2026-05-07):**
+  | Component | Status |
+  |---|---|
+  | Hetzner Ashburn CCX13 VPS | Up, accessible via SSH key auth as root |
+  | Docker engine 29.4.2 | Pre-installed by Hetzner Ubuntu 24.04 image |
+  | sops 3.10.2 binary | Installed from GitHub releases |
+  | age 1.1.1 | apt installed |
+  | `/opt/trading` repo | Cloned via deploy key (read-only); HEAD at `2a7a92a` |
+  | paper age private key | Installed at `/etc/credstore.encrypted/age_key` (mode 0400, root) |
+  | `secrets/paper.enc.yaml` postgres app-role passwords | Filled (64-hex each) via `sops` on VPS |
+  | `/opt/trading/deploy/.env` | Authored with full schema + bootstrap superuser password |
+  | postgres 16-alpine container | Healthy; `app_service` role auth verified |
+  | alembic migrations 0001-0006 | Applied (audit_log, core tables, risk, ops, immutability, roles) |
+  | `app_service` + `app_owner` ALTER ROLE | Done; sops-stored passwords match `pg_authid` |
+  | api container (`ghcr.io/shaanyp123/trading-api:latest`) | Healthy; bind-mounts `/opt/trading/secrets-decrypted/decrypted.yaml` |
+  | caddy:2-alpine container | Started (TLS verification deferred) |
+- **Five live bugs hit during Day 5 deploy + their fixes:**
+  1. `getsops/sops:v3.10.2` Docker image doesn't exist → dropped sops_init container; sops decryption moves to host (PR #26 + Day 5 close-out entry above).
+  2. Bind-mount workaround tried mounting a single file inside read-only `secrets_volume` tmpfs → Docker can't create mountpoint. Fixed by mounting the entire host directory at `/run/secrets`.
+  3. `volumes: !reset [...]` syntax silently ignored in Hetzner's Compose v2 5.1.3 repackage → override file dropped the volume entirely. Fixed by editing base `docker-compose.yml` instead of relying on override.
+  4. `psql` heredoc-stdin competed with interactive password prompt → fail. Fixed by passing `PGPASSWORD` via `-e` env var to `docker compose exec`.
+  5. **NEW (this PR fixes):** `ENV_FILE` variable name collision between script-local var (path to `deploy/.env`) and a key inside `deploy/.env` itself (`ENV_FILE=paper.enc.yaml` from the original runbook). When script `source`d `deploy/.env`, the inner value clobbered the path; subsequent `docker compose --env-file "${ENV_FILE}"` looked for `paper.enc.yaml` in the working directory. Renamed the script's local var to `DEPLOY_ENV_PATH` (unique enough to never collide with operator deploy/.env contents).
+  6. **NEW (this PR fixes):** `docker-compose.override.yml` from prior debug session survived `git reset --hard` (gitignored, so untracked = preserved by git reset). The stale override silently broke api volume mounts on subsequent deploy. Fixed by adding defensive auto-removal at the top of the bringup script.
+- **One LATENT bug discovered Day 5 deploy that this PR documents but does NOT auto-fix:** `secrets/paper.enc.yaml` is **tracked** in git, so the operator-side fills (postgres app-role passwords) get **wiped by `git reset --hard`** on subsequent deploys. The VPS deploy key is read-only — the VPS can't push the filled file back to GitHub. Three remediation options now in `deploy/api/README.md` Step 4a.1: (A) manual backup-restore via `/etc/credstore.encrypted/paper.enc.yaml.backup` (Day 5 short-term workaround); (B) commit + push the filled sops file from the operator's laptop (proper fix; follow-up PR Day 6); (C) auto-restore in the bringup script (defensive). For Day 5 the operator should do (A) before any future `git reset --hard`. Day 6 should land (B).
+- **Bringup script v2 (this PR):**
+  - Renamed `ENV_FILE` → `DEPLOY_ENV_PATH` to fix the collision bug above.
+  - Added auto-removal of stale `docker-compose.override.yml` at script start.
+  - Added explicit `docker compose stop + rm` of api/caddy in Step 6 to force-recreate (handles the case where a stale container exists with the old broken volume config from a prior debug session).
+- **Time spent:** Day 5 deploy took ~3 hours of operator time across debug + fix cycles. The bringup script v2 should reduce subsequent deploys to ~30 seconds (the Step 1-5 docker work) + ~10 seconds (script overhead).
+- **Lesson reinforced:** every `git reset --hard` on the VPS will wipe the filled `secrets/paper.enc.yaml`. Until follow-up PR #B lands, the operator must `cp /opt/trading/secrets/paper.enc.yaml /etc/credstore.encrypted/paper.enc.yaml.backup` immediately after filling, and `cp /etc/credstore.encrypted/paper.enc.yaml.backup /opt/trading/secrets/paper.enc.yaml` before each subsequent deploy. The runbook now spells this out.
+- **Day 5 verification gate:** ✅ closed at the loopback level. The TLS-path verification gate (laptop `curl https://spratcapital.com/api/health`) is deferred to Day 6 morning.
+- **Cost / scope impact:** none. ~3 hours of operator time on Day 5 deploy (vs the implementation-guide's nominal 1-hour estimate). Net Day 5 outcome on schedule for Week 1 close.
+
+---
+
 ## Open follow-ups (post-Day-4)
 
 ### From Day 1 (carried)
 - [x] ~~**Day 4** — Watchdog Python script + systemd timer not yet deployed to Nuremberg.~~ — code shipped 2026-05-06; deployed + operational 2026-05-07. See "Watchdog operational on Hetzner Nuremberg" close-out entry above.
-- [ ] **Day 5** — Caddy / TLS / `/api/health` not yet running on Ashburn. **In flight:** FastAPI skeleton + Caddyfile + docker-compose Day-5 subset shipped this PR; operator deploy via `deploy/api/README.md` closes this item. **Day 5 morning addition:** as the FIRST step after `/api/health` is reachable, run `curl https://discord.com/api/webhooks/<critical-webhook-url>` from the Ashburn VPS to confirm whether Cloudflare also blocks Discord webhook POSTs from Ashburn IPs (Falkenstein blocks; we don't yet know about Ashburn). If blocked → all 7 backend → Discord webhook channels (`#daily_brief`, `#signals`, `#fills`, `#alerts`, `#critical`, `#ops`, `#audit`) need to migrate to Resend. If not blocked → Phase 0 plan unchanged for the backend; only the watchdog uses Resend.
+- [~] **Day 5** — Caddy / TLS / `/api/health` running on Ashburn. **PARTIAL 2026-05-07:** api container healthy at the loopback level (`docker compose exec api curl http://localhost:8000/api/health` returns ok + db_connected:true); TLS-path verification (`curl https://spratcapital.com/api/health` from operator's laptop) **deferred to Day 6 morning** by operator decision. Caddy is started; first ACME cert acquisition happens on first external request. See Day 5 close-out entry "api healthy on Ashburn; Day 5 closed at loopback level".
+- [ ] **Day 6 morning — TLS verification + Ashburn ↔ Discord webhook test (carried from Day 5)** — (a) From laptop: `curl -fsS https://spratcapital.com/api/health | jq .` (expect `{"status":"ok",...}` + HSTS + CSP headers). If 502 on first try, wait 30s for Caddy to acquire its first Let's Encrypt cert, retry. (b) From Ashburn VPS: `curl -X POST <discord-ops-webhook-url>` to determine whether Cloudflare blocks Hetzner Ashburn IPs the same way it blocks Hetzner Nuremberg. Result determines whether 6 backend → Discord webhook channels (daily_brief, signals, fills, alerts, ops, audit) keep their Phase 0 plan or migrate to Resend.
+- [ ] **Day 6 morning — capture SETUP_TOKEN_EMITTED into 1Password** — re-run `bash deploy/day5-bringup.sh` (or grep api logs directly) to emit + capture the bootstrap setup token. Save to 1Password as `trading-system paper bootstrap setup token (24h)`. The token is needed for first-time WebAuthn ceremony when that lands (Phase 0 Week 2).
+- [ ] **Day 6 follow-up PR — commit filled `secrets/paper.enc.yaml` from laptop** — fixes the latent bug where `git reset --hard` wipes the operator's VPS-side sops fills. Workflow: scp the filled file from VPS to laptop, commit, push. Repo's encrypted yaml becomes the canonical filled version; future `git pull` on the VPS preserves it. Until this lands, operator must manually `cp /opt/trading/secrets/paper.enc.yaml /etc/credstore.encrypted/paper.enc.yaml.backup` after each fill, and restore before each `git reset --hard`. See Day 5 close-out entry "api healthy on Ashburn".
 - [ ] **Optional** — Ashburn root SSH still allowed (B9 hardening; can disable any time).
 
 ### From Day 2 (carried)
@@ -625,7 +667,7 @@ text remains unchanged and this log records the deviations.
 ### From Day 3 (carried)
 - [x] ~~**Operator (anytime post-merge)** — fill paper env Day-2/3 captured set via sops~~ — resolved 2026-05-05 via PR #11.
 - [ ] **Operator (rolling, by checkpoint)** — fill the remaining `<TODO>` fields in `paper.enc.yaml` (and `live.enc.yaml` at Week 8) at their respective day checkpoints: `postgres.*` (Day 5 paper VPS bootstrap), `quantconnect.*` (when QC token is regenerated post Day 1 leak), `resend.api_key` (deferred to Phase 1 hardening per 2026-05-06 entry below — Phase 0 watchdog is Discord-only), `anthropic.*` (Week 5 agent bringup), `s3.*` (Day 5 S3 provision), `trading_economics.api_token` (Week 2 calendar import), `ibkr.flex_query_token` (Week 2 IBKR flex setup). Runtime fail-closes on placeholder strings; nothing breaks until a service tries to use the field.
-- [ ] **Operator (Day 5 deploy)** — bootstrap Postgres roles' passwords per `deploy/api/README.md` Step 3 (sops paste) + Step 6 (`ALTER ROLE`). Carried from Day 3 13:00 follow-up; the Day 5 runbook formalizes it with copy-paste commands. Migration 0006 created the roles NOLOGIN with no passwords; Day 5 also adds a `POSTGRES_SUPERUSER_PASSWORD` to `deploy/.env` (NOT in sops) for the postgres container's bootstrap user — see Day 5 close-out entry "Postgres superuser bootstrap moved to `deploy/.env`".
+- [x] ~~**Operator (Day 5 deploy)** — bootstrap Postgres roles' passwords~~ — resolved 2026-05-07. App-role passwords filled in sops + `ALTER ROLE` applied on Ashburn VPS. `app_service` auth verified via `SELECT current_user;`. `POSTGRES_SUPERUSER_PASSWORD` in `/opt/trading/deploy/.env`.
 - [ ] **Partition-rollover cron (Dec 31 each year)** — when adding `audit_log_y<next>`, ALSO attach the no-truncate trigger: `CREATE TRIGGER audit_log_y<next>_no_truncate BEFORE TRUNCATE ON audit_log_y<next> FOR EACH STATEMENT EXECUTE FUNCTION block_audit_truncate();`. Easy to forget and silently break TRUNCATE blocking on the new partition. Cron lands later (Phase 1 ops).
 - [x] ~~**Optional dev-guide update** — §7.1 migration filename convention~~ — resolved 2026-05-05.
 - [x] ~~**Operator (anytime post-`forbidden-paths` PR merge)** — add `forbidden-paths` to required-status-checks~~ — resolved 2026-05-05.
@@ -634,11 +676,21 @@ text remains unchanged and this log records the deviations.
 - [x] ~~**Operator (Day 4 10:00)** — execute `lean/README.md` Steps 1–7 in QC dashboard~~ — resolved 2026-05-07. Algorithm Running on QC Paper Brokerage. Three QC API discoveries fixed in-flight (PRs #17, #18, #19 all merged).
 - [x] ~~**Operator (Day 4 13:00)** — execute `watchdog/README.md` Steps 1–8 on Nuremberg~~ — resolved 2026-05-07. Watchdog deployed + operational on `188.245.37.16`; Resend email alerting confirmed end-to-end; Discord blocked by Cloudflare (treated as best-effort secondary). PR #21 (User-Agent fix) + PR #22 (close-out + runbook fixes) capture the journey.
 - [x] ~~**Phase 1 hardening (deferred from Day 4)** — provision Resend~~ — resolved 2026-05-07 (forced earlier by Cloudflare-blocking-Discord discovery). See "Resend is now Phase 0" close-out entry above.
-- [ ] **Day 5 morning verification (2026-05-07 17:30 ET cycle fire)** — check QC's ObjectStore tab for `heartbeat/2026-05-07.json`. If present → daily cycle is firing correctly. If `signal_cycle_tick` log line is also visible (in any QC UI panel) → `self.log()` works and the missing init log was just routing weirdly. If only the ObjectStore key appears (no log line anywhere) → confirmed `self.log()` is silent in QC's snake_case API; push a follow-up PR to switch to `self.Log()` (PascalCase). See open-question paragraph in 2026-05-07 paper-day-clock close-out entry above.
-- [ ] **Day 5 morning verification (Ashburn ↔ Discord)** — FIRST step after `paper.spratcapital.com/api/health` is up: run `curl -X POST https://discord.com/api/webhooks/...` from the Ashburn VPS to confirm whether Discord webhook POSTs work from Ashburn or are also CF-blocked. Result determines whether the 6 backend → Discord webhook channels (daily_brief, signals, fills, alerts, ops, audit) keep their Phase 0 plan or need to migrate to Resend.
+- [ ] **Day 6+ verification (2026-05-07 17:30 ET cycle fire)** — check QC's ObjectStore tab for `heartbeat/2026-05-07.json`. Operator-only; non-blocking. Backtest validation already confirmed schedule + DST + every_day() semantics work; the open question is whether `self.log()` emits in QC's live UI (cosmetic; doesn't affect correctness).
+- [ ] **Day 6 morning verification (Ashburn ↔ Discord)** — see "Day 6 morning — TLS verification + Ashburn ↔ Discord webhook test" entry above for the consolidated next-day checklist.
 - [x] ~~**Day 5 morning — codify the platform-API smoke-test rule**~~ — resolved 2026-05-07. Shipped as `Docs/claude-dev-guide.md` §6.8 (Third-Party Platform Integration Smoke Tests) + anti-pattern `[A27]` + §1.4 cross-reference. Five strikes (snake_case, `main.py`, `time_rules.at`, Cloudflare-blocks-Hetzner-Discord, FastAPI app import-time Pydantic Settings failure at Docker build) now codified with concrete examples. See "Day 5 close-out — Codify platform-API smoke-test rule" entry below.
 - [ ] **Week 5+ (when `POST /api/internal/watchdog` lands on the backend)** — extend `watchdog/watchdog.py` to also push to that endpoint after each successful GET. Add `WATCHDOG_BEARER_TOKEN` to `/opt/trading-watchdog/watchdog.env` (sourced from `secrets/paper.enc.yaml` `internal.watchdog_bearer_token`, already encrypted Day 3 via PR #11). Bearer token is captured + ready; just unused until the endpoint exists.
 - [ ] **Week 4 hygiene (when strategy logic wires up)** — tighten the schedule registration in `lean/v1_qc_algorithm.py` `initialize()` from `schedule.on(date_rules.every_day(), time_rules.at(17, 30), ...)` to `schedule.on(date_rules.every_day(<cme_anchor_symbol>), time_rules.at(17, 30), ...)` where `<cme_anchor_symbol>` is one of the subscribed futures (e.g., `/MES` per `Docs/backend-spec.md` §2.3 — the most-traded micro + natural calendar driver). Empirically confirmed via Jan-May backtest 2026-05-07: current `every_day()` fires on every calendar day (~126 ticks for 126 days), not just CME trading days. Cosmetic for Day 4 heartbeat-only; would mean unnecessary weekend/holiday strategy executions in Week 4. See "Backtest validation" close-out entry above.
+
+### New from Day 5
+- [x] ~~**Operator (Day 5)** — execute `deploy/api/README.md` Steps 1-5 on Ashburn~~ — resolved 2026-05-07. api healthy at the loopback level; full step-by-step capture in Day 5 close-out entry "api healthy on Ashburn". Three live bringup-script bugs found + fixed in same-day PR (this one).
+- [x] ~~**Day 5 — codify the platform-API smoke-test rule**~~ — resolved 2026-05-07 via PR #25 (dev-guide §6.8 + A27 + §1.4 cross-reference).
+- [x] ~~**Day 5 — bringup script bug: `ENV_FILE` collision with deploy/.env**~~ — resolved 2026-05-07 (this PR). Renamed script-local var to `DEPLOY_ENV_PATH`.
+- [x] ~~**Day 5 — bringup script bug: stale `docker-compose.override.yml` survives `git reset --hard`**~~ — resolved 2026-05-07 (this PR). Defensive auto-removal at script start.
+- [x] ~~**Day 5 — bringup script bug: api container needs explicit force-recreate**~~ — resolved 2026-05-07 (this PR). `docker compose stop api caddy + rm -f api caddy` before `up -d` in Step 6.
+- [ ] **Day 6 follow-up PR — commit filled `secrets/paper.enc.yaml`** from operator's laptop. Fixes the latent bug where `git reset --hard` wipes the operator's VPS-side fills. See Day 5 close-out entry. Until this lands, operator does manual backup-restore via `/etc/credstore.encrypted/paper.enc.yaml.backup` (documented in `deploy/api/README.md` Step 4a.1).
+- [ ] **Day 6 — auto-restore sops backup in bringup script** (defensive followup). Detect `/etc/credstore.encrypted/paper.enc.yaml.backup` at script start; if present AND `secrets/paper.enc.yaml` looks placeholder-y, restore the backup. Removes the operator's manual cp dance.
+- [ ] **Phase 0 Week 2+ (when 2nd service Dockerfile lands)** — ship the same host-bind-mount-of-decrypted-secrets pattern for that service. Each new service in the phase1 profile will need its own `volumes: - ${SECRETS_DIR}:/run/secrets:ro` line in `docker-compose.yml`.
 
 ---
 

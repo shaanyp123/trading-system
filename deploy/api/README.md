@@ -125,6 +125,48 @@ SOPS_AGE_KEY_FILE=/etc/credstore.encrypted/age_key \
 unset APP_SERVICE_PWD APP_OWNER_PWD
 ```
 
+### 4a.1 — Back up the filled sops file (CRITICAL — prevents `git reset` data loss)
+
+`secrets/paper.enc.yaml` is tracked in git. The VPS's deploy key is
+read-only, so changes you make here can't be pushed back to GitHub.
+**Future `git reset --hard` will wipe these passwords back to placeholder
+strings**, breaking the next deploy.
+
+Three protection options, in increasing order of robustness:
+
+**Option A (manual backup, simplest):** copy the filled file outside the
+repo. Restore before each deploy that does `git reset --hard`.
+
+```bash
+cp /opt/trading/secrets/paper.enc.yaml /etc/credstore.encrypted/paper.enc.yaml.backup
+chmod 0400 /etc/credstore.encrypted/paper.enc.yaml.backup
+
+# Future deploy pattern:
+cp /etc/credstore.encrypted/paper.enc.yaml.backup /opt/trading/secrets/paper.enc.yaml
+bash deploy/day5-bringup.sh
+```
+
+**Option B (proper, do this in a follow-up PR):** download the filled file
+to your laptop, commit + push from there. The repo's `secrets/paper.enc.yaml`
+becomes the canonical filled version. Future `git pull` on the VPS
+preserves it forever.
+
+```bash
+# On laptop:
+scp root@178.156.239.84:/opt/trading/secrets/paper.enc.yaml secrets/paper.enc.yaml
+cd <local repo>
+git add secrets/paper.enc.yaml
+git commit -m "chore(secrets): fill paper.enc.yaml app-role passwords (Day 5 deploy)"
+git push origin <branch>
+# Open PR; merge.
+```
+
+**Option C (auto-restore in the script):** the bringup script could detect
+a backup file and restore on each run. Not implemented yet — covered as a
+Day 5 follow-up.
+
+For Day 5, do **Option A**. The Option-B follow-up PR can land Day 6.
+
 ### 4b — Author `/opt/trading/deploy/.env`
 
 ```bash
