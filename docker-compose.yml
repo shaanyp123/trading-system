@@ -2,7 +2,7 @@
 # Service inventory: backend-spec §1.4 (19 services).
 #
 # Profile gating:
-#   default (no profile)  — Day 5 deploy subset: caddy, api, postgres, sops_init.
+#   default (no profile)  — Day 5 deploy subset: caddy, api, postgres.
 #   phase1                — services that ship Phase 0 Week 2+ (signal, risk,
 #                           execution, …). Activated with `--profile phase1`.
 #   phase2                — direct-IBKR services (ib_gateway, lean_local).
@@ -26,10 +26,6 @@ volumes:
   prometheus_data:
   grafana_data:
   gitea_data:
-  secrets_volume:
-    driver_opts:
-      type: tmpfs
-      device: tmpfs
 
 services:
 
@@ -71,13 +67,15 @@ services:
       API_LOG_LEVEL: ${API_LOG_LEVEL:-INFO}
       API_DB_HOST: postgres
       API_DB_NAME: trading
+    # Bind-mount the host-decrypted secrets directory. `deploy/day5-bringup.sh`
+    # runs `sops -d` on the host and writes /opt/trading/secrets-decrypted/
+    # decrypted.yaml — the api entrypoint reads it at /run/secrets/decrypted.yaml.
+    # SECRETS_DIR is set in deploy/.env (default kept here for clarity).
     volumes:
-      - secrets_volume:/run/secrets:ro
+      - ${SECRETS_DIR:-/opt/trading/secrets-decrypted}:/run/secrets:ro
     depends_on:
       postgres:
         condition: service_healthy
-      sops_init:
-        condition: service_completed_successfully
     healthcheck:
       test: ['CMD', 'curl', '-fsS', 'http://localhost:8000/api/health']
       interval: 30s
@@ -106,27 +104,6 @@ services:
       retries: 5
       start_period: 15s
 
-  # ---- sops decrypt sidecar (runs once at compose-up) -------------------
-  # Decrypts secrets/<env>.enc.yaml to a tmpfs volume that the api mounts
-  # read-only. Exits 0 on success; api waits via `service_completed_successfully`.
-  sops_init:
-    image: getsops/sops:v3.10.2
-    restart: 'no'
-    networks: [egress]
-    volumes:
-      - secrets_volume:/run/secrets
-      - ./secrets:/secrets:ro
-      - ${SOPS_AGE_KEY_FILE:?set SOPS_AGE_KEY_FILE in deploy/.env}:/age_key:ro
-    environment:
-      SOPS_AGE_KEY_FILE: /age_key
-      ENV_FILE: ${ENV_FILE:-paper.enc.yaml}
-    entrypoint: ['/bin/sh', '-c']
-    command: |
-      set -euo pipefail
-      sops -d "/secrets/${ENV_FILE}" > /run/secrets/decrypted.yaml
-      chmod 0440 /run/secrets/decrypted.yaml
-      echo "[sops_init] decrypted /secrets/${ENV_FILE} -> /run/secrets/decrypted.yaml"
-
   # ---- Phase 0 Week 2+ services (profile-gated until Dockerfile lands) -
   # Each ships its own Dockerfile + tests in a follow-on PR; until then,
   # the `phase1` profile keeps `docker compose up` from trying to pull
@@ -136,21 +113,21 @@ services:
     restart: unless-stopped
     networks: [internal]
     profiles: ['phase1']
-    depends_on: [postgres, sops_init]
+    depends_on: [postgres]
 
   risk:
     image: ghcr.io/${GHCR_OWNER}/trading-risk:${RELEASE_SHA:-latest}
     restart: unless-stopped
     networks: [internal]
     profiles: ['phase1']
-    depends_on: [postgres, sops_init]
+    depends_on: [postgres]
 
   execution:
     image: ghcr.io/${GHCR_OWNER}/trading-execution:${RELEASE_SHA:-latest}
     restart: unless-stopped
     networks: [internal, egress]   # Phase 1 needs QC ObjectStore reach
     profiles: ['phase1']
-    depends_on: [postgres, sops_init, qc_adapter]
+    depends_on: [postgres, qc_adapter]
 
   reconciliation:
     image: ghcr.io/${GHCR_OWNER}/trading-reconciliation:${RELEASE_SHA:-latest}
@@ -185,21 +162,20 @@ services:
     restart: unless-stopped
     networks: [internal, egress]
     profiles: ['phase1']
-    depends_on: [postgres, sops_init]
+    depends_on: [postgres]
 
   discord_bot:
     image: ghcr.io/${GHCR_OWNER}/trading-discord-bot:${RELEASE_SHA:-latest}
     restart: unless-stopped
     networks: [internal, egress]
     profiles: ['phase1']
-    depends_on: [api, sops_init]
+    depends_on: [api]
 
   webhook_pusher:
     image: ghcr.io/${GHCR_OWNER}/trading-webhook-pusher:${RELEASE_SHA:-latest}
     restart: unless-stopped
     networks: [internal, egress]
     profiles: ['phase1']
-    depends_on: [sops_init]
 
   monitoring:
     image: ghcr.io/${GHCR_OWNER}/trading-monitoring:${RELEASE_SHA:-latest}
@@ -213,7 +189,7 @@ services:
     restart: unless-stopped
     networks: [internal, egress]
     profiles: ['phase1']
-    depends_on: [postgres, sops_init]
+    depends_on: [postgres]
 
   # ---- Source mirror ----------------------------------------------------
   gitea:

@@ -4,267 +4,265 @@ The Day 5 deploy brings up the first stack on the **Hetzner Ashburn primary
 VPS** (CCX13, `178.156.239.84`). Goal: `curl https://spratcapital.com/api/health`
 returns `{"status":"ok",...}` from the operator's laptop.
 
-This runbook is the operator-side counterpart to the FastAPI skeleton in
-`services/api/`. Once executed end-to-end, the Day 5 verification gate
-(`implementation-guide.md` §3 Week 1) is closed.
-
-The runbook assumes:
-
-- The operator has SSH access to the Ashburn VPS as a non-root sudoer (Day 1).
-- DNS A record for `spratcapital.com` resolves to `178.156.239.84` (Day 2).
-- `secrets/paper.enc.yaml` has the Day-3-and-earlier values filled (PR #11).
-- The `<TODO>` placeholders in `secrets/paper.enc.yaml` for Postgres app-role
-  passwords will be filled here at Step 3.
+The deploy is split into a **one-time setup** (Steps 1-4) and a
+**re-runnable bringup script** (Step 5). Once Steps 1-4 land, every future
+deploy is a one-liner: `git pull && bash deploy/day5-bringup.sh`.
 
 If anything fails, capture the exact error + the step number and stop. We
 debug rather than blow past it (root-cause discipline per dev-guide §1.3).
 
 ---
 
-## Step 1 — Prepare the VPS
+## Step 1 — One-time VPS prep
+
+SSH in as root (Hetzner-provisioned servers ship with root SSH key auth):
 
 ```bash
-# On laptop:
-ssh trading@178.156.239.84
-
-# On the VPS (one-time, idempotent):
-sudo apt update && sudo apt install -y docker.io docker-compose-plugin git age curl
-sudo usermod -aG docker trading
-# Log out and back in for the group change to take effect.
-
-sudo mkdir -p /opt/trading /etc/credstore.encrypted
-sudo chown trading:trading /opt/trading
+ssh root@178.156.239.84
 ```
 
-Install sops 3.10.2 (matches the docker image pin in compose):
+Install supporting tooling. Hetzner's Ubuntu 24.04 image ships with Docker
+already; we just add age, jq, and the sops binary:
 
 ```bash
+apt update && apt install -y age jq nano
 SOPS_VERSION=3.10.2
-curl -sSfL "https://github.com/getsops/sops/releases/download/v${SOPS_VERSION}/sops-v${SOPS_VERSION}.linux.amd64" \
-  -o /tmp/sops
-sudo install -m 0755 /tmp/sops /usr/local/bin/sops
+curl -sSfL "https://github.com/getsops/sops/releases/download/v${SOPS_VERSION}/sops-v${SOPS_VERSION}.linux.amd64" -o /tmp/sops
+install -m 0755 /tmp/sops /usr/local/bin/sops
 sops --version
+mkdir -p /opt/trading /etc/credstore.encrypted
 ```
 
-## Step 2 — Clone the repo and set up the age key
+## Step 2 — Repo clone via SSH deploy key
+
+Generate a deploy key on the VPS:
 
 ```bash
-# On the VPS as `trading`:
+ssh-keygen -t ed25519 -N '' -f /root/.ssh/github_deploy_key -C "ashburn-deploy@spratcapital.com"
+cat /root/.ssh/github_deploy_key.pub
+```
+
+Copy the printed public key. On your laptop browser, open
+<https://github.com/shaanyp123/trading-system/settings/keys/new> and:
+
+- **Title:** `ashburn-vps-deploy-key`
+- **Key:** paste the line above
+- **Allow write access:** UNCHECKED (read-only)
+- Click **Add key**
+
+Back on the VPS, wire the SSH config and clone:
+
+```bash
+cat >> /root/.ssh/config <<'EOF'
+Host github-trading
+  HostName github.com
+  User git
+  IdentityFile /root/.ssh/github_deploy_key
+  IdentitiesOnly yes
+EOF
+chmod 600 /root/.ssh/config
+ssh -T github-trading   # type 'yes' to accept github.com fingerprint
+
 cd /opt/trading
-git clone https://github.com/shaanyp123/trading-system.git .
-git checkout main
-
-# Copy the paper age private key into the system credstore. The operator
-# already holds the printed paper from Day 2's sops setup; transfer via a
-# trusted channel (1Password CLI is the canonical path).
-sudo tee /etc/credstore.encrypted/age_key > /dev/null  <<'AGE_KEY'
-# paste the contents of the `paper` age private key file (begins with
-# `# created: ...` and ends with the AGE-SECRET-KEY-1... line).
-AGE_KEY
-sudo chmod 0400 /etc/credstore.encrypted/age_key
-sudo chown root:root /etc/credstore.encrypted/age_key
+git clone github-trading:shaanyp123/trading-system.git .
+git config --global --add safe.directory /opt/trading
+git log --oneline -5
 ```
 
-## Step 3 — Fill the Postgres role passwords in sops
+## Step 3 — Install paper age private key
 
-Generate two strong passwords and bake them into `secrets/paper.enc.yaml`:
+The paper age private key lives on `~/.config/sops/age/keys.txt` on your
+laptop (and on the printed paper in your fireproof safe). The Day 2 paper
+key fingerprint is `age1dth25vwm75fpc32an0e77y39je2q8uyqe4sx3ysxjlamnlu6n43qrpa4wh`.
+
+From your **laptop**:
 
 ```bash
+scp ~/.config/sops/age/keys.txt root@178.156.239.84:/etc/credstore.encrypted/age_key
+```
+
+Back on the VPS:
+
+```bash
+chmod 0400 /etc/credstore.encrypted/age_key
+chown root:root /etc/credstore.encrypted/age_key
+
+# Sanity check: round-trip a non-secret value through sops.
+SOPS_AGE_KEY_FILE=/etc/credstore.encrypted/age_key \
+  sops -d --extract '["webauthn"]["rp_id"]' /opt/trading/secrets/paper.enc.yaml
+# Expected: spratcapital.com
+```
+
+## Step 4 — Author `deploy/.env` + fill Postgres app-role passwords in sops
+
+### 4a — Generate + paste two app-role passwords into sops
+
+```bash
+cd /opt/trading
+export EDITOR=nano
 APP_SERVICE_PWD=$(openssl rand -hex 32)
 APP_OWNER_PWD=$(openssl rand -hex 32)
-echo "APP_SERVICE_PWD=$APP_SERVICE_PWD"   # capture briefly; will paste into sops
+echo "APP_SERVICE_PWD=$APP_SERVICE_PWD"
 echo "APP_OWNER_PWD=$APP_OWNER_PWD"
 
-# In a second terminal (still on the VPS):
 SOPS_AGE_KEY_FILE=/etc/credstore.encrypted/age_key sops secrets/paper.enc.yaml
-# Replace the two <TODO_FROM_DAY_3_POSTGRES_BOOTSTRAP> placeholders with the
-# values just generated. Save + exit; sops re-encrypts on close.
 ```
 
-Verify the round-trip (must NOT print the actual password to stdout):
+In nano, find the two `<TODO_FROM_DAY_3_POSTGRES_BOOTSTRAP>` placeholders
+under the `postgres:` section. Replace each with the matching `APP_*_PWD`
+value above. Save with **Ctrl-O**, Enter, **Ctrl-X**.
+
+Verify both landed:
 
 ```bash
 SOPS_AGE_KEY_FILE=/etc/credstore.encrypted/age_key \
-  sops -d --extract '["postgres"]["app_service_password"]' secrets/paper.enc.yaml \
-  | wc -c    # expect ~65 bytes (64 hex chars + newline)
+  sops -d --extract '["postgres"]["app_service_password"]' secrets/paper.enc.yaml | wc -c
+# Expected: 64 (or 65 with trailing newline)
+SOPS_AGE_KEY_FILE=/etc/credstore.encrypted/age_key \
+  sops -d --extract '["postgres"]["app_owner_password"]' secrets/paper.enc.yaml | wc -c
+# Expected: 64 (or 65)
+
+unset APP_SERVICE_PWD APP_OWNER_PWD
 ```
 
-Commit the encrypted file change:
-
-```bash
-git add secrets/paper.enc.yaml
-git commit -m "chore(secrets): fill postgres.app_service_password + app_owner_password (Day 5)"
-git push origin main
-```
-
-## Step 4 — Author `deploy/.env` (NOT committed)
-
-This file holds the deploy-only knobs that the docker-compose stack reads.
-Keep it out of git; it stays on the VPS only.
+### 4b — Author `/opt/trading/deploy/.env`
 
 ```bash
 cat > /opt/trading/deploy/.env <<EOF
-# Generated by Day 5 deploy on $(date -u +%Y-%m-%dT%H:%M:%SZ).
 GHCR_OWNER=shaanyp123
-RELEASE_SHA=$(git rev-parse --short HEAD)
+RELEASE_SHA=$(cd /opt/trading && git rev-parse --short HEAD)
 ENVIRONMENT=paper
 DOMAIN=spratcapital.com
 ACME_EMAIL=shaanrpatel2@gmail.com
 WATCHDOG_IP=188.245.37.16
 SOPS_AGE_KEY_FILE=/etc/credstore.encrypted/age_key
-ENV_FILE=paper.enc.yaml
+ENV_FILE_NAME=paper.enc.yaml
 POSTGRES_SUPERUSER_PASSWORD=$(openssl rand -hex 32)
+SECRETS_DIR=/opt/trading/secrets-decrypted
+API_LOG_LEVEL=INFO
 EOF
 chmod 0400 /opt/trading/deploy/.env
 ```
 
 The `POSTGRES_SUPERUSER_PASSWORD` is a one-time bootstrap secret used only
-to bring up the postgres container's built-in `postgres` superuser; the
-app-level `app_service` role (which the api uses for queries) authenticates
-with the password from `secrets/paper.enc.yaml` at Step 6 below.
+for the postgres container's built-in `postgres` superuser. The app-level
+roles (`app_service`, `app_owner`) authenticate with passwords from sops.
 
-## Step 5 — Build the api image + start postgres + run migrations
+## Step 5 — Run the bringup script
+
+This is the actual deploy. The script is **idempotent** — re-run it any
+time (after a code update, after a reboot, after a config change) and it
+will only do work that needs doing.
 
 ```bash
 cd /opt/trading
-
-# Pull only what changes; the api image is built locally on first deploy.
-docker compose --env-file deploy/.env pull caddy postgres sops_init || true
-docker compose --env-file deploy/.env build api
-
-# Bring up postgres + sops_init (sops_init exits 0 after writing decrypted.yaml).
-docker compose --env-file deploy/.env up -d postgres sops_init
-docker compose --env-file deploy/.env logs sops_init   # expect "decrypted /secrets/paper.enc.yaml -> /run/secrets/decrypted.yaml"
-
-# Wait for postgres healthcheck (~15s).
-until docker compose --env-file deploy/.env exec -T postgres pg_isready -U postgres -d trading; do
-  sleep 2
-done
-
-# Apply migrations 0001..0006 against the bootstrap superuser. The api image
-# carries alembic; --rm so the migration container exits cleanly.
-docker compose --env-file deploy/.env run --rm \
-  -e API_DATABASE_URL="postgresql+asyncpg://postgres:$(grep POSTGRES_SUPERUSER_PASSWORD deploy/.env | cut -d= -f2)@postgres:5432/trading" \
-  --entrypoint sh \
-  api -c 'alembic upgrade head'
+bash deploy/day5-bringup.sh
 ```
 
-## Step 6 — Set the app-role passwords in Postgres
+What it does, in order:
 
-Migrations 0006 created `app_service` and `app_owner` NOLOGIN with no
-passwords. Match `pg_authid` to the values in `secrets/paper.enc.yaml`:
+1. Sanity-check `deploy/.env`, sops binary, age key
+2. Decrypt sops yaml on the host → `/opt/trading/secrets-decrypted/decrypted.yaml`
+3. Build the api image (skip if already cached)
+4. Bring up postgres + wait for healthy
+5. Run `alembic upgrade head` (idempotent — alembic skips applied migrations)
+6. `ALTER ROLE` `app_service` + `app_owner` with sops-stored passwords
+7. Bring up api + caddy
+8. Print the `SETUP_TOKEN_EMITTED` line — **copy this into 1Password**
+9. Verify `/api/health` returns `{"status":"ok","db_connected":true,...}`
 
-```bash
-APP_SERVICE_PWD=$(SOPS_AGE_KEY_FILE=/etc/credstore.encrypted/age_key \
-  sops -d --extract '["postgres"]["app_service_password"]' secrets/paper.enc.yaml)
-APP_OWNER_PWD=$(SOPS_AGE_KEY_FILE=/etc/credstore.encrypted/age_key \
-  sops -d --extract '["postgres"]["app_owner_password"]' secrets/paper.enc.yaml)
+The script ends with a green `Day 5 verification gate CLOSED` banner if
+everything works. If any step fails, the script exits with a clear error
+and the failing step number — paste back to Claude for debug.
 
-docker compose --env-file deploy/.env exec -T postgres psql -U postgres -d trading <<SQL
-ALTER ROLE app_service WITH LOGIN PASSWORD '${APP_SERVICE_PWD}';
-ALTER ROLE app_owner   WITH LOGIN PASSWORD '${APP_OWNER_PWD}';
-SQL
-
-unset APP_SERVICE_PWD APP_OWNER_PWD
-```
-
-## Step 7 — Start the api + caddy
+## Step 6 — Verify from your laptop (the actual gate)
 
 ```bash
-docker compose --env-file deploy/.env up -d api caddy
-docker compose --env-file deploy/.env ps                # api should be (healthy) within ~20s
-docker compose --env-file deploy/.env logs api | grep -i SETUP_TOKEN
-# Expect a single WARN line `SETUP_TOKEN_EMITTED ... raw_token=...`.
-# COPY THE RAW TOKEN to 1Password as a Secure Note titled
-# "trading-system paper bootstrap setup token (24h)". This is the only time
-# it will be printed.
-```
-
-## Step 8 — Verification gate (`/api/health`)
-
-```bash
-# On the VPS (loopback path; no Caddy/TLS):
-curl -fsS http://localhost:8000/api/health | jq .
-
-# Expected:
-# {
-#   "status": "ok",
-#   "environment": "paper",
-#   "version": "<sha>",
-#   "db_connected": true,
-#   "checks": [{"name": "postgres", "ok": true, "latency_ms": <small>, "detail": null}]
-# }
-```
-
-```bash
-# From the operator's laptop (TLS path):
 curl -fsS https://spratcapital.com/api/health | jq .
-# Same shape; Caddy adds HSTS + the security headers in deploy/Caddyfile.
 ```
 
-If https returns 502 or connection refused:
+Expected:
+
+```json
+{
+  "status": "ok",
+  "environment": "paper",
+  "version": "<sha>",
+  "db_connected": true,
+  "checks": [
+    {"name": "postgres", "ok": true, "latency_ms": <small>, "detail": null}
+  ]
+}
+```
+
+Plus security headers (HSTS + CSP) added by Caddy.
+
+If https returns 502 or connection refused: Caddy is still acquiring its
+Let's Encrypt cert (~30s on first deploy). Wait + retry. If it still fails:
 
 ```bash
-docker compose --env-file deploy/.env logs caddy | tail -20   # ACME issues?
-docker compose --env-file deploy/.env logs api | tail -20     # API crash?
+ssh root@178.156.239.84
+docker compose --env-file /opt/trading/deploy/.env logs caddy | tail -30
 ```
 
-## Step 9 — Watchdog shutoff (closes Day 4 carry-over)
+## Step 7 — Watchdog reset (closes Day 4 carry-over)
 
 The Hetzner Nuremberg watchdog has been alerting since ~21:00 ET 2026-05-07
-because `paper.spratcapital.com/api/health` (NOT the apex `spratcapital.com`)
-didn't resolve. As soon as Caddy issues a cert for the apex AND the
-`paper.spratcapital.com` subdomain (Phase 1 staging) is added to DNS +
-Caddyfile, the watchdog ticks flip to `check_success: true` and the email
-storm self-resolves.
+because the Ashburn `/api/health` URL didn't resolve. As soon as Caddy is
+serving, the next watchdog tick (≤5 min) flips to `check_success: true` and
+the email storm self-resolves.
 
-Day 5 brings up the apex only; `paper.<domain>` lands later. Until then the
-watchdog continues to alert. **Do NOT disable the watchdog timer** — its
-alerting against a real DNS-failure proves the Resend pipeline. We close
-the gap by either (a) adding `paper.spratcapital.com` DNS + Caddy config in
-a same-day follow-up, or (b) updating the watchdog's `WATCHDOG_HEALTH_URL`
-to the apex.
+**Do NOT disable the watchdog timer** — its alerting against a real
+DNS-failure proves the Resend pipeline. The first `check_success: true`
+tick is itself a positive proof point.
 
-(b) is the simpler Day 5 fix; (a) is the cleaner long-term shape per
-backend-spec §9.3 (env table). Decision is captured in `Docs/decisions-log.md`.
+## Step 8 — Ashburn ↔ Discord webhook test
 
-## Step 10 — Ashburn ↔ Discord webhook test
-
-Per Day 4 carry-over (`Docs/decisions-log.md` 2026-05-07 entry "Discord
-webhook POSTs blocked from Hetzner VPS by Cloudflare WAF"), we don't yet
-know whether Discord webhooks work from the Ashburn IP. Test once the
-api is up:
+Per the [Day 4 close-out entry](../../Docs/decisions-log.md), Cloudflare
+blocks Discord webhook POSTs from the Hetzner Nuremberg IP. We don't yet
+know about Ashburn. Test once api is up:
 
 ```bash
+ssh root@178.156.239.84
 WEBHOOK_URL=$(SOPS_AGE_KEY_FILE=/etc/credstore.encrypted/age_key \
-  sops -d --extract '["discord"]["webhook_urls"]["ops"]' secrets/paper.enc.yaml)
+  sops -d --extract '["discord"]["webhook_urls"]["ops"]' /opt/trading/secrets/paper.enc.yaml)
 curl -sS -X POST -H 'content-type: application/json' \
   --user-agent 'trading-day5-test/1.0 (+spratcapital.com)' \
   -d '{"content": "[day5] Ashburn → Discord webhook test"}' \
   "$WEBHOOK_URL"
 echo
-# Expect: nothing (HTTP 204) or a JSON error body.
-# 204 → Ashburn IP is not blocked; backend Discord webhooks are viable.
-# 500/403 → Cloudflare also blocks Ashburn; backend channels migrate to Resend.
 unset WEBHOOK_URL
 ```
 
-Append the result to the `Day 5 morning verification (Ashburn ↔ Discord)`
-follow-up in `Docs/decisions-log.md`.
+- `204` (or empty body) → Ashburn IP is NOT blocked; backend Discord channels stay Discord.
+- `500/403` → Cloudflare also blocks Ashburn; backend channels migrate to Resend in a follow-up PR.
+
+Append the result to the Day 4 follow-up in [decisions-log.md](../../Docs/decisions-log.md).
 
 ---
+
+## Future deploys (after Step 1-4 done once)
+
+```bash
+ssh root@178.156.239.84
+cd /opt/trading
+git fetch origin main
+git reset --hard origin/main   # discard any local docker-compose edits
+bash deploy/day5-bringup.sh
+```
+
+That's it.
 
 ## Summary of secrets touched
 
 | Secret | Where | Source |
 |---|---|---|
-| `postgres.superuser_password` | `deploy/.env` (VPS only) | `openssl rand -hex 32` at deploy |
-| `postgres.app_service_password` | `secrets/paper.enc.yaml` | `openssl rand -hex 32` at Step 3 |
-| `postgres.app_owner_password` | `secrets/paper.enc.yaml` | `openssl rand -hex 32` at Step 3 |
-| Owner setup token | `1Password` (Secure Note) | api emits at Step 7 |
+| `POSTGRES_SUPERUSER_PASSWORD` | `deploy/.env` (VPS only) | `openssl rand -hex 32` at deploy |
+| `postgres.app_service_password` | `secrets/paper.enc.yaml` | `openssl rand -hex 32` at Step 4a |
+| `postgres.app_owner_password` | `secrets/paper.enc.yaml` | `openssl rand -hex 32` at Step 4a |
+| Owner setup token | `1Password` (Secure Note) | api emits at Step 5 |
 
 ## Annual maintenance
 
 - **2027-05-05** — rotate `paper` age key (existing reminder); renew
-  `POSTGRES_SUPERUSER_PASSWORD` opportunistically at the same time
-  (psql `ALTER ROLE postgres PASSWORD '<new>'` + `deploy/.env` update).
+  `POSTGRES_SUPERUSER_PASSWORD` opportunistically at the same time.

@@ -594,6 +594,20 @@ text remains unchanged and this log records the deviations.
 
 ---
 
+### 2026-05-07 — Day 5 deploy — `getsops/sops` container abandoned; sops decryption moves to host + bringup script
+
+- **Spec reference:** `Docs/decisions-log.md` 2026-05-07 Day 5 entry "`getsops/sops` image pinned to v3.10.2"; `docker-compose.yml` `sops_init` service; `deploy/api/README.md` Day 5 deploy runbook.
+- **Trigger (operator-reported during Day 5 Ashburn deploy):** `docker compose pull getsops/sops:v3.10.2` returns `pull access denied for getsops/sops, repository does not exist or may require 'docker login'`. The sops project does NOT publish official container images to Docker Hub; my Day-5 PR pinned a tag that doesn't exist. (The 2026-05-07 "pinned to v3.10.2" entry above is the decision that this entry reverses.)
+- **Decision (this PR):** drop the `sops_init` container entirely. sops decryption moves to the host: `deploy/day5-bringup.sh` runs `sops -d secrets/<env>.enc.yaml > /opt/trading/secrets-decrypted/decrypted.yaml` on the VPS as root, sets uid 1000 / mode 0400 (so the api container's `trading` uid 1000 user can read it), and bind-mounts `${SECRETS_DIR}` (default `/opt/trading/secrets-decrypted`) at `/run/secrets:ro` in the api container. The api `entrypoint.py` reads `/run/secrets/decrypted.yaml` exactly as before — same in-container path; only the host-side write mechanism changed.
+- **Compose changes:** `sops_init` service deleted; `secrets_volume` (tmpfs) deleted; api `volumes` swap to `${SECRETS_DIR:-/opt/trading/secrets-decrypted}:/run/secrets:ro`; api `depends_on` no longer references sops_init; phase1-profile-gated services (signal/risk/execution/audit/qc_adapter/discord_bot/webhook_pusher/agent) drop their `sops_init` depends_on entries too (they'll need their own host-bind-mount when they ship).
+- **Why drop the container instead of finding a valid image:** (a) `mozilla/sops` is deprecated; (b) building a custom Alpine-based sops image is N+1 layers of plumbing for a one-shot decrypt; (c) the host already has the sops binary (per `deploy/api/README.md` Step 1) — running it on the host is one less abstraction. The container approach was over-engineered for a Phase 0 single-node deploy. Phase 2+ multi-node will revisit if sops needs to fan out.
+- **Why the bringup script:** the operator hit ~10 round-trips of debug-and-fix during Day-5 deploy because each compose-config wrinkle surfaced separately (sops_init image missing → bind-mount conflict → !reset compose v2 5.1.3 not honored → app_service_password placeholder). Each wrinkle was a 5-min Claude round-trip. The script collapses all the working logic into one re-runnable command. Idempotent: re-run any time (after code update, reboot, config change) and it skips work that's already done.
+- **Failure modes the script catches up-front:** missing `deploy/.env`, unreadable age key, missing sops binary, placeholder `<TODO>` strings still in sops yaml, postgres timeout, alembic failure, app_service auth failure, api unhealthy after 90s, /api/health curl failure.
+- **Remaining work for the operator (one-time per VPS):** Steps 1-4 of `deploy/api/README.md` (VPS prep, repo clone, age key, sops fill + `deploy/.env`). After that, every subsequent deploy is `git pull && bash deploy/day5-bringup.sh`.
+- **Cost / scope impact:** none on the spec architecture; -1 service from the compose stack (sops_init); +1 host-side script; net deploy time on subsequent runs ~30s vs the prior interactive ~30 min.
+
+---
+
 ## Open follow-ups (post-Day-4)
 
 ### From Day 1 (carried)
