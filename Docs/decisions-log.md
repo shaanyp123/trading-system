@@ -407,6 +407,21 @@ text remains unchanged and this log records the deviations.
 - **Lesson for future sessions:** when a third-party SDK or platform's code is generated from spec rather than from current docs/examples, fact-check against the platform's own examples (or have the operator run a smoke test) before declaring complete. The Day 2 + Day 4 algorithm files looked syntactically fine, parsed cleanly, and even matched older QC documentation — but the platform had moved.
 - **Cost / scope impact:** none functionally. ~10 minutes of operator time blocked at Day 4 Step 4 (smoke backtest) before this fix lands. No spec changes; the existing strategy / parameter contracts hold.
 
+---
+
+### 2026-05-06 — Day 4 close-out — QC Cloud requires entry file named `main.py` (LEAN convention; not in spec)
+
+- **Spec reference:** `lean/README.md` Step 2 (operator runbook); `lean/lean.json` `algorithm-location` field.
+- **Discovered 2026-05-07 (Day 4 10:00 operator step, immediately after PR #17 fix):** after the snake_case API fix unblocked the QC Cloud build, the backtest itself failed at runtime with `Failed to load the algorithm. Ensure your algorithm class is defined in a file named 'main.py'.` Root cause: my Step 2 told the operator to rename `main.py` → `v1_qc_algorithm.py` for in-cloud-editor consistency with the repo's filename. QC's editor accepts the rename; QC's runtime loader is hardcoded to look for `main.py`.
+- **Decision (PR #18, this entry):** rewrite `lean/README.md` Step 2 to **leave the QC project file named `main.py`**. The repo file `lean/v1_qc_algorithm.py` keeps its descriptive name (LEAN Local picks it up via `lean.json`'s `algorithm-location` field, which QC Cloud ignores). Only the file *contents* are pasted between the two; filenames are platform-specific. New troubleshooting-table row pins the symptom + fix. `lean.json` gets a new `$comment-algorithm-location` explaining the QC Cloud / LEAN Local asymmetry.
+- **Rationale:** the descriptive in-repo name (`v1_qc_algorithm.py`) is more useful than `main.py` when the file lives next to other modules in the repo (`lean.json`, future `scripts/qc_sync.py`, etc.). But on the QC Cloud side, the platform expects `main.py`. Keeping both is the simplest fix; the contents are identical between paths.
+- **Lesson for future sessions:** same lesson as the snake_case entry above — when authoring against a third-party platform from spec rather than running the platform's own examples, prefer to fact-check filename + entry-point conventions BEFORE writing operator runbooks. The LEAN docs are explicit that `main.py` is the cloud entry point; I missed that when authoring Step 2.
+- **Cost / scope impact:** none functionally. ~5 more minutes of operator time blocked between PR #17 merge and this fix landing.
+
+---
+
+## Open follow-ups (post-Day-4)
+
 ### From Day 1 (carried)
 - [x] ~~**Day 4** — Watchdog Python script + systemd timer not yet deployed to Nuremberg.~~ — code shipped 2026-05-06; operator deploy follow-up below.
 - [ ] **Day 5** — Caddy / TLS / `/api/health` not yet running on Ashburn.
