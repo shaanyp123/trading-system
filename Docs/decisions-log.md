@@ -456,11 +456,62 @@ text remains unchanged and this log records the deviations.
 
 ---
 
+### 2026-05-07 — Day 4 close-out — Discord webhook POSTs blocked from Hetzner VPS by Cloudflare WAF
+
+- **Spec reference:** `Docs/backend-spec.md` §1.6 (watchdog topology — "Discord webhook to `#critical` on 3 consecutive failures"); `lean/README.md` Day 4 Step 7 (forced-503 alert wiring test).
+- **Spec said:** the watchdog alerts via Discord webhook (and Resend, deferred per 2026-05-06 entry above).
+- **Discovered 2026-05-07 (Day 4 deploy Step 7):** every Discord webhook POST from the Hetzner Nuremberg VPS is rejected by Cloudflare's WAF, regardless of payload, User-Agent, cookie state, or HTTP client. Diagnostic sequence:
+  1. **Initial symptom (PR #21 unfixed):** `HTTP 403 Forbidden` from Python POST. Root cause: stdlib `urllib.request` defaults to `User-Agent: Python-urllib/3.12` which Discord's anti-bot layer blocks by exact prefix match. Fixed in PR #21 by setting `WATCHDOG_USER_AGENT = "trading-watchdog/0.1.0 (+...)"` on every outbound POST.
+  2. **Post-PR-#21 symptom:** `HTTP 500 Internal Server Error` from Python POST. The User-Agent fix got the request past the first layer, but Cloudflare's IP-reputation / bot-detection still rejects it.
+  3. **Confirmation it's the IP, not the code:** ran `curl -v` from the same VPS with the same webhook + same proper User-Agent → `HTTP 500` from `server: cloudflare` with `cf-cache-status: DYNAMIC` and a `_cfuvid` cookie set on the response. Same webhook URL + same `curl` from the operator's home/laptop IP → `HTTP 204 No Content` (success, message landed in `#critical`). Webhook is fine; Hetzner Nuremberg IP block is the issue.
+  4. **Mozilla-prefix UA test:** also returned `HTTP 500`. Cloudflare isn't selectively blocking the User-Agent string — it's the Hetzner data-center IP range.
+  5. **Cookie-replay test:** also returned `HTTP 500` (the `_cfuvid` cookie didn't unlock the path).
+- **Decision (PR #22, this entry):** treat Discord webhooks from this VPS as **best-effort secondary**. The watchdog still attempts Discord on every alert (channel-isolation guarantees a Discord failure can't block the email path), but Resend is the canonical alert channel for Phase 0. If Cloudflare's IP reputation relaxes later, Discord starts working automatically — no code change required.
+- **Why not switch VPS provider or move the watchdog?** Cloudflare-blocking-Hetzner is a known pattern affecting many self-hosted alert setups; switching to AWS/DO/Linode might or might not work and is significantly more expensive (~3-5× the $5.59/mo Hetzner cost). The "geographically separated EU watchdog" property in `backend-spec.md` §1.6 doesn't lock-in Hetzner specifically, but moving providers is a Phase-1+ decision, not a Day-4 hot-fix.
+- **Why not bypass Cloudflare bot-fight via cookie replay or fingerprint mimicry?** Adds maintenance debt (cookie jar in state file, header rotation, retry logic), is fragile (CF rules update silently), and is morally the wrong answer — Cloudflare's blocking is a feature for them, not a bug, and we'd be playing whack-a-mole forever. Resend is the right answer.
+- **Cost / scope impact:** none on the spec architecture; the watchdog still has two alert channels by design, just with the primary/secondary roles flipped from the spec's implicit ordering. Resend setup added ~15 min of operator time to the Day 4 close-out (DNS verification + sops update).
+
+---
+
+### 2026-05-07 — Day 4 close-out — Resend is now Phase 0 (reverses 2026-05-06 deferral)
+
+- **Spec reference:** `Docs/decisions-log.md` 2026-05-06 entry "Resend (email alerting) deferred to Phase 1; Phase 0 = Discord-only".
+- **Decision (this entry, PR #22):** Resend is Phase 0, not Phase 1. **Reverses the 2026-05-06 deferral.**
+- **Rationale:** the 2026-05-06 deferral was premised on Discord webhooks working from this VPS. Day 4 deploy proved they don't (see Cloudflare-blocking entry above). With Discord effectively offline as an alert channel for Phase 0, the operator needs Resend just to have ONE working alert path. The "monitor Discord directly" rationale from the deferral assumed alerts could reach Discord; they can't.
+- **What landed for Phase 0:** Resend account provisioned (free tier — 100 emails/day, 3,000/month — comfortably exceeds expected alert volume), `spratcapital.com` verified as a sending domain via 5 DNS records added to Cloudflare (1 MX, 2 TXT for SPF + DKIM, plus tracking CNAMEs). API key generated with sending-only permission scoped to the verified domain. `secrets/paper.enc.yaml` `resend.api_key` filled with the real `re_xxx...` key; `resend.from_address` set to `noreply@spratcapital.com`. VPS env file updated to populate `WATCHDOG_RESEND_API_KEY` + `WATCHDOG_RESEND_FROM`. Operator-confirmed Step-7 test: tick 3 of forced-503 sequence reported `email_sent: true`, email landed in inbox.
+- **Cost / scope impact:** $0/mo (Resend free tier sufficient for the foreseeable future). +15 min of operator time on Day 4 vs the deferred plan. Phase 1 transition no longer has a "provision Resend" follow-up — it's done.
+
+---
+
+### 2026-05-07 — Day 4 close-out — Watchdog operational on Hetzner Nuremberg
+
+- **Deliverable achieved:** the external watchdog is **deployed, enabled, and operational** on the Hetzner Nuremberg CX23 VPS. Day 4 13:00 chunk closed.
+- **Captured artifacts (Step 8 of `watchdog/README.md`):**
+  | Field | Value |
+  |---|---|
+  | VPS static IP | `188.245.37.16` (Hetzner Nuremberg, NBG1 — Falkenstein deviation per 2026-05-05 entry) |
+  | systemd unit | `trading-watchdog.timer` (enabled + active); `trading-watchdog.service` (oneshot) |
+  | Cadence | `OnUnitActiveSec=5min` + `RandomizedDelaySec=30s` (per spec §1.6) |
+  | First fire (operator-confirmed) | 2026-05-07 19:51:51 UTC |
+  | Alert channels | Resend (primary, working — email delivered to `shaanrpatel2@gmail.com`); Discord `#critical` (best-effort secondary, blocked by Cloudflare IP reputation per entry above) |
+  | Sender domain | `spratcapital.com` (Resend-verified) |
+  | From address | `noreply@spratcapital.com` |
+  | State path | `/var/lib/trading-watchdog/state.json` (created by systemd `StateDirectory=`) |
+  | Hardening | `trading-watchdog` system user, `NoNewPrivileges`, `ProtectSystem=strict`, `MemoryMax=128M`, `SystemCallFilter=@system-service` per `trading-watchdog.service` |
+- **Two runbook bugs found + fixed in same PR:**
+  1. **Step 5 / Step 6 ordering:** original runbook had operator run a manual smoke test (Step 5) BEFORE enabling the timer (Step 6). systemd's `StateDirectory=trading-watchdog` directive only creates `/var/lib/trading-watchdog/` on first service activation — running the script manually first failed with `PermissionError: [Errno 13] Permission denied: '/var/lib/trading-watchdog'`. Reordered: timer enable now precedes smoke test.
+  2. **Step 4 env file (Discord-only template):** the original Step 4 used a Discord-only template per the (now-reversed) Resend-deferred decision. Updated to the canonical Resend + Discord env file shape.
+- **Open behavior overnight 2026-05-07 → 2026-05-08 (operator-accepted):** the watchdog's `/api/health` URL points at `paper.spratcapital.com` which Day 5 will bring up. Until then, every 5-min tick reports `URLError [Errno -2] Name or service not known` and increments the failure counter. After the 3rd failure an alert email fires; cooldown then suppresses for 60 min. Net: ~1 alert email per hour overnight. **Operator opted to leave the timer running** — this validates end-to-end that the alert pipeline keeps firing on a real DNS-failure condition, which is exactly what the Resend channel needs to prove before live money. Day 5 morning, after `/api/health` is reachable, the watchdog ticks should flip to `check_success: true` and the email storm self-resolves; first such tick is itself a positive proof point for Day 5's verification gate.
+- **Day 4 13:00 verification gate:** ✅ closed. Backend-spec §1.6 + §2.12 deliverable (external watchdog, alert-only, geographically separated, ≥1 working alert channel) is satisfied.
+- **Cost / scope impact:** $5.59/mo VPS (Hetzner CX23 + IPv4) + $0/mo Resend free tier. Net Day 4 monthly burn delta: $0 (Resend) + already-budgeted VPS cost.
+
+---
+
 ## Open follow-ups (post-Day-4)
 
 ### From Day 1 (carried)
-- [x] ~~**Day 4** — Watchdog Python script + systemd timer not yet deployed to Nuremberg.~~ — code shipped 2026-05-06; operator deploy follow-up below.
-- [ ] **Day 5** — Caddy / TLS / `/api/health` not yet running on Ashburn.
+- [x] ~~**Day 4** — Watchdog Python script + systemd timer not yet deployed to Nuremberg.~~ — code shipped 2026-05-06; deployed + operational 2026-05-07. See "Watchdog operational on Hetzner Nuremberg" close-out entry above.
+- [ ] **Day 5** — Caddy / TLS / `/api/health` not yet running on Ashburn. **Day 5 morning addition:** as the FIRST step after `/api/health` is reachable, run `curl https://discord.com/api/webhooks/<critical-webhook-url>` from the Ashburn VPS to confirm whether Cloudflare also blocks Discord webhook POSTs from Ashburn IPs (Falkenstein blocks; we don't yet know about Ashburn). If blocked → all 7 backend → Discord webhook channels (`#daily_brief`, `#signals`, `#fills`, `#alerts`, `#critical`, `#ops`, `#audit`) need to migrate to Resend. If not blocked → Phase 0 plan unchanged for the backend; only the watchdog uses Resend.
 - [ ] **Optional** — Ashburn root SSH still allowed (B9 hardening; can disable any time).
 
 ### From Day 2 (carried)
@@ -479,11 +530,12 @@ text remains unchanged and this log records the deviations.
 - [x] ~~**Operator (anytime post-`forbidden-paths` PR merge)** — add `forbidden-paths` to required-status-checks~~ — resolved 2026-05-05.
 
 ### New from Day 4
-- [x] ~~**Operator (Day 4 10:00 or whenever the QC PR merges)** — execute `lean/README.md` Steps 1–7 in QC dashboard~~ — resolved 2026-05-07. Algorithm Running on QC Paper Brokerage; artifacts captured in 2026-05-07 close-out entry above. Three QC API discoveries surfaced + fixed in-flight (PRs #17 merged; #18 + #19 pending).
-- [ ] **Operator (Day 4 13:00 — pending; can be done anytime today/tomorrow)** — execute `watchdog/README.md` Steps 1–8 on Hetzner Nuremberg VPS (`188.245.37.16`): create `trading-watchdog` user, scp script + systemd files, populate `/opt/trading-watchdog/watchdog.env` (Discord-only — Phase 0), smoke-test the script manually, enable `trading-watchdog.timer`, verify alert wiring via the Step 7 forced-503 test (Discord `#critical` should receive a `[CRITICAL]` message; email path is intentionally inactive). Capture the Discord message link in a Day 5 close-out entry.
-- [ ] **Day 5 morning verification (2026-05-07 17:30 ET cycle fire)** — check QC's ObjectStore tab for `heartbeat/2026-05-07.json`. If present → daily cycle is firing correctly. If `signal_cycle_tick` log line is also visible (in any QC UI panel) → `self.log()` works and the missing init log was just routing weirdly. If only the ObjectStore key appears (no log line anywhere) → confirmed `self.log()` is silent in QC's snake_case API; push a follow-up PR to switch to `self.Log()` (PascalCase). See open-question paragraph in 2026-05-07 close-out entry above.
-- [ ] **Day 5 morning — codify the platform-API smoke-test rule** — add to `Docs/claude-dev-guide.md` §10.1 (or new §6.x): for any third-party platform integration (QC LEAN, IBKR ib-async, Discord.py, Resend), the FIRST commit of an integration file MUST include either (a) a smoke-test fixture against the platform OR (b) an explicit operator-runbook checklist that fact-checks N specifics by running the platform's own current example. Three QC API misses in one Day-4 session confirms the pattern; codify the fix.
-- [ ] **Phase 1 hardening (deferred from Day 4)** — when transitioning from heavy-monitoring paper trading to live money, add Resend as a second alert channel: provision Resend account at [resend.com](https://resend.com), verify sender domain in Cloudflare DNS, fill `resend.api_key` + `resend.from_address` in `secrets/paper.enc.yaml`, edit `/opt/trading-watchdog/watchdog.env` to set the two `WATCHDOG_RESEND_*` env vars, `systemctl restart trading-watchdog.service`, re-run watchdog README Step 7 to verify both channels fire. Procedure documented in `watchdog/README.md` "Adding Resend later".
+- [x] ~~**Operator (Day 4 10:00)** — execute `lean/README.md` Steps 1–7 in QC dashboard~~ — resolved 2026-05-07. Algorithm Running on QC Paper Brokerage. Three QC API discoveries fixed in-flight (PRs #17, #18, #19 all merged).
+- [x] ~~**Operator (Day 4 13:00)** — execute `watchdog/README.md` Steps 1–8 on Nuremberg~~ — resolved 2026-05-07. Watchdog deployed + operational on `188.245.37.16`; Resend email alerting confirmed end-to-end; Discord blocked by Cloudflare (treated as best-effort secondary). PR #21 (User-Agent fix) + PR #22 (close-out + runbook fixes) capture the journey.
+- [x] ~~**Phase 1 hardening (deferred from Day 4)** — provision Resend~~ — resolved 2026-05-07 (forced earlier by Cloudflare-blocking-Discord discovery). See "Resend is now Phase 0" close-out entry above.
+- [ ] **Day 5 morning verification (2026-05-07 17:30 ET cycle fire)** — check QC's ObjectStore tab for `heartbeat/2026-05-07.json`. If present → daily cycle is firing correctly. If `signal_cycle_tick` log line is also visible (in any QC UI panel) → `self.log()` works and the missing init log was just routing weirdly. If only the ObjectStore key appears (no log line anywhere) → confirmed `self.log()` is silent in QC's snake_case API; push a follow-up PR to switch to `self.Log()` (PascalCase). See open-question paragraph in 2026-05-07 paper-day-clock close-out entry above.
+- [ ] **Day 5 morning verification (Ashburn ↔ Discord)** — FIRST step after `paper.spratcapital.com/api/health` is up: run `curl -X POST https://discord.com/api/webhooks/...` from the Ashburn VPS to confirm whether Discord webhook POSTs work from Ashburn or are also CF-blocked. Result determines whether the 6 backend → Discord webhook channels (daily_brief, signals, fills, alerts, ops, audit) keep their Phase 0 plan or need to migrate to Resend.
+- [ ] **Day 5 morning — codify the platform-API smoke-test rule** — add to `Docs/claude-dev-guide.md` §10.1 (or new §6.x): for any third-party platform integration (QC LEAN, IBKR ib-async, Discord webhooks, Resend), the FIRST commit of an integration file MUST include either (a) a smoke-test fixture against the platform OR (b) an explicit operator-runbook checklist that fact-checks N specifics by running the platform's own current example. Four post-spec platform discoveries in one Day-4 session (snake_case, main.py, time_rules.at, Cloudflare-blocks-Hetzner-Discord) confirms the pattern; codify the fix.
 - [ ] **Week 5+ (when `POST /api/internal/watchdog` lands on the backend)** — extend `watchdog/watchdog.py` to also push to that endpoint after each successful GET. Add `WATCHDOG_BEARER_TOKEN` to `/opt/trading-watchdog/watchdog.env` (sourced from `secrets/paper.enc.yaml` `internal.watchdog_bearer_token`, already encrypted Day 3 via PR #11). Bearer token is captured + ready; just unused until the endpoint exists.
 
 ---
@@ -533,3 +585,8 @@ Cross-references in current edits:
 - `Docs/backend-spec.md` §1.6 + §4.5.3 (watchdog endpoints) → Day 4 watchdog uses GET `/api/health` only. POST `/api/internal/watchdog` (push) is wired in spec but not implemented Day 4 since the endpoint doesn't exist on the backend yet. Bearer token captured Day 3 (PR #11), held for Week 5+ when the endpoint lands.
 - `Docs/claude-dev-guide.md` §3.5 (`structlog` mandate) → watchdog explicitly opts out (stdlib `logging` with JSON formatter). Documented as an exception in this log; rule remains in effect for backend service code.
 - `lean/v1_qc_algorithm.py` (PascalCase QC API) → QC migrated its Python API to snake_case; algorithm rewritten in PR #17 with method names, enum values, and framework callbacks all snake_case. Class names remain PascalCase. Module docstring + `lean/README.md` troubleshooting table updated.
+- `lean/README.md` Step 2 (filename rename) → QC Cloud's runtime loader requires the algorithm file to be named `main.py` specifically; renaming to `v1_qc_algorithm.py` for repo-filename consistency caused runtime failure. PR #18 reverted the rename instruction; the repo file keeps its descriptive name, the QC project file stays `main.py`.
+- `lean/v1_qc_algorithm.py` (`time_rules.at` timezone arg) → QC's API does not accept a timezone string as a third positional argument. PR #19 dropped the redundant arg; scheduled actions inherit the algorithm's time zone from `set_time_zone()`.
+- `Docs/backend-spec.md` §1.6 + `claude-dev-guide.md` §1.5 (Resend deferral) → reversed 2026-05-07 (PR #22). Discord webhooks from the Hetzner Nuremberg VPS are blocked at the Cloudflare WAF. Resend is now Phase 0's primary alert channel for the watchdog; Discord stays as best-effort secondary. See "Discord webhook POSTs blocked from Hetzner VPS by Cloudflare WAF" entry above. Backend-side Discord webhook viability (Ashburn IP) is open until Day 5 morning verification.
+- `watchdog/watchdog.py` (User-Agent on outbound POSTs) → stdlib `urllib.request` defaults to `Python-urllib/3.x` which Discord's anti-bot layer blocks with 403. PR #21 added an explicit `WATCHDOG_USER_AGENT` constant and applied it in `_post_json` so all outbound POSTs (Discord, Resend, future `/api/internal/watchdog` push) identify as `trading-watchdog/0.1.0` rather than the stdlib default.
+- `watchdog/README.md` Step 5 / Step 6 ordering → original runbook ran the manual smoke test before enabling the timer; systemd's `StateDirectory=` only creates `/var/lib/trading-watchdog/` on first service activation, so the manual run failed with `PermissionError`. PR #22 reordered: timer enable now precedes smoke test.
