@@ -67,6 +67,15 @@ ALERT_COOLDOWN_MINUTES = 60
 HTTP_TIMEOUT_SECONDS = 10
 DEFAULT_STATE_PATH = "/var/lib/trading-watchdog/state.json"
 
+# User-Agent for ALL outbound HTTP. Discord's API explicitly rejects requests
+# whose User-Agent starts with `Python-urllib/...` (the stdlib default) as an
+# anti-bot measure — returns 403 Forbidden with no useful body. Setting an
+# explicit, identifiable User-Agent fixes this and is good hygiene for every
+# other API too (Resend, the backend's /api/internal/watchdog endpoint, etc.).
+# See `Docs/decisions-log.md` 2026-05-07 entry "Discord webhook 403 from
+# stdlib User-Agent".
+WATCHDOG_USER_AGENT = "trading-watchdog/0.1.0 (+https://github.com/shaanyp123/trading-system)"
+
 
 @dataclass(frozen=True)
 class WatchdogConfig:
@@ -325,8 +334,17 @@ def decide_alerts(
 # ---------------------------------------------------------------------------
 def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str]) -> tuple[int, str]:
     body = json.dumps(payload).encode("utf-8")
+    # User-Agent is set explicitly to avoid Discord's 403-on-stdlib-default
+    # behavior (see WATCHDOG_USER_AGENT comment near top of module). The
+    # caller-provided `headers` dict can override it if a specific endpoint
+    # requires a different User-Agent.
+    final_headers = {
+        "Content-Type": "application/json",
+        "User-Agent": WATCHDOG_USER_AGENT,
+        **headers,
+    }
     req = urllib.request.Request(  # noqa: S310 — URLs are sops-validated
-        url, data=body, method="POST", headers={"Content-Type": "application/json", **headers}
+        url, data=body, method="POST", headers=final_headers
     )
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:  # noqa: S310
         return resp.getcode(), resp.read().decode("utf-8", errors="replace")

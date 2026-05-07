@@ -19,7 +19,7 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -383,6 +383,9 @@ class TestResendPayload:
 
 class TestDiscordPayload:
     def test_no_auth_header_content_body(self, tmp_path: Path) -> None:
+        """send_discord_webhook adds NO custom headers above the _post_json layer
+        (the User-Agent + Content-Type are added inside _post_json, see
+        TestPostJsonHttpHeaders below)."""
         cfg = _config(tmp_path)
         captured: dict[str, Any] = {}
 
@@ -400,6 +403,87 @@ class TestDiscordPayload:
         assert captured["url"] == "https://discord.com/api/webhooks/123/abc"
         assert captured["headers"] == {}
         assert captured["payload"] == {"content": "alert body"}
+
+
+class TestPostJsonHttpHeaders:
+    """Verify _post_json sets the headers Discord/Resend require.
+
+    Pins the regression-fix invariant for the 2026-05-07 Discord 403 bug:
+    requests without an explicit User-Agent default to `Python-urllib/3.x`,
+    which Discord rejects with 403 Forbidden. _post_json must always send
+    a non-default User-Agent.
+    """
+
+    def _capture_post(self, status_code: int = 204):
+        """Patch urllib.request.urlopen and capture the Request object passed to it."""
+        captured: dict[str, Any] = {}
+
+        class _FakeResponse:
+            def __init__(self) -> None:
+                self.status = status_code
+
+            def __enter__(self) -> _FakeResponse:
+                return self
+
+            def __exit__(self, *_: Any) -> None:
+                pass
+
+            def getcode(self) -> int:
+                return status_code
+
+            def read(self) -> bytes:
+                return b""
+
+        def fake_urlopen(req: Any, timeout: int = 10) -> _FakeResponse:
+            captured["request"] = req
+            return _FakeResponse()
+
+        return captured, fake_urlopen
+
+    def test_post_json_sets_user_agent(self, tmp_path: Path) -> None:
+        """_post_json includes a non-default User-Agent on every call."""
+        captured, fake_urlopen = self._capture_post()
+        with patch("watchdog.urllib.request.urlopen", side_effect=fake_urlopen):
+            status, _ = wd._post_json(
+                "https://example.test/webhook",
+                {"content": "x"},
+                {},
+            )
+        assert status == 204
+        req = captured["request"]
+        ua = req.get_header("User-agent")
+        assert ua is not None
+        assert ua == wd.WATCHDOG_USER_AGENT
+        assert not ua.lower().startswith("python-urllib")
+
+    def test_post_json_sets_content_type(self, tmp_path: Path) -> None:
+        captured, fake_urlopen = self._capture_post()
+        with patch("watchdog.urllib.request.urlopen", side_effect=fake_urlopen):
+            wd._post_json("https://example.test/webhook", {"content": "x"}, {})
+        req = captured["request"]
+        assert req.get_header("Content-type") == "application/json"
+
+    def test_post_json_caller_can_override_user_agent(self, tmp_path: Path) -> None:
+        """If a future endpoint requires a custom User-Agent, callers can override."""
+        captured, fake_urlopen = self._capture_post()
+        with patch("watchdog.urllib.request.urlopen", side_effect=fake_urlopen):
+            wd._post_json(
+                "https://example.test/webhook",
+                {"content": "x"},
+                {"User-Agent": "custom-agent/1.0"},
+            )
+        req = captured["request"]
+        assert req.get_header("User-agent") == "custom-agent/1.0"
+
+    def test_user_agent_constant_format_meets_discord_expectation(self) -> None:
+        """Discord's docs recommend User-Agent identifying the bot + URL.
+        Pin the format so a future cleanup doesn't reduce it back to something
+        that looks like the stdlib default."""
+        ua = wd.WATCHDOG_USER_AGENT
+        assert "trading-watchdog" in ua
+        assert "/" in ua  # version separator
+        assert not ua.lower().startswith("python")
+        assert not ua.lower().startswith("urllib")
 
 
 # ---------------------------------------------------------------------------
