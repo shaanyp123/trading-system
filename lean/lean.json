@@ -1,0 +1,53 @@
+{
+  "$comment-1": "QuantConnect LEAN project config for v1_trend_following — Day 4 09:00.",
+  "$comment-2": "Two deploy paths are supported by this file:",
+  "$comment-3": "  (a) QC Cloud (the Day 4 10:00 path): operator uploads the algorithm via the QC dashboard. Cloud reads `algorithm-language`, `algorithm-type-name`, and `parameters`; the brokerage is chosen at deploy time in the Live Trading deploy form (recommended: 'Quant Connect Paper Trading' until IBKR Pro is approved).",
+  "$comment-4": "  (b) LEAN Local CLI (`lean live --environment live-paper-qc`): used Phase 2+ for offline parity testing. Reads `environments`. Not run on Day 4 — left ready for later.",
+  "$comment-5": "Phase 1 architecture (CLAUDE.md): backend has NO direct IBKR connection. The QC algorithm is the only thing that talks to a broker. Signals + broker state cross to the backend via QC ObjectStore only.",
+
+  "algorithm-language": "Python",
+  "algorithm-type-name": "V1TrendFollowingAlgorithm",
+  "algorithm-location": "v1_qc_algorithm.py",
+
+  "description": "v1_trend_following — Donchian/MA/Hurst/ATR trend strategy on Phase 1 sub-universe (CME micro futures + bond ETFs). Daily resolution, 17:30 ET signal cycle. Phase 0–1 paper trading on QC.",
+
+  "parameters": {
+    "LOOKBACK_DAYS_DONCHIAN": "60",
+    "MA_FAST_DAYS": "50",
+    "MA_SLOW_DAYS": "200",
+    "HURST_THRESHOLD": "0.55",
+    "STOP_DISTANCE_ATR_MULT": "3.0",
+    "ATR_LOOKBACK_DAYS": "20",
+    "MIN_HOLDING_DAYS": "14",
+    "VOL_TARGET_PCT_ANNUAL": "0.15",
+    "INSTRUMENT_VOL_LOOKBACK_DAYS": "60",
+    "ROLL_DAYS_BEFORE_EXPIRY": "5",
+    "STARTING_CASH_USD": "15000"
+  },
+  "$comment-parameters": "Mirrors strategies/v1_trend_following/parameters.py V1_DEFAULTS. QC's UI exposes these as overridable knobs in the Live deploy form; the algorithm reads them via self.GetParameter(...) with the V1_DEFAULTS as fallback. Keys are the canonical agent `tighten_parameter` enum names (backend-spec §12.3) — never rename without a parameter_sets migration.",
+
+  "environments": {
+    "$comment": "LEAN Local CLI environments. Cloud deploys ignore this map; cloud reads only the top-level `algorithm-*` fields plus `parameters`.",
+    "live-paper-qc": {
+      "live-mode": true,
+      "$comment-broker": "QC's built-in paper broker. No real money; no IBKR dependency. This is the correct env name to pass to `lean live --environment live-paper-qc` for offline parity testing.",
+      "live-mode-brokerage": "PaperBrokerage",
+      "data-queue-handler": [
+        "QuantConnect.Lean.Engine.DataFeeds.Queues.LiveDataQueue"
+      ],
+      "transaction-handler": "QuantConnect.Lean.Engine.TransactionHandlers.BacktestingTransactionHandler"
+    },
+    "live-paper-ibkr": {
+      "$comment-broker": "Reserved for Phase 2 once IBKR Pro is approved + IB Gateway runs locally. Do not use until then. ib-async/IBGateway dependencies are not installed in the Phase 0 LEAN Local container.",
+      "live-mode": true,
+      "live-mode-brokerage": "InteractiveBrokersBrokerage",
+      "ib-account": "<TODO_PHASE_2>",
+      "ib-user-name": "<TODO_PHASE_2>",
+      "ib-trading-mode": "paper"
+    },
+    "backtesting": {
+      "live-mode": false,
+      "$comment": "Default for QC Cloud backtests. No special config needed; LEAN engine fills defaults."
+    }
+  }
+}

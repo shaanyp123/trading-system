@@ -18,10 +18,23 @@ QC's pip support is limited to a curated whitelist. Strategy logic is therefore
 copied into the QC project workspace by `scripts/qc_sync.py` (Week 4 deliverable)
 or, for now, manually by the operator on each strategy version bump.
 
-Day 2 status: skeleton — algorithm structure + universe subscription + a stub
-`OnData` that just logs. Wiring to actual `V1TrendFollowing` happens in Week 4
-when QC ObjectStore parity is verified (implementation-guide §3 Week 4 + claude-
-dev-guide §10.1 Week 4 gate).
+Day 4 status (paper-broker ready):
+- Brokerage model: InteractiveBrokers / Margin (matches Phase 2 production).
+  Backtest fees/slippage simulate IBKR; live broker is selected at deploy time
+  in the QC dashboard (recommended: 'Quant Connect Paper Trading' until IBKR
+  Pro is approved). For LEAN Local, the broker is read from `lean.json`'s
+  `environments.live-paper-qc.live-mode-brokerage = PaperBrokerage`.
+- Parameters: read from QC's parameter map (`self.GetParameter`) with
+  `strategies.v1_trend_following.parameters.V1_DEFAULTS` as fallback. The
+  QC Live Trading deploy form exposes these as editable knobs.
+- Warmup: 200 trading days (longest indicator lookback = MA_SLOW_DAYS).
+- OnDailySignalCycle: heartbeat + ObjectStore write only. Strategy wiring
+  lands Week 4 once the QC adapter golden test (claude-dev-guide §10.1
+  Week 4 gate) is green.
+
+Week 4 will add: BarSeries assembly via self.History; position snapshot via
+self.Portfolio; call into self._strategy.generate_signals; JSONL emit to
+ObjectStore at key f"signals/{self.Time.date()}.jsonl".
 
 This file is intentionally NOT in the project's mypy/ruff target set
 (see pyproject.toml `exclude` lists). QC's `AlgorithmImports` injects symbols
@@ -37,8 +50,8 @@ from AlgorithmImports import *  # type: ignore[import-not-found,import-untyped] 
 
 # Local strategy imports — copied into the QC project workspace alongside this
 # file by scripts/qc_sync.py.
-# Day 2: leave commented out so this file lints/parses without the strategy
-# module being present in the QC workspace.
+# Day 4: leave commented out so this file lints/parses without the strategy
+# module being present in the QC workspace. Wired in Week 4.
 #
 # from v1_trend_following.parameters import default_v1_parameters
 # from v1_trend_following.strategy import V1TrendFollowing
@@ -51,17 +64,56 @@ PHASE1_FUTURES = ("MES", "MNQ", "MYM", "M2K", "MGC", "MCL", "MBT")
 PHASE1_ETFS = ("TLT", "IEF", "SHY", "TIP")
 
 
+# Parameter keys + V1_DEFAULTS fallbacks (kept in sync with
+# strategies/v1_trend_following/parameters.py V1_DEFAULTS). QC's `GetParameter`
+# returns `None` if a key is missing in the deploy config; we fall back to
+# these values. The keys match the agent `tighten_parameter` enum (backend-spec
+# §12.3) — never rename without a parameter_sets migration.
+V1_PARAMETER_DEFAULTS = {
+    "LOOKBACK_DAYS_DONCHIAN": "60",
+    "MA_FAST_DAYS": "50",
+    "MA_SLOW_DAYS": "200",
+    "HURST_THRESHOLD": "0.55",
+    "STOP_DISTANCE_ATR_MULT": "3.0",
+    "ATR_LOOKBACK_DAYS": "20",
+    "MIN_HOLDING_DAYS": "14",
+    "VOL_TARGET_PCT_ANNUAL": "0.15",
+    "INSTRUMENT_VOL_LOOKBACK_DAYS": "60",
+    "ROLL_DAYS_BEFORE_EXPIRY": "5",
+    "STARTING_CASH_USD": "15000",
+}
+
+
 class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]  # noqa: F405
     """QC entry-point. Daily resolution; 17:30 ET signal cycle."""
 
     def Initialize(self):
+        # Read parameters from QC's parameter map (set in lean.json's
+        # `parameters` block + overridable in the QC Live deploy form).
+        # Fall back to V1_DEFAULTS when a key is missing.
+        params = {
+            key: self.GetParameter(key) or default
+            for key, default in V1_PARAMETER_DEFAULTS.items()
+        }
+
         # Backtest window — operator can override in QC's UI; the defaults below
         # match the locked Phase 1 paper-trading window.
         self.SetStartDate(2026, 5, 1)
         self.SetEndDate(2026, 12, 31)
-        self.SetCash(15000)
+        self.SetCash(int(params["STARTING_CASH_USD"]))
         self.SetTimeZone("America/New_York")
         self.SetBenchmark("SPY")
+
+        # Brokerage MODEL — controls backtest fees/slippage simulation. Match
+        # IBKR Margin since Phase 2 will run live against IBKR. The LIVE
+        # broker is independent: QC Cloud uses the broker chosen in the
+        # dashboard deploy form; LEAN Local uses lean.json's
+        # `environments.<env>.live-mode-brokerage`. See the Day 4 operator
+        # runbook (lean/README.md) for dashboard step-by-step.
+        self.SetBrokerageModel(
+            BrokerageName.InteractiveBrokersBrokerage,  # noqa: F405
+            AccountType.Margin,  # noqa: F405
+        )
 
         # Subscribe to micro futures (continuous contract via QC's `Future` API).
         for ticker in PHASE1_FUTURES:
@@ -82,6 +134,11 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
                 extendedMarketHours=False,
             )
 
+        # Warmup — longest indicator lookback is MA_SLOW_DAYS (default 200).
+        # QC fills indicators by replaying historical bars before the first
+        # OnData fires; without this, the first ~200 sessions emit no signals.
+        self.SetWarmUp(int(params["MA_SLOW_DAYS"]), Resolution.Daily)  # noqa: F405
+
         # Daily 17:30 ET scheduled action — fires after CME settlement.
         self.Schedule.On(
             self.DateRules.EveryDay(),
@@ -89,10 +146,15 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
             self.OnDailySignalCycle,
         )
 
-        # Strategy parameters — Day 2 skeleton: instantiate but don't yet route
-        # signals to ObjectStore. Wired in Week 4.
-        # self._strategy = V1TrendFollowing(default_v1_parameters())
-        self.Log("v1_trend_following algorithm initialized (skeleton)")
+        # Strategy parameters — Day 4 still skeleton: instantiated with the
+        # parameter map but signals NOT yet routed to ObjectStore. Wired Week 4.
+        # self._strategy = V1TrendFollowing(default_v1_parameters().override(params))
+        self._params = params
+        self.Log(
+            f"v1_trend_following algorithm initialized "
+            f"(skeleton; live_mode={self.LiveMode}; "
+            f"params_keys={sorted(params.keys())})"
+        )
 
     def OnData(self, data: Slice):  # noqa: F405
         """No per-tick logic in V1. All signal work happens in OnDailySignalCycle."""
@@ -102,15 +164,31 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         """17:30 ET daily — assemble bars, run strategy, write signals/<date>.jsonl
         to ObjectStore for backend ingestion.
 
-        Day 2 skeleton: emit a heartbeat log only. Implementation lands Week 4
-        once QC adapter golden test (claude-dev-guide §10.1 Week 4 gate) is
-        green.
+        Day 4 skeleton: emit a heartbeat log + ObjectStore heartbeat key. The
+        backend's qc_adapter (Week 4) will start consuming `signals/*.jsonl` once
+        strategy wiring lands. Until then, the heartbeat key gives the operator
+        a way to confirm via QC's ObjectStore tab that the daily cycle is firing.
         """
-        self.Log(
+        if self.IsWarmingUp:
+            return
+
+        session_date = self.Time.date().isoformat()
+        equity = self.Portfolio.TotalPortfolioValue
+        msg = (
             f"signal_cycle_tick utc={self.UtcTime} et={self.Time} "
-            f"equity={self.Portfolio.TotalPortfolioValue}"
+            f"session_date={session_date} equity={equity}"
         )
-        # TODO(week-4): assemble BarSeries from self.History(...); snapshot
-        # positions from self.Portfolio; call self._strategy.generate_signals;
-        # write JSONL to ObjectStore at key f"signals/{self.Time.date()}.jsonl".
+        self.Log(msg)
+
+        # Heartbeat-only ObjectStore write. Week 4 replaces this with a real
+        # signals/<date>.jsonl emit per backend-spec §2.10. Key namespace
+        # `heartbeat/` is reserved for liveness pings and will not be consumed
+        # by qc_adapter (which polls `signals/`, `state/`, `events/`).
+        heartbeat_payload = (
+            f'{{"session_date":"{session_date}",'
+            f'"utc":"{self.UtcTime}",'
+            f'"equity_usd":"{equity}",'
+            f'"live_mode":{str(self.LiveMode).lower()}}}'
+        )
+        self.ObjectStore.Save(f"heartbeat/{session_date}.json", heartbeat_payload)
         return
