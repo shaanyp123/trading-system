@@ -7,7 +7,7 @@ to the backend via QC ObjectStore (no direct IBKR connection — see
 
 | File | Purpose |
 |---|---|
-| `v1_qc_algorithm.py` | `QCAlgorithm` subclass. Daily resolution, 17:30 ET signal cycle, IBKR brokerage model, parameter map via `self.GetParameter`. Day 4 = paper-broker ready, heartbeat-only `OnDailySignalCycle`. Strategy wiring lands Week 4. |
+| `v1_qc_algorithm.py` | `QCAlgorithm` subclass. Daily resolution, 17:30 ET signal cycle, IBKR brokerage model, parameter map via `self.get_parameter`. Day 4 = paper-broker ready, heartbeat-only `on_daily_signal_cycle`. Strategy wiring lands Week 4. Uses QC's snake_case Python API (per `Docs/decisions-log.md` 2026-05-06 — QC migrated from PascalCase). |
 | `lean.json` | LEAN project config. QC Cloud reads `algorithm-language` + `algorithm-type-name` + `parameters`. LEAN Local reads the `environments` map (`live-paper-qc` for paper trading; `live-paper-ibkr` is reserved for Phase 2). |
 
 ---
@@ -86,7 +86,7 @@ Before going live-paper, run a short backtest to confirm the algorithm boots:
    (the start/end dates set in `Initialize`) will run. ~30 seconds.
 3. When complete, scroll to the **Logs** tab.
    - Look for: `v1_trend_following algorithm initialized (skeleton; live_mode=False; ...)`
-   - Look for: ≥ 1 line of `signal_cycle_tick utc=... et=...`
+   - Look for: ≥ 1 line of `signal_cycle_tick utc=... et=...` (note: backtest mode plays through warmup instantly, so the first tick lands ~200 sessions in; live mode waits real-time for warmup to complete)
 4. If both lines appear → proceed. If not → check **Errors** tab; common cause
    is a missed parameter key in Step 3.
 
@@ -140,11 +140,13 @@ when you next have a Claude Code session open.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
+| Build errors like `"Resolution" has no attribute "Daily"` or `"V1TrendFollowingAlgorithm" has no attribute "SetStartDate"` | The pasted file is from a pre-2026-05-06 commit (PascalCase API). QC migrated its Python API to snake_case sometime ~2024 and the cloud editor's analyzer rejects PascalCase calls. | Re-copy the file from `main` (post-PR-#17). Method names are snake_case (`set_start_date`, `add_future`, `get_parameter`); enum values are SCREAMING_SNAKE (`Resolution.DAILY`, `DataMappingMode.OPEN_INTEREST`); class names stay PascalCase (`QCAlgorithm`, `Slice`). |
 | Build error: `NameError: name 'AlgorithmImports' is not defined` | The first line `from AlgorithmImports import *` was deleted on paste | Re-copy the full file from the repo; ensure the import line is the first non-comment line |
 | Build error: `cannot import V1TrendFollowing` | Strategy module wiring is enabled but Week 4 hasn't shipped yet | Confirm the `from v1_trend_following...` lines are still commented out (they should be on Day 4) |
 | Live deploy: "No live nodes available" | Researcher tier's 1 live node is in use by another algorithm | Stop the other algorithm in Live Trading dashboard, or upgrade tier |
 | Status flips from Running → Error | Often a parameter type mismatch | Check Errors tab; the algorithm reads parameters as strings then casts. A non-numeric value (e.g., `"sixty"`) crashes `int(...)` |
 | `signal_cycle_tick` log never appears | Algorithm is still in warmup (200 daily bars ≈ 200 calendar days for futures) | Wait until QC's data feed has played through the warmup window. Backtest mode plays warmup instantly; live mode waits real-time |
+| Algorithm boots but `initialize` never seems to run (no startup log line, no scheduled actions firing) | Method name typo — QC dispatches to `initialize` (snake_case). A method named `Initialize` (PascalCase) is silently ignored and the parent's no-op default runs instead. | Rename `def Initialize(self):` → `def initialize(self):`. Same for `OnData` → `on_data`. |
 
 ---
 
