@@ -1,24 +1,25 @@
 # Caddyfile — Hetzner Ashburn primary VPS reverse proxy.
-# - Auto-cert via Let's Encrypt (HTTP-01 / TLS-ALPN). Requires DNS A record + ports 80/443 open.
-# - Anti-pattern A18: <your-domain> and <watchdog_static_ip> remain literal placeholders;
-#   they are substituted at deploy time via Caddy's env-var support
-#   (operator's apex domain is registered separately and held in `secrets/<env>.enc.yaml`).
-
+#
+# - Auto-cert via Let's Encrypt (HTTP-01 / TLS-ALPN). Requires DNS A record +
+#   ports 80/443 open.
+# - Anti-pattern A18: no bare `<your-domain>` or `<watchdog_static_ip>`;
+#   substituted at deploy time via Caddy's env-var support (`{$VAR}`). The
+#   docker-compose `caddy` service exports DOMAIN, ACME_EMAIL, WATCHDOG_IP
+#   from `deploy/.env` per backend-spec §9.2.1.
 {
-	email <operator_email>          # Caddy account contact for ACME (substituted at deploy)
+	email {$ACME_EMAIL}
 	servers {
 		timeouts {
 			read_body 10s
 			read_header 5s
 			write 30s
-			idle 24h                    # long-lived SSE connections need this
+			idle 24h # long-lived SSE connections need this
 		}
 	}
 }
 
-# Apex domain. <your-domain> is replaced with the operator's registered apex (e.g. spratcapital.com)
-# at deployment via `caddy run --envfile deploy/.env`, where DOMAIN=spratcapital.com is set.
-{$DOMAIN:<your-domain>} {
+# Apex domain. {$DOMAIN} is set in deploy/.env on the VPS (e.g. spratcapital.com).
+{$DOMAIN} {
 	encode gzip zstd
 
 	header {
@@ -39,11 +40,11 @@
 		}
 	}
 
-	# Watchdog push endpoint — IP-allowlisted to the Hetzner Falkenstein static IP.
-	# Substitute <watchdog_static_ip> at deploy via env: WATCHDOG_IP=...
+	# Watchdog push endpoint — IP-allowlisted to the Hetzner Nuremberg static IP.
+	# WATCHDOG_IP is set in deploy/.env on the VPS (Day 4: 188.245.37.16).
 	@watchdog {
 		path /api/internal/watchdog
-		remote_ip {$WATCHDOG_IP:<watchdog_static_ip>}
+		remote_ip {$WATCHDOG_IP}
 	}
 	handle @watchdog {
 		reverse_proxy api:8000
@@ -54,7 +55,9 @@
 		reverse_proxy api:8000
 	}
 
-	# Internal admin tools (basicauth credentials live in sops; substituted at deploy)
+	# Internal admin tools — only resolve when `--profile phase1` is active
+	# (docker-compose.yml). Phase 0 Day 5 has no grafana/gitea upstream;
+	# requests fall through to handle_errors below.
 	handle_path /grafana/* {
 		reverse_proxy grafana:3000
 	}
@@ -63,21 +66,24 @@
 		reverse_proxy gitea:3000
 	}
 
-	# Maintenance fallback for 502s
+	# Maintenance fallback for 5xx (also covers Day-5 case where the Next.js
+	# upstream below isn't running yet).
 	handle_errors {
-		@502 expression `{http.error.status_code} == 502`
-		handle @502 {
+		@5xx expression `{http.error.status_code} >= 500`
+		handle @5xx {
 			respond "Service temporarily unavailable. Watchdog has been notified." 503
 		}
 	}
 
-	# Default → Next.js frontend
+	# Default → Next.js frontend (lands Phase 0 Week 4+). Until the upstream
+	# exists, /` falls through to handle_errors. /api/* routes above are
+	# served independently and are not affected.
 	handle {
 		reverse_proxy nextjs:3000
 	}
 }
 
-# www → apex redirect (for visitors typing www.spratcapital.com)
-www.{$DOMAIN:<your-domain>} {
-	redir https://{$DOMAIN:<your-domain>}{uri} permanent
+# www → apex redirect (for visitors typing www.{$DOMAIN}).
+www.{$DOMAIN} {
+	redir https://{$DOMAIN}{uri} permanent
 }

@@ -84,14 +84,23 @@ jobs:
       # services/audit, services/risk, services/execution once those land.
       - run: pytest --cov --cov-report=xml
 
-  # docker-build:
-  #   name: docker build (matrix per service)
-  #   runs-on: ubuntu-latest
-  #   strategy:
-  #     fail-fast: false
-  #     matrix:
-  #       service: [api, signal, risk, execution, reconciliation, audit, calibration, scheduler, qc_adapter, discord_bot, webhook_pusher, monitoring, agent]
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: docker/setup-buildx-action@v3
-  #     - run: docker buildx build --file services/${{ matrix.service }}/Dockerfile --tag local/${{ matrix.service }}:${{ github.sha }} services/${{ matrix.service }}
+  # docker-build matrix: one job per service that ships a Dockerfile. New
+  # services join by appending to the matrix list AND landing the Dockerfile
+  # in the same PR. Day 5 onboards `api`; the remainder onboard Phase 0 Week 2+.
+  docker-build:
+    name: docker build (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [api]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image (no push)
+        run: |
+          docker buildx build \
+            --file services/${{ matrix.service }}/Dockerfile \
+            --tag local/trading-${{ matrix.service }}:${{ github.sha }} \
+            --load \
+            .
