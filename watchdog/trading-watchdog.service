@@ -1,0 +1,59 @@
+[Unit]
+# External watchdog for the Trading System backend.
+# Triggered by trading-watchdog.timer (every 5 min). One-shot — exits after
+# each check; state persists in /var/lib/trading-watchdog/state.json.
+#
+# Per Docs/backend-spec.md §1.6 + §2.12, this service runs on the Hetzner
+# Nuremberg CX23 VPS (Falkenstein deviation per Docs/decisions-log.md
+# 2026-05-05). It is alert-only — no authority to halt the backend.
+Description=Trading System external watchdog (one-shot)
+Documentation=https://github.com/shaanyp123/trading-system/blob/main/watchdog/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=trading-watchdog
+Group=trading-watchdog
+WorkingDirectory=/opt/trading-watchdog
+
+# All sensitive config (Resend API key, Discord webhook, bearer tokens) lives
+# in this env file. Operator populates it once via sops decrypt of
+# secrets/paper.enc.yaml — see watchdog/README.md "Step 4 — env file".
+EnvironmentFile=/opt/trading-watchdog/watchdog.env
+
+ExecStart=/usr/bin/python3 /opt/trading-watchdog/watchdog.py
+
+# Hardening — see https://systemd.io/SECURITY/ and
+# https://www.freedesktop.org/software/systemd/man/systemd.exec.html
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# State directory under /var/lib/trading-watchdog — created by systemd at first
+# start with the right ownership/permissions.
+StateDirectory=trading-watchdog
+StateDirectoryMode=0750
+
+# Resource limits — this is a 1-vCPU host doing a 5-min cron; no need for more.
+CPUQuota=50%
+MemoryMax=128M
+TasksMax=16
+
+# Network egress is the only network surface needed (GET health URL + POST
+# alerts to Resend / Discord). No inbound — the watchdog never listens.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trading-watchdog
