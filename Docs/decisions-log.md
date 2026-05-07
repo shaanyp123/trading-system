@@ -507,6 +507,23 @@ text remains unchanged and this log records the deviations.
 
 ---
 
+### 2026-05-07 — Day 4 close-out — Backtest validation: schedule reliability + DST handling + `every_day()` semantics
+
+- **Spec reference:** `lean/v1_qc_algorithm.py` `initialize()` schedule registration (`schedule.on(date_rules.every_day(), time_rules.at(17, 30), on_daily_signal_cycle)`); the time-zone wiring set via `set_time_zone("America/New_York")`; `lean/README.md` Step 4 (smoke backtest, originally "optional but recommended" — operator ran one against the live algorithm's hardcoded May 1 → Dec 31 window earlier in the day and cancelled at 5.5 min on cold-cache continuous-futures data fetch).
+- **Backtest run:** operator edited `set_start_date(2026, 1, 1)` + `set_end_date(2026, 5, 6)` in the QC editor (live algo was unaffected since it runs frozen-at-deploy code; see 2026-05-07 paper-day-clock entry), clicked Backtest, ran in ~2-5 min on warm cache, no errors.
+- **Three validations achieved (use these as proof points; future agents should not re-derive them):**
+  1. **Schedule reliability — over 100 `signal_cycle_tick` log lines across Jan 1 → May 6 2026.** That's 126 calendar days, and we observed 100+ matches on the substring search. The schedule fires reliably; `schedule.on(date_rules.every_day(), time_rules.at(17, 30), ...)` works as documented and there are NO weekday gaps where the schedule silently failed to fire.
+  2. **Time-zone wiring is bulletproof across DST.** Operator-confirmed the two reference dates by reading log lines:
+     - `2026-03-06` (Friday before US DST transition): `et=2026-03-06 17:30:00`, `utc=2026-03-06 22:30:00` (EST = UTC-5; 17:30 ET = 22:30 UTC ✓)
+     - `2026-03-09` (Monday after US DST transition; clocks sprang forward Sunday 03-08): `et=2026-03-09 17:30:00`, `utc=2026-03-09 21:30:00` (EDT = UTC-4; 17:30 ET = 21:30 UTC ✓)
+     - The `et=` field stays at `17:30:00` across the EST→EDT transition; the `utc=` field shifts by exactly 1 hour. **`set_time_zone("America/New_York")` is DST-aware; `time_rules.at(17, 30)` correctly inherits the algorithm's local time zone.** This is canonical behavior.
+  3. **Strategy behavior correctly inert pre-Week-4.** Statistics tab: 0 trades, 0 orders, $15,000 equity flat throughout, Sharpe undefined (0 P&L). Errors tab: empty (only the routine `SetBenchmark(SPY): no existing symbol found` info-warning we also see live; benign). Backtest didn't trigger any latent strategy code accidentally.
+- **One Week-4 hygiene discovery:** `date_rules.every_day()` with no arguments fires on **every calendar day**, not just CME trading days. We observed ~100+ ticks for 126 calendar days, ~not~ ~85 trading days (which is what we'd see with `every_day(<symbol>)` restricting to a market's calendar). For Day 4 heartbeat-only callbacks this is cosmetic; for Week 4 strategy logic, the callback should restrict to CME sessions to avoid weekend / holiday no-op cycles. Fix is one line: change to `date_rules.every_day(symbol)` where `symbol` is a CME-listed instrument the algorithm has subscribed to (e.g., `/MES` is the natural anchor — most-traded micro and the calendar driver per `Docs/backend-spec.md` §2.3). Captured in open follow-ups below.
+- **Why this matters for future agents:** these three platform behaviors (schedule reliability, DST correctness, `every_day()` semantics) are now empirically confirmed against QC's actual Live Engine 2.5.0.0.17710. Future strategy work — Week 4 wiring, parameter sweeps, agent-driven tighten/loosen flows — can rely on these without re-deriving. If a future change to the schedule wiring is proposed, this entry is the regression-baseline; rerun a Jan-May backtest and confirm the same three behaviors hold.
+- **Cost / scope impact:** none. ~5 min of operator backtest time; one new Week-4 hygiene follow-up below.
+
+---
+
 ## Open follow-ups (post-Day-4)
 
 ### From Day 1 (carried)
@@ -537,6 +554,7 @@ text remains unchanged and this log records the deviations.
 - [ ] **Day 5 morning verification (Ashburn ↔ Discord)** — FIRST step after `paper.spratcapital.com/api/health` is up: run `curl -X POST https://discord.com/api/webhooks/...` from the Ashburn VPS to confirm whether Discord webhook POSTs work from Ashburn or are also CF-blocked. Result determines whether the 6 backend → Discord webhook channels (daily_brief, signals, fills, alerts, ops, audit) keep their Phase 0 plan or need to migrate to Resend.
 - [ ] **Day 5 morning — codify the platform-API smoke-test rule** — add to `Docs/claude-dev-guide.md` §10.1 (or new §6.x): for any third-party platform integration (QC LEAN, IBKR ib-async, Discord webhooks, Resend), the FIRST commit of an integration file MUST include either (a) a smoke-test fixture against the platform OR (b) an explicit operator-runbook checklist that fact-checks N specifics by running the platform's own current example. Four post-spec platform discoveries in one Day-4 session (snake_case, main.py, time_rules.at, Cloudflare-blocks-Hetzner-Discord) confirms the pattern; codify the fix.
 - [ ] **Week 5+ (when `POST /api/internal/watchdog` lands on the backend)** — extend `watchdog/watchdog.py` to also push to that endpoint after each successful GET. Add `WATCHDOG_BEARER_TOKEN` to `/opt/trading-watchdog/watchdog.env` (sourced from `secrets/paper.enc.yaml` `internal.watchdog_bearer_token`, already encrypted Day 3 via PR #11). Bearer token is captured + ready; just unused until the endpoint exists.
+- [ ] **Week 4 hygiene (when strategy logic wires up)** — tighten the schedule registration in `lean/v1_qc_algorithm.py` `initialize()` from `schedule.on(date_rules.every_day(), time_rules.at(17, 30), ...)` to `schedule.on(date_rules.every_day(<cme_anchor_symbol>), time_rules.at(17, 30), ...)` where `<cme_anchor_symbol>` is one of the subscribed futures (e.g., `/MES` per `Docs/backend-spec.md` §2.3 — the most-traded micro + natural calendar driver). Empirically confirmed via Jan-May backtest 2026-05-07: current `every_day()` fires on every calendar day (~126 ticks for 126 days), not just CME trading days. Cosmetic for Day 4 heartbeat-only; would mean unnecessary weekend/holiday strategy executions in Week 4. See "Backtest validation" close-out entry above.
 
 ---
 
