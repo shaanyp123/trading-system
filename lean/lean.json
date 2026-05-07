@@ -8,6 +8,7 @@
   "algorithm-language": "Python",
   "algorithm-type-name": "V1TrendFollowingAlgorithm",
   "algorithm-location": "v1_qc_algorithm.py",
+  "$comment-algorithm-location": "LEAN Local reads this field — the local file is named v1_qc_algorithm.py to match the repo. QC Cloud IGNORES this field and is hardcoded to load `main.py`; the operator's QC project keeps that filename per lean/README.md Step 2 (the file CONTENTS are identical between the two paths).",
 
   "description": "v1_trend_following — Donchian/MA/Hurst/ATR trend strategy on Phase 1 sub-universe (CME micro futures + bond ETFs). Daily resolution, 17:30 ET signal cycle. Phase 0–1 paper trading on QC.",
 

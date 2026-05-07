@@ -33,17 +33,27 @@ you.** Each numbered step is a single click or paste. Total time: ~10 min.
 2. Click **+ New Project** (top-left of the project list).
 3. Name: `v1_trend_following_paper`. Language: **Python**. Click **Create**.
 
-### Step 2 — Upload `v1_qc_algorithm.py`
+### Step 2 — Upload the algorithm into QC's `main.py`
 
-The new project ships with a `main.py` template. Replace it with our algorithm:
+The new project ships with a `main.py` template. **Keep that filename** — QC
+Cloud's runtime loader explicitly requires the algorithm class to live in a
+file named `main.py` (the in-repo file `lean/v1_qc_algorithm.py` is just our
+descriptive name for the same code; LEAN Local picks it up via `lean.json`'s
+`algorithm-location` field, but QC Cloud does not read `lean.json`).
 
 1. In the file tree on the left, click `main.py` to open it.
-2. Right-click `main.py` → **Rename** → enter `v1_qc_algorithm.py` → **Save**.
-3. Open `lean/v1_qc_algorithm.py` from this repo (github.com or your laptop)
-   and copy the entire file contents.
-4. Paste into the QC editor for `v1_qc_algorithm.py`. **Replace the entire
-   file** — including the boilerplate QC put there.
-5. Click the **Save** disk icon (or `Cmd+S` / `Ctrl+S`).
+2. Open `lean/v1_qc_algorithm.py` from this repo
+   (<https://github.com/shaanyp123/trading-system/blob/main/lean/v1_qc_algorithm.py>
+   → click **Raw**) and copy the entire file contents.
+3. Paste into the QC editor for `main.py`. **Replace the entire file** —
+   including the boilerplate QC put there.
+4. Click the **Save** disk icon (or `Cmd+S` / `Ctrl+S`).
+
+> ⚠️ Do NOT rename `main.py`. If you do, the build will succeed (QC's editor
+> doesn't enforce the convention) but the backtest will fail at runtime with
+> "Failed to load the algorithm. Ensure your algorithm class is defined in
+> a file named 'main.py'." Just leave the filename alone — only the contents
+> matter.
 
 ### Step 3 — Set the parameter map
 
@@ -140,6 +150,7 @@ when you next have a Claude Code session open.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
+| Backtest log: `Failed to load the algorithm. Ensure your algorithm class is defined in a file named 'main.py'.` | The QC project file was renamed away from `main.py` (e.g., to `v1_qc_algorithm.py`). QC's editor accepts the rename but its runtime loader is hardcoded to look for `main.py`. | In QC's file tree, right-click the renamed file → **Rename** → enter `main.py` → Save → re-run backtest. The class name inside the file doesn't matter; only the filename. |
 | Build errors like `"Resolution" has no attribute "Daily"` or `"V1TrendFollowingAlgorithm" has no attribute "SetStartDate"` | The pasted file is from a pre-2026-05-06 commit (PascalCase API). QC migrated its Python API to snake_case sometime ~2024 and the cloud editor's analyzer rejects PascalCase calls. | Re-copy the file from `main` (post-PR-#17). Method names are snake_case (`set_start_date`, `add_future`, `get_parameter`); enum values are SCREAMING_SNAKE (`Resolution.DAILY`, `DataMappingMode.OPEN_INTEREST`); class names stay PascalCase (`QCAlgorithm`, `Slice`). |
 | Build error: `NameError: name 'AlgorithmImports' is not defined` | The first line `from AlgorithmImports import *` was deleted on paste | Re-copy the full file from the repo; ensure the import line is the first non-comment line |
 | Build error: `cannot import V1TrendFollowing` | Strategy module wiring is enabled but Week 4 hasn't shipped yet | Confirm the `from v1_trend_following...` lines are still commented out (they should be on Day 4) |
