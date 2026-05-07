@@ -84,6 +84,8 @@ pnpm typecheck && pnpm lint && pnpm test
 
 No exceptions. If CI is the only gate, a broken test blocks the PR and wastes time. Run locally first.
 
+**Third-party platform integrations:** if your PR introduces a service file that talks to a third-party platform (QC LEAN, IBKR, Discord, Resend, Anthropic, S3, sops, FastAPI, alembic-against-real-Postgres), `make test` is necessary but NOT sufficient — see §6.8. The first commit MUST also include either a smoke-test fixture (CI/build-time) or an operator-runbook checklist. Anti-pattern `[A27]`. Local test passes don't prove the platform contract still matches the spec.
+
 ---
 
 # 1.5 Locked Decisions Quick Reference
@@ -1883,6 +1885,51 @@ def test_vectorbt_lean_parity(vbt_results, lean_results, starting_equity):
 
 CI runs unit + integration on every PR. Weekly cron runs golden-test + vectorbt-vs-LEAN parity.
 
+## 6.8 Third-Party Platform Integration Smoke Tests (locked 2026-05-07 Day 5)
+
+**Rule:** the FIRST commit that introduces a service file talking to a third-party platform (QuantConnect LEAN, IBKR `ib-async`, Discord webhooks, Resend, Anthropic API, S3, sops, Cloudflare, FastAPI app construction, alembic against real Postgres, etc.) MUST include EITHER:
+
+(a) **A smoke-test fixture** that exercises the platform's contract end-to-end. Must run as part of `make ci` OR as a Dockerfile RUN step OR as a CI workflow job. Examples below.
+
+(b) **An explicit operator-runbook checklist** with N concrete fact-checks the operator runs against the platform's CURRENT documented example. Each fact-check has: what to do (single command or click-path), expected result, what to do on mismatch. The runbook lives next to the integration file (typically `deploy/<service>/README.md`).
+
+The PR commit message must include `Smoke-tested via: <fixture-path>` OR `Smoke-tested via: deploy/<runbook>.md Step <N>`. Reviewer rejects PRs that lack one. Anti-pattern `[A27]` is the quick-reference enforcement hook.
+
+**Why this rule exists.** Spec/docs and platform reality drift. Five post-spec platform discoveries hit Day 4 + Day 5 alone:
+
+1. **QC migrated PascalCase → snake_case Python API** ([PR #17](https://github.com/shaanyp123/trading-system/pull/17)). Spec said `Initialize`, `OnData`, `Resolution.Daily`. Platform expected `initialize`, `on_data`, `Resolution.DAILY`. PascalCase methods on `QCAlgorithm` were silently ignored — algorithm booted with default no-op behavior.
+2. **QC Cloud requires entry file named `main.py` specifically** ([PR #18](https://github.com/shaanyp123/trading-system/pull/18)). Renamed for repo-filename consistency to `v1_qc_algorithm.py`; QC's runtime loader is hardcoded to `main.py`.
+3. **QC `time_rules.at()` does not accept timezone string as 3rd arg** ([PR #19](https://github.com/shaanyp123/trading-system/pull/19)). Spec example showed three-arg form; runtime raised `TypeError: No method matches given arguments`.
+4. **Discord webhooks blocked from Hetzner Nuremberg by Cloudflare WAF** ([PRs #21](https://github.com/shaanyp123/trading-system/pull/21) + [#22](https://github.com/shaanyp123/trading-system/pull/22)). Spec said "Discord webhook to #critical"; reality: HTTP 500 from Cloudflare regardless of User-Agent or cookie state. Required reversing the Day-4 Resend-deferral plan.
+5. **FastAPI app fails to import at Docker build time** unless `API_DATABASE_URL` env var is set ([PR #24](https://github.com/shaanyp123/trading-system/pull/24)). Local `make ci` didn't catch it because pyproject.toml's `[tool.coverage.report]` excludes `**/main.py` and the test fixture set the env var via monkeypatch. The Dockerfile sanity-check `python -c "from services.api.main import create_app; create_app()"` failed with a Pydantic ValidationError until a stub env var was added to the RUN line.
+
+Five strikes in two days is the threshold to codify the fix.
+
+**Pattern that fails this rule.** A PR introduces `services/foo/integration_with_platform.py`, has unit tests against in-memory mocks only, and ships without ever touching the real platform. The PR review surface looks complete; production breaks at first contact with reality.
+
+**Examples that satisfy the rule:**
+
+- `services/api/Dockerfile` Day 5 — `RUN /opt/venv/bin/python -c "from services.api.main import create_app; create_app()"` exercises FastAPI app construction at build time. Catches Pydantic Settings load, import-cycle, route-registration failures. CI runs the build via `.github/workflows/ci.yml docker-build` matrix entry. (Caught the API_DATABASE_URL strict-required failure during Day 5.)
+- `lean/v1_qc_algorithm.py` Day 4 — `lean/README.md` Steps 4-7 walk the operator through QC Cloud Backtest (Step 4) and Live Deploy (Steps 5-7). Each step has explicit expected result and mismatch resolution. (Caught snake_case + main.py + time_rules.at issues.)
+- `watchdog/watchdog.py` Day 4 — `watchdog/README.md` Step 7 forces a 503 on the backend `/api/health` to test end-to-end alert wiring. (Caught Cloudflare-blocking-Discord on the fourth tick.)
+- Future: `services/qc_adapter/poll.py` would need either a CI job that polls a known-stable QC ObjectStore key OR a `deploy/qc_adapter/README.md` step that has the operator round-trip a test signal through QC paper.
+- Future: `services/agent/anthropic_client.py` would need either a smoke fixture against `api.anthropic.com` with a budget cap OR a runbook step where the operator confirms a real API key returns a non-error response.
+
+**Examples that would fail the rule:**
+
+- A PR adding `services/discord_bot/main.py` with `discord.py` mocked in unit tests but no `deploy/discord/README.md` step that has the operator run `/status` in a real channel. **Reject.**
+- A PR adding `services/calibration/slippage_recalibrate.py` that loads QC ObjectStore data but has no smoke test against a known-historical ObjectStore key AND no runbook entry. **Reject.**
+
+**When the rule does NOT apply:**
+
+- Internal code that doesn't talk to a third-party platform (pure-logic modules, in-process services). Example: `strategies/v1_trend_following/indicators.py` — no platform contract; standard unit tests are sufficient.
+- Edits to existing integration files where the smoke test from the FIRST commit still runs.
+- Dev-only tooling (lint configs, test helpers) that won't run in production.
+
+**What "first commit" means.** The commit that first introduces the integration file, where the integration file is ANY file that imports a third-party platform's SDK or makes an HTTP call to a platform endpoint. Subsequent edits to the same file don't re-trigger the rule (assuming the smoke test still runs in CI / runbook is still valid). If a subsequent edit changes the integration's surface enough that the original smoke test no longer covers the new code path, treat it as a new integration.
+
+**Recommended structure for runbook smoke tests:** mirror `lean/README.md` Steps 4-7 layout. Each step is a numbered section with three subsections: **Action** (the command/click), **Expected** (what success looks like), **On mismatch** (what to do — usually capture the error + paste back in chat for diagnosis). The runbook is reusable across operator sessions and serves as the rollback playbook when the platform's surface changes.
+
 ---
 
 # 7. Database Patterns
@@ -2585,6 +2632,8 @@ Each entry: what NOT to do, why, what to do instead.
 **[A25]** DO NOT write Python code using `logging` module. Only `structlog`. Using both creates two log streams, breaks log aggregation, and may leak audit-relevant data to the wrong stream.
 
 **[A26]** DO NOT compute metrics (Sharpe, drawdown, hit rate, health score, exposure pcts) in the frontend. Backend computes and returns pre-computed values. Frontend renders only. This is a hard architectural constraint for reader-redaction simplicity.
+
+**[A27]** DO NOT introduce a service file that talks to a third-party platform (QC LEAN, IBKR ib-async, Discord webhooks, Resend, Anthropic API, S3, sops, Cloudflare, FastAPI app construction, alembic against real Postgres) without a smoke test or runbook checklist (§6.8). The first commit MUST include either (a) a CI/build-time smoke fixture that exercises the platform's contract OR (b) an operator-runbook with N concrete fact-checks. Spec/docs and platform reality drift; mock-only integrations break at first contact. Five post-spec platform discoveries hit Days 4-5 alone — see §6.8 for the canonical examples.
 
 ---
 

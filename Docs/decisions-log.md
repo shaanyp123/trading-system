@@ -574,6 +574,26 @@ text remains unchanged and this log records the deviations.
 
 ---
 
+### 2026-05-07 — Day 5 close-out — Codify platform-API smoke-test rule (dev-guide §6.8 + A27)
+
+- **Spec reference:** `Docs/decisions-log.md` open follow-up "Day 5 morning — codify the platform-API smoke-test rule" (carried from Day 4 close-out); 2026-05-07 PR #24 (FastAPI skeleton).
+- **Trigger:** five post-spec platform discoveries hit Day 4 + Day 5 alone:
+  1. QC migrated PascalCase → snake_case Python API (PR #17).
+  2. QC Cloud requires entry file `main.py` specifically (PR #18).
+  3. QC `time_rules.at()` does NOT accept timezone string as 3rd arg (PR #19).
+  4. Discord webhooks blocked from Hetzner Nuremberg by Cloudflare WAF (PRs #21 + #22).
+  5. FastAPI `from services.api.main import app` fails at Docker build time without `API_DATABASE_URL` env var (PR #24, caught by the new Dockerfile sanity-check `RUN` step that is itself the first instance of the rule applied).
+- **Decision (this PR):** codify the rule in `Docs/claude-dev-guide.md`:
+  - **§6.8 Third-Party Platform Integration Smoke Tests (locked 2026-05-07 Day 5)** — the canonical rule + concrete examples. The first commit that introduces a service file talking to a third-party platform MUST include either (a) a smoke-test fixture (CI/build-time) OR (b) an operator-runbook checklist with N concrete fact-checks. Commit message must include `Smoke-tested via: <fixture-path>` OR `Smoke-tested via: deploy/<runbook>.md Step <N>`.
+  - **Anti-pattern `[A27]`** — quick-reference enforcement hook in §11 that points back to §6.8.
+  - **§1.4 cross-reference** — under "Test-Before-Commit Rule," a brief reminder that `make test` is necessary but not sufficient for platform integrations.
+- **Why §6.8 (not §10.1 or §11):** §6 is the Testing Patterns section; the rule is fundamentally a test-discipline rule, not a phase priority or naked anti-pattern. The A27 anti-pattern paired with the §6.8 home mirrors how A01 (audit-log direct INSERT) pairs with §5.1 (Audit-Log Writer): the §-number contains the WHAT/HOW; the anti-pattern is the DO-NOT enforcement hook.
+- **Examples in §6.8:** retroactive credit for `services/api/Dockerfile` (Day 5; build-time fixture caught Pydantic Settings failure), `lean/v1_qc_algorithm.py` (Day 4; runbook caught snake_case + main.py + time_rules.at), `watchdog/watchdog.py` (Day 4; runbook caught Cloudflare-blocking-Discord). Future-applicability called out for `services/qc_adapter/poll.py`, `services/agent/anthropic_client.py`, `services/discord_bot/main.py`, `services/calibration/slippage_recalibrate.py`.
+- **What "first commit" means:** the commit that first introduces an integration file, where integration = imports a third-party platform's SDK or makes an HTTP call to a platform endpoint. Subsequent edits to the same file don't re-trigger the rule (assuming the original smoke test still runs).
+- **Cost / scope impact:** none in code; ~10-15 min added to the FIRST commit of any new platform integration to author the smoke test or runbook entry. Recovers many hours of operator time that were burned across PRs #17-22 + the Day-5 Dockerfile-build fix.
+
+---
+
 ## Open follow-ups (post-Day-4)
 
 ### From Day 1 (carried)
@@ -602,7 +622,7 @@ text remains unchanged and this log records the deviations.
 - [x] ~~**Phase 1 hardening (deferred from Day 4)** — provision Resend~~ — resolved 2026-05-07 (forced earlier by Cloudflare-blocking-Discord discovery). See "Resend is now Phase 0" close-out entry above.
 - [ ] **Day 5 morning verification (2026-05-07 17:30 ET cycle fire)** — check QC's ObjectStore tab for `heartbeat/2026-05-07.json`. If present → daily cycle is firing correctly. If `signal_cycle_tick` log line is also visible (in any QC UI panel) → `self.log()` works and the missing init log was just routing weirdly. If only the ObjectStore key appears (no log line anywhere) → confirmed `self.log()` is silent in QC's snake_case API; push a follow-up PR to switch to `self.Log()` (PascalCase). See open-question paragraph in 2026-05-07 paper-day-clock close-out entry above.
 - [ ] **Day 5 morning verification (Ashburn ↔ Discord)** — FIRST step after `paper.spratcapital.com/api/health` is up: run `curl -X POST https://discord.com/api/webhooks/...` from the Ashburn VPS to confirm whether Discord webhook POSTs work from Ashburn or are also CF-blocked. Result determines whether the 6 backend → Discord webhook channels (daily_brief, signals, fills, alerts, ops, audit) keep their Phase 0 plan or need to migrate to Resend.
-- [ ] **Day 5 morning — codify the platform-API smoke-test rule** — add to `Docs/claude-dev-guide.md` §10.1 (or new §6.x): for any third-party platform integration (QC LEAN, IBKR ib-async, Discord webhooks, Resend), the FIRST commit of an integration file MUST include either (a) a smoke-test fixture against the platform OR (b) an explicit operator-runbook checklist that fact-checks N specifics by running the platform's own current example. Four post-spec platform discoveries in one Day-4 session (snake_case, main.py, time_rules.at, Cloudflare-blocks-Hetzner-Discord) confirms the pattern; codify the fix. **Carried into a follow-up dev-guide PR after Day-5 deploy lands** — the FastAPI skeleton is bigger scope and the operator is on a deploy-day clock; the dev-guide rule isn't blocking Day 5's verification gate.
+- [x] ~~**Day 5 morning — codify the platform-API smoke-test rule**~~ — resolved 2026-05-07. Shipped as `Docs/claude-dev-guide.md` §6.8 (Third-Party Platform Integration Smoke Tests) + anti-pattern `[A27]` + §1.4 cross-reference. Five strikes (snake_case, `main.py`, `time_rules.at`, Cloudflare-blocks-Hetzner-Discord, FastAPI app import-time Pydantic Settings failure at Docker build) now codified with concrete examples. See "Day 5 close-out — Codify platform-API smoke-test rule" entry below.
 - [ ] **Week 5+ (when `POST /api/internal/watchdog` lands on the backend)** — extend `watchdog/watchdog.py` to also push to that endpoint after each successful GET. Add `WATCHDOG_BEARER_TOKEN` to `/opt/trading-watchdog/watchdog.env` (sourced from `secrets/paper.enc.yaml` `internal.watchdog_bearer_token`, already encrypted Day 3 via PR #11). Bearer token is captured + ready; just unused until the endpoint exists.
 - [ ] **Week 4 hygiene (when strategy logic wires up)** — tighten the schedule registration in `lean/v1_qc_algorithm.py` `initialize()` from `schedule.on(date_rules.every_day(), time_rules.at(17, 30), ...)` to `schedule.on(date_rules.every_day(<cme_anchor_symbol>), time_rules.at(17, 30), ...)` where `<cme_anchor_symbol>` is one of the subscribed futures (e.g., `/MES` per `Docs/backend-spec.md` §2.3 — the most-traded micro + natural calendar driver). Empirically confirmed via Jan-May backtest 2026-05-07: current `every_day()` fires on every calendar day (~126 ticks for 126 days), not just CME trading days. Cosmetic for Day 4 heartbeat-only; would mean unnecessary weekend/holiday strategy executions in Week 4. See "Backtest validation" close-out entry above.
 
