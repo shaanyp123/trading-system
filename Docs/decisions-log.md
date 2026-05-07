@@ -420,6 +420,42 @@ text remains unchanged and this log records the deviations.
 
 ---
 
+### 2026-05-07 — Day 4 close-out — Paper-day clock STARTED on QC Paper Brokerage
+
+- **Deliverable achieved:** `v1_trend_following_paper` algorithm is **Running** on QuantConnect Paper Brokerage. Phase 1 paper-day clock has started; the 30-CME-session counter increments at each daily 17:30 ET cycle (first fire: 2026-05-07 17:30 ET, ~2.5 hours after deploy).
+- **Captured artifacts (Step 7 of `lean/README.md`):**
+  | Field | Value |
+  |---|---|
+  | QC Project ID | `31282389` |
+  | QC Live Algorithm ID | `L-57b2dc364f993a74f2ca256abc97dbe8` |
+  | QC live host | `LIVE-130-57b2dc364` |
+  | LEAN Engine | `2.5.0.0.17710` |
+  | Deploy timestamp UTC | `2026-05-07T07:00:48Z` |
+  | Brokerage | Paper Brokerage (Quant Connect Paper Trading; explicit choice over IBKR Paper per 2026-05-06 entry above) |
+  | Starting equity | $15,000.00 |
+  | Project name | `v1_trend_following_paper` |
+  | Init + warmup duration | ~10 seconds (live mode); warmup window 2025-07-22 → 2026-05-07 ≈ 200 trading days |
+
+- **QC API discovery sequence (three PRs in one session, all post-spec deviations from the QC platform):**
+  1. **PR #17 (merged):** QC migrated its Python API from PascalCase to snake_case ~2024. Method names + enum values + framework-callback overrides all migrated. See snake_case entry above.
+  2. **PR #18 (merged):** QC Cloud's runtime loader requires the algorithm class to live in a file named `main.py` specifically — renaming to `v1_qc_algorithm.py` for repo-filename consistency causes runtime failure with explicit error message. LEAN Local reads `algorithm-location` from `lean.json`; QC Cloud ignores it.
+  3. **PR #19 (merged):** QC's `time_rules.at()` does NOT accept a timezone string as a third positional argument (raises `TypeError: No method matches given arguments for At: (int, int, str)` at init). Scheduled actions inherit the algorithm-wide time zone set via `set_time_zone()`; the third arg is redundant.
+
+- **Open question (carried into Day 5 morning):** the init log line `v1_trend_following algorithm initialized (skeleton; live_mode=True; params_keys=[...])` did NOT appear in QC's Cloud Terminal between the SetBenchmark warning and the warmup-start log. Since warmup proceeded successfully, init must have completed; the log call (`self.log(...)` in `on_daily_signal_cycle` and the init-end summary line) appears to be silent. Three hypotheses, in order of likelihood:
+  1. User logs route to a separate "Logs" tab inside the Live Deploy view (vs the Cloud Terminal at the bottom of the editor) — QC's UI nests them differently than the engine's own log lines.
+  2. QC's snake_case migration kept `Log` as the canonical method and `log` as a no-op or alias that's silently filtered.
+  3. Log filter / pagination on the cloud terminal panel.
+  - **Verification at 2026-05-07 17:30 ET:** check QC's ObjectStore tab for a key `heartbeat/2026-05-07.json`. The ObjectStore write (`self.object_store.save(...)`) is independent of the log path; if the key appears, the daily cycle is firing regardless of whether `self.log()` works. If the key appears AND a `signal_cycle_tick` line is also visible somewhere in QC's UI → both paths work and the init log was just routing weirdly. If the key appears but no `signal_cycle_tick` log line anywhere → confirmed `self.log()` issue, push a follow-up PR switching to `self.Log()` (PascalCase).
+  - **No impact on strategy correctness Day 4:** the algorithm is heartbeat-only; logs are diagnostic, not functional.
+
+- **Lessons reinforced:** the same pattern played out three times in this session — spec described a QC API behavior, generated code matched the spec, actual QC platform had moved. The decisions-log already captures this lesson on individual entries; for systemic fix, Day 5 morning should add a hard rule to `Docs/claude-dev-guide.md` for any third-party platform integration: **first commit must include either (a) a smoke-test fixture against the platform OR (b) an explicit "verify these N specifics by running the platform's own example" checklist for the operator before declaring complete.** Two API misses is acceptable; three in one session is a process gap that needs codification, not just per-incident notes.
+
+- **Day 4 verification gate:** ✅ closed. `implementation-guide.md` §3 Week 1 ("Phase 1 paper trading kicks off; paper-day clock starts") is satisfied. Active universe + first-session validation are Day 5 09:00 [OPERATOR] tasks.
+
+- **Cost / scope impact:** none on the spec; ~3 hours of operator time across three QC API debugging cycles. Net Day 4 outcome on schedule.
+
+---
+
 ## Open follow-ups (post-Day-4)
 
 ### From Day 1 (carried)
@@ -443,8 +479,10 @@ text remains unchanged and this log records the deviations.
 - [x] ~~**Operator (anytime post-`forbidden-paths` PR merge)** — add `forbidden-paths` to required-status-checks~~ — resolved 2026-05-05.
 
 ### New from Day 4
-- [ ] **Operator (Day 4 10:00 or whenever the QC PR merges)** — execute `lean/README.md` Steps 1–7 in QC dashboard: create `v1_trend_following_paper` project, paste `v1_qc_algorithm.py`, populate parameter map (11 keys per the table), smoke-backtest, deploy Live Paper, capture **QC project ID + Live Algorithm ID + deploy timestamp + broker pick + starting cash** into a Day 4 close-out entry below.
-- [ ] **Operator (Day 4 13:00 post-PR-#16-merge)** — execute `watchdog/README.md` Steps 1–8 on Hetzner Nuremberg VPS (`188.245.37.16`): create `trading-watchdog` user, scp script + systemd files, populate `/opt/trading-watchdog/watchdog.env` (Discord-only — Phase 0), smoke-test the script manually, enable `trading-watchdog.timer`, verify alert wiring via the Step 7 forced-503 test (Discord `#critical` should receive a `[CRITICAL]` message; email path is intentionally inactive). Capture the Discord message link in a Day 4 close-out entry below.
+- [x] ~~**Operator (Day 4 10:00 or whenever the QC PR merges)** — execute `lean/README.md` Steps 1–7 in QC dashboard~~ — resolved 2026-05-07. Algorithm Running on QC Paper Brokerage; artifacts captured in 2026-05-07 close-out entry above. Three QC API discoveries surfaced + fixed in-flight (PRs #17 merged; #18 + #19 pending).
+- [ ] **Operator (Day 4 13:00 — pending; can be done anytime today/tomorrow)** — execute `watchdog/README.md` Steps 1–8 on Hetzner Nuremberg VPS (`188.245.37.16`): create `trading-watchdog` user, scp script + systemd files, populate `/opt/trading-watchdog/watchdog.env` (Discord-only — Phase 0), smoke-test the script manually, enable `trading-watchdog.timer`, verify alert wiring via the Step 7 forced-503 test (Discord `#critical` should receive a `[CRITICAL]` message; email path is intentionally inactive). Capture the Discord message link in a Day 5 close-out entry.
+- [ ] **Day 5 morning verification (2026-05-07 17:30 ET cycle fire)** — check QC's ObjectStore tab for `heartbeat/2026-05-07.json`. If present → daily cycle is firing correctly. If `signal_cycle_tick` log line is also visible (in any QC UI panel) → `self.log()` works and the missing init log was just routing weirdly. If only the ObjectStore key appears (no log line anywhere) → confirmed `self.log()` is silent in QC's snake_case API; push a follow-up PR to switch to `self.Log()` (PascalCase). See open-question paragraph in 2026-05-07 close-out entry above.
+- [ ] **Day 5 morning — codify the platform-API smoke-test rule** — add to `Docs/claude-dev-guide.md` §10.1 (or new §6.x): for any third-party platform integration (QC LEAN, IBKR ib-async, Discord.py, Resend), the FIRST commit of an integration file MUST include either (a) a smoke-test fixture against the platform OR (b) an explicit operator-runbook checklist that fact-checks N specifics by running the platform's own current example. Three QC API misses in one Day-4 session confirms the pattern; codify the fix.
 - [ ] **Phase 1 hardening (deferred from Day 4)** — when transitioning from heavy-monitoring paper trading to live money, add Resend as a second alert channel: provision Resend account at [resend.com](https://resend.com), verify sender domain in Cloudflare DNS, fill `resend.api_key` + `resend.from_address` in `secrets/paper.enc.yaml`, edit `/opt/trading-watchdog/watchdog.env` to set the two `WATCHDOG_RESEND_*` env vars, `systemctl restart trading-watchdog.service`, re-run watchdog README Step 7 to verify both channels fire. Procedure documented in `watchdog/README.md` "Adding Resend later".
 - [ ] **Week 5+ (when `POST /api/internal/watchdog` lands on the backend)** — extend `watchdog/watchdog.py` to also push to that endpoint after each successful GET. Add `WATCHDOG_BEARER_TOKEN` to `/opt/trading-watchdog/watchdog.env` (sourced from `secrets/paper.enc.yaml` `internal.watchdog_bearer_token`, already encrypted Day 3 via PR #11). Bearer token is captured + ready; just unused until the endpoint exists.
 
