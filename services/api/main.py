@@ -1,0 +1,142 @@
+"""services/api/main.py — FastAPI app entrypoint.
+
+Wired in execution order:
+
+  1. structlog configured for JSON output on production / Console on dev.
+  2. Settings loaded from env (sops-decrypted bundle exported by entrypoint).
+  3. Lifespan:
+       - Init asyncpg pool.
+       - First-boot bootstrap: if no unconsumed/unexpired owner setup_token
+         exists, create one, print raw to stdout, store hash. Idempotent.
+  4. Middleware (RequestContext + CSRF + optional CORS).
+  5. Error handlers (canonical envelope per dev-guide §3.6).
+  6. Routes (health, setup, sse).
+
+Day 5 scope deliberately omits: WebAuthn, TOTP, sessions, audit writes,
+risk endpoints, signals. Those land Phase-0 Week-2+ behind the existing
+forbidden-paths CI gate.
+"""
+
+from __future__ import annotations
+
+import logging
+import secrets
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+
+import structlog
+from fastapi import FastAPI
+
+from services.api.config import APISettings, get_settings
+from services.api.db import close_pool, init_pool, session_scope
+from services.api.errors import register_error_handlers
+from services.api.middleware import register_middleware
+from services.api.repos.setup_tokens import PostgresSetupTokenRepo
+from services.api.routes.health import router as health_router
+from services.api.routes.setup import router as setup_router
+from services.api.routes.sse import router as sse_router
+
+log = structlog.get_logger()
+
+
+def _configure_structlog(settings: APISettings) -> None:
+    is_dev = settings.environment == "dev"
+    level = getattr(logging, settings.log_level, logging.INFO)
+
+    processors: list[structlog.types.Processor] = [
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.TimeStamper(fmt="iso", utc=True, key="timestamp_utc"),
+        structlog.processors.add_log_level,
+        structlog.processors.CallsiteParameterAdder(
+            [structlog.processors.CallsiteParameter.FUNC_NAME]
+        ),
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
+    ]
+    processors.append(
+        structlog.dev.ConsoleRenderer() if is_dev else structlog.processors.JSONRenderer()
+    )
+
+    structlog.configure(
+        processors=processors,
+        wrapper_class=structlog.make_filtering_bound_logger(level),
+        context_class=dict,
+        logger_factory=structlog.PrintLoggerFactory(),
+        cache_logger_on_first_use=True,
+    )
+
+
+async def _bootstrap_owner_token() -> None:
+    """Emit a first-run owner setup token if none exists.
+
+    Per backend-spec §3.1.1: raw token printed to stdout exactly once at
+    boot; only the Argon2id hash is persisted. Idempotent across restarts —
+    once a token is consumed (or another is in flight), no new token is
+    minted.
+    """
+    async with session_scope() as session:
+        repo = PostgresSetupTokenRepo(session)
+        if await repo.has_unconsumed_owner_token():
+            log.info("setup_owner_token_already_present")
+            return
+        raw_token = secrets.token_urlsafe(32)
+        token_uuid = await repo.insert_owner_token(raw_token)
+        # Bind to root logger so the token is visible regardless of caller
+        # context. Single-line emit because operators grep for SETUP_TOKEN.
+        log.warning(
+            "SETUP_TOKEN_EMITTED",
+            token_uuid=str(token_uuid),
+            raw_token=raw_token,
+            instructions=(
+                "Submit this token at POST /api/setup/verify-token within 24h. "
+                "It will not be re-emitted; if lost, run "
+                "`python -m services.api.bootstrap_owner_token` to mint another."
+            ),
+        )
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    settings = get_settings()
+    _configure_structlog(settings)
+    log.info(
+        "api_starting",
+        environment=settings.environment,
+        version=settings.version,
+    )
+    await init_pool(settings)
+    try:
+        try:
+            await _bootstrap_owner_token()
+        except Exception:
+            # Bootstrap failure shouldn't crash the api — alembic may not
+            # have run yet on this VPS. Log loudly and continue; operator
+            # runs the bootstrap CLI after migrations finish.
+            log.exception("setup_token_bootstrap_failed")
+        log.info("api_ready")
+        yield
+    finally:
+        log.info("api_stopping")
+        await close_pool()
+
+
+def create_app() -> FastAPI:
+    settings = get_settings()
+    _configure_structlog(settings)
+    app = FastAPI(
+        title="trading-system api",
+        version=settings.version,
+        docs_url="/api/docs" if settings.environment == "dev" else None,
+        redoc_url=None,
+        openapi_url="/api/openapi.json" if settings.environment == "dev" else None,
+        lifespan=_lifespan,
+    )
+    register_error_handlers(app)
+    register_middleware(app, settings)
+    app.include_router(health_router)
+    app.include_router(setup_router)
+    app.include_router(sse_router)
+    return app
+
+
+app = create_app()

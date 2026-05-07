@@ -30,6 +30,7 @@ dependencies = [
   "apscheduler>=3.11",
   "resend>=2.4",
   "anthropic>=0.39",
+  "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -47,6 +48,8 @@ dev = [
   "psycopg2-binary>=2.9",
   "respx>=0.21",
   "freezegun>=1.5",
+  "types-pyyaml>=6.0",
+  "asgi-lifespan>=2.1",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -90,6 +93,10 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["S", "B"]
 "scripts/**/*.py" = ["S"]
+# FastAPI uses `Depends()` in default args by design; B008 conflicts.
+"services/api/routes/*.py" = ["B008"]
+# Container entrypoint binds 0.0.0.0 by design and exec()s a known argv.
+"services/api/entrypoint.py" = ["S104", "S603", "S606"]
 
 [tool.ruff.format]
 quote-style = "double"
