@@ -632,6 +632,77 @@ def test_run_once_records_email_error(tmp_path: Path) -> None:
     assert outcome.discord_sent is True
 
 
+def test_email_unhandled_exception_does_not_block_discord(tmp_path: Path) -> None:
+    """Channel-isolation invariant (backend-spec §1.6): an unhandled exception
+    in the email path MUST NOT prevent the Discord path from firing.
+
+    This guards Phase 0 (Discord-only — the email path doesn't run, so this is
+    moot) AND Phase 1 (both channels live — a bug in send_resend_email or its
+    dependencies cannot regress Discord delivery).
+    """
+    cfg = _config(tmp_path)
+    state = wd.WatchdogState(consecutive_failures=2)
+    discord_calls: list[dict[str, Any]] = []
+
+    def exploding_email(**_: Any) -> tuple[bool, str | None]:
+        # Simulates a future bug: TypeError, AttributeError, an unhandled
+        # ssl error, etc. — anything not in URLError/OSError/TimeoutError.
+        raise RuntimeError("simulated unhandled exception in resend path")
+
+    def discord_fn(**kwargs: Any) -> tuple[bool, str | None]:
+        discord_calls.append(kwargs)
+        return True, None
+
+    outcome = wd.run_once(
+        config=cfg,
+        state=state,
+        now=datetime(2026, 5, 6, 12, 0, tzinfo=UTC),
+        check_fn=_fail_check,
+        email_fn=exploding_email,
+        discord_fn=discord_fn,
+    )
+    # Email failed, error captured
+    assert outcome.email_sent is False
+    assert outcome.email_error is not None
+    assert "RuntimeError" in outcome.email_error
+    assert "simulated unhandled exception" in outcome.email_error
+    # Discord fired regardless — channel isolation upheld
+    assert outcome.discord_sent is True
+    assert len(discord_calls) == 1
+
+
+def test_discord_unhandled_exception_does_not_block_email(tmp_path: Path) -> None:
+    """Mirror of the above — Discord failure must not block email delivery
+    (relevant only in Phase 1 when both channels are live, but worth pinning
+    so the symmetry can't regress)."""
+    cfg = _config(tmp_path)
+    state = wd.WatchdogState(consecutive_failures=2)
+    email_calls: list[dict[str, Any]] = []
+
+    def email_fn(**kwargs: Any) -> tuple[bool, str | None]:
+        email_calls.append(kwargs)
+        return True, None
+
+    def exploding_discord(**_: Any) -> tuple[bool, str | None]:
+        raise ValueError("simulated unhandled exception in discord path")
+
+    outcome = wd.run_once(
+        config=cfg,
+        state=state,
+        now=datetime(2026, 5, 6, 12, 0, tzinfo=UTC),
+        check_fn=_fail_check,
+        email_fn=email_fn,
+        discord_fn=exploding_discord,
+    )
+    # Email fired (channel isolation works in both directions)
+    assert outcome.email_sent is True
+    assert len(email_calls) == 1
+    # Discord captured the error
+    assert outcome.discord_sent is False
+    assert outcome.discord_error is not None
+    assert "ValueError" in outcome.discord_error
+
+
 def test_first_check_after_recovery_does_not_carry_old_error(tmp_path: Path) -> None:
     cfg = _config(tmp_path)
     state = wd.WatchdogState(

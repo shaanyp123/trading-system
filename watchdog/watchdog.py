@@ -415,6 +415,31 @@ def _format_alert_body(config: WatchdogConfig, state: WatchdogState, check: Chec
     )
 
 
+def _safe_invoke_alert(
+    label: str,
+    fn: Callable[..., tuple[bool, str | None]],
+    /,
+    **kwargs: Any,
+) -> tuple[bool, str | None]:
+    """Wrapper around an alert-sender callable that converts ANY exception
+    into a (False, error_message) return.
+
+    Each alert channel is invoked independently in `run_once`. Without this
+    wrapper, an unhandled exception in one channel would propagate up and
+    skip the other channel — defeating the "two independent channels" guarantee
+    in backend-spec §1.6. We accept that catching `Exception` is broad on
+    purpose: the watchdog's job is to alert, and a bug in the email path must
+    NEVER prevent the Discord path from firing (or vice versa).
+    """
+    try:
+        return fn(**kwargs)
+    except Exception as exc:
+        # Deliberate broad catch — see this function's docstring. The watchdog's
+        # job is to alert; a bug in one channel's sender must NEVER prevent the
+        # other channel from firing.
+        return False, f"{label} sender raised {type(exc).__name__}: {exc}"
+
+
 def run_once(
     *,
     config: WatchdogConfig,
@@ -432,8 +457,13 @@ def run_once(
     decision = decide_alerts(state=state, config=config, check=check, now=now)
     outcome = RunOutcome(check=check, decision=decision)
 
+    # Each alert channel is invoked independently. A failure in one (whether a
+    # well-handled error return or an unhandled exception) MUST NOT prevent
+    # the other from firing. `_safe_invoke_alert` enforces this.
     if decision.send_email:
-        ok, err = email_fn(
+        ok, err = _safe_invoke_alert(
+            "email",
+            email_fn,
             config=config,
             subject=_format_alert_subject(config, state),
             body_text=_format_alert_body(config, state, check),
@@ -441,7 +471,9 @@ def run_once(
         outcome.email_sent, outcome.email_error = ok, err
 
     if decision.send_discord:
-        ok, err = discord_fn(
+        ok, err = _safe_invoke_alert(
+            "discord",
+            discord_fn,
             config=config,
             content=_format_alert_subject(config, state)
             + "\n"
