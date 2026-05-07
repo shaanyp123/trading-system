@@ -147,9 +147,14 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         self.set_warm_up(int(params["MA_SLOW_DAYS"]), Resolution.DAILY)  # noqa: F405
 
         # Daily 17:30 ET scheduled action — fires after CME settlement.
+        # `time_rules.at(hour, minute)` uses the algorithm's time zone (set
+        # via `self.set_time_zone("America/New_York")` above). QC's
+        # `time_rules.at` does NOT accept a timezone string as a third
+        # argument — passing one raises `TypeError: No method matches given
+        # arguments for At: (int, int, str)` at algorithm initialize.
         self.schedule.on(
             self.date_rules.every_day(),
-            self.time_rules.at(17, 30, "America/New_York"),
+            self.time_rules.at(17, 30),
             self.on_daily_signal_cycle,
         )
 
