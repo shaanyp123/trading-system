@@ -409,20 +409,26 @@ class TestLoadConfig:
     REQUIRED = (
         "WATCHDOG_HEALTH_URL",
         "WATCHDOG_OPERATOR_EMAIL",
-        "WATCHDOG_RESEND_API_KEY",
-        "WATCHDOG_RESEND_FROM",
         "WATCHDOG_DISCORD_WEBHOOK_URL",
     )
+    OPTIONAL = (
+        "WATCHDOG_RESEND_API_KEY",
+        "WATCHDOG_RESEND_FROM",
+    )
+
+    def _clear_all(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for k in (*self.REQUIRED, *self.OPTIONAL, "WATCHDOG_ID", "WATCHDOG_STATE_PATH"):
+            monkeypatch.delenv(k, raising=False)
 
     def test_missing_required_env_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        for k in self.REQUIRED:
-            monkeypatch.delenv(k, raising=False)
+        self._clear_all(monkeypatch)
         with pytest.raises(SystemExit) as exc:
             wd.load_config()
         msg = str(exc.value)
         assert "missing required env var" in msg
 
     def test_full_env_loads(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._clear_all(monkeypatch)
         env = {
             "WATCHDOG_HEALTH_URL": "https://paper.example/api/health",
             "WATCHDOG_OPERATOR_EMAIL": "ops@example.test",
@@ -440,6 +446,7 @@ class TestLoadConfig:
         assert cfg.discord_alerts_enabled is True
 
     def test_default_watchdog_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._clear_all(monkeypatch)
         for k, v in {
             "WATCHDOG_HEALTH_URL": "https://x/api/health",
             "WATCHDOG_OPERATOR_EMAIL": "o@e.test",
@@ -448,9 +455,42 @@ class TestLoadConfig:
             "WATCHDOG_DISCORD_WEBHOOK_URL": "https://d/wh",
         }.items():
             monkeypatch.setenv(k, v)
-        monkeypatch.delenv("WATCHDOG_ID", raising=False)
         cfg = wd.load_config()
         assert cfg.watchdog_id == "hetzner-nuremberg-1"
+
+    def test_discord_only_phase_0_loads_without_resend(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Phase 0 deliberate decision: Discord-only is fully supported; Resend
+        is deferred until Phase 1. See decisions-log 2026-05-06 'Resend deferred'."""
+        self._clear_all(monkeypatch)
+        for k, v in {
+            "WATCHDOG_HEALTH_URL": "https://paper.example/api/health",
+            "WATCHDOG_OPERATOR_EMAIL": "ops@example.test",
+            "WATCHDOG_DISCORD_WEBHOOK_URL": "https://discord.com/api/webhooks/1/2",
+        }.items():
+            monkeypatch.setenv(k, v)
+        cfg = wd.load_config()
+        assert cfg.discord_alerts_enabled is True
+        assert cfg.email_alerts_enabled is False
+        # Resend fields default to empty strings, not None — match the
+        # WatchdogConfig dataclass contract.
+        assert cfg.resend_api_key == ""
+        assert cfg.resend_from_address == ""
+
+    def test_no_alert_channel_configured_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A watchdog with no alert surface is worse than no watchdog. Fail closed."""
+        self._clear_all(monkeypatch)
+        for k, v in {
+            "WATCHDOG_HEALTH_URL": "https://paper.example/api/health",
+            "WATCHDOG_OPERATOR_EMAIL": "ops@example.test",
+            # Discord URL provided but isn't a valid https:// URL → discord_alerts_enabled=False
+            "WATCHDOG_DISCORD_WEBHOOK_URL": "not-a-valid-url",
+        }.items():
+            monkeypatch.setenv(k, v)
+        with pytest.raises(SystemExit) as exc:
+            wd.load_config()
+        assert "no alert channel" in str(exc.value)
 
 
 # ---------------------------------------------------------------------------

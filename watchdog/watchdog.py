@@ -150,22 +150,26 @@ def load_config() -> WatchdogConfig:
     Required env vars (set by systemd `EnvironmentFile=/opt/trading-watchdog/watchdog.env`,
     sourced from sops-decrypted `secrets/paper.enc.yaml`):
 
-    - `WATCHDOG_HEALTH_URL`       e.g. `https://paper.spratcapital.com/api/health`
-    - `WATCHDOG_OPERATOR_EMAIL`   recipient of the alert email
-    - `WATCHDOG_RESEND_API_KEY`   Resend API key (sops `resend.api_key`)
-    - `WATCHDOG_RESEND_FROM`      Resend "from" address (sops `resend.from_address`)
+    - `WATCHDOG_HEALTH_URL`           e.g. `https://paper.spratcapital.com/api/health`
+    - `WATCHDOG_OPERATOR_EMAIL`       recipient of the alert email (used by Resend
+                                      when email path is enabled; ignored otherwise)
     - `WATCHDOG_DISCORD_WEBHOOK_URL`  Discord `#critical` webhook (sops `discord.webhook_urls.critical`)
 
-    Optional:
+    Optional (Phase 0 = Discord-only is fully supported; Resend path activates when
+    these are populated; see `Docs/decisions-log.md` 2026-05-06 "Resend deferred"):
 
-    - `WATCHDOG_ID`         identifier for this watchdog instance; default `hetzner-nuremberg-1`
-    - `WATCHDOG_STATE_PATH` state-file path; default `/var/lib/trading-watchdog/state.json`
+    - `WATCHDOG_RESEND_API_KEY`   Resend API key (sops `resend.api_key`)
+    - `WATCHDOG_RESEND_FROM`      Resend "from" address (sops `resend.from_address`)
+    - `WATCHDOG_ID`               identifier for this watchdog instance; default `hetzner-nuremberg-1`
+    - `WATCHDOG_STATE_PATH`       state-file path; default `/var/lib/trading-watchdog/state.json`
+
+    At least one alert channel must be live: if Discord is missing AND Resend is
+    not configured, `load_config()` fails closed (a watchdog with no alert
+    surface is worse than no watchdog at all — see backend-spec §1.6).
     """
     required = {
         "WATCHDOG_HEALTH_URL": os.environ.get("WATCHDOG_HEALTH_URL", "").strip(),
         "WATCHDOG_OPERATOR_EMAIL": os.environ.get("WATCHDOG_OPERATOR_EMAIL", "").strip(),
-        "WATCHDOG_RESEND_API_KEY": os.environ.get("WATCHDOG_RESEND_API_KEY", "").strip(),
-        "WATCHDOG_RESEND_FROM": os.environ.get("WATCHDOG_RESEND_FROM", "").strip(),
         "WATCHDOG_DISCORD_WEBHOOK_URL": os.environ.get("WATCHDOG_DISCORD_WEBHOOK_URL", "").strip(),
     }
     missing = [k for k, v in required.items() if not v]
@@ -174,15 +178,26 @@ def load_config() -> WatchdogConfig:
             f"watchdog: missing required env var(s): {', '.join(missing)}. "
             "Source /opt/trading-watchdog/watchdog.env and retry."
         )
-    return WatchdogConfig(
+    # Resend is optional for Phase 0; empty values disable the email path
+    # gracefully (see WatchdogConfig.email_alerts_enabled).
+    resend_api_key = os.environ.get("WATCHDOG_RESEND_API_KEY", "").strip()
+    resend_from = os.environ.get("WATCHDOG_RESEND_FROM", "").strip()
+
+    config = WatchdogConfig(
         health_url=required["WATCHDOG_HEALTH_URL"],
         operator_email=required["WATCHDOG_OPERATOR_EMAIL"],
-        resend_api_key=required["WATCHDOG_RESEND_API_KEY"],
-        resend_from_address=required["WATCHDOG_RESEND_FROM"],
+        resend_api_key=resend_api_key,
+        resend_from_address=resend_from,
         discord_webhook_url=required["WATCHDOG_DISCORD_WEBHOOK_URL"],
         watchdog_id=os.environ.get("WATCHDOG_ID", "hetzner-nuremberg-1"),
         state_path=Path(os.environ.get("WATCHDOG_STATE_PATH", DEFAULT_STATE_PATH)),
     )
+    if not config.email_alerts_enabled and not config.discord_alerts_enabled:
+        raise SystemExit(
+            "watchdog: no alert channel configured. Set WATCHDOG_DISCORD_WEBHOOK_URL "
+            "(recommended for Phase 0) and/or WATCHDOG_RESEND_API_KEY + WATCHDOG_RESEND_FROM."
+        )
+    return config
 
 
 def load_state(path: Path) -> WatchdogState:

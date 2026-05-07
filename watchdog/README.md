@@ -2,13 +2,19 @@
 
 Stdlib-only Python script + systemd timer that monitors the Trading System
 backend. Runs every 5 minutes; on 3 consecutive failures (≈ 15 minutes
-unreachable) it alerts the operator via Resend email and the Discord
-`#critical` webhook.
+unreachable) it alerts the operator via Discord `#critical` webhook (and
+Resend email, when that path is enabled — deferred to Phase 1; see below).
 
 Per `Docs/backend-spec.md` §1.6 + §2.12 the watchdog is **alert-only** — no
-authority to halt or modify backend state. Three independent alert channels
-(Resend, Discord, systemd journal on a separate VPS) so a single-vendor
-outage on any one doesn't silence the alarm.
+authority to halt or modify backend state.
+
+**Phase 0 = Discord-only.** Per `Docs/decisions-log.md` 2026-05-06, Resend
+email alerting is deferred until Phase 1. Rationale: during paper trading
+the operator is heavily monitoring Discord directly; a single reliable
+channel is sufficient and avoids the Resend account / DNS-verification setup
+on Day 4. The watchdog code is fully Resend-ready — flipping the email path
+on later is a `sops secrets/paper.enc.yaml` edit + `systemctl restart` away.
+See "Adding Resend later" at the bottom of this file.
 
 ## Files
 
@@ -40,12 +46,14 @@ outage on any one doesn't silence the alarm.
 - [ ] Ubuntu 24.04 LTS is up to date: `apt update && apt -y upgrade`.
 - [ ] You have `secrets/paper.enc.yaml` decryptable on your laptop
       (`sops -d secrets/paper.enc.yaml | head` returns plaintext).
-- [ ] **Resend API key is filled in `secrets/paper.enc.yaml`** under
-      `resend.api_key`. If still placeholder (`<TODO_FROM_DAY_3_RESEND_PROVISION>`),
-      provision Resend now: sign up at [resend.com](https://resend.com), grab
-      an API key from the dashboard, and `sops secrets/paper.enc.yaml` to fill
-      it. Without this, the watchdog deploys but email alerts won't fire (only
-      Discord will).
+- [ ] Discord `#critical` webhook URL is filled in `secrets/paper.enc.yaml`
+      under `discord.webhook_urls.critical` (resolved Day 2 via PR #11; verify
+      via `sops -d --extract '["discord"]["webhook_urls"]["critical"]' secrets/paper.enc.yaml`).
+      **This is the one alert channel Phase 0 relies on.**
+
+> Resend (email) is **not required** for Phase 0 deploy. The watchdog runs
+> Discord-only by default; see "Adding Resend later" at the bottom of this
+> file when Phase 1 is approaching.
 
 ### Step 1 — Create the watchdog system user
 
@@ -86,38 +94,40 @@ ssh root@188.245.37.16 "python3 --version"
 
 If older: `apt install -y python3.12`.
 
-### Step 4 — Create the watchdog env file
+### Step 4 — Create the watchdog env file (Discord-only Phase 0)
 
-The env file holds Resend / Discord / health-URL config. Source values from
-`secrets/paper.enc.yaml` on your laptop, paste into the VPS file via
-`ssh + cat - > /opt/trading-watchdog/watchdog.env`.
-
-On your laptop, decrypt the relevant fields:
+The env file holds the Discord webhook + health-URL config. Source the
+Discord webhook from `secrets/paper.enc.yaml` on your laptop:
 
 ```bash
-sops -d --extract '["resend"]["api_key"]'                  secrets/paper.enc.yaml
-sops -d --extract '["resend"]["from_address"]'             secrets/paper.enc.yaml
 sops -d --extract '["discord"]["webhook_urls"]["critical"]' secrets/paper.enc.yaml
-sops -d --extract '["internal"]["watchdog_bearer_token"]'  secrets/paper.enc.yaml
 ```
 
-On the VPS, write the file (replace `<...>` with the decrypted values):
+On the VPS, write the file (replace `<discord-critical-webhook>` with the
+decrypted value above):
 
 ```bash
 ssh root@188.245.37.16
 cat > /opt/trading-watchdog/watchdog.env <<'EOF'
 WATCHDOG_HEALTH_URL=https://paper.spratcapital.com/api/health
 WATCHDOG_OPERATOR_EMAIL=shaanrpatel2@gmail.com
-WATCHDOG_RESEND_API_KEY=<resend-api-key-from-sops>
-WATCHDOG_RESEND_FROM=<resend-from-address-from-sops>
-WATCHDOG_DISCORD_WEBHOOK_URL=<discord-critical-webhook-from-sops>
+WATCHDOG_DISCORD_WEBHOOK_URL=<discord-critical-webhook>
 WATCHDOG_ID=hetzner-nuremberg-1
 WATCHDOG_STATE_PATH=/var/lib/trading-watchdog/state.json
+
+# Phase 0: Resend email path is deferred — leave these unset (or empty).
+# When you provision Resend later, fill these and `systemctl restart trading-watchdog.service`.
+# WATCHDOG_RESEND_API_KEY=
+# WATCHDOG_RESEND_FROM=
 EOF
 
 chown root:trading-watchdog /opt/trading-watchdog/watchdog.env
 chmod 0640 /opt/trading-watchdog/watchdog.env
 ```
+
+`WATCHDOG_OPERATOR_EMAIL` is required even in Discord-only mode — it's a
+no-cost placeholder used when/if the email path is later enabled. Use the
+operator's gmail.
 
 > The `<watchdog-bearer-token>` from sops is intentionally NOT in the env
 > file. It's reserved for the future `POST /api/internal/watchdog` push
@@ -173,8 +183,8 @@ journalctl -u trading-watchdog.service -f
 
 ### Step 7 — Verify alert wiring (one-time)
 
-To confirm Resend + Discord actually deliver, force a 3-strike alert by pointing
-the watchdog at a URL guaranteed to 404:
+To confirm Discord actually delivers, force a 3-strike alert by pointing the
+watchdog at a URL guaranteed to 503:
 
 ```bash
 ssh root@188.245.37.16
@@ -192,8 +202,8 @@ for i in 1 2 3; do
 done
 
 # Confirm the alert came through:
-#   - Email in your inbox (subject starts with "[CRITICAL]")
 #   - Discord #critical channel has a new message starting with "[CRITICAL]"
+#   - (Email skipped: Phase 0 = Discord-only)
 
 # Restore real config + reset state
 mv /opt/trading-watchdog/watchdog.env.bak /opt/trading-watchdog/watchdog.env
@@ -206,7 +216,6 @@ Note these for the Day 4 close-out entry in `Docs/decisions-log.md`:
 
 - VPS hostname + static IP (should match Day 1 capture: `188.245.37.16`)
 - systemd timer first-fire timestamp (from `systemctl list-timers`)
-- Resend test-alert message ID (from your Resend dashboard)
 - Discord test-alert message link (from `#critical`)
 
 ---
@@ -240,13 +249,37 @@ rm -f /var/lib/trading-watchdog/state.json
 
 ### Rotating credentials
 
-- **Resend API key** — rotate via Resend dashboard, update
-  `secrets/paper.enc.yaml`, then re-run Step 4 to refresh the VPS env file.
-- **Discord webhook URL** — same flow, Discord channel settings → Integrations
-  → Webhooks → regenerate.
+- **Discord webhook URL** — Discord channel settings → Integrations →
+  Webhooks → regenerate; update `discord.webhook_urls.critical` in
+  `secrets/paper.enc.yaml`; re-run Step 4 to refresh the VPS env file.
+- **Resend API key** — only relevant once email path is enabled (see "Adding
+  Resend later" below). Rotate via Resend dashboard; update
+  `secrets/paper.enc.yaml`; re-run Step 4.
 - **Annual age key rotation (2027-05-05)** — covered by the existing rotation
   cadence (`Docs/decisions-log.md` Day 2). Re-encrypts the secrets; nothing
   watchdog-specific to do.
+
+### Adding Resend later (Phase 1)
+
+Phase 0 ships Discord-only on the operational decision that one reliable
+alert channel is enough during heavy paper-trading monitoring. To add Resend
+email when Phase 1 approaches:
+
+1. Sign up at [resend.com](https://resend.com) (free tier ≥ 3,000
+   emails/month is sufficient for alert traffic).
+2. Verify the sender domain in Resend's dashboard (DNS TXT records on
+   `spratcapital.com` via Cloudflare).
+3. Generate an API key and fill `resend.api_key` + `resend.from_address` in
+   `secrets/paper.enc.yaml` via `sops secrets/paper.enc.yaml`.
+4. SSH into the Nuremberg VPS, edit `/opt/trading-watchdog/watchdog.env`,
+   uncomment + populate the two `WATCHDOG_RESEND_*` lines.
+5. `systemctl restart trading-watchdog.service` (no daemon-reload needed —
+   only the env file changed).
+6. Re-run Step 7 to verify the email path delivers; both Discord and email
+   should fire on the 3rd forced failure.
+
+No code change required. The watchdog already reads both env vars on every
+tick; the email path activates the moment they're populated.
 
 ### Tuning knobs
 
@@ -264,10 +297,10 @@ These are LOCKED. Any change requires a `Docs/decisions-log.md` entry first:
 |---|---|---|
 | Backend `/api/health` returns 503 | Increment counter; alert at 3 | Investigate backend per spec §6.2 |
 | Backend unreachable (DNS / TCP) | Increment counter; alert at 3 | Check Hetzner status page; check Caddy is up |
-| Resend API returns 5xx | `email_sent=false`, `email_error` logged; Discord still attempts | Discord still alerts you; Resend retry next tick |
-| Discord webhook revoked | `discord_sent=false`, `discord_error` logged; Resend still sends | Email still alerts you; rotate webhook |
+| Discord webhook revoked | `discord_sent=false`, `discord_error` logged in journal | systemd journal is your only signal until you rotate the webhook. **In Phase 0 = Discord-only mode this is the single point of failure for alerting; check `journalctl -u trading-watchdog` daily during paper trading.** |
+| Resend API returns 5xx (only relevant if email path is enabled) | `email_sent=false`, `email_error` logged; Discord still attempts | Discord still alerts you; Resend retry next tick |
 | Watchdog VPS itself unreachable | Backend can't see the watchdog's `/api/internal/watchdog` push (when wired Week 5+) → backend will eventually emit `watchdog_unreachable` defensive-envelope trigger per §1.6 + §2.12 | Operator notices via the backend's own degradation path |
-| Both Resend + Discord fail | systemd journal still records the failure on this VPS | If the backend is unreachable AND both alert channels are down, your only signal is operator habit (daily review / direct check). This is the residual risk of running a single watchdog. |
+| Both alert channels fail | systemd journal still records the failure on this VPS | If the backend is unreachable AND alert channels are down, your only signal is operator habit (daily review / direct check). This is the residual risk of running a single watchdog. Phase 1 mitigation: add Resend as second channel (see "Adding Resend later"). |
 
 ### What to do if the watchdog itself misbehaves
 
