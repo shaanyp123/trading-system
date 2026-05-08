@@ -193,9 +193,9 @@ Operator learning allocation: 5–8 hours/week on Python basics, git operations,
 - **Fri:** `[BOTH]` Operator reads first paper session logs in QC dashboard; Claude Code explains log structure. `[CLAUDE_CODE]` Set up Hetzner VPS: install Docker, create `trading` user, clone repo to `/opt/trading`, configure UFW (ports 22 SSH key-only, 80, 443; block all else).
 
 **Verification gate (end of Week 1):**
-- [~] `curl -I https://<your-domain>` returns HTTP 200 or redirect (Caddy placeholder or Let's Encrypt)
+- [x] `curl -I https://<your-domain>` returns HTTP 200 or redirect (Caddy placeholder or Let's Encrypt)
       Done means: TLS cert issued; apex domain resolves to Hetzner Ashburn IPv4
-      **Status 2026-05-07:** PARTIAL — api container is healthy on the VPS (loopback `/api/health` returns ok + db_connected:true); Caddy started but the laptop-side `curl https://spratcapital.com/api/health` verification was deferred to Day 6 morning. See `Docs/decisions-log.md` Day 5 close-out entry.
+      **Status 2026-05-08:** DONE — `curl -fsS -i https://spratcapital.com/api/health` from operator's laptop returns HTTP/2 200 + HSTS preload + CSP + `db_connected:true` JSON body on first cold-cache request. Caddy ACME cert acquired; HTTP/3 advertised via `alt-svc`. See `Docs/decisions-log.md` "Day 6 carryover morning — TLS verified end-to-end" entry.
 - [x] QC organization exists; paper trading algorithm is **Running** status in QC dashboard
       Done means: at least 1 QC paper session tick visible in algorithm logs
       **Status 2026-05-07:** DONE — `v1_trend_following_paper` Running on QC Paper Brokerage since 2026-05-07 07:00 UTC (Day 4 close-out).
