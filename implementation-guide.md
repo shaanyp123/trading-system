@@ -227,12 +227,15 @@ Operator learning allocation: 5–8 hours/week on Python basics, git operations,
 - **Fri:** `[BOTH]` Operator SSH into Hetzner VPS; walk through `docker compose up` manually to confirm containers start. Claude Code debugs any startup failures. Confirm QC paper trading is still live and ticking.
 
 **Verification gate (end of Week 2):**
-- [ ] Sub-universe check: run `python3 scripts/verify_universe.py --equity 15000` (Claude Code authors this script). Output lists all Phase 1 contracts; each shows PASS/FAIL with 1-contract notional vs. 50% threshold.
+- [x] Sub-universe check: run `python3 scripts/verify_universe.py --equity 15000` (Claude Code authors this script). Output lists all Phase 1 contracts; each shows PASS/FAIL with 1-contract notional vs. 50% threshold.
       Done means: ≥4 markets show PASS at $15,000 equity
-- [ ] Sops decrypt test: `sops -d secrets/paper.enc.yaml` on laptop returns plaintext YAML without error
+      **Status (2026-05-08, Day 7):** ≥4 markets PASS — but only at $20k after **DP-002 invoked** raising initial capital $15k → $20k (insufficient PASS coverage at $15k). Decisions-log: 2026-05-08 Day 7 09:00 sub-universe + DP-002 entry.
+- [x] Sops decrypt test: `sops -d secrets/paper.enc.yaml` on laptop returns plaintext YAML without error
       Done means: age key works; sops config correct
+      **Status (2026-05-08):** verified after laptop sops `exec format error` fix (Day 6 carryover evening). `paper.enc.yaml` filled from VPS and committed via PR #29.
 - [ ] IBKR Pro application email confirmation received (or follow-up submitted if no response)
       Done means: application in review; 2-week clock tracked
+      **Status (2026-05-08):** still pending. **DP-001 trigger window opens at end of Week 2** — if no approval by then, execute DP-001 (alternate broker / extended timeline).
 
 **Risks this week:** Age key backup missed or stored only digitally — if laptop lost, secrets become unrecoverable. IBKR approval further delayed.
 
