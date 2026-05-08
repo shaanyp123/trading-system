@@ -789,6 +789,38 @@ Spec deviations from `implementation-guide.md` §11 prompts — locked here for 
 
 ---
 
+### 2026-05-08 — Day 7 09:00 — sub-universe verification + DP-002 invoked ($15k → $20k initial capital)
+
+- **Spec reference:** `implementation-guide.md` §3 Week 2 Tue ("Confirm: ≥4 markets active at $15k; record exclusions with rationale in decision diary"); `implementation-guide.md` §6 row DP-002 (mitigation: "raise initial capital to $20k") + DP-003 (initial live allocation: $15k/$20k/$25k); 2026-05-05 Day 2 entry "Phase 1 candidate sub-universe LOCKED" (line 168, per-tier exclusion expectations).
+- **Verification ran on the operator's laptop, in this worktree, against PR #28's `services/risk/sizing._stage_0_universe_filter` (single source of truth):** `python3 scripts/verify_universe.py --equity {15000, 20000, 25000}` (without and with `--include-mes-override`).
+
+| Equity | /MES override | Markets pass | Active set | Cluster diversity |
+|---|---|---|---|---|
+| $15k | off | 4 / 11 | TLT, IEF, SHY, TIP | **1** (rates only) |
+| $20k | off | 7 / 11 | + /M2K, /MCL, /MBT | 4 |
+| $20k | on  | 8 / 11 | + /MES | 4 |
+| $25k | off | 7 / 11 | same as $20k off | 4 |
+| $25k | on  | 8 / 11 | same as $20k on | 4 |
+
+- **DP-002 numeric trigger NOT activated:** the spec gate ("≥4 markets active at $15k") is met at exactly 4. DP-002 mitigation triggers at <4.
+- **Operator decision (2026-05-08):** invoke DP-002 mitigation anyway — raise initial live capital target from $15k (DP-003 default) to $20k. Reason: the 4 markets that pass at $15k (TLT, IEF, SHY, TIP) are all U.S. Treasury duration ETFs — a single risk cluster. Trend-following with one cluster is roughly equivalent to one position; Stage 3 cluster-shrink does nothing. At $20k, /M2K (equity-index micro), /MCL (commodity micro), and /MBT (crypto micro) come online → 4 clusters / 7 markets — the strategy turns on. $25k buys nothing extra over $20k until /MGC qualifies at $48k.
+- **DP-003 superseded:** DP-003's default ($15k) is overridden by DP-002 invocation. New initial-live-capital target is **$20k**. When the operator funds IBKR Pro at Week 8 Wed (per implementation-guide line 411), funding amount = $20k.
+- **/MES override at $20k is moot until ~$52k equity:** Stage 0 admits /MES via the override (`scripts/verify_universe.py:DEFAULT_SINGLE_CONTRACT_OVERRIDES` mapping /MES → $20k), Stage 2 caps at the 50% hard floor ($10k notional), Stage 5 banker's-rounds 0.38 contracts to 0 because 1 contract ($26k) > $10k cap. /MES becomes a real, executable position only when equity ≥ ~$52k (at which point 1-contract notional ≤ 50% × equity and the override is no longer needed). Decision: leave the override configured per spec — at $20k it's a no-op (Stage 5 sub-minimum drop), so no behavior change vs. removing it.
+- **`accounts.initial_equity` value at first deploy:** `Decimal("20000.00")` (was `Decimal("15000.00")` per DP-003 default). Applied on first INSERT into `accounts` at Week 8 Wed funding; see new "From Day 7" follow-ups below.
+- **Tests:** added `tests/unit/test_sizing.py::TestStage0UniverseFilter::test_stage_0_20k_admits_4cluster_active_set` to lock in the new operational baseline (the 7-market active set + 4-cluster diversity property at $20k without override). Existing $15k / $25k / $50k / $100k tests unchanged. `test_verify_universe_script.py`'s tier inventory ($15k, $20k, $25k, $50k, $100k) already covers post-decision behavior.
+- **Cost / scope impact:** +$5k operator capital allocation at Phase 1 funding (Week 8 Wed). No engineering scope change. No backtest behavior change. Strategy parameters (`parameters.py:V1_DEFAULTS`) are equity-tier-independent; no parameter migration needed. No `services/risk/**` change in this PR — pure docs + test addition; no `risk-review-approved` label required.
+
+---
+
+### 2026-05-08 — Day 7 14:00 — kill-switch state machine verbal walkthrough (operator learning session)
+
+- **Spec reference:** `implementation-guide.md` §11 Day 7 14:00 ("Operator learning session: kill-switch state machine"); `Docs/backend-spec.md` §2.4.3; `services/risk/state_machine.py` (PR #28).
+- **Coverage of the IG learning goals:** (a) what triggers HALT_NEW (15+ conditions) — confirmed 15 triggers across 3 severities (9 routine, 3 defensive_envelope, 3 incident_review); operator now knows the full inventory. (b) what CONVALESCENT means — confirmed `m_convalescent = 0.5` in the `m_combined()` MIN composition (backend-spec §2.4.4), so "reduced size for 5 sessions" = half the target vol for ~1 calendar week of CME closes. (c) when incident_review applies — confirmed the 3 triggers (audit_write_fail, hash_chain_break, decommission_floor) and the resume gate (`incident_review_id` FK into `incident_reviews` table, `length(write_up_text) >= 100` CHECK per §3.25, web-only re-auth). (d) HALT_NEW dwell — 7 trading days of HALT triggers a daily reminder; system NEVER auto-flattens.
+- **Implementation-vs-spec mismatch surfaced during the walkthrough:** spec §2.4.3 mermaid names "5 states" (NORMAL, HALT_NEW_routine, HALT_NEW_defenv, HALT_NEW_incident, CONVALESCENT) but the actual implementation uses 3 states + a severity column on `risk_state` (matching the §3.14 schema). This is documented at line 897 in this log; the IG prose was shorthand. Walkthrough used the canonical 3-state model.
+- **Cost / scope impact:** none. ~10 min of session time. No code change. Day 7 is now closed.
+
+---
+
 ## Open follow-ups (post-Day-4)
 
 ### From Day 1 (carried)
@@ -802,7 +834,7 @@ Spec deviations from `implementation-guide.md` §11 prompts — locked here for 
 
 ### From Day 2 (carried)
 - [x] ~~**Week 2 Mon** — `services/risk/sizing.py` Stage 0 implementation~~ — resolved 2026-05-07 via PR #28 (full Stages 0-5, not just Stage 0; merged with `risk-review-approved` label).
-- [ ] **Week 2 Tue** — sub-universe data-executability check (QC bundled data availability per locked candidate); active universe at $15k–$25k tier emerges from Stage 0 dynamically (no manual finalization needed since the candidate pool is already locked). Run `python3 scripts/verify_universe.py --equity 15000` (then 20000, 25000) after PR #28 merge.
+- [x] ~~**Week 2 Tue** — sub-universe data-executability check (QC bundled data availability per locked candidate); active universe at $15k–$25k tier emerges from Stage 0 dynamically (no manual finalization needed since the candidate pool is already locked). Run `python3 scripts/verify_universe.py --equity 15000` (then 20000, 25000) after PR #28 merge.~~ — resolved 2026-05-08. Verified at all three tiers; numeric DP-002 trigger met-by-bare-minimum (4/11 at $15k); operator invoked DP-002 mitigation anyway to gain 4-cluster diversification at $20k. See "Day 7 09:00 — sub-universe verification + DP-002 invoked" entry above.
 - [ ] **Week 3–4** — implement `V1TrendFollowing.generate_exit_candidates` (currently scaffolded with `NotImplementedError`).
 - [ ] **Week 4** — full LEAN/QC algorithm wiring (`lean/v1_qc_algorithm.py` is heartbeat-only as of Day 4; brokerage model + warmup + parameter-map are in place but `OnDailySignalCycle` still emits heartbeat-only — strategy module imports remain commented out).
 - [ ] **2027-05-05** — annual rotation: regenerate age keys, `sops updatekeys` all `secrets/*.enc.yaml`, print new papers, destroy old papers.
@@ -824,6 +856,12 @@ Spec deviations from `implementation-guide.md` §11 prompts — locked here for 
 - [x] ~~**Day 5 morning — codify the platform-API smoke-test rule**~~ — resolved 2026-05-07. Shipped as `Docs/claude-dev-guide.md` §6.8 (Third-Party Platform Integration Smoke Tests) + anti-pattern `[A27]` + §1.4 cross-reference. Five strikes (snake_case, `main.py`, `time_rules.at`, Cloudflare-blocks-Hetzner-Discord, FastAPI app import-time Pydantic Settings failure at Docker build) now codified with concrete examples. See "Day 5 close-out — Codify platform-API smoke-test rule" entry below.
 - [ ] **Week 5+ (when `POST /api/internal/watchdog` lands on the backend)** — extend `watchdog/watchdog.py` to also push to that endpoint after each successful GET. Add `WATCHDOG_BEARER_TOKEN` to `/opt/trading-watchdog/watchdog.env` (sourced from `secrets/paper.enc.yaml` `internal.watchdog_bearer_token`, already encrypted Day 3 via PR #11). Bearer token is captured + ready; just unused until the endpoint exists.
 - [ ] **Week 4 hygiene (when strategy logic wires up)** — tighten the schedule registration in `lean/v1_qc_algorithm.py` `initialize()` from `schedule.on(date_rules.every_day(), time_rules.at(17, 30), ...)` to `schedule.on(date_rules.every_day(<cme_anchor_symbol>), time_rules.at(17, 30), ...)` where `<cme_anchor_symbol>` is one of the subscribed futures (e.g., `/MES` per `Docs/backend-spec.md` §2.3 — the most-traded micro + natural calendar driver). Empirically confirmed via Jan-May backtest 2026-05-07: current `every_day()` fires on every calendar day (~126 ticks for 126 days), not just CME trading days. Cosmetic for Day 4 heartbeat-only; would mean unnecessary weekend/holiday strategy executions in Week 4. See "Backtest validation" close-out entry above.
+
+### New from Day 7
+- [ ] **Week 8 Wed (IBKR funding day)** — fund IBKR Pro account with **$20k**, NOT the DP-003 default $15k. DP-002 mitigation invoked Day 7 (2026-05-08); see close-out entry above.
+- [ ] **Week 8 Wed (first `accounts` row insert)** — set `accounts.initial_equity = Decimal("20000.00")`. Bootstrap script / first-deploy SQL must use the post-DP-002 amount, not the spec/IG default.
+- [ ] **Week 8 Wed (immediately after first capital inflow)** — write a `decision_diary` row tagged `size_concern` (per backend-spec §3.13 enum + alembic 0003 CHECK; NOT IG's `universe_change` — see line 898) with the DP-002 rationale text (≥10 char, ≤2000 char). Suggested wording: "Initial live capital raised from $15k (DP-003 default) to $20k per DP-002 mitigation. At $15k Stage 0 admits only the 4 Treasury duration ETFs (single rates cluster), defeating cluster diversification. $20k admits /M2K, /MCL, /MBT — full 4-cluster active set. Operator decision 2026-05-08; verification numbers in Docs/decisions-log.md."
+- [ ] **Week 8 Wed (auto via bootstrap)** — first `capital_events` row written by the deploy bootstrap; first 5 live sessions get `m_capital_event = 0.5` per backend-spec §2.4.4 (composes via MIN with `m_convalescent`, but the system starts in NORMAL so only `m_capital_event` binds).
 
 ### New from Day 5
 - [x] ~~**Operator (Day 5)** — execute `deploy/api/README.md` Steps 1-5 on Ashburn~~ — resolved 2026-05-07. api healthy at the loopback level; full step-by-step capture in Day 5 close-out entry "api healthy on Ashburn". Three live bringup-script bugs found + fixed in same-day PR (this one).

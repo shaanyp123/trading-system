@@ -144,6 +144,35 @@ class TestStage0UniverseFilter:
         excluded_markets = {e["market"] for e in s0.excluded}
         assert excluded_markets == {"/MES", "/MNQ", "/MYM", "/M2K", "/MGC", "/MCL", "/MBT"}
 
+    def test_stage_0_20k_admits_4cluster_active_set(self) -> None:
+        """At $20k equity (DP-002 mitigation amount per Day 7 close-out), threshold
+        is $10k — admits /M2K ($10k), /MCL ($8k), /MBT ($10k) plus the four ETFs.
+        The active set spans all 4 V1 risk clusters (equity_index via /M2K,
+        commodity via /MCL, crypto via /MBT, rates via the ETFs); cluster-shrink
+        at Stage 3 has something to do, unlike the rates-only $15k tier. See
+        2026-05-08 Day 7 entry in Docs/decisions-log.md."""
+        meta = _v1_metadata()
+        s0 = _stage_0_universe_filter(
+            candidate_markets=tuple(V1_NOTIONALS.keys()),
+            equity=Decimal("20000"),
+            contracts_metadata=meta,
+            single_contract_overrides={},
+            evaluated_at_utc="2026-05-08T13:00:00Z",
+        )
+        assert set(s0.active_markets) == {
+            "/M2K",
+            "/MCL",
+            "/MBT",
+            "TLT",
+            "IEF",
+            "SHY",
+            "TIP",
+        }
+        assert {e["market"] for e in s0.excluded} == {"/MES", "/MNQ", "/MYM", "/MGC"}
+        # Cluster-diversity property: the active set spans all 4 V1 clusters.
+        clusters_present = {meta[m].cluster for m in s0.active_markets}
+        assert clusters_present == {"equity_index", "commodity", "crypto", "rates"}
+
     def test_stage_0_25k_admits_8k_to_12k_micros(self) -> None:
         """At $25k equity, threshold is $12.5k — admits /MCL ($8k), /M2K ($10k),
         /MBT ($10k) plus the four ETFs."""
