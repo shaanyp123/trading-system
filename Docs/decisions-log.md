@@ -647,19 +647,102 @@ text remains unchanged and this log records the deviations.
 
 ---
 
+### 2026-05-07 — Day 6-9 [CLAUDE_CODE] chain — pure-policy modules; spec wins on every IG deviation
+
+PR #28 (squash commit `1735106`) lands the entire Day 6 09:00 → Day 9 11:00 [CLAUDE_CODE] chain in one branch — five forbidden-whitelist policy modules + one CLI script + one defensive bringup-script fix, 4428 lines, 222 tests. Every module follows the same plan-then-apply shape (pure-policy core; ``PendingAuditEvent`` returned as data; the caller owns DB I/O), so unit tests need zero audit/SSE mocking and the modules don't depend on ``services/audit/writer.py`` or ``services/api/sse.emit_sse`` (neither exists yet).
+
+Spec deviations from `implementation-guide.md` §11 prompts — locked here for archaeology:
+
+- **Day 6 09:00 sizing.py** — added `numpy>=2.1` runtime dep (Higham PSD repair via `np.linalg.eigh`; pure-Python eigendecomposition impractical). PSD repair runs ONCE upstream of Stage 1 (not just inside Stage 3 as the spec example trace suggests) because backend-spec §2.4.1 itself says "every Σ used for portfolio-vol or cluster shrink runs through nearest_psd"; both Stage 1 (vol scaling) and Stage 3 (cluster decisions) consume Σ, so repair must precede Stage 1.
+
+- **Day 6 11:00 verify_universe.py** — CLI imports the locked `V1_CANDIDATE_UNIVERSE` from `parameters.py` (TLT/IEF/SHY/TIP for bond exposure), NOT the `/ZN /ZB /ZF /ZT` Treasury futures the IG §11 Day 6 11:00 prompt suggested. The bond-ETF lock predates the IG (see 2026-05-05 Day 2 entry). Single-source-of-truth wins: future re-locks of the candidate universe are picked up automatically.
+
+- **Day 7 10:30 state_machine.py** — three states (NORMAL, HALT_NEW, CONVALESCENT) + severity column matching the `risk_state` schema (§3.14), NOT five collapsed states (HALT_NEW_routine / HALT_NEW_defenv / HALT_NEW_incident / NORMAL / CONVALESCENT) the IG §11 Day 7 prompt names. The IG was using state names as a prose shorthand for state+severity tuples; the canonical model is state + severity column. Plan functions return `StateTransitionPlan` with audit + SSE intents as data.
+
+- **Day 9 09:00 decision_diary.py** — tag enum follows the SPEC (`data_concern`, `regime_concern`, `size_concern`, `manual_judgment`, `other` per §3.13 + alembic 0003 CHECK constraint), NOT the IG's `signal_override / parameter_change_reviewed / halt_acknowledgement / engagement_miss / path_decision / universe_change / mid_phase_review / strategy_review_triggered / cutover_scheduled / capital_event / manual_reconciliation / vacation_mode_toggled` list (which would fail the DB CHECK at INSERT). The IG's tags look more like operator-action labels for a different surface; if the operator wants those captured, that's a separate enum (e.g., a future `decision_diary.action_label` column) with its own migration. NO separate `decision_diary_logged` audit_log event either — that event_type isn't in the locked taxonomy (§3.30); A04 binds. The decision_diary row itself IS the audit-style record (carries `ts_utc`, `monotonic_ns`, `author`).
+
+- **Day 9 09:00 vacation.py** — emits `vacation_started` / `vacation_ended` (locked taxonomy §3.30), NOT the IG's `vacation_mode_toggled` (not in §3.30). end-vacation policy rejects the Discord path explicitly: "re-auth window: web-only by construction" (dev-guide §1.5 lock) is enforced at the policy layer in addition to the API gate.
+
+- **Day 9 11:00 calendar_import.py** — schedule constants are 22:00 ET import + 23:00 ET cutoff (spec §2.9 row "Schedules"), NOT 20:00 ET / 16:00 ET as the IG §11 Day 9 11:00 prompt says. Audit event names use the canonical taxonomy (`calendar_imported`, NOT `calendar_event_imported`). Scope is policy + audit-builder only — Forex Factory + Trading Economics network fetch + APScheduler cron registration + Discord `/calendar` `/ratify` handlers are deferred to Week 7 per the IG itself ("Wire Discord stubs (full implementation in Week 7)"). A27 deferred until the actual fetcher lands.
+
+- **Day 6 cleanup — bringup script Step 0.5** — auto-restore `secrets/<env>.enc.yaml` from `/etc/credstore.encrypted/<env>.enc.yaml.backup` when the in-repo file's `app_service_password` is a `<TODO>` placeholder. Idempotent no-op when already filled. Removes the manual `cp` dance from `deploy/api/README.md` Option A; promotes Option C from "not implemented yet" to "shipped"; Option B (commit the filled file) is now PR #29 below.
+
+- **Cost / scope impact:** none on the spec architecture; ~6h of Claude session time across the chain (sizing was the long pole). No backtest behavior change — none of these modules execute strategy logic; they enforce policy on inputs the strategy already produces. Net Week 2 outcome: ahead of schedule (the IG schedules these tasks across Days 6-9; the operator's "Get us to where I am the only one who can do the next steps" instruction merged the chain into one PR).
+
+---
+
+### 2026-05-08 — Day 6 carryover morning — TLS verified end-to-end; Week 1 gate fully closed
+
+- **Spec reference:** `implementation-guide.md` §3 Week 1 verification gate ("`curl -I https://<your-domain>` returns HTTP 200 or redirect"); 2026-05-07 Day 5 close-out entry "api healthy on Ashburn; Day 5 closed at loopback level" deferred this to Day 6 morning.
+- **Verification (operator laptop, 2026-05-08 ~01:39 UTC):** `curl -fsS -i https://spratcapital.com/api/health` returns:
+  - `HTTP/2 200`
+  - HSTS: `strict-transport-security: max-age=31536000; includeSubDomains; preload`
+  - CSP: `default-src 'self'; script-src 'self'; connect-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'`
+  - `via: 1.1 Caddy` proxying to `server: uvicorn`
+  - `alt-svc: h3=":443"` — HTTP/3 advertised
+  - Body: `{"status":"ok","environment":"paper","version":"dev","db_connected":true,"checks":[{"name":"postgres","ok":true,"latency_ms":1.58,"detail":null}]}`
+- **Verdict:** Caddy acquired its first ACME cert successfully; full TLS path works on the first cold-cache request from the operator's laptop. Week 1 verification gate item ("`curl -I` returns HTTP 200 or redirect; TLS cert issued; apex domain resolves to Hetzner Ashburn IPv4") is now [x] (was [~] at Day 5 close).
+- **Cost / scope impact:** none. ~30 seconds of operator time. Confirms the entire Day 1-5 chain (apex DNS → Hetzner Ashburn → Caddy + Let's Encrypt → api lifespan → postgres health) holds end-to-end.
+
+---
+
+### 2026-05-08 — Day 6 carryover morning — Ashburn → Discord works; backend stays on Discord (NOT migrated to Resend)
+
+- **Spec reference:** 2026-05-07 Day 4 close-out "Discord webhook POSTs blocked from Hetzner VPS by Cloudflare WAF"; that entry's open question was "Backend-side Discord webhook viability (Ashburn IP) is open until Day 5 morning verification" — slipped to Day 6.
+- **Test (operator on Ashburn VPS, 2026-05-08 ~01:50 UTC):** `curl -i -X POST -H "User-Agent: trading-system-probe/0.1 (+ashburn-webhook-test)" -H "Content-Type: application/json" -d '{"content":"<probe message>"}' "$DISCORD_WEBHOOK_URL"` from Hetzner Ashburn `178.156.239.84` against a Discord webhook URL.
+- **Result:** **HTTP 204 No Content** + the probe message landed in Discord. Operator-confirmed.
+- **Architectural decision (settled):** the planned Phase 0/1 backend-side 6-channel Discord routing (`#daily-brief`, `#signals`, `#fills`, `#alerts`, `#critical`, `#ops`, `#audit`) **stays on Discord**. NOT migrated to Resend. Cloudflare's IP-reputation block on Hetzner Nuremberg (the watchdog VPS) is NOT applied uniformly across Hetzner data centers — Ashburn passes the same probe that Nuremberg fails. Resend remains primary for the watchdog (Nuremberg-blocked) only; the broader backend's Discord plan is unblocked.
+- **Why the divergence between Nuremberg and Ashburn is plausible:** Cloudflare maintains per-data-center IP-reputation scores. Hetzner Nuremberg's IP range has more bot/abuse history (Nuremberg is one of Hetzner's oldest+largest DCs with a long tail of resold IP space); Ashburn `178.156.239.0/24` is a newer Hetzner range with cleaner reputation. The block isn't an explicit Hetzner-vs-Cloudflare adversarial situation — it's bot-fight scoring that happens to bind on Nuremberg.
+- **Cost / scope impact:** none. The architecture call we deferred at Day 5 close-out is now made: Discord routing for backend stays on plan; no Resend migration scope expansion. Watchdog's Resend-primary configuration (PR #22) stands.
+
+---
+
+### 2026-05-08 — Day 6 carryover morning — bootstrap setup token captured to 1Password
+
+- **Spec reference:** 2026-05-07 Day 5 10:00 entry "FastAPI skeleton: structure + scope choices" — first-boot owner-token bootstrap minted to stdout via `structlog.warning("SETUP_TOKEN_EMITTED", raw_token=...)`; Day 5 close-out follow-up "Day 6 morning — capture SETUP_TOKEN_EMITTED into 1Password".
+- **Action (operator, 2026-05-08):** `docker compose --env-file deploy/.env logs api 2>&1 | grep SETUP_TOKEN_EMITTED | tail -1` from the Ashburn VPS surfaced the line; full log line (timestamp + level + event + raw_token + setup_token_id + expires_at) saved to 1Password as a Secure Note titled `trading-system paper bootstrap setup token (24h)`. Temp file shredded.
+- **Why save the entire log line and not just the raw_token:** the line includes the emission timestamp (so the 24h-clock start is unambiguous) and the `setup_token_id` UUID (so manual `psql` interventions — e.g. marking the token consumed early to force a fresh emission — can target the right row).
+- **Token lifetime context:** emitted ~2026-05-07 07:00 UTC at Day 5 deploy; captured ~2026-05-08 ~01:53 UTC, ~19h after emission, ~5h before natural expiry. Sufficient buffer for the WebAuthn ceremony when it lands (Phase 0 Week 2+); if the ceremony slips past expiry, the api lifespan re-mints on next restart (idempotent: lifespan checks for unconsumed-unexpired tokens before minting).
+- **Cost / scope impact:** none. Token is the only path to first WebAuthn registration. Loss of this token + expiry of the emission window would force a manual DB intervention to mint a new one (not blocked but adds friction). Captured as planned.
+
+---
+
+### 2026-05-08 — Day 6 carryover morning — VPS-side backup of filled `paper.enc.yaml` (auto-restore now functional)
+
+- **Spec reference:** 2026-05-07 Day 6 cleanup commit (PR #28) shipped `deploy/day5-bringup.sh` Step 0.5 auto-restore from `/etc/credstore.encrypted/<env>.enc.yaml.backup`; the auto-restore needs that backup to exist.
+- **Action (operator on Ashburn VPS, 2026-05-08 ~01:56 UTC):**
+  - `sops -d --extract '["postgres"]["app_service_password"]' /opt/trading/secrets/paper.enc.yaml | wc -c` → 64 (real password, not `<TODO>` placeholder).
+  - `cp /opt/trading/secrets/paper.enc.yaml /etc/credstore.encrypted/paper.enc.yaml.backup`
+  - `chmod 0400 /etc/credstore.encrypted/paper.enc.yaml.backup` — root-only, 13725 bytes.
+- **Auto-restore now wired:** future `git reset --hard` on the VPS that wipes the in-repo `secrets/paper.enc.yaml` back to placeholder ciphertext will be self-healing — `bash deploy/day5-bringup.sh` Step 0.5 detects the placeholder and `cp`s the backup over. Operator no longer needs the manual `cp` dance documented in `deploy/api/README.md` §4a.1 Option A.
+- **Cost / scope impact:** none. ~10s of operator time. PR #29 (next entry) ends this entire bug class — once the repo's `secrets/paper.enc.yaml` IS the canonical filled version, `git reset --hard` won't even introduce a placeholder.
+
+---
+
+### 2026-05-08 — Day 6 carryover morning — PR #29 commits filled `paper.enc.yaml` (Option B; ends the `git reset --hard` data-loss class)
+
+- **Spec reference:** Day 5 close-out follow-up "Day 6 follow-up PR — commit filled `secrets/paper.enc.yaml`"; `deploy/api/README.md` §4a.1 Option B.
+- **Action:** scp filled file VPS → laptop; replace worktree's placeholder copy; commit + push from laptop. Diff is 4 lines: `postgres.app_service_password` ciphertext rotated, `postgres.app_owner_password` ciphertext rotated, `sops.lastmodified` 2026-05-07T20:26:45Z → 2026-05-07T23:34:16Z, `sops.mac` re-MAC'd. All AES256-GCM ciphertext; gitleaks gate passes; age public-key envelope keeps the file opaque without the paper age private key.
+- **Result:** the repo's `secrets/paper.enc.yaml` IS now the canonical filled version. Future `git pull` on the VPS preserves the fills; `git reset --hard` no longer wipes them. The Step 0.5 auto-restore (PR #28) becomes a never-fires safety net — useful belt-and-suspenders, but not load-bearing.
+- **Local-sops follow-up:** operator's macOS sops binary returned `exec format error` during the laptop-side decrypt sanity check. Likely an x86 binary on Apple Silicon. Doesn't block this PR (the byte-identical scp + the VPS-side `wc -c`=64 cover the integrity chain). Fix when the operator next needs `sops` locally: `brew uninstall sops && brew install sops`.
+- **Cost / scope impact:** none on the spec; ends the Day 5-introduced operational drag of "manual cp before every deploy." The combination of PR #28 Step 0.5 (auto-restore) + PR #29 (canonical filled file) puts the system in a state where neither the operator nor the bringup script ever has to think about this class of bug again.
+
+---
+
 ## Open follow-ups (post-Day-4)
 
 ### From Day 1 (carried)
 - [x] ~~**Day 4** — Watchdog Python script + systemd timer not yet deployed to Nuremberg.~~ — code shipped 2026-05-06; deployed + operational 2026-05-07. See "Watchdog operational on Hetzner Nuremberg" close-out entry above.
-- [~] **Day 5** — Caddy / TLS / `/api/health` running on Ashburn. **PARTIAL 2026-05-07:** api container healthy at the loopback level (`docker compose exec api curl http://localhost:8000/api/health` returns ok + db_connected:true); TLS-path verification (`curl https://spratcapital.com/api/health` from operator's laptop) **deferred to Day 6 morning** by operator decision. Caddy is started; first ACME cert acquisition happens on first external request. See Day 5 close-out entry "api healthy on Ashburn; Day 5 closed at loopback level".
-- [ ] **Day 6 morning — TLS verification + Ashburn ↔ Discord webhook test (carried from Day 5)** — (a) From laptop: `curl -fsS https://spratcapital.com/api/health | jq .` (expect `{"status":"ok",...}` + HSTS + CSP headers). If 502 on first try, wait 30s for Caddy to acquire its first Let's Encrypt cert, retry. (b) From Ashburn VPS: `curl -X POST <discord-ops-webhook-url>` to determine whether Cloudflare blocks Hetzner Ashburn IPs the same way it blocks Hetzner Nuremberg. Result determines whether 6 backend → Discord webhook channels (daily_brief, signals, fills, alerts, ops, audit) keep their Phase 0 plan or migrate to Resend.
-- [ ] **Day 6 morning — capture SETUP_TOKEN_EMITTED into 1Password** — re-run `bash deploy/day5-bringup.sh` (or grep api logs directly) to emit + capture the bootstrap setup token. Save to 1Password as `trading-system paper bootstrap setup token (24h)`. The token is needed for first-time WebAuthn ceremony when that lands (Phase 0 Week 2).
-- [ ] **Day 6 follow-up PR — commit filled `secrets/paper.enc.yaml` from laptop** — fixes the latent bug where `git reset --hard` wipes the operator's VPS-side sops fills. Workflow: scp the filled file from VPS to laptop, commit, push. Repo's encrypted yaml becomes the canonical filled version; future `git pull` on the VPS preserves it. Until this lands, operator must manually `cp /opt/trading/secrets/paper.enc.yaml /etc/credstore.encrypted/paper.enc.yaml.backup` after each fill, and restore before each `git reset --hard`. See Day 5 close-out entry "api healthy on Ashburn".
+- [x] ~~**Day 5** — Caddy / TLS / `/api/health` running on Ashburn~~ — resolved 2026-05-08. Full TLS path verified from laptop; `curl -fsS -i https://spratcapital.com/api/health` returns HTTP/2 200 + HSTS preload + CSP + JSON body with `db_connected:true`. Week 1 verification gate item now [x]. See "Day 6 carryover morning — TLS verified end-to-end" entry above.
+- [x] ~~**Day 6 morning — TLS verification + Ashburn ↔ Discord webhook test (carried from Day 5)**~~ — both resolved 2026-05-08. (a) TLS: HTTP/2 200 first try (above entry). (b) Ashburn → Discord: HTTP 204; backend's 6 Discord channels stay on Discord, NOT migrated to Resend. See "Day 6 carryover morning — Ashburn → Discord works" entry above.
+- [x] ~~**Day 6 morning — capture SETUP_TOKEN_EMITTED into 1Password**~~ — resolved 2026-05-08. Token saved with full structlog warning line (timestamp + raw_token + setup_token_id + expires_at) to 1Password Secure Note `trading-system paper bootstrap setup token (24h)`. See "Day 6 carryover morning — bootstrap setup token captured" entry above.
+- [x] ~~**Day 6 follow-up PR — commit filled `secrets/paper.enc.yaml` from laptop**~~ — resolved 2026-05-08 via PR #29. Repo's `secrets/paper.enc.yaml` is now the canonical filled version; `git reset --hard` data-loss class ended. See "Day 6 carryover morning — PR #29 commits filled paper.enc.yaml" entry above.
 - [ ] **Optional** — Ashburn root SSH still allowed (B9 hardening; can disable any time).
+- [ ] **Operator (anytime)** — fix the laptop's local sops binary (`exec format error` on macOS during Day 6 decrypt). Likely an x86 binary on Apple Silicon. Fix: `brew uninstall sops && brew install sops`. Not blocking; needed for any future `sops <file>` edit on the laptop.
 
 ### From Day 2 (carried)
-- [ ] **Week 2 Mon** — `services/risk/sizing.py` Stage 0 implementation (forbidden whitelist; `risk-review-approved` label required).
-- [ ] **Week 2 Tue** — sub-universe data-executability check (QC bundled data availability per locked candidate); active universe at $15k–$25k tier emerges from Stage 0 dynamically (no manual finalization needed since the candidate pool is already locked).
+- [x] ~~**Week 2 Mon** — `services/risk/sizing.py` Stage 0 implementation~~ — resolved 2026-05-07 via PR #28 (full Stages 0-5, not just Stage 0; merged with `risk-review-approved` label).
+- [ ] **Week 2 Tue** — sub-universe data-executability check (QC bundled data availability per locked candidate); active universe at $15k–$25k tier emerges from Stage 0 dynamically (no manual finalization needed since the candidate pool is already locked). Run `python3 scripts/verify_universe.py --equity 15000` (then 20000, 25000) after PR #28 merge.
 - [ ] **Week 3–4** — implement `V1TrendFollowing.generate_exit_candidates` (currently scaffolded with `NotImplementedError`).
 - [ ] **Week 4** — full LEAN/QC algorithm wiring (`lean/v1_qc_algorithm.py` is heartbeat-only as of Day 4; brokerage model + warmup + parameter-map are in place but `OnDailySignalCycle` still emits heartbeat-only — strategy module imports remain commented out).
 - [ ] **2027-05-05** — annual rotation: regenerate age keys, `sops updatekeys` all `secrets/*.enc.yaml`, print new papers, destroy old papers.
@@ -677,7 +760,7 @@ text remains unchanged and this log records the deviations.
 - [x] ~~**Operator (Day 4 13:00)** — execute `watchdog/README.md` Steps 1–8 on Nuremberg~~ — resolved 2026-05-07. Watchdog deployed + operational on `188.245.37.16`; Resend email alerting confirmed end-to-end; Discord blocked by Cloudflare (treated as best-effort secondary). PR #21 (User-Agent fix) + PR #22 (close-out + runbook fixes) capture the journey.
 - [x] ~~**Phase 1 hardening (deferred from Day 4)** — provision Resend~~ — resolved 2026-05-07 (forced earlier by Cloudflare-blocking-Discord discovery). See "Resend is now Phase 0" close-out entry above.
 - [ ] **Day 6+ verification (2026-05-07 17:30 ET cycle fire)** — check QC's ObjectStore tab for `heartbeat/2026-05-07.json`. Operator-only; non-blocking. Backtest validation already confirmed schedule + DST + every_day() semantics work; the open question is whether `self.log()` emits in QC's live UI (cosmetic; doesn't affect correctness).
-- [ ] **Day 6 morning verification (Ashburn ↔ Discord)** — see "Day 6 morning — TLS verification + Ashburn ↔ Discord webhook test" entry above for the consolidated next-day checklist.
+- [x] ~~**Day 6 morning verification (Ashburn ↔ Discord)**~~ — resolved 2026-05-08. Ashburn→Discord HTTP 204; backend stays on Discord. See "Day 6 carryover morning — Ashburn → Discord works" entry above.
 - [x] ~~**Day 5 morning — codify the platform-API smoke-test rule**~~ — resolved 2026-05-07. Shipped as `Docs/claude-dev-guide.md` §6.8 (Third-Party Platform Integration Smoke Tests) + anti-pattern `[A27]` + §1.4 cross-reference. Five strikes (snake_case, `main.py`, `time_rules.at`, Cloudflare-blocks-Hetzner-Discord, FastAPI app import-time Pydantic Settings failure at Docker build) now codified with concrete examples. See "Day 5 close-out — Codify platform-API smoke-test rule" entry below.
 - [ ] **Week 5+ (when `POST /api/internal/watchdog` lands on the backend)** — extend `watchdog/watchdog.py` to also push to that endpoint after each successful GET. Add `WATCHDOG_BEARER_TOKEN` to `/opt/trading-watchdog/watchdog.env` (sourced from `secrets/paper.enc.yaml` `internal.watchdog_bearer_token`, already encrypted Day 3 via PR #11). Bearer token is captured + ready; just unused until the endpoint exists.
 - [ ] **Week 4 hygiene (when strategy logic wires up)** — tighten the schedule registration in `lean/v1_qc_algorithm.py` `initialize()` from `schedule.on(date_rules.every_day(), time_rules.at(17, 30), ...)` to `schedule.on(date_rules.every_day(<cme_anchor_symbol>), time_rules.at(17, 30), ...)` where `<cme_anchor_symbol>` is one of the subscribed futures (e.g., `/MES` per `Docs/backend-spec.md` §2.3 — the most-traded micro + natural calendar driver). Empirically confirmed via Jan-May backtest 2026-05-07: current `every_day()` fires on every calendar day (~126 ticks for 126 days), not just CME trading days. Cosmetic for Day 4 heartbeat-only; would mean unnecessary weekend/holiday strategy executions in Week 4. See "Backtest validation" close-out entry above.
@@ -688,8 +771,8 @@ text remains unchanged and this log records the deviations.
 - [x] ~~**Day 5 — bringup script bug: `ENV_FILE` collision with deploy/.env**~~ — resolved 2026-05-07 (this PR). Renamed script-local var to `DEPLOY_ENV_PATH`.
 - [x] ~~**Day 5 — bringup script bug: stale `docker-compose.override.yml` survives `git reset --hard`**~~ — resolved 2026-05-07 (this PR). Defensive auto-removal at script start.
 - [x] ~~**Day 5 — bringup script bug: api container needs explicit force-recreate**~~ — resolved 2026-05-07 (this PR). `docker compose stop api caddy + rm -f api caddy` before `up -d` in Step 6.
-- [ ] **Day 6 follow-up PR — commit filled `secrets/paper.enc.yaml`** from operator's laptop. Fixes the latent bug where `git reset --hard` wipes the operator's VPS-side fills. See Day 5 close-out entry. Until this lands, operator does manual backup-restore via `/etc/credstore.encrypted/paper.enc.yaml.backup` (documented in `deploy/api/README.md` Step 4a.1).
-- [ ] **Day 6 — auto-restore sops backup in bringup script** (defensive followup). Detect `/etc/credstore.encrypted/paper.enc.yaml.backup` at script start; if present AND `secrets/paper.enc.yaml` looks placeholder-y, restore the backup. Removes the operator's manual cp dance.
+- [x] ~~**Day 6 follow-up PR — commit filled `secrets/paper.enc.yaml`** from operator's laptop~~ — resolved 2026-05-08 via PR #29.
+- [x] ~~**Day 6 — auto-restore sops backup in bringup script**~~ — resolved 2026-05-07 via PR #28 (Step 0.5). Operator-side one-time `cp` to seed the backup also done 2026-05-08; auto-restore is now functional.
 - [ ] **Phase 0 Week 2+ (when 2nd service Dockerfile lands)** — ship the same host-bind-mount-of-decrypted-secrets pattern for that service. Each new service in the phase1 profile will need its own `volumes: - ${SECRETS_DIR}:/run/secrets:ro` line in `docker-compose.yml`.
 
 ---
@@ -741,6 +824,19 @@ Cross-references in current edits:
 - `lean/v1_qc_algorithm.py` (PascalCase QC API) → QC migrated its Python API to snake_case; algorithm rewritten in PR #17 with method names, enum values, and framework callbacks all snake_case. Class names remain PascalCase. Module docstring + `lean/README.md` troubleshooting table updated.
 - `lean/README.md` Step 2 (filename rename) → QC Cloud's runtime loader requires the algorithm file to be named `main.py` specifically; renaming to `v1_qc_algorithm.py` for repo-filename consistency caused runtime failure. PR #18 reverted the rename instruction; the repo file keeps its descriptive name, the QC project file stays `main.py`.
 - `lean/v1_qc_algorithm.py` (`time_rules.at` timezone arg) → QC's API does not accept a timezone string as a third positional argument. PR #19 dropped the redundant arg; scheduled actions inherit the algorithm's time zone from `set_time_zone()`.
-- `Docs/backend-spec.md` §1.6 + `claude-dev-guide.md` §1.5 (Resend deferral) → reversed 2026-05-07 (PR #22). Discord webhooks from the Hetzner Nuremberg VPS are blocked at the Cloudflare WAF. Resend is now Phase 0's primary alert channel for the watchdog; Discord stays as best-effort secondary. See "Discord webhook POSTs blocked from Hetzner VPS by Cloudflare WAF" entry above. Backend-side Discord webhook viability (Ashburn IP) is open until Day 5 morning verification.
+- `Docs/backend-spec.md` §1.6 + `claude-dev-guide.md` §1.5 (Resend deferral) → reversed 2026-05-07 (PR #22). Discord webhooks from the Hetzner Nuremberg VPS are blocked at the Cloudflare WAF. Resend is now Phase 0's primary alert channel for the watchdog; Discord stays as best-effort secondary. See "Discord webhook POSTs blocked from Hetzner VPS by Cloudflare WAF" entry above. Backend-side Discord webhook viability (Ashburn IP) **resolved 2026-05-08**: Ashburn passes the same probe Nuremberg fails, so the backend's 6 planned Discord channels stay on Discord; only the watchdog migrated to Resend. The block is per-DC IP-reputation scoring at Cloudflare, not a Hetzner-wide rule.
 - `watchdog/watchdog.py` (User-Agent on outbound POSTs) → stdlib `urllib.request` defaults to `Python-urllib/3.x` which Discord's anti-bot layer blocks with 403. PR #21 added an explicit `WATCHDOG_USER_AGENT` constant and applied it in `_post_json` so all outbound POSTs (Discord, Resend, future `/api/internal/watchdog` push) identify as `trading-watchdog/0.1.0` rather than the stdlib default.
 - `watchdog/README.md` Step 5 / Step 6 ordering → original runbook ran the manual smoke test before enabling the timer; systemd's `StateDirectory=` only creates `/var/lib/trading-watchdog/` on first service activation, so the manual run failed with `PermissionError`. PR #22 reordered: timer enable now precedes smoke test.
+
+**Day 5:**
+- `docker-compose.yml` (sops_init container) → dropped 2026-05-07 (PR #26). The pinned `getsops/sops:v3.10.2` image doesn't exist on Docker Hub; sops decryption moved to the host via `deploy/day5-bringup.sh`. `sops_init` service deleted; api volumes bind-mount `${SECRETS_DIR}` directly.
+- `secrets/paper.enc.yaml` (`git reset --hard` data-loss) → 2026-05-08 PR #29 commits the filled file from operator's laptop; `secrets/paper.enc.yaml` IS now the canonical filled version. `deploy/day5-bringup.sh` Step 0.5 auto-restore from `/etc/credstore.encrypted/paper.enc.yaml.backup` shipped in PR #28 as a safety net.
+
+**Day 6-9 (PR #28):**
+- `Docs/backend-spec.md` §2.4.1 (sizing pipeline) → PSD repair runs ONCE upstream of Stage 1 (not just inside Stage 3 as the spec example trace suggests), because spec text says "every Σ used for portfolio-vol or cluster shrink runs through nearest_psd"; both Stage 1 (vol scaling) and Stage 3 (cluster) use Σ. Stage 3 trace records the boolean; orchestrator emits the audit event.
+- `Docs/backend-spec.md` §2.4.3 (kill-switch state machine) → 3-state model + severity column matches `risk_state` schema (§3.14), implemented in `services/risk/state_machine.py` as pure-policy plan functions. Implementation-guide §11 Day 7 prose's "5 states" (HALT_NEW_routine / HALT_NEW_defenv / HALT_NEW_incident / NORMAL / CONVALESCENT) was prose shorthand for state+severity tuples.
+- `Docs/backend-spec.md` §3.13 (decision_diary) → tag enum is the SPEC's `data_concern / regime_concern / size_concern / manual_judgment / other`. Implementation-guide §11 Day 9 prompt's alternative tags (signal_override, parameter_change_reviewed, halt_acknowledgement, etc.) would fail the alembic 0003 CHECK constraint. NO separate `decision_diary_logged` audit_log event (not in §3.30 taxonomy).
+- `Docs/backend-spec.md` §3.18 (vacation_mode) → `vacation_started` / `vacation_ended` from locked taxonomy §3.30 (NOT the IG's `vacation_mode_toggled`). end-vacation policy rejects Discord path (re-auth web-only per dev-guide §1.5).
+- `Docs/backend-spec.md` §2.9 + §3.28 (calendar) → schedules are 22:00 ET import + 23:00 ET cutoff (spec); IG §11 Day 9 prompt's 20:00 ET / 16:00 ET ignored. Audit event names: `calendar_imported` (NOT `calendar_event_imported`).
+- `implementation-guide.md` §11 Day 6 11:00 (verify_universe.py bond list) → script imports `V1_CANDIDATE_UNIVERSE` from `parameters.py` (TLT/IEF/SHY/TIP locked 2026-05-05); IG's `/ZN /ZB /ZF /ZT` Treasury-futures list is superseded.
+- `pyproject.toml` (numpy>=2.1 added) → `services/risk/sizing.py` PSD repair via `np.linalg.eigh`. Pure-Python eigendecomposition is impractical; numpy is the canonical choice. Same dep will be needed for Week 4+ slippage calibration OLS.
