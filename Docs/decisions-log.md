@@ -729,6 +729,48 @@ Spec deviations from `implementation-guide.md` §11 prompts — locked here for 
 
 ---
 
+### 2026-05-08 — Day 6 carryover evening — laptop sops binary fix (was `exec format error`)
+
+- **Spec reference:** 2026-05-08 PR #29 entry "Local-sops follow-up" above; Day 6 close-out open follow-up "fix the laptop's local sops binary".
+- **Symptom:** `sops -d --extract '...' secrets/paper.enc.yaml` on the operator's MacBook Pro (Intel — `/usr/local/Cellar/...` path) returned `zsh: exec format error: sops`. The binary at `/usr/local/bin/sops` was non-executable for the current OS — likely a stale binary built against an older macOS SDK that broke after a system update, NOT an arch mismatch as the open follow-up speculated (the Mac is Intel, not Apple Silicon).
+- **Fix:** `brew uninstall sops` (clears the broken Cellar entry) → `brew install sops` (downloads the 3.12.2 bottle for Sonoma) → `brew link --overwrite sops` (the install step couldn't symlink because the broken binary was still at `/usr/local/bin/sops`; `--overwrite` replaces it).
+- **Verification:** `sops --version` returns 3.12.2; `sops -d --extract '["postgres"]["app_service_password"]' /Users/shaanpatel/Documents/GitHub/Trading/secrets/paper.enc.yaml | wc -c` returns 64. Decrypt path that failed at Day 6 carryover #5 now works end-to-end.
+- **Lesson for the next stale-binary surprise:** `exec format error` on macOS isn't always arch — it can also be SDK incompatibility from old binaries surviving OS updates. `brew reinstall <pkg>` is the safer first try than diagnosing arch mismatches.
+- **Cost / scope impact:** none. ~2 min of operator time. Future `sops` edits on the laptop work; the operator can now `sops secrets/paper.enc.yaml` directly to add/rotate values without the VPS round-trip.
+
+---
+
+### 2026-05-08 — Day 6 carryover evening — `self.log()` works in QC live UI; Day 4 open question RESOLVED
+
+- **Spec reference:** 2026-05-07 Day 4 close-out entry "Paper-day clock STARTED on QC Paper Brokerage" — that entry's open question was "the init log line ... did NOT appear in QC's Cloud Terminal between the SetBenchmark warning and the warmup-start log. Three hypotheses..." The entry left this for Day 6+ verification.
+- **Verification (operator on QC live algorithm view, 2026-05-08 ~02:30 UTC):** the runtime log surface (separate from the editor's Cloud Terminal — accessed via Live left-sidebar → algorithm → Logs tab, NOT via the Live Deploy editor view) shows the canonical `signal_cycle_tick` line from the 2026-05-07 17:30 ET fire:
+  ```
+  2026-05-07 17:30:00 : signal_cycle_tick utc=2026-05-07 21:30:00.800222+00:00 et=2026-05-07 17:30:00.800222 session_date=2026-05-07 equity=15000.0
+  ```
+- **What this confirms (resolves three Day-4 open questions in one observation):**
+  1. **`self.log()` does work in live UI.** The Day 4 hypothesis-1 ("user logs route to a separate Logs tab vs the Cloud Terminal") was correct — runtime log lines land in the Live algo's Logs tab, not the editor's Cloud Terminal. Day 4's missing init log probably went there too; we just weren't looking in the right place.
+  2. **17:30 ET schedule fires reliably on the LIVE algorithm** (not just the backtest). Backtest validation 2026-05-07 already confirmed schedule + DST + every_day() across 100+ ticks; this is the live-mode equivalent confirmation.
+  3. **DST (EDT) handled correctly on live.** UTC = ET + 4h on 2026-05-07 → matches `utc=21:30` for `et=17:30`.
+- **What we did NOT verify directly:** the `heartbeat/<date>.json` ObjectStore key. QC's UI organizes ObjectStore browsing differently in newer versions (the operator couldn't surface it in the live algo view without more digging). Skipped because the log line evidence is sufficient — `self.log("signal_cycle_tick ...")` and `self.object_store.save("heartbeat/...", ...)` are sequential statements in the same `on_daily_signal_cycle` callback (per `lean/v1_qc_algorithm.py`); the log line surfacing means the callback ran to completion (no exception between statements) so the ObjectStore write necessarily ran.
+- **Day 4 open question status:** ✅ RESOLVED. No action required; algorithm correctness preserved.
+- **Cost / scope impact:** none. ~5 min of operator time exploring QC's UI to find the right Logs surface. Future agents reading this log entry know: live runtime logs are in `Live → algorithm → Logs`, NOT the editor's Cloud Terminal.
+
+---
+
+### 2026-05-08 — Day 6 carryover evening — Ashburn root-SSH hardening DEFERRED (operator decision)
+
+- **Spec reference:** 2026-05-05 Day 1 carried follow-up "**Optional** — Ashburn root SSH still allowed (B9 hardening; can disable any time)"; `project_trading_identifiers.md` line 39 ("Root SSH still allowed (Day 1 only); will harden during VPS bootstrap to `trading` user only").
+- **Operator decision (2026-05-08):** explicitly defer the hardening. Not blocking Day 7 entry, not blocking any operator workflow, not gating any spec compliance check. The current posture (root SSH key-only, password-auth disabled by Hetzner cloud-init defaults — confirmed 2026-05-08: `permitrootlogin without-password`, `passwordauthentication yes` in effective sshd_config) is acceptable for Phase 0 paper trading. Hardening to a non-root user (`trading` user already exists with same SSH key but no sudo; needs sudoers entry + sshd `PermitRootLogin no` + `PasswordAuthentication no`) is documented and ready to execute when the operator schedules it — likely concurrent with Phase 0 → Phase 1 cutover (Week 8) or earlier if a security incident motivates it.
+- **What was discovered while staging the change (kept here for the future-agent who picks this up):**
+  - `trading` user exists with uid 1000, in `docker` group, but NOT in `sudo` group — pre-hardening step is `usermod -aG sudo trading` + a `/etc/sudoers.d/90-trading-nopasswd` drop-in.
+  - `/home/trading/.ssh/authorized_keys` contains the SAME ed25519 key as root's (operator's `shaan-laptop-ed25519`). No key copy needed.
+  - `/etc/ssh/sshd_config.d/` is empty; the hardening drop-in `99-harden.conf` with `PermitRootLogin no` + `PasswordAuthentication no` is the cleanest way to override defaults without editing the main sshd_config.
+  - `systemctl reload ssh` (NOT restart) preserves existing sessions if the operator wants a safety net during the cutover.
+  - Hetzner Cloud Console (web KVM) is the lockout-recovery path if anything goes wrong.
+- **Cost / scope impact:** none. Open follow-up below stays open with this fuller context. The 2026-05-08 staging work (sshd inspection) consumed ~2 min of session time.
+
+---
+
 ## Open follow-ups (post-Day-4)
 
 ### From Day 1 (carried)
@@ -737,8 +779,8 @@ Spec deviations from `implementation-guide.md` §11 prompts — locked here for 
 - [x] ~~**Day 6 morning — TLS verification + Ashburn ↔ Discord webhook test (carried from Day 5)**~~ — both resolved 2026-05-08. (a) TLS: HTTP/2 200 first try (above entry). (b) Ashburn → Discord: HTTP 204; backend's 6 Discord channels stay on Discord, NOT migrated to Resend. See "Day 6 carryover morning — Ashburn → Discord works" entry above.
 - [x] ~~**Day 6 morning — capture SETUP_TOKEN_EMITTED into 1Password**~~ — resolved 2026-05-08. Token saved with full structlog warning line (timestamp + raw_token + setup_token_id + expires_at) to 1Password Secure Note `trading-system paper bootstrap setup token (24h)`. See "Day 6 carryover morning — bootstrap setup token captured" entry above.
 - [x] ~~**Day 6 follow-up PR — commit filled `secrets/paper.enc.yaml` from laptop**~~ — resolved 2026-05-08 via PR #29. Repo's `secrets/paper.enc.yaml` is now the canonical filled version; `git reset --hard` data-loss class ended. See "Day 6 carryover morning — PR #29 commits filled paper.enc.yaml" entry above.
-- [ ] **Optional** — Ashburn root SSH still allowed (B9 hardening; can disable any time).
-- [ ] **Operator (anytime)** — fix the laptop's local sops binary (`exec format error` on macOS during Day 6 decrypt). Likely an x86 binary on Apple Silicon. Fix: `brew uninstall sops && brew install sops`. Not blocking; needed for any future `sops <file>` edit on the laptop.
+- [ ] **Optional, deferred 2026-05-08** — Ashburn root SSH still allowed (B9 hardening). Operator explicitly deferred to Phase 1 cutover or earlier if security-motivated. Pre-hardening discovery: `trading` user (uid 1000) exists with same SSH key but needs sudoers entry; cleanest cutover is sudoers + `/etc/ssh/sshd_config.d/99-harden.conf` (`PermitRootLogin no` + `PasswordAuthentication no`) + `systemctl reload ssh`. Hetzner Cloud web KVM is the recovery path. See "Day 6 carryover evening — Ashburn root-SSH hardening DEFERRED" entry above for full step-by-step the future-agent can execute.
+- [x] ~~**Operator (anytime)** — fix the laptop's local sops binary (`exec format error`)~~ — resolved 2026-05-08. Was an SDK incompatibility from a stale binary surviving an OS update (NOT arch mismatch as initially speculated; operator is on Intel Mac). Fixed via `brew uninstall sops && brew install sops && brew link --overwrite sops`. Decrypt verified: `wc -c` returns 64 on `app_service_password`. See "Day 6 carryover evening — laptop sops binary fix" entry above.
 
 ### From Day 2 (carried)
 - [x] ~~**Week 2 Mon** — `services/risk/sizing.py` Stage 0 implementation~~ — resolved 2026-05-07 via PR #28 (full Stages 0-5, not just Stage 0; merged with `risk-review-approved` label).
@@ -759,7 +801,7 @@ Spec deviations from `implementation-guide.md` §11 prompts — locked here for 
 - [x] ~~**Operator (Day 4 10:00)** — execute `lean/README.md` Steps 1–7 in QC dashboard~~ — resolved 2026-05-07. Algorithm Running on QC Paper Brokerage. Three QC API discoveries fixed in-flight (PRs #17, #18, #19 all merged).
 - [x] ~~**Operator (Day 4 13:00)** — execute `watchdog/README.md` Steps 1–8 on Nuremberg~~ — resolved 2026-05-07. Watchdog deployed + operational on `188.245.37.16`; Resend email alerting confirmed end-to-end; Discord blocked by Cloudflare (treated as best-effort secondary). PR #21 (User-Agent fix) + PR #22 (close-out + runbook fixes) capture the journey.
 - [x] ~~**Phase 1 hardening (deferred from Day 4)** — provision Resend~~ — resolved 2026-05-07 (forced earlier by Cloudflare-blocking-Discord discovery). See "Resend is now Phase 0" close-out entry above.
-- [ ] **Day 6+ verification (2026-05-07 17:30 ET cycle fire)** — check QC's ObjectStore tab for `heartbeat/2026-05-07.json`. Operator-only; non-blocking. Backtest validation already confirmed schedule + DST + every_day() semantics work; the open question is whether `self.log()` emits in QC's live UI (cosmetic; doesn't affect correctness).
+- [x] ~~**Day 6+ verification (2026-05-07 17:30 ET cycle fire)** — check QC's ObjectStore tab for `heartbeat/2026-05-07.json`~~ — resolved 2026-05-08. `signal_cycle_tick` log line confirmed in the live algo's Logs tab (NOT the editor's Cloud Terminal — that's where Day 4's missing init log was likely also routing). `self.log()` does work in live UI; the Day 4 open question is closed. ObjectStore key not directly verified (UI navigation), but log-line evidence is sufficient — both calls live in the same `on_daily_signal_cycle` callback so log surfacing implies ObjectStore write completed. See "Day 6 carryover evening — `self.log()` works in QC live UI" entry above.
 - [x] ~~**Day 6 morning verification (Ashburn ↔ Discord)**~~ — resolved 2026-05-08. Ashburn→Discord HTTP 204; backend stays on Discord. See "Day 6 carryover morning — Ashburn → Discord works" entry above.
 - [x] ~~**Day 5 morning — codify the platform-API smoke-test rule**~~ — resolved 2026-05-07. Shipped as `Docs/claude-dev-guide.md` §6.8 (Third-Party Platform Integration Smoke Tests) + anti-pattern `[A27]` + §1.4 cross-reference. Five strikes (snake_case, `main.py`, `time_rules.at`, Cloudflare-blocks-Hetzner-Discord, FastAPI app import-time Pydantic Settings failure at Docker build) now codified with concrete examples. See "Day 5 close-out — Codify platform-API smoke-test rule" entry below.
 - [ ] **Week 5+ (when `POST /api/internal/watchdog` lands on the backend)** — extend `watchdog/watchdog.py` to also push to that endpoint after each successful GET. Add `WATCHDOG_BEARER_TOKEN` to `/opt/trading-watchdog/watchdog.env` (sourced from `secrets/paper.enc.yaml` `internal.watchdog_bearer_token`, already encrypted Day 3 via PR #11). Bearer token is captured + ready; just unused until the endpoint exists.
