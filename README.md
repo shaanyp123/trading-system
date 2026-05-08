@@ -6,7 +6,7 @@ A solo-operator algorithmic trading system. Multi-asset systematic trend-followi
 
 | Phase | Window | Status |
 |---|---|---|
-| Phase 0 — foundation | Weeks 0–8 | 🔄 Week 1 in progress (Day 1 ✅ 2026-05-05; Day 2 ✅ 2026-05-05) |
+| Phase 0 — foundation | Weeks 0–8 | 🔄 Week 2 closing — Days 1-7 ✅, Days 8-9 [CLAUDE_CODE] chain ✅ early via PR #28 |
 | Phase 1 — QC live | Months 2–5 | ⏳ Not started |
 | Phase 2 — direct IBKR | Months 5–9 | ⏳ Not started |
 | Phase 3 — capital scaling | Months 9–12 | ⏳ Not started |
@@ -128,11 +128,20 @@ Common reasons you (the operator) open it:
 
 ---
 
-## Day 1 + Day 2 status (2026-05-05) — DONE
+## Days 1-9 status — Phase 0 Week 2 closing
 
-Both days of Phase 0 Week 1 are complete. See [`Docs/decisions-log.md`](Docs/decisions-log.md) for actuals (10 Day 2 entries + Day 2 verdict).
+Phase 0 Week 1 complete. Week 2 daily tasks complete; Days 8-9 [CLAUDE_CODE] chain landed early via PR #28. Week 2 verification gate: 2 of 3 boxes checked (sub-universe ≥4 at $20k after DP-002; sops decrypt verified). DP-001 (IBKR-not-approved trigger) window opens at end of Week 2.
 
-Day 3 work begins next session — see `implementation-guide.md` §11 Day 3 (sops initialization: encrypt the GitHub App private key + Discord bot token + initial schema; then dev/paper/live `.enc.yaml` ship in encrypted form).
+Per-day one-liners (full detail in [`Docs/decisions-log.md`](Docs/decisions-log.md)):
+
+- **Day 1 (2026-05-05):** account/infra prereqs — IBKR `U25655583` submitted, Hetzner Ashburn (`trading-primary`) + Nuremberg (`trading-watchdog`), Cloudflare DNS for `spratcapital.com`, GitHub repo + branch protection, QC Researcher tier ($60/mo). PR #1; decisions-log Day 1 entries (9).
+- **Day 2 (2026-05-05):** v1 trend-following strategy skeleton (Donchian + MA + Hurst R/S + ATR stop) + 16 unit tests + parameter lock + Phase 1 sub-universe locked + GitHub App `trading-system-pr-review` (App ID `3615825`) + Discord guild + 7 channels + sops/age keys generated. PRs #4 + #8; decisions-log Day 2 entries (10) + verdict.
+- **Day 3 (2026-05-05):** Alembic migrations `0001_audit_log` → `0006_roles` (audit_log + core + risk + ops tables, partitioned by year, immutability triggers, role grants); sops `{dev,paper,live}.enc.yaml` encrypted with placeholders; `risk-review-approved` label + `forbidden-paths` CI gate live. PRs #9-13; decisions-log Day 3 entries (6).
+- **Day 4 (2026-05-06):** QC live-broker = QC Paper / brokerage MODEL = IBKR Margin; LEAN parameter map; **paper-day clock STARTED**; external watchdog operational on Hetzner Nuremberg (stdlib-only); QC Python API migrated PascalCase → snake_case. PRs #15-23; decisions-log Day 4 entries (12).
+- **Day 5 (2026-05-07):** FastAPI skeleton deployed to Ashburn (loopback healthy, structlog wired); docker-compose Day-5 subset (`phase1` profile gates non-Day-5 services); single-shot bringup script; dev-guide §6.8 platform smoke-test rule + A27 anti-pattern codified. PRs #24-27; decisions-log Day 5 entries (7).
+- **Days 6-9 [CLAUDE_CODE] chain (2026-05-07 — landed early):** `services/risk/sizing.py` (Stage 0 universe filter) + `services/risk/state_machine.py` (kill-switch); `services/audit/decision_diary.py`; `services/scheduler/vacation.py` + `calendar_import.py`. Pure-policy modules; spec wins on every IG deviation. PR #28 (`risk-review-approved` label); decisions-log entry 2026-05-07 Day 6-9 chain.
+- **Day 6 carryover (2026-05-08 morning):** TLS verified end-to-end (Week 1 gate fully closed); `paper.enc.yaml` filled and committed from VPS; bootstrap setup token captured to 1Password; laptop sops `exec format error` fixed; watchdog email-storm fix (apex/subdomain mismatch); QC `self.log()` confirmed working in live UI; backend stays on Discord (no Resend migration). PRs #29-32; decisions-log Day 6 carryover entries (8).
+- **Day 7 (2026-05-08):** sub-universe verification — **DP-002 invoked, $15k → $20k initial capital** (≥4 markets PASS at $20k); kill-switch state machine verbal walkthrough (operator learning); Day 7 entry doc-closure + Week 1 gate. PRs #31, #33; decisions-log Day 7 entries (sub-universe + DP-002 + kill-switch walkthrough).
 
 The original Day-1-Monday-priority-list is preserved in `implementation-guide.md` §11 as the canonical template; this section's old "How to start" walkthrough was Day-1-specific and is now historical.
 
