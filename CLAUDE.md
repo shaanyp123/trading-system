@@ -65,6 +65,7 @@ For pattern ambiguity within already-allowed scope (naming, file organization wi
 | `services/risk/` | `sizing.py` (Stage 0 universe filter, $15k/$25k/$50k/$100k tiers, /MES 50%-override) + `state_machine.py` (kill-switch transitions) | Day 6-9 chain — pure-policy modules shipped early via PR #28 (`risk-review-approved`) |
 | `services/audit/` | `decision_diary.py` writer service; canonical fields per backend-spec §3.30 enum | Day 6-9 chain — shipped early via PR #28 (`risk-review-approved`) |
 | `services/scheduler/` | `vacation.py` mode handler + `calendar_import.py` macro-events seeding | Day 6-9 chain — shipped early via PR #28 (`risk-review-approved`) |
+| `services/qc_adapter/` | `payloads.py` JSONL parser + `cursor.py` (`qc_adapter_cursor` row + canonical 3-directory enum) + `poll.py` (`plan_ingest_batch` orchestrator playbook) | Week 3 Tue scaffold — pure-policy plan-then-apply; HTTP fetcher + audit writer integration land Week 4 |
 | `watchdog/watchdog.py` + systemd unit + timer | External watchdog: `GET /api/health` poll, Discord webhook alert on degraded, 60-min cooldown | Day 4 — deployed to Hetzner Nuremberg (`trading-watchdog`); apex URL fix Day 6 carryover |
 | `deploy/github-app/` | Canonical manifest + operator runbook for the in-app PR review surface app | Day 2 — app created (App ID 3615825 / Installation ID 129868686) |
 | `deploy/discord/` | Canonical manifest + operator runbook for the Discord guild + bot (7 channels) | Day 2 — guild + bot created |
