@@ -329,6 +329,12 @@ text remains unchanged and this log records the deviations.
 
 ---
 
+## Day 3 verdict
+
+All Day 3 implementation-guide §11 tasks complete. Schema migrations 0001-0006 shipped via PR #9 (first-ever forbidden-whitelist PR with `risk-review-approved` label — both label and `forbidden-paths` CI gate were vapor before Day 3 and got created mid-day via PR #10 to make the dev-guide §11 [A02] anti-pattern actually mechanical). Integration tests against real Postgres 16 caught two real spec bugs (UNIQUE INDEX on partitioned table; EVENT TRIGGER not firing on TRUNCATE) that typecheck-only verification would have shipped silently. Migration filename convention LOCKED as hybrid (numeric `NNNN_` for foundational 0001-0006, date-based `YYYY-MM-DD_` from Day 4 onward; dev-guide §7.1 updated). sops paper file filled with Day-2/3 captured set via PR #11. Day-1 branch-protection required-checks gap (typecheck + test + forbidden-paths) closed in same-day cleanup. Net: Phase 0 mechanical-gating posture goes from "anti-pattern documents the rule" to "CI enforces the rule" within 24 hours of the rule's first real test.
+
+---
+
 ### 2026-05-06 — Day 4 09:00 — QC live broker = QC Paper, brokerage MODEL = IBKR Margin
 
 - **Spec reference:** `implementation-guide.md` §11 Day 4 09:00 ("QC algorithm file `lean/v1_qc_algorithm.py` should use QC's paper broker"); `Docs/backend-spec.md` §1 (Phase 1 architecture: QC paper); `Docs/backend-spec.md` §2.14 (slippage calibration uses LEAN-emitted `expected_price`).
@@ -524,6 +530,12 @@ text remains unchanged and this log records the deviations.
 
 ---
 
+## Day 4 verdict
+
+All Day 4 implementation-guide §11 tasks complete, but only after three QC platform discoveries forced in-flight rewrites: PR #17 migrated the LEAN wrapper from PascalCase to snake_case (QC's API moved post-spec); PR #18 reverted the file rename `main.py → v1_qc_algorithm.py` because QC Cloud's runtime loader is hardcoded to `main.py` (LEAN convention, not in spec); PR #19 dropped the redundant timezone arg from `time_rules.at()` (QC raises `TypeError` if passed). Day 4 deploy then surfaced a fourth platform discovery: Discord webhook POSTs from Hetzner Nuremberg are blocked by Cloudflare's IP-reputation layer regardless of payload or User-Agent (PRs #21, #22). This forced a reversal of the 2026-05-06 "Resend deferred to Phase 1" decision — Resend is now Phase 0 primary for the watchdog, Discord is best-effort secondary. Watchdog operational on Hetzner Nuremberg `188.245.37.16` per PR #22; alert pipeline end-to-end verified via forced-503 test. Paper-day clock STARTED on QC Paper Brokerage 2026-05-07 07:00 UTC; first 17:30 ET cycle fired same day. Backtest validation across Jan-May 2026 empirically confirmed schedule reliability + DST correctness + `every_day()` calendar-day semantics over 100+ ticks (these are now regression baselines, not assumptions). Net: four platform-vs-spec divergences in one day — the volume that motivated codifying the §6.8 platform-API smoke-test rule on Day 5 (PR #25). Week 1 verification gate item "QC paper algo running" now [x].
+
+---
+
 ### 2026-05-07 — Day 5 10:00 — FastAPI skeleton: structure + scope choices
 
 - **Spec reference:** `implementation-guide.md` §11 Day 5 10:00 ("Create the FastAPI service skeleton in `services/api/`"); `Docs/backend-spec.md` §3.1.1 (setup_tokens), §4.1.1 (auth/setup endpoints), §4.2 (SSE channel), §7.3 (health checks), §8.5 (auth + sessions), §1.4 (service inventory).
@@ -647,6 +659,12 @@ text remains unchanged and this log records the deviations.
 
 ---
 
+## Day 5 verdict
+
+All Day 5 implementation-guide §11 tasks shipped — FastAPI skeleton (PR #24), docker-compose `phase1` profile, Caddy reverse-proxy, Postgres role bootstrap — but the day's actual scope was dominated by a mid-deploy discovery: `getsops/sops:v3.10.2` is not a real Docker Hub image, so the morning's PR-#24 `sops_init` sidecar plumbing got abandoned in favor of a host-side decryption pattern + single-shot bringup script (PR #26). Five+ live deploy bugs surfaced in sequence (image missing → bind-mount conflict → `volumes: !reset` ignored on Compose v2 5.1.3 → `psql` heredoc-vs-prompt collision → `ENV_FILE` script/env var name collision → stale `docker-compose.override.yml` surviving `git reset --hard`); each fixed in PR #27. The five strikes accumulated across Days 4-5 (snake_case, main.py, time_rules.at, Cloudflare-Discord, Pydantic Settings at Docker build) motivated codifying the §6.8 platform-API smoke-test rule + anti-pattern A27 in PR #25 — every new platform integration now requires a build-time fixture or an explicit operator runbook checklist before "complete." API healthy on Ashburn at the loopback level (`docker compose exec api curl http://localhost:8000/api/health` → `{"status":"ok","db_connected":true}`). Full TLS-path verification (`curl https://spratcapital.com/api/health` from laptop) deferred to Day 6 morning by operator decision. Day 5 verification gate closed at loopback; Week 1 gate ("`curl -I https://...` returns HTTP 200 or redirect; TLS cert issued") still [~] entering Day 6.
+
+---
+
 ### 2026-05-07 — Day 6-9 [CLAUDE_CODE] chain — pure-policy modules; spec wins on every IG deviation
 
 PR #28 (squash commit `1735106`) lands the entire Day 6 09:00 → Day 9 11:00 [CLAUDE_CODE] chain in one branch — five forbidden-whitelist policy modules + one CLI script + one defensive bringup-script fix, 4428 lines, 222 tests. Every module follows the same plan-then-apply shape (pure-policy core; ``PendingAuditEvent`` returned as data; the caller owns DB I/O), so unit tests need zero audit/SSE mocking and the modules don't depend on ``services/audit/writer.py`` or ``services/api/sse.emit_sse`` (neither exists yet).
@@ -668,6 +686,12 @@ Spec deviations from `implementation-guide.md` §11 prompts — locked here for 
 - **Day 6 cleanup — bringup script Step 0.5** — auto-restore `secrets/<env>.enc.yaml` from `/etc/credstore.encrypted/<env>.enc.yaml.backup` when the in-repo file's `app_service_password` is a `<TODO>` placeholder. Idempotent no-op when already filled. Removes the manual `cp` dance from `deploy/api/README.md` Option A; promotes Option C from "not implemented yet" to "shipped"; Option B (commit the filled file) is now PR #29 below.
 
 - **Cost / scope impact:** none on the spec architecture; ~6h of Claude session time across the chain (sizing was the long pole). No backtest behavior change — none of these modules execute strategy logic; they enforce policy on inputs the strategy already produces. Net Week 2 outcome: ahead of schedule (the IG schedules these tasks across Days 6-9; the operator's "Get us to where I am the only one who can do the next steps" instruction merged the chain into one PR).
+
+---
+
+## Day 6-9 [CLAUDE_CODE] chain verdict
+
+PR #28 (squash commit `1735106`, 4428 lines, 222 tests) ships the entire IG §11 Day 6 09:00 → Day 9 11:00 [CLAUDE_CODE] surface in one branch — five forbidden-whitelist policy modules (`services/risk/sizing.py` Stages 0-5, `services/risk/state_machine.py` 3-state + severity, `services/audit/decision_diary.py` validator, `services/scheduler/vacation.py` mode handler, `services/scheduler/calendar_import.py` macro events) + one CLI (`scripts/verify_universe.py`) + one defensive bringup-script fix (Step 0.5 sops auto-restore). Pure-policy plan-then-apply shape across all modules: each function returns `*Plan` structs as data, the caller owns DB I/O. This deliberately removes the dependency on `services/audit/writer.py` and `services/api/sse.emit_sse` (neither built yet), so unit tests need zero audit/SSE mocking. Spec wins on every IG deviation: 3 states + severity (NOT IG's 5 collapsed states); decision_diary tag enum from spec §3.13 (NOT IG's action-label list which would fail the alembic 0003 CHECK); vacation event names from §3.30 taxonomy (NOT IG's `vacation_mode_toggled`); calendar schedule from §2.9 (22:00/23:00 ET, NOT IG's 20:00/16:00); bond ETFs from `V1_CANDIDATE_UNIVERSE` (NOT IG's Treasury futures suggestion). Net effect: Days 8-9 [CLAUDE_CODE] substance is done before Day 8; Days 6-9 [OPERATOR] tasks (sub-universe verification, state-machine learning, diary entry) become the only remaining day-by-day work, and they all run on Day 7. Week 2 enters with the engine pieces already on the bench.
 
 ---
 
@@ -789,6 +813,12 @@ Spec deviations from `implementation-guide.md` §11 prompts — locked here for 
 
 ---
 
+## Day 6 carryover verdict
+
+Single calendar day (2026-05-08) closed seven open follow-ups inherited from Days 4-5: TLS verified end-to-end (`curl -fsS -i https://spratcapital.com/api/health` → HTTP/2 200 + HSTS + CSP + `db_connected:true`), promoting the Week 1 verification gate's TLS item from [~] to [x]; Ashburn → Discord webhook returns HTTP 204 (per-DC IP-reputation block on Cloudflare binds on Nuremberg, NOT Ashburn — backend's 6-channel Discord plan stays on Discord, NOT migrated to Resend); bootstrap setup token captured to 1Password; `secrets/paper.enc.yaml` committed from operator's laptop via PR #29 (ends the `git reset --hard` data-loss class — auto-restore Step 0.5 from PR #28 becomes a never-fires safety net); laptop sops binary fixed (`brew uninstall && brew install && brew link --overwrite` — was SDK incompatibility from a stale binary surviving an OS update, NOT arch mismatch); Day 4's `self.log()` open question RESOLVED — runtime logs land in QC's Live algorithm Logs tab, NOT the editor's Cloud Terminal; watchdog email storm (Day 4 deploy hygiene miss — test sentinel `httpbin.org/status/503` left in the env file + canonical URL example pointed at `paper.spratcapital.com` not the apex) fixed in PR #32 with runbook hardening (Step 7 now uses inline env-var override, never mutates the canonical config). One operator decision: Ashburn root-SSH hardening DEFERRED to Phase 1 cutover or earlier (security-motivated). Net result: zero outstanding Days 4-5 hangovers entering Day 7; the four open Day-1 carries either resolved or explicitly deferred with a runnable handoff.
+
+---
+
 ### 2026-05-08 — Day 7 09:00 — sub-universe verification + DP-002 invoked ($15k → $20k initial capital)
 
 - **Spec reference:** `implementation-guide.md` §3 Week 2 Tue ("Confirm: ≥4 markets active at $15k; record exclusions with rationale in decision diary"); `implementation-guide.md` §6 row DP-002 (mitigation: "raise initial capital to $20k") + DP-003 (initial live allocation: $15k/$20k/$25k); 2026-05-05 Day 2 entry "Phase 1 candidate sub-universe LOCKED" (line 168, per-tier exclusion expectations).
@@ -833,6 +863,12 @@ Spec deviations from `implementation-guide.md` §11 prompts — locked here for 
 - **No code change required.** `lean/v1_qc_algorithm.py` is correct; the next live tick at 2026-05-08 21:30 UTC (17:30 ET) will land in the live algorithm's Logs tab the same way 2026-05-07's did. CLAUDE.md file-index status for `lean/v1_qc_algorithm.py` already says "Day 4 — paper-day clock STARTED on QC Paper Brokerage; snake_case API; full wiring Week 4" — that line stays true.
 - **Lesson for future agents:** the live heartbeat fires at 17:30 ET (= 21:30 UTC EDT / 22:30 UTC EST). Before declaring a missed schedule, **convert the operator's wall-clock to UTC and compare against 21:30 UTC (or 22:30 UTC in winter)**. If the operator's check timestamp is earlier than that, no schedule fire was expected. If later (and no log line appears), THEN it's a real miss and warrants investigation per the open Week 4 hygiene follow-up below (move from `every_day()` to `every_day(<cme_anchor_symbol>)` to surface CME-calendar-aware semantics).
 - **Cost / scope impact:** none. Doc-only entry. ~3 min of session time on diagnosis. Future sessions seeing "no heartbeat 2026-05-08" can short-circuit re-investigation by reading this entry.
+
+---
+
+## Day 7 verdict
+
+All Day 7 implementation-guide §11 tasks complete. 09:00 sub-universe verification ran against PR #28's `services/risk/sizing._stage_0_universe_filter` as single source of truth: $15k admits exactly 4 markets (TLT/IEF/SHY/TIP — single rates cluster), meeting the IG bare minimum ("≥4 markets active at $15k") but defeating cluster diversification. Operator invoked DP-002 mitigation anyway and raised initial live capital target from $15k (DP-003 default) to $20k (PR #33), unlocking /M2K + /MCL + /MBT for full 4-cluster active set. 14:00 kill-switch state-machine learning session walked the canonical 3-state + severity model (matching `risk_state` schema §3.14, NOT IG prose's 5 collapsed states); operator now knows the 15 HALT_NEW triggers across 3 severities, the `m_convalescent = 0.5` MIN composition, and the 3 incident_review resume-gate conditions. Days 8-9 [CLAUDE_CODE] substance (sizing, state_machine, decision_diary, vacation, calendar_import) was already shipped via PR #28 ahead of schedule. Doc hygiene caught up across PR #31 (Day 7 entry doc-closure for the three Day 6 carryover resolutions) and PR #34 (README + CLAUDE.md file-index + Week 1 IG verification gate hygiene). Heartbeat false alarm resolved (PR #35) — the schedule fires at 17:30 ET = 21:30 UTC in EDT and the operator's check was earlier in the calendar day; no code change required, doc-only entry to short-circuit future re-investigation. Week 1 verification gate fully closed; Week 2 gate stands at 2/3 — sub-universe ✅, DP-001 trigger window opens Monday 2026-05-11, IBKR funding still pending Phase 1 cutover. Net: Week 2 closes ahead of schedule with zero open hangovers entering Week 3.
 
 ---
 
