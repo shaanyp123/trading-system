@@ -120,7 +120,10 @@ values above):
 ```bash
 ssh root@188.245.37.16
 cat > /opt/trading-watchdog/watchdog.env <<'EOF'
-WATCHDOG_HEALTH_URL=https://paper.spratcapital.com/api/health
+# Phase 0 paper trading runs on the apex domain; the architectural plan
+# splits Phase 1 into apex (live) + paper.<your-domain> (staging) but
+# until that split lands, point at the apex.
+WATCHDOG_HEALTH_URL=https://spratcapital.com/api/health
 WATCHDOG_OPERATOR_EMAIL=shaanrpatel2@gmail.com
 WATCHDOG_DISCORD_WEBHOOK_URL=<discord-critical-webhook>
 WATCHDOG_RESEND_API_KEY=<resend-api-key>
@@ -168,23 +171,24 @@ sudo -u trading-watchdog \
   python3 /opt/trading-watchdog/watchdog.py
 ```
 
-Expected output: a single JSON line on stdout. Until Day 5 brings up
-`paper.spratcapital.com`, you'll see:
+Expected output: a single JSON line on stdout. After Day 5's Caddy + api
+brought up `https://spratcapital.com/api/health`, a happy tick looks like:
 
 ```json
 {"timestamp_utc": "...", "level": "info", "service_name": "watchdog",
  "event": "watchdog_tick_completed", "watchdog_id": "hetzner-nuremberg-1",
- "health_url": "https://paper.spratcapital.com/api/health",
- "check_success": false, "check_status_code": null,
- "check_error": "URLError [Errno -2] Name or service not known",
- "consecutive_failures": 1, "decision_reason": "failure 1/3 (under threshold)",
+ "health_url": "https://spratcapital.com/api/health",
+ "check_success": true, "check_status_code": 200, "check_error": null,
+ "consecutive_failures": 0, "decision_reason": "check ok",
  "email_sent": false, "email_error": null,
  "discord_sent": false, "discord_error": null}
 ```
 
-That's the shape of every healthy run. A real failure (after Day 5 deploy)
-would have `check_success: true`. After the smoke test, reset the counter so
-the timer starts fresh:
+Before Day 5 (deploy not done yet), every tick reports
+`check_success: false` with `URLError [Errno -2] Name or service not
+known`. That's expected on the pre-deploy timeline.
+
+After the smoke test, reset the counter so the timer starts fresh:
 
 ```bash
 rm -f /var/lib/trading-watchdog/state.json
@@ -193,25 +197,42 @@ rm -f /var/lib/trading-watchdog/state.json
 ### Step 7 — Forced-503 alert wiring test
 
 To confirm the Resend (and best-effort Discord) alert path actually fires,
-point the watchdog at a URL guaranteed to 503 and run 3 ticks back-to-back:
+run 3 ticks back-to-back against a URL guaranteed to 503.
+
+> ⚠️ **Lesson from Day 4 deploy (2026-05-07 → 2026-05-08):** the original
+> version of this step `sed`-ed the URL into `watchdog.env` and required
+> a manual `mv` to restore. The operator missed the restore step and the
+> systemd timer kept ticking against the test sentinel for ~7 hours,
+> generating an email storm (88 consecutive failures, ~7 emails fired
+> via the 60-min cooldown). The pattern below uses an **inline env-var
+> override** that lives only for the test ticks — the canonical
+> `watchdog.env` file is never modified, so there's nothing to restore
+> and nothing to forget.
 
 ```bash
 ssh root@188.245.37.16
 
-cp /opt/trading-watchdog/watchdog.env /opt/trading-watchdog/watchdog.env.bak
-sed -i 's|^WATCHDOG_HEALTH_URL=.*|WATCHDOG_HEALTH_URL=https://httpbin.org/status/503|' \
-       /opt/trading-watchdog/watchdog.env
-
+# The override URL is supplied AFTER the env-file load so it shadows
+# the file's value FOR THIS INVOCATION ONLY. The file itself stays
+# pointed at the real URL the whole time; the systemd timer's next tick
+# (5 min later) automatically uses the real URL again.
 for i in 1 2 3; do
   echo "=== Tick $i ==="
   sudo -u trading-watchdog \
-    env $(grep -v '^#' /opt/trading-watchdog/watchdog.env | xargs) \
+    env $(grep -v '^#' /opt/trading-watchdog/watchdog.env | grep -v '^WATCHDOG_HEALTH_URL=' | xargs) \
+    WATCHDOG_HEALTH_URL=https://httpbin.org/status/503 \
     python3 /opt/trading-watchdog/watchdog.py
 done
 
-# Restore real config + reset state
-mv /opt/trading-watchdog/watchdog.env.bak /opt/trading-watchdog/watchdog.env
+# Reset state so the next legitimate tick starts the failure counter at 0:
 rm -f /var/lib/trading-watchdog/state.json
+
+# Sanity-check the canonical URL is still set correctly (paranoia after the
+# Day 4 incident — verify the env file was never accidentally mutated):
+grep WATCHDOG_HEALTH_URL /opt/trading-watchdog/watchdog.env
+# Expected: WATCHDOG_HEALTH_URL=https://spratcapital.com/api/health
+# If you see anything else (httpbin.org, paper.spratcapital.com, etc.),
+# fix immediately and reset state again.
 ```
 
 Tick 3 should show `"email_sent": true, "email_error": null` and an email
