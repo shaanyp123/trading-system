@@ -161,11 +161,20 @@ git push origin <branch>
 # Open PR; merge.
 ```
 
-**Option C (auto-restore in the script):** the bringup script could detect
-a backup file and restore on each run. Not implemented yet — covered as a
-Day 5 follow-up.
+**Option C (auto-restore in the script):** SHIPPED — `deploy/day5-bringup.sh`
+Step 0.5 detects a backup at `/etc/credstore.encrypted/<env>.enc.yaml.backup`
+and auto-restores onto the in-repo file when the in-repo file's
+`postgres.app_service_password` is a `<TODO...>` placeholder or the
+yaml fails to decrypt. Idempotent no-op when the in-repo file is
+already filled. Removes the manual `cp` dance from Option A — once
+the operator has done the one-time `cp` to create the backup, every
+subsequent `git reset --hard` is self-healing.
 
-For Day 5, do **Option A**. The Option-B follow-up PR can land Day 6.
+For Day 5, do **Option A** (one-time backup). For all later deploys,
+the Step 0.5 auto-restore runs automatically. The Option-B follow-up
+PR (commit the filled file from laptop) is still the cleanest end
+state — once landed, the auto-restore stays as a safety net and never
+fires.
 
 ### 4b — Author `/opt/trading/deploy/.env`
 
