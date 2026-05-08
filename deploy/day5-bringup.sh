@@ -81,6 +81,57 @@ ok "deploy/.env loaded"
 ok "age key + sops + docker available"
 
 # ---------------------------------------------------------------------------
+# Step 0.5 — auto-restore sops backup (defensive; replaces operator's manual cp)
+# ---------------------------------------------------------------------------
+#
+# Latent bug from Day 5 close-out: secrets/<env>.enc.yaml is tracked in git,
+# so operator-side fills (postgres app-role passwords pasted via `sops` on
+# the VPS) get wiped by every `git reset --hard`. The runbook documents a
+# manual cp from /etc/credstore.encrypted/<env>.enc.yaml.backup before each
+# deploy; this step automates the dance.
+#
+# Decision rule:
+#   - No backup at the conventional path -> first deploy / laptop-side
+#     follow-up PR landed; nothing to restore.
+#   - Backup exists AND in-repo file's app_service_password is a <TODO>
+#     placeholder -> in-repo file was wiped, restore from backup.
+#   - Backup exists AND in-repo file already filled -> idempotent no-op.
+#
+# Note: the conventional backup path is parameterized via ENV_FILE_NAME so
+# `paper.enc.yaml.backup` (Phase 0) and `live.enc.yaml.backup` (Phase 1)
+# both work without script edits.
+
+step "Step 0.5 — auto-restore sops backup (defensive)"
+
+BACKUP_PATH="/etc/credstore.encrypted/${ENV_FILE_NAME:-paper.enc.yaml}.backup"
+LIVE_PATH="${REPO_ROOT}/secrets/${ENV_FILE_NAME:-paper.enc.yaml}"
+
+if [[ ! -f "${BACKUP_PATH}" ]]; then
+  ok "no backup at ${BACKUP_PATH} — skipping (first deploy or laptop-side fill landed)"
+else
+  # Probe the in-repo file's app_service_password. If sops can't decrypt
+  # (file structure broken) OR the value is a <TODO> placeholder, restore
+  # from the backup. The decrypt failure path covers the case where the
+  # in-repo yaml was reverted to the pre-encryption template.
+  in_repo_pwd="$(SOPS_AGE_KEY_FILE="${SOPS_AGE_KEY_FILE}" \
+    sops -d --extract '["postgres"]["app_service_password"]' \
+    "${LIVE_PATH}" 2>/dev/null || echo "<DECRYPT_FAILED>")"
+
+  case "${in_repo_pwd}" in
+    "<TODO"*|""|"<DECRYPT_FAILED>")
+      warn "in-repo ${LIVE_PATH} has placeholder / unreadable app_service_password"
+      warn "restoring from ${BACKUP_PATH}"
+      cp "${BACKUP_PATH}" "${LIVE_PATH}"
+      chmod 0640 "${LIVE_PATH}"
+      ok "restored ${LIVE_PATH} from backup"
+      ;;
+    *)
+      ok "in-repo ${LIVE_PATH} already has filled secrets (no restore needed)"
+      ;;
+  esac
+fi
+
+# ---------------------------------------------------------------------------
 # Step 1 — decrypt sops yaml on the host
 # ---------------------------------------------------------------------------
 
