@@ -757,6 +757,24 @@ Spec deviations from `implementation-guide.md` §11 prompts — locked here for 
 
 ---
 
+### 2026-05-08 — Day 6 carryover evening — watchdog email storm fix (Day 4 deploy hygiene miss + apex/subdomain mismatch)
+
+- **Spec reference:** 2026-05-07 Day 4 close-out "Watchdog operational on Hetzner Nuremberg" entry; `watchdog/README.md` Step 7 (forced-503 alert wiring test).
+- **Symptom (operator-reported 2026-05-08 ~04:25 UTC):** ~1 Resend email per hour from the watchdog with `[CRITICAL] Trading System unreachable` since the Day 4 deploy. After Day 5 brought up Caddy + api on `https://spratcapital.com`, the alerts should have stopped — but they kept firing.
+- **Diagnosis on Nuremberg VPS:** the live env file `/opt/trading-watchdog/watchdog.env` had `WATCHDOG_HEALTH_URL=https://httpbin.org/status/503` — the **test sentinel from the Day 4 alert wiring test**, never reverted. State file showed `consecutive_failures: 88` (one per 5-min tick × ~7.3 hours). Each batch of 3 failures fires a real alert, then the 60-min cooldown gates further alerts; over the night that's roughly 7 emails to the operator.
+- **Two root causes found:**
+  1. **`watchdog/README.md` Step 7 mutated the env file in place** (`sed -i ...`) and required a manual `mv .bak` to restore. The original Day 4 runbook DID have that restore line, but it was easy to miss / skip during a long deploy session. The systemd timer then kept firing against the test URL.
+  2. **`watchdog/README.md` line 123's canonical URL example was `https://paper.spratcapital.com/api/health`** — but Day 5's actual deploy brought up the API on the **apex** `spratcapital.com`, NOT the `paper.` subdomain. Even if the operator had restored the URL on Day 4, the restored value would also have been wrong (DNS NXDOMAIN on `paper.`). Same email storm, slightly different error class.
+- **Live VPS fix (2026-05-08 04:24 UTC):** `sed`-replaced `WATCHDOG_HEALTH_URL` to `https://spratcapital.com/api/health`; `rm -f /var/lib/trading-watchdog/state.json` to reset the failure counter; `systemctl start trading-watchdog.service` to force an immediate verification tick. Result: `check_success: true, check_status_code: 200, consecutive_failures: 0, decision_reason: "check ok"`. Email storm stopped.
+- **Runbook fix (this PR):**
+  1. Line 123 canonical URL: `paper.spratcapital.com` → `spratcapital.com` with a comment explaining the Phase 0 vs Phase 1 split intent (apex now; future Phase 1 may add `paper.<your-domain>` as staging subdomain).
+  2. Step 6 expected-output sample: updated to show `check_success: true` (post-Day-5 reality) instead of the pre-deploy DNS-failure shape.
+  3. Step 7 restructured: replaced the file-mutation pattern with an **inline env-var override** that shadows the file's value FOR THIS INVOCATION ONLY. The canonical `watchdog.env` is never modified, so there's nothing to restore and nothing to forget. Added a prominent `⚠️ Lesson from Day 4 deploy` callout citing this incident, plus a paranoia-check `grep WATCHDOG_HEALTH_URL` after the test ticks.
+- **Lesson for future agents authoring deploy-test runbooks:** any "test pattern" that mutates a config file in-place is one operator-distraction away from leaving the system in the test state. Default to env-var override or trap-based cleanup for tests; reserve in-place mutation for permanent config changes.
+- **Cost / scope impact:** ~7 alert emails to the operator's inbox overnight (no operational impact — just noise). ~5 min of operator + Claude time to diagnose + fix. Decisions-log + runbook + live VPS all reconciled in one PR. Phase 1 cutover follow-up: when `paper.<your-domain>` staging is provisioned, watchdog URL on Nuremberg flips back to `paper.spratcapital.com` (Phase 0 → Phase 1 ops checklist item).
+
+---
+
 ### 2026-05-08 — Day 6 carryover evening — Ashburn root-SSH hardening DEFERRED (operator decision)
 
 - **Spec reference:** 2026-05-05 Day 1 carried follow-up "**Optional** — Ashburn root SSH still allowed (B9 hardening; can disable any time)"; `project_trading_identifiers.md` line 39 ("Root SSH still allowed (Day 1 only); will harden during VPS bootstrap to `trading` user only").
