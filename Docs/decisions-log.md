@@ -821,6 +821,21 @@ Spec deviations from `implementation-guide.md` §11 prompts — locked here for 
 
 ---
 
+### 2026-05-08 — Day 7 close-out — paper-day heartbeat false alarm (timing, not a miss)
+
+- **Spec reference:** `lean/v1_qc_algorithm.py:155-159` (heartbeat schedule); 2026-05-07 Day 4 close-out entry "Backtest validation: schedule reliability + DST handling + `every_day()` semantics" (line 510 above); 2026-05-08 Day 6 carryover evening entry "`self.log()` works in QC live UI" (line 743 above).
+- **Trigger (operator-reported 2026-05-08):** during Day 7 close-out review, no `signal_cycle_tick` heartbeat log line was visible in the QC live algorithm's Logs tab for 2026-05-08 (Friday, regular trading day, no US holiday). Initial concern: did the schedule miss?
+- **Diagnosis (this entry):** the heartbeat is registered at `self.schedule.on(self.date_rules.every_day(), self.time_rules.at(17, 30), self.on_daily_signal_cycle)` with `self.set_time_zone("America/New_York")` per `lean/v1_qc_algorithm.py:111` + `:155-159`. Concretely: **17:30 ET = 21:30 UTC in EDT** (May falls inside US DST). Operator's check was earlier in the calendar day — before the 21:30 UTC schedule fired. Not a miss; a timing window where the daily cycle hadn't run yet.
+- **Cross-checks ruling out a real failure:**
+  1. The previous tick fired correctly: 2026-05-07 17:30 ET log line `signal_cycle_tick utc=2026-05-07 21:30:00.800222+00:00 et=2026-05-07 17:30:00.800222 session_date=2026-05-07 equity=15000.0` is captured at line 748 above. So the schedule wiring and `self.log()` are both confirmed working in live mode as of yesterday's tick.
+  2. The Day 4 backtest validation across Jan-May 2026 (line 510) empirically confirmed 100+ ticks fire reliably across the same `schedule.on(date_rules.every_day(), time_rules.at(17, 30), ...)` registration with no weekday gaps and correct DST handling across the EST→EDT transition. The current registration is the one that passed that validation.
+  3. The watchdog channel is independent of QC and stays green: `watchdog/README.md:126` (post-PR-#32) points at `https://spratcapital.com/api/health` (Ashburn FastAPI), not the QC algorithm. TLS verified end-to-end 2026-05-08 (line 674 above). A QC-side schedule miss would NOT show up on the watchdog and a watchdog false-positive would NOT mean the QC heartbeat fired — the two surfaces are deliberately decoupled per backend-spec §1.6.
+- **No code change required.** `lean/v1_qc_algorithm.py` is correct; the next live tick at 2026-05-08 21:30 UTC (17:30 ET) will land in the live algorithm's Logs tab the same way 2026-05-07's did. CLAUDE.md file-index status for `lean/v1_qc_algorithm.py` already says "Day 4 — paper-day clock STARTED on QC Paper Brokerage; snake_case API; full wiring Week 4" — that line stays true.
+- **Lesson for future agents:** the live heartbeat fires at 17:30 ET (= 21:30 UTC EDT / 22:30 UTC EST). Before declaring a missed schedule, **convert the operator's wall-clock to UTC and compare against 21:30 UTC (or 22:30 UTC in winter)**. If the operator's check timestamp is earlier than that, no schedule fire was expected. If later (and no log line appears), THEN it's a real miss and warrants investigation per the open Week 4 hygiene follow-up below (move from `every_day()` to `every_day(<cme_anchor_symbol>)` to surface CME-calendar-aware semantics).
+- **Cost / scope impact:** none. Doc-only entry. ~3 min of session time on diagnosis. Future sessions seeing "no heartbeat 2026-05-08" can short-circuit re-investigation by reading this entry.
+
+---
+
 ## Open follow-ups (post-Day-4)
 
 ### From Day 1 (carried)
