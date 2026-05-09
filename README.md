@@ -128,9 +128,9 @@ Common reasons you (the operator) open it:
 
 ---
 
-## Days 1-9 status — Phase 0 Week 2 closing
+## Days 1-10 status — Phase 0 Week 2 closing; Week 3 entered
 
-Phase 0 Week 1 complete. Week 2 daily tasks complete; Days 8-9 [CLAUDE_CODE] chain landed early via PR #28. Week 2 verification gate: 2 of 3 boxes checked (sub-universe ≥4 at $20k after DP-002; sops decrypt verified). DP-001 (IBKR-not-approved trigger) window opens at end of Week 2.
+Phase 0 Week 1 complete (verification gate 3/3 closed). Week 2 daily tasks complete; Days 8-9 [CLAUDE_CODE] chain landed early via PR #28. Week 2 verification gate: 2 of 3 boxes checked (sub-universe ≥4 at $20k after DP-002; sops decrypt verified; **IBKR Pro pending — DP-001 window opens Mon 2026-05-11**). Week 3 verification gate: 3 of 4 boxes checked at Day 8 (api/health TLS curl, audit_log migration applied, immutability triggers installed); the alerts-pipeline Discord webhook test stays open until `services/webhook_pusher/` ships (Week 3 Thu IG task).
 
 Per-day one-liners (full detail in [`Docs/decisions-log.md`](Docs/decisions-log.md)):
 
@@ -142,6 +142,7 @@ Per-day one-liners (full detail in [`Docs/decisions-log.md`](Docs/decisions-log.
 - **Days 6-9 [CLAUDE_CODE] chain (2026-05-07 — landed early):** `services/risk/sizing.py` (Stage 0 universe filter) + `services/risk/state_machine.py` (kill-switch); `services/audit/decision_diary.py`; `services/scheduler/vacation.py` + `calendar_import.py`. Pure-policy modules; spec wins on every IG deviation. PR #28 (`risk-review-approved` label); decisions-log entry 2026-05-07 Day 6-9 chain.
 - **Day 6 carryover (2026-05-08 morning):** TLS verified end-to-end (Week 1 gate fully closed); `paper.enc.yaml` filled and committed from VPS; bootstrap setup token captured to 1Password; laptop sops `exec format error` fixed; watchdog email-storm fix (apex/subdomain mismatch); QC `self.log()` confirmed working in live UI; backend stays on Discord (no Resend migration). PRs #29-32; decisions-log Day 6 carryover entries (8).
 - **Day 7 (2026-05-08):** sub-universe verification — **DP-002 invoked, $15k → $20k initial capital** (≥4 markets PASS at $20k); kill-switch state machine verbal walkthrough (operator learning); Day 7 entry doc-closure + Week 1 gate. PRs #31, #33; decisions-log Day 7 entries (sub-universe + DP-002 + kill-switch walkthrough).
+- **Day 8 (2026-05-09):** canonical audit-log writer shipped — `services/audit/writer.py` (`pg_advisory_xact_lock` + SERIALIZABLE + 5-attempt SQLSTATE-40001 retry + SHA-256 hash chain) + `event_types.py` (locked taxonomy mirror of §3.30) + `models.py` + `chain.py` (in-tree JCS canonicalizer; Decimal-aware; A05 float rejection); 22 chain unit tests + 4 testcontainers writer tests. First **operational** alembic migration `2026-05-09_qc_adapter_cursor_seed.py` (defensive idempotent re-seed). Three discoveries documented: (1) asyncpg's `SerializationError` is wrapped as generic `DBAPIError` not `OperationalError`; (2) `pg_advisory_xact_lock` is itself the snapshot-taking statement under SERIALIZABLE so retries are inherent to the spec'd pattern; (3) `0004_ops_tables.py` already inserts the §3.19 cursor rows. Day 8 calendar mapping: operator's actual cadence drifted ~1 day from IG nominal — today's substance is IG Week 3 Mon work in IG terms. PRs #39 (`risk-review-approved`) + #40 (`risk-review-approved`); decisions-log Day 8 entries (calendar mapping + 09:00 + 10:00) + Day 8 verdict.
 
 The original Day-1-Monday-priority-list is preserved in `implementation-guide.md` §11 as the canonical template; this section's old "How to start" walkthrough was Day-1-specific and is now historical.
 

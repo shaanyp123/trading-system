@@ -260,14 +260,22 @@ Operator learning allocation: 5–8 hours/week on Python basics, git operations,
 - **Fri:** `[CLAUDE_CODE]` Stand up FastAPI app (`services/api/`): health endpoint `GET /api/health`, SSE channel `/api/sse/events`, auth scaffolding. Caddy reverse-proxy config pointing to FastAPI (backend-spec §9.2.1). Deploy to `[paper]` VPS; run `docker compose up -d`.
 
 **Verification gate (end of Week 3):**
-- [ ] `curl https://<your-domain>/api/health` returns `{"status":"ok","environment":"paper"}` with HTTP 200
+- [x] `curl https://<your-domain>/api/health` returns `{"status":"ok","environment":"paper"}` with HTTP 200
       Done means: Caddy TLS terminating; FastAPI running; health endpoint live
-- [ ] On VPS: `docker compose logs audit | grep "audit_log migration"` shows migration applied
+      **Status (2026-05-08, Day 6 carryover):** DONE — same TLS curl that closes the Week 1 gate. Body returns `{"status":"ok","environment":"paper","version":"dev","db_connected":true,...}`. See `Docs/decisions-log.md` "Day 6 carryover morning — TLS verified end-to-end" entry.
+- [x] On VPS: `docker compose logs audit | grep "audit_log migration"` shows migration applied
       Done means: Alembic ran `0001_audit_log.py`; table exists in Postgres
-- [ ] `docker compose logs postgres | grep "TRIGGER"` shows trigger creation (or run `psql -c "\d+ audit_log"` and confirm BEFORE UPDATE trigger present)
+      **Status (2026-05-07, Day 5):** DONE — alembic 0001-0006 applied during Ashburn bringup; the api service container runs `alembic upgrade head` at startup. Verified via `tests/integration/test_audit_immutability.py` 6/6 pass against the same migrated schema. (Gate phrasing references the never-shipped standalone `audit` service container; the migrations are actually run by the api container per dev-guide §6.3 — same end state.)
+- [x] `docker compose logs postgres | grep "TRIGGER"` shows trigger creation (or run `psql -c "\d+ audit_log"` and confirm BEFORE UPDATE trigger present)
       Done means: immutability trigger installed
+      **Status (2026-05-05, Day 3):** DONE — alembic `0005_immutability.py` creates BEFORE UPDATE/DELETE row triggers + BEFORE TRUNCATE statement triggers (parent + each yearly partition). `tests/integration/test_audit_immutability.py` exercises all four cases against postgres:16 and passes.
 - [ ] Discord: send a test message via webhook URL → message appears in `#alerts`
       Done means: webhook delivery working
+      **Status (2026-05-09, Day 8):** Discord guild + 7 webhook URLs created Day 2; Ashburn → Discord round-trip proven Day 6 carryover (HTTP 204 from Ashburn IP; `Cloudflare-blocks-Hetzner-Discord` only affects Nuremberg watchdog). The actual `services/webhook_pusher/` alerts pipeline service that closes this gate is **Week 3 Thu IG task — not yet shipped**. Gate stays open until that service ships and an end-to-end alerts → `#alerts` → Discord trip is verified.
+
+**Bonus shipped this Week (not on the Week 3 verification gate):**
+- `services/audit/writer.py` (PR #39, Day 8) — canonical hash-chain writer with `pg_advisory_xact_lock` + SERIALIZABLE + 5-attempt SQLSTATE-40001 retry; 22 unit tests for chain primitives + 4 testcontainers integration tests for the writer. Anti-pattern A01 ("DO NOT write to audit_log directly via INSERT") is enforceable from this PR forward. See `Docs/decisions-log.md` "Day 8 09:00 — services/audit/writer.py canonical hash-chain writer" entry.
+- `alembic/versions/2026-05-09_qc_adapter_cursor_seed.py` (PR #40, Day 8) — first **operational** dated migration under dev-guide §7.1 hybrid scheme. Defensive idempotent re-seed (no-op against current schema since 0004 already inserts the rows). See `Docs/decisions-log.md` "Day 8 10:00 — alembic operational migration" entry.
 
 **Risks this week:** Alembic migration fails due to Postgres role permissions → Claude Code debugs; check `app_owner` role grant. Discord webhook URL expires or is wrong → regenerate.
 

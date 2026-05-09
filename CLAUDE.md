@@ -54,16 +54,18 @@ For pattern ambiguity within already-allowed scope (naming, file organization wi
 | `Prompts/` | Generation prompts (archived; do not reference for current work) |
 | `Archive/` | Reserved for superseded versions |
 
-### Code + ops surfaces (current state as of 2026-05-08, Day 7)
+### Code + ops surfaces (current state as of 2026-05-09, Day 8)
 | Path | Purpose | Status |
 |---|---|---|
 | `strategies/v1_trend_following/` | V1 Donchian/MA/Hurst/ATR strategy logic; `parameters.py`, `indicators.py`, `signals.py`, `audit_events.py`, `sizing_trace.py`, `strategy.py` | Day 2 — entry pipeline real; exit pipeline scaffolded for Week 3–4 |
 | `lean/v1_qc_algorithm.py` | QC LEAN wrapper for the strategy | Day 4 — paper-day clock STARTED on QC Paper Brokerage; snake_case API; full wiring Week 4 |
 | `tests/unit/test_strategy_v1.py` | 16 tests covering entry pipeline + indicators + parameter validation | Day 2 |
+| `tests/unit/test_audit_chain.py` | 22 tests covering JCS canonicalization (Decimal-as-str, float rejection per A05, key-sort determinism), SHA-256 record-hash math, GENESIS_HASH | Day 8 — pure Python, no Docker (PR #39) |
 | `tests/integration/test_audit_immutability.py` | testcontainers Postgres 16; 6 tests verifying audit_log UPDATE/DELETE/TRUNCATE blocked + attribution.expected_* immutable | Day 3 — passes when Docker is up; skips cleanly otherwise |
+| `tests/integration/test_audit_writer.py` | testcontainers Postgres 16; 4 tests: single insert chain math, genesis prev_hash = zero32, 3 concurrent writers (continuous chain), deterministic SQLSTATE 40001 retry-path | Day 8 — passes when Docker is up; skips cleanly otherwise (PR #39) |
 | `services/api/` | FastAPI skeleton (`main.py`, `config.py`, `db.py`, `entrypoint.py`, `errors.py`, `middleware.py`, `routes/`, `repos/`); structlog + Postgres pool | Day 5 — healthy on Ashburn (`/api/health` 200 over loopback); TLS end-to-end verified Day 6 carryover |
 | `services/risk/` | `sizing.py` (Stage 0 universe filter, $15k/$25k/$50k/$100k tiers, /MES 50%-override) + `state_machine.py` (kill-switch transitions) | Day 6-9 chain — pure-policy modules shipped early via PR #28 (`risk-review-approved`) |
-| `services/audit/` | `decision_diary.py` writer service; canonical fields per backend-spec §3.30 enum | Day 6-9 chain — shipped early via PR #28 (`risk-review-approved`) |
+| `services/audit/` | `event_types.py` (locked taxonomy enum mirror of backend-spec §3.30) + `models.py` (`AuditLogRecord` DTO) + `chain.py` (in-tree JCS + SHA-256 record-hash + `verify_chain`) + `writer.py` (`append_audit_event` — `pg_advisory_xact_lock` + SERIALIZABLE + 5-attempt SQLSTATE-40001 retry) + `decision_diary.py` validator (PR #28) | Day 8 — canonical hash-chain entry point shipped via PR #39 (`risk-review-approved`); A01 enforceable from this PR forward |
 | `services/scheduler/` | `vacation.py` mode handler + `calendar_import.py` macro-events seeding | Day 6-9 chain — shipped early via PR #28 (`risk-review-approved`) |
 | `services/qc_adapter/` | `payloads.py` JSONL parser + `cursor.py` (`qc_adapter_cursor` row + canonical 3-directory enum) + `poll.py` (`plan_ingest_batch` orchestrator playbook) | Week 3 Tue scaffold — pure-policy plan-then-apply; HTTP fetcher + audit writer integration land Week 4 |
 | `watchdog/watchdog.py` + systemd unit + timer | External watchdog: `GET /api/health` poll, Discord webhook alert on degraded, 60-min cooldown | Day 4 — deployed to Hetzner Nuremberg (`trading-watchdog`); apex URL fix Day 6 carryover |
@@ -78,9 +80,10 @@ For pattern ambiguity within already-allowed scope (naming, file organization wi
 | `alembic/versions/0001_audit_log.py` | `audit_log` partitioned by `ingest_clock_ts`; yearly partitions 2026–2031; `uuid_generate_v7()` SQL function | Day 3 |
 | `alembic/versions/0002_core_tables.py` | accounts, setup_tokens, contracts, signals, orders, fills, trades, attribution, positions, balances; orders/fills/trades/attribution partitioned by year | Day 3 |
 | `alembic/versions/0003_risk_tables.py` | strategy_versions, parameters, parameter_sets, slippage_calibration_versions, decision_diary, risk_state; closes deferred FKs from 0002 | Day 3 |
-| `alembic/versions/0004_ops_tables.py` | reconciliation_breaks, data_quality_events, agent_actions, vacation_mode, qc_adapter_cursor, capital_events, cost_events, liveness_probes, pdt_day_trade_log, dividend_history, incident_reviews, universe_state, alerts (+`alert_category` enum), macro_events | Day 3 |
+| `alembic/versions/0004_ops_tables.py` | reconciliation_breaks, data_quality_events, agent_actions, vacation_mode, qc_adapter_cursor (TABLE + 3 §3.19 INSERT rows), capital_events, cost_events, liveness_probes, pdt_day_trade_log, dividend_history, incident_reviews, universe_state, alerts (+`alert_category` enum), macro_events | Day 3 |
 | `alembic/versions/0005_immutability.py` | audit_log BEFORE UPDATE/DELETE blocker, BEFORE TRUNCATE blockers (parent + each yearly partition), attribution expected_* lock, REVOKE TRUNCATE FROM PUBLIC | Day 3 |
 | `alembic/versions/0006_roles.py` | app_service, app_service_readonly, app_owner (NOLOGIN), dba_breakglass (SUPERUSER NOLOGIN); per-role grants; per-role audit_log REVOKEs; passwords set out-of-band from sops | Day 3 |
-| `infrastructure/`, `apps/web/`, `packages/`, remaining `services/*` (signal, execution, reconciliation, calibration, qc_adapter, webhook_pusher, agent, monitoring, observability, discord_bot) | Scaffolded directories with `__init__.py` only | filled Week 3+ per `implementation-guide.md` §3 |
+| `alembic/versions/2026-05-09_qc_adapter_cursor_seed.py` | Defensive idempotent re-seed of qc_adapter_cursor (`ON CONFLICT DO NOTHING` upgrade + intentional no-op downgrade); first **operational** migration under dev-guide §7.1 hybrid scheme | Day 8 — no-op against current schema since 0004 already inserts (PR #40) |
+| `infrastructure/`, `apps/web/`, `packages/`, remaining `services/*` (signal, execution, reconciliation, calibration, webhook_pusher, agent, monitoring, observability, discord_bot) | Scaffolded directories with `__init__.py` only | filled Week 3+ per `implementation-guide.md` §3 |
 
 See `Docs/claude-dev-guide.md` §2 for the canonical full-repo layout.
