@@ -276,6 +276,7 @@ Operator learning allocation: 5–8 hours/week on Python basics, git operations,
 **Bonus shipped this Week (not on the Week 3 verification gate):**
 - `services/audit/writer.py` (PR #39, Day 8) — canonical hash-chain writer with `pg_advisory_xact_lock` + SERIALIZABLE + 5-attempt SQLSTATE-40001 retry; 22 unit tests for chain primitives + 4 testcontainers integration tests for the writer. Anti-pattern A01 ("DO NOT write to audit_log directly via INSERT") is enforceable from this PR forward. See `Docs/decisions-log.md` "Day 8 09:00 — services/audit/writer.py canonical hash-chain writer" entry.
 - `alembic/versions/2026-05-09_qc_adapter_cursor_seed.py` (PR #40, Day 8) — first **operational** dated migration under dev-guide §7.1 hybrid scheme. Defensive idempotent re-seed (no-op against current schema since 0004 already inserts the rows). See `Docs/decisions-log.md` "Day 8 10:00 — alembic operational migration" entry.
+- `services/reconciliation/recon.py` (PR #42, Day 9) — pure-policy `plan_reconciliation_check` per backend-spec §2.6 + §3.15. Returns `ReconciliationPlan` dataclass; caller (Week 4 dispatcher) owns DB I/O + audit writes + kill-switch invocation. Locked tolerances (position qty = 0, cash = max($5 abs, 1 bps × equity_baseline), dividend ex-date 2× widening); T+1 grace via prior_breaks input. 45 unit tests across 8 `Test*` classes; A22 enforced (zero audit writes from tests). Same plan-then-apply shape as PR #28 / PR #37. See `Docs/decisions-log.md` "Day 9 09:00 — services/reconciliation/recon.py pure-policy skeleton" entry.
 
 **Risks this week:** Alembic migration fails due to Postgres role permissions → Claude Code debugs; check `app_owner` role grant. Discord webhook URL expires or is wrong → regenerate.
 
@@ -1485,6 +1486,8 @@ Configure systemd trading service per backend-spec §8.1.3 to load the age key c
 ---
 
 ## Day 9 (Thursday, Week 2)
+
+> **Calendar mapping note (added 2026-05-10):** the operator's actual Day 9 = 2026-05-10 Sunday, NOT this nominal Thu Week 2. The ~1-day cadence drift documented in `Docs/decisions-log.md` 2026-05-09 Day 8 calendar-mapping entry continues. Both [CLAUDE_CODE] tasks below (09:00 decision_diary + vacation; 11:00 calendar_import) were already shipped Day 7 via PR #28 (`Docs/decisions-log.md` 2026-05-07 Day 6-9 [CLAUDE_CODE] chain entry). The operator's Day 9 substance shifted to **Week 3 Wed** work — `services/reconciliation/recon.py` (PR #42, see §3 Week 3 "Bonus shipped this Week"). The 14:00 [OPERATOR] sops workflow learning session below is the only Day 9 nominal task still open; not a delivery gate.
 
 **09:00 [CLAUDE_CODE]** Decision diary service + vacation mode.
 Open Claude Code session. Describe:
