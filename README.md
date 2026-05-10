@@ -6,7 +6,7 @@ A solo-operator algorithmic trading system. Multi-asset systematic trend-followi
 
 | Phase | Window | Status |
 |---|---|---|
-| Phase 0 — foundation | Weeks 0–8 | 🔄 Week 4 entered — Days 1-11 ✅, IG §11 Days 8-9 [CLAUDE_CODE] chain ✅ early via PR #28; Week 3 alerts pipeline ✅ via PR #44; Week 4 golden tests ✅ via PR #45; Week 3 gate 4/4 binds on operator runbook smoke; Week 4 gate 1/3 (verify_chain CLI Day 12, concurrency test Day 14 to follow) |
+| Phase 0 — foundation | Weeks 0–8 | 🔄 Week 4 entered — Days 1-11 ✅, IG §11 Days 8-9 [CLAUDE_CODE] chain ✅ early via PR #28; Week 3 alerts pipeline ✅ via PR #44; Week 4 golden tests ✅ via PR #45; **Week 3 gate 4/4** (last box closed Day 11 carryover #2 via PRs #47 + #48 — Discord webhook smoke Step 3 returned `status=ok http=204`, operator visually confirmed embed in `#alerts`); Week 4 gate 1/3 (verify_chain CLI Day 12, concurrency test Day 14 to follow) |
 | Phase 1 — QC live | Months 2–5 | ⏳ Not started |
 | Phase 2 — direct IBKR | Months 5–9 | ⏳ Not started |
 | Phase 3 — capital scaling | Months 9–12 | ⏳ Not started |
