@@ -17,13 +17,57 @@ past it.
 
 - Ashburn VPS reachable via SSH (`ssh root@178.156.239.84`).
 - `/opt/trading` checked out at the PR-#44 commit (`git pull origin main`
-  if the VPS is behind).
-- `secrets/paper.enc.yaml` decryption working (Day 6 carryover already
-  verified `wc -c == 64` on `app_service_password`; if `sops -d` errors,
-  fix that before continuing).
+  if the VPS is behind). Day 11 carryover (PR #47) added the missing
+  runtime deps to the api Dockerfile; if your image is older than 2026-05-12,
+  rebuild it: `cd /opt/trading && docker compose --env-file deploy/.env
+  build api && docker compose --env-file deploy/.env up -d --force-recreate api`.
+- `secrets/paper.enc.yaml` decryption working. The age key lives at
+  `/etc/credstore.encrypted/age_key` per `deploy/.env`'s `SOPS_AGE_KEY_FILE`;
+  every sops invocation in this runbook needs that env var exported in
+  the current shell. Day 6 carryover verified `wc -c == 64` on
+  `app_service_password`; if `sops -d` errors, fix that before continuing.
 - `docker compose` `api` service healthy (`/api/health` returns 200 over
   loopback). The webhook_pusher CLI runs from inside the api container
   since the api image bundles the `services/` Python package.
+
+### Network attachment (Phase 0 only — see Step 0 below)
+
+The `api` service is on `trading_internal` (Docker `Internal: true` —
+no external internet by design; backend-spec §8.11 hardening).
+`webhook_pusher` HTTP calls to `discord.com` and `api.resend.com`
+therefore fail from inside the api container by default with
+`[Errno -3] Temporary failure in name resolution` — confirmed Day 11
+when this runbook was first executed end-to-end.
+
+The architecturally correct fix is to deploy `webhook_pusher` as its
+own service container (already stubbed in `docker-compose.yml` with
+`networks: [internal, egress]; profiles: ['phase1']`); that lands at
+Phase 1 cutover.
+
+Until then, **Step 0** below temporarily attaches the api container
+to `trading_egress` for the duration of the smoke, and **Step 8**
+disconnects it. The deployed config (docker-compose.yml) is
+unchanged — the attach/detach is purely runtime state on the VPS.
+
+## Step 0 — Temporarily attach api to `trading_egress` (Phase 0 workaround)
+
+```bash
+# api defaults to internal-only; add egress for outbound HTTP to
+# Discord + Resend. Reversed in Step 8.
+docker network connect trading_egress trading-api-1
+
+# Verify both networks are now attached:
+docker inspect trading-api-1 \
+  --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} ({{$v.IPAddress}}){{println}}{{end}}'
+# Expected:
+#   trading_egress (172.20.0.X)
+#   trading_internal (172.18.0.X)
+```
+
+**On mismatch:** if `docker network connect` errors with `Error
+response from daemon: endpoint with name trading-api-1 already
+exists in network trading_egress`, the api is already on egress
+(prior smoke run didn't disconnect cleanly). That's fine — proceed.
 
 ## Step 1 — Decrypt sops + extract webhook URLs
 
@@ -32,6 +76,10 @@ On the VPS:
 ```bash
 ssh root@178.156.239.84
 cd /opt/trading
+
+# Required: point sops at the age key (per deploy/.env). Without this,
+# sops --decrypt errors with "failed to load age identities".
+export SOPS_AGE_KEY_FILE=/etc/credstore.encrypted/age_key
 
 # Confirm we're at PR-#44+ (need services/webhook_pusher/cli.py).
 test -f services/webhook_pusher/cli.py || \
@@ -58,15 +106,21 @@ runtime never parses YAML). On the VPS:
 
 ```bash
 # Pick the alerts + critical webhook URLs out of the decrypted YAML.
-# yq is the right tool but may not be installed; this awk fallback is
-# zero-dep and works on plain YAML.
-DISCORD_ALERTS_URL=$(awk '/^discord:/,/^[a-z]/{ if ($1=="alerts:") print $2 }' \
+# yq is the right tool but may not be installed; the awk approach below
+# is zero-dep and tolerant of nested YAML structure (alerts/critical/
+# api_key/from_address all live nested under their parent dict).
+#
+# Awk strategy: match by ($1 == "key:") AND ($2 ~ value-shape-regex).
+# This is robust to indentation depth and to multiple unrelated keys
+# named "api_key" elsewhere in the file (anthropic.api_key vs
+# resend.api_key; only resend's matches the ^re_ prefix).
+DISCORD_ALERTS_URL=$(awk '$1 == "alerts:" && $2 ~ /^https:\/\/discord/ {print $2; exit}' \
   /dev/shm/paper.decrypted.yaml)
-DISCORD_CRITICAL_URL=$(awk '/^discord:/,/^[a-z]/{ if ($1=="critical:") print $2 }' \
+DISCORD_CRITICAL_URL=$(awk '$1 == "critical:" && $2 ~ /^https:\/\/discord/ {print $2; exit}' \
   /dev/shm/paper.decrypted.yaml)
-RESEND_API_KEY=$(awk '/^resend:/,/^[a-z]/{ if ($1=="api_key:") print $2 }' \
+RESEND_API_KEY=$(awk '$1 == "api_key:" && $2 ~ /^re_/ {print $2; exit}' \
   /dev/shm/paper.decrypted.yaml)
-RESEND_FROM=$(awk '/^resend:/,/^[a-z]/{ if ($1=="from_address:") print $2 }' \
+RESEND_FROM=$(awk '$1 == "from_address:" {print $2; exit}' \
   /dev/shm/paper.decrypted.yaml)
 
 # Sanity print (URL hosts only — no tokens).
@@ -91,19 +145,25 @@ the keys are nested under `discord.webhook_urls.alerts` (not at top
 level). If the YAML structure differs from what the CLI expects, escalate
 — the `paper.template.yaml` schema is the canonical source.
 
+**Note (Day 11 carryover):** the original awk pattern in this step used
+range addresses (`/^discord:/,/^[a-z]/`) which terminate immediately
+because `discord:` itself matches `^[a-z]`. The `$1 == ... && $2 ~ ...`
+form above replaces it; both Day 11 smoke runs (Step 3 + the optional
+Step 5) used this corrected form successfully.
+
 ## Step 3 — Run the bare-smoke test (no DB)
 
 This step verifies the planner + sender + webhook URL all work without
 touching Postgres. Closes Step 4 of the Week 3 gate.
 
 ```bash
-docker compose exec -T api env \
+docker compose --env-file deploy/.env exec -T api env \
   WEBHOOK_PUSHER_DISCORD_ALERTS_URL=$WEBHOOK_PUSHER_DISCORD_ALERTS_URL \
   WEBHOOK_PUSHER_DISCORD_CRITICAL_URL=$WEBHOOK_PUSHER_DISCORD_CRITICAL_URL \
   WEBHOOK_PUSHER_RESEND_API_KEY=$WEBHOOK_PUSHER_RESEND_API_KEY \
   WEBHOOK_PUSHER_RESEND_FROM=$WEBHOOK_PUSHER_RESEND_FROM \
   WEBHOOK_PUSHER_OPERATOR_EMAIL=$WEBHOOK_PUSHER_OPERATOR_EMAIL \
-  python -m services.webhook_pusher.cli \
+  /opt/venv/bin/python -m services.webhook_pusher.cli \
     --severity P2 \
     --message "Day 10 webhook_pusher smoke test from $(hostname)"
 ```
@@ -145,8 +205,15 @@ test from ..."`, and a footer carrying the alert id + UTC timestamp.
 The full-path test (Step 5) needs an existing `accounts.id`. On the VPS:
 
 ```bash
-docker compose exec -T postgres \
-  psql -U app_service -d trading -c "SELECT id FROM accounts LIMIT 1;"
+# Postgres requires password auth for app_service via the unix socket;
+# pull it from the decrypted yaml. (The unix socket peer auth that
+# would let `-U postgres` skip auth doesn't apply here — `-U app_service`
+# always wants password.)
+APP_SERVICE_PWD=$(awk '$1 == "app_service_password:" {print $2; exit}' \
+  /dev/shm/paper.decrypted.yaml)
+
+docker compose --env-file deploy/.env exec -T -e PGPASSWORD="$APP_SERVICE_PWD" postgres \
+  psql -U app_service -d trading -h postgres -c "SELECT id FROM accounts LIMIT 1;"
 ```
 
 **Expected:** one UUID printed under `id`. Copy it for the next step.
@@ -165,15 +232,17 @@ P0 fan-out to all 3 channels). Substitute the account UUID from Step 4.
 
 ```bash
 ACCOUNT_ID="<UUID-FROM-STEP-4>"
+APP_SERVICE_PWD=$(awk '$1 == "app_service_password:" {print $2; exit}' \
+  /dev/shm/paper.decrypted.yaml)
 
-docker compose exec -T api env \
+docker compose --env-file deploy/.env exec -T api env \
   WEBHOOK_PUSHER_DISCORD_ALERTS_URL=$WEBHOOK_PUSHER_DISCORD_ALERTS_URL \
   WEBHOOK_PUSHER_DISCORD_CRITICAL_URL=$WEBHOOK_PUSHER_DISCORD_CRITICAL_URL \
   WEBHOOK_PUSHER_RESEND_API_KEY=$WEBHOOK_PUSHER_RESEND_API_KEY \
   WEBHOOK_PUSHER_RESEND_FROM=$WEBHOOK_PUSHER_RESEND_FROM \
   WEBHOOK_PUSHER_OPERATOR_EMAIL=$WEBHOOK_PUSHER_OPERATOR_EMAIL \
-  WEBHOOK_PUSHER_DATABASE_URL="postgresql+asyncpg://app_service:$(awk '/^postgres:/,/^[a-z]/{ if ($1=="app_service_password:") print $2 }' /dev/shm/paper.decrypted.yaml)@postgres:5432/trading" \
-  python -m services.webhook_pusher.cli \
+  WEBHOOK_PUSHER_DATABASE_URL="postgresql+asyncpg://app_service:${APP_SERVICE_PWD}@postgres:5432/trading" \
+  /opt/venv/bin/python -m services.webhook_pusher.cli \
     --severity P0 \
     --message "Day 10 P0 smoke test from $(hostname)" \
     --with-db \
@@ -224,8 +293,11 @@ Confirms the dispatcher's UPDATE actually persisted (Step 7 of the
 session-prompt's gate language).
 
 ```bash
-docker compose exec -T postgres \
-  psql -U app_service -d trading -c "
+APP_SERVICE_PWD=$(awk '$1 == "app_service_password:" {print $2; exit}' \
+  /dev/shm/paper.decrypted.yaml)
+
+docker compose --env-file deploy/.env exec -T -e PGPASSWORD="$APP_SERVICE_PWD" postgres \
+  psql -U app_service -d trading -h postgres -c "
     SELECT id, severity, category, fired_at_utc, delivery_status, acknowledged
     FROM alerts
     ORDER BY fired_at_utc DESC
@@ -251,9 +323,11 @@ short-circuits when populated.
 ```bash
 # Pick the most recent alert id from Step 6.
 ALERT_ID="<MOST-RECENT-ID-FROM-STEP-6>"
+APP_SERVICE_PWD=$(awk '$1 == "app_service_password:" {print $2; exit}' \
+  /dev/shm/paper.decrypted.yaml)
 
-docker compose exec -T postgres \
-  psql -U app_service -d trading -c "
+docker compose --env-file deploy/.env exec -T -e PGPASSWORD="$APP_SERVICE_PWD" postgres \
+  psql -U app_service -d trading -h postgres -c "
     SELECT delivery_status FROM alerts WHERE id = '$ALERT_ID';
   "
 ```
@@ -269,11 +343,21 @@ not re-tested in production.
 # Wipe the decrypted secrets from tmpfs.
 shred -u /dev/shm/paper.decrypted.yaml
 
+# Disconnect api from trading_egress (revert Step 0; api back to
+# internal-only matching docker-compose.yml's deployed config).
+docker network disconnect trading_egress trading-api-1
+
+# Verify api is back to internal-only:
+docker inspect trading-api-1 \
+  --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{println}}{{end}}'
+# Expected: only `trading_internal`
+
 # Logout of the SSH session (env vars are subshell-local; closing the
 # shell discards them). Belt-and-suspenders:
 unset WEBHOOK_PUSHER_DISCORD_ALERTS_URL WEBHOOK_PUSHER_DISCORD_CRITICAL_URL \
       WEBHOOK_PUSHER_RESEND_API_KEY WEBHOOK_PUSHER_RESEND_FROM \
-      WEBHOOK_PUSHER_OPERATOR_EMAIL WEBHOOK_PUSHER_DATABASE_URL
+      WEBHOOK_PUSHER_OPERATOR_EMAIL WEBHOOK_PUSHER_DATABASE_URL \
+      APP_SERVICE_PWD SOPS_AGE_KEY_FILE
 exit
 ```
 
