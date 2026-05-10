@@ -1,0 +1,277 @@
+# Day 12 — `services/audit/verify_chain.py` operator runbook
+
+End-to-end smoke for the audit-chain integrity CLI. This is the A27
+smoke fixture per `Docs/claude-dev-guide.md` §6.8 alternative (b)
+(operator-runbook checklist) — same shape as `lean/README.md`
+Steps 4–7, `watchdog/README.md` Steps 6–7, `deploy/api/README.md`
+Steps 1–5, and `deploy/webhook_pusher/README.md` Steps 1–8.
+
+**Closes Week 4 verification gate box 2** (per
+`implementation-guide.md` §3 Week 4 Tue):
+"`python3 services/audit/verify_chain.py --env paper` returns
+`CHAIN OK: N rows verified`."
+
+If anything fails, capture the exact error + the step number and stop.
+Root-cause discipline per dev-guide §1.3 — we debug rather than blow
+past it.
+
+## Prerequisites
+
+- Ashburn VPS reachable via SSH (`ssh root@178.156.239.84`).
+- `/opt/trading` checked out at the Day 12 PR commit (or later).
+  `git pull origin main` if the VPS is behind. Day 11 carryover
+  resolved the VPS's stale-HEAD `secrets/paper.enc.yaml` issue;
+  if that recurs, see `Docs/decisions-log.md` 2026-05-12 Day 11
+  carryover entry for the empirical-diff procedure.
+- The `api` image must contain `services/audit/verify_chain.py`.
+  PR #50 keeps the `api` container on `trading_internal` (no external
+  internet by design) — the chain CLI does not need egress, so it is
+  invoked from inside the `api` container directly. If the api image
+  is older than the Day 12 PR merge, rebuild:
+
+  ```bash
+  docker compose --env-file deploy/.env build api && \
+  docker compose --env-file deploy/.env up -d --force-recreate api
+  ```
+
+- `secrets/paper.enc.yaml` decryption working. The age key lives at
+  `/etc/credstore.encrypted/age_key` per `deploy/.env`'s
+  `SOPS_AGE_KEY_FILE`; every `sops --decrypt` invocation here needs
+  that env var exported in the current shell. Day 6 carryover
+  verified `wc -c == 64` on `app_service_password`; if `sops -d`
+  errors, fix that before continuing.
+
+### Architecture note (where this CLI runs)
+
+The walker reads `audit_log` only — no outbound HTTP, no third-party
+APIs. The CLI runs from inside the **`api` container** because that
+container already has the `services/` package baked in and has the
+correct `app_service` Postgres role available on `trading_internal`.
+We do NOT use the `webhook_pusher` container for this — it is on
+`trading_egress` for outbound delivery and has no audit reason to
+read `audit_log`. We do NOT run from the host because the `services`
+Python package lives inside the image, not on the VPS host filesystem.
+
+## Step 1 — Decrypt sops + extract `app_service` password
+
+On the VPS:
+
+```bash
+ssh root@178.156.239.84
+cd /opt/trading
+
+# Required: point sops at the age key (per deploy/.env). Without this,
+# sops --decrypt errors with "failed to load age identities".
+export SOPS_AGE_KEY_FILE=/etc/credstore.encrypted/age_key
+
+# Confirm the api container has the new CLI module.
+docker compose --env-file deploy/.env exec -T api \
+  test -f /app/services/audit/verify_chain.py || \
+  { echo "MISSING: api image is older than Day 12 — rebuild via 'docker compose --env-file deploy/.env build api && docker compose --env-file deploy/.env up -d --force-recreate api'"; exit 1; }
+
+# Decrypt to a tmpfs path; never to disk.
+sops --decrypt secrets/paper.enc.yaml > /dev/shm/paper.decrypted.yaml
+chmod 600 /dev/shm/paper.decrypted.yaml
+
+# Sanity-check app_service_password is non-empty.
+APP_SERVICE_PWD=$(awk '$1 == "app_service_password:" {print $2; exit}' \
+  /dev/shm/paper.decrypted.yaml)
+test -n "$APP_SERVICE_PWD" || \
+  { echo "MISSING: postgres.app_service_password not in /dev/shm/paper.decrypted.yaml"; exit 1; }
+echo "app_service_password length: ${#APP_SERVICE_PWD}"
+# Expected: 64 (32-byte hex string from openssl rand -hex 32 at Day 5).
+```
+
+**On mismatch:** if `app_service_password` is empty or shorter than
+64 chars, the secret was never filled in `secrets/paper.enc.yaml`.
+Run `sops secrets/paper.enc.yaml`, locate `postgres.app_service_password`,
+and check whether it is still a `<TODO_FROM_DAY_3_POSTGRES_BOOTSTRAP>`
+placeholder. See `deploy/api/README.md` Step 4a for the canonical fill
+procedure.
+
+## Step 2 — Stage `DATABASE_URL` for the CLI
+
+The CLI reads its connection string from the bare `DATABASE_URL` env var
+(NOT the api process's `API_DATABASE_URL` — the CLI is independent of
+the api process's prefixed config). On the VPS, still in the same shell
+that sourced `APP_SERVICE_PWD` from Step 1:
+
+```bash
+# SQLAlchemy + asyncpg URL shape; postgres host is the docker-compose
+# service name (resolves over trading_internal).
+export DATABASE_URL="postgresql+asyncpg://app_service:${APP_SERVICE_PWD}@postgres:5432/trading"
+
+# Sanity print (host/role only; never echo the full URL with the password).
+echo "DATABASE_URL host: $(echo $DATABASE_URL | sed 's|.*@\([^/]*\)/.*|\1|')"
+echo "DATABASE_URL role: $(echo $DATABASE_URL | sed 's|postgresql+asyncpg://\([^:]*\):.*|\1|')"
+# Expected:
+#   DATABASE_URL host: postgres:5432
+#   DATABASE_URL role: app_service
+```
+
+**On mismatch:** if either echo prints an empty field, the
+`APP_SERVICE_PWD` value was lost between shells. Re-source from
+Step 1 in the current terminal — env vars are subshell-local.
+
+## Step 3 — Run the verifier
+
+The CLI runs inside the `api` container with `DATABASE_URL` injected
+explicitly via `docker compose exec env`:
+
+```bash
+docker compose --env-file deploy/.env exec -T \
+  -e DATABASE_URL="$DATABASE_URL" \
+  api \
+  /opt/venv/bin/python -m services.audit.verify_chain --env paper
+```
+
+**Expected (Phase 0, before any audit events have been written):**
+
+```
+CHAIN OK: 0 rows verified
+```
+
+The exit code is `0`. The 0-row case is vacuously intact and is the
+correct state for a fresh paper environment whose `audit_log` table
+has been migrated but never written to. The verification gate considers
+this a PASS — the CLI's contract is "the chain is intact," not
+"the chain has rows."
+
+**Expected (Phase 0+, after `services/api` or other writers have
+emitted audit events):**
+
+```
+CHAIN OK: <N> rows verified
+```
+
+…where `<N>` matches `SELECT COUNT(*) FROM audit_log` (you can
+double-check via Step 4 below if you want belt-and-suspenders).
+
+**On mismatch:**
+
+- `CHAIN BREAK at sequence_no=<X> (after <K> verified rows)` —
+  rows 1 through `K` are vouched-for; row `X` is the offending row.
+  This is a P0 incident: per backend-spec §2.10.1 + §11.1, a hash-chain
+  break triggers HALT_NEW with severity `incident_review`. **Stop the
+  CLI loop, leave the chain alone, and escalate immediately.** Do NOT
+  attempt to delete or repair the offending row — `audit_log` is
+  append-only by trigger (`alembic/versions/0005_immutability.py`),
+  and any "fix" would falsify the audit trail. Recovery path: capture
+  the row's payload via the read-only export tool (Phase 1), run the
+  forensic recompute against the canonical source (QC adapter + paper
+  trading audit upstream), and append a `repaired_for_sequence_no`
+  audit event per backend-spec §2.11 "loss handling" — that work is
+  out of scope for this runbook.
+
+- `ERROR: DATABASE_URL is not set.` — Step 2 didn't propagate.
+  Re-export `APP_SERVICE_PWD` (Step 1) and `DATABASE_URL` (Step 2) in
+  the current shell, then retry Step 3.
+
+- `argparse error: invalid choice: 'production'` — `--env` accepts
+  only `dev`, `paper`, `live-small`, `live-scale`. Use the value
+  matching `audit_log.env`'s CHECK constraint for the current
+  environment.
+
+- `OperationalError: ... password authentication failed for user
+  "app_service"` — `app_service_password` in sops doesn't match the
+  Postgres role's actual password. Recovery: run `deploy/day5-bringup.sh`
+  Step 6 (`ALTER ROLE app_service WITH PASSWORD ...`) to resync from
+  sops; or, if sops is the truth, run `sops secrets/paper.enc.yaml`
+  and confirm the password matches what Postgres has.
+
+- `OperationalError: ... could not translate host name "postgres" to
+  address` — the api container is not on `trading_internal`. Run
+  `docker inspect trading-api-1 --format '{{json .NetworkSettings.Networks}}'`
+  and verify `trading_internal` is in the list. If not, restart via
+  `docker compose --env-file deploy/.env up -d --force-recreate api`.
+
+- `ImportError: No module named services.audit.verify_chain` — the api
+  image is older than the Day 12 PR. Rebuild per Step 1's prerequisite
+  block.
+
+## Step 4 — Cross-check the count (optional but cheap)
+
+Independent count via psql to confirm the CLI's `<N>` matches the table:
+
+```bash
+APP_SERVICE_PWD=$(awk '$1 == "app_service_password:" {print $2; exit}' \
+  /dev/shm/paper.decrypted.yaml)
+
+docker compose --env-file deploy/.env exec -T \
+  -e PGPASSWORD="$APP_SERVICE_PWD" \
+  postgres \
+  psql -U app_service -d trading -h postgres -c \
+    "SELECT COUNT(*) AS rows, COALESCE(MAX(sequence_no), 0) AS max_seq FROM audit_log;"
+```
+
+**Expected:** `rows` matches the `<N>` from Step 3's `CHAIN OK: <N>
+rows verified` line. `max_seq` may be greater than `rows` if any prior
+SERIALIZABLE retry consumed `BIGSERIAL` ticks without committing — that
+is by design (writer.py docstring + Day 8 PR #39 close-out) and not a
+chain break.
+
+**On mismatch:** if `rows < N`, you are looking at a different
+database than the CLI ran against (check `DATABASE_URL`'s host); if
+`rows > N`, the chain is GROWING during the walk (a writer is active),
+which is fine — the next run will report the new tail.
+
+## Step 5 — Cleanup
+
+```bash
+# Wipe the decrypted secrets from tmpfs.
+shred -u /dev/shm/paper.decrypted.yaml
+
+# Logout of the SSH session (env vars are subshell-local; closing the
+# shell discards them). Belt-and-suspenders:
+unset DATABASE_URL APP_SERVICE_PWD SOPS_AGE_KEY_FILE
+exit
+```
+
+## Closure of the Week 4 verification gate box 2
+
+Once Step 3 prints `CHAIN OK: <N> rows verified` and exits 0, the
+second box of the Week 4 gate
+(`implementation-guide.md` §3 Week 4 Tue:
+"`python3 services/audit/verify_chain.py --env paper` returns
+`CHAIN OK: N rows verified`") flips to `[x]`.
+
+Capture for the Day 12 close-out in `Docs/decisions-log.md`:
+
+- The exact stdout line from Step 3 (`CHAIN OK: <N> rows verified`).
+- The `<N>` value (so we have a chain-length anchor for future runs).
+- The cross-check from Step 4 (count + max_seq) if you ran it.
+
+Box 3 (concurrency test under 10 concurrent writes) is Day 14 work in
+a separate PR — not part of this runbook.
+
+## Caveats
+
+- **DOES NOT mutate state.** The CLI is read-only; it issues a single
+  `SELECT * FROM audit_log ORDER BY sequence_no ASC`. There is no risk
+  of accidentally writing to `audit_log` even if you run it on a live
+  paper or live-scale environment. The `app_service` role does not have
+  TRUNCATE on `audit_log` per `alembic/versions/0006_roles.py`.
+- **NOT a periodic job.** This runbook is for the verification gate
+  + ad-hoc operator runs. The Phase 1 periodic-integrity-check job
+  (every 24h via cron, also calls `verify_chain`) lives in a separate
+  service and is wired up in Week 5+.
+- **A02 binding.** `services/audit/**` is on the dev-guide §2.2
+  forbidden whitelist. Future edits to `services/audit/verify_chain.py`
+  require a `risk-review-approved` PR label; the pre-merge linter
+  blocks otherwise. Operator runbook edits (this file) are off the
+  forbidden whitelist; regular PR review applies.
+
+## Module surface (for next agent)
+
+| Function | File | Purpose |
+|---|---|---|
+| `verify_chain` | `services/audit/chain.py` | Async walker; returns `(ok, broken_seq_no, rows_walked)` |
+| `main` | `services/audit/verify_chain.py` | argparse + asyncio.run + DATABASE_URL CLI shell |
+| `python -m services.audit.verify_chain --env paper` | (entry point) | What this runbook executes |
+
+For test coverage see `tests/unit/test_audit_chain.py::TestVerifyChainWalker`
+(5 fake-session tests covering all four return branches),
+`tests/unit/test_verify_chain_cli.py` (CLI argparse + env + stdout
+contract; 14 tests across 5 `Test*` classes), and
+`tests/integration/test_audit_writer.py::test_verify_chain_count_matches_select_count`
+(testcontainers; locks the SQL contract for the `<N>` value above).

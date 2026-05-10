@@ -149,17 +149,29 @@ def compute_record_hash(prev_hash: bytes, payload_jcs: bytes) -> bytes:
     return hashlib.sha256(prev_hash + payload_jcs).digest()
 
 
-async def verify_chain(session: AsyncSession) -> tuple[bool, int | None]:
+async def verify_chain(session: AsyncSession) -> tuple[bool, int | None, int]:
     """Walk the entire ``audit_log`` and verify hash-chain integrity.
 
-    Returns ``(True, None)`` on a clean walk. On failure returns
-    ``(False, sequence_no)`` where ``sequence_no`` is the first row whose
-    ``record_hash`` does not match ``SHA-256(expected_prev || payload_jcs)``
-    OR whose ``prev_hash`` does not match the previous row's
-    ``record_hash``.
+    Returns ``(True, None, N)`` on a clean walk over ``N`` rows. On failure
+    returns ``(False, sequence_no, K)`` where ``sequence_no`` is the first
+    row whose ``record_hash`` does not match ``SHA-256(expected_prev ||
+    payload_jcs)`` OR whose ``prev_hash`` does not match the previous row's
+    ``record_hash``, and ``K`` is the number of rows walked successfully
+    before the break (so ``K + 1`` is the offending row's position in the
+    walk; ``K`` rows are vouched-for as intact).
+
+    The empty-table case returns ``(True, None, 0)`` — vacuously intact.
 
     This is O(N) over the entire audit log and is intended for periodic
-    integrity checks and the export-verification tool, not for every write.
+    integrity checks, the operator-facing verification CLI
+    (``services/audit/verify_chain.py``), and the export-verification tool;
+    it is not on the write path.
+
+    Returning the row count alongside the verdict avoids a follow-up
+    ``SELECT COUNT(*)`` that would race against concurrent appends — the
+    walk and the count are derived from the same ``ORDER BY sequence_no``
+    snapshot, so the message ``"CHAIN OK: N rows verified"`` is exactly
+    truthful about the rows that were checked.
     """
     rows = (
         await session.execute(
@@ -171,18 +183,20 @@ async def verify_chain(session: AsyncSession) -> tuple[bool, int | None]:
     ).fetchall()
 
     expected_prev: bytes = GENESIS_HASH
+    walked: int = 0
     for row in rows:
         prev_hash = bytes(row.prev_hash)
         record_hash = bytes(row.record_hash)
         payload_jcs = bytes(row.payload_jcs)
 
         if prev_hash != expected_prev:
-            return False, row.sequence_no
+            return False, row.sequence_no, walked
         computed = compute_record_hash(prev_hash, payload_jcs)
         if record_hash != computed:
-            return False, row.sequence_no
+            return False, row.sequence_no, walked
         expected_prev = record_hash
-    return True, None
+        walked += 1
+    return True, None, walked
 
 
 __all__ = [

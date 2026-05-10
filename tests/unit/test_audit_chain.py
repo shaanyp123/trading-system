@@ -3,12 +3,22 @@
 These run without Docker — they exercise pure Python code (JCS
 canonicalization, SHA-256 record-hash math, error paths). Database-bound
 tests for the writer live in ``tests/integration/test_audit_writer.py``.
+
+The :class:`TestVerifyChainWalker` block covers the async ``verify_chain``
+walker by stubbing :class:`~sqlalchemy.ext.asyncio.AsyncSession` with a
+minimal in-memory fake — the walker's logic is pure Python over rows
+returned by a single ``SELECT``, so a fake fetcher exercises every return
+branch (clean walk, prev_hash mismatch, record_hash mismatch, empty
+table) without testcontainers. The full SQL-contract round-trip is
+covered separately at the integration layer.
 """
 
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 from decimal import Decimal
+from typing import Any
 
 import pytest
 
@@ -17,6 +27,7 @@ from services.audit.chain import (
     HASH_LENGTH_BYTES,
     compute_record_hash,
     jcs_serialize,
+    verify_chain,
 )
 
 
@@ -142,3 +153,129 @@ class TestComputeRecordHash:
     def test_empty_prev_hash_raises(self) -> None:
         with pytest.raises(ValueError, match=r"32 bytes"):
             compute_record_hash(b"", b"{}")
+
+
+# ---------------------------------------------------------------------------
+# verify_chain walker — fake-session coverage of all four return branches.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _FakeRow:
+    """Minimal stand-in for a SQLAlchemy ``Row`` returned by audit_log
+    SELECTs. Only the four columns the walker reads are present."""
+
+    sequence_no: int
+    prev_hash: bytes
+    record_hash: bytes
+    payload_jcs: bytes
+
+
+class _FakeResult:
+    def __init__(self, rows: list[_FakeRow]) -> None:
+        self._rows = rows
+
+    def fetchall(self) -> list[_FakeRow]:
+        return self._rows
+
+
+class _FakeSession:
+    """Async-session stub: the walker calls ``await session.execute(...)``
+    once and then ``.fetchall()`` on the result. We don't validate the SQL
+    text here — the integration test does that against real Postgres."""
+
+    def __init__(self, rows: list[_FakeRow]) -> None:
+        self._rows = rows
+
+    async def execute(self, _stmt: Any, *_args: Any, **_kwargs: Any) -> _FakeResult:
+        return _FakeResult(self._rows)
+
+
+def _build_clean_chain(n: int) -> list[_FakeRow]:
+    """Construct ``n`` rows where each row's ``prev_hash`` links to the
+    previous row's ``record_hash`` and the math holds."""
+    rows: list[_FakeRow] = []
+    expected_prev = GENESIS_HASH
+    for i in range(1, n + 1):
+        payload = jcs_serialize({"i": i})
+        record_hash = compute_record_hash(expected_prev, payload)
+        rows.append(
+            _FakeRow(
+                sequence_no=i,
+                prev_hash=expected_prev,
+                record_hash=record_hash,
+                payload_jcs=payload,
+            )
+        )
+        expected_prev = record_hash
+    return rows
+
+
+class TestVerifyChainWalker:
+    @pytest.mark.asyncio
+    async def test_empty_table_returns_clean_zero_count(self) -> None:
+        session = _FakeSession([])
+        ok, broken_at, walked = await verify_chain(session)  # type: ignore[arg-type]
+        assert ok is True
+        assert broken_at is None
+        assert walked == 0
+
+    @pytest.mark.asyncio
+    async def test_three_row_clean_chain_returns_count_three(self) -> None:
+        session = _FakeSession(_build_clean_chain(3))
+        ok, broken_at, walked = await verify_chain(session)  # type: ignore[arg-type]
+        assert ok is True
+        assert broken_at is None
+        assert walked == 3
+
+    @pytest.mark.asyncio
+    async def test_prev_hash_mismatch_at_row_two_returns_walked_one(self) -> None:
+        rows = _build_clean_chain(3)
+        # Tamper with row 2's prev_hash so it no longer links to row 1.
+        rows[1] = _FakeRow(
+            sequence_no=rows[1].sequence_no,
+            prev_hash=b"\xff" * 32,  # wrong link
+            record_hash=rows[1].record_hash,
+            payload_jcs=rows[1].payload_jcs,
+        )
+        session = _FakeSession(rows)
+        ok, broken_at, walked = await verify_chain(session)  # type: ignore[arg-type]
+        assert ok is False
+        # The walker reports the offending row's sequence_no — row 2.
+        assert broken_at == 2
+        # One row was successfully verified before the break (row 1).
+        assert walked == 1
+
+    @pytest.mark.asyncio
+    async def test_record_hash_mismatch_returns_break(self) -> None:
+        rows = _build_clean_chain(3)
+        # Tamper with row 2's record_hash so it doesn't match SHA-256(prev_hash || payload).
+        # prev_hash + payload still align with row 1 -> row 2's prev_hash check passes,
+        # so we exercise the SECOND failure branch (record_hash recomputation).
+        rows[1] = _FakeRow(
+            sequence_no=rows[1].sequence_no,
+            prev_hash=rows[1].prev_hash,
+            record_hash=b"\xab" * 32,  # corrupt
+            payload_jcs=rows[1].payload_jcs,
+        )
+        session = _FakeSession(rows)
+        ok, broken_at, walked = await verify_chain(session)  # type: ignore[arg-type]
+        assert ok is False
+        assert broken_at == 2
+        assert walked == 1
+
+    @pytest.mark.asyncio
+    async def test_break_at_genesis_row_returns_walked_zero(self) -> None:
+        # Single row whose prev_hash is NOT GENESIS_HASH — should fail
+        # immediately with walked == 0.
+        rogue = _FakeRow(
+            sequence_no=1,
+            prev_hash=b"\x01" * 32,
+            record_hash=b"\x02" * 32,
+            payload_jcs=b"{}",
+        )
+        session = _FakeSession([rogue])
+        ok, broken_at, walked = await verify_chain(session)  # type: ignore[arg-type]
+        assert ok is False
+        assert broken_at == 1
+        assert walked == 0
