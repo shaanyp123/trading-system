@@ -32,9 +32,18 @@ from services.api.db import close_pool, init_pool, session_scope
 from services.api.errors import register_error_handlers
 from services.api.middleware import register_middleware
 from services.api.repos.setup_tokens import PostgresSetupTokenRepo
+from services.api.routes.alerts import router as alerts_router
+from services.api.routes.auth import router as auth_router
+from services.api.routes.fills import router as fills_router
 from services.api.routes.health import router as health_router
+from services.api.routes.orders import router as orders_router
+from services.api.routes.positions import router as positions_router
 from services.api.routes.setup import router as setup_router
+from services.api.routes.signals import router as signals_router
 from services.api.routes.sse import router as sse_router
+from services.api.routes.system import router as system_router
+from services.api.routes.today import router as today_router
+from services.api.session import SessionStubMiddleware
 
 log = structlog.get_logger()
 
@@ -133,9 +142,25 @@ def create_app() -> FastAPI:
     )
     register_error_handlers(app)
     register_middleware(app, settings)
+    # Session stub middleware sits BETWEEN the request-context binding and
+    # the CSRF gate so route handlers see ``request.state.session`` after
+    # CSRF has cleared. Added after register_middleware so it ends up
+    # innermost (FastAPI/Starlette: last-added = innermost in the request
+    # path; runs after CSRF + RequestContext).
+    app.add_middleware(SessionStubMiddleware, settings=settings)  # type: ignore[arg-type]
+    # Day 5 routes
     app.include_router(health_router)
     app.include_router(setup_router)
     app.include_router(sse_router)
+    # Day 15 — Phase 1 REST scaffold per backend-spec §4.1 / IG §3 Week 5 Mon
+    app.include_router(auth_router)
+    app.include_router(signals_router)
+    app.include_router(system_router)
+    app.include_router(today_router)
+    app.include_router(positions_router)
+    app.include_router(orders_router)
+    app.include_router(fills_router)
+    app.include_router(alerts_router)
     return app
 
 
