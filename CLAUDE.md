@@ -54,7 +54,7 @@ For pattern ambiguity within already-allowed scope (naming, file organization wi
 | `Prompts/` | Generation prompts (archived; do not reference for current work) |
 | `Archive/` | Reserved for superseded versions |
 
-### Code + ops surfaces (current state as of 2026-05-09, Day 8)
+### Code + ops surfaces (current state as of 2026-05-10, Day 9)
 | Path | Purpose | Status |
 |---|---|---|
 | `strategies/v1_trend_following/` | V1 Donchian/MA/Hurst/ATR strategy logic; `parameters.py`, `indicators.py`, `signals.py`, `audit_events.py`, `sizing_trace.py`, `strategy.py` | Day 2 — entry pipeline real; exit pipeline scaffolded for Week 3–4 |
@@ -68,6 +68,8 @@ For pattern ambiguity within already-allowed scope (naming, file organization wi
 | `services/audit/` | `event_types.py` (locked taxonomy enum mirror of backend-spec §3.30) + `models.py` (`AuditLogRecord` DTO) + `chain.py` (in-tree JCS + SHA-256 record-hash + `verify_chain`) + `writer.py` (`append_audit_event` — `pg_advisory_xact_lock` + SERIALIZABLE + 5-attempt SQLSTATE-40001 retry) + `decision_diary.py` validator (PR #28) | Day 8 — canonical hash-chain entry point shipped via PR #39 (`risk-review-approved`); A01 enforceable from this PR forward |
 | `services/scheduler/` | `vacation.py` mode handler + `calendar_import.py` macro-events seeding | Day 6-9 chain — shipped early via PR #28 (`risk-review-approved`) |
 | `services/qc_adapter/` | `payloads.py` JSONL parser + `cursor.py` (`qc_adapter_cursor` row + canonical 3-directory enum) + `poll.py` (`plan_ingest_batch` orchestrator playbook) | Week 3 Tue scaffold — pure-policy plan-then-apply; HTTP fetcher + audit writer integration land Week 4 |
+| `services/reconciliation/` | `recon.py` (`plan_reconciliation_check` — pure-policy diff returning `ReconciliationPlan` dataclass; tolerances 0/$5/1bps + 2× dividend widening + T+1 grace via prior_breaks; emits `reconciliation_check_passed` / `_break_detected` / `_break_resolved` audit events) | Day 9 — pure-policy plan-then-apply via PR #42 (`risk-review-approved`); Week 4 dispatcher wires it into the recon cron + RECON_MISMATCH kill-switch trigger |
+| `tests/unit/test_reconciliation.py` | 45 tests across 8 `Test*` classes — exact match, position mismatch, cash abs/bps tolerances, T+1 grace, dividend 2× widening, multiple breaks, resolved priors, A06 timezone enforcement, A05 Decimal-as-str, canonical taxonomy validation | Day 9 — pure Python, no Docker (PR #42) |
 | `watchdog/watchdog.py` + systemd unit + timer | External watchdog: `GET /api/health` poll, Discord webhook alert on degraded, 60-min cooldown | Day 4 — deployed to Hetzner Nuremberg (`trading-watchdog`); apex URL fix Day 6 carryover |
 | `deploy/github-app/` | Canonical manifest + operator runbook for the in-app PR review surface app | Day 2 — app created (App ID 3615825 / Installation ID 129868686) |
 | `deploy/discord/` | Canonical manifest + operator runbook for the Discord guild + bot (7 channels) | Day 2 — guild + bot created |
@@ -84,6 +86,6 @@ For pattern ambiguity within already-allowed scope (naming, file organization wi
 | `alembic/versions/0005_immutability.py` | audit_log BEFORE UPDATE/DELETE blocker, BEFORE TRUNCATE blockers (parent + each yearly partition), attribution expected_* lock, REVOKE TRUNCATE FROM PUBLIC | Day 3 |
 | `alembic/versions/0006_roles.py` | app_service, app_service_readonly, app_owner (NOLOGIN), dba_breakglass (SUPERUSER NOLOGIN); per-role grants; per-role audit_log REVOKEs; passwords set out-of-band from sops | Day 3 |
 | `alembic/versions/2026-05-09_qc_adapter_cursor_seed.py` | Defensive idempotent re-seed of qc_adapter_cursor (`ON CONFLICT DO NOTHING` upgrade + intentional no-op downgrade); first **operational** migration under dev-guide §7.1 hybrid scheme | Day 8 — no-op against current schema since 0004 already inserts (PR #40) |
-| `infrastructure/`, `apps/web/`, `packages/`, remaining `services/*` (signal, execution, reconciliation, calibration, webhook_pusher, agent, monitoring, observability, discord_bot) | Scaffolded directories with `__init__.py` only | filled Week 3+ per `implementation-guide.md` §3 |
+| `infrastructure/`, `apps/web/`, `packages/`, remaining `services/*` (signal, execution, calibration, webhook_pusher, agent, monitoring, observability, discord_bot) | Scaffolded directories with `__init__.py` only | filled Week 3+ per `implementation-guide.md` §3 |
 
 See `Docs/claude-dev-guide.md` §2 for the canonical full-repo layout.

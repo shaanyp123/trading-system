@@ -6,7 +6,7 @@ A solo-operator algorithmic trading system. Multi-asset systematic trend-followi
 
 | Phase | Window | Status |
 |---|---|---|
-| Phase 0 — foundation | Weeks 0–8 | 🔄 Week 2 closing — Days 1-7 ✅, Days 8-9 [CLAUDE_CODE] chain ✅ early via PR #28 |
+| Phase 0 — foundation | Weeks 0–8 | 🔄 Week 3 in progress — Days 1-9 ✅, IG §11 Days 8-9 [CLAUDE_CODE] chain ✅ early via PR #28 |
 | Phase 1 — QC live | Months 2–5 | ⏳ Not started |
 | Phase 2 — direct IBKR | Months 5–9 | ⏳ Not started |
 | Phase 3 — capital scaling | Months 9–12 | ⏳ Not started |
@@ -128,9 +128,9 @@ Common reasons you (the operator) open it:
 
 ---
 
-## Days 1-10 status — Phase 0 Week 2 closing; Week 3 entered
+## Days 1-11 status — Phase 0 Week 3 in progress
 
-Phase 0 Week 1 complete (verification gate 3/3 closed). Week 2 daily tasks complete; Days 8-9 [CLAUDE_CODE] chain landed early via PR #28. Week 2 verification gate: 2 of 3 boxes checked (sub-universe ≥4 at $20k after DP-002; sops decrypt verified; **IBKR Pro pending — DP-001 window opens Mon 2026-05-11**). Week 3 verification gate: 3 of 4 boxes checked at Day 8 (api/health TLS curl, audit_log migration applied, immutability triggers installed); the alerts-pipeline Discord webhook test stays open until `services/webhook_pusher/` ships (Week 3 Thu IG task).
+Phase 0 Week 1 complete (verification gate 3/3 closed). Week 2 daily tasks complete; IG §11 Days 8-9 [CLAUDE_CODE] chain landed early via PR #28. Week 2 verification gate: 2 of 3 boxes checked (sub-universe ≥4 at $20k after DP-002; sops decrypt verified; **IBKR Pro pending — DP-001 window opens Mon 2026-05-11, 1 day away**). Week 3 verification gate: 3 of 4 boxes checked (api/health TLS curl, audit_log migration applied, immutability triggers installed); the alerts-pipeline Discord webhook test stays open until `services/webhook_pusher/` ships (Week 3 Thu IG task — Day 10 in operator's actual cadence). Week 3 "Bonus shipped" surface: `services/audit/writer.py` (PR #39, Day 8), `alembic/versions/2026-05-09_qc_adapter_cursor_seed.py` (PR #40, Day 8), `services/reconciliation/recon.py` (PR #42, Day 9).
 
 Per-day one-liners (full detail in [`Docs/decisions-log.md`](Docs/decisions-log.md)):
 
@@ -143,6 +143,7 @@ Per-day one-liners (full detail in [`Docs/decisions-log.md`](Docs/decisions-log.
 - **Day 6 carryover (2026-05-08 morning):** TLS verified end-to-end (Week 1 gate fully closed); `paper.enc.yaml` filled and committed from VPS; bootstrap setup token captured to 1Password; laptop sops `exec format error` fixed; watchdog email-storm fix (apex/subdomain mismatch); QC `self.log()` confirmed working in live UI; backend stays on Discord (no Resend migration). PRs #29-32; decisions-log Day 6 carryover entries (8).
 - **Day 7 (2026-05-08):** sub-universe verification — **DP-002 invoked, $15k → $20k initial capital** (≥4 markets PASS at $20k); kill-switch state machine verbal walkthrough (operator learning); Day 7 entry doc-closure + Week 1 gate. PRs #31, #33; decisions-log Day 7 entries (sub-universe + DP-002 + kill-switch walkthrough).
 - **Day 8 (2026-05-09):** canonical audit-log writer shipped — `services/audit/writer.py` (`pg_advisory_xact_lock` + SERIALIZABLE + 5-attempt SQLSTATE-40001 retry + SHA-256 hash chain) + `event_types.py` (locked taxonomy mirror of §3.30) + `models.py` + `chain.py` (in-tree JCS canonicalizer; Decimal-aware; A05 float rejection); 22 chain unit tests + 4 testcontainers writer tests. First **operational** alembic migration `2026-05-09_qc_adapter_cursor_seed.py` (defensive idempotent re-seed). Three discoveries documented: (1) asyncpg's `SerializationError` is wrapped as generic `DBAPIError` not `OperationalError`; (2) `pg_advisory_xact_lock` is itself the snapshot-taking statement under SERIALIZABLE so retries are inherent to the spec'd pattern; (3) `0004_ops_tables.py` already inserts the §3.19 cursor rows. Day 8 calendar mapping: operator's actual cadence drifted ~1 day from IG nominal — today's substance is IG Week 3 Mon work in IG terms. PRs #39 (`risk-review-approved`) + #40 (`risk-review-approved`); decisions-log Day 8 entries (calendar mapping + 09:00 + 10:00) + Day 8 verdict.
+- **Day 9 (2026-05-10):** `services/reconciliation/recon.py` shipped — pure-policy `plan_reconciliation_check` per backend-spec §2.6 + §3.15. Locked tolerances (position qty = 0, cash = max($5 abs, 1 bps × equity_baseline), dividend ex-date 2× widening). T+1 grace via `prior_breaks` input (data-based match on `(metric, market, delta)` tuple — substantive interpretation locked vs dev-guide §5.5's time-based reference). Emits 3 audit event types (`reconciliation_check_passed` / `_break_detected` / `_break_resolved`) — all values in `services.audit.event_types.AuditEventType`. 45 unit tests across 8 `Test*` classes; A22 enforced (zero audit writes from tests). Same plan-then-apply shape as PR #28 + PR #37 (state_machine, sizing, vacation, calendar_import, qc_adapter/poll). Day 9 calendar mapping continues Day 8 lock — operator's Day 9 substance is IG Week 3 Wed work; IG §11 Day 9 [CLAUDE_CODE] tasks (decision_diary + vacation + calendar_import) already shipped Day 7 via PR #28; IG §11 Day 9 14:00 [OPERATOR] sops workflow learning is open optional practice. PR #42 (`risk-review-approved`); decisions-log Day 9 entries (calendar mapping + 09:00) + Day 9 verdict.
 
 The original Day-1-Monday-priority-list is preserved in `implementation-guide.md` §11 as the canonical template; this section's old "How to start" walkthrough was Day-1-specific and is now historical.
 
