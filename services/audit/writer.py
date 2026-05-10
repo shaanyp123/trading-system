@@ -243,6 +243,18 @@ async def append_audit_event(
                     text("SELECT pg_advisory_xact_lock(:lock_id)"),
                     {"lock_id": AUDIT_CHAIN_LOCK_ID},
                 )
+                # Lock-acquisition checkpoint. Asserted by the IG §3 Week 4
+                # gate (box 3) via structlog capture in
+                # ``tests/integration/test_audit_writer.py`` 10-writer
+                # concurrency test. Operator-facing equivalent grep:
+                # ``docker compose logs api | grep advisory_lock_acquired``.
+                log.info(
+                    "advisory_lock_acquired",
+                    lock_id=AUDIT_CHAIN_LOCK_ID,
+                    attempt=attempt,
+                    event_type=enum_event_type.value,
+                    event_uuid=str(event_uuid),
+                )
 
                 tail_row = (
                     await session.execute(
@@ -323,8 +335,14 @@ async def append_audit_event(
             last_serialization_error = exc
             if attempt < MAX_RETRIES - 1:
                 delay = RETRY_DELAYS_SECONDS[attempt]
+                # Renamed from ``audit_event_serialization_retry`` Day 14 to
+                # match the IG §3 Week 4 gate language verbatim
+                # (``grep "SERIALIZABLE_retry"``). No external consumers
+                # depend on the old name (Phase 0 has no observability
+                # surface yet); a sibling structlog event ``audit_event_*``
+                # naming is preserved for the other writer events.
                 log.warning(
-                    "audit_event_serialization_retry",
+                    "SERIALIZABLE_retry",
                     event_type=enum_event_type.value,
                     event_uuid=str(event_uuid),
                     attempt=attempt,
