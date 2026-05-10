@@ -1,16 +1,43 @@
 """Integration tests for audit_log immutability + attribution expected_* lock.
 
-Verifies the triggers and EVENT TRIGGER from migration 0005 actually block
-UPDATE / DELETE / TRUNCATE against audit_log, plus the attribution
-expected_* immutability rule.
+Verifies the triggers from migration 0005 (BEFORE UPDATE/DELETE row trigger
++ per-table BEFORE TRUNCATE statement triggers) and the role-permission
+landscape from migration 0006 actually block UPDATE / DELETE / TRUNCATE
+against audit_log, plus the attribution expected_* immutability rule.
 
 Spins up a fresh `postgres:16` testcontainer per module, runs
 `alembic upgrade head`, and asserts that mutation attempts raise the expected
 DB error. If Docker is unreachable on the runner, the module is skipped (the
 default behavior of testcontainers).
 
+The fault-injection block (Day 13 / Week 4 Wed) layers role-aware coverage on
+top of the original 6 default-superuser tests:
+
+* As ``app_service`` (INSERT/SELECT only on audit_log): UPDATE / DELETE /
+  TRUNCATE all hit the **permission layer** first — SQLSTATE 42501
+  (insufficient_privilege). The trigger never fires; that's by design and
+  documents the first-line defense.
+* As ``app_owner`` (full DML; only TRUNCATE explicitly REVOKEd on the
+  parent partitioned table): UPDATE / DELETE on the parent get past
+  permission and **hit the trigger** — SQLSTATE P0001 with the
+  ``audit_log is append-only`` message. TRUNCATE on the parent is
+  permission-denied (REVOKE TRUNCATE FROM app_owner in 0006); TRUNCATE
+  on a yearly partition reaches the **per-partition trigger** because
+  the wildcard GRANT ALL never gets re-revoked at the partition level
+  — SQLSTATE P0001 with the ``TRUNCATE forbidden on audit_log``
+  message.
+* SQLSTATE P0001 is asserted explicitly on the trigger paths so a future
+  refactor that downgrades RAISE EXCEPTION to e.g. RAISE WARNING fails
+  loudly here instead of silently letting a mutation through.
+
+The fourth role tier — ``dba_breakglass`` — is created NOLOGIN in 0006 and
+is intentionally NOT exercised; per spec §8.2.1 it's the manual operator
+escape hatch and the test would have to run as superuser to ``SET ROLE``
+to it anyway, which defeats the purpose. Coverage of its TRUNCATE GRANT
+stays at the migration level (0006).
+
 Backend-spec sections under test: §2.10.2 (audit_log append-only), §3.7
-(attribution expected_* immutable post-emit).
+(attribution expected_* immutable post-emit), §8.2 (role hierarchy).
 """
 
 from __future__ import annotations
@@ -313,3 +340,209 @@ def test_attribution_expected_columns_immutable(pg_engine: Engine) -> None:
             ),
             {"id": attribution_id},
         )
+
+
+# ---------------------------------------------------------------------------
+# Day 13 / Week 4 Wed — fault-injection coverage
+#
+# The seven tests below add role-permission + SQLSTATE assertion coverage on
+# top of the defaults-as-superuser tests. Two defense layers are exercised:
+#
+#   Layer 1 — REVOKE / GRANT (migration 0006). Permission denial fires
+#             BEFORE the row hits the table; SQLSTATE 42501.
+#   Layer 2 — Triggers (migration 0005). Fire AFTER permission allows the
+#             write attempt; SQLSTATE P0001 + the spec's RAISE EXCEPTION
+#             message.
+#
+# Both layers must hold for the audit_log immutability guarantee to be
+# real. ``app_service`` exercises layer 1; ``app_owner`` exercises layer 2
+# for UPDATE/DELETE on the parent and partitions, AND layer 1 for TRUNCATE
+# on the parent (TRUNCATE was REVOKEd from app_owner specifically in 0006).
+# ---------------------------------------------------------------------------
+
+
+def _pgcode(excinfo: pytest.ExceptionInfo[Any]) -> str | None:
+    """Best-effort SQLSTATE accessor for a SQLAlchemy DB error.
+
+    psycopg2's ``Error`` exposes ``pgcode``; SQLAlchemy wraps it in
+    ``DBAPIError`` and stashes the original on ``.orig``. The chain is
+    ``excinfo.value.orig.pgcode``; both legs are guarded with ``getattr``
+    so a future driver swap (or a synthetic exception in a unit test)
+    surfaces a clean ``None`` instead of an ``AttributeError`` distractor.
+    """
+    orig = getattr(excinfo.value, "orig", None)
+    return getattr(orig, "pgcode", None) if orig is not None else None
+
+
+def test_audit_log_update_as_app_service_blocked_by_permission(pg_engine: Engine) -> None:
+    """``app_service`` UPDATE on audit_log → permission layer (SQLSTATE 42501).
+
+    Defense layer 1: migration 0006 grants ``app_service`` only INSERT/SELECT
+    on audit_log and REVOKEs UPDATE/DELETE/TRUNCATE. The UPDATE never reaches
+    the BEFORE UPDATE trigger.
+    """
+    keys = _seed_account_and_audit_row(pg_engine)
+    with pytest.raises((DatabaseError, InternalError, ProgrammingError)) as excinfo:
+        with pg_engine.begin() as conn:
+            conn.execute(text("SET LOCAL ROLE app_service"))
+            conn.execute(
+                text("UPDATE audit_log SET event_type = 'spoofed' WHERE sequence_no = :seq"),
+                {"seq": keys["sequence_no"]},
+            )
+    msg = str(excinfo.value).lower()
+    assert "permission denied" in msg, f"expected permission denial, got: {msg}"
+    assert _pgcode(excinfo) == "42501", (
+        f"expected SQLSTATE 42501 (insufficient_privilege), got {_pgcode(excinfo)!r}"
+    )
+
+
+def test_audit_log_truncate_as_app_service_blocked_by_permission(pg_engine: Engine) -> None:
+    """``app_service`` TRUNCATE on audit_log → permission layer (SQLSTATE 42501).
+
+    Defense layer 1: REVOKE TRUNCATE FROM app_service blocks before the
+    BEFORE TRUNCATE trigger has a chance to fire.
+    """
+    _seed_account_and_audit_row(pg_engine)
+    with pytest.raises((DatabaseError, InternalError, ProgrammingError)) as excinfo:
+        with pg_engine.begin() as conn:
+            conn.execute(text("SET LOCAL ROLE app_service"))
+            conn.execute(text("TRUNCATE TABLE audit_log"))
+    msg = str(excinfo.value).lower()
+    assert "permission denied" in msg, f"expected permission denial, got: {msg}"
+    assert _pgcode(excinfo) == "42501", (
+        f"expected SQLSTATE 42501 (insufficient_privilege), got {_pgcode(excinfo)!r}"
+    )
+
+
+def test_audit_log_update_as_app_owner_blocked_by_trigger(pg_engine: Engine) -> None:
+    """``app_owner`` UPDATE on audit_log → trigger layer (SQLSTATE P0001).
+
+    Defense layer 2: migration 0006 grants ``app_owner`` ALL privileges,
+    so the UPDATE passes the permission gate and hits the BEFORE UPDATE
+    row trigger from 0005. The trigger raises with the spec's exact
+    message ``audit_log is append-only; UPDATE/DELETE forbidden (TG_OP=%)``.
+    """
+    keys = _seed_account_and_audit_row(pg_engine)
+    with pytest.raises((DatabaseError, InternalError)) as excinfo:
+        with pg_engine.begin() as conn:
+            conn.execute(text("SET LOCAL ROLE app_owner"))
+            conn.execute(
+                text("UPDATE audit_log SET event_type = 'spoofed' WHERE sequence_no = :seq"),
+                {"seq": keys["sequence_no"]},
+            )
+    msg = str(excinfo.value).lower()
+    assert "append-only" in msg, f"expected append-only message, got: {msg}"
+    assert "tg_op=update" in msg, f"expected TG_OP=UPDATE, got: {msg}"
+    assert _pgcode(excinfo) == "P0001", (
+        f"expected SQLSTATE P0001 (raise_exception), got {_pgcode(excinfo)!r}"
+    )
+
+
+def test_audit_log_delete_as_app_owner_blocked_by_trigger(pg_engine: Engine) -> None:
+    """``app_owner`` DELETE on audit_log → trigger layer (SQLSTATE P0001).
+
+    Same path as UPDATE-as-app_owner but exercises the BEFORE DELETE leg
+    of the row trigger; TG_OP differs (DELETE vs UPDATE).
+    """
+    keys = _seed_account_and_audit_row(pg_engine)
+    with pytest.raises((DatabaseError, InternalError)) as excinfo:
+        with pg_engine.begin() as conn:
+            conn.execute(text("SET LOCAL ROLE app_owner"))
+            conn.execute(
+                text("DELETE FROM audit_log WHERE sequence_no = :seq"),
+                {"seq": keys["sequence_no"]},
+            )
+    msg = str(excinfo.value).lower()
+    assert "append-only" in msg, f"expected append-only message, got: {msg}"
+    assert "tg_op=delete" in msg, f"expected TG_OP=DELETE, got: {msg}"
+    assert _pgcode(excinfo) == "P0001", (
+        f"expected SQLSTATE P0001 (raise_exception), got {_pgcode(excinfo)!r}"
+    )
+
+
+def test_audit_log_truncate_parent_as_app_owner_blocked_by_permission(
+    pg_engine: Engine,
+) -> None:
+    """``app_owner`` TRUNCATE on parent → permission layer (SQLSTATE 42501).
+
+    ``app_owner`` has GRANT ALL on every table EXCEPT TRUNCATE on the
+    parent partitioned table (REVOKE TRUNCATE ON audit_log FROM app_owner
+    in 0006 — the only TRUNCATE retainer is ``dba_breakglass``). So the
+    parent-table TRUNCATE is permission-denied; the trigger doesn't fire.
+    """
+    _seed_account_and_audit_row(pg_engine)
+    with pytest.raises((DatabaseError, InternalError, ProgrammingError)) as excinfo:
+        with pg_engine.begin() as conn:
+            conn.execute(text("SET LOCAL ROLE app_owner"))
+            conn.execute(text("TRUNCATE TABLE audit_log"))
+    msg = str(excinfo.value).lower()
+    assert "permission denied" in msg, f"expected permission denial, got: {msg}"
+    assert _pgcode(excinfo) == "42501", (
+        f"expected SQLSTATE 42501 (insufficient_privilege), got {_pgcode(excinfo)!r}"
+    )
+
+
+def test_audit_log_truncate_partition_as_app_owner_blocked_by_trigger(
+    pg_engine: Engine,
+) -> None:
+    """``app_owner`` TRUNCATE on a yearly partition → trigger layer (SQLSTATE P0001).
+
+    Postgres treats a partitioned-table REVOKE as parent-only — the
+    GRANT ALL ON ALL TABLES wildcard from 0006 leaves ``app_owner`` with
+    TRUNCATE on each yearly partition (``audit_log_y2026`` etc.). That
+    means TRUNCATE on a partition gets past the permission gate and hits
+    the per-partition ``audit_log_y2026_no_truncate`` BEFORE TRUNCATE
+    trigger registered in 0005 (the spec's EVENT TRIGGER pattern; the
+    migration uses statement-level triggers because Postgres doesn't
+    accept TRUNCATE TABLE as an event trigger tag — see the comment block
+    in 0005 lines 56-69).
+    """
+    _seed_account_and_audit_row(pg_engine)
+    with pytest.raises((DatabaseError, InternalError, ProgrammingError)) as excinfo:
+        with pg_engine.begin() as conn:
+            conn.execute(text("SET LOCAL ROLE app_owner"))
+            conn.execute(text("TRUNCATE TABLE audit_log_y2026"))
+    msg = str(excinfo.value).lower()
+    assert "truncate forbidden" in msg, f"expected trigger message, got: {msg}"
+    assert _pgcode(excinfo) == "P0001", (
+        f"expected SQLSTATE P0001 (raise_exception), got {_pgcode(excinfo)!r}"
+    )
+
+
+def test_audit_log_update_default_role_sqlstate_is_p0001(pg_engine: Engine) -> None:
+    """Locks SQLSTATE P0001 on the trigger path under the default superuser.
+
+    Complements ``test_audit_log_update_raises_immutability_exception`` by
+    asserting the SQLSTATE in addition to the message substring. Without
+    this, a future migration could downgrade RAISE EXCEPTION → RAISE
+    WARNING (SQLSTATE 01000) and the substring assertion alone would
+    keep passing while the trigger silently let the mutation through.
+    """
+    keys = _seed_account_and_audit_row(pg_engine)
+    with pytest.raises((DatabaseError, InternalError)) as excinfo:
+        with pg_engine.begin() as conn:
+            conn.execute(
+                text("UPDATE audit_log SET event_type = 'spoofed' WHERE sequence_no = :seq"),
+                {"seq": keys["sequence_no"]},
+            )
+    assert _pgcode(excinfo) == "P0001", (
+        f"expected SQLSTATE P0001 (raise_exception), got {_pgcode(excinfo)!r}"
+    )
+
+
+def test_audit_log_truncate_partition_default_role_sqlstate_is_p0001(
+    pg_engine: Engine,
+) -> None:
+    """Locks SQLSTATE P0001 on the per-partition TRUNCATE trigger path.
+
+    Complements ``test_audit_log_truncate_partition_also_raises``. Same
+    rationale as the UPDATE SQLSTATE lock above — guards against silent
+    severity downgrades on the per-partition triggers from 0005.
+    """
+    _seed_account_and_audit_row(pg_engine)
+    with pytest.raises((DatabaseError, InternalError, ProgrammingError)) as excinfo:
+        with pg_engine.begin() as conn:
+            conn.execute(text("TRUNCATE TABLE audit_log_y2026"))
+    assert _pgcode(excinfo) == "P0001", (
+        f"expected SQLSTATE P0001 (raise_exception), got {_pgcode(excinfo)!r}"
+    )
