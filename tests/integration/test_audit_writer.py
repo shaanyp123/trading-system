@@ -1,8 +1,9 @@
-"""Integration tests for :func:`services.audit.writer.append_audit_event`.
+"""Integration tests for :func:`services.audit.writer.append_audit_event`
+and :func:`services.audit.chain.verify_chain`.
 
 Spins up a fresh ``postgres:16`` testcontainer per module, runs
-``alembic upgrade head``, then exercises the writer over an asyncpg
-connection. Test cases:
+``alembic upgrade head``, then exercises the writer + walker over an
+asyncpg connection. Test cases:
 
 1. ``test_single_insert_computes_correct_hash_chain`` — a single insert's
    ``record_hash`` matches ``SHA-256(prev_hash || JCS(payload))``.
@@ -16,6 +17,11 @@ connection. Test cases:
 4. ``test_serialization_failure_triggers_retry_then_succeeds`` —
    deterministic injection of a SQLSTATE 40001 error on the first attempt
    exercises the retry control flow without relying on race conditions.
+5. ``test_verify_chain_count_matches_select_count`` — ``verify_chain``'s
+   third return value (rows-walked count) matches a separate
+   ``SELECT COUNT(*) FROM audit_log`` against the same DB state, locking
+   the SQL contract for the operator-runbook gate at
+   ``deploy/audit/README.md``.
 
 If Docker is unreachable on the runner, the module skips cleanly (same
 pattern as ``test_audit_immutability.py``).
@@ -41,7 +47,12 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from services.audit.chain import GENESIS_HASH, compute_record_hash, jcs_serialize
+from services.audit.chain import (
+    GENESIS_HASH,
+    compute_record_hash,
+    jcs_serialize,
+    verify_chain,
+)
 from services.audit.event_types import AuditEventType
 from services.audit.writer import append_audit_event
 
@@ -402,3 +413,97 @@ async def test_serialization_failure_triggers_retry_then_succeeds(
         persisted["prev_hash"], persisted["payload_jcs"]
     )
     assert persisted["record_hash"] == expected_record_hash
+
+
+@pytest.mark.asyncio
+async def test_verify_chain_count_matches_select_count(
+    async_session_factory: async_sessionmaker[AsyncSession],
+    sync_engine: Engine,
+    fresh_account_id: UUID,
+) -> None:
+    """``verify_chain`` rows-walked count == ``SELECT COUNT(*)`` after a
+    real chain has been built up by prior tests + fresh writes.
+
+    This locks the SQL contract for the operator-runbook gate: the
+    operator's "CHAIN OK: N rows verified" stdout line is true iff the
+    walker's count equals the table's row count, and the chain is
+    intact. We don't trust the count alone — we also assert the walker
+    returned ``ok = True`` and ``broken_at = None`` so the test fails
+    loudly if the walker silently degrades the contract.
+    """
+    # Append two rows so the chain has enough material to walk.
+    async with async_session_factory() as session:
+        await append_audit_event(
+            session,
+            AuditEventType.SYSTEM_STARTED,
+            {"probe": "verify_chain_count_1"},
+            account_id=fresh_account_id,
+            env="paper",
+            phase_at_emit=0,
+        )
+    async with async_session_factory() as session:
+        await append_audit_event(
+            session,
+            AuditEventType.SYSTEM_STARTED,
+            {"probe": "verify_chain_count_2"},
+            account_id=fresh_account_id,
+            env="paper",
+            phase_at_emit=0,
+        )
+
+    # Walk the whole chain.
+    async with async_session_factory() as session:
+        ok, broken_at, walked = await verify_chain(session)
+
+    # Independent count via the sync engine.
+    with sync_engine.connect() as conn:
+        actual_count = conn.execute(text("SELECT COUNT(*) FROM audit_log")).scalar_one()
+
+    assert ok is True
+    assert broken_at is None
+    assert walked == actual_count, (
+        f"verify_chain reported {walked} rows but SELECT COUNT(*) sees {actual_count}"
+    )
+    # The sequence is monotonic; we expect at least the two rows we just
+    # wrote (plus any from prior tests in this module-scoped DB).
+    assert walked >= 2
+
+
+@pytest.mark.asyncio
+async def test_cli_verify_function_runs_against_real_db(
+    pg_url: str,
+    fresh_account_id: UUID,
+    async_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """``services.audit.verify_chain._verify`` exercises engine lifecycle.
+
+    The CLI's ``_verify`` wrapper builds its own one-shot engine,
+    sessionmaker, and session — separate from the ``async_engine``
+    fixture used elsewhere in this module. This test forwards the
+    testcontainer's URL into ``_verify`` and asserts the same
+    ``(True, None, N)`` contract as the direct ``verify_chain`` call,
+    locking the engine-lifecycle path against real Postgres.
+
+    Without this test, ``_verify`` is exercised only at operator-runbook
+    time (``deploy/audit/README.md``) — the unit tests in
+    ``test_verify_chain_cli.py`` monkeypatch it out.
+    """
+    from services.audit.verify_chain import _verify as cli_verify
+
+    # Append a row so the chain has at least one element to walk.
+    async with async_session_factory() as session:
+        await append_audit_event(
+            session,
+            AuditEventType.SYSTEM_STARTED,
+            {"probe": "cli_verify_smoke"},
+            account_id=fresh_account_id,
+            env="paper",
+            phase_at_emit=0,
+        )
+
+    async_url = pg_url.replace("postgresql+psycopg2", "postgresql+asyncpg")
+    ok, broken_at, walked = await cli_verify(async_url)
+
+    assert ok is True
+    assert broken_at is None
+    assert walked >= 1
