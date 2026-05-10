@@ -16,58 +16,40 @@ past it.
 ## Prerequisites
 
 - Ashburn VPS reachable via SSH (`ssh root@178.156.239.84`).
-- `/opt/trading` checked out at the PR-#44 commit (`git pull origin main`
-  if the VPS is behind). Day 11 carryover (PR #47) added the missing
-  runtime deps to the api Dockerfile; if your image is older than 2026-05-12,
-  rebuild it: `cd /opt/trading && docker compose --env-file deploy/.env
-  build api && docker compose --env-file deploy/.env up -d --force-recreate api`.
+- `/opt/trading` checked out at the PR-#50 commit (the architectural
+  follow-up that ships the `services/webhook_pusher/Dockerfile` and
+  removes the `phase1` profile gate from the docker-compose stub —
+  `git pull origin main` if the VPS is behind). Day 11 carryover (PR #47)
+  also requires the api image to have httpx + 6 other runtime deps; if
+  the api image is older than 2026-05-12, rebuild it:
+  `docker compose --env-file deploy/.env build api && docker compose
+  --env-file deploy/.env up -d --force-recreate api`.
+- `webhook_pusher` container running. First-time bringup (or after a
+  Dockerfile change):
+  `docker compose --env-file deploy/.env build webhook_pusher && docker
+  compose --env-file deploy/.env up -d webhook_pusher`. Verify:
+  `docker compose --env-file deploy/.env ps webhook_pusher` shows
+  `Up`. The container's CMD is a `sleep infinity` placeholder that logs
+  one line at boot — operator runbook execs the CLI into it.
 - `secrets/paper.enc.yaml` decryption working. The age key lives at
   `/etc/credstore.encrypted/age_key` per `deploy/.env`'s `SOPS_AGE_KEY_FILE`;
   every sops invocation in this runbook needs that env var exported in
   the current shell. Day 6 carryover verified `wc -c == 64` on
   `app_service_password`; if `sops -d` errors, fix that before continuing.
-- `docker compose` `api` service healthy (`/api/health` returns 200 over
-  loopback). The webhook_pusher CLI runs from inside the api container
-  since the api image bundles the `services/` Python package.
 
-### Network attachment (Phase 0 only — see Step 0 below)
+### Architecture note (Day 11 carryover #2 + PR #50)
 
-The `api` service is on `trading_internal` (Docker `Internal: true` —
-no external internet by design; backend-spec §8.11 hardening).
-`webhook_pusher` HTTP calls to `discord.com` and `api.resend.com`
-therefore fail from inside the api container by default with
-`[Errno -3] Temporary failure in name resolution` — confirmed Day 11
-when this runbook was first executed end-to-end.
+The smoke runs from inside the **`webhook_pusher` container**, NOT the
+`api` container. Why: `api` is on `trading_internal` only (Docker
+`Internal: true` — no external internet by design; backend-spec §8.11
+hardening to limit blast radius if api is compromised). `webhook_pusher`
+is on `[internal, egress]` so it can reach `discord.com` and
+`api.resend.com`.
 
-The architecturally correct fix is to deploy `webhook_pusher` as its
-own service container (already stubbed in `docker-compose.yml` with
-`networks: [internal, egress]; profiles: ['phase1']`); that lands at
-Phase 1 cutover.
-
-Until then, **Step 0** below temporarily attaches the api container
-to `trading_egress` for the duration of the smoke, and **Step 8**
-disconnects it. The deployed config (docker-compose.yml) is
-unchanged — the attach/detach is purely runtime state on the VPS.
-
-## Step 0 — Temporarily attach api to `trading_egress` (Phase 0 workaround)
-
-```bash
-# api defaults to internal-only; add egress for outbound HTTP to
-# Discord + Resend. Reversed in Step 8.
-docker network connect trading_egress trading-api-1
-
-# Verify both networks are now attached:
-docker inspect trading-api-1 \
-  --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} ({{$v.IPAddress}}){{println}}{{end}}'
-# Expected:
-#   trading_egress (172.20.0.X)
-#   trading_internal (172.18.0.X)
-```
-
-**On mismatch:** if `docker network connect` errors with `Error
-response from daemon: endpoint with name trading-api-1 already
-exists in network trading_egress`, the api is already on egress
-(prior smoke run didn't disconnect cleanly). That's fine — proceed.
+Day 11 carryover #2 (decisions-log 2026-05-12) used a temporary
+`docker network connect trading_egress trading-api-1` workaround
+because the `webhook_pusher` container didn't exist yet. PR #50
+landed the dedicated container; that workaround is gone.
 
 ## Step 1 — Decrypt sops + extract webhook URLs
 
@@ -81,9 +63,10 @@ cd /opt/trading
 # sops --decrypt errors with "failed to load age identities".
 export SOPS_AGE_KEY_FILE=/etc/credstore.encrypted/age_key
 
-# Confirm we're at PR-#44+ (need services/webhook_pusher/cli.py).
-test -f services/webhook_pusher/cli.py || \
-  { echo "MISSING: services/webhook_pusher/cli.py — git pull origin main first"; exit 1; }
+# Confirm webhook_pusher container is running with the CLI baked in.
+docker compose --env-file deploy/.env exec -T webhook_pusher \
+  test -f /app/services/webhook_pusher/cli.py || \
+  { echo "MISSING: webhook_pusher container or cli.py inside it — rebuild via 'docker compose --env-file deploy/.env build webhook_pusher && docker compose --env-file deploy/.env up -d webhook_pusher'"; exit 1; }
 
 # Decrypt to a tmpfs path; never to disk.
 sops --decrypt secrets/paper.enc.yaml > /dev/shm/paper.decrypted.yaml
@@ -157,7 +140,7 @@ This step verifies the planner + sender + webhook URL all work without
 touching Postgres. Closes Step 4 of the Week 3 gate.
 
 ```bash
-docker compose --env-file deploy/.env exec -T api env \
+docker compose --env-file deploy/.env exec -T webhook_pusher env \
   WEBHOOK_PUSHER_DISCORD_ALERTS_URL=$WEBHOOK_PUSHER_DISCORD_ALERTS_URL \
   WEBHOOK_PUSHER_DISCORD_CRITICAL_URL=$WEBHOOK_PUSHER_DISCORD_CRITICAL_URL \
   WEBHOOK_PUSHER_RESEND_API_KEY=$WEBHOOK_PUSHER_RESEND_API_KEY \
@@ -235,7 +218,7 @@ ACCOUNT_ID="<UUID-FROM-STEP-4>"
 APP_SERVICE_PWD=$(awk '$1 == "app_service_password:" {print $2; exit}' \
   /dev/shm/paper.decrypted.yaml)
 
-docker compose --env-file deploy/.env exec -T api env \
+docker compose --env-file deploy/.env exec -T webhook_pusher env \
   WEBHOOK_PUSHER_DISCORD_ALERTS_URL=$WEBHOOK_PUSHER_DISCORD_ALERTS_URL \
   WEBHOOK_PUSHER_DISCORD_CRITICAL_URL=$WEBHOOK_PUSHER_DISCORD_CRITICAL_URL \
   WEBHOOK_PUSHER_RESEND_API_KEY=$WEBHOOK_PUSHER_RESEND_API_KEY \
@@ -343,14 +326,11 @@ not re-tested in production.
 # Wipe the decrypted secrets from tmpfs.
 shred -u /dev/shm/paper.decrypted.yaml
 
-# Disconnect api from trading_egress (revert Step 0; api back to
-# internal-only matching docker-compose.yml's deployed config).
-docker network disconnect trading_egress trading-api-1
-
-# Verify api is back to internal-only:
-docker inspect trading-api-1 \
-  --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{println}}{{end}}'
-# Expected: only `trading_internal`
+# Note: PR #50 dropped the `docker network disconnect trading_egress
+# trading-api-1` step that earlier versions of this runbook needed.
+# webhook_pusher now runs in its own container with `[internal, egress]`
+# baked into docker-compose.yml; the api container stays on
+# `trading_internal` only at all times.
 
 # Logout of the SSH session (env vars are subshell-local; closing the
 # shell discards them). Belt-and-suspenders:
