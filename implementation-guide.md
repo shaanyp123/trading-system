@@ -271,7 +271,7 @@ Operator learning allocation: 5–8 hours/week on Python basics, git operations,
       **Status (2026-05-05, Day 3):** DONE — alembic `0005_immutability.py` creates BEFORE UPDATE/DELETE row triggers + BEFORE TRUNCATE statement triggers (parent + each yearly partition). `tests/integration/test_audit_immutability.py` exercises all four cases against postgres:16 and passes.
 - [ ] Discord: send a test message via webhook URL → message appears in `#alerts`
       Done means: webhook delivery working
-      **Status (2026-05-09, Day 8):** Discord guild + 7 webhook URLs created Day 2; Ashburn → Discord round-trip proven Day 6 carryover (HTTP 204 from Ashburn IP; `Cloudflare-blocks-Hetzner-Discord` only affects Nuremberg watchdog). The actual `services/webhook_pusher/` alerts pipeline service that closes this gate is **Week 3 Thu IG task — not yet shipped**. Gate stays open until that service ships and an end-to-end alerts → `#alerts` → Discord trip is verified.
+      **Status (2026-05-11, Day 10):** `services/webhook_pusher/` shipped via PR #44 (Day 10 / Week 3 Thu) with planner + sender + dispatcher + CLI + 8-step operator runbook (`deploy/webhook_pusher/README.md`); 58 unit tests green (404/404 total). Discord guild + 7 webhook URLs created Day 2; Ashburn → Discord round-trip proven Day 6 carryover (HTTP 204; `Cloudflare-blocks-Hetzner-Discord` only affects Nuremberg watchdog, NOT Ashburn). **Gate closure binds on operator completing `deploy/webhook_pusher/README.md` Steps 3 + 5 + 6 on Ashburn** (Step 3 = bare-smoke P2 → `#alerts`; Step 5 = full P0 roundtrip → `#alerts` + `#critical` + Resend email; Step 6 = psql confirms `delivery_status` JSONB landed). Code ready; awaits operator runbook execution. See `Docs/decisions-log.md` "Day 10 09:00 — services/webhook_pusher/ alerts pipeline (PR #44)" entry.
 
 **Bonus shipped this Week (not on the Week 3 verification gate):**
 - `services/audit/writer.py` (PR #39, Day 8) — canonical hash-chain writer with `pg_advisory_xact_lock` + SERIALIZABLE + 5-attempt SQLSTATE-40001 retry; 22 unit tests for chain primitives + 4 testcontainers integration tests for the writer. Anti-pattern A01 ("DO NOT write to audit_log directly via INSERT") is enforceable from this PR forward. See `Docs/decisions-log.md` "Day 8 09:00 — services/audit/writer.py canonical hash-chain writer" entry.
@@ -1527,6 +1527,8 @@ Goal: operator can independently update a secret value when credentials rotate, 
 ---
 
 ## Day 10 (Friday, Week 2)
+
+> **Calendar mapping note (added 2026-05-11):** the operator's actual Day 10 = 2026-05-11 Monday, NOT this nominal Fri Week 2. The ~1-day cadence drift documented in `Docs/decisions-log.md` 2026-05-09 Day 8 + 2026-05-10 Day 9 calendar-mapping entries continues. The [CLAUDE_CODE] substance shifted to **Week 3 Thu** work — `services/webhook_pusher/` alerts pipeline (PR #44; see §3 Week 3 verification gate box 4 status note). The Day 10 [OPERATOR] tasks below (09:00 VPS startup walkthrough; 11:00 log-reading training; 14:00 Week 2 close-out) are largely already covered in spirit by the Day 5 + Day 6 carryover bringup work + Day 4 watchdog journald reads + ongoing PR-review surfaces; flagged as covered, not delivery gates. Week 2 close-out itself binds on DP-001 closure (IBKR approval window opens TODAY 2026-05-11), not on a calendar slot.
 
 **09:00 [OPERATOR]** Full VPS startup walkthrough.
 SSH into Hetzner VPS and run through the full startup sequence manually:
