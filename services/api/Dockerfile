@@ -36,6 +36,23 @@ COPY infrastructure/__init__.py infrastructure/
 COPY strategies/__init__.py strategies/
 
 # Pre-resolve runtime deps into the venv.
+#
+# Keep this list in sync with `pyproject.toml`'s `[project] dependencies`
+# block. Drift here breaks runtime imports — see Day 11 carryover entry
+# in `Docs/decisions-log.md` (2026-05-12) for the incident this comment
+# commemorates: webhook_pusher (PR #44, Day 10) added httpx + resend to
+# pyproject.toml but not to this list, and the Dockerfile build's import
+# sanity check did NOT catch it because services.api.main does not
+# transitively import services.webhook_pusher today. Discovered Day 11
+# when the operator runbook smoke (deploy/webhook_pusher/README.md)
+# tried to run `python -m services.webhook_pusher.cli` from inside the
+# api container and ImportError'd on httpx.
+#
+# Until a follow-up CI gate validates this list against pyproject.toml,
+# the workflow when adding a new runtime dep is:
+#   1. Add to `pyproject.toml` `[project] dependencies`
+#   2. Add to this list (with the same version pin)
+#   3. `docker compose build api` to verify
 RUN python -m venv /opt/venv \
     && /opt/venv/bin/pip install --upgrade pip wheel \
     && /opt/venv/bin/pip install hatchling \
@@ -49,7 +66,14 @@ RUN python -m venv /opt/venv \
         "alembic>=1.14" \
         "structlog>=24.4" \
         "argon2-cffi>=23.1" \
+        "pyotp>=2.9" \
         "uuid-utils>=0.10" \
+        "numpy>=2.1" \
+        "discord.py>=2.4" \
+        "httpx>=0.28" \
+        "apscheduler>=3.11" \
+        "resend>=2.4" \
+        "anthropic>=0.39" \
         "pyyaml>=6.0" \
         "psycopg2-binary>=2.9"
 
