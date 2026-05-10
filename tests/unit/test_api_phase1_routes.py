@@ -1,0 +1,785 @@
+"""Unit tests for the Day 15 / Week 5 Mon Phase-1 REST scaffold.
+
+Coverage matrix (mirrors backend-spec §4.1 / IG §3 Week 5 Mon list):
+
+  * §4.1.1 ``GET /api/auth/me``              — 1 happy + 1 schema-shape.
+  * §4.1.2 ``GET /api/signals``              — 1 happy (empty list)
+                                                + 1 status-filter passthrough.
+  * §4.1.2 ``POST /api/signals/:id/approve`` — 1 happy (501 stub)
+                                                + 1 schema-validation reject.
+  * §4.1.2 ``POST /api/signals/:id/reject``  — 1 happy (501 stub)
+                                                + 1 missing-diary 422.
+  * §4.1.2 ``POST /api/signals/:id/defer``   — 1 happy (501 stub).
+  * §4.1.3 ``GET /api/system/status``        — 1 happy (no-account fallback)
+                                                + 1 with-row populated.
+  * §4.1.3 ``GET /api/system/kill-switch``   — 1 happy (no-account fallback).
+  * §4.1.3 ``POST /api/system/kill-switch/invoke`` — 1 happy (501 stub)
+                                                       + 1 invalid-trigger 422.
+  * §4.1.3 ``POST /api/system/kill-switch/resume`` — 1 happy (501 stub)
+                                                       + 1 schema-shape.
+  * §4.1.5b ``GET /api/health-score``        — 1 happy (insufficient_data).
+  * §4.1.5b ``GET /api/today/digest``        — 1 happy (empty envelope).
+  * §4.1.5b ``GET /api/positions/current``   — 1 happy (empty list).
+  * §4.1.5b ``GET /api/orders``              — 1 happy (empty list)
+                                                + 1 limit-clamp.
+  * §4.1.5b ``GET /api/fills``               — 1 happy (empty list).
+  * §4.1.5b ``GET /api/alerts``              — 1 happy (empty list)
+                                                + 1 status+severity filter.
+  * Session stub                              — 1 stub-injected on protected
+                                                endpoint
+                                                + 1 exempt-path bypass.
+  * Cursor pagination                         — 1 encode/decode round-trip
+                                                + 1 invalid-cursor envelope.
+
+Each route gets a stub Phase1QueryRepo via ``override_dep`` (the helper
+defined in ``tests/unit/conftest.py``); the repo returns canned no-data /
+populated rows so the route's mapper code is exercised without testcontainers.
+
+The Day 5 ``test_api_*.py`` modules already exercise ``health`` + ``setup`` +
+``sse`` + middleware integration; this file only covers Day 15 surface.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+from typing import Any
+from uuid import UUID, uuid4
+
+import pytest
+from httpx import AsyncClient
+
+from services.api.repos.phase1 import (
+    AlertCountRow,
+    Phase1QueryRepo,
+    ReconciliationSummaryRow,
+    RiskStateRow,
+)
+from services.api.routes import (
+    alerts as alerts_route,
+)
+from services.api.routes import (
+    fills as fills_route,
+)
+from services.api.routes import (
+    orders as orders_route,
+)
+from services.api.routes import (
+    positions as positions_route,
+)
+from services.api.routes import (
+    signals as signals_route,
+)
+from services.api.routes import (
+    system as system_route,
+)
+from services.api.routes import (
+    today as today_route,
+)
+from services.api.routes._pagination import (
+    clamp_limit,
+    decode_cursor,
+    encode_cursor,
+)
+
+# ---------------------------------------------------------------------------
+# Stub repo
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _StubRepo:
+    """In-memory ``Phase1QueryRepo`` for unit tests."""
+
+    account_id: UUID | None = None
+    risk_row: RiskStateRow | None = None
+    recon_row: ReconciliationSummaryRow | None = None
+    watchdog_ping: datetime | None = None
+    pending_signals: int = 0
+    alert_counts: AlertCountRow | None = None
+    signals_page: tuple[list[dict[str, Any]], str | None, bool] = (
+        [],
+        None,
+        False,
+    )
+    positions_rows: list[dict[str, Any]] = None  # type: ignore[assignment]
+    orders_page: tuple[list[dict[str, Any]], str | None, bool] = (
+        [],
+        None,
+        False,
+    )
+    fills_page: tuple[list[dict[str, Any]], str | None, bool] = (
+        [],
+        None,
+        False,
+    )
+    alerts_page: tuple[list[dict[str, Any]], str | None, bool] = (
+        [],
+        None,
+        False,
+    )
+    nav: Decimal | None = None
+    last_signals_filter: dict[str, Any] | None = None
+    last_alerts_filter: dict[str, Any] | None = None
+    last_orders_filter: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if self.positions_rows is None:
+            self.positions_rows = []
+        if self.recon_row is None:
+            self.recon_row = ReconciliationSummaryRow(
+                last_check_utc=None,
+                last_check_passed=True,
+                open_breaks=0,
+                breaks_24h=0,
+            )
+        if self.alert_counts is None:
+            self.alert_counts = AlertCountRow(p0=0, p1=0, p2=0)
+
+    async def fetch_active_account_id(self) -> UUID | None:
+        return self.account_id
+
+    async def fetch_risk_state_current(self, account_id: UUID) -> RiskStateRow | None:
+        return self.risk_row
+
+    async def fetch_reconciliation_summary(self, account_id: UUID) -> ReconciliationSummaryRow:
+        assert self.recon_row is not None  # appeased post_init
+        return self.recon_row
+
+    async def fetch_watchdog_last_ping_utc(self, account_id: UUID) -> datetime | None:
+        return self.watchdog_ping
+
+    async def count_pending_signals(self, account_id: UUID) -> int:
+        return self.pending_signals
+
+    async def count_open_alerts_by_severity(self, account_id: UUID) -> AlertCountRow:
+        assert self.alert_counts is not None
+        return self.alert_counts
+
+    async def fetch_signals_page(
+        self,
+        account_id: UUID,
+        *,
+        status: str | None,
+        cursor: str | None,
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], str | None, bool]:
+        self.last_signals_filter = {"status": status, "cursor": cursor, "limit": limit}
+        return self.signals_page
+
+    async def fetch_positions_current(
+        self,
+        account_id: UUID,
+    ) -> list[dict[str, Any]]:
+        return self.positions_rows
+
+    async def fetch_orders_page(
+        self,
+        account_id: UUID,
+        *,
+        status: str | None,
+        cursor: str | None,
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], str | None, bool]:
+        self.last_orders_filter = {"status": status, "cursor": cursor, "limit": limit}
+        return self.orders_page
+
+    async def fetch_fills_page(
+        self,
+        account_id: UUID,
+        *,
+        cursor: str | None,
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], str | None, bool]:
+        return self.fills_page
+
+    async def fetch_alerts_page(
+        self,
+        account_id: UUID,
+        *,
+        status: str | None,
+        severity: str | None,
+        cursor: str | None,
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], str | None, bool]:
+        self.last_alerts_filter = {
+            "status": status,
+            "severity": severity,
+            "cursor": cursor,
+            "limit": limit,
+        }
+        return self.alerts_page
+
+    async def fetch_latest_balance_nav(self, account_id: UUID) -> Decimal | None:
+        return self.nav
+
+
+def _bind_repo(override_dep: Any, route_module: Any, repo: Phase1QueryRepo) -> None:
+    override_dep(route_module._get_repo, lambda: repo)
+
+
+# Double-submit CSRF tokens used for state-changing endpoints. Cookie + header
+# must MATCH (per services/api/middleware.CSRFMiddleware); the value is opaque.
+_CSRF_TOKEN = "test-csrf-token-day15"
+
+
+def _csrf_kwargs() -> dict[str, dict[str, str]]:
+    """Return cookie + header kwargs for a CSRF-protected POST request.
+
+    Mirrors the frontend's double-submit pattern: the same opaque token sits
+    in the ``__Host-csrf_token`` cookie AND the ``X-CSRF-Token`` header. The
+    middleware compares them for equality.
+    """
+    return {
+        "cookies": {"__Host-csrf_token": _CSRF_TOKEN},
+        "headers": {"X-CSRF-Token": _CSRF_TOKEN},
+    }
+
+
+# ---------------------------------------------------------------------------
+# Auth / session
+# ---------------------------------------------------------------------------
+
+
+class TestAuthMe:
+    @pytest.mark.asyncio
+    async def test_returns_phase0_stub_session_envelope(
+        self,
+        api_client: AsyncClient,
+    ) -> None:
+        response = await api_client.get("/api/auth/me")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["user_id"] == "phase0-stub-owner"
+        assert body["username"] == "operator"
+        assert body["role"] == "owner"
+        assert body["auth_strength"] == "weak"
+        assert body["webauthn_enrolled"] is False
+        assert body["totp_enrolled"] is False
+        assert body["last_uv_at"] is not None
+        assert body["session_expires_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_response_schema_has_no_extra_fields(
+        self,
+        api_client: AsyncClient,
+    ) -> None:
+        response = await api_client.get("/api/auth/me")
+        assert response.status_code == 200
+        body = response.json()
+        expected = {
+            "user_id",
+            "username",
+            "role",
+            "auth_strength",
+            "last_uv_at",
+            "session_expires_at",
+            "webauthn_enrolled",
+            "totp_enrolled",
+        }
+        assert set(body.keys()) == expected
+
+
+class TestSessionStub:
+    @pytest.mark.asyncio
+    async def test_health_endpoint_is_session_exempt(
+        self,
+        api_client: AsyncClient,
+    ) -> None:
+        # /api/health was Day 5; should still pass through without a session.
+        response = await api_client.get("/api/health")
+        # Day 5 health route returns 503 if pool isn't initialized; the
+        # important thing is that the session middleware did not 401.
+        assert response.status_code in (200, 503)
+
+    @pytest.mark.asyncio
+    async def test_protected_endpoint_gets_phase0_session(
+        self,
+        api_client: AsyncClient,
+    ) -> None:
+        # Hits /api/auth/me without any cookie; should get the stub session.
+        response = await api_client.get("/api/auth/me")
+        assert response.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Signals
+# ---------------------------------------------------------------------------
+
+
+class TestListSignals:
+    @pytest.mark.asyncio
+    async def test_no_active_account_returns_empty_list(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(account_id=None)
+        _bind_repo(override_dep, signals_route, repo)
+        response = await api_client.get("/api/signals")
+        assert response.status_code == 200
+        body = response.json()
+        assert body == {"items": [], "next_cursor": None, "has_more": False}
+
+    @pytest.mark.asyncio
+    async def test_status_filter_passes_through_to_repo(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(account_id=uuid4())
+        _bind_repo(override_dep, signals_route, repo)
+        response = await api_client.get("/api/signals?status=pending&limit=25")
+        assert response.status_code == 200
+        assert repo.last_signals_filter == {
+            "status": "pending",
+            "cursor": None,
+            "limit": 25,
+        }
+
+
+class TestSignalApprove:
+    @pytest.mark.asyncio
+    async def test_returns_501_stub_with_canonical_envelope(
+        self,
+        api_client: AsyncClient,
+    ) -> None:
+        signal_id = uuid4()
+        response = await api_client.post(
+            f"/api/signals/{signal_id}/approve",
+            json={"override_size": 3},
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 501
+        body = response.json()
+        assert body["error_code"] == "SIGNAL_HANDLER_NOT_WIRED"
+        assert "Week 4 Wed" in body["message"]
+
+    @pytest.mark.asyncio
+    async def test_unknown_field_rejected_with_validation_error(
+        self,
+        api_client: AsyncClient,
+    ) -> None:
+        signal_id = uuid4()
+        response = await api_client.post(
+            f"/api/signals/{signal_id}/approve",
+            json={"override_size": 3, "extra": "nope"},
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 422
+        body = response.json()
+        assert body["error_code"] == "VALIDATION_ERROR"
+
+
+class TestSignalReject:
+    @pytest.mark.asyncio
+    async def test_with_diary_entry_returns_501_stub(
+        self,
+        api_client: AsyncClient,
+    ) -> None:
+        signal_id = uuid4()
+        response = await api_client.post(
+            f"/api/signals/{signal_id}/reject",
+            json={
+                "decision_diary_entry": {
+                    "tag": "data_concern",
+                    "reasoning_text": "vol regime is elevated above z=2 threshold",
+                },
+            },
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 501
+        assert response.json()["error_code"] == "SIGNAL_HANDLER_NOT_WIRED"
+
+    @pytest.mark.asyncio
+    async def test_missing_diary_entry_returns_422(
+        self,
+        api_client: AsyncClient,
+    ) -> None:
+        signal_id = uuid4()
+        response = await api_client.post(
+            f"/api/signals/{signal_id}/reject",
+            json={},
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 422
+
+
+class TestSignalDefer:
+    @pytest.mark.asyncio
+    async def test_with_diary_entry_returns_501_stub(
+        self,
+        api_client: AsyncClient,
+    ) -> None:
+        signal_id = uuid4()
+        response = await api_client.post(
+            f"/api/signals/{signal_id}/defer",
+            json={
+                "decision_diary_entry": {
+                    "tag": "manual_judgment",
+                    "reasoning_text": "want to wait for FOMC tomorrow before adding risk",
+                },
+            },
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 501
+
+
+# ---------------------------------------------------------------------------
+# System / kill-switch
+# ---------------------------------------------------------------------------
+
+
+class TestSystemStatus:
+    @pytest.mark.asyncio
+    async def test_no_account_returns_default_normal_state(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(account_id=None)
+        _bind_repo(override_dep, system_route, repo)
+        response = await api_client.get("/api/system/status")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["risk_state"] == "NORMAL"
+        assert body["severity"] is None
+        assert body["halt_reason"] is None
+        assert body["halt_dwell_session_count"] is None
+        assert body["convalescent_session_count"] is None
+        assert body["vacation_active"] is False
+        assert body["reconciliation_summary"]["open_breaks"] == 0
+        assert body["reconciliation_summary"]["last_check_passed"] is True
+        # Epoch sentinel for never-run watchdog
+        assert body["watchdog_last_ping_utc"].startswith("1970-01-01")
+        assert body["server_now"] is not None
+        assert body["backend_version"] == "test"
+
+    @pytest.mark.asyncio
+    async def test_halt_new_state_populates_halt_reason(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        account_id = uuid4()
+        now = datetime.now(tz=UTC)
+        repo = _StubRepo(
+            account_id=account_id,
+            risk_row=RiskStateRow(
+                state="HALT_NEW",
+                severity="routine",
+                reason="trailing_dd_breach",
+                entered_at_utc=now,
+                convalescent_session_count=0,
+                vacation_active=False,
+                vacation_until_utc=None,
+                audit_event_uuid=uuid4(),
+            ),
+        )
+        _bind_repo(override_dep, system_route, repo)
+        response = await api_client.get("/api/system/status")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["risk_state"] == "HALT_NEW"
+        assert body["severity"] == "routine"
+        assert body["halt_reason"] == "trailing_dd_breach"
+        assert body["halt_dwell_session_count"] == 0
+        assert body["convalescent_session_count"] is None
+
+
+class TestKillSwitchStatus:
+    @pytest.mark.asyncio
+    async def test_no_account_returns_default_normal(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(account_id=None)
+        _bind_repo(override_dep, system_route, repo)
+        response = await api_client.get("/api/system/kill-switch")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["risk_state"] == "NORMAL"
+        assert body["severity"] is None
+        assert body["halt_reason"] is None
+        assert body["last_transition_audit_event_uuid"] is None
+
+
+class TestKillSwitchInvoke:
+    @pytest.mark.asyncio
+    async def test_valid_body_returns_501_stub(
+        self,
+        api_client: AsyncClient,
+    ) -> None:
+        response = await api_client.post(
+            "/api/system/kill-switch/invoke",
+            json={"trigger": "manual_judgment", "reason": "operator paused"},
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 501
+        body = response.json()
+        assert body["error_code"] == "KILL_SWITCH_HANDLER_NOT_WIRED"
+        assert "dispatcher" in body["message"]
+
+    @pytest.mark.asyncio
+    async def test_invalid_trigger_returns_422(
+        self,
+        api_client: AsyncClient,
+    ) -> None:
+        response = await api_client.post(
+            "/api/system/kill-switch/invoke",
+            json={"trigger": "not_a_real_trigger", "reason": "x"},
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 422
+
+
+class TestKillSwitchResume:
+    @pytest.mark.asyncio
+    async def test_no_body_treated_as_empty_returns_501_stub(
+        self,
+        api_client: AsyncClient,
+    ) -> None:
+        response = await api_client.post(
+            "/api/system/kill-switch/resume",
+            json={},
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 501
+
+    @pytest.mark.asyncio
+    async def test_with_incident_review_id_returns_501_stub(
+        self,
+        api_client: AsyncClient,
+    ) -> None:
+        response = await api_client.post(
+            "/api/system/kill-switch/resume",
+            json={"incident_review_id": "INC-2026-001"},
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 501
+
+
+# ---------------------------------------------------------------------------
+# Today / health-score
+# ---------------------------------------------------------------------------
+
+
+class TestHealthScore:
+    @pytest.mark.asyncio
+    async def test_returns_phase0_insufficient_data_envelope(
+        self,
+        api_client: AsyncClient,
+    ) -> None:
+        response = await api_client.get("/api/health-score")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["insufficient_data"] is True
+        assert body["traffic_light"] == "yellow"
+        assert body["composite"] == 0
+        assert len(body["components"]) == 5
+        # Five locked component names
+        names = [c["name"] for c in body["components"]]
+        assert names == [
+            "live_sharpe_vs_backtest",
+            "slippage_drift",
+            "hit_rate",
+            "capacity_headroom",
+            "days_since_recon_break",
+        ]
+        # Weights sum to 100
+        total_weight = sum(c["weight_pct"] for c in body["components"])
+        assert total_weight == 100
+        # All scores null with insufficient_data=True
+        for component in body["components"]:
+            assert component["score"] is None
+            assert component["insufficient_data"] is True
+
+
+class TestTodayDigest:
+    @pytest.mark.asyncio
+    async def test_no_account_returns_zero_envelope(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(account_id=None)
+        _bind_repo(override_dep, today_route, repo)
+        response = await api_client.get("/api/today/digest")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["health_score"]["insufficient_data"] is True
+        assert body["pnl"]["daily_pnl"] == "0"
+        assert body["queued_signals_count"] == 0
+        assert body["active_alerts_count_by_severity"] == {"P0": 0, "P1": 0, "P2": 0}
+        assert body["state"] == "NORMAL"
+        assert body["state_severity"] is None
+        assert body["agent_status"] == "disabled"
+        assert body["environment"] == "dev"
+
+    @pytest.mark.asyncio
+    async def test_vacation_active_overrides_state_to_vacation(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        account_id = uuid4()
+        now = datetime.now(tz=UTC)
+        repo = _StubRepo(
+            account_id=account_id,
+            risk_row=RiskStateRow(
+                state="NORMAL",
+                severity=None,
+                reason=None,
+                entered_at_utc=now,
+                convalescent_session_count=0,
+                vacation_active=True,
+                vacation_until_utc=now + timedelta(days=3),
+                audit_event_uuid=uuid4(),
+            ),
+            pending_signals=2,
+            alert_counts=AlertCountRow(p0=0, p1=1, p2=3),
+        )
+        _bind_repo(override_dep, today_route, repo)
+        response = await api_client.get("/api/today/digest")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["state"] == "VACATION"
+        assert body["queued_signals_count"] == 2
+        assert body["active_alerts_count_by_severity"] == {"P0": 0, "P1": 1, "P2": 3}
+
+
+# ---------------------------------------------------------------------------
+# Positions / orders / fills / alerts
+# ---------------------------------------------------------------------------
+
+
+class TestPositionsCurrent:
+    @pytest.mark.asyncio
+    async def test_no_account_returns_empty_envelope_with_as_of(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(account_id=None)
+        _bind_repo(override_dep, positions_route, repo)
+        response = await api_client.get("/api/positions/current")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["positions"] == []
+        assert body["as_of"] is not None
+
+
+class TestListOrders:
+    @pytest.mark.asyncio
+    async def test_no_account_returns_empty_envelope(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(account_id=None)
+        _bind_repo(override_dep, orders_route, repo)
+        response = await api_client.get("/api/orders")
+        assert response.status_code == 200
+        assert response.json() == {
+            "orders": [],
+            "next_cursor": None,
+            "has_more": False,
+        }
+
+    @pytest.mark.asyncio
+    async def test_limit_above_max_rejected_with_422(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(account_id=uuid4())
+        _bind_repo(override_dep, orders_route, repo)
+        response = await api_client.get("/api/orders?limit=999")
+        assert response.status_code == 422
+
+
+class TestListFills:
+    @pytest.mark.asyncio
+    async def test_no_account_returns_empty_envelope(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(account_id=None)
+        _bind_repo(override_dep, fills_route, repo)
+        response = await api_client.get("/api/fills")
+        assert response.status_code == 200
+        assert response.json() == {
+            "fills": [],
+            "next_cursor": None,
+            "has_more": False,
+        }
+
+
+class TestListAlerts:
+    @pytest.mark.asyncio
+    async def test_no_account_returns_empty_envelope(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(account_id=None)
+        _bind_repo(override_dep, alerts_route, repo)
+        response = await api_client.get("/api/alerts")
+        assert response.status_code == 200
+        assert response.json() == {
+            "alerts": [],
+            "next_cursor": None,
+            "has_more": False,
+        }
+
+    @pytest.mark.asyncio
+    async def test_status_and_severity_filters_pass_through(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(account_id=uuid4())
+        _bind_repo(override_dep, alerts_route, repo)
+        response = await api_client.get("/api/alerts?status=open&severity=P0&limit=10")
+        assert response.status_code == 200
+        assert repo.last_alerts_filter == {
+            "status": "open",
+            "severity": "P0",
+            "cursor": None,
+            "limit": 10,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Cursor pagination helper
+# ---------------------------------------------------------------------------
+
+
+class TestCursorPagination:
+    def test_encode_decode_round_trip(self) -> None:
+        ts = datetime(2026, 5, 10, 17, 30, 45, 123456, tzinfo=UTC)
+        row_id = "0190a1b2-c3d4-7000-8000-000000000001"
+        cursor = encode_cursor(ts, row_id)
+        decoded_ts, decoded_id = decode_cursor(cursor)
+        assert decoded_ts == ts
+        assert decoded_id == row_id
+
+    def test_invalid_cursor_raises_app_error(self) -> None:
+        from services.api.errors import AppError
+
+        with pytest.raises(AppError) as exc:
+            decode_cursor("not-a-real-cursor-value!!!")
+        assert exc.value.error_code == "INVALID_CURSOR"
+        assert exc.value.status_code == 400
+
+    def test_clamp_limit_returns_default_when_none(self) -> None:
+        assert clamp_limit(None) == 50
+
+    def test_clamp_limit_caps_at_max(self) -> None:
+        assert clamp_limit(500) == 200
+
+    def test_clamp_limit_floors_at_min(self) -> None:
+        assert clamp_limit(0) == 1
