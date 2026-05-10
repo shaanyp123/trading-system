@@ -1,0 +1,15 @@
+{
+  "sequence_no": 1046,
+  "event_type": "system_stopped",
+  "source_clock_ts": "2026-05-04T22:30:00.000+00:00",
+  "qc_algorithm_version": "v1-trend-following-9d2f7a1c",
+  "payload": {
+    "reason": "operator_initiated",
+    "stopped_by": "operator",
+    "stopped_via": "discord_command",
+    "graceful_shutdown": true,
+    "last_signal_processed_seq": 12340,
+    "last_audit_log_seq": 87654,
+    "in_flight_orders_count": 0
+  }
+}

@@ -302,8 +302,9 @@ Operator learning allocation: 5–8 hours/week on Python basics, git operations,
 - **Fri:** `[BOTH]` Run full golden test suite: `pytest tests/golden/ -v`. Review any failures with Claude Code. `[OPERATOR]` Read the test output; confirm understanding of what each golden test asserts.
 
 **Verification gate (end of Week 4):**
-- [ ] `pytest tests/golden/ -v` passes all 5 golden test cases
+- [x] `pytest tests/golden/ -v` passes all 5 golden test cases
       Done means: QC adapter produces byte-for-byte identical `record_hash` for each representative session event
+      **Status (2026-05-12, Day 11):** DONE — `tests/golden/` shipped via PR #45 (Day 11 / Week 4 Mon) with 18 tests across 5 `Test*` classes covering byte-for-byte `record_hash` for the 5 representative QC session events (`signal_emitted`, `order_filled`, `reconciliation_check_passed`, `kill_switch_triggered`, `system_stopped` — locked taxonomy from `services/audit/event_types.py`, NOT IG's casual prose), sequential chain composition with baked-in tail hex, parser-is-payload-identity round-trip via `services.qc_adapter.payloads.parse_jsonl_record`, "modulo three mutable fields" recursive walk for `{ingest_clock_ts, ingest_uuid, sequence_no}` audit-side metadata, and fixture sanity asserts. A22 enforced: pure Python, zero `audit_log` INSERTs, zero testcontainers, zero mocking. `make test-golden` runs in 0.61s; full `make test` runs 412/412 green. See `Docs/decisions-log.md` "Day 11 09:00 — tests/golden/ QC adapter parity suite (PR #45)" entry.
 - [ ] `python3 services/audit/verify_chain.py --env paper` returns `CHAIN OK: N rows verified`
       Done means: audit chain is intact; no broken prev_hash links
 - [ ] `docker compose logs audit` shows `advisory_lock_acquired` and `SERIALIZABLE_retry` log lines from concurrency test
