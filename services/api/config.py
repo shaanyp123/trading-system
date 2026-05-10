@@ -76,6 +76,23 @@ class APISettings(BaseSettings):
     # if the dev environment uses a separate localhost port.
     cors_allow_origins: list[str] = Field(default_factory=list)
 
+    # --- rate limiting (Day 17 — IG §3 Week 5 Wed) ------------------------
+    # Fixed-window counters per (client_ip, bucket). The api enforces these
+    # rather than Caddy because the stock `caddy:2-alpine` image lacks the
+    # `mholt/caddy-ratelimit` community module; rather than fork the Caddy
+    # build (xcaddy + custom image push) for Phase 0, the spec contract is
+    # met via in-process Python middleware. Phase 1 can revisit if Caddy-edge
+    # filtering is justified by real load. See Docs/decisions-log.md
+    # "2026-05-10 — Day 17 09:00" entry for the rationale.
+    #
+    # Two buckets per IG §3 Week 5 Wed:
+    #   - general: 100 req / 10s on /api/** (excl. /api/auth/**, /api/health,
+    #     /api/internal/watchdog, /api/sse/events)
+    #   - auth:      5 req / 10s on /api/auth/** (brute-force-conscious)
+    rate_limit_window_seconds: float = Field(default=10.0)
+    rate_limit_general_per_window: int = Field(default=100)
+    rate_limit_auth_per_window: int = Field(default=5)
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> APISettings:

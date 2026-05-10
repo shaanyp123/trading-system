@@ -240,9 +240,12 @@ services/monitoring/**
 infrastructure/retry/**
 infrastructure/broker_reconnect/**
 infrastructure/logging/**
+watchdog/**
 ```
 
 Hot-fixes in these paths can auto-deploy. Auto-rollback fires within 30 min if metrics breach. Still run tests locally before pushing.
+
+> `watchdog/**` is the Hetzner Nuremberg external watchdog (`watchdog/watchdog.py` + systemd unit + timer). Codified onto the hot-fix whitelist Day 17 (2026-05-10): the watchdog runs OFF the primary VPS and is alert-only (no authority to halt or modify backend state per backend-spec §1.6), so the same "small, observable, reversible" property that justifies the other paths applies. Note that `auto-deploy` here means the same workflow as other entries — CI green, image push, VPS pull — except the watchdog binary is deployed via `scp` + systemd reload per `watchdog/README.md` (the watchdog VPS does not run Docker). The 30-min auto-rollback window applies via systemd `Restart=on-failure` on the timer's `OnUnitActiveSec=5min` cadence — a broken watchdog binary fails its first tick and the systemd journal surfaces the error.
 
 ---
 
