@@ -317,3 +317,135 @@ That's it.
 
 - **2027-05-05** — rotate `paper` age key (existing reminder); renew
   `POSTGRES_SUPERUSER_PASSWORD` opportunistically at the same time.
+
+---
+
+## Day 17 — Caddy reload (DP-003 SSE timeout fix) + rate-limit verification
+
+Day 17 (2026-05-10) ships two changes that need a Caddy reload + an api
+restart on Ashburn after the PR merges:
+
+- **DP-003 fix** — `deploy/Caddyfile` raises the server-level `write` timeout
+  from `30s` → `24h`. Caddy's `write` is the *max time to write the entire
+  response*, not the per-write window; SSE responses are infinite, so the
+  prior `write 30s` was closing the h2 stream at exactly 30.2s (the
+  `CURLE_HTTP2_STREAM` exit-92 the Day 16 carryover external curl saw).
+  Matches the existing `idle 24h` philosophy.
+- **API-side rate limiting** — `services/api/middleware.py` adds
+  `RateLimitMiddleware`: 100 req / 10s per IP on `/api/**` (general bucket);
+  5 req / 10s per IP on `/api/auth/**` (auth bucket); `/api/health`,
+  `/api/internal/watchdog`, `/api/sse/events` exempt. Done in the api rather
+  than Caddy because `caddy:2-alpine` doesn't include `mholt/caddy-ratelimit`
+  and a custom xcaddy build was deferred per Day 17 PR rationale.
+
+### Step 1 — Pull + rebuild
+
+```bash
+ssh root@178.156.239.84
+cd /opt/trading
+git fetch origin main
+git pull origin main   # fast-forward to the Day 17 PR commit
+docker compose --env-file deploy/.env build api
+```
+
+### Step 2 — Reload Caddy (picks up new Caddyfile)
+
+Caddy v2 hot-reloads its config without dropping connections via SIGUSR1
+or `caddy reload`. Inside the container:
+
+```bash
+docker compose --env-file deploy/.env exec caddy caddy reload --config /etc/caddy/Caddyfile
+# Expected: no output. Errors (if any) print to stderr — fail fast.
+```
+
+If `caddy reload` rejects the new file (syntax error, etc.), the old
+config keeps serving — no outage. Roll forward by fixing the file and
+re-running. **Do not** restart the caddy container as the recovery path
+during business hours — drop the connection-graceful reload and only
+restart if reload won't take.
+
+### Step 3 — Force-recreate api (picks up new middleware)
+
+```bash
+docker compose --env-file deploy/.env up -d --force-recreate api
+# Watch for "api_ready" log line:
+docker compose --env-file deploy/.env logs -f --tail 0 api | head -20
+```
+
+### Step 4 — Verify DP-003 fix: two-surface SSE smoke
+
+**(a) Loopback** — confirm the multiplexer is still emitting `event: ping`
+every 30s (regression guard; same check as Day 16 carryover):
+
+```bash
+docker compose --env-file deploy/.env exec api \
+  curl -s --max-time 80 -N --no-buffer http://localhost:8000/api/sse/events | head -30
+```
+
+Expected: ≥2 `event: ping` frames at 30s cadence in 80 seconds, each with
+the canonical envelope (`{"type": "ping", "sequence_no": <N>, "server_now": ...}`).
+
+**(b) External (the actual DP-003 gate)** — from the operator's laptop:
+
+```bash
+curl --no-buffer --max-time 95 -N https://spratcapital.com/api/sse/events | head -30
+```
+
+Expected: ≥2 `event: ping` frames in a 65-second window (the Day 16
+carryover's external curl reset at 30.2s; this MUST sustain past 60s now).
+Exit code 0 (or 28 timeout — fine, just means we hit `--max-time` after
+draining frames), NOT 92 (`CURLE_HTTP2_STREAM`).
+
+If the external curl still resets at ~30s after the Day 17 PR is deployed:
+- Confirm Caddy actually reloaded: `docker compose ... exec caddy caddy adapt --config /etc/caddy/Caddyfile --pretty | grep -A2 write` should show `"write": "24h0m0s"`.
+- Confirm api is on the Day-17 commit: `docker compose ... exec api python -c "from services.api.middleware import RateLimitMiddleware; print(RateLimitMiddleware)"`.
+
+### Step 5 — Verify rate limiting (the Week 5 Fri [OPERATOR] gate)
+
+```bash
+# General bucket — 100/10s limit. The 101st request must be 429.
+for i in $(seq 1 105); do
+  curl -s -o /dev/null -w "%{http_code} " https://spratcapital.com/api/today/digest
+done; echo
+# Expected: ~100 200s (or 401s — depends on auth state), then several 429s.
+
+# Auth bucket — 5/10s limit. The 6th request must be 429.
+for i in $(seq 1 10); do
+  curl -s -o /dev/null -w "%{http_code} " https://spratcapital.com/api/auth/me
+done; echo
+# Expected: 5 codes (200 or 401), then several 429s.
+
+# /api/health MUST NOT be rate-limited (watchdog hits it every 5 min).
+for i in $(seq 1 110); do
+  curl -s -o /dev/null -w "%{http_code} " https://spratcapital.com/api/health
+done; echo
+# Expected: 110 × 200 — never any 429.
+```
+
+### Step 6 — Rollback path (if any of Steps 4–5 fail)
+
+Caddy reload is graceful (old config keeps serving on reload failure).
+The api change is a force-recreate; rollback is a single `docker compose
+... up -d --force-recreate api` against the prior commit's image. Both
+have ~30s blast radius. If the rate-limit middleware proves overly
+aggressive (false 429s on legitimate traffic), the operator can raise
+the limits via `deploy/.env` overrides without redeploy:
+
+```bash
+# Add to /opt/trading/deploy/.env:
+API_RATE_LIMIT_GENERAL_PER_WINDOW=200
+API_RATE_LIMIT_AUTH_PER_WINDOW=10
+# Then:
+docker compose --env-file deploy/.env up -d --force-recreate api
+```
+
+The Pydantic settings layer picks these up automatically — they map to
+`APISettings.rate_limit_general_per_window` and
+`APISettings.rate_limit_auth_per_window`.
+
+### Smoke-tested via
+
+The Day 17 PR commit message includes `Smoke-tested via: deploy/api/README.md
+"Day 17 — Caddy reload" Steps 2–5` per dev-guide §6.8 A27 (Caddy config
+changes are third-party platform changes). The runbook above IS the
+satisfier.

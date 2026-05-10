@@ -9,10 +9,23 @@
 {
 	email {$ACME_EMAIL}
 	servers {
+		# DP-003 (Day 17, 2026-05-10) — Caddy's `write` timeout caps the time to
+		# write the entire response, NOT the per-write window. SSE responses are
+		# infinite, so a 30s write cap closes the h2 stream at exactly 30s (the
+		# Day 16 carryover external curl saw CURLE_HTTP2_STREAM exit 92 at 30.2s).
+		# `idle 24h` does NOT cover this because the connection is actively
+		# writing between pings (so it's never "idle"). Raising `write 30s` →
+		# `write 24h` matches `idle 24h` and unblocks the SSE multiplexer's
+		# 30s-cadence `event: ping` heartbeat from h2 stream resets. Risk:
+		# none material — non-SSE responses complete in milliseconds; a malicious
+		# client tying up a write slot is constrained by the api-side rate limit
+		# middleware (services/api/middleware.py `RateLimitMiddleware`, Day 17).
+		# See Docs/decisions-log.md "Day 17 09:00" entry + implementation-guide.md
+		# §8 DP register row DP-003.
 		timeouts {
 			read_body 10s
 			read_header 5s
-			write 30s
+			write 24h
 			idle 24h # long-lived SSE connections need this
 		}
 	}
