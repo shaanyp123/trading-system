@@ -1,4 +1,4 @@
-.PHONY: help install lint format typecheck test test-unit test-integration test-golden ci all clean
+.PHONY: help install lint format typecheck test test-unit test-integration test-golden dep-drift-check ci all clean
 
 PYTHON ?= python3
 PIP ?= $(PYTHON) -m pip
@@ -11,7 +11,8 @@ help:
 	@echo "  make typecheck     — mypy --strict on services + infrastructure + strategies"
 	@echo "  make test          — pytest with coverage"
 	@echo "  make test-unit     — pytest tests/unit only"
-	@echo "  make ci            — what CI runs: lint + typecheck + test"
+	@echo "  make dep-drift-check — diff pyproject runtime deps vs api Dockerfile pip-install list"
+	@echo "  make ci            — what CI runs: lint + dep-drift-check + typecheck + test"
 	@echo "  make all           — format + lint + typecheck + test"
 
 install:
@@ -40,9 +41,12 @@ test-integration:
 test-golden:
 	$(PYTHON) -m pytest tests/golden -m golden
 
-ci: lint typecheck test
+dep-drift-check:
+	$(PYTHON) scripts/check_dockerfile_deps_against_pyproject.py
 
-all: format lint typecheck test
+ci: lint dep-drift-check typecheck test
+
+all: format lint dep-drift-check typecheck test
 
 clean:
 	find . -type d -name __pycache__ -prune -exec rm -rf {} \;

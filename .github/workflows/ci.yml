@@ -30,6 +30,25 @@ jobs:
       - name: ruff check
         run: ruff check .
 
+  dep-drift-check:
+    name: dep drift (Dockerfile vs pyproject)
+    # Closes the loop on the Day 11 carryover root cause (PR #47): PR #44
+    # added httpx + resend to pyproject.toml runtime deps but did NOT
+    # update the api Dockerfile's hardcoded pip-install list. The
+    # Dockerfile builder's import sanity check did NOT catch it because
+    # services.api.main doesn't transitively import services.webhook_pusher
+    # today; the ImportError only surfaced when the operator runbook smoke
+    # ran from inside the api container. This job fails CI on any future
+    # drift between the two lists at the SAME PR that introduces it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Diff pyproject runtime deps vs Dockerfile pip-install list
+        run: python3 scripts/check_dockerfile_deps_against_pyproject.py
+
   gitleaks:
     name: gitleaks (secret scan)
     runs-on: ubuntu-latest

@@ -48,11 +48,14 @@ COPY strategies/__init__.py strategies/
 # tried to run `python -m services.webhook_pusher.cli` from inside the
 # api container and ImportError'd on httpx.
 #
-# Until a follow-up CI gate validates this list against pyproject.toml,
-# the workflow when adding a new runtime dep is:
+# Drift between this list and pyproject.toml's [project] dependencies
+# is enforced by `scripts/check_dockerfile_deps_against_pyproject.py`,
+# wired into CI as the `dep-drift-check` job in `.github/workflows/ci.yml`.
+# The workflow when adding a new runtime dep is:
 #   1. Add to `pyproject.toml` `[project] dependencies`
 #   2. Add to this list (with the same version pin)
-#   3. `docker compose build api` to verify
+#   3. `python3 scripts/check_dockerfile_deps_against_pyproject.py` (local check)
+#   4. `docker compose --env-file deploy/.env build api` to verify the build
 RUN python -m venv /opt/venv \
     && /opt/venv/bin/pip install --upgrade pip wheel \
     && /opt/venv/bin/pip install hatchling \
