@@ -1109,6 +1109,8 @@ sops -d secrets/live.enc.yaml | grep -A3 webauthn
 
 Specific, ordered, time-approximate tasks. All tasks reference the pre-Phase-0 checklist (§2) for account prereqs.
 
+> **§11 SCOPE NOTE (added Day 13 / 2026-05-10 — recurring follow-up resolved):** §11 covers Days 1–10 only. **For Days 11+ trust dated entries in `Docs/decisions-log.md`** (`### YYYY-MM-DD — Day N — ...`) **and the Week 4+ blocks in §3** (Phase 0 weekly plan). Operator's actual day-of-execution may also drift ±1 calendar day from §11's nominal day-of-week labels (lock entered Day 8 calendar mapping; carries forward through Day 13). When §11 + §3 + decisions-log disagree on what "Day N" means, **decisions-log wins** (it's the canonical record of what actually happened). When unsure which day's substance to work on, the operator's session prompt is authoritative.
+
 > **Day 1 status:** ✅ COMPLETED 2026-05-05. All tasks executed. Concrete values captured in `Docs/decisions-log.md`. The procedural steps below remain the canonical template; deviations and actuals (Hetzner DC, watchdog DC, QC pricing, GitHub Pro) are in the decisions log.
 
 ---
