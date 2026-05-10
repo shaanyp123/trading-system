@@ -27,6 +27,7 @@ from contextlib import asynccontextmanager
 import structlog
 from fastapi import FastAPI
 
+from services.api import sse as sse_multiplexer
 from services.api.config import APISettings, get_settings
 from services.api.db import close_pool, init_pool, session_scope
 from services.api.errors import register_error_handlers
@@ -114,6 +115,8 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         version=settings.version,
     )
     await init_pool(settings)
+    sse_multiplexer.reset_state()
+    sse_multiplexer.start_heartbeat()
     try:
         try:
             await _bootstrap_owner_token()
@@ -126,6 +129,7 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         yield
     finally:
         log.info("api_stopping")
+        await sse_multiplexer.stop_heartbeat()
         await close_pool()
 
 
