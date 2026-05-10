@@ -6,7 +6,7 @@ A solo-operator algorithmic trading system. Multi-asset systematic trend-followi
 
 | Phase | Window | Status |
 |---|---|---|
-| Phase 0 — foundation | Weeks 0–8 | 🔄 Week 3 in progress — Days 1-9 ✅, IG §11 Days 8-9 [CLAUDE_CODE] chain ✅ early via PR #28 |
+| Phase 0 — foundation | Weeks 0–8 | 🔄 Week 3 closing — Days 1-10 ✅, IG §11 Days 8-9 [CLAUDE_CODE] chain ✅ early via PR #28; Week 3 alerts pipeline ✅ via PR #44; Week 3 verification gate 4/4 binds on operator runbook smoke |
 | Phase 1 — QC live | Months 2–5 | ⏳ Not started |
 | Phase 2 — direct IBKR | Months 5–9 | ⏳ Not started |
 | Phase 3 — capital scaling | Months 9–12 | ⏳ Not started |
