@@ -43,19 +43,21 @@ from services.api.errors import ErrorEnvelope
 log = structlog.get_logger()
 
 
-#: Routes that don't need a session — mirror of the CSRF allowlist plus the
-#: SSE endpoint (which carries its own auth in the cookie chain) and the
-#: health probe (public). Keep in sync with
+#: Routes that don't need a session — mirror of the CSRF allowlist plus
+#: the health probe (public). Keep in sync with
 #: ``services/api/middleware._CSRF_EXEMPT_PATHS`` plus the read-only public
 #: probes.
+#:
+#: ``/api/sse/events`` is NOT exempt as of Day 16 — the SSE multiplexer
+#: needs ``session.user_id`` to enforce the per-user N=4 tab limit
+#: (frontend-spec §4.6). Before Day 16 the path was exempt because the
+#: Day-5 heartbeat scaffold had no per-user state; the Day 16 multiplexer
+#: introduces it.
 _SESSION_EXEMPT_PATHS: Final[frozenset[str]] = frozenset(
     {
         "/api/health",
         "/api/setup/verify-token",
         "/api/internal/watchdog",
-        # SSE today carries no real auth (Day 5 scaffold); when sessions land
-        # the SSE middleware will reuse the same session context.
-        "/api/sse/events",
     }
 )
 
