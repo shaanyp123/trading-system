@@ -348,21 +348,51 @@ git pull origin main   # fast-forward to the Day 17 PR commit
 docker compose --env-file deploy/.env build api
 ```
 
-### Step 2 — Reload Caddy (picks up new Caddyfile)
+### Step 2 — Recreate Caddy (picks up new Caddyfile)
 
-Caddy v2 hot-reloads its config without dropping connections via SIGUSR1
-or `caddy reload`. Inside the container:
+> **⚠️ Day 17 carryover lesson: `caddy reload` alone is INSUFFICIENT
+> post-`git pull`** — see "Discovery: Caddy bind-mount inode caching"
+> note below.
 
 ```bash
-docker compose --env-file deploy/.env exec caddy caddy reload --config /etc/caddy/Caddyfile
-# Expected: no output. Errors (if any) print to stderr — fail fast.
+docker compose --env-file deploy/.env up -d --force-recreate caddy
+# Expected: ~10s wall. caddy Stopped → Started → Healthy.
 ```
 
-If `caddy reload` rejects the new file (syntax error, etc.), the old
-config keeps serving — no outage. Roll forward by fixing the file and
-re-running. **Do not** restart the caddy container as the recovery path
-during business hours — drop the connection-graceful reload and only
-restart if reload won't take.
+This is `force-recreate`, NOT `reload`. The reason: Docker bind mounts
+of single files (`./deploy/Caddyfile:/etc/caddy/Caddyfile:ro` per
+`docker-compose.yml`) capture the inode at mount time. `git pull`
+updates files via atomic-rename (write to temp + `rename()` over
+destination), which creates a NEW inode. The container's bind mount
+continues to expose the OLD inode. `caddy reload` re-reads the file
+inside the container — still the OLD content — so the reload succeeds
+but applies stale config.
+
+Verify the host + container SHAs match post-recreate:
+
+```bash
+sha256sum /opt/trading/deploy/Caddyfile
+docker exec trading-caddy-1 sha256sum /etc/caddy/Caddyfile
+# Both must return the same hex.
+```
+
+Verify the new timeouts are LIVE on the running server via Caddy's
+admin API (port 2019 inside the container):
+
+```bash
+docker exec trading-caddy-1 wget -qO- http://127.0.0.1:2019/config/apps/http/servers/srv0/ \
+  | python3 -c 'import json,sys; cfg=json.load(sys.stdin); print({k:f"{cfg[k]/1e9:.0f}s" for k in ["read_timeout","read_header_timeout","write_timeout","idle_timeout"] if k in cfg})'
+# Day 17 expected: write_timeout = 86400s (24h) — the DP-020 fix.
+```
+
+**Discovery: Caddy bind-mount inode caching (Day 17 carryover):** the
+first attempt at this step used `docker compose exec caddy caddy reload
+--config /etc/caddy/Caddyfile`. Caddy returned `Valid configuration` +
+"reload OK". But the live admin API still showed `write_timeout: 30s`
+(old value). Different SHAs between host and container confirmed the
+inode-pinning. **Always use `force-recreate caddy` post-`git pull` of
+a Caddyfile change.** This applies to any single-file bind mount that
+git replaces atomically.
 
 ### Step 3 — Force-recreate api (picks up new middleware)
 
@@ -402,25 +432,111 @@ If the external curl still resets at ~30s after the Day 17 PR is deployed:
 
 ### Step 5 — Verify rate limiting (the Week 5 Fri [OPERATOR] gate)
 
-```bash
-# General bucket — 100/10s limit. The 101st request must be 429.
-for i in $(seq 1 105); do
-  curl -s -o /dev/null -w "%{http_code} " https://spratcapital.com/api/today/digest
-done; echo
-# Expected: ~100 200s (or 401s — depends on auth state), then several 429s.
+> **⚠️ Day 17 carryover lesson: the general-bucket test MUST use parallel
+> curls.** Sequential `for i in $(seq 1 110); do curl ... ; done` takes
+> >10s wall time (each TLS handshake + round-trip is ~50-100ms), which
+> crosses the 10s window boundary mid-loop and resets the counter. The
+> Day 17 carryover's first run with the sequential pattern returned
+> 110 × 200 (false negative). Use `xargs -P 30` to parallelize.
 
-# Auth bucket — 5/10s limit. The 6th request must be 429.
+```bash
+# General bucket — 100/10s limit. PARALLELIZE via xargs.
+seq 1 110 | xargs -P 30 -I{} curl -sk -o /dev/null -w "%{http_code}\n" \
+  --max-time 5 https://spratcapital.com/api/today/digest \
+  | sort | uniq -c | sort -rn
+# Expected: 100 × 200 + 10 × 429 (exact lock-step on the 100/10s contract).
+
+# Auth bucket — 5/10s limit. Sequential is fine (the 6th request takes
+# <10s of cumulative wall, well inside the window).
 for i in $(seq 1 10); do
-  curl -s -o /dev/null -w "%{http_code} " https://spratcapital.com/api/auth/me
-done; echo
-# Expected: 5 codes (200 or 401), then several 429s.
+  echo "  request $i: $(curl -sk -o /dev/null -w "%{http_code}" --max-time 3 https://spratcapital.com/api/auth/me)"
+done
+# Expected: 5 × 200 then 5 × 429.
 
 # /api/health MUST NOT be rate-limited (watchdog hits it every 5 min).
 for i in $(seq 1 110); do
-  curl -s -o /dev/null -w "%{http_code} " https://spratcapital.com/api/health
+  curl -sk -o /dev/null -w "%{http_code} " --max-time 3 https://spratcapital.com/api/health
 done; echo
 # Expected: 110 × 200 — never any 429.
 ```
+
+Inspect a 429 response to verify the canonical envelope:
+
+```bash
+# Burn the bucket first in the background, then capture one 429:
+for i in $(seq 1 110); do curl -sk -o /dev/null --max-time 2 \
+  https://spratcapital.com/api/today/digest 2>/dev/null & done; wait
+curl -sk --max-time 5 -D - https://spratcapital.com/api/today/digest 2>&1 | head -25
+# Expected: HTTP/2 429 + Retry-After header + body:
+#   {"error_code":"RATE_LIMITED","message":"Too many requests. Rate limit
+#    for this endpoint is 100 per 10s.","details":{"bucket":"general",
+#    "limit":100,"retry_after_s":<N>}}
+```
+
+### Step 5b — Verify Week 5 gate box 3 (external watchdog outage test)
+
+> **⚠️ Day 17 carryover lesson: `ufw deny 443/tcp` does NOT block
+> Docker-published ports.** Docker's iptables rules for `-p 443:443`
+> live in the `DOCKER` chain which is hit BEFORE UFW's `INPUT` chain
+> via the `FORWARD` jump. UFW INPUT rules filter host-destined traffic
+> only — Docker-published ports are unaffected. The IG Week 5 gate box
+> 3 text says "`ufw deny 443`" but the actually-correct mechanism for
+> this Docker setup is `docker compose stop caddy`. Same outage signal
+> from the watchdog's perspective (Caddy is the only listener on 443).
+
+**Outage mechanism — `docker compose stop caddy`** (not `ufw deny 443`):
+
+```bash
+ssh root@178.156.239.84
+cd /opt/trading
+
+# Step 1: Schedule auto-restart in 22 min (independent of SSH session
+# liveness). Even if your laptop sleeps or the SSH connection dies,
+# the at-job fires.
+echo "cd /opt/trading && /usr/bin/docker compose --env-file deploy/.env start caddy && echo 'CADDY_RESTART_DONE '\$(date -u -Iseconds) >> /var/log/ufw_test.log" \
+  | at now + 22 minutes
+atq  # confirm queued
+
+# Step 2: Stop caddy (this IS the outage)
+docker compose --env-file deploy/.env stop caddy
+
+# Step 3: Verify outage from your laptop (NEW shell)
+curl -sk --max-time 5 -o /dev/null -w "HTTP=%{http_code} EXIT=%{exitcode} TIME=%{time_total}s\n" \
+  https://spratcapital.com/api/health
+# Expected: HTTP=000 EXIT=28 TIME=5.000s (connection times out)
+
+# Step 4: Wait ~15 min for the Nuremberg watchdog to fire 3 consecutive
+# failures (5-min cadence × 3 ticks). Observe via journald:
+ssh root@188.245.37.16 'journalctl -u trading-watchdog -f -o cat' \
+  | grep --line-buffered -E 'consecutive_failures|email_sent|decision_reason'
+# Expected sequence:
+#   consecutive_failures: 1, decision_reason: "failure 1/3 (under threshold)"
+#   consecutive_failures: 2, decision_reason: "failure 2/3 (under threshold)"
+#   consecutive_failures: 3, decision_reason: "threshold reached: 3 consecutive failures"
+#   email_sent: true   ← watchdog Resend email fires here
+
+# Step 5: Check operator Gmail for the [CRITICAL] email.
+# Subject: "[CRITICAL] Trading System unreachable — 3 consecutive failures from hetzner-nuremberg-1"
+
+# Step 6: At T+22 min, the at-job auto-restarts Caddy. Verify:
+ssh root@178.156.239.84 'cat /var/log/ufw_test.log; docker compose --env-file /opt/trading/deploy/.env ps caddy'
+# Expected: CADDY_RESTART_DONE line + caddy container Up Healthy
+
+# Step 7: Verify service restored from laptop:
+curl -sk --max-time 5 https://spratcapital.com/api/health | head -c 200
+# Expected: {"status":"ok",...}
+
+# Step 8: Verify watchdog returns to healthy on next tick (5 min after restart):
+ssh root@188.245.37.16 'cat /var/lib/trading-watchdog/state.json'
+# Expected: consecutive_failures: 0
+```
+
+**Rationale for `docker stop` over `ufw deny`:**
+- `docker stop` cleanly closes the listening socket — external curl gets `Connection refused` (real outage from the watchdog's perspective).
+- `ufw deny 443` would correctly block traffic if Caddy listened directly on the host; since Caddy listens via Docker's port-publish, UFW INPUT is bypassed entirely.
+- An alternative (`iptables -I DOCKER-USER -p tcp --dport 443 -j DROP`) works but adds an iptables rule that must be removed for auto-revert — more error-prone than `at`-scheduled `docker compose start`.
+
+**Closes Week 5 verification gate box 3** when the operator confirms the Resend email arrived in Gmail. The journald event with `consecutive_failures: 3` + `email_sent: true` is the canonical machine-verifiable signal.
 
 ### Step 6 — Rollback path (if any of Steps 4–5 fail)
 
