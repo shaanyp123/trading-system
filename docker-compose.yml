@@ -172,10 +172,21 @@ services:
     depends_on: [api]
 
   webhook_pusher:
-    image: ghcr.io/${GHCR_OWNER}/trading-webhook-pusher:${RELEASE_SHA:-latest}
+    # Phase 0 placeholder container: stays alive (sleep infinity) so the
+    # operator runbook (deploy/webhook_pusher/README.md) can `docker
+    # compose exec webhook_pusher /opt/venv/bin/python -m
+    # services.webhook_pusher.cli ...` to run alerts smoke without
+    # attaching the api container to trading_egress (the Day 11
+    # carryover #2 workaround). When the Week 4 risk dispatcher PR
+    # lands, swap CMD in services/webhook_pusher/Dockerfile to a real
+    # worker entrypoint and add a healthcheck.
+    image: ghcr.io/${GHCR_OWNER:?set GHCR_OWNER in deploy/.env}/trading-webhook-pusher:${RELEASE_SHA:-latest}
+    build:
+      context: .
+      dockerfile: services/webhook_pusher/Dockerfile
     restart: unless-stopped
     networks: [internal, egress]
-    profiles: ['phase1']
+    depends_on: [postgres]
 
   monitoring:
     image: ghcr.io/${GHCR_OWNER}/trading-monitoring:${RELEASE_SHA:-latest}
