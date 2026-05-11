@@ -103,23 +103,68 @@ jobs:
       # services/audit, services/risk, services/execution once those land.
       - run: pytest --cov --cov-report=xml
 
+  # Frontend gate. Day 20 (PR #66) shipped apps/web/ but did NOT add it to
+  # CI. This job closes the gap so a future Python-only diff that breaks
+  # the Next.js build (e.g., touching shared types under packages/api-types
+  # in Phase 1+) is caught at PR time, not at `make ci` time locally.
+  # Mirrors the `make frontend-test` target in the repo-root Makefile.
+  frontend-test:
+    name: frontend-test (pnpm typecheck + lint + build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.30.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+          cache-dependency-path: apps/web/pnpm-lock.yaml
+      - name: pnpm install
+        working-directory: apps/web
+        run: pnpm install --frozen-lockfile
+      - name: pnpm typecheck
+        working-directory: apps/web
+        run: pnpm typecheck
+      - name: pnpm lint
+        working-directory: apps/web
+        run: pnpm lint
+      - name: pnpm build
+        working-directory: apps/web
+        run: pnpm build
+
   # docker-build matrix: one job per service that ships a Dockerfile. New
-  # services join by appending to the matrix list AND landing the Dockerfile
-  # in the same PR. Day 5 onboards `api`; the remainder onboard Phase 0 Week 2+.
+  # services join by appending an entry to `matrix.include` (NOT the legacy
+  # short-form `matrix.service: [...]` — moved to include-style Day 20 so
+  # apps/web/ can specify its own dockerfile path + build context without
+  # forcing repo-root context like the api + webhook_pusher containers).
+  # Day 5 onboards `api`; Day 10 PR #50 onboards `webhook_pusher`; Day 20
+  # PR #66 ships `apps/web/Dockerfile` and the Day-20-follow-up CI hygiene
+  # PR onboards it here.
   docker-build:
     name: docker build (${{ matrix.service }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        service: [api, webhook_pusher]
+        include:
+          - service: api
+            dockerfile: services/api/Dockerfile
+            context: .
+          - service: webhook_pusher
+            dockerfile: services/webhook_pusher/Dockerfile
+            context: .
+          - service: web
+            dockerfile: apps/web/Dockerfile
+            context: apps/web
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
       - name: Build image (no push)
         run: |
           docker buildx build \
-            --file services/${{ matrix.service }}/Dockerfile \
+            --file ${{ matrix.dockerfile }} \
             --tag local/trading-${{ matrix.service }}:${{ github.sha }} \
             --load \
-            .
+            ${{ matrix.context }}
