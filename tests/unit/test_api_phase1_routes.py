@@ -52,6 +52,8 @@ from httpx import AsyncClient
 
 from services.api.repos.phase1 import (
     AlertCountRow,
+    AuditLogRow,
+    ParameterSetRow,
     Phase1QueryRepo,
     ReconciliationSummaryRow,
     RiskStateRow,
@@ -134,6 +136,13 @@ class _StubRepo:
     trade_by_id: dict[str, Any] | None = None
     last_trades_filter: dict[str, Any] | None = None
     last_trade_by_id_arg: UUID | None = None
+    parameter_set_row: ParameterSetRow | None = None
+    audit_log_page: tuple[list[AuditLogRow], int | None, bool] = (
+        [],
+        None,
+        False,
+    )
+    last_audit_filter: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.positions_rows is None:
@@ -252,6 +261,29 @@ class _StubRepo:
     ) -> dict[str, Any] | None:
         self.last_trade_by_id_arg = trade_id
         return self.trade_by_id
+
+    async def fetch_active_parameter_set(self) -> ParameterSetRow | None:
+        return self.parameter_set_row
+
+    async def fetch_audit_log_page(
+        self,
+        *,
+        event_type: str | None,
+        env: str | None,
+        from_ingest_utc: datetime | None,
+        to_ingest_utc: datetime | None,
+        before_sequence_no: int | None,
+        limit: int,
+    ) -> tuple[list[AuditLogRow], int | None, bool]:
+        self.last_audit_filter = {
+            "event_type": event_type,
+            "env": env,
+            "from_ingest_utc": from_ingest_utc,
+            "to_ingest_utc": to_ingest_utc,
+            "before_sequence_no": before_sequence_no,
+            "limit": limit,
+        }
+        return self.audit_log_page
 
     async def fetch_latest_balance_nav(self, account_id: UUID) -> Decimal | None:
         return self.nav
@@ -1425,3 +1457,335 @@ class TestCursorPagination:
 
     def test_clamp_limit_floors_at_min(self) -> None:
         assert clamp_limit(0) == 1
+
+
+# ---------------------------------------------------------------------------
+# Day 27 — Risk envelope (GET /api/system/risk-envelope)
+# ---------------------------------------------------------------------------
+
+
+class TestRiskEnvelope:
+    @pytest.mark.asyncio
+    async def test_empty_parameters_table_returns_spec_defaults(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(parameter_set_row=None)
+        _bind_repo(override_dep, system_route, repo)
+        response = await api_client.get("/api/system/risk-envelope")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["source"] == "spec_defaults"
+        assert body["parameter_set_hash"] is None
+        assert body["parameter_set_active_since_utc"] is None
+        # 15 locked rows (5 portfolio + 5 cluster + 2 correlation + 3 DD)
+        assert len(body["items"]) == 15
+        # Verify a few canonical entries are present + Decimal-as-string
+        keys = {item["key"] for item in body["items"]}
+        assert "vol_target_annual" in keys
+        assert "cluster_cap_equity_index" in keys
+        assert "correlation_halt_threshold" in keys
+        assert "monthly_drawdown_vol_halve" in keys
+        vol_target = next(i for i in body["items"] if i["key"] == "vol_target_annual")
+        assert vol_target["value"] == "0.14"
+        assert vol_target["unit"] == "percent"
+        assert vol_target["cluster"] is None
+        equity_cluster = next(i for i in body["items"] if i["key"] == "cluster_cap_equity_index")
+        assert equity_cluster["cluster"] == "equity_index"
+
+    @pytest.mark.asyncio
+    async def test_populated_parameter_set_uses_table_values(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        # All 15 canonical keys present + a couple of non-default values to
+        # prove the route reads from the table when populated.
+        parameters_jsonb: dict[str, Any] = {
+            "vol_target_annual": "0.12",
+            "per_position_target": "0.25",
+            "per_position_hard_floor": "0.50",
+            "gross_exposure_cap": "2.50",
+            "net_exposure_cap": "1.50",
+            "cluster_cap_equity_index": "0.55",
+            "cluster_cap_rates_bonds": "0.80",
+            "cluster_cap_commodity": "0.80",
+            "cluster_cap_crypto": "0.40",
+            "cluster_cap_fx": "0.30",
+            "correlation_alert_threshold": "0.70",
+            "correlation_halt_threshold": "0.85",
+            "daily_loss_limit": "-0.05",
+            "trailing_drawdown_limit": "-0.20",
+            "monthly_drawdown_vol_halve": "-0.10",
+        }
+        active_since = datetime(2026, 4, 1, tzinfo=UTC)
+        repo = _StubRepo(
+            parameter_set_row=ParameterSetRow(
+                parameter_set_hash="a" * 64,
+                parameters=parameters_jsonb,
+                first_active_at=active_since,
+                last_active_at=None,
+            )
+        )
+        _bind_repo(override_dep, system_route, repo)
+        response = await api_client.get("/api/system/risk-envelope")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["source"] == "parameters_table"
+        assert body["parameter_set_hash"] == "a" * 64
+        assert body["parameter_set_active_since_utc"].startswith("2026-04-01")
+        # Tweaked values surface verbatim (Decimal -> string)
+        vol_target = next(i for i in body["items"] if i["key"] == "vol_target_annual")
+        assert vol_target["value"] == "0.12"
+        gross = next(i for i in body["items"] if i["key"] == "gross_exposure_cap")
+        assert gross["value"] == "2.50"
+
+    @pytest.mark.asyncio
+    async def test_partial_parameter_set_falls_back_to_defaults(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        # Row exists but missing required keys -> route falls back to spec
+        # defaults rather than rendering a partially-filled envelope.
+        repo = _StubRepo(
+            parameter_set_row=ParameterSetRow(
+                parameter_set_hash="b" * 64,
+                parameters={"vol_target_annual": "0.10"},  # only 1 of 15
+                first_active_at=datetime(2026, 4, 1, tzinfo=UTC),
+                last_active_at=None,
+            )
+        )
+        _bind_repo(override_dep, system_route, repo)
+        response = await api_client.get("/api/system/risk-envelope")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["source"] == "spec_defaults"
+        assert body["parameter_set_hash"] is None
+
+
+# ---------------------------------------------------------------------------
+# Day 27 — Audit explorer (GET /api/system/audit)
+# ---------------------------------------------------------------------------
+
+
+def _make_audit_row(
+    *,
+    seq: int,
+    event_type: str = "state_transition_normal_to_halt",
+    env: str = "paper",
+    payload: bytes = b'{"reason":"trailing_dd_breach","triggered_by":"operator"}',
+) -> AuditLogRow:
+    now = datetime(2026, 5, 18, 13, 30, tzinfo=UTC)
+    return AuditLogRow(
+        event_uuid=uuid4(),
+        sequence_no=seq,
+        event_type=event_type,
+        env=env,
+        phase_at_emit=0,
+        source_clock_ts=now,
+        ingest_clock_ts=now,
+        prev_hash=b"\x00" * 32,
+        record_hash=b"\xab" * 32,
+        payload_jcs=payload,
+        repaired_for_sequence_no=None,
+        repaired_for_event_timestamp=None,
+    )
+
+
+class TestAuditLogTable:
+    @pytest.mark.asyncio
+    async def test_empty_table_returns_empty_page(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(audit_log_page=([], None, False))
+        _bind_repo(override_dep, system_route, repo)
+        response = await api_client.get("/api/system/audit")
+        assert response.status_code == 200
+        body = response.json()
+        assert body == {"entries": [], "next_cursor": None, "has_more": False}
+        assert repo.last_audit_filter == {
+            "event_type": None,
+            "env": None,
+            "from_ingest_utc": None,
+            "to_ingest_utc": None,
+            "before_sequence_no": None,
+            "limit": 50,
+        }
+
+    @pytest.mark.asyncio
+    async def test_filters_pass_through_to_repo(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(audit_log_page=([], None, False))
+        _bind_repo(override_dep, system_route, repo)
+        url = (
+            "/api/system/audit?"
+            "event_type=state_transition_normal_to_halt&"
+            "env=paper&"
+            "from=2026-05-01T00:00:00%2B00:00&"
+            "to=2026-05-20T23:59:59%2B00:00&"
+            "limit=25"
+        )
+        response = await api_client.get(url)
+        assert response.status_code == 200
+        f = repo.last_audit_filter
+        assert f is not None
+        assert f["event_type"] == "state_transition_normal_to_halt"
+        assert f["env"] == "paper"
+        assert f["from_ingest_utc"].year == 2026
+        assert f["to_ingest_utc"].day == 20
+        assert f["limit"] == 25
+        assert f["before_sequence_no"] is None
+
+    @pytest.mark.asyncio
+    async def test_populated_row_maps_to_wire_entry(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        row = _make_audit_row(seq=1)
+        repo = _StubRepo(audit_log_page=([row], None, False))
+        _bind_repo(override_dep, system_route, repo)
+        response = await api_client.get("/api/system/audit")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["has_more"] is False
+        assert body["next_cursor"] is None
+        assert len(body["entries"]) == 1
+        entry = body["entries"][0]
+        assert entry["sequence_no"] == 1
+        assert entry["event_type"] == "state_transition_normal_to_halt"
+        assert entry["env"] == "paper"
+        assert entry["prev_hash_hex"] == "00" * 32
+        assert entry["record_hash_hex"] == "ab" * 32
+        assert entry["payload_preview"].startswith('{"reason":"trailing_dd_breach"')
+        # Preview capped at 80 chars
+        assert len(entry["payload_preview"]) <= 80
+
+    @pytest.mark.asyncio
+    async def test_has_more_emits_next_cursor(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        row = _make_audit_row(seq=42)
+        repo = _StubRepo(audit_log_page=([row], 42, True))
+        _bind_repo(override_dep, system_route, repo)
+        response = await api_client.get("/api/system/audit?limit=1")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["has_more"] is True
+        assert body["next_cursor"] == "42"
+
+    @pytest.mark.asyncio
+    async def test_cursor_passthrough(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(audit_log_page=([], None, False))
+        _bind_repo(override_dep, system_route, repo)
+        response = await api_client.get("/api/system/audit?cursor=100")
+        assert response.status_code == 200
+        assert repo.last_audit_filter is not None
+        assert repo.last_audit_filter["before_sequence_no"] == 100
+
+    @pytest.mark.asyncio
+    async def test_malformed_cursor_returns_invalid_cursor(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo()
+        _bind_repo(override_dep, system_route, repo)
+        response = await api_client.get("/api/system/audit?cursor=not-an-int")
+        assert response.status_code == 400
+        body = response.json()
+        assert body["error_code"] == "INVALID_CURSOR"
+
+    @pytest.mark.asyncio
+    async def test_zero_cursor_rejected(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo()
+        _bind_repo(override_dep, system_route, repo)
+        response = await api_client.get("/api/system/audit?cursor=0")
+        assert response.status_code == 400
+        body = response.json()
+        assert body["error_code"] == "INVALID_CURSOR"
+
+    @pytest.mark.asyncio
+    async def test_limit_over_max_returns_422(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo()
+        _bind_repo(override_dep, system_route, repo)
+        response = await api_client.get("/api/system/audit?limit=999")
+        assert response.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Day 27 — Watchdog status (GET /api/system/watchdog)
+# ---------------------------------------------------------------------------
+
+
+class TestWatchdogStatus:
+    @pytest.mark.asyncio
+    async def test_no_account_returns_never_pinged(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(account_id=None)
+        _bind_repo(override_dep, system_route, repo)
+        response = await api_client.get("/api/system/watchdog")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["has_ever_pinged"] is False
+        assert body["last_ping_utc"].startswith("1970-01-01")
+        assert body["seconds_since_last_ping"] is None
+        assert body["watchdog_id"] is None
+        assert body["consecutive_failures_observed"] is None
+
+    @pytest.mark.asyncio
+    async def test_recent_ping_emits_age(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        account_id = uuid4()
+        ping = datetime.now(tz=UTC) - timedelta(seconds=42)
+        repo = _StubRepo(account_id=account_id, watchdog_ping=ping)
+        _bind_repo(override_dep, system_route, repo)
+        response = await api_client.get("/api/system/watchdog")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["has_ever_pinged"] is True
+        # Age within a tolerance window — the route uses datetime.now()
+        # internally, so we can't pin to an exact int.
+        assert body["seconds_since_last_ping"] is not None
+        assert 40 <= body["seconds_since_last_ping"] <= 60
+
+    @pytest.mark.asyncio
+    async def test_account_exists_but_no_pings_yet(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(account_id=uuid4(), watchdog_ping=None)
+        _bind_repo(override_dep, system_route, repo)
+        response = await api_client.get("/api/system/watchdog")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["has_ever_pinged"] is False
+        assert body["last_ping_utc"].startswith("1970-01-01")

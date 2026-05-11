@@ -72,6 +72,47 @@ class AlertCountRow:
     p2: int
 
 
+@dataclass(frozen=True, slots=True)
+class ParameterSetRow:
+    """One row from ``parameter_sets`` projected for the §4.1.3 risk envelope.
+
+    The JSONB ``parameters`` column is returned as a plain dict; routing
+    handlers walk it into the canonical ``RiskParameterItem`` list. Empty
+    Phase 0 returns ``None`` from the repo and the route falls back to spec
+    defaults.
+    """
+
+    parameter_set_hash: str
+    parameters: dict[str, object]
+    first_active_at: datetime
+    last_active_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class AuditLogRow:
+    """One row from ``audit_log`` projected for the §2.6.4 audit explorer.
+
+    BYTEA columns (``prev_hash``, ``record_hash``, ``payload_jcs``) are
+    returned as raw ``bytes`` — the route layer hex-encodes the hashes and
+    UTF-8 decodes the payload preview. ``payload_jcs`` is the full payload;
+    truncation happens at the route layer so the operator-debug runbook can
+    fetch the full row without re-querying.
+    """
+
+    event_uuid: UUID
+    sequence_no: int
+    event_type: str
+    env: str
+    phase_at_emit: int
+    source_clock_ts: datetime
+    ingest_clock_ts: datetime
+    prev_hash: bytes
+    record_hash: bytes
+    payload_jcs: bytes
+    repaired_for_sequence_no: int | None
+    repaired_for_event_timestamp: datetime | None
+
+
 # ---------------------------------------------------------------------------
 # Protocol
 # ---------------------------------------------------------------------------
@@ -151,6 +192,19 @@ class Phase1QueryRepo(Protocol):
         account_id: UUID,
         trade_id: UUID,
     ) -> dict[str, object] | None: ...
+
+    async def fetch_active_parameter_set(self) -> ParameterSetRow | None: ...
+
+    async def fetch_audit_log_page(
+        self,
+        *,
+        event_type: str | None,
+        env: str | None,
+        from_ingest_utc: datetime | None,
+        to_ingest_utc: datetime | None,
+        before_sequence_no: int | None,
+        limit: int,
+    ) -> tuple[list[AuditLogRow], int | None, bool]: ...
 
     async def fetch_latest_balance_nav(self, account_id: UUID) -> Decimal | None: ...
 
@@ -510,6 +564,108 @@ class PostgresPhase1QueryRepo:
             p2=int(row.p2) if row else 0,
         )
 
+    # --- parameter_sets (Day 27 — risk envelope) ---------------------------
+
+    async def fetch_active_parameter_set(self) -> ParameterSetRow | None:
+        # The "active" set is whichever row has the latest ``first_active_at``
+        # with ``last_active_at IS NULL`` (= currently active per
+        # backend-spec §3.11). Phase 0 returns None — the table stays empty
+        # until the Week 4 Wed dispatcher seeds the first parameter set.
+        row = (
+            await self._session.execute(
+                text(
+                    "SELECT parameter_set_hash, parameters, "
+                    "       first_active_at, last_active_at "
+                    "FROM parameter_sets "
+                    "WHERE last_active_at IS NULL "
+                    "ORDER BY first_active_at DESC LIMIT 1"
+                )
+            )
+        ).fetchone()
+        if row is None:
+            return None
+        return ParameterSetRow(
+            parameter_set_hash=row.parameter_set_hash,
+            parameters=dict(row.parameters),
+            first_active_at=row.first_active_at,
+            last_active_at=row.last_active_at,
+        )
+
+    # --- audit_log (Day 27 — audit explorer) -------------------------------
+
+    async def fetch_audit_log_page(
+        self,
+        *,
+        event_type: str | None,
+        env: str | None,
+        from_ingest_utc: datetime | None,
+        to_ingest_utc: datetime | None,
+        before_sequence_no: int | None,
+        limit: int,
+    ) -> tuple[list[AuditLogRow], int | None, bool]:
+        # Partition-pruned SELECT against the partitioned ``audit_log`` heap.
+        # Postgres prunes on ``ingest_clock_ts`` when from/to are bound at
+        # plan time (RANGE partitioning per ``alembic/versions/0001_audit_log``).
+        # Without from/to the planner still scans only the populated
+        # partition (audit_log_y2026 today) but emits a longer plan.
+        #
+        # Cursor: ``before_sequence_no`` is the highest sequence_no the
+        # caller has ALREADY SEEN; the page returns rows with strictly
+        # lower sequence_no in DESC order. We fetch ``limit + 1`` rows so
+        # we can compute ``has_more`` without a second query.
+        params: dict[str, object] = {"lim": limit + 1}
+        sql = (
+            "SELECT event_uuid, sequence_no, event_type, env, phase_at_emit, "
+            "       source_clock_ts, ingest_clock_ts, prev_hash, record_hash, "
+            "       payload_jcs, repaired_for_sequence_no, "
+            "       repaired_for_event_timestamp "
+            "FROM audit_log WHERE 1=1"
+        )
+        if event_type is not None:
+            sql += " AND event_type = :et"
+            params["et"] = event_type
+        if env is not None:
+            sql += " AND env = :env"
+            params["env"] = env
+        if from_ingest_utc is not None:
+            sql += " AND ingest_clock_ts >= :from_ts"
+            params["from_ts"] = from_ingest_utc
+        if to_ingest_utc is not None:
+            sql += " AND ingest_clock_ts <= :to_ts"
+            params["to_ts"] = to_ingest_utc
+        if before_sequence_no is not None:
+            sql += " AND sequence_no < :before_seq"
+            params["before_seq"] = before_sequence_no
+        sql += " ORDER BY sequence_no DESC LIMIT :lim"
+
+        result = (await self._session.execute(text(sql), params)).fetchall()
+        rows = [
+            AuditLogRow(
+                event_uuid=r.event_uuid,
+                sequence_no=int(r.sequence_no),
+                event_type=r.event_type,
+                env=r.env,
+                phase_at_emit=int(r.phase_at_emit),
+                source_clock_ts=r.source_clock_ts,
+                ingest_clock_ts=r.ingest_clock_ts,
+                prev_hash=bytes(r.prev_hash),
+                record_hash=bytes(r.record_hash),
+                payload_jcs=bytes(r.payload_jcs),
+                repaired_for_sequence_no=(
+                    int(r.repaired_for_sequence_no)
+                    if r.repaired_for_sequence_no is not None
+                    else None
+                ),
+                repaired_for_event_timestamp=r.repaired_for_event_timestamp,
+            )
+            for r in result
+        ]
+        has_more = len(rows) > limit
+        if has_more:
+            rows = rows[:limit]
+        next_cursor = rows[-1].sequence_no if has_more and rows else None
+        return rows, next_cursor, has_more
+
     # --- balances (NAV) ----------------------------------------------------
 
     async def fetch_latest_balance_nav(self, account_id: UUID) -> Decimal | None:
@@ -528,6 +684,8 @@ class PostgresPhase1QueryRepo:
 
 __all__ = [
     "AlertCountRow",
+    "AuditLogRow",
+    "ParameterSetRow",
     "Phase1QueryRepo",
     "PostgresPhase1QueryRepo",
     "ReconciliationSummaryRow",
