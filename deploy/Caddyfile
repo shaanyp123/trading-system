@@ -40,7 +40,19 @@
 		X-Content-Type-Options "nosniff"
 		X-Frame-Options "DENY"
 		Referrer-Policy "strict-origin-when-cross-origin"
-		Content-Security-Policy "default-src 'self'; script-src 'self'; connect-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'"
+		# Day 24: 'unsafe-inline' added to script-src because Next.js 14 App Router
+		# emits inline hydration bootstrap scripts (`__next_f.push(...)` chunks
+		# inlined into <script> tags) that are required for client-side React to
+		# attach. Without 'unsafe-inline', the page renders statically but is
+		# non-interactive (no input handlers, no state, no navigation). Same
+		# issue surfaced during the Day 24 operator ceremony at /setup.
+		#
+		# Phase 1 follow-up (deferred): switch to nonce-based CSP (Caddy injects
+		# a per-request nonce; Next.js applies it to its inline scripts via
+		# next.config.js `experimental.serverActions.nonce` or middleware).
+		# Until then, 'unsafe-inline' for script-src is the standard Next.js
+		# production workaround.
+		Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; connect-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'"
 	}
 
 	# Server-Sent Events — must not buffer; long read timeout for 24h replay window.
