@@ -54,7 +54,7 @@ For pattern ambiguity within already-allowed scope (naming, file organization wi
 | `Prompts/` | Generation prompts (archived; do not reference for current work) |
 | `Archive/` | Reserved for superseded versions |
 
-### Code + ops surfaces (current state as of 2026-05-18, Day 25 — kill-switch invoke + resume wired end-to-end; Week 7 Mon `[CLAUDE_CODE]` complete)
+### Code + ops surfaces (current state as of 2026-05-18, Day 25 carryover close — kill-switch invoke LIVE-confirmed; 2 latent grant/session bugs (DP-021 + DP-022) fixed; **first prod audit_log row written** (sequence_no=1, state_transition_normal_to_halt, genesis-rooted, `CHAIN OK`); system HALT_NEW awaiting Day 27 Wed `/system` page for resume; VPS at commit `7e8d5cf`)
 | Path | Purpose | Status |
 |---|---|---|
 | `strategies/v1_trend_following/` | V1 Donchian/MA/Hurst/ATR strategy logic; `parameters.py`, `indicators.py`, `signals.py`, `audit_events.py`, `sizing_trace.py`, `strategy.py` | Day 2 — entry pipeline real; exit pipeline scaffolded for Week 3–4 |
