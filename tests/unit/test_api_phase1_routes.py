@@ -813,12 +813,25 @@ class _NoopDbSession:
     asyncpg pool stays out of unit tests; ``apply_state_transition`` is
     also monkeypatched in the same test, so the session is never actually
     touched. Calls into it surface a clear error.
+
+    ``commit()`` is a real no-op because Day-25 DP-021 fix added
+    ``await db.commit()`` between the repo reads and apply_state_transition
+    to release the implicit transaction the repo opened. Unit tests don't
+    issue real SELECTs against this fake (the repo is stubbed), but the
+    route still calls commit() — make it a no-op so the route reaches its
+    happy path.
     """
 
     async def execute(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover
         raise RuntimeError(
             "fake _NoopDbSession.execute called — monkeypatch apply_state_transition first"
         )
+
+    async def commit(self) -> None:
+        # DP-021 fix calls this between repo reads and apply. No-op for
+        # the fake (no real transaction to commit; the real DB-touching
+        # apply_state_transition is monkeypatched in these tests).
+        return None
 
 
 async def _fake_db_session_dependency() -> Any:

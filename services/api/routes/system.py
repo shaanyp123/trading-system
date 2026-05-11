@@ -333,6 +333,16 @@ async def invoke_kill_switch(
         timestamp_utc=now.isoformat(),
     )
 
+    # DP-021 (Day 25 carryover): the repo SELECTs above implicitly open a
+    # transaction on this session (SQLAlchemy 2.0 autobegin semantics). The
+    # audit writer's contract — services/audit/writer.py:58 — requires a
+    # session with NO open transaction (it manages its own SERIALIZABLE +
+    # advisory-lock block). Commit here to close the implicit read-side
+    # transaction before apply_state_transition opens its writer transactions.
+    # The reads were no-modify SELECTs so this commit is a no-op for data;
+    # it only releases the transaction state.
+    await db.commit()
+
     applied = await apply_state_transition(
         plan=plan,
         db=db,
@@ -445,6 +455,11 @@ async def resume_from_halt(
             message=str(exc),
             status_code=422,
         ) from exc
+
+    # DP-021 (Day 25 carryover): see invoke route comment. The repo SELECTs
+    # above auto-began a transaction on this session; the writer requires a
+    # clean session, so commit here before apply_state_transition.
+    await db.commit()
 
     applied = await apply_state_transition(
         plan=plan,
