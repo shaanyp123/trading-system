@@ -1,0 +1,60 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html {
+  font-feature-settings:
+    'tnum' 1,
+    'cv02' 1,
+    'cv03' 1;
+}
+
+body {
+  @apply bg-bg-base text-text-primary font-sans;
+}
+
+.font-mono {
+  font-feature-settings: 'tnum' 1;
+}
+
+@media print {
+  @page {
+    size: letter portrait;
+    margin: 0.5in;
+  }
+
+  html.print-mode body {
+    @apply bg-white text-black;
+  }
+
+  .chart-container {
+    page-break-inside: avoid;
+    break-inside: avoid;
+  }
+
+  .top-bar,
+  .vacation-banner,
+  .convalescent-banner,
+  .toast-container {
+    display: none !important;
+  }
+
+  .print-header {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    @apply text-xs text-black border-b border-gray-300 pb-1;
+  }
+  .print-footer {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    @apply text-xs text-black border-t border-gray-300 pt-1;
+  }
+}
