@@ -2475,3 +2475,52 @@ Day 25 carryover closed at 20:40 UTC after 2 latent-bug fixes (DP-021 transactio
 ### Day 26 verdict
 
 Day 26 [CLAUDE_CODE] PR ready to merge. Single PR; regular review (no `risk-review-approved` label — zero forbidden paths). Net 11 files (4 backend + 4 frontend + 3 doc files; `services/api/schemas/trades.py` + `services/api/routes/trades.py` are new; `services/api/repos/phase1.py` + `services/api/main.py` + `tests/unit/test_api_phase1_routes.py` + `apps/web/src/lib/api/types.ts` + `apps/web/src/lib/api/queries.ts` are extended; `apps/web/src/app/trades/page.tsx` + `apps/web/src/app/trades/[id]/page.tsx` are rewrites of the Day-20 placeholders). **823/823 unit + integration tests pass** (was 814 baseline; +9 new trades tests). All gates green: `make ci` end-to-end (ruff/mypy --strict + dep-drift + 823 pytest + pnpm typecheck/lint/build). Trades page bundle: 3.2kB / 117kB First Load JS for `/trades`; 3.62kB / 115kB for `/trades/[id]` (ƒ Dynamic — UUID-parametrized). Phase 0 returns empty list / 404 `TRADE_NOT_FOUND` because the trades table is empty; the empty-state UX + the graceful "Trade not found" detail-page body cover both edge cases until the Week 7 Thu paper round-trip populates the first real trade. Day 28 Thu `[BOTH]` ceremony will exercise the full path end-to-end against real fill data; Day 27 Wed ships the `/system` page that clears the HALT_NEW state lingering from Day-25 carryover.
+
+---
+
+### 2026-05-19 — Day 26 carryover — operator-delegated VPS deploy + 5-probe internal smoke + 4-probe apex HTTPS smoke
+
+- **Spec reference:** Day 26 PR #80 merged earlier in the session. Carryover deploy follows the Day-24/25 operator-delegated SSH pattern; operator authorization: "do any/all that you recommend and I authorize you to do whatever you can." Claude drove the deploy + smoke end-to-end via `ssh root@178.156.239.84`.
+- **VPS baseline at 21:15 UTC:** HEAD `7e8d5cf` (Day 25 carryover close from PR #79). All 6 containers healthy: api (`Up 41 minutes (healthy)`), caddy (`Up 3 hours`), discord_bot (`Up 3 hours`), nextjs (`Up 3 hours (healthy)`), postgres (`Up 3 days (healthy)`), webhook_pusher (`Up 42 hours`). `audit_log` row count unchanged from Day 25 (1 row, sequence_no=1, state_transition_normal_to_halt). `risk_state` still HALT_NEW from Day 25 carryover (orthogonal to Day 26 work).
+- **Deploy sequence:**
+  - **21:18 UTC — git pull.** `cd /opt/trading && git fetch origin --quiet && git pull --ff-only origin main` advanced HEAD `7e8d5cf → cdb41f3` (PR #80 squash-merge). 12 files changed, 1554 insertions(+), 17 deletions(-); `services/api/routes/trades.py` + `services/api/schemas/trades.py` created.
+  - **21:19 UTC — rebuild.** `time docker compose --env-file deploy/.env build api nextjs` completed in **40.27 seconds** (`Image ghcr.io/shaanyp123/trading-api:latest Built` + `Image ghcr.io/shaanyp123/trading-web:latest Built`). No build warnings; both Dockerfile RUN sanity checks (api `create_app()` + nextjs `pnpm build`) passed.
+  - **21:19 UTC — recreate.** `docker compose --env-file deploy/.env up -d --force-recreate api nextjs` brought both containers from `Recreated → Starting → Started → Waiting → Healthy` in **~12 seconds** (api 18s end-to-end; nextjs 12s). Postgres dependency confirmed healthy mid-sequence.
+- **5-probe internal smoke (curl from inside api container):**
+  - `GET /api/health` → `200 OK` + `{"status":"ok","environment":"paper","version":"dev","db_connected":true,"checks":[{"name":"postgres","ok":true,"latency_ms":1.36}]}` — confirms api ↔ postgres link unchanged after recreate.
+  - `GET /api/trades` → `200 OK` + `{"trades":[],"next_cursor":null,"has_more":false}` — Phase-0 empty envelope from `fetch_trades_page` against the empty `trades` table; 3.21ms `elapsed_ms` in structlog `request_completed`.
+  - `GET /api/trades?market=/MES&state=closed&limit=10` → `200 OK` + same empty envelope — filter-passthrough doesn't crash the repo SQL (validates the conditional `AND` clause chain in `PostgresPhase1QueryRepo.fetch_trades_page` against real Postgres syntax).
+  - `GET /api/trades/00000000-0000-0000-0000-000000000000` → `404 Not Found` + canonical `{"error_code":"TRADE_NOT_FOUND","message":"No trade exists with the requested ID.","details":{"trade_id":"00000000-0000-0000-0000-000000000000"}}` — confirms the AppError → JSONResponse handler maps `TRADE_NOT_FOUND` to HTTP 404 with the spec-compliant envelope.
+  - `GET /api/trades/not-a-uuid` → `422 Unprocessable Entity` + `VALIDATION_ERROR` envelope + `uuid_parsing` error detail — FastAPI path-param validation fires before the route handler.
+  - `GET /api/trades?limit=999` → `422 Unprocessable Entity` + `less_than_equal` constraint detail — Pydantic `Query(le=200)` validation fires.
+- **4-probe external HTTPS apex smoke (via Caddy at `https://spratcapital.com`):**
+  - `GET /api/health` → `HTTP 200`. Caddy reverse-proxy chain still healthy.
+  - `GET /api/trades` → `HTTP 200`. Phase-0 stub session injects `auth_strength="strong"` in paper env (Day 25 realignment), so the no-cookie HTTPS curl gets a 200 with the empty envelope (in `live-small`/`live-scale` envs the stub would fail-close to 401).
+  - `GET /trades` → `HTTP 200 Content-Type=text/html size=9107` — Next.js SSR shell + filter bar + empty-state body all paint server-side; React hydrates client-side via the `'use client'` directive.
+  - `GET /trades/00000000-0000-0000-0000-000000000000` → `HTTP 200 Content-Type=text/html size=7323` — the detail page's "Trade not found" body renders client-side after TanStack Query catches the 404 (the SSR HTML is the empty React shell; the not-found body shows after hydration + first fetch resolves to the `TRADE_NOT_FOUND` envelope).
+- **Api log scan (since deploy):** all 5 internal probes appear with the expected status codes. Zero `error`/`exception`/`fail` lines outside the deliberate 422/404 responses. Structlog `request_started`/`request_completed` pairs with bound `trace_id` per dev-guide §3.5; happy-path `/api/trades` request completed in 3.21ms. No `SerializationError`, no `OperationalError`, no `IntegrityError`, no Tracebacks.
+- **What's NOT smoked yet (deferred per Day 26 PR description):**
+  - **Browser-side interactive smoke** (operator-only — requires authenticated WebAuthn session from Day 24 enrollment). Operator can verify filter-bar interactivity + clicking Clear + the "Export CSV" button generates a download + the click-through from `/trades` row → `/trades/:id` works. Bundled into Day 27 close-out smoke or Day 28 paper round-trip.
+  - **Real-data path** (CSV export with rows, populated detail page, Discord `#signals` + `#fills` deep-links from the frontend-spec §6.3 button payloads). Awaits the first paper signal fill — Day 28 Thu `[BOTH]` paper round-trip ceremony.
+  - **`verify_chain` re-run.** Day 26 wrote zero audit rows by design (read-only projection); the audit chain is unchanged. Re-running would verify a constant — skipped as not necessary. Last verify was Day 25 carryover 20:37 UTC: `CHAIN OK: 1 rows verified`. The Day-25 row stays the head.
+- **Files in this carryover doc PR (single commit):**
+  - `Docs/decisions-log.md` — this entry + Day 26 carryover verdict.
+  - `CLAUDE.md` — date stamp Day 26 close → Day 26 carryover close; VPS commit pointer `7e8d5cf → cdb41f3`; brief smoke summary.
+  - `implementation-guide.md` §3 Week 7 Tue line 417 — carryover-LIVE-confirmed status row appended.
+- **VPS production state at 2026-05-19 21:25 UTC (Day 26 carryover close):**
+  - Apex domain + Caddy auto-TLS healthy (Day 5 → 26, stable across 14 deploy cycles)
+  - api at commit `cdb41f3` healthy
+  - nextjs at commit `cdb41f3` healthy
+  - alembic at head `20260518_audit_seq_grant` (8 migrations applied; unchanged from Day 25 carryover)
+  - `audit_log`: 1 row (sequence_no=1, state_transition_normal_to_halt, paper env, genesis-rooted; UNCHANGED from Day 25 carryover by design)
+  - `risk_state`: 1 row, current, state=HALT_NEW, severity=routine, reason=manual_judgment (UNCHANGED; Day 27 Wed `/system` page ships the canonical RESUME button)
+  - All 6 containers running (api + nextjs + postgres healthy; webhook_pusher + discord_bot + caddy running w/o Phase-0 healthchecks)
+  - WebAuthn passkey + TOTP + backup codes from Day 24 ceremony all intact
+- **Day 27 readiness:** unblocked. The Trades surface is live; Day 27 Wed `[CLAUDE_CODE]` ships Performance page (`/performance`) + System page (`/system`) — the System page includes the canonical RESUME button that clears the lingering HALT_NEW state from Day 25 carryover, closing the round-trip first opened Day 25.
+
+---
+
+### Day 26 carryover verdict
+
+Day 26 carryover closed at 21:25 UTC after a clean operator-delegated VPS deploy: 40s build + 12s recreate, all 6 containers healthy, 5-probe internal curl smoke + 4-probe external HTTPS apex smoke all green, structlog clean, 3.21ms api response time on the happy path. **First production exposure of the `/api/trades` + `/api/trades/:id` routes** verified via internal curl against real Postgres (empty `trades` table + canonical `TRADE_NOT_FOUND` 404 envelope + 422 path-param + 422 query-clamp). No live bugs surfaced — clean carry-over from Day 25's "audit-writing surface MUST test as `app_service`" lesson does not bind here (Day 26 has zero audit writes by design). VPS at `cdb41f3`; system still HALT_NEW awaiting Day 27 Wed `/system` page RESUME button. Day 27 fully unblocked.
+
