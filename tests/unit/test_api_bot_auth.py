@@ -70,11 +70,60 @@ _INVOKE_PATH = "/api/system/kill-switch/invoke"
 _VALID_BEARER = "Bearer bot-bearer-secret-test"
 
 
+# Day 25: ``/api/system/kill-switch/invoke`` is no longer a 501 stub — it's
+# a real handler that requires the ``get_session`` DB dep + a Phase1 repo.
+# These overrides let the bot-auth tests reach the route handler without a
+# live Postgres; the route then hits its 409 NO_ACTIVE_ACCOUNT branch (the
+# stub repo returns ``None`` from ``fetch_active_account_id``). The
+# semantic the tests care about — "BotAuth bypassed CSRF + the route ran" —
+# is preserved; the response code changes from 501 to 409.
+async def _fake_get_session() -> AsyncIterator[object]:
+    class _NoopSession:
+        async def execute(self, *args: object, **kwargs: object) -> object:  # pragma: no cover
+            raise RuntimeError("fake session.execute called — route reached real DB unexpectedly")
+
+    yield _NoopSession()
+
+
+class _NoAccountRepo:
+    """Stub :class:`Phase1QueryRepo` returning no active account.
+
+    Routes call ``fetch_active_account_id`` first; receiving ``None`` is
+    enough to short-circuit before any other repo method runs. The other
+    methods are intentionally unimplemented so test coverage stays honest —
+    if a route relies on something else, we'll notice.
+    """
+
+    async def fetch_active_account_id(self) -> object:
+        return None
+
+    def __getattr__(self, name: str) -> object:  # pragma: no cover
+        raise NotImplementedError(
+            f"_NoAccountRepo.{name} called — bot-auth tests should hit the "
+            "NO_ACTIVE_ACCOUNT branch before any other repo method"
+        )
+
+
+def _install_route_overrides(app: FastAPI) -> None:
+    """Install ``get_session`` + ``_get_repo`` overrides for the bot-auth POST tests.
+
+    Day 25: the kill-switch route is wired end-to-end so the tests need the
+    full dep graph satisfied. We bypass with a fake session + no-account
+    repo so the route reaches its 409 branch deterministically.
+    """
+    from services.api.db import get_session
+    from services.api.routes import system as system_route
+
+    app.dependency_overrides[get_session] = _fake_get_session
+    app.dependency_overrides[system_route._get_repo] = lambda: _NoAccountRepo()
+
+
 @pytest_asyncio.fixture
 async def client_with_bot_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> AsyncIterator[AsyncClient]:
     app = _build_app(monkeypatch)
+    _install_route_overrides(app)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
         yield client
@@ -85,6 +134,7 @@ async def client_without_bot_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> AsyncIterator[AsyncClient]:
     app = _build_app(monkeypatch, bot_token=None)
+    _install_route_overrides(app)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
         yield client
@@ -95,6 +145,7 @@ async def client_in_production(
     monkeypatch: pytest.MonkeyPatch,
 ) -> AsyncIterator[AsyncClient]:
     app = _build_app(monkeypatch, environment="live-small")
+    _install_route_overrides(app)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
         yield client
@@ -207,23 +258,25 @@ class TestInvalidBearer:
 
 
 class TestValidBearer:
-    async def test_valid_bearer_bypasses_csrf_and_reaches_501_stub(
+    async def test_valid_bearer_bypasses_csrf_and_reaches_handler(
         self,
         client_with_bot_token: AsyncClient,
     ) -> None:
         # POST without CSRF cookie/header normally returns 403. With bot
         # bearer, CSRFMiddleware skips → request reaches the route which
-        # returns 501 KILL_SWITCH_HANDLER_NOT_WIRED (the Day-15 stub).
+        # (Day 25 onward) returns 409 NO_ACTIVE_ACCOUNT — the stub repo
+        # returns ``None`` from ``fetch_active_account_id``. Prior to
+        # Day 25 the route returned 501 KILL_SWITCH_HANDLER_NOT_WIRED.
+        # The semantic the test asserts — "BotAuth bypassed CSRF + the
+        # route handler ran" — is preserved by the 409.
         resp = await client_with_bot_token.post(
             _INVOKE_PATH,
             headers={"Authorization": _VALID_BEARER},
             json=_VALID_BODY,
         )
-        # 501 = stub fired = auth + CSRF passed; route validated body
-        # and raised the canonical KILL_SWITCH_HANDLER_NOT_WIRED.
-        assert resp.status_code == 501
+        assert resp.status_code == 409
         body = resp.json()
-        assert body["error_code"] == "KILL_SWITCH_HANDLER_NOT_WIRED"
+        assert body["error_code"] == "NO_ACTIVE_ACCOUNT"
 
     async def test_valid_bearer_validates_request_body_after_csrf_bypass(
         self,
@@ -313,15 +366,18 @@ class TestProductionFailClose:
     ) -> None:
         # With bot bearer, BotAuth injects strong-auth session →
         # SessionStub skips its production fail-close because session is
-        # already populated → route runs → 501 stub.
+        # already populated → route runs. Day 25 onward the route returns
+        # 409 NO_ACTIVE_ACCOUNT (no account in the stub repo) instead of
+        # the prior 501 stub. Either way, the test asserts that the
+        # production fail-close was bypassed by BotAuth.
         resp = await client_in_production.post(
             _INVOKE_PATH,
             headers={"Authorization": _VALID_BEARER},
             json=_VALID_BODY,
         )
-        assert resp.status_code == 501
+        assert resp.status_code == 409
         body = resp.json()
-        assert body["error_code"] == "KILL_SWITCH_HANDLER_NOT_WIRED"
+        assert body["error_code"] == "NO_ACTIVE_ACCOUNT"
 
 
 # ---------------------------------------------------------------------------

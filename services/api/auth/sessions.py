@@ -33,6 +33,9 @@ import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from services.api.errors import AppError
+from services.api.session import SessionContext
+
 log = structlog.get_logger()
 
 
@@ -43,6 +46,50 @@ SESSION_ID_BYTES: Final[int] = 32
 # Locked re-auth window per dev-guide §1.5: WebAuthn UV must have happened
 # within this many seconds to allow risk-loosening actions.
 RE_AUTH_WINDOW_SECONDS: Final[int] = 300
+
+
+def require_recent_uv(
+    session: SessionContext,
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Gate the re-auth-required endpoints per dev-guide §1.5 LOCKED.
+
+    Raises ``AppError(RE_AUTH_REQUIRED, 401)`` unless:
+
+      * ``session.auth_strength == "strong"`` (WebAuthn-backed), AND
+      * ``session.last_uv_at`` is not None, AND
+      * ``now - session.last_uv_at <= RE_AUTH_WINDOW_SECONDS``.
+
+    The ``now`` parameter exists for test determinism — pass an explicit
+    timestamp to anchor the comparison. Defaults to ``datetime.now(tz=UTC)``.
+
+    Used by:
+      * ``POST /api/auth/backup-codes/regenerate``
+      * ``POST /api/system/kill-switch/resume``
+
+    Spec ref: backend-spec §4.1.3 ``require_uv_within_5min`` dependency.
+    """
+    current = now if now is not None else datetime.now(tz=UTC)
+    if session.auth_strength != "strong" or session.last_uv_at is None:
+        raise AppError(
+            error_code="RE_AUTH_REQUIRED",
+            message=(
+                "This action requires a recent WebAuthn user-verification. "
+                "Re-prompt the operator and retry."
+            ),
+            status_code=401,
+        )
+    age = current - session.last_uv_at
+    if age > timedelta(seconds=RE_AUTH_WINDOW_SECONDS):
+        raise AppError(
+            error_code="RE_AUTH_REQUIRED",
+            message=(
+                "Last WebAuthn user-verification is older than the re-auth "
+                f"window ({RE_AUTH_WINDOW_SECONDS}s). Re-prompt and retry."
+            ),
+            status_code=401,
+        )
 
 
 @dataclass(frozen=True)
@@ -338,6 +385,7 @@ __all__ = [
     "load_active_session",
     "mint_session_id",
     "refresh_activity",
+    "require_recent_uv",
     "revoke_session",
     "stamp_uv",
     "upgrade_strength_to_strong",

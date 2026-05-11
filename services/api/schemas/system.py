@@ -133,9 +133,8 @@ class KillSwitchResumeRequest(BaseModel):
     """Body for ``POST /api/system/kill-switch/resume`` (HALT_NEW → CONVALESCENT).
 
     ``incident_review_id`` is REQUIRED when the current severity is
-    ``incident_review``; the validator below catches the empty-string case.
-    The state-machine layer enforces the conditional requirement when the
-    real handler wires up Week 4 Wed.
+    ``incident_review``; the state-machine policy layer enforces the
+    conditional requirement.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -143,10 +142,42 @@ class KillSwitchResumeRequest(BaseModel):
     incident_review_id: str | None = None
 
 
+class KillSwitchTransitionResponse(BaseModel):
+    """Body for the 200 OK response to both ``invoke`` and ``resume``.
+
+    The shape is symmetric across both endpoints — the differing semantics
+    are encoded in the field values:
+
+      * ``invoke`` always returns ``risk_state=HALT_NEW`` with non-null
+        severity + halt_reason.
+      * ``resume`` always returns ``risk_state=CONVALESCENT`` with
+        ``severity=None`` (per schema §3.14 CHECK constraint).
+
+    ``audit_event_uuid`` is the UUID of the ``state_transition_*`` audit
+    row (NOT the optional ``convalescent_counter_reset`` precursor when
+    one fires). Operators deep-link from this UUID into the audit
+    explorer at ``GET /api/system/audit?event_uuid=...``.
+
+    ``sse_sequence_no`` is the SSE multiplexer's monotonic sequence
+    number for the corresponding ``risk_state`` envelope. Clients can use
+    it to verify the SSE event matches the response (e.g., if the
+    response arrives before the SSE event lands on the EventSource).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    risk_state: Literal["NORMAL", "HALT_NEW", "CONVALESCENT"]
+    severity: Literal["routine", "defensive_envelope", "incident_review"] | None
+    halt_reason: str | None
+    audit_event_uuid: str
+    sse_sequence_no: int
+
+
 __all__ = [
     "KillSwitchInvokeRequest",
     "KillSwitchResumeRequest",
     "KillSwitchStatus",
+    "KillSwitchTransitionResponse",
     "ReconciliationSummary",
     "SystemStatus",
 ]

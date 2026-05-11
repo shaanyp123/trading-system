@@ -93,6 +93,20 @@ def _build_phase0_stub_session(idle_seconds: int) -> SessionContext:
     has no real WebAuthn so the value is mock; downstream code should
     NOT depend on the exact timestamp until Week 6 wiring lands.
 
+    ``auth_strength`` is ``"strong"``: the stub explicitly models a
+    "WebAuthn-just-verified" session so risk-loosening endpoints
+    (``POST /api/system/kill-switch/resume``,
+    ``POST /api/auth/backup-codes/regenerate``) are reachable in
+    Phase-0 paper/dev environments. The Day-15 author left this field as
+    ``"weak"`` while writing ``last_uv_at`` to a recent timestamp; Day 25
+    realigned the field to match the docstring intent. The semantic of
+    the change: the stub IS the operator in paper/dev — the operator's
+    real WebAuthn session has been verified, just by a different
+    middleware that hasn't landed yet (Week 6+). The fail-closed
+    behavior in ``live-small``/``live-scale`` means production never
+    sees this strong-stub session, so this carries no security weight
+    in those envs.
+
     ``session_expires_at`` is NOW + idle_seconds (default 30 min from
     APISettings). The stub does NOT track absolute expiry — that lands
     when the real ``sessions`` table is wired.
@@ -102,7 +116,7 @@ def _build_phase0_stub_session(idle_seconds: int) -> SessionContext:
         user_id="phase0-stub-owner",
         username="operator",
         role="owner",
-        auth_strength="weak",
+        auth_strength="strong",
         last_uv_at=now - timedelta(minutes=1),
         session_expires_at=now + timedelta(seconds=idle_seconds),
         webauthn_enrolled=False,

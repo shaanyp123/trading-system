@@ -312,7 +312,13 @@ class TestAuthMe:
         payload = response.json()
         assert payload["username"] == "operator"
         assert payload["role"] == "owner"
-        assert payload["auth_strength"] == "weak"
+        # Day 25 (Week 7 Mon): the Phase-0 stub session was realigned to
+        # ``auth_strength="strong"`` to match its docstring intent so the
+        # 5-min re-auth gate on risk-loosening endpoints
+        # (kill-switch resume, backup-codes regenerate) is reachable in
+        # paper/dev environments. Production envs fail closed before this
+        # stub injects, so the change carries no security weight there.
+        assert payload["auth_strength"] == "strong"
         assert payload["webauthn_enrolled"] is False
         assert payload["totp_enrolled"] is False
 

@@ -254,7 +254,10 @@ class TestAuthMe:
         assert body["user_id"] == "phase0-stub-owner"
         assert body["username"] == "operator"
         assert body["role"] == "owner"
-        assert body["auth_strength"] == "weak"
+        # Day 25: Phase-0 stub realigned to "strong" so the 5-min re-auth
+        # gate on risk-loosening endpoints is reachable in paper/dev.
+        # See services/api/session._build_phase0_stub_session docstring.
+        assert body["auth_strength"] == "strong"
         assert body["webauthn_enrolled"] is False
         assert body["totp_enrolled"] is False
         assert body["last_uv_at"] is not None
@@ -507,26 +510,124 @@ class TestKillSwitchStatus:
 
 
 class TestKillSwitchInvoke:
+    """Day 25 (Week 7 Mon): the 501 stubs become real handlers backed by
+    ``services.risk.state_machine`` + ``services.risk.dispatch``.
+
+    Unit tests monkeypatch ``apply_state_transition`` + ``emit_sse`` at the
+    route-module level so the route's plan-then-apply orchestration is
+    exercised without a real audit_log write. The end-to-end behavior
+    (real Postgres + real audit chain + real SSE multiplexer) is covered
+    in ``tests/integration/test_kill_switch_end_to_end.py``.
+    """
+
     @pytest.mark.asyncio
-    async def test_valid_body_returns_501_stub(
+    async def test_no_active_account_returns_409(
         self,
         api_client: AsyncClient,
+        api_app: Any,
+        override_dep: Any,
     ) -> None:
+        repo = _StubRepo(account_id=None)
+        _bind_repo(override_dep, system_route, repo)
+        _override_db_session(api_app)
         response = await api_client.post(
             "/api/system/kill-switch/invoke",
             json={"trigger": "manual_judgment", "reason": "operator paused"},
             **_csrf_kwargs(),
         )
-        assert response.status_code == 501
+        assert response.status_code == 409
         body = response.json()
-        assert body["error_code"] == "KILL_SWITCH_HANDLER_NOT_WIRED"
-        assert "dispatcher" in body["message"]
+        assert body["error_code"] == "NO_ACTIVE_ACCOUNT"
+
+    @pytest.mark.asyncio
+    async def test_normal_to_halt_returns_200_with_envelope(
+        self,
+        api_client: AsyncClient,
+        api_app: Any,
+        override_dep: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        account_id = uuid4()
+        repo = _StubRepo(account_id=account_id, risk_row=None)  # no row → NORMAL default
+        _bind_repo(override_dep, system_route, repo)
+        # Bypass the DB session dep (apply_state_transition gets the
+        # stubbed fake session; we monkeypatch apply itself so the session
+        # is never used).
+        _override_db_session(api_app)
+
+        applied_audit_uuid = uuid4()
+        fake_apply = _make_fake_apply(
+            applied_audit_uuid,
+            new_state="HALT_NEW",
+            new_severity="routine",
+        )
+        monkeypatch.setattr(system_route, "apply_state_transition", fake_apply)
+        monkeypatch.setattr(
+            system_route,
+            "emit_sse",
+            _make_fake_emit_sse(captured_sequence_no=42),
+        )
+
+        response = await api_client.post(
+            "/api/system/kill-switch/invoke",
+            json={"trigger": "manual_judgment", "reason": "operator paused"},
+            **_csrf_kwargs(),
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["risk_state"] == "HALT_NEW"
+        assert body["severity"] == "routine"
+        assert body["halt_reason"] == "manual_judgment"
+        assert body["audit_event_uuid"] == str(applied_audit_uuid)
+        assert body["sse_sequence_no"] == 42
+
+    @pytest.mark.asyncio
+    async def test_already_halted_returns_409(
+        self,
+        api_client: AsyncClient,
+        api_app: Any,
+        override_dep: Any,
+    ) -> None:
+        account_id = uuid4()
+        repo = _StubRepo(
+            account_id=account_id,
+            risk_row=RiskStateRow(
+                state="HALT_NEW",
+                severity="routine",
+                reason="trailing_dd_breach",
+                entered_at_utc=datetime.now(tz=UTC),
+                convalescent_session_count=0,
+                vacation_active=False,
+                vacation_until_utc=None,
+                audit_event_uuid=uuid4(),
+            ),
+        )
+        _bind_repo(override_dep, system_route, repo)
+        _override_db_session(api_app)
+        response = await api_client.post(
+            "/api/system/kill-switch/invoke",
+            json={"trigger": "manual_judgment", "reason": "redundant"},
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 409
+        body = response.json()
+        assert body["error_code"] == "ALREADY_HALTED"
+        # The error message echoes the existing severity + reason so the
+        # operator can decide whether to /resume or accept the no-op.
+        assert "routine" in body["message"]
+        assert "trailing_dd_breach" in body["message"]
 
     @pytest.mark.asyncio
     async def test_invalid_trigger_returns_422(
         self,
         api_client: AsyncClient,
+        api_app: Any,
     ) -> None:
+        # Body validation runs before DB deps resolve, so no override needed,
+        # but defensively override anyway so the test isn't sensitive to
+        # FastAPI's dep-resolution ordering changes upstream.
+        _override_db_session(api_app)
         response = await api_client.post(
             "/api/system/kill-switch/invoke",
             json={"trigger": "not_a_real_trigger", "reason": "x"},
@@ -536,29 +637,236 @@ class TestKillSwitchInvoke:
 
 
 class TestKillSwitchResume:
+    """Day 25 (Week 7 Mon): real resume handler with 5-min UV re-auth gate."""
+
     @pytest.mark.asyncio
-    async def test_no_body_treated_as_empty_returns_501_stub(
+    async def test_no_active_account_returns_409(
         self,
         api_client: AsyncClient,
+        api_app: Any,
+        override_dep: Any,
     ) -> None:
+        repo = _StubRepo(account_id=None)
+        _bind_repo(override_dep, system_route, repo)
+        _override_db_session(api_app)
         response = await api_client.post(
             "/api/system/kill-switch/resume",
             json={},
             **_csrf_kwargs(),
         )
-        assert response.status_code == 501
+        assert response.status_code == 409
+        assert response.json()["error_code"] == "NO_ACTIVE_ACCOUNT"
 
     @pytest.mark.asyncio
-    async def test_with_incident_review_id_returns_501_stub(
+    async def test_not_halted_returns_409(
         self,
         api_client: AsyncClient,
+        api_app: Any,
+        override_dep: Any,
     ) -> None:
+        account_id = uuid4()
+        repo = _StubRepo(account_id=account_id, risk_row=None)  # → NORMAL default
+        _bind_repo(override_dep, system_route, repo)
+        _override_db_session(api_app)
         response = await api_client.post(
             "/api/system/kill-switch/resume",
-            json={"incident_review_id": "INC-2026-001"},
+            json={},
             **_csrf_kwargs(),
         )
-        assert response.status_code == 501
+        assert response.status_code == 409
+        body = response.json()
+        assert body["error_code"] == "NOT_HALTED"
+        assert "NORMAL" in body["message"]
+
+    @pytest.mark.asyncio
+    async def test_routine_halt_to_convalescent_returns_200(
+        self,
+        api_client: AsyncClient,
+        api_app: Any,
+        override_dep: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        account_id = uuid4()
+        repo = _StubRepo(
+            account_id=account_id,
+            risk_row=RiskStateRow(
+                state="HALT_NEW",
+                severity="routine",
+                reason="trailing_dd_breach",
+                entered_at_utc=datetime.now(tz=UTC),
+                convalescent_session_count=0,
+                vacation_active=False,
+                vacation_until_utc=None,
+                audit_event_uuid=uuid4(),
+            ),
+        )
+        _bind_repo(override_dep, system_route, repo)
+        _override_db_session(api_app)
+
+        applied_audit_uuid = uuid4()
+        monkeypatch.setattr(
+            system_route,
+            "apply_state_transition",
+            _make_fake_apply(
+                applied_audit_uuid,
+                new_state="CONVALESCENT",
+                new_severity=None,
+            ),
+        )
+        monkeypatch.setattr(
+            system_route,
+            "emit_sse",
+            _make_fake_emit_sse(captured_sequence_no=7),
+        )
+
+        response = await api_client.post(
+            "/api/system/kill-switch/resume",
+            json={},
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["risk_state"] == "CONVALESCENT"
+        assert body["severity"] is None
+        assert body["halt_reason"] is None
+        assert body["audit_event_uuid"] == str(applied_audit_uuid)
+        assert body["sse_sequence_no"] == 7
+
+    @pytest.mark.asyncio
+    async def test_incident_review_without_id_returns_422(
+        self,
+        api_client: AsyncClient,
+        api_app: Any,
+        override_dep: Any,
+    ) -> None:
+        account_id = uuid4()
+        repo = _StubRepo(
+            account_id=account_id,
+            risk_row=RiskStateRow(
+                state="HALT_NEW",
+                severity="incident_review",
+                reason="hash_chain_break",
+                entered_at_utc=datetime.now(tz=UTC),
+                convalescent_session_count=0,
+                vacation_active=False,
+                vacation_until_utc=None,
+                audit_event_uuid=uuid4(),
+            ),
+        )
+        _bind_repo(override_dep, system_route, repo)
+        _override_db_session(api_app)
+        response = await api_client.post(
+            "/api/system/kill-switch/resume",
+            json={},  # missing incident_review_id
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 422
+        body = response.json()
+        assert body["error_code"] == "INCIDENT_REVIEW_ID_REQUIRED"
+
+    @pytest.mark.asyncio
+    async def test_re_auth_required_when_session_weak(
+        self,
+        api_client: AsyncClient,
+        api_app: Any,
+    ) -> None:
+        # Override get_session_context to inject a weak session — re-auth
+        # gate fails first; no DB lookup happens. Proves the resume route
+        # enforces the dev-guide §1.5 5-min UV gate.
+        from datetime import timedelta as _td
+
+        from services.api.session import SessionContext, get_session_context
+
+        weak_session = SessionContext(
+            user_id="phase0-stub-owner",
+            username="operator",
+            role="owner",
+            auth_strength="weak",
+            last_uv_at=datetime.now(tz=UTC) - _td(minutes=1),
+            session_expires_at=datetime.now(tz=UTC) + _td(minutes=30),
+            webauthn_enrolled=False,
+            totp_enrolled=False,
+            is_phase0_stub=True,
+        )
+        api_app.dependency_overrides[get_session_context] = lambda: weak_session
+        _override_db_session(api_app)
+
+        response = await api_client.post(
+            "/api/system/kill-switch/resume",
+            json={},
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 401
+        body = response.json()
+        assert body["error_code"] == "RE_AUTH_REQUIRED"
+
+
+# ---------------------------------------------------------------------------
+# Test-only helpers — fake DB session + apply + emit_sse for Day 25 routes.
+# ---------------------------------------------------------------------------
+
+
+class _NoopDbSession:
+    """Placeholder session that errors loudly if anything tries to use it.
+
+    The route's ``Depends(get_session)`` is overridden via this so the
+    asyncpg pool stays out of unit tests; ``apply_state_transition`` is
+    also monkeypatched in the same test, so the session is never actually
+    touched. Calls into it surface a clear error.
+    """
+
+    async def execute(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover
+        raise RuntimeError(
+            "fake _NoopDbSession.execute called — monkeypatch apply_state_transition first"
+        )
+
+
+async def _fake_db_session_dependency() -> Any:
+    """Async generator dep replacement matching ``get_session``'s shape."""
+    yield _NoopDbSession()
+
+
+def _override_db_session(api_app: Any) -> None:
+    """Wire ``_fake_db_session_dependency`` over ``get_session``.
+
+    FastAPI resolves all deps for a route up-front, so even the early
+    409/422 error branches need a valid db session dep — otherwise
+    ``init_pool() first`` raises before the route handler sees the
+    short-circuit branch.
+    """
+    from services.api.db import get_session
+
+    api_app.dependency_overrides[get_session] = _fake_db_session_dependency
+
+
+def _make_fake_apply(
+    applied_audit_uuid: Any,
+    *,
+    new_state: str,
+    new_severity: str | None,
+) -> Any:
+    """Build an async stub for ``apply_state_transition`` returning a canned
+    :class:`AppliedStateTransition`.
+    """
+    from services.risk.dispatch import AppliedStateTransition
+
+    async def _apply(**kwargs: Any) -> AppliedStateTransition:
+        return AppliedStateTransition(
+            state_transition_audit_event_uuid=applied_audit_uuid,
+            new_state=new_state,
+            new_severity=new_severity,
+        )
+
+    return _apply
+
+
+def _make_fake_emit_sse(*, captured_sequence_no: int) -> Any:
+    """Build an async stub for ``emit_sse`` returning a canned sequence_no."""
+
+    async def _emit(event_type: str, data: dict[str, Any]) -> int:
+        return captured_sequence_no
+
+    return _emit
 
 
 # ---------------------------------------------------------------------------
