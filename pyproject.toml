@@ -24,6 +24,7 @@ dependencies = [
   "structlog>=24.4",
   "argon2-cffi>=23.1",
   "pyotp>=2.9",
+  "webauthn>=2.0",
   "uuid-utils>=0.10",
   # numpy: services/risk/sizing.py uses np.linalg.eigh for the Higham PSD repair
   # algorithm (backend-spec §2.4.1 Stage 3). Eigendecomposition in pure Python

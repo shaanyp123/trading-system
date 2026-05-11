@@ -70,6 +70,7 @@ RUN python -m venv /opt/venv \
         "structlog>=24.4" \
         "argon2-cffi>=23.1" \
         "pyotp>=2.9" \
+        "webauthn>=2.0" \
         "uuid-utils>=0.10" \
         "numpy>=2.1" \
         "discord.py>=2.4" \
