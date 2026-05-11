@@ -1101,6 +1101,51 @@ sops -d secrets/live.enc.yaml | grep -A3 webauthn
 
 ---
 
+## RB-012 — VPS `git pull` Blocks on a Sops-Encrypted File
+
+**Symptom:** On the Ashburn VPS, `git pull origin main` aborts with `error: Your local changes to the following files would be overwritten by merge: secrets/<env>.enc.yaml` or similar.
+
+**Likely cause:** one of three cases — only the first two are real conflicts:
+- **(a) stale-HEAD** — working tree matches `origin/main`'s content but git's index thinks it has local edits. Cosmetic; resolves with a checkout.
+- **(b) real-divergence** — working tree truly differs from `origin/main` (e.g., operator filled secret values on the VPS that were never committed back). Needs an Option-B commit-back PR per Day 6 carryover precedent (PR #29).
+- **(c) sops-noise** — plaintext content matches `origin/main` but the on-disk ciphertext differs (sops re-encrypts on every edit; the ciphertext is non-deterministic). Same resolution as (a).
+
+**Diagnostic (5 seconds, unambiguously distinguishes the three cases):**
+```bash
+# On VPS:
+git hash-object secrets/paper.enc.yaml
+# Note the SHA.
+
+# From any laptop with the repo cloned (or anywhere with gh access):
+git rev-parse origin/main:secrets/paper.enc.yaml
+# Compare SHAs.
+```
+
+**Resolution:**
+1. **If SHAs match** (cases (a) or (c)): the VPS working tree has nothing new. Discard the local "change":
+   ```bash
+   git checkout HEAD -- secrets/paper.enc.yaml
+   git pull origin main
+   ```
+2. **If SHAs differ** (case (b)): there are real local edits worth preserving. Do NOT discard. Bring the file back via Option-B PR from a laptop with the repo + sops key:
+   ```bash
+   # On VPS:
+   scp operator@<vps-ip>:/opt/trading/secrets/paper.enc.yaml /tmp/paper.enc.yaml
+
+   # On laptop:
+   git checkout -b chore/commit-back-vps-secrets
+   cp /tmp/paper.enc.yaml secrets/paper.enc.yaml
+   sops -d secrets/paper.enc.yaml | head -1  # sanity check decrypts cleanly
+   git add secrets/paper.enc.yaml
+   git commit -m "chore(secrets): commit filled paper.enc.yaml from VPS"
+   gh pr create --fill
+   # After merge: VPS `git pull origin main` fast-forwards cleanly.
+   ```
+
+**Anti-pattern to avoid:** reflexively running `git reset --hard` on the VPS to "fix" the pull. This wipes case (b) work. Always run the SHA diagnostic first; it is cheap and decisive. See `Docs/decisions-log.md` "Day 6 carryover morning — PR #29 commits filled paper.enc.yaml" and "Day 11 carryover — VPS git pull stale-HEAD diagnostic" entries for the precedent incidents.
+
+---
+
 # 10. Risk Register
 
 | # | Risk | Probability | Impact | Mitigation | Monitoring Signal |
