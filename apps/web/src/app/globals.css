@@ -21,6 +21,36 @@ body {
   font-feature-settings: 'tnum' 1;
 }
 
+/* Day 24 ceremony fix: @tailwindcss/forms resets form inputs to a white
+ * background + dark text default, which fights the dark theme — password
+ * input dots become white-on-white and invisible, plaintext inputs render
+ * with low contrast. Themed via @layer base so per-input className utilities
+ * can still override when intentional. */
+@layer base {
+  input[type='text'],
+  input[type='password'],
+  input[type='email'],
+  input[type='number'],
+  input[type='tel'],
+  input[type='search'],
+  input[type='url'],
+  textarea,
+  select {
+    @apply bg-bg-elevated text-text-primary;
+  }
+
+  input[type='text']::placeholder,
+  input[type='password']::placeholder,
+  input[type='email']::placeholder,
+  input[type='number']::placeholder,
+  input[type='tel']::placeholder,
+  input[type='search']::placeholder,
+  input[type='url']::placeholder,
+  textarea::placeholder {
+    @apply text-text-muted;
+  }
+}
+
 @media print {
   @page {
     size: letter portrait;
