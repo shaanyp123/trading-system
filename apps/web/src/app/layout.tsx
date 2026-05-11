@@ -2,6 +2,8 @@ import './globals.css';
 
 import type { Metadata, Viewport } from 'next';
 
+import { Providers } from '@/components/providers';
+
 export const metadata: Metadata = {
   title: 'Trading',
   description: 'Solo-operator algorithmic trading system',
@@ -18,7 +20,9 @@ export default function RootLayout({ children }: Props) {
   return (
     <html lang="en" className="dark">
       <body>
-        <main className="min-h-screen">{children}</main>
+        <Providers>
+          <main className="min-h-screen">{children}</main>
+        </Providers>
       </body>
     </html>
   );
