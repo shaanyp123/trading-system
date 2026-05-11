@@ -44,6 +44,7 @@ from services.api.routes.signals import router as signals_router
 from services.api.routes.sse import router as sse_router
 from services.api.routes.system import router as system_router
 from services.api.routes.today import router as today_router
+from services.api.routes.trades import router as trades_router
 from services.api.session import SessionStubMiddleware
 
 log = structlog.get_logger()
@@ -173,6 +174,8 @@ def create_app() -> FastAPI:
     app.include_router(orders_router)
     app.include_router(fills_router)
     app.include_router(alerts_router)
+    # Day 26 — Week 7 Tue Trades page surface (backend-spec §4.1.2).
+    app.include_router(trades_router)
     return app
 
 

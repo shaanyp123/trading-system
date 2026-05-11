@@ -133,6 +133,25 @@ class Phase1QueryRepo(Protocol):
         limit: int,
     ) -> tuple[list[dict[str, object]], str | None, bool]: ...
 
+    async def fetch_trades_page(
+        self,
+        account_id: UUID,
+        *,
+        from_utc: datetime | None,
+        to_utc: datetime | None,
+        market: str | None,
+        state: str | None,
+        id_prefix: str | None,
+        cursor: str | None,
+        limit: int,
+    ) -> tuple[list[dict[str, object]], str | None, bool]: ...
+
+    async def fetch_trade_by_id(
+        self,
+        account_id: UUID,
+        trade_id: UUID,
+    ) -> dict[str, object] | None: ...
+
     async def fetch_latest_balance_nav(self, account_id: UUID) -> Decimal | None: ...
 
 
@@ -384,6 +403,90 @@ class PostgresPhase1QueryRepo:
         rows = (await self._session.execute(text(sql), params)).fetchall()
         items = [dict(r._mapping) for r in rows]
         return items, None, False
+
+    # --- trades ------------------------------------------------------------
+
+    async def fetch_trades_page(
+        self,
+        account_id: UUID,
+        *,
+        from_utc: datetime | None,
+        to_utc: datetime | None,
+        market: str | None,
+        state: str | None,
+        id_prefix: str | None,
+        cursor: str | None,
+        limit: int,
+    ) -> tuple[list[dict[str, object]], str | None, bool]:
+        # Phase 0: trades table is empty until Week 7 Thu paper round-trip
+        # populates the first row. Query runs against the partition-pruned
+        # table heap; filter pushes down via ``trades_opened_at`` /
+        # ``trades_market`` / ``trades_state`` indexes when present.
+        params: dict[str, object] = {"acc": account_id, "lim": limit}
+        sql = (
+            "SELECT id, env, market, direction, state, "
+            "       opened_at_utc, closed_at_utc, total_quantity, "
+            "       avg_entry_price, avg_exit_price, realized_pnl_usd, "
+            "       entry_signal_id, managed_by_version "
+            "FROM trades WHERE account_id = :acc"
+        )
+        if from_utc is not None:
+            sql += " AND opened_at_utc >= :from_utc"
+            params["from_utc"] = from_utc
+        if to_utc is not None:
+            sql += " AND opened_at_utc <= :to_utc"
+            params["to_utc"] = to_utc
+        if market:
+            sql += " AND market = :mkt"
+            params["mkt"] = market
+        if state:
+            sql += " AND state = :st"
+            params["st"] = state
+        if id_prefix:
+            # ``id_prefix`` is the command-palette (Phase 2) lookup —
+            # backend-spec §4.1.2 specifies ``trade_uuid::text`` prefix
+            # match. ``id_prefix`` is operator-supplied so escape the LIKE
+            # metacharacters defensively even though UUID strings can't
+            # legitimately contain ``%`` or ``_``.
+            sanitized = id_prefix.replace("%", r"\%").replace("_", r"\_")
+            sql += " AND id::text LIKE :id_prefix || '%' ESCAPE '\\'"
+            params["id_prefix"] = sanitized
+        sql += " ORDER BY opened_at_utc DESC LIMIT :lim"
+        rows = (await self._session.execute(text(sql), params)).fetchall()
+        items = [dict(r._mapping) for r in rows]
+        # Phase 0 always returns has_more=False because no data exists; the
+        # cursor stays None. Real cursor encoding lands when trades populate
+        # (Week 7 Thu paper round-trip onwards) — same pattern as signals /
+        # orders / fills above.
+        return items, None, False
+
+    async def fetch_trade_by_id(
+        self,
+        account_id: UUID,
+        trade_id: UUID,
+    ) -> dict[str, object] | None:
+        # Detail endpoint — returns the full TradeDetail wire shape's columns.
+        # account_id is part of the WHERE clause for defense-in-depth even
+        # though Phase 0 has a single operator account; matches the pattern in
+        # ``fetch_risk_state_current`` so a future multi-tenant Phase doesn't
+        # leak trade rows across accounts via deep-link enumeration.
+        row = (
+            await self._session.execute(
+                text(
+                    "SELECT id, account_id, env, market, direction, state, "
+                    "       opened_at_utc, closed_at_utc, total_quantity, "
+                    "       avg_entry_price, avg_exit_price, realized_pnl_usd, "
+                    "       realized_commission_usd, dividend_pnl_usd, "
+                    "       entry_signal_id, entry_order_id, exit_order_id, "
+                    "       managed_by_version, strategy_hash, "
+                    "       parameter_set_hash, slippage_calibration_version_id "
+                    "FROM trades "
+                    "WHERE account_id = :acc AND id = :tid"
+                ),
+                {"acc": account_id, "tid": trade_id},
+            )
+        ).fetchone()
+        return dict(row._mapping) if row is not None else None
 
     async def count_open_alerts_by_severity(self, account_id: UUID) -> AlertCountRow:
         row = (
