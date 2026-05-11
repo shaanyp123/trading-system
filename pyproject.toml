@@ -102,6 +102,13 @@ ignore = [
 "services/api/routes/*.py" = ["B008"]
 # Container entrypoint binds 0.0.0.0 by design and exec()s a known argv.
 "services/api/entrypoint.py" = ["S104", "S603", "S606"]
+# Discord bot entrypoint also exec()s a known argv — same pattern.
+"services/discord_bot/entrypoint.py" = ["S603", "S606"]
+# Discord bot commands use `@app_commands.describe` decorator + nested
+# closures; B008 (Depends-style) doesn't apply but the decorator pattern
+# trips Ruff's "function call in argument default" check on the
+# `@tree.command(...)` decorator stack — same exception we make for FastAPI.
+"services/discord_bot/commands/*.py" = ["B008"]
 
 [tool.ruff.format]
 quote-style = "double"

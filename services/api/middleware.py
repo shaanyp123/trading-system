@@ -20,6 +20,17 @@ Day 17 addition (IG §3 Week 5 Wed):
     module; Phase 1 may move to Caddy-edge filtering if real load justifies
     the custom build. See Docs/decisions-log.md "Day 17 09:00" entry.
 
+Day 23 addition (IG §3 Week 6 Thu):
+
+  * `BotAuthMiddleware` — bearer-token authentication for the Discord
+    bot per backend-spec §6.6 + §4.4. Runs OUTERMOST of the middleware
+    stack so the bot's requests skip CSRF (no cookies) and SessionStub
+    (which would fail-close in production envs). On a valid token: sets
+    ``request.state.session`` to a service-account ``SessionContext`` +
+    ``request.state.is_bot_authenticated = True``. On an invalid token:
+    rejects with 401 + canonical envelope. No header → falls through to
+    downstream middleware unchanged.
+
 Session cookies (`__Host-trading_session`) are NOT issued in Day 5: the
 session table doesn't exist yet (Phase 0 Week 2 ships it). The cookie
 NAME is reserved in `APISettings.session_cookie_name` so future routes
@@ -29,10 +40,12 @@ can share the constant; no middleware reads it yet.
 from __future__ import annotations
 
 import asyncio
+import secrets
 import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
 import structlog
 from fastapi import FastAPI, Request, Response
@@ -113,7 +126,21 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
 
 
 class CSRFMiddleware(BaseHTTPMiddleware):
-    """Double-submit CSRF check for state-changing requests."""
+    """Double-submit CSRF check for state-changing requests.
+
+    Bot-authenticated requests (``request.state.is_bot_authenticated``)
+    bypass this gate because:
+
+      * The bot is a service-account caller using a bearer token sourced
+        from sops — not a browser session cookie.
+      * The double-submit CSRF pattern defends against cross-site form
+        submissions; bearer auth has no equivalent threat (no cookies
+        to forge, no browser context).
+      * Backend-spec §6.6 + §4.4 explicitly require bearer auth for the
+        bot's POST endpoints — keeping CSRF active would require giving
+        the bot a CSRF cookie + header pair which is operationally
+        worse (now there are TWO secrets to manage).
+    """
 
     def __init__(self, app: FastAPI, *, settings: APISettings) -> None:
         super().__init__(app)
@@ -128,6 +155,7 @@ class CSRFMiddleware(BaseHTTPMiddleware):
         if (
             request.method in ("POST", "PUT", "PATCH", "DELETE")
             and request.url.path not in _CSRF_EXEMPT_PATHS
+            and not getattr(request.state, "is_bot_authenticated", False)
         ):
             cookie_val = request.cookies.get(self._cookie_name)
             header_val = request.headers.get(self._header_name)
@@ -271,6 +299,113 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         )
 
 
+#: Service-account user_id surfaced in ``SessionContext.user_id`` for
+#: bot-authenticated requests. Distinct from ``phase0-stub-owner`` (the
+#: SessionStub user_id) so log scrapers + audit-log writers can tell the
+#: two paths apart at a glance.
+_BOT_SERVICE_ACCOUNT_USER_ID = "discord-bot"
+
+
+class BotAuthMiddleware(BaseHTTPMiddleware):
+    """Bearer-token auth for the Discord bot per backend-spec §6.6 + §4.4.
+
+    Behavior:
+
+      * No ``Authorization: Bearer ...`` header → pass through unchanged.
+        Downstream middleware (SessionStub) handles human-session paths.
+      * ``Authorization: Bearer <valid-token>`` (constant-time matched
+        against ``settings.discord_bot_bearer_token``) → set
+        ``request.state.session = SessionContext(...)`` with service-
+        account identity + ``request.state.is_bot_authenticated = True``.
+        Bypasses CSRF + SessionStub on later middleware. Pass through.
+      * ``Authorization: Bearer <invalid-token>`` → 401 + canonical
+        envelope. Don't pass through (defense-in-depth: a bad token is
+        an explicit auth attempt that the api should reject loudly).
+      * No bot bearer configured (``settings.discord_bot_bearer_token`` is
+        None) → fall through unconditionally. The bot path is simply not
+        served until the operator wires the sops secret per
+        ``deploy/discord_bot/README.md``. This is the Day-23 dev-mode
+        default; production sets the token via sops.
+
+    The middleware imports ``SessionContext`` lazily inside ``dispatch``
+    to avoid a top-of-module import cycle (services.api.session imports
+    services.api.config which imports services.api ... see). Lazy import
+    is safe because dispatch runs only after the module graph has settled.
+    """
+
+    def __init__(self, app: FastAPI, *, settings: APISettings) -> None:
+        super().__init__(app)
+        token_secret = settings.discord_bot_bearer_token
+        self._expected_token: str | None = (
+            token_secret.get_secret_value() if token_secret is not None else None
+        )
+        # ``session_idle_seconds`` mirrors the SessionStub's session expiry
+        # window — bot sessions are stateless (one-shot per request) but
+        # the SessionContext.session_expires_at field is not nullable so
+        # we synthesize a sensible value.
+        self._idle_seconds = settings.session_idle_seconds
+
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        auth_header = request.headers.get("authorization", "")
+        if not auth_header.lower().startswith("bearer "):
+            return await call_next(request)
+
+        # Whitespace-insensitive split per RFC 7235 §2.1.
+        provided_token = auth_header[7:].strip()
+        if not provided_token:
+            return await call_next(request)
+
+        if self._expected_token is None:
+            # Bot bearer not configured for this deployment. Treat the
+            # request like any other (no bot path served) — the watchdog's
+            # bearer goes through a different code path so we don't
+            # accidentally 401 it.
+            return await call_next(request)
+
+        # Constant-time compare to defend against timing oracles.
+        if not secrets.compare_digest(provided_token, self._expected_token):
+            log.warning(
+                "bot_auth_invalid_token",
+                path=request.url.path,
+                client_host=request.client.host if request.client else None,
+            )
+            return JSONResponse(
+                status_code=401,
+                content=ErrorEnvelope(
+                    error_code="BOT_AUTH_INVALID",
+                    message="Bearer token did not match the configured discord-bot token.",
+                ).model_dump(),
+            )
+
+        # Lazy import to avoid the session ↔ config ↔ middleware import
+        # graph forming a cycle at module-load time. Safe at request time:
+        # by the time dispatch runs, every module has imported.
+        from services.api.session import SessionContext
+
+        now = datetime.now(tz=UTC)
+        request.state.session = SessionContext(
+            user_id=_BOT_SERVICE_ACCOUNT_USER_ID,
+            username=_BOT_SERVICE_ACCOUNT_USER_ID,
+            role="owner",
+            auth_strength="strong",
+            last_uv_at=now,
+            session_expires_at=now + timedelta(seconds=self._idle_seconds),
+            webauthn_enrolled=False,
+            totp_enrolled=False,
+            is_phase0_stub=False,
+        )
+        request.state.is_bot_authenticated = True
+        log.debug(
+            "bot_auth_accepted",
+            path=request.url.path,
+        )
+        return await call_next(request)
+
+
 def register_middleware(app: FastAPI, settings: APISettings) -> None:
     """Wire middleware. Starlette's `add_middleware` makes the LAST-ADDED
     layer OUTERMOST in the request path (verified empirically; see Day 17
@@ -284,11 +419,29 @@ def register_middleware(app: FastAPI, settings: APISettings) -> None:
     only mutates `request.state` and never short-circuits, so it does not
     affect the gate semantics below.)
 
-    Order rationale:
-      * `RequestContext` outermost: binds `trace_id` to structlog so a
-        rejection by RateLimit OR CSRF still emits `request_completed` /
-        `csrf_rejected` / `rate_limit_exceeded` lines with `trace_id`
-        attached for ops grep-ability.
+    Day 23 addition: ``BotAuthMiddleware`` is added LAST after the stub
+    in ``main.py`` so it ends up OUTERMOST of all middleware — the
+    request flow becomes:
+
+        BotAuth → SessionStub → RequestContext → RateLimit → CSRF → routes
+
+    BotAuth runs first because:
+      * It must execute BEFORE SessionStub's fail-close in production
+        envs (live-small / live-scale) — otherwise a bot request to
+        production gets 401'd before BotAuth can inject its session.
+      * It must set ``request.state.is_bot_authenticated`` BEFORE CSRF
+        checks it (CSRF reads the flag to decide whether to skip the
+        cookie+header comparison for bot calls).
+      * It only mutates ``request.state`` on a valid token; on no
+        header / no configured token, it's a noop — adding it to the
+        outermost position has zero performance cost on the human path.
+
+    Order rationale (existing):
+      * `RequestContext` outermost (of the 3 register_middleware adds):
+        binds `trace_id` to structlog so a rejection by RateLimit OR CSRF
+        still emits `request_completed` / `csrf_rejected` /
+        `rate_limit_exceeded` lines with `trace_id` attached for ops
+        grep-ability.
       * `RateLimit` outer of `CSRF`: a flood of CSRF-failing POSTs from a
         single attacker IP would otherwise bypass the limiter entirely
         (CSRF rejection short-circuits before RateLimit's counter
@@ -315,6 +468,7 @@ def register_middleware(app: FastAPI, settings: APISettings) -> None:
 
 
 __all__ = [
+    "BotAuthMiddleware",
     "CSRFMiddleware",
     "RateLimitMiddleware",
     "RequestContextMiddleware",

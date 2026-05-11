@@ -71,6 +71,15 @@ def main(argv: list[str] | None = None) -> int:
         if wb and not _looks_like_placeholder(wb):
             os.environ["API_WATCHDOG_BEARER_TOKEN"] = wb
 
+    # Day 23: Discord-bot bearer (sops yaml `discord.api_bearer_token`).
+    # When unset the api still boots — BotAuthMiddleware degrades to a
+    # noop and the bot path is simply not served until the operator
+    # adds the secret per `deploy/discord_bot/README.md`.
+    if "API_DISCORD_BOT_BEARER_TOKEN" not in os.environ:
+        bb = (secrets.get("discord") or {}).get("api_bearer_token")
+        if bb and not _looks_like_placeholder(bb):
+            os.environ["API_DISCORD_BOT_BEARER_TOKEN"] = bb
+
     if "API_VERSION" not in os.environ:
         os.environ.setdefault("API_VERSION", os.environ.get("RELEASE_SHA", "dev"))
     if "API_ENVIRONMENT" not in os.environ:

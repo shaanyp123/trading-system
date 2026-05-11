@@ -143,6 +143,36 @@ class APISettings(BaseSettings):
     # multi-operator environments in Phase 3+.
     operator_username: str = Field(default="operator", min_length=1, max_length=64)
 
+    # --- Discord bot bearer auth (Day 23 — IG §3 Week 6 Thu) --------------
+    # Shared bearer token between the api and the discord bot per backend-
+    # spec §6.6 + §4.4 ("shared sops-decrypted Bearer token; rotated
+    # quarterly with 1h overlap"). When the bot makes an HTTP request to
+    # the api over the trading_internal Docker network, it sets
+    # ``Authorization: Bearer <token>``; ``BotAuthMiddleware`` validates
+    # via constant-time compare and on match injects a service-account
+    # ``SessionContext`` (username=``discord-bot``, role=``owner``,
+    # auth_strength=``strong``, is_phase0_stub=False).
+    #
+    # When unset the middleware degrades to no-op (no bot path is
+    # served). Production must set this — the SessionStubMiddleware fail-
+    # close in live envs would otherwise reject the bot's calls before
+    # any handler runs.
+    #
+    # Sourced from sops yaml ``discord.api_bearer_token`` per
+    # ``deploy/discord_bot/README.md``. Token format: 32-byte URL-safe
+    # base64 (``secrets.token_urlsafe(32)``); operator can rotate by
+    # generating a fresh value, deploying both api + discord_bot with the
+    # new value, then revoking the old.
+    discord_bot_bearer_token: SecretStr | None = Field(
+        default=None,
+        description=(
+            "Shared bearer token for Discord bot → api authentication. "
+            "When set, BotAuthMiddleware accepts requests bearing this "
+            "token in Authorization header and injects a service-account "
+            "SessionContext."
+        ),
+    )
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> APISettings:
