@@ -20,15 +20,21 @@ import { useQuery, type UseQueryResult } from '@tanstack/react-query';
 import { apiCall } from '../api';
 import type {
   AlertsResponse,
+  AuditLogFilters,
+  AuditLogPageResponse,
+  AuthMeResponse,
   FillsResponse,
   HealthScoreResponse,
+  KillSwitchStatus,
   PositionsResponse,
+  RiskEnvelopeResponse,
   SignalListResponse,
   SystemStatus,
   TodayDigestResponse,
   TradeDetail,
   TradesListResponse,
   TradesQueryFilters,
+  WatchdogStatus,
 } from './types';
 
 const KEYS = {
@@ -41,6 +47,11 @@ const KEYS = {
   alertsOpen: ['alerts', { status: 'open' as const }] as const,
   trades: (filters: TradesQueryFilters) => ['trades', filters] as const,
   trade: (id: string) => ['trade', id] as const,
+  authMe: ['auth-me'] as const,
+  killSwitch: ['system', 'kill-switch'] as const,
+  riskEnvelope: ['system', 'risk-envelope'] as const,
+  watchdog: ['system', 'watchdog'] as const,
+  auditLog: (filters: AuditLogFilters) => ['system', 'audit', filters] as const,
 };
 
 export function useTodayDigest(): UseQueryResult<TodayDigestResponse> {
@@ -159,6 +170,102 @@ export function useTrade(id: string): UseQueryResult<TradeDetail> {
       apiCall<TradeDetail>(`/api/trades/${encodeURIComponent(id)}`, { signal }),
     staleTime: 60_000,
     enabled: id.length > 0,
+  });
+}
+
+/**
+ * `/api/auth/me` — session info for the operator.
+ *
+ * Day 27: consumed by the re-auth modal to compute `now - last_uv_at` for
+ * the 5-min UV gate (dev-guide §1.5 LOCKED). Short staleTime so the page
+ * refetches around the gate boundary and the operator doesn't spend
+ * minutes in stale-session UI before being prompted.
+ */
+export function useAuthMe(): UseQueryResult<AuthMeResponse> {
+  return useQuery({
+    queryKey: KEYS.authMe,
+    queryFn: ({ signal }) =>
+      apiCall<AuthMeResponse>('/api/auth/me', { signal }),
+    staleTime: 30_000,
+  });
+}
+
+/**
+ * `/api/system/kill-switch` — narrow projection consumed by the kill-switch
+ * tile on `/system`. Same content as `/api/system/status.risk_state` etc;
+ * separate hook so the tile can be invalidated independently after an
+ * invoke/resume mutation without bouncing the whole page.
+ */
+export function useKillSwitchStatus(): UseQueryResult<KillSwitchStatus> {
+  return useQuery({
+    queryKey: KEYS.killSwitch,
+    queryFn: ({ signal }) =>
+      apiCall<KillSwitchStatus>('/api/system/kill-switch', { signal }),
+    staleTime: 30_000,
+  });
+}
+
+/**
+ * `/api/system/risk-envelope` — read-only Phase 1 tile per spec §2.6.3.
+ *
+ * 1-min staleTime: the envelope is essentially static today (LOCKED spec
+ * defaults until the dispatcher writes the first parameter set). When
+ * Phase 1+ parameter-change PRs land this stays a slow-changing surface,
+ * so the cache window is conservative.
+ */
+export function useRiskEnvelope(): UseQueryResult<RiskEnvelopeResponse> {
+  return useQuery({
+    queryKey: KEYS.riskEnvelope,
+    queryFn: ({ signal }) =>
+      apiCall<RiskEnvelopeResponse>('/api/system/risk-envelope', { signal }),
+    staleTime: 60_000,
+  });
+}
+
+/**
+ * `/api/system/watchdog` — last-ping summary per spec §2.6.6.
+ *
+ * 30-second staleTime aligned with the watchdog poll cadence (5 min from
+ * the external VPS; the frontend refreshing every 30s is fast enough to
+ * catch a stale-ping transition without thrashing).
+ */
+export function useWatchdogStatus(): UseQueryResult<WatchdogStatus> {
+  return useQuery({
+    queryKey: KEYS.watchdog,
+    queryFn: ({ signal }) =>
+      apiCall<WatchdogStatus>('/api/system/watchdog', { signal }),
+    staleTime: 30_000,
+  });
+}
+
+function buildAuditLogUrl(filters: AuditLogFilters): string {
+  const params = new URLSearchParams();
+  if (filters.event_type !== undefined) params.set('event_type', filters.event_type);
+  if (filters.env !== undefined) params.set('env', filters.env);
+  if (filters.from !== undefined) params.set('from', filters.from);
+  if (filters.to !== undefined) params.set('to', filters.to);
+  if (filters.cursor !== undefined) params.set('cursor', filters.cursor);
+  if (filters.limit !== undefined) params.set('limit', String(filters.limit));
+  const qs = params.toString();
+  return qs.length > 0 ? `/api/system/audit?${qs}` : '/api/system/audit';
+}
+
+/**
+ * `/api/system/audit` — paginated audit-log table per spec §2.6.4.
+ *
+ * Long staleTime (5 min) because audit_log is append-only by construction
+ * (immutability triggers from migration 0005). New rows show up on next
+ * refetch — SSE-event invalidation per spec §8.6 is wired in the SSE
+ * manager (Phase 1+).
+ */
+export function useAuditLogPage(
+  filters: AuditLogFilters,
+): UseQueryResult<AuditLogPageResponse> {
+  return useQuery({
+    queryKey: KEYS.auditLog(filters),
+    queryFn: ({ signal }) =>
+      apiCall<AuditLogPageResponse>(buildAuditLogUrl(filters), { signal }),
+    staleTime: 5 * 60_000,
   });
 }
 

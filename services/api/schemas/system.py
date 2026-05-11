@@ -1,25 +1,29 @@
-"""services/api/schemas/system.py — `/api/system/*` schemas (subset).
+"""services/api/schemas/system.py — `/api/system/*` schemas.
 
-Backend-spec §4.1.3:
+Backend-spec §4.1.3 endpoints:
 
   * ``SystemStatus`` + ``ReconciliationSummary`` — composite snapshot for
-    landing-page paint.
+    landing-page paint (Day 15).
   * ``KillSwitchStatus`` — narrower projection used by the kill-switch tile
-    (a strict subset of ``SystemStatus``).
-  * ``KillSwitchInvokeRequest`` / ``KillSwitchResumeRequest`` — request bodies
-    for the two POST endpoints. These are validated today; the actual
-    transition logic flows through ``services/risk/state_machine.py``
-    (forbidden whitelist), wired by the Week 4 Wed dispatcher PR. Day 15 ships
-    501 ``KILL_SWITCH_HANDLER_NOT_WIRED`` responses.
+    (a strict subset of ``SystemStatus``; Day 15).
+  * ``KillSwitchInvokeRequest`` / ``KillSwitchResumeRequest`` /
+    ``KillSwitchTransitionResponse`` — request + response bodies for the two
+    POST endpoints (Day 25 wired end-to-end).
+  * ``RiskEnvelopeResponse`` + ``RiskParameterItem`` — read-only Phase-1 tile
+    surface per frontend-spec §2.6.3 (Day 27).
+  * ``AuditLogEntry`` + ``AuditLogPageResponse`` — audit explorer wire shape
+    per frontend-spec §2.6.4 (Day 27).
+  * ``WatchdogStatusResponse`` — last-ping summary per frontend-spec §2.6.6
+    (Day 27).
 
-The `vacation_*`, `audit`, `deployments`, `agent-activity`, `costs`,
-`watchdog`, and `risk-envelope` endpoints from §4.1.3 are NOT in Day 15 scope
-(deferred to Week 5 Tue-Fri sessions).
+The `vacation_*`, `deployments`, `agent-activity`, and `costs` endpoints
+from §4.1.3 remain deferred (Phase 2 surfaces).
 """
 
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -173,11 +177,164 @@ class KillSwitchTransitionResponse(BaseModel):
     sse_sequence_no: int
 
 
+# ---------------------------------------------------------------------------
+# Risk envelope (Day 27 — read-only tile per frontend-spec §2.6.3)
+# ---------------------------------------------------------------------------
+
+
+class RiskParameterItem(BaseModel):
+    """One row in the read-only risk envelope tile.
+
+    Display values come from the active ``parameter_sets`` row (keyed by the
+    current ``parameter_set_hash``) once the parameters surface populates.
+    Phase 0 returns the LOCKED spec defaults from backend-spec §2.4 +
+    frontend-spec §2.6.3 because the ``parameters`` table is empty until the
+    Week 4 Wed dispatcher seeds the first parameter set.
+
+    ``value`` is a ``Decimal`` (serialized as string per dev-guide §3.8).
+    ``unit`` distinguishes percent fractions (0.14 → "14%") from raw ratios
+    (0.7 → "0.70") so the frontend formatter knows what suffix to append.
+    ``cluster`` is set on the five cluster-cap rows and None for portfolio-
+    level limits.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: str
+    label: str
+    value: Decimal
+    unit: Literal["percent", "ratio"]
+    cluster: Literal["equity_index", "rates_bonds", "commodity", "crypto", "fx"] | None = None
+
+
+class RiskEnvelopeResponse(BaseModel):
+    """Backend-spec §4.1.3 ``GET /api/system/risk-envelope`` response.
+
+    ``source`` reports where the values came from:
+
+      * ``parameters_table`` — pulled from the active ``parameter_sets`` row.
+      * ``spec_defaults``    — Phase 0 fallback because no row has been
+        written yet (the §2.4 LOCKED defaults are returned verbatim).
+
+    The frontend renders identically in either case; the field only matters
+    for operator runbook diagnostics ("did the dispatcher wire up the
+    parameter set yet, or am I looking at the seed defaults?").
+
+    ``server_now`` mirrors ``SystemStatus.server_now`` so the frontend can
+    anchor relative-time renderings consistently across the page.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[RiskParameterItem]
+    parameter_set_hash: str | None
+    parameter_set_active_since_utc: datetime | None
+    source: Literal["parameters_table", "spec_defaults"]
+    server_now: datetime
+
+
+# ---------------------------------------------------------------------------
+# Audit explorer (Day 27 — read-only table per frontend-spec §2.6.4)
+# ---------------------------------------------------------------------------
+
+
+class AuditLogEntry(BaseModel):
+    """One row from ``audit_log`` projected for the §2.6.4 audit-explorer table.
+
+    Hash columns are returned as lowercase hex strings (NOT base64) to match
+    the existing ``deploy/audit/README.md`` operator runbook display + the
+    ``verify_chain`` CLI output. Frontend renders them in a monospace font;
+    operators paste into runbooks verbatim.
+
+    ``payload_preview`` is the first 80 characters of the decoded JCS payload
+    per spec §2.6.4 "preview (first 80 chars of payload reason)". Decoded as
+    UTF-8 with ``errors='replace'`` so a malformed payload doesn't crash the
+    response — replacement characters in the preview signal the operator to
+    open the full event detail.
+
+    Repaired-event provenance (``repaired_for_*``) is null for normal rows;
+    the frontend renders an "↳ repaired @ ..." indicator when set, per spec
+    §2.6.4 "Backfill provenance".
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    event_uuid: str
+    sequence_no: int
+    event_type: str
+    env: Literal["paper", "live-small", "live-scale"]
+    phase_at_emit: int
+    source_clock_ts: datetime
+    ingest_clock_ts: datetime
+    prev_hash_hex: str = Field(min_length=64, max_length=64)
+    record_hash_hex: str = Field(min_length=64, max_length=64)
+    repaired_for_sequence_no: int | None = None
+    repaired_for_event_timestamp: datetime | None = None
+    payload_preview: str = Field(max_length=80)
+
+
+class AuditLogPageResponse(BaseModel):
+    """Paginated audit-log page per backend-spec §4.1.3 ``GET /api/system/audit``.
+
+    Phase 0 walks the partition-pruned heap with no LIMIT-bypass; cursor
+    encodes the last-seen ``sequence_no`` (monotonic + globally unique) so
+    "load more" pages stay consistent across concurrent writers.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    entries: list[AuditLogEntry]
+    next_cursor: str | None
+    has_more: bool
+
+
+# ---------------------------------------------------------------------------
+# Watchdog status (Day 27 — read-only tile per frontend-spec §2.6.6)
+# ---------------------------------------------------------------------------
+
+
+class WatchdogStatusResponse(BaseModel):
+    """Backend-spec §4.1.3 ``GET /api/system/watchdog`` response.
+
+    Phase 0 surfaces only the columns that ``liveness_probes`` carries
+    (``sent_at_utc`` + ``channel``); the richer fields from the watchdog
+    push payload (``watchdog_id``, ``consecutive_failures_observed``,
+    ``region``) land in the response when the ingestion writer plumbs them
+    onto a future ``liveness_probes`` extension column or the audit-log
+    payload lookup. Today those fields are null + the frontend falls back
+    to a baseline "healthy / stale / unhealthy" pill driven purely by
+    ``last_ping_utc`` age.
+
+    ``has_ever_pinged`` distinguishes "table empty → render as 'Watchdog
+    not yet wired'" from "table populated but last ping is old → render
+    stale/unhealthy pill". When False the ``last_ping_utc`` field carries
+    the canonical ``EPOCH_SENTINEL_UTC`` (1970-01-01); the frontend
+    interprets epoch + ``has_ever_pinged=False`` as the "never pinged"
+    branch.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    last_ping_utc: datetime
+    has_ever_pinged: bool
+    seconds_since_last_ping: int | None
+    last_check_status_code: int | None
+    consecutive_failures_observed: int | None
+    watchdog_id: str | None
+    region: str | None
+    server_now: datetime
+
+
 __all__ = [
+    "AuditLogEntry",
+    "AuditLogPageResponse",
     "KillSwitchInvokeRequest",
     "KillSwitchResumeRequest",
     "KillSwitchStatus",
     "KillSwitchTransitionResponse",
     "ReconciliationSummary",
+    "RiskEnvelopeResponse",
+    "RiskParameterItem",
     "SystemStatus",
+    "WatchdogStatusResponse",
 ]

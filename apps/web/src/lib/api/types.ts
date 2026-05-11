@@ -344,3 +344,141 @@ export interface VersionData {
   readonly must_reload: boolean;
   readonly reason: string;
 }
+
+// ---------------------------------------------------------------------------
+// Auth /me (services/api/schemas/auth.py)
+// ---------------------------------------------------------------------------
+
+export interface AuthMeResponse {
+  readonly user_id: string;
+  readonly username: string;
+  readonly role: 'owner' | 'reader';
+  readonly auth_strength: 'weak' | 'strong';
+  readonly last_uv_at: string | null;
+  readonly session_expires_at: string;
+  readonly webauthn_enrolled: boolean;
+  readonly totp_enrolled: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Kill switch (services/api/schemas/system.py)
+// ---------------------------------------------------------------------------
+
+export type KillSwitchTrigger =
+  | 'trailing_dd_breach'
+  | 'daily_loss_breach'
+  | 'signal_storm'
+  | 'recon_mismatch'
+  | 'broker_disconnect_5m'
+  | 'vol_regime_z_gt_2'
+  | 'corr_gt_0_85'
+  | 'unhandled_exception'
+  | 'calendar_unratified'
+  | 'heartbeat_engagement_fail'
+  | 'qc_objstore_stale_10m'
+  | 'watchdog_and_discord_both_fail'
+  | 'audit_write_fail'
+  | 'hash_chain_break'
+  | 'decommission_floor'
+  | 'manual_judgment';
+
+export interface KillSwitchStatus {
+  readonly risk_state: 'NORMAL' | 'HALT_NEW' | 'CONVALESCENT';
+  readonly severity: RiskSeverity | null;
+  readonly halt_reason: string | null;
+  readonly last_transition_utc: string | null;
+  readonly last_transition_audit_event_uuid: string | null;
+}
+
+export interface KillSwitchTransitionResponse {
+  readonly risk_state: 'NORMAL' | 'HALT_NEW' | 'CONVALESCENT';
+  readonly severity: RiskSeverity | null;
+  readonly halt_reason: string | null;
+  readonly audit_event_uuid: string;
+  readonly sse_sequence_no: number;
+}
+
+// ---------------------------------------------------------------------------
+// Risk envelope (services/api/schemas/system.py — Day 27)
+// ---------------------------------------------------------------------------
+
+export type RiskParameterCluster =
+  | 'equity_index'
+  | 'rates_bonds'
+  | 'commodity'
+  | 'crypto'
+  | 'fx';
+
+export interface RiskParameterItem {
+  readonly key: string;
+  readonly label: string;
+  readonly value: string; // Decimal-as-string
+  readonly unit: 'percent' | 'ratio';
+  readonly cluster: RiskParameterCluster | null;
+}
+
+export interface RiskEnvelopeResponse {
+  readonly items: readonly RiskParameterItem[];
+  readonly parameter_set_hash: string | null;
+  readonly parameter_set_active_since_utc: string | null;
+  readonly source: 'parameters_table' | 'spec_defaults';
+  readonly server_now: string;
+}
+
+// ---------------------------------------------------------------------------
+// Audit explorer (services/api/schemas/system.py — Day 27)
+// ---------------------------------------------------------------------------
+
+export interface AuditLogEntry {
+  readonly event_uuid: string;
+  readonly sequence_no: number;
+  readonly event_type: string;
+  readonly env: 'paper' | 'live-small' | 'live-scale';
+  readonly phase_at_emit: number;
+  readonly source_clock_ts: string;
+  readonly ingest_clock_ts: string;
+  readonly prev_hash_hex: string;
+  readonly record_hash_hex: string;
+  readonly repaired_for_sequence_no: number | null;
+  readonly repaired_for_event_timestamp: string | null;
+  readonly payload_preview: string;
+}
+
+export interface AuditLogPageResponse {
+  readonly entries: readonly AuditLogEntry[];
+  readonly next_cursor: string | null;
+  readonly has_more: boolean;
+}
+
+export interface AuditLogFilters {
+  readonly event_type?: string;
+  readonly env?: 'paper' | 'live-small' | 'live-scale';
+  readonly from?: string; // ISO 8601 UTC
+  readonly to?: string;
+  readonly cursor?: string;
+  readonly limit?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Watchdog (services/api/schemas/system.py — Day 27)
+// ---------------------------------------------------------------------------
+
+export interface WatchdogStatus {
+  readonly last_ping_utc: string;
+  readonly has_ever_pinged: boolean;
+  readonly seconds_since_last_ping: number | null;
+  readonly last_check_status_code: number | null;
+  readonly consecutive_failures_observed: number | null;
+  readonly watchdog_id: string | null;
+  readonly region: string | null;
+  readonly server_now: string;
+}
+
+// ---------------------------------------------------------------------------
+// Backup codes regenerate (services/api/schemas/auth.py)
+// ---------------------------------------------------------------------------
+
+export interface BackupCodesRegenerateResponse {
+  readonly codes: readonly string[];
+  readonly generation_id: string;
+}

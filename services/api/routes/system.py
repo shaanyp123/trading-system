@@ -1,4 +1,4 @@
-"""services/api/routes/system.py — `/api/system/*` Phase-1 endpoints (subset).
+"""services/api/routes/system.py — `/api/system/*` Phase-1 endpoints.
 
 Day 15 (Week 5 Mon) shipped:
 
@@ -9,7 +9,7 @@ Day 15 (Week 5 Mon) shipped:
   * ``POST /api/system/kill-switch/invoke`` — body-validated 501 stub.
   * ``POST /api/system/kill-switch/resume`` — body-validated 501 stub.
 
-Day 25 (Week 7 Mon) unstubs the two POST endpoints end-to-end:
+Day 25 (Week 7 Mon) unstubbed the two POST endpoints end-to-end:
 
   * **invoke** — looks up the current ``risk_state``, plans the
     NORMAL/CONVALESCENT → HALT_NEW transition via
@@ -23,24 +23,32 @@ Day 25 (Week 7 Mon) unstubs the two POST endpoints end-to-end:
     (``services.api.auth.sessions.require_recent_uv``) per dev-guide §1.5
     LOCKED.
 
-Conflict handling:
+Day 27 (Week 7 Wed) adds three read-only surfaces consumed by the
+`/system` page (frontend-spec §2.6.3/§2.6.4/§2.6.6):
+
+  * ``GET /api/system/risk-envelope`` — Phase 1 read-only view of the
+    active parameter set. Phase 0 returns LOCKED spec defaults (§2.4)
+    because the ``parameter_sets`` table is empty until the Week 4 Wed
+    dispatcher writes the first row.
+  * ``GET /api/system/audit`` — audit explorer with filter + cursor.
+    Reads the partition-pruned ``audit_log`` heap and returns canonical
+    payload + chain metadata.
+  * ``GET /api/system/watchdog`` — last-ping summary keyed off the
+    ``liveness_probes`` table.
+
+Conflict handling on the POST endpoints (Day 25):
 
   * ``invoke`` while ``risk_state=HALT_NEW`` returns 409
-    ``ALREADY_HALTED`` — the policy layer rejects HALT_NEW → HALT_NEW; the
-    route surfaces a friendlier error than the policy's
-    :class:`IllegalTransitionError`.
-  * ``resume`` while ``risk_state != HALT_NEW`` returns 409
-    ``NOT_HALTED``.
+    ``ALREADY_HALTED``.
+  * ``resume`` while ``risk_state != HALT_NEW`` returns 409 ``NOT_HALTED``.
 
-NOT in scope today (deferred to Week 5 Tue-Fri or later sessions):
+NOT in scope today (deferred to later sessions):
 
-  * ``GET /api/system/risk-envelope`` (Phase 1 readonly view)
   * ``POST /api/system/vacation/{start,end}``
-  * ``GET /api/system/audit*``
+  * ``GET /api/system/audit/export.csv``
   * ``GET /api/system/deployments`` / rollback (Phase 2)
   * ``GET /api/system/agent-activity`` (Phase 2)
-  * ``GET /api/system/costs``, ``GET /api/system/watchdog``,
-    ``POST /api/internal/watchdog`` (Week 5 Wed Caddy bringup or later).
+  * ``GET /api/system/costs`` (Phase 2)
 
 The ``server_now`` field is computed at response build time per spec
 §4.1.6. The ``backend_version`` echoes ``APISettings.version``;
@@ -51,11 +59,12 @@ The ``server_now`` field is computed at response build time per spec
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Final, Literal
 from uuid import UUID
 
 import structlog
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.api.auth import sessions as sessions_mod
@@ -63,18 +72,25 @@ from services.api.config import APISettings, get_settings
 from services.api.db import get_session
 from services.api.errors import AppError
 from services.api.repos.phase1 import (
+    AuditLogRow,
+    ParameterSetRow,
     Phase1QueryRepo,
     PostgresPhase1QueryRepo,
     RiskStateRow,
 )
 from services.api.schemas.common import EPOCH_SENTINEL_UTC
 from services.api.schemas.system import (
+    AuditLogEntry,
+    AuditLogPageResponse,
     KillSwitchInvokeRequest,
     KillSwitchResumeRequest,
     KillSwitchStatus,
     KillSwitchTransitionResponse,
     ReconciliationSummary,
+    RiskEnvelopeResponse,
+    RiskParameterItem,
     SystemStatus,
+    WatchdogStatusResponse,
 )
 from services.api.session import SessionContext, get_session_context
 from services.api.sse import emit_sse
@@ -492,6 +508,359 @@ async def resume_from_halt(
         halt_reason=None,  # CONVALESCENT carries no halt_reason
         audit_event_uuid=str(applied.state_transition_audit_event_uuid),
         sse_sequence_no=sequence_no,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Day 27 — Risk envelope (read-only)
+# ---------------------------------------------------------------------------
+
+# LOCKED Phase 0 defaults per backend-spec §2.4 + frontend-spec §2.6.3.
+# These mirror the displayed values verbatim; when the Week 4 Wed dispatcher
+# writes the first ``parameter_sets`` row the route swaps to reading from the
+# table and ``source`` flips to ``"parameters_table"``.
+_DEFAULT_RISK_ENVELOPE: Final[tuple[RiskParameterItem, ...]] = (
+    RiskParameterItem(
+        key="vol_target_annual",
+        label="Vol target",
+        value=Decimal("0.14"),
+        unit="percent",
+    ),
+    RiskParameterItem(
+        key="per_position_target",
+        label="Per-position target",
+        value=Decimal("0.25"),
+        unit="percent",
+    ),
+    RiskParameterItem(
+        key="per_position_hard_floor",
+        label="Per-position hard floor",
+        value=Decimal("0.50"),
+        unit="percent",
+    ),
+    RiskParameterItem(
+        key="gross_exposure_cap",
+        label="Gross exposure cap",
+        value=Decimal("3.00"),
+        unit="percent",
+    ),
+    RiskParameterItem(
+        key="net_exposure_cap",
+        label="Net exposure cap",
+        value=Decimal("1.50"),
+        unit="percent",
+    ),
+    RiskParameterItem(
+        key="cluster_cap_equity_index",
+        label="Cluster cap: equity-idx",
+        value=Decimal("0.60"),
+        unit="percent",
+        cluster="equity_index",
+    ),
+    RiskParameterItem(
+        key="cluster_cap_rates_bonds",
+        label="Cluster cap: rates/bonds",
+        value=Decimal("0.80"),
+        unit="percent",
+        cluster="rates_bonds",
+    ),
+    RiskParameterItem(
+        key="cluster_cap_commodity",
+        label="Cluster cap: commodity",
+        value=Decimal("0.80"),
+        unit="percent",
+        cluster="commodity",
+    ),
+    RiskParameterItem(
+        key="cluster_cap_crypto",
+        label="Cluster cap: crypto",
+        value=Decimal("0.40"),
+        unit="percent",
+        cluster="crypto",
+    ),
+    RiskParameterItem(
+        key="cluster_cap_fx",
+        label="Cluster cap: FX",
+        value=Decimal("0.30"),
+        unit="percent",
+        cluster="fx",
+    ),
+    RiskParameterItem(
+        key="correlation_alert_threshold",
+        label="Realized correlation alert",
+        value=Decimal("0.70"),
+        unit="ratio",
+    ),
+    RiskParameterItem(
+        key="correlation_halt_threshold",
+        label="Realized correlation halt",
+        value=Decimal("0.85"),
+        unit="ratio",
+    ),
+    RiskParameterItem(
+        key="daily_loss_limit",
+        label="Daily loss limit",
+        value=Decimal("-0.05"),
+        unit="percent",
+    ),
+    RiskParameterItem(
+        key="trailing_drawdown_limit",
+        label="Trailing DD limit",
+        value=Decimal("-0.20"),
+        unit="percent",
+    ),
+    RiskParameterItem(
+        key="monthly_drawdown_vol_halve",
+        label="Monthly DD vol-halve",
+        value=Decimal("-0.10"),
+        unit="percent",
+    ),
+)
+
+
+def _parameter_set_to_items(
+    row: ParameterSetRow,
+) -> list[RiskParameterItem] | None:
+    """Walk a populated ``parameter_sets`` JSONB into RiskParameterItem rows.
+
+    Returns None when the row's JSONB doesn't carry the canonical keys —
+    the route then falls back to spec defaults rather than rendering a
+    partially-filled envelope. The canonical key set is the 15 keys from
+    ``_DEFAULT_RISK_ENVELOPE``; Phase 1+ may extend the parameter set
+    schema but must keep these keys present.
+
+    Phase 0 reality: this path is dead code today because
+    ``fetch_active_parameter_set`` returns None against an empty table.
+    Lock it now so the wire shape doesn't shift when the dispatcher
+    finally writes a row.
+    """
+    items: list[RiskParameterItem] = []
+    for default in _DEFAULT_RISK_ENVELOPE:
+        raw = row.parameters.get(default.key)
+        if raw is None:
+            return None
+        try:
+            value = Decimal(str(raw))
+        except (ValueError, TypeError):
+            return None
+        items.append(
+            RiskParameterItem(
+                key=default.key,
+                label=default.label,
+                value=value,
+                unit=default.unit,
+                cluster=default.cluster,
+            )
+        )
+    return items
+
+
+@router.get(
+    "/api/system/risk-envelope",
+    tags=["system"],
+    response_model=RiskEnvelopeResponse,
+)
+async def risk_envelope(
+    session: SessionContext = Depends(get_session_context),
+    repo: Phase1QueryRepo = Depends(_get_repo),
+) -> RiskEnvelopeResponse:
+    """Phase 1 read-only view of the active risk envelope.
+
+    Phase 0: ``parameter_sets`` table is empty, the route returns
+    ``source="spec_defaults"`` with the §2.4 LOCKED values inlined above.
+    When the dispatcher writes the first row this route auto-flips to
+    ``source="parameters_table"`` and reads via
+    :meth:`Phase1QueryRepo.fetch_active_parameter_set` without further
+    code changes here.
+    """
+    now = datetime.now(tz=UTC)
+    row = await repo.fetch_active_parameter_set()
+    if row is not None:
+        items_from_db = _parameter_set_to_items(row)
+        if items_from_db is not None:
+            return RiskEnvelopeResponse(
+                items=items_from_db,
+                parameter_set_hash=row.parameter_set_hash,
+                parameter_set_active_since_utc=row.first_active_at,
+                source="parameters_table",
+                server_now=now,
+            )
+        log.warning(
+            "risk_envelope_parameter_set_missing_keys",
+            parameter_set_hash=row.parameter_set_hash,
+            present_keys=sorted(row.parameters.keys()),
+        )
+    return RiskEnvelopeResponse(
+        items=list(_DEFAULT_RISK_ENVELOPE),
+        parameter_set_hash=None,
+        parameter_set_active_since_utc=None,
+        source="spec_defaults",
+        server_now=now,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Day 27 — Audit explorer (read-only)
+# ---------------------------------------------------------------------------
+
+# Payload preview is the first 80 chars of the decoded JCS string per
+# frontend-spec §2.6.4 "preview (first 80 chars of payload reason)".
+_PAYLOAD_PREVIEW_CHARS: Final[int] = 80
+
+
+def _audit_row_to_entry(row: AuditLogRow) -> AuditLogEntry:
+    """Map a raw audit_log row to the §2.6.4 wire entry.
+
+    Decodes ``payload_jcs`` as UTF-8 with ``errors='replace'`` so a
+    malformed payload (shouldn't happen — JCS is ASCII-only by RFC 8785)
+    doesn't crash the response. Hashes hex-encoded so operators paste
+    into runbooks verbatim.
+    """
+    preview = row.payload_jcs.decode("utf-8", errors="replace")[:_PAYLOAD_PREVIEW_CHARS]
+    return AuditLogEntry(
+        event_uuid=str(row.event_uuid),
+        sequence_no=row.sequence_no,
+        event_type=row.event_type,
+        env=row.env,  # type: ignore[arg-type]  # Pydantic Literal coercion from str
+        phase_at_emit=row.phase_at_emit,
+        source_clock_ts=row.source_clock_ts,
+        ingest_clock_ts=row.ingest_clock_ts,
+        prev_hash_hex=row.prev_hash.hex(),
+        record_hash_hex=row.record_hash.hex(),
+        repaired_for_sequence_no=row.repaired_for_sequence_no,
+        repaired_for_event_timestamp=row.repaired_for_event_timestamp,
+        payload_preview=preview,
+    )
+
+
+def _decode_audit_cursor(cursor: str | None) -> int | None:
+    """Decode an audit-log cursor into the ``before_sequence_no`` int.
+
+    Cursor format: the decimal string of the last-seen ``sequence_no``.
+    Operator-readable + lock-free + globally unique (BIGSERIAL).
+    Falls back to a canonical ``INVALID_CURSOR`` AppError per the
+    ``_pagination.py`` contract on any parse failure.
+    """
+    if cursor is None:
+        return None
+    try:
+        seq = int(cursor)
+    except (ValueError, TypeError) as exc:
+        raise AppError(
+            error_code="INVALID_CURSOR",
+            message=("Audit-log cursor is malformed; restart pagination from the top."),
+            status_code=400,
+            details={"reason": type(exc).__name__},
+        ) from exc
+    if seq <= 0:
+        raise AppError(
+            error_code="INVALID_CURSOR",
+            message=(
+                "Audit-log cursor must be a positive sequence_no; restart pagination from the top."
+            ),
+            status_code=400,
+        )
+    return seq
+
+
+@router.get(
+    "/api/system/audit",
+    tags=["system"],
+    response_model=AuditLogPageResponse,
+)
+async def audit_log_page(
+    session: SessionContext = Depends(get_session_context),
+    repo: Phase1QueryRepo = Depends(_get_repo),
+    event_type: str | None = Query(default=None, max_length=128),
+    env: Literal["paper", "live-small", "live-scale"] | None = Query(default=None),
+    from_utc: datetime | None = Query(default=None, alias="from"),
+    to_utc: datetime | None = Query(default=None, alias="to"),
+    cursor: str | None = Query(default=None, max_length=64),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> AuditLogPageResponse:
+    """Audit explorer page per backend-spec §4.1.3 + frontend-spec §2.6.4.
+
+    Query params (all optional):
+
+      * ``event_type`` — exact match against the locked taxonomy.
+      * ``env`` — partition filter (paper / live-small / live-scale).
+      * ``from`` / ``to`` — ``ingest_clock_ts`` window for partition
+        pruning.
+      * ``cursor`` — decimal sequence_no; returns rows STRICTLY less than
+        the cursor in DESC order.
+      * ``limit`` — 1..200 (defaults to 50).
+    """
+    before_seq = _decode_audit_cursor(cursor)
+    rows, next_seq, has_more = await repo.fetch_audit_log_page(
+        event_type=event_type,
+        env=env,
+        from_ingest_utc=from_utc,
+        to_ingest_utc=to_utc,
+        before_sequence_no=before_seq,
+        limit=limit,
+    )
+    return AuditLogPageResponse(
+        entries=[_audit_row_to_entry(r) for r in rows],
+        next_cursor=str(next_seq) if next_seq is not None else None,
+        has_more=has_more,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Day 27 — Watchdog status (read-only)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/api/system/watchdog",
+    tags=["system"],
+    response_model=WatchdogStatusResponse,
+)
+async def watchdog_status(
+    session: SessionContext = Depends(get_session_context),
+    repo: Phase1QueryRepo = Depends(_get_repo),
+) -> WatchdogStatusResponse:
+    """Watchdog last-ping projection per frontend-spec §2.6.6.
+
+    Phase 0: liveness_probes is empty until the external watchdog VPS
+    starts posting; the response carries ``has_ever_pinged=False`` +
+    ``last_ping_utc=EPOCH_SENTINEL_UTC`` so the frontend renders the
+    "Watchdog not yet wired" state. Once the table populates the
+    response auto-flips to the real ping + the frontend's age formatter
+    renders healthy/stale/unhealthy per the spec thresholds.
+
+    The richer fields (``watchdog_id``, ``consecutive_failures_observed``,
+    ``last_check_status_code``, ``region``) are all null Phase 0 — they
+    plumb through when the ingestion writer adds them to the
+    ``liveness_probes`` schema or the audit-log payload lookup.
+    """
+    now = datetime.now(tz=UTC)
+    account_id = await repo.fetch_active_account_id()
+    last_ping: datetime | None = None
+    if account_id is not None:
+        last_ping = await repo.fetch_watchdog_last_ping_utc(account_id)
+
+    if last_ping is None:
+        return WatchdogStatusResponse(
+            last_ping_utc=EPOCH_SENTINEL_UTC,
+            has_ever_pinged=False,
+            seconds_since_last_ping=None,
+            last_check_status_code=None,
+            consecutive_failures_observed=None,
+            watchdog_id=None,
+            region=None,
+            server_now=now,
+        )
+    age_seconds = max(int((now - last_ping).total_seconds()), 0)
+    return WatchdogStatusResponse(
+        last_ping_utc=last_ping,
+        has_ever_pinged=True,
+        seconds_since_last_ping=age_seconds,
+        last_check_status_code=None,
+        consecutive_failures_observed=None,
+        watchdog_id=None,
+        region=None,
+        server_now=now,
     )
 
 
