@@ -77,6 +77,9 @@ from services.api.routes import (
 from services.api.routes import (
     today as today_route,
 )
+from services.api.routes import (
+    trades as trades_route,
+)
 from services.api.routes._pagination import (
     clamp_limit,
     decode_cursor,
@@ -123,6 +126,14 @@ class _StubRepo:
     last_signals_filter: dict[str, Any] | None = None
     last_alerts_filter: dict[str, Any] | None = None
     last_orders_filter: dict[str, Any] | None = None
+    trades_page: tuple[list[dict[str, Any]], str | None, bool] = (
+        [],
+        None,
+        False,
+    )
+    trade_by_id: dict[str, Any] | None = None
+    last_trades_filter: dict[str, Any] | None = None
+    last_trade_by_id_arg: UUID | None = None
 
     def __post_init__(self) -> None:
         if self.positions_rows is None:
@@ -210,6 +221,37 @@ class _StubRepo:
             "limit": limit,
         }
         return self.alerts_page
+
+    async def fetch_trades_page(
+        self,
+        account_id: UUID,
+        *,
+        from_utc: datetime | None,
+        to_utc: datetime | None,
+        market: str | None,
+        state: str | None,
+        id_prefix: str | None,
+        cursor: str | None,
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], str | None, bool]:
+        self.last_trades_filter = {
+            "from_utc": from_utc,
+            "to_utc": to_utc,
+            "market": market,
+            "state": state,
+            "id_prefix": id_prefix,
+            "cursor": cursor,
+            "limit": limit,
+        }
+        return self.trades_page
+
+    async def fetch_trade_by_id(
+        self,
+        account_id: UUID,
+        trade_id: UUID,
+    ) -> dict[str, Any] | None:
+        self.last_trade_by_id_arg = trade_id
+        return self.trade_by_id
 
     async def fetch_latest_balance_nav(self, account_id: UUID) -> Decimal | None:
         return self.nav
@@ -1072,6 +1114,285 @@ class TestListAlerts:
             "cursor": None,
             "limit": 10,
         }
+
+
+# ---------------------------------------------------------------------------
+# Trades (Day 26 — backend-spec §4.1.2 / IG §3 Week 7 Tue)
+# ---------------------------------------------------------------------------
+
+
+class TestListTrades:
+    @pytest.mark.asyncio
+    async def test_no_account_returns_empty_envelope(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(account_id=None)
+        _bind_repo(override_dep, trades_route, repo)
+        response = await api_client.get("/api/trades")
+        assert response.status_code == 200
+        assert response.json() == {
+            "trades": [],
+            "next_cursor": None,
+            "has_more": False,
+        }
+
+    @pytest.mark.asyncio
+    async def test_filters_pass_through_to_repo(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(account_id=uuid4())
+        _bind_repo(override_dep, trades_route, repo)
+        response = await api_client.get(
+            "/api/trades"
+            "?from=2026-05-01T00:00:00Z"
+            "&to=2026-05-19T23:59:59Z"
+            "&market=%2FMES"  # /MES URL-encoded
+            "&state=closed"
+            "&id_prefix=0190a1b2"
+            "&limit=25",
+        )
+        assert response.status_code == 200
+        assert repo.last_trades_filter is not None
+        assert repo.last_trades_filter["market"] == "/MES"
+        assert repo.last_trades_filter["state"] == "closed"
+        assert repo.last_trades_filter["id_prefix"] == "0190a1b2"
+        assert repo.last_trades_filter["limit"] == 25
+        assert repo.last_trades_filter["from_utc"] == datetime(2026, 5, 1, 0, 0, 0, tzinfo=UTC)
+        assert repo.last_trades_filter["to_utc"] == datetime(2026, 5, 19, 23, 59, 59, tzinfo=UTC)
+
+    @pytest.mark.asyncio
+    async def test_limit_above_max_rejected_with_422(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(account_id=uuid4())
+        _bind_repo(override_dep, trades_route, repo)
+        response = await api_client.get("/api/trades?limit=999")
+        assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_populated_row_maps_to_summary_with_short_hash(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        # Day 26 has no real trades in the DB, but the mapper still needs
+        # coverage so the wire shape is locked. Stub a single populated row
+        # and assert the response body matches the locked TradeSummary
+        # shape — including managed_by_strategy_version being the first 7
+        # chars of the 40-char managed_by_version.
+        full_hash = "a" * 40
+        trade_id = uuid4()
+        signal_id = uuid4()
+        opened = datetime(2026, 5, 19, 17, 32, 5, tzinfo=UTC)
+        closed = datetime(2026, 5, 19, 21, 11, 12, tzinfo=UTC)
+        repo = _StubRepo(
+            account_id=uuid4(),
+            trades_page=(
+                [
+                    {
+                        "id": trade_id,
+                        "env": "paper",
+                        "market": "/MES",
+                        "direction": "long",
+                        "state": "closed",
+                        "opened_at_utc": opened,
+                        "closed_at_utc": closed,
+                        "total_quantity": 1,
+                        "avg_entry_price": Decimal("5234.50"),
+                        "avg_exit_price": Decimal("5237.25"),
+                        "realized_pnl_usd": Decimal("13.75"),
+                        "entry_signal_id": signal_id,
+                        "managed_by_version": full_hash,
+                    }
+                ],
+                None,
+                False,
+            ),
+        )
+        _bind_repo(override_dep, trades_route, repo)
+        response = await api_client.get("/api/trades")
+        assert response.status_code == 200
+        body = response.json()
+        assert len(body["trades"]) == 1
+        row = body["trades"][0]
+        assert row["id"] == str(trade_id)
+        assert row["entry_signal_id"] == str(signal_id)
+        assert row["env"] == "paper"
+        assert row["market"] == "/MES"
+        assert row["direction"] == "long"
+        assert row["state"] == "closed"
+        assert row["total_quantity"] == 1
+        assert row["avg_entry_price"] == "5234.50"
+        assert row["avg_exit_price"] == "5237.25"
+        assert row["realized_pnl_usd"] == "13.75"
+        # 7-char short hash matches git rev-parse --short default.
+        assert row["managed_by_strategy_version"] == "aaaaaaa"
+        assert len(row["managed_by_strategy_version"]) == 7
+
+
+class TestTradeDetail:
+    @pytest.mark.asyncio
+    async def test_no_account_returns_404_envelope(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        # When no account exists, every trade lookup is a 404 — the spec
+        # says "TRADE_NOT_FOUND" is the canonical error code so the frontend
+        # /trades/:id page can render a graceful "Trade not found" body
+        # instead of Next's hard 404 (IG line 417: "ensures Discord
+        # deep-links don't 404").
+        repo = _StubRepo(account_id=None)
+        _bind_repo(override_dep, trades_route, repo)
+        tid = uuid4()
+        response = await api_client.get(f"/api/trades/{tid}")
+        assert response.status_code == 404
+        body = response.json()
+        assert body["error_code"] == "TRADE_NOT_FOUND"
+        assert body["details"] == {"trade_id": str(tid)}
+
+    @pytest.mark.asyncio
+    async def test_missing_trade_returns_404_envelope(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(account_id=uuid4(), trade_by_id=None)
+        _bind_repo(override_dep, trades_route, repo)
+        tid = uuid4()
+        response = await api_client.get(f"/api/trades/{tid}")
+        assert response.status_code == 404
+        assert response.json()["error_code"] == "TRADE_NOT_FOUND"
+
+    @pytest.mark.asyncio
+    async def test_malformed_uuid_rejected_with_422(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        # FastAPI's dependency resolver enters generator-based deps before
+        # path-param validation finishes, so without overriding ``_get_repo``
+        # the real ``get_session`` raises ``DB pool not initialized``.
+        # Override with a stub repo even though it's never called — the
+        # UUID parse failure surfaces as 422 instead.
+        repo = _StubRepo(account_id=uuid4())
+        _bind_repo(override_dep, trades_route, repo)
+        response = await api_client.get("/api/trades/not-a-uuid")
+        assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_populated_row_maps_to_detail_shape(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        full_hash = "b" * 40
+        trade_id = uuid4()
+        account_id = uuid4()
+        signal_id = uuid4()
+        entry_oid = uuid4()
+        exit_oid = uuid4()
+        slip_vid = uuid4()
+        opened = datetime(2026, 5, 19, 17, 32, 5, tzinfo=UTC)
+        closed = datetime(2026, 5, 19, 21, 11, 12, tzinfo=UTC)
+        row = {
+            "id": trade_id,
+            "account_id": account_id,
+            "env": "paper",
+            "market": "/MES",
+            "direction": "long",
+            "state": "closed",
+            "opened_at_utc": opened,
+            "closed_at_utc": closed,
+            "total_quantity": 1,
+            "avg_entry_price": Decimal("5234.50"),
+            "avg_exit_price": Decimal("5237.25"),
+            "realized_pnl_usd": Decimal("13.75"),
+            "realized_commission_usd": Decimal("0.85"),
+            "dividend_pnl_usd": Decimal("0"),
+            "entry_signal_id": signal_id,
+            "entry_order_id": entry_oid,
+            "exit_order_id": exit_oid,
+            "managed_by_version": full_hash,
+            "strategy_hash": "c" * 40,
+            "parameter_set_hash": "d" * 64,
+            "slippage_calibration_version_id": slip_vid,
+        }
+        repo = _StubRepo(account_id=account_id, trade_by_id=row)
+        _bind_repo(override_dep, trades_route, repo)
+        response = await api_client.get(f"/api/trades/{trade_id}")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["id"] == str(trade_id)
+        assert body["account_id"] == str(account_id)
+        assert body["entry_signal_id"] == str(signal_id)
+        assert body["entry_order_id"] == str(entry_oid)
+        assert body["exit_order_id"] == str(exit_oid)
+        assert body["slippage_calibration_version_id"] == str(slip_vid)
+        assert body["managed_by_version"] == full_hash
+        assert body["managed_by_strategy_version"] == "bbbbbbb"
+        assert body["strategy_hash"] == "c" * 40
+        assert body["parameter_set_hash"] == "d" * 64
+        assert body["realized_pnl_usd"] == "13.75"
+        assert body["realized_commission_usd"] == "0.85"
+        assert body["dividend_pnl_usd"] == "0"
+        # repo received the parsed UUID
+        assert repo.last_trade_by_id_arg == trade_id
+
+    @pytest.mark.asyncio
+    async def test_open_position_detail_keeps_nullable_fields_null(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        # An open_position trade has no closed_at_utc / avg_exit_price /
+        # realized_pnl_usd / exit_order_id. The detail page renders these
+        # as "—" placeholders; the wire contract must allow null.
+        trade_id = uuid4()
+        account_id = uuid4()
+        signal_id = uuid4()
+        entry_oid = uuid4()
+        slip_vid = uuid4()
+        opened = datetime(2026, 5, 19, 17, 32, 5, tzinfo=UTC)
+        row = {
+            "id": trade_id,
+            "account_id": account_id,
+            "env": "paper",
+            "market": "/MES",
+            "direction": "long",
+            "state": "open_position",
+            "opened_at_utc": opened,
+            "closed_at_utc": None,
+            "total_quantity": 2,
+            "avg_entry_price": Decimal("5234.50"),
+            "avg_exit_price": None,
+            "realized_pnl_usd": None,
+            "realized_commission_usd": Decimal("0"),
+            "dividend_pnl_usd": Decimal("0"),
+            "entry_signal_id": signal_id,
+            "entry_order_id": entry_oid,
+            "exit_order_id": None,
+            "managed_by_version": "e" * 40,
+            "strategy_hash": "f" * 40,
+            "parameter_set_hash": "9" * 64,
+            "slippage_calibration_version_id": slip_vid,
+        }
+        repo = _StubRepo(account_id=account_id, trade_by_id=row)
+        _bind_repo(override_dep, trades_route, repo)
+        response = await api_client.get(f"/api/trades/{trade_id}")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["state"] == "open_position"
+        assert body["closed_at_utc"] is None
+        assert body["avg_exit_price"] is None
+        assert body["realized_pnl_usd"] is None
+        assert body["exit_order_id"] is None
 
 
 # ---------------------------------------------------------------------------

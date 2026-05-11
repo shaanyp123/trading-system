@@ -242,6 +242,73 @@ export interface AlertsResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Trades (services/api/schemas/trades.py)
+// ---------------------------------------------------------------------------
+
+export type TradeDirection = 'long' | 'short';
+export type TradeState =
+  | 'open_position'
+  | 'closed'
+  | 'stopped_out'
+  | 'capacity_constrained';
+
+export interface Trade {
+  readonly id: string;
+  readonly env: string;
+  readonly market: string;
+  readonly direction: TradeDirection;
+  readonly state: TradeState;
+  readonly opened_at_utc: string;
+  readonly closed_at_utc: string | null;
+  readonly total_quantity: number;
+  readonly avg_entry_price: string;
+  readonly avg_exit_price: string | null;
+  readonly realized_pnl_usd: string | null;
+  readonly entry_signal_id: string;
+  readonly managed_by_strategy_version: string;
+}
+
+export interface TradesListResponse {
+  readonly trades: readonly Trade[];
+  readonly next_cursor: string | null;
+  readonly has_more: boolean;
+}
+
+export interface TradeDetail {
+  readonly id: string;
+  readonly account_id: string;
+  readonly env: string;
+  readonly market: string;
+  readonly direction: TradeDirection;
+  readonly state: TradeState;
+  readonly opened_at_utc: string;
+  readonly closed_at_utc: string | null;
+  readonly total_quantity: number;
+  readonly avg_entry_price: string;
+  readonly avg_exit_price: string | null;
+  readonly realized_pnl_usd: string | null;
+  readonly realized_commission_usd: string;
+  readonly dividend_pnl_usd: string;
+  readonly entry_signal_id: string;
+  readonly entry_order_id: string;
+  readonly exit_order_id: string | null;
+  readonly managed_by_version: string;
+  readonly managed_by_strategy_version: string;
+  readonly strategy_hash: string;
+  readonly parameter_set_hash: string;
+  readonly slippage_calibration_version_id: string;
+}
+
+export interface TradesQueryFilters {
+  readonly from?: string; // ISO 8601 UTC
+  readonly to?: string;
+  readonly market?: string;
+  readonly state?: TradeState;
+  readonly id_prefix?: string;
+  readonly limit?: number;
+}
+
+// ---------------------------------------------------------------------------
 // SSE envelope (services/api/sse.py)
 // ---------------------------------------------------------------------------
 
