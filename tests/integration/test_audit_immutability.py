@@ -546,3 +546,69 @@ def test_audit_log_truncate_partition_default_role_sqlstate_is_p0001(
     assert _pgcode(excinfo) == "P0001", (
         f"expected SQLSTATE P0001 (raise_exception), got {_pgcode(excinfo)!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# DP-022 regression — app_service must have USAGE on audit_log's BIGSERIAL
+# ---------------------------------------------------------------------------
+
+
+def test_audit_log_insert_as_app_service_succeeds_dp022(pg_engine: Engine) -> None:
+    """Regression for DP-022 (Day 25 carryover smoke).
+
+    Backstop for the grant gap that surfaced live on 2026-05-18: the
+    migration ``20260518_audit_log_sequence_grant`` adds
+    ``GRANT USAGE, SELECT ON SEQUENCE audit_log_sequence_no_seq TO
+    app_service`` because alembic 0006 only granted INSERT/SELECT on the
+    TABLE but never USAGE on the implicit BIGSERIAL sequence — Postgres'
+    DEFAULT clause needs USAGE on the sequence to call ``nextval()``.
+
+    Why this stayed latent for 5+ weeks: every prior audit-writer test
+    bound to the testcontainer SUPERUSER. SUPERUSER has implicit grants
+    on every object so the gap was invisible. Day-25's PR exposed it on
+    the first production write. This test exercises the writer **as
+    app_service** so the gap can never re-open without breaking CI.
+
+    The assertion is intentionally simple: the INSERT must succeed
+    (no exception). Hash-chain math is exercised by the writer
+    integration tests in ``test_audit_writer.py``; this test only
+    verifies the GRANT layer is intact.
+    """
+    # 1. Seed an accounts row (as the default SUPERUSER) so the FK target exists.
+    ext_id = f"DP022_GRANT_TEST_{uuid.uuid4().hex[:12]}"
+    with pg_engine.begin() as conn:
+        account_id = conn.execute(
+            text(
+                "INSERT INTO accounts (external_account_id, account_type, active_from) "
+                "VALUES (:ext, 'individual', now()) RETURNING id"
+            ),
+            {"ext": ext_id},
+        ).scalar_one()
+
+    # 2. Switch to ``app_service`` and INSERT into audit_log. The BIGSERIAL
+    # DEFAULT calls ``nextval('audit_log_sequence_no_seq')`` which requires
+    # USAGE on the sequence. Without the DP-022 fix this raises SQLSTATE
+    # 42501; with the fix it succeeds and a chain row lands.
+    event_uuid = uuid.uuid4()
+    with pg_engine.begin() as conn:
+        conn.execute(text("SET LOCAL ROLE app_service"))
+        inserted_seq = conn.execute(
+            text(
+                "INSERT INTO audit_log ("
+                "    event_uuid, event_type, account_id, env, phase_at_emit, "
+                "    source_clock_ts, monotonic_ns, prev_hash, record_hash, "
+                "    payload_jcs"
+                ") VALUES ("
+                "    :event_uuid, 'system_started', :account_id, 'paper', 0, "
+                "    now(), 0, "
+                "    decode('00000000000000000000000000000000000000000000000000000000000000', 'hex')"
+                "    || decode('00', 'hex'), "
+                "    decode('00000000000000000000000000000000000000000000000000000000000000', 'hex')"
+                "    || decode('00', 'hex'), "
+                "    decode('00', 'hex')"
+                ") RETURNING sequence_no"
+            ),
+            {"event_uuid": event_uuid, "account_id": account_id},
+        ).scalar_one()
+    assert isinstance(inserted_seq, int)
+    assert inserted_seq >= 1, f"sequence_no should be >= 1 after INSERT; got {inserted_seq!r}"

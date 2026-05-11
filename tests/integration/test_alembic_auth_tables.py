@@ -103,14 +103,21 @@ def pg() -> Iterator[tuple[Engine, str]]:
 
 
 class TestUpDownUp:
-    """alembic upgrade head -> downgrade -1 -> upgrade head."""
+    """alembic upgrade <auth_rev> -> downgrade -1 -> upgrade <auth_rev>.
+
+    Day 25 carryover (DP-022): the test targets ``_AUTH_REVISION``
+    explicitly instead of ``head`` so future operational migrations sitting
+    on top of the auth tables don't break this test. The original Day-21
+    form used ``head`` which assumed the auth-tables migration was the
+    tip; the DP-022 grant migration broke that assumption.
+    """
 
     def test_initial_upgrade_creates_all_four_tables(self, pg: tuple[Engine, str]) -> None:
         engine, sync_url = pg
-        _run("upgrade", sync_url, "head")
+        _run("upgrade", sync_url, _AUTH_REVISION)
         assert _current_revision(engine) == _AUTH_REVISION
         for tname in _AUTH_TABLES:
-            assert _table_exists(engine, tname), f"{tname} missing after upgrade head"
+            assert _table_exists(engine, tname), f"{tname} missing after upgrade to auth rev"
 
     def test_downgrade_one_step_drops_all_four_tables(self, pg: tuple[Engine, str]) -> None:
         engine, sync_url = pg
@@ -121,10 +128,10 @@ class TestUpDownUp:
 
     def test_second_upgrade_recreates_all_four_tables(self, pg: tuple[Engine, str]) -> None:
         engine, sync_url = pg
-        _run("upgrade", sync_url, "head")
+        _run("upgrade", sync_url, _AUTH_REVISION)
         assert _current_revision(engine) == _AUTH_REVISION
         for tname in _AUTH_TABLES:
-            assert _table_exists(engine, tname), f"{tname} missing after second upgrade head"
+            assert _table_exists(engine, tname), f"{tname} missing after second upgrade to auth rev"
 
 
 class TestSchemaShape:
@@ -137,9 +144,11 @@ class TestSchemaShape:
     @pytest.fixture(autouse=True)
     def _ensure_head(self, pg: tuple[Engine, str]) -> None:
         engine, sync_url = pg
-        # Defensive: re-upgrade in case tests are re-ordered.
+        # Defensive: re-upgrade to the auth revision in case tests are
+        # re-ordered. Targets the explicit revision (not ``head``) so the
+        # later DP-022 grant migration doesn't move the goalpost.
         if _current_revision(engine) != _AUTH_REVISION:
-            _run("upgrade", sync_url, "head")
+            _run("upgrade", sync_url, _AUTH_REVISION)
 
     @staticmethod
     def _columns(engine: Engine, table: str) -> dict[str, dict[str, object]]:
