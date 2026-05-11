@@ -46,6 +46,12 @@ node_modules/
 # Secrets — only sops-encrypted files are allowed in `secrets/`
 # (see secrets/.gitignore for the inverted rule)
 
+# VPS-side sops-decrypted plaintext volume (e.g. /opt/trading/secrets-decrypted/)
+# Created by deploy/day5-bringup.sh; canonical pattern, NOT a leak. But blocking
+# at the repo root prevents a careless `git add -A` on the VPS from committing
+# plaintext credentials. See Day 11 carryover follow-up.
+secrets-decrypted/
+
 # Build artifacts
 *.log
 *.tmp
