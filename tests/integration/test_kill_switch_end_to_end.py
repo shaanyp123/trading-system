@@ -626,3 +626,76 @@ async def test_first_transition_in_empty_chain_uses_genesis_prev_hash(
             text("SELECT prev_hash FROM audit_log ORDER BY sequence_no ASC LIMIT 1")
         ).one()
     assert bytes(first_row.prev_hash) == GENESIS_HASH
+
+
+# ---------------------------------------------------------------------------
+# DP-021 regression — route's read-then-apply session-flow
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_apply_after_repo_reads_via_same_session_dp021(
+    async_session_factory: async_sessionmaker[AsyncSession],
+    fresh_account_id: UUID,
+) -> None:
+    """Regression for DP-021 (Day 25 carryover smoke).
+
+    Production bug: FastAPI's ``Depends`` cache shared the same
+    ``AsyncSession`` between ``Phase1QueryRepo.fetch_*`` and
+    ``apply_state_transition``. The repo's SELECT auto-began a transaction
+    (SQLAlchemy 2.0 autobegin semantics); the writer then raised
+    ``InvalidRequestError: A transaction is already begun on this Session``
+    because :func:`append_audit_event`'s contract requires a session with
+    no open transaction.
+
+    Day-25 unit tests didn't catch this because they monkeypatched
+    ``apply_state_transition`` (real writer never ran). The Day-25
+    integration tests didn't catch it because they used a fresh session
+    not previously touched by a repo. This test simulates the route's
+    real flow:
+
+      1. Issue a SELECT through the session (mimics the repo reads).
+      2. ``await session.commit()`` (the route's DP-021 fix).
+      3. Call ``apply_state_transition`` — must succeed.
+
+    Without the commit between steps 1 and 3, apply raises
+    ``InvalidRequestError``. The test asserts both directions: the broken
+    pre-fix path raises, the post-fix path succeeds.
+    """
+    from sqlalchemy.exc import InvalidRequestError
+
+    plan = plan_invoke_kill_switch(
+        current_state=RiskState.NORMAL,
+        current_severity=None,
+        convalescent_counter=0,
+        trigger=TransitionTrigger.MANUAL_JUDGMENT,
+        triggered_by="operator",
+        timestamp_utc="2026-05-18T12:00:00+00:00",
+    )
+
+    # Pre-fix path: repo SELECT auto-begins transaction; apply raises.
+    async with async_session_factory() as session:
+        await session.execute(text("SELECT 1"))  # mimics the repo's SELECT
+        with pytest.raises(InvalidRequestError, match="already begun"):
+            await apply_state_transition(
+                plan=plan,
+                db=session,
+                account_id=fresh_account_id,
+                env="paper",
+                phase_at_emit=0,
+            )
+
+    # Post-fix path: explicit commit releases the implicit transaction;
+    # apply succeeds.
+    async with async_session_factory() as session:
+        await session.execute(text("SELECT 1"))
+        await session.commit()  # the DP-021 fix in routes/system.py
+        applied = await apply_state_transition(
+            plan=plan,
+            db=session,
+            account_id=fresh_account_id,
+            env="paper",
+            phase_at_emit=0,
+        )
+        assert applied.state_transition_audit_event_uuid is not None
+        assert applied.new_state == "HALT_NEW"
