@@ -31,7 +31,7 @@ from services.api import sse as sse_multiplexer
 from services.api.config import APISettings, get_settings
 from services.api.db import close_pool, init_pool, session_scope
 from services.api.errors import register_error_handlers
-from services.api.middleware import register_middleware
+from services.api.middleware import BotAuthMiddleware, register_middleware
 from services.api.repos.setup_tokens import PostgresSetupTokenRepo
 from services.api.routes.alerts import router as alerts_router
 from services.api.routes.auth import router as auth_router
@@ -152,6 +152,14 @@ def create_app() -> FastAPI:
     # innermost (FastAPI/Starlette: last-added = innermost in the request
     # path; runs after CSRF + RequestContext).
     app.add_middleware(SessionStubMiddleware, settings=settings)  # type: ignore[arg-type]
+    # Day 23: BotAuthMiddleware sits OUTERMOST so the Discord bot's
+    # bearer-authenticated requests bypass CSRF (no cookies) and
+    # short-circuit SessionStub's fail-close in production envs. The
+    # middleware is a noop on requests without an Authorization: Bearer
+    # header, so adding it OUTERMOST has zero overhead on the human path.
+    # See services/api/middleware.BotAuthMiddleware docstring for the
+    # full request-flow diagram.
+    app.add_middleware(BotAuthMiddleware, settings=settings)  # type: ignore[arg-type]
     # Day 5 routes
     app.include_router(health_router)
     app.include_router(setup_router)

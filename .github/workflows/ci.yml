@@ -155,6 +155,9 @@ jobs:
           - service: webhook_pusher
             dockerfile: services/webhook_pusher/Dockerfile
             context: .
+          - service: discord_bot
+            dockerfile: services/discord_bot/Dockerfile
+            context: .
           - service: web
             dockerfile: apps/web/Dockerfile
             context: apps/web

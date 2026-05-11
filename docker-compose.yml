@@ -164,12 +164,35 @@ services:
     profiles: ['phase1']
     depends_on: [postgres]
 
+  # Discord bot — Day 23 (Week 6 Thu) onwards. Default profile (no
+  # --profile) per the Phase 0 surface phasing in frontend-spec §6.1
+  # (LOCKED — /positions + /halt + /status ship Phase 0). Networks:
+  #   internal — bot calls api over http://api:8000 (no Caddy hop)
+  #   egress   — Discord gateway WebSocket (gateway.discord.gg) needs
+  #              outbound TLS
+  # Auth: shared sops-decrypted bearer token per backend-spec §6.6 +
+  # §4.4. The api-side validator is services/api/middleware.BotAuthMiddleware.
+  # See deploy/discord_bot/README.md for the operator runbook.
   discord_bot:
-    image: ghcr.io/${GHCR_OWNER}/trading-discord-bot:${RELEASE_SHA:-latest}
+    image: ghcr.io/${GHCR_OWNER:?set GHCR_OWNER in deploy/.env}/trading-discord-bot:${RELEASE_SHA:-latest}
+    build:
+      context: .
+      dockerfile: services/discord_bot/Dockerfile
     restart: unless-stopped
     networks: [internal, egress]
-    profiles: ['phase1']
-    depends_on: [api]
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-paper}
+      LOG_LEVEL: ${BOT_LOG_LEVEL:-INFO}
+      API_BASE_URL: ${BOT_API_BASE_URL:-http://api:8000}
+      # DISCORD_BOT_TOKEN, DISCORD_GUILD_ID, DISCORD_BOT_API_BEARER_TOKEN
+      # come in via the sops-decrypted bundle volume below + the bot's
+      # entrypoint reads them as bare DISCORD_*/* env vars (no API_*
+      # prefix — bot's pydantic-settings uses env_prefix="").
+    volumes:
+      - ${SECRETS_DIR:-/opt/trading/secrets-decrypted}:/run/secrets:ro
+    depends_on:
+      api:
+        condition: service_healthy
 
   webhook_pusher:
     # Phase 0 placeholder container: stays alive (sleep infinity) so the

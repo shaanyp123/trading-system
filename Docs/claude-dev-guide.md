@@ -160,7 +160,7 @@ If a session asks you to deviate from any of these, escalate per §1.3 — do NO
 │       └── package.json
 ├── services/
 │   ├── api/                          # FastAPI HTTP + SSE  [HOT-FIX whitelist]
-│   ├── discord-bot/                  # discord.py          [HOT-FIX whitelist]
+│   ├── discord_bot/                  # discord.py          [HOT-FIX whitelist]
 │   ├── risk/                         # Risk engine         [FORBIDDEN — PR required]
 │   ├── signal/                       # Signal generation   [FORBIDDEN — PR required]
 │   ├── audit/                        # Hash-chain writer   [FORBIDDEN — PR required]
@@ -229,7 +229,7 @@ If your task touches any of these, open a PR immediately. Do not attempt to merg
 
 ```
 services/api/**
-services/discord-bot/**
+services/discord_bot/**
 services/qc_adapter/**
 services/agent/reporting/**
 services/agent/monitoring/**

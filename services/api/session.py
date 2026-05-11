@@ -132,6 +132,14 @@ class SessionStubMiddleware(BaseHTTPMiddleware):
         if request.url.path in _SESSION_EXEMPT_PATHS:
             return await call_next(request)
 
+        # Day 23: if BotAuthMiddleware (running OUTER of this middleware)
+        # already injected a service-account session, don't overwrite it
+        # — the bot's strong-auth context wins over the Phase-0 stub.
+        # Without this guard the bot's calls would land in production envs
+        # with the stub session, defeating BotAuth's purpose.
+        if getattr(request.state, "session", None) is not None:
+            return await call_next(request)
+
         if self._is_production:
             # Fail closed in production. The stub MUST NOT be the auth path
             # in live environments. When the real session middleware ships,
