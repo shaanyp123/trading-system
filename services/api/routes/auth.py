@@ -751,24 +751,11 @@ async def logout(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def _require_recent_uv(session: SessionContext) -> None:
-    """Gate the re-auth-required endpoints per dev-guide §1.5."""
-    if session.auth_strength != "strong" or session.last_uv_at is None:
-        raise AppError(
-            error_code="RE_AUTH_REQUIRED",
-            message=(
-                "This action requires a recent WebAuthn user-verification. "
-                "Re-prompt the operator and retry."
-            ),
-            status_code=401,
-        )
-    age_seconds = (datetime.now(tz=UTC) - session.last_uv_at).total_seconds()
-    if age_seconds > sessions_mod.RE_AUTH_WINDOW_SECONDS:
-        raise AppError(
-            error_code="RE_AUTH_REQUIRED",
-            message="Re-auth window expired; re-prompt WebAuthn UV.",
-            status_code=401,
-        )
+# Backwards-compat: Day 25 extracted the canonical re-auth gate into
+# ``services.api.auth.sessions.require_recent_uv`` so ``routes/system.py``
+# (kill-switch resume) can share it without a cross-route import. The alias
+# keeps the local call sites in this module unchanged.
+_require_recent_uv = sessions_mod.require_recent_uv
 
 
 def _client_ip(request: Request) -> str | None:

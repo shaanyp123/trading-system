@@ -314,3 +314,118 @@ class TestModuleContract:
     def test_role_literal_helper_passes(self) -> None:
         # Sanity that ``Literal`` import works for downstream consumers.
         _: Literal["owner", "reader"] = "owner"
+
+
+# ---------------------------------------------------------------------------
+# require_recent_uv re-auth gate (dev-guide §1.5 LOCKED, 5-min UV window)
+# ---------------------------------------------------------------------------
+class TestRequireRecentUv:
+    """Day 25 (Week 7 Mon) gate test surface.
+
+    The helper is the canonical 5-min re-auth check used by:
+
+      * ``POST /api/auth/backup-codes/regenerate``
+      * ``POST /api/system/kill-switch/resume``
+
+    Three failure modes (rejected with ``AppError(RE_AUTH_REQUIRED, 401)``):
+    weak auth_strength, missing last_uv_at, last_uv_at older than 5 min.
+    One pass: strong auth + last_uv_at within the window.
+    """
+
+    def _session(
+        self,
+        *,
+        auth_strength: Literal["strong", "weak"],
+        last_uv_at: datetime | None,
+    ):
+        from services.api.session import SessionContext
+
+        now = datetime.now(tz=UTC)
+        return SessionContext(
+            user_id="phase0-stub-owner",
+            username="operator",
+            role="owner",
+            auth_strength=auth_strength,
+            last_uv_at=last_uv_at,
+            session_expires_at=now + timedelta(minutes=30),
+            webauthn_enrolled=False,
+            totp_enrolled=False,
+            is_phase0_stub=False,
+        )
+
+    def test_strong_with_recent_uv_passes(self) -> None:
+        from services.api.auth.sessions import require_recent_uv
+
+        session = self._session(
+            auth_strength="strong",
+            last_uv_at=datetime.now(tz=UTC) - timedelta(minutes=1),
+        )
+        # Should not raise
+        require_recent_uv(session)
+
+    def test_weak_strength_rejects_even_with_recent_uv(self) -> None:
+        from services.api.auth.sessions import require_recent_uv
+        from services.api.errors import AppError
+
+        session = self._session(
+            auth_strength="weak",
+            last_uv_at=datetime.now(tz=UTC) - timedelta(seconds=10),
+        )
+        with pytest.raises(AppError) as excinfo:
+            require_recent_uv(session)
+        assert excinfo.value.error_code == "RE_AUTH_REQUIRED"
+        assert excinfo.value.status_code == 401
+
+    def test_no_last_uv_at_rejects(self) -> None:
+        from services.api.auth.sessions import require_recent_uv
+        from services.api.errors import AppError
+
+        session = self._session(auth_strength="strong", last_uv_at=None)
+        with pytest.raises(AppError) as excinfo:
+            require_recent_uv(session)
+        assert excinfo.value.error_code == "RE_AUTH_REQUIRED"
+
+    def test_uv_older_than_window_rejects(self) -> None:
+        from services.api.auth.sessions import (
+            RE_AUTH_WINDOW_SECONDS,
+            require_recent_uv,
+        )
+        from services.api.errors import AppError
+
+        now = datetime.now(tz=UTC)
+        stale_uv = now - timedelta(seconds=RE_AUTH_WINDOW_SECONDS + 60)
+        session = self._session(auth_strength="strong", last_uv_at=stale_uv)
+        with pytest.raises(AppError) as excinfo:
+            require_recent_uv(session, now=now)
+        assert excinfo.value.error_code == "RE_AUTH_REQUIRED"
+        # The age-of-UV branch carries a different message than the
+        # missing-UV branch (both are RE_AUTH_REQUIRED but the message
+        # mentions the window).
+        assert (
+            "older than" in excinfo.value.message.lower()
+            or "window" in excinfo.value.message.lower()
+        )
+
+    def test_uv_exactly_at_window_boundary_passes(self) -> None:
+        from services.api.auth.sessions import (
+            RE_AUTH_WINDOW_SECONDS,
+            require_recent_uv,
+        )
+
+        now = datetime.now(tz=UTC)
+        # Exactly at the boundary — the helper uses `> RE_AUTH_WINDOW_SECONDS`
+        # so the boundary itself passes.
+        boundary_uv = now - timedelta(seconds=RE_AUTH_WINDOW_SECONDS)
+        session = self._session(auth_strength="strong", last_uv_at=boundary_uv)
+        require_recent_uv(session, now=now)  # should not raise
+
+    def test_now_parameter_overrides_wall_clock(self) -> None:
+        from services.api.auth.sessions import require_recent_uv
+
+        # Force the gate to pass by pretending it's just-now, even if
+        # last_uv_at is 1 day old.
+        ancient_uv = datetime.now(tz=UTC) - timedelta(days=1)
+        session = self._session(auth_strength="strong", last_uv_at=ancient_uv)
+        # ``now`` exactly 1 second after the ancient UV — well within window.
+        fake_now = ancient_uv + timedelta(seconds=1)
+        require_recent_uv(session, now=fake_now)  # should not raise

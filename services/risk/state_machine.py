@@ -101,6 +101,7 @@ class TransitionTrigger(StrEnum):
     CORR_GT_0_85 = "corr_gt_0_85"
     UNHANDLED_EXCEPTION = "unhandled_exception"
     CALENDAR_UNRATIFIED = "calendar_unratified"
+    MANUAL_JUDGMENT = "manual_judgment"
     # defensive_envelope
     HEARTBEAT_ENGAGEMENT_FAIL = "heartbeat_engagement_fail"
     QC_OBJSTORE_STALE_10M = "qc_objstore_stale_10m"
@@ -122,6 +123,14 @@ TRIGGER_SEVERITY: Final[dict[TransitionTrigger, HaltSeverity]] = {
     TransitionTrigger.CORR_GT_0_85: HaltSeverity.ROUTINE,
     TransitionTrigger.UNHANDLED_EXCEPTION: HaltSeverity.ROUTINE,
     TransitionTrigger.CALENDAR_UNRATIFIED: HaltSeverity.ROUTINE,
+    # Day 25: operator-initiated manual halt via web /system or Discord
+    # /halt. Severity is routine — manual halts aren't an incident; they're
+    # the operator exercising the kill-switch on judgment (e.g. before a
+    # FOMC release the operator wants to flatten new entries). The
+    # ``KillSwitchInvokeRequest`` schema (services/api/schemas/system.py)
+    # has accepted this value since Day 15; the Day-15 author left the
+    # enum out-of-sync; Day 25 reconciles.
+    TransitionTrigger.MANUAL_JUDGMENT: HaltSeverity.ROUTINE,
     # defensive_envelope
     TransitionTrigger.HEARTBEAT_ENGAGEMENT_FAIL: HaltSeverity.DEFENSIVE_ENVELOPE,
     TransitionTrigger.QC_OBJSTORE_STALE_10M: HaltSeverity.DEFENSIVE_ENVELOPE,
