@@ -93,6 +93,56 @@ class APISettings(BaseSettings):
     rate_limit_general_per_window: int = Field(default=100)
     rate_limit_auth_per_window: int = Field(default=5)
 
+    # --- WebAuthn (Day 21 — IG §3 Week 6 Tue) -----------------------------
+    # Relying-party identifier per spec §5.1 — apex registrable domain.
+    # Default is intentionally an obvious placeholder so a live deploy that
+    # forgets to override it fails the WebAuthn ceremony at verify time
+    # rather than silently registering credentials against the placeholder.
+    webauthn_rp_id: str = Field(
+        default="localhost",
+        description=(
+            "WebAuthn RP ID — operator's registrable apex domain. "
+            "Set per env via API_WEBAUTHN_RP_ID. 'localhost' is dev-only."
+        ),
+    )
+    webauthn_rp_name: str = Field(
+        default="trading-system",
+        description="Human-readable RP name shown in the authenticator UI.",
+    )
+    webauthn_origin: str = Field(
+        default="http://localhost:3000",
+        description=(
+            "Expected origin for WebAuthn verifications "
+            "(scheme + host + optional port; no trailing slash)."
+        ),
+    )
+
+    # --- TOTP encryption key (Day 21) -------------------------------------
+    # Column-encryption key for ``totp_secrets.encrypted_secret`` per backend-
+    # spec §8.5.2 ("separate from sops; column-encrypted"). The key itself
+    # ships via sops -- ``totp.encryption_key`` in ``secrets/<env>.enc.yaml``
+    # -- but the sops master key (age key) protects the file at rest;
+    # operationally these are two different keys.
+    #
+    # Encoded as base64url-no-padding of a 32-byte key (AES-256-GCM key).
+    # When unset, the TOTP-touching endpoints fail closed with
+    # ``TOTP_KEY_MISSING`` — never silently fall back to plaintext storage.
+    totp_encryption_key: SecretStr | None = Field(
+        default=None,
+        description=(
+            "Base64url-encoded 32-byte AES-256-GCM key for column encryption "
+            "of totp_secrets.encrypted_secret. Sourced from sops per env."
+        ),
+    )
+
+    # --- Operator username (Phase 0 single-operator constant) -------------
+    # Backend-spec §8.5 is silent on username convention because the system
+    # is single-operator. Locking it to ``operator`` keeps the TOTP login +
+    # recovery flow deterministic (operator types this username on /login
+    # fallback + /recover). Configurable via API_OPERATOR_USERNAME for
+    # multi-operator environments in Phase 3+.
+    operator_username: str = Field(default="operator", min_length=1, max_length=64)
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> APISettings:
