@@ -80,6 +80,38 @@ def main(argv: list[str] | None = None) -> int:
         if bb and not _looks_like_placeholder(bb):
             os.environ["API_DISCORD_BOT_BEARER_TOKEN"] = bb
 
+    # Day 21 carryover: TOTP column-encryption key (sops yaml
+    # `totp.encryption_key`). Base64url-encoded 32-byte AES-256-GCM key
+    # per services/api/config.py `totp_encryption_key`. When unset the
+    # TOTP-touching endpoints fail closed with `TOTP_KEY_MISSING` —
+    # never silently fall back to plaintext storage.
+    if "API_TOTP_ENCRYPTION_KEY" not in os.environ:
+        tk = (secrets.get("totp") or {}).get("encryption_key")
+        if tk and not _looks_like_placeholder(tk):
+            os.environ["API_TOTP_ENCRYPTION_KEY"] = tk
+
+    # Day 21 carryover: WebAuthn relying-party identity (sops yaml
+    # `webauthn.rp_id` + `.rp_name` + `.origin`). Defaults in
+    # services/api/config.py are dev-only (localhost rp_id) — production
+    # MUST override via these env vars so credentials register against
+    # the apex domain. When any single key is unset, the corresponding
+    # APISettings field falls back to its default; WebAuthn ceremonies
+    # against a placeholder rp_id will fail at verify time loudly.
+    if "API_WEBAUTHN_RP_ID" not in os.environ:
+        rp_id = (secrets.get("webauthn") or {}).get("rp_id")
+        if rp_id and not _looks_like_placeholder(rp_id):
+            os.environ["API_WEBAUTHN_RP_ID"] = rp_id
+
+    if "API_WEBAUTHN_RP_NAME" not in os.environ:
+        rp_name = (secrets.get("webauthn") or {}).get("rp_name")
+        if rp_name and not _looks_like_placeholder(rp_name):
+            os.environ["API_WEBAUTHN_RP_NAME"] = rp_name
+
+    if "API_WEBAUTHN_ORIGIN" not in os.environ:
+        origin = (secrets.get("webauthn") or {}).get("origin")
+        if origin and not _looks_like_placeholder(origin):
+            os.environ["API_WEBAUTHN_ORIGIN"] = origin
+
     if "API_VERSION" not in os.environ:
         os.environ.setdefault("API_VERSION", os.environ.get("RELEASE_SHA", "dev"))
     if "API_ENVIRONMENT" not in os.environ:
