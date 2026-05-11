@@ -25,11 +25,11 @@ from __future__ import annotations
 from typing import Literal
 
 import structlog
-import uuid_utils as uuid7_lib
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from services.api.auth.ceremony import CeremonyStore, get_ceremony_store
 from services.api.db import get_session
 from services.api.errors import AppError
 from services.api.repos.setup_tokens import (
@@ -65,6 +65,7 @@ def _get_repo(session: AsyncSession = Depends(get_session)) -> SetupTokenRepo:
 async def verify_token(
     body: SetupTokenVerifyRequest,
     repo: SetupTokenRepo = Depends(_get_repo),
+    store: CeremonyStore = Depends(get_ceremony_store),
 ) -> SetupTokenVerifyResponse:
     row = await repo.consume_if_valid(body.token)
     if row is None:
@@ -75,7 +76,17 @@ async def verify_token(
             status_code=401,
         )
 
-    ceremony_session_id = str(uuid7_lib.uuid7())
+    # Day 24 fix: the Day-5 verify_token route minted a free-floating
+    # UUID7 and returned it without actually storing the ceremony anywhere.
+    # When the operator advanced to Step 2 (WebAuthn register), the api
+    # looked up that ceremony_session_id in the (Day-21) CeremonyStore,
+    # didn't find it, and rejected with 401 INVALID_CEREMONY_SESSION.
+    # Correct behavior: ask the CeremonyStore to mint + persist the
+    # ceremony with the verified setup token's metadata.
+    ceremony_session_id = await store.create_setup_ceremony(
+        setup_token_uuid=row.token_uuid,
+        intended_role=row.intended_role,
+    )
     log.info(
         "setup_token_verified",
         token_uuid=str(row.token_uuid),

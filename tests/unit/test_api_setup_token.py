@@ -13,6 +13,7 @@ from uuid import uuid4
 import pytest
 from httpx import AsyncClient
 
+from services.api.auth.ceremony import CeremonyStore, get_ceremony_store
 from services.api.repos.setup_tokens import SetupTokenRow
 from services.api.routes import setup as setup_route
 
@@ -56,7 +57,9 @@ async def test_verify_token_returns_200_with_session_id_when_valid(
     override_dep,  # type: ignore[no-untyped-def]
 ) -> None:
     repo = _StubRepo(valid_token="valid-raw-token-1234")
+    fresh_store = CeremonyStore()
     override_dep(setup_route._get_repo, lambda: repo)
+    override_dep(get_ceremony_store, lambda: fresh_store)
 
     response = await api_client.post(
         "/api/setup/verify-token",
@@ -68,8 +71,49 @@ async def test_verify_token_returns_200_with_session_id_when_valid(
     assert body["valid"] is True
     assert body["intended_role"] == "owner"
     assert isinstance(body["ceremony_session_id"], str)
-    assert len(body["ceremony_session_id"]) >= 30  # UUID-ish
+    # CeremonyStore.mint_key returns secrets.token_urlsafe(16) ≈ 22 chars.
+    # Lower-bound matches the WebAuthnRegisterChallengeRequest schema's
+    # min_length=8 constraint.
+    assert len(body["ceremony_session_id"]) >= 16
     assert repo.consume_calls == ["valid-raw-token-1234"]
+
+
+@pytest.mark.asyncio
+async def test_verify_token_persists_ceremony_in_store(
+    api_client: AsyncClient,
+    override_dep,  # type: ignore[no-untyped-def]
+) -> None:
+    """Day 24 regression: verify_token must call create_setup_ceremony so
+    subsequent wizard endpoints (webauthn/register/challenge etc.) can
+    look up the ceremony state by id.
+
+    Day-5 bug: the route minted a free-floating UUID7 and returned it but
+    never stored anything → wizard endpoints rejected with 401
+    INVALID_CEREMONY_SESSION. This test guards against the regression.
+    """
+    repo = _StubRepo(valid_token="ceremony-persist-test")
+    fresh_store = CeremonyStore()
+    override_dep(setup_route._get_repo, lambda: repo)
+    override_dep(get_ceremony_store, lambda: fresh_store)
+
+    response = await api_client.post(
+        "/api/setup/verify-token",
+        json={"token": "ceremony-persist-test"},
+    )
+
+    assert response.status_code == 200
+    ceremony_session_id = response.json()["ceremony_session_id"]
+
+    # The ceremony MUST be findable in the store with kind="setup".
+    state = await fresh_store.get(ceremony_session_id)
+    assert state is not None, (
+        "verify_token returned a ceremony_session_id but did not actually "
+        "create the ceremony in the store — subsequent wizard endpoints "
+        "would 401 with INVALID_CEREMONY_SESSION"
+    )
+    assert state.kind == "setup"
+    assert state.intended_role == "owner"
+    assert state.setup_token_uuid is not None
 
 
 @pytest.mark.asyncio
