@@ -188,6 +188,33 @@ services:
     networks: [internal, egress]
     depends_on: [postgres]
 
+  # ---- Next.js frontend (web UI) ----------------------------------------
+  # Day 20 (Week 6 Mon): scaffold + 10 placeholder routes. Phase 0 Wed
+  # wires the Today page to real data; Phase 1+ adds auth-gated routes
+  # + SSE proxying. internal-only network — never exposes a public
+  # port; Caddy reverse-proxies the apex `/` → nextjs:3000 (the route
+  # already exists in deploy/Caddyfile from Day 5). Bringing this
+  # service up resolves the Day-19 root-`/` 503 maintenance fallback.
+  nextjs:
+    image: ghcr.io/${GHCR_OWNER:?set GHCR_OWNER in deploy/.env}/trading-web:${RELEASE_SHA:-latest}
+    build:
+      context: apps/web
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    networks: [internal]
+    environment:
+      NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:-http://api:8000}
+      NEXT_PUBLIC_PHASE: ${NEXT_PUBLIC_PHASE:-0}
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', 'http://localhost:3000/']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
   monitoring:
     image: ghcr.io/${GHCR_OWNER}/trading-monitoring:${RELEASE_SHA:-latest}
     restart: unless-stopped

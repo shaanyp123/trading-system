@@ -1,0 +1,9 @@
+.next/
+out/
+node_modules/
+*.tsbuildinfo
+.env*.local
+.pnpm-debug.log*
+Dockerfile
+.dockerignore
+README.md

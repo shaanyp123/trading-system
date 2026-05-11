@@ -1,7 +1,8 @@
-.PHONY: help install lint format typecheck test test-unit test-integration test-golden dep-drift-check ci all clean
+.PHONY: help install lint format typecheck test test-unit test-integration test-golden dep-drift-check frontend-test ci all clean
 
 PYTHON ?= python3
 PIP ?= $(PYTHON) -m pip
+PNPM ?= pnpm
 
 help:
 	@echo "Common targets:"
@@ -12,8 +13,9 @@ help:
 	@echo "  make test          — pytest with coverage"
 	@echo "  make test-unit     — pytest tests/unit only"
 	@echo "  make dep-drift-check — diff pyproject runtime deps vs api Dockerfile pip-install list"
-	@echo "  make ci            — what CI runs: lint + dep-drift-check + typecheck + test"
-	@echo "  make all           — format + lint + typecheck + test"
+	@echo "  make frontend-test — pnpm typecheck + lint + build in apps/web"
+	@echo "  make ci            — what CI runs: lint + dep-drift-check + typecheck + test + frontend-test"
+	@echo "  make all           — format + lint + typecheck + test + frontend-test"
 
 install:
 	$(PIP) install -e ".[dev]"
@@ -44,9 +46,16 @@ test-golden:
 dep-drift-check:
 	$(PYTHON) scripts/check_dockerfile_deps_against_pyproject.py
 
-ci: lint dep-drift-check typecheck test
+# Day 20: frontend test gate. Runs pnpm typecheck + lint + build against
+# apps/web/. Wired into `make ci` so future Python-only diffs don't
+# accidentally regress the Next.js build. Requires the apps/web/
+# scaffold (Day 20 PR) + `pnpm install` in apps/web before first run.
+frontend-test:
+	cd apps/web && $(PNPM) typecheck && $(PNPM) lint && $(PNPM) build
 
-all: format lint dep-drift-check typecheck test
+ci: lint dep-drift-check typecheck test frontend-test
+
+all: format lint dep-drift-check typecheck test frontend-test
 
 clean:
 	find . -type d -name __pycache__ -prune -exec rm -rf {} \;
