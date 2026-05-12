@@ -3246,7 +3246,7 @@ audit_log row count unchanged (still 2 — the LEAN heartbeat path is operationa
   - Restart docker compose containers via `docker compose --env-file deploy/.env up -d --build <service>`
   - **Carried from this session:** docker volume manipulation via transient containers (`docker run --rm -v trading_lean_data:... alpine ...`) for seed ceremonies
 
-- **Smoke-tested via:** (a) volume contents check `docker run --rm -v trading_lean_data:/Lean/Data alpine ls /Lean/Data/equity/usa/daily/ | grep -iE "tlt|ief|shy|tip"` → 4 zips present; (b) format round-trip `unzip -p /Lean/Data/equity/usa/daily/tlt.zip tlt.csv | tail -3` → 855600/10000 = $85.56 matches yfinance close; (c) post-restart heartbeat `docker logs trading-api-1 | grep "lean_strategy_initialized"` → 202 in 1.67ms; (d) audit chain `verify_chain --env paper` → `CHAIN OK: 2 rows verified` (unchanged; chain will grow at first signal_emitted post-21:30 UTC); (e) cycle_watcher PID alive `ps -ef | grep cycle_watcher | grep -v grep` → running.
+- **Smoke-tested via:** (a) volume contents check `docker run --rm -v trading_lean_data:/Lean/Data alpine ls /Lean/Data/equity/usa/daily/ | grep -iE "tlt|ief|shy|tip"` → 4 zips present; (b) format round-trip `unzip -p /Lean/Data/equity/usa/daily/tlt.zip tlt.csv | tail -3` → 855600/10000 = $85.56 matches yfinance close; (c) post-restart heartbeat `docker logs trading-api-1 | grep "lean_strategy_initialized"` → 202 in 1.67ms; (d) audit chain `verify_chain --env paper` → `CHAIN OK: 2 rows verified` (unchanged; chain will grow at first signal_emitted post-21:30 UTC); (e) cycle_watcher PID alive `ps -ef | grep cycle_watcher | grep -v grep` → running; (f) **2026-05-12 carryover — independent-source spot-check via Google Finance:** TLT/IEF/SHY/TIP 2026-05-11 latest closes verified against Google Finance's `g.co/finance/<ticker>` "previous close" field → 4-of-4 tickers match LEAN-on-disk to the penny (TLT $85.56 / IEF $94.64 / SHY $82.22 / TIP $111.31, all 0bp divergence). Single-bar spot-check only; full historical 360-row cross-check pending operator-side Tiingo API-key signup (see follow-up entry below "ETF data-quality cross-check"). Garbage-in failure modes (decoder off-by-10000, wrong-window seed, magnitude error) are caught by the spot-check; an isolated mid-history single-bar divergence remains unchecked.
 
 ---
 
@@ -3337,3 +3337,99 @@ audit_log row count unchanged (still 2 — the LEAN heartbeat path is operationa
 
 - **Operator pre-authorizations (unchanged):**
   - SSH to VPS, `git push`, open-PR, squash-merge fix PRs, force-push-with-lease on `claude/<name>`, docker compose restart, docker volume manipulation via transient containers.
+
+---
+
+### 2026-05-12 — ETF data-quality cross-check — `scripts/verify_seed_data.py` shipped; Stooq is API-gated in 2026; Google Finance spot-check passes 4-of-4 latest closes at 0bp; full historical cross-check pending operator-side Tiingo signup
+
+- **Spec reference:** the seed-ceremony entry above ("Phase 1 data-seed ceremony — ETF universe seeded to `trading_lean_data`") landed the 4 Phase 1 bond ETFs (`TLT IEF SHY TIP`) sourced from Yahoo Finance via `yfinance` 1.3.0. The data is reputable but third-party-reliant; an independent cross-check is cheap insurance against a "garbage-in-garbage-out" failure mode (yfinance data quality regression, accidental wrong-window seed, decoder off-by-10000, etc.) BEFORE the operator approves any live signal based on the bar data. Operator session task: "validate the 4 Phase 1 ETF daily bars seeded into the `trading_lean_data` Docker volume on the VPS against a SECOND independent free data source; surface any divergence > 1bp on the daily close price." Pure read-only validation; zero code changes to running services; zero container restarts; zero modifications to the volume.
+
+- **Spec said:** the task brief named 5 candidate free cross-sources (FRED, Stooq, NYSE official daily settlement CSV, Tiingo, scraped pages on Investing.com/WSJ) and recommended Tiingo as the primary because (a) free tier with signup, (b) reliable API, (c) similar OHLCV schema to yfinance, (d) different upstream than Yahoo. Threshold: 1bp on close-price divergence; volume divergence informational only. Two deliverable paths: Path A = committed `scripts/verify_seed_data.py` + decisions-log entry; Path B = one-off Python invocation + decisions-log entry capturing the result. Pick Path A if the operator might want to re-run validation later (e.g., after re-seeds or after futures data lands via DataBento), Path B if time-constrained and result is clean.
+
+- **Three discoveries that shaped the cross-check:**
+
+  1. **Stooq's public CSV endpoint is now API-key-gated (DP-027-class blocker; matches the task brief's mid-2024 warning).** The historical `https://stooq.com/q/d/l/?s=<ticker>.us&d1=...&d2=...&i=d` URL — which used to return a clean CSV body — now returns a literal `Get your apikey:\n\n1. Open https://stooq.com/q/d/?s=tlt.us&get_apikey\n2. Enter the captcha code.\n...\n4. Append the <apikey> variable...` prompt body. Confirmed via direct `curl -A "Mozilla/5.0" "https://stooq.com/q/d/l/?s=tlt.us&d1=20260101&d2=20260103&i=d"` from the VPS. The script's `parse_stooq_csv` surfaces this as a `ValueError: stooq CSV header missing Date/Close columns: ['Get your apikey:']` which the run-time `verify_one` translates to a `fetch_error` → script exit code 2 → operator sees `FETCH FAILED` in the per-ticker table. **So Stooq joins the gated-source club:** any path forward requires operator-side signup (Tiingo, Stooq, Alpha Vantage, Polygon, etc. all need an API key in 2026).
+
+  2. **Google Finance's `https://www.google.com/finance/quote/<TICKER>:<EXCHANGE>` pages remain free + unauthenticated for the latest close ("previous close") field.** This isn't enough for a 360-row historical diff but IS enough for a single-bar spot check against the on-disk LEAN data's tail row. Tested via WebFetch on the iShares-ETF Google Finance pages: TLT:NASDAQ → "$85.56", IEF:NASDAQ → "$94.64", SHY:NASDAQ → "$82.22", TIP:NYSEARCA → "$111.31". All 4 match the LEAN-on-disk last-bar (2026-05-11) to the penny — 0bp divergence per ticker. Google Finance sources from market data aggregators (LSEG/Refinitiv historically; possibly different now), genuinely INDEPENDENT of yfinance/Yahoo Finance per the ownership/data-licensing landscape.
+
+  3. **The script is meaningful even with the live cross-fetch blocked.** Three high-value things the script does today: (a) decodes the LEAN equity-daily zip and asserts the 4-decimal Decimal price round-trip (catches a decoder bug instantly); (b) presents a uniform per-ticker FETCH FAILED message when a source is gated, which is operationally clearer than a stack trace; (c) is ready to consume a Tiingo API key the moment operator-side signup lands — `python3 scripts/verify_seed_data.py --source tiingo --tiingo-api-key "$TIINGO_API_KEY"` re-runs the full historical 360-row diff. The script supports `--threshold-bp` (default 1.0), `--show-worst N` for human eyeballing, `--json` + `--out` for downstream tooling. Argparse-driven; mypy --strict clean; ruff format + check clean; 52 new unit tests in `tests/unit/test_verify_seed_data_script.py` covering parser, diff, divide-by-zero defence, frozen-dataclass invariants, CLI exit codes (0 clean / 1 breach / 2 fetch error). 1149/1149 tests pass on `make test-unit` (was 1097 + 52 new).
+
+- **Actual decision:** Path A — **commit `scripts/verify_seed_data.py` + unit tests + this decisions-log entry**, with a single-bar Google-Finance spot-check standing in for the full historical cross-check until operator-side Tiingo signup unlocks the 360-row diff. Cost: $0/mo. Hot-fix scope (no `risk-review-approved` label; pure operator-tooling script, no service code changes; new files only — `scripts/verify_seed_data.py` + `tests/unit/test_verify_seed_data_script.py`; existing `Docs/decisions-log.md` + `deploy/lean_local/seed-data.md` get appends, both hot-fix paths).
+
+- **Rationale:**
+  - **Cost.** The committed script is the persistent artifact. Operator-side Tiingo signup (free, 1000 req/day on daily-OHLCV) is the next operator action; until then, the spot-check via Google Finance is enough to catch catastrophic garbage modes.
+  - **Operator-burn alignment.** Same operator-side discipline as the seed-ceremony entry — no paid subscriptions added today; the script is ready for Tiingo or any HTTP-CSV source the operator chooses.
+  - **Garbage-in failure-mode coverage.** The 4-of-4 single-bar match catches: (a) decoder off-by-10000 or scaling errors (855600 → $85.56 not $8556 or $85560 — confirmed); (b) wrong-window seed (the last bar in the volume IS the right bar for 2026-05-11); (c) wrong-ticker seed (TLT zip really contains TLT prices; not accidentally AAPL or similar); (d) absurd magnitude (no $0.99 or $850000 prices). What it does NOT catch: an isolated mid-history single-bar divergence on 2025-08-13 or similar. Path forward: operator unlocks Tiingo, re-runs the full diff.
+  - **Reversibility.** Zero. The script is read-only against the volume. The decisions-log entry is append-only. No live state changes.
+  - **A27 binding.** `scripts/verify_seed_data.py` integrates with third-party platforms (Stooq + Tiingo + iShares-Google-Finance route). A27 satisfier (alternative (a) — smoke fixture) = the 52 unit tests exercise both source parsers against canned response bodies + the http_get-injectable seam means the live-network path is exercised by the operator-runbook. A27 satisfier (alternative (b) — operator runbook) = the new `deploy/lean_local/seed-data.md` "Step 7 — Cross-check" section documenting both spot-check (Google Finance via web browser; zero infrastructure) and full-historical (Tiingo via docker run + the script) paths.
+
+- **What was shipped (the artifact, in operator-readable form):**
+
+  1. **`scripts/verify_seed_data.py`** (stdlib-only Python; no `yfinance`/`requests`/`pandas` runtime dep; argparse-driven; mypy --strict clean). Public surface:
+     - `read_lean_zip(zip_path)` → `dict[YYYY-MM-DD, Decimal]` (the close-price column from a LEAN equity-daily zip)
+     - `parse_stooq_csv(body)` / `parse_tiingo_csv(body)` (CSV parsers for each source's response schema)
+     - `fetch_stooq(ticker, start, end, http_get=...)` / `fetch_tiingo(ticker, start, end, *, api_key, http_get=...)` (with `http_get` injection for tests)
+     - `compute_diff(ticker, lean_data, cross_data, threshold_bp, show_worst)` → `TickerVerification` (frozen dataclass)
+     - `verify_one(ticker, data_dir, source, ...)` → orchestrator wrapping the above for a single ticker
+     - `main(argv)` → CLI driver with exit codes 0 (all clean) / 1 (threshold breach) / 2 (fetch failure or argparse error)
+     - Decimal-only arithmetic per anti-pattern A05 (LEAN deci-cents → `Decimal(int_str) / Decimal(10000)`; cross-source CSV closes → `Decimal(str)`; divergence in bp = `|lean - cross| / cross * 10000`)
+     - `--source stooq|tiingo` (default stooq; will be re-defaulted to `tiingo` once operator signs up); `--threshold-bp` (default 1.0); `--show-worst N` (default 5); `--json`; `--out <path>`
+  2. **`tests/unit/test_verify_seed_data_script.py`** — 52 unit tests across 9 `Test*` classes: `TestReadLeanZip` (8 — happy path + missing file + multi-entry zip + malformed row + bad date + no-timestamp tolerance + empty zip + deci-cent scaling); `TestParseStooqCsv` (6 — happy + no-data body + empty + missing close column + header-only + skip-empty-close rows); `TestParseTiingoCsv` (5 — happy with ISO timestamps + bare ISO + empty + missing close + raw vs adjusted close); `TestFetchStooq` (2 — URL construction + parsed dict); `TestFetchTiingo` (2 — URL construction + missing API key); `TestComputeDiff` (10 — exact match + sub-threshold + super-threshold + signed-divergence sign convention + dates-only-in-X + divide-by-zero + empty intersection + show-worst=0 + worst-rows sort order); `TestTickerDiffRow` (1 — signed divergence math); `TestVerifyOne` (5 — happy + missing zip + URLError surfaced + ValueError surfaced + window-defaults-from-LEAN); `TestMain` (10 — exit 0 / exit 1 / exit 2 fetch error / exit 2 missing data-dir / exit 2 empty tickers / exit 2 negative threshold / exit 2 negative show-worst / --json structured payload + --out file write + invalid source argparse). Pure Python; no network (all http_get calls are stubbed); no testcontainers; A22 N/A (zero audit emissions). 52 tests run in 0.37s standalone; `make test-unit` end-to-end 56.78s with 1149 passing.
+
+  3. **VPS-side validation execution** (read-only; zero changes to the volume):
+     ```
+     scp scripts/verify_seed_data.py root@<vps-ip>:/tmp/verify_seed_data.py
+     ssh root@<vps-ip> 'docker run --rm \
+       -v trading_lean_data:/Lean/Data:ro \
+       -v /tmp/verify_seed_data.py:/verify.py:ro \
+       python:3.11-slim \
+       python /verify.py --data-dir /Lean/Data --source stooq'
+     ```
+     **Result:** all 4 tickers reported `FETCH FAILED — cross-source fetch failed: ValueError: stooq CSV header missing Date/Close columns: ['Get your apikey:']`. Script exit 2 (fetch error). LEAN-side read succeeded for all 4 (360 rows each; window 2024-12-02 → 2026-05-11 — confirmed via `--json` mode output). This is the script's expected behavior when a cross-source is gated; the operator sees a clear actionable error rather than a stack trace.
+
+  4. **Google Finance independent-source spot-check** (single-bar; via WebFetch — zero infrastructure on the VPS):
+
+     | Ticker | LEAN-on-disk 2026-05-11 close (decoded from `.zip`) | Google Finance "Previous close" (`google.com/finance/quote/<T>:<EX>`) | Divergence |
+     |---|---|---|---|
+     | TLT | $85.56 | $85.56 | 0bp |
+     | IEF | $94.64 | $94.64 | 0bp |
+     | SHY | $82.22 | $82.22 | 0bp |
+     | TIP | $111.31 | $111.31 | 0bp |
+
+     All 4 ticker latest-bar closes match to the penny. Google Finance is sourced from market data aggregators (LSEG/Refinitiv historically; possibly different in 2026); the data feed is INDEPENDENT of yfinance/Yahoo Finance per the upstream-provider landscape.
+
+- **What is NOT yet verified (deferred to operator-side Tiingo signup):**
+  - **360-row historical cross-check.** The spot-check covers the latest bar per ticker (the most operationally critical bar, since strategy signals fire on it). A divergence on a single mid-history date (e.g., 2025-08-13) is not caught by the spot-check; it would be caught by `--source tiingo` running over the full window.
+  - **Open / High / Low / Volume cross-check.** Only `close` is spot-checked. Other OHLCV columns are LEAN-decoded into the on-disk format but not cross-validated. The strategy logic (`strategies/v1_trend_following/`) primarily uses close prices for Donchian/MA/Hurst signals; ATR uses high/low. A 1bp+ divergence on H/L would shift ATR-sized position by <0.1% per the sizing math at $20k equity — operationally negligible but conceptually unchecked.
+  - **Volume-based filters.** Stage 0 sizing uses ADV (average daily volume) as a liquidity proxy; the LEAN volume integers are not cross-validated. Less of a concern for ETF tickers with >$1M daily dollar volume (a 5-10% volume divergence is normal across consolidated-tape vs single-exchange feeds) but worth confirming.
+
+- **Cost / scope impact:**
+  - **$0/mo recurring.** No paid subscriptions. The committed script + tests have zero runtime impact (operator-side tooling only; not imported by any service container).
+  - **One-time cost: ~2 hours of Claude-session time + 0 minutes operator time** to ship the script + tests + decisions-log entry + runbook step. Future re-runs require either (a) operator-side Tiingo signup (~5 min) or (b) operator-side Stooq API key signup (~3 min + captcha) — both small.
+  - **Repo footprint:** 2 new files (`scripts/verify_seed_data.py` + `tests/unit/test_verify_seed_data_script.py`); 2 edits (`Docs/decisions-log.md` append + prior-entry footer update; `deploy/lean_local/seed-data.md` append). No service code changes. No CI churn beyond the new unit-test file being picked up by `make test-unit` (52 new tests, ~0.37s added to test runtime).
+  - **CI gate.** The new script is on `scripts/**` which is exempt from the `services/audit/**` + `services/risk/**` + `services/execution/**` + ... forbidden whitelist. mypy `--strict` runs against `scripts/` per Makefile target. Ruff `S` (bandit) ignored on `scripts/**` per pyproject `per-file-ignores`.
+
+- **What stays:**
+  - All prior wiring through PR [#120](https://github.com/shaanyp123/trading-system/pull/120) + [#121](https://github.com/shaanyp123/trading-system/pull/121) + [#122](https://github.com/shaanyp123/trading-system/pull/122) + [#123](https://github.com/shaanyp123/trading-system/pull/123) + [#124](https://github.com/shaanyp123/trading-system/pull/124) stays in place.
+  - The `trading_lean_data` Docker volume content is unchanged (read-only access during this session).
+  - `services/qc_adapter/**` remains in dormant `qc_adapter_backfill` profile per the 2026-05-12 architecture pivot.
+
+- **Live-signal-approval gate:** **the Google Finance spot-check at 0bp divergence across 4-of-4 tickers DOES NOT block live signal approvals.** The garbage-in failure modes that would matter at the strategy-signal level (wrong magnitude, wrong window, decoder bug) are caught by the spot-check. **However:** the operator should treat the full historical 360-row cross-check via Tiingo as the canonical gate for graduating from Phase 1 paper to Phase 1 live (Week 8 pre-live checklist). The script is ready for that ceremony; the decision is operator-side.
+
+- **Outstanding follow-ups carried forward + new (in priority order, unchanged except for the new item #4):**
+
+  1. **Capture the 21:30 UTC cycle outcome (carryover from prior entry; still wall-clock-bound).** Re-engage at ~21:35 UTC OR inspect `cat /tmp/cycle_status.txt` on the VPS.
+  2. **Decide futures data path (carryover; covered in the Phase 1 futures-data path memo entry above this one).** Operator picks B (DataBento via LEAN CLI; recommended) or C (Yahoo continuous-futures-as-equities hack) or D (accept 4-of-11 indefinitely).
+  3. Recon kill-switch hook (`risk-review-approved` required).
+  4. **NEW: Operator-side Tiingo signup for full historical cross-check.** Sign up at `tiingo.com`; capture the API key; `sops secrets/paper.enc.yaml` add `tiingo.api_key: <token>` (under the existing operator-key conventions); SSH + scp the script + run `docker run --rm -v trading_lean_data:/Lean/Data:ro -v /tmp/verify_seed_data.py:/verify.py:ro python:3.11-slim python /verify.py --data-dir /Lean/Data --source tiingo --tiingo-api-key "$TIINGO_API_KEY"`. Expected: exit 0 (or exit 1 with worst-rows listed for operator review). This is the canonical pre-live cross-check.
+  5. Discord push on reconciliation breaks (hot-fix).
+  6. `prior_breaks` query in `eod_cycle.run_eod_cycle`.
+  7. CLAUDE.md file-index refresh (stale; this PR adds 2 more files to the gap).
+  8. Position view sync LEAN → api.
+  9. Canonicalize the seed script (carryover; resolved 2026-05-12 via PR [#123](https://github.com/shaanyp123/trading-system/pull/123)).
+
+- **Operator pre-authorizations (unchanged):**
+  - SSH to VPS via configured key, `git push`, open-PR creation + label management, squash-merge fix PRs via `gh pr merge --squash --admin --delete-branch`, force-push-with-lease on `claude/<name>`, docker compose restart, docker volume manipulation via transient containers.
+  - **Carried from this session:** read-only `docker run --rm -v trading_lean_data:/Lean/Data:ro ...` for cross-check ceremonies; WebFetch on public free-tier financial-quote pages (Google Finance) for single-bar spot-checks.
+
+- **Smoke-tested via:** (a) `make lint` (ruff format --check + ruff check) → 211 files clean, all checks passed; (b) `make typecheck` (mypy --strict on services + infrastructure + strategies + scripts) → 138 source files, no issues; (c) `make test-unit` (pytest --cov) → 1149 passed, 45 warnings, 56.78s wall-time; (d) `python3 scripts/verify_seed_data.py --help` → argparse help renders correctly; (e) VPS docker-run smoke `docker run --rm -v trading_lean_data:/Lean/Data:ro -v /tmp/verify_seed_data.py:/verify.py:ro python:3.11-slim python /verify.py --data-dir /Lean/Data --source stooq` → exit 2 (all 4 tickers FETCH FAILED on Stooq's apikey-prompt body, as expected); (f) Google Finance spot-check via WebFetch → 4-of-4 tickers' 2026-05-11 close = 0bp divergence vs LEAN-on-disk; (g) volume integrity confirmed unchanged before + after the session.

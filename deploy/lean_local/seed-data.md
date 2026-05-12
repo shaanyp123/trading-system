@@ -237,6 +237,130 @@ volumes are persistent.
 
 ---
 
+## Step 7 — Cross-check against an independent data source
+
+After a new seed lands, validate it against a SECOND independent data
+provider to catch a "garbage-in-garbage-out" failure mode (yfinance data
+quality regression, accidental wrong-window seed, decoder off-by-10000,
+etc.) BEFORE approving any live signal that consumes the bars.
+
+The validation script `scripts/verify_seed_data.py` reads the on-disk
+LEAN zips (read-only against the volume) and diffs the close prices
+against either Stooq or Tiingo. Threshold: 1bp on the close-price
+divergence (= 0.01% = ~$0.01 on a $85 ETF). Volume divergence is
+informational only.
+
+### Option A — Single-bar spot-check via Google Finance (zero infrastructure)
+
+For a quick sanity check after a re-seed, browse to `https://www.google.com/finance/quote/<TICKER>:<EXCHANGE>` for each ticker (TLT:NASDAQ, IEF:NASDAQ, SHY:NASDAQ, TIP:NYSEARCA) and confirm the "Previous close" field matches the LEAN-decoded last bar.
+
+The 2026-05-12 ceremony validated:
+
+| Ticker | LEAN last close (2026-05-11) | Google Finance previous close | Divergence |
+|---|---|---|---|
+| TLT | $85.56 | $85.56 | 0bp |
+| IEF | $94.64 | $94.64 | 0bp |
+| SHY | $82.22 | $82.22 | 0bp |
+| TIP | $111.31 | $111.31 | 0bp |
+
+This is a single-bar check; it catches catastrophic garbage modes (wrong
+magnitude, decoder bug, wrong-window seed) but does NOT catch an isolated
+mid-history single-bar divergence.
+
+### Option B — Full historical 360-row cross-check via Tiingo (recommended pre-live gate)
+
+For the canonical pre-live gate (Week 8 pre-live checklist), use Tiingo
+as the independent source (free tier: 1000 req/day on daily-OHLCV, well
+above our 4-ticker scope). One-time setup:
+
+1. Sign up at `https://www.tiingo.com/account/api` — free; gives the
+   account-level API key.
+2. Add to sops: `sops secrets/paper.enc.yaml` → append the key under a
+   new `tiingo:` block:
+   ```yaml
+   tiingo:
+     api_key: <token>
+   ```
+3. Commit + push the sops-encrypted secrets file.
+
+Then run the script against the live volume:
+
+```bash
+# Stage the script on the VPS
+scp scripts/verify_seed_data.py root@178.156.239.84:/tmp/verify_seed_data.py
+
+# Decrypt sops to surface the key (file-only, never to stdout)
+ssh root@178.156.239.84 '
+  export SOPS_AGE_KEY_FILE=/etc/credstore.encrypted/age_key
+  sops --decrypt secrets/paper.enc.yaml > /dev/shm/paper.decrypted.yaml
+  chmod 600 /dev/shm/paper.decrypted.yaml
+  TIINGO_KEY=$(awk "/^tiingo:/,/^[a-z]/" /dev/shm/paper.decrypted.yaml | \
+               awk "/api_key:/ {print \$2; exit}")
+  # Sanity-check key was captured (non-empty length only; never echo the key itself)
+  echo "tiingo key length: ${#TIINGO_KEY}"
+  docker run --rm \
+    -v trading_lean_data:/Lean/Data:ro \
+    -v /tmp/verify_seed_data.py:/verify.py:ro \
+    -e TIINGO_KEY="$TIINGO_KEY" \
+    python:3.11-slim \
+    sh -c "python /verify.py --data-dir /Lean/Data --source tiingo --tiingo-api-key \"\$TIINGO_KEY\""
+  shred -u /dev/shm/paper.decrypted.yaml
+'
+```
+
+**Expected output (clean case):**
+
+```
+LEAN seed verification vs 'tiingo'
+Data dir:   /Lean/Data
+Window:     2024-12-02 -> 2026-05-11 (inclusive on both ends)
+Threshold:  1.0000bp on close-price divergence
+
+Ticker     LEAN rows   Cross rows   Shared   Only LEAN   Only cross      Max bp   Breaches  Result
+--------------------------------------------------------------------------------------------------
+TLT              360          360      360           0            0    0.0000bp          0  PASS
+IEF              360          360      360           0            0    0.0000bp          0  PASS
+SHY              360          360      360           0            0    0.0000bp          0  PASS
+TIP              360          360      360           0            0    0.0000bp          0  PASS
+```
+
+Exit code 0. **On exit 1** (any row > threshold), the per-ticker
+"Worst-divergence rows" section lists the dates + LEAN close vs cross
+close + signed bp divergence. Operator inspects, decides whether to:
+(a) accept (e.g., a known dividend ex-date that yfinance handles
+differently from Tiingo); (b) reject + re-seed from a different source.
+
+**On exit 2** (cross-source fetch failed): check the per-ticker
+`FETCH FAILED — ...` line. The most common causes are rate-limiting
+(Tiingo's free tier: 1000 req/day; we use ~4) or an invalid/expired key.
+
+### Option C — Stooq (DEFERRED — API-gated as of 2026)
+
+The script supports `--source stooq` but Stooq's public CSV endpoint
+moved behind an API-key gate in mid-2024. Calls return a
+"Get your apikey: ..." prompt body instead of CSV. To use Stooq, sign
+up at `https://stooq.com/q/d/?s=tlt.us&get_apikey` (free + captcha),
+then pass the key as a `&apikey=` URL parameter — current script
+doesn't wire this; treat Stooq as TODO if/when operator prefers it
+over Tiingo. Documented for institutional memory.
+
+---
+
+## Step 8 — Cross-check cleanup
+
+After Step 7 completes (regardless of outcome), remove the transient
+script staged on the VPS:
+
+```bash
+ssh root@178.156.239.84 'rm -f /tmp/verify_seed_data.py'
+```
+
+The cross-check is read-only against the volume; nothing in
+`/Lean/Data/` is mutated. Re-running the cross-check at any later time
+is a single `scp` + `docker run` cycle away.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
@@ -250,13 +374,18 @@ volumes are persistent.
 | `_` AppleDouble files in volume | macOS tar leaked `._<file>` sidecars | scripts/seed_lean_data.py uses Python `tarfile` which avoids this — re-run via the script, NOT manual `tar -czf` |
 | Boot crash with `Sequence contains no matching element` | LEAN-side broker mismatch (pre-PR #120 state) | Confirm `lean/lean.json::live-mode-brokerage` is `PaperBrokerage` per PR #120 |
 | `MIN_HOLDING_DAYS` filter never blocks anything | LEAN's `self.portfolio[symbol]` returns flat under PaperBrokerage | Expected post-pivot — the api owns positions, not LEAN; tracked as Phase 1+ follow-up |
+| Step 7 cross-check: all 4 tickers `FETCH FAILED — ... 'Get your apikey:'` | Stooq's public CSV endpoint is now API-gated (mid-2024) | Switch to `--source tiingo` after operator-side signup at `tiingo.com`; see Step 7 Option B |
+| Step 7 cross-check: `cross-source fetch failed: ValueError: tiingo: --tiingo-api-key required` | Forgot to pass `--tiingo-api-key` (or env var blank) | Pass `--tiingo-api-key "$TIINGO_API_KEY"` (env var captured from sops) |
+| Step 7 cross-check: 1 or more tickers `FAIL` with worst-row divergence > 1bp | yfinance data quality regression OR a known dividend ex-date OR factor-file mismatch | Inspect the worst-rows table for which dates flag; cross-reference against `dividend_history` for known ex-dates; decide accept (corner case) vs re-seed |
 
 ---
 
 ## Cross-references
 
 * Build script: `scripts/seed_lean_data.py`
+* Cross-check script: `scripts/verify_seed_data.py`
 * 2026-05-12 ceremony record: `Docs/decisions-log.md` entry "Phase 1 data-seed ceremony"
+* 2026-05-12 cross-check record: `Docs/decisions-log.md` entry "ETF data-quality cross-check"
 * LEAN data-volume design: `lean/README.md` file-index `lean_data` row
 * LEAN local container runbook: `deploy/lean_local/README.md`
 * Audit chain verifier: `deploy/audit/README.md`
