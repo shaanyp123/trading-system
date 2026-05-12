@@ -208,6 +208,12 @@ class Phase1QueryRepo(Protocol):
 
     async def fetch_latest_balance_nav(self, account_id: UUID) -> Decimal | None: ...
 
+    async def fetch_signal_summary(
+        self,
+        account_id: UUID,
+        signal_id: UUID,
+    ) -> dict[str, object] | None: ...
+
 
 # ---------------------------------------------------------------------------
 # Postgres implementation
@@ -680,6 +686,46 @@ class PostgresPhase1QueryRepo:
             )
         ).fetchone()
         return Decimal(str(row.net_liquidation)) if row else None
+
+    async def fetch_signal_summary(
+        self,
+        account_id: UUID,
+        signal_id: UUID,
+    ) -> dict[str, object] | None:
+        """Single-row read of the columns needed for ``signal`` SSE emission.
+
+        Returns the fields ``services.webhook_pusher.sse_subscriber.route_event``
+        consumes (market + direction) plus a few related identity fields
+        the api emits as SSE data payload so subscribers can deep-link
+        to the trade. The account_id filter prevents cross-account
+        leakage in the multi-account future (Phase 3+); today the api
+        is single-operator.
+        """
+        row = (
+            await self._session.execute(
+                text(
+                    "SELECT market, direction, target_contracts, decision_price, "
+                    "       strategy_hash, parameter_set_hash, emitted_at_utc, "
+                    "       env, status "
+                    "FROM signals "
+                    "WHERE id = :sid AND account_id = :acc"
+                ),
+                {"sid": signal_id, "acc": account_id},
+            )
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "market": row.market,
+            "direction": row.direction,
+            "target_contracts": int(row.target_contracts),
+            "decision_price": Decimal(str(row.decision_price)),
+            "strategy_hash": row.strategy_hash,
+            "parameter_set_hash": row.parameter_set_hash,
+            "emitted_at_utc": row.emitted_at_utc,
+            "env": row.env,
+            "status": row.status,
+        }
 
 
 __all__ = [
