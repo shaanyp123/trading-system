@@ -45,5 +45,8 @@ ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/lean_local_entrypoint.sh"]
 
 # Default command: run LEAN's standard runtime against the rendered
 # lean.json. The entrypoint script handles config rendering before
-# execing this command via `exec "$@"`.
-CMD ["dotnet", "/Lean/QuantConnect.Lean.Launcher.dll"]
+# execing this command via `exec "$@"`. The launcher .dll lives under
+# /Lean/Launcher/bin/Debug/ in the quantconnect/lean:latest image (Apr
+# 2026 build) — /Lean/QuantConnect.Lean.Launcher.dll does not exist
+# at the WORKDIR level.
+CMD ["dotnet", "/Lean/Launcher/bin/Debug/QuantConnect.Lean.Launcher.dll"]
