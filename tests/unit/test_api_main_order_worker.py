@@ -76,6 +76,9 @@ def _settings(**overrides: Any) -> Any:
         ibkr_client_id=1,
         ibkr_account="DUQ_TEST",
         order_placement_poll_interval_seconds=5.0,
+        reconciliation_scheduler_enabled=True,
+        flex_query_id=12345,
+        flex_query_token=None,  # SecretStr in real settings; helper handles None
     )
     for k, v in overrides.items():
         setattr(base, k, v)
@@ -129,6 +132,123 @@ class TestStopOrderPlacementWorkerNoState:
 
         # Should not raise.
         await api_main._stop_order_placement_worker(None)
+
+
+class TestStartReconciliationSchedulerDefensive:
+    """Recon scheduler bring-up is gated on operator-populated sops fields.
+
+    These tests lock the contract: when the operator hasn't populated
+    `ibkr.flex_query_id` + `ibkr.flex_query_token` yet (the Phase-1
+    expected state at deploy time), the scheduler quietly does not
+    start. Once the operator updates sops + restarts the api, the
+    real-cred path takes over.
+    """
+
+    @pytest.mark.asyncio
+    async def test_disabled_setting_returns_none(self) -> None:
+        from services.api import main as api_main
+
+        result = await api_main._start_reconciliation_scheduler(
+            _settings(reconciliation_scheduler_enabled=False)
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_missing_flex_id_returns_none(self) -> None:
+        from services.api import main as api_main
+
+        result = await api_main._start_reconciliation_scheduler(
+            _settings(flex_query_id=None, flex_query_token=SimpleNamespace())
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_missing_flex_token_returns_none(self) -> None:
+        from services.api import main as api_main
+
+        result = await api_main._start_reconciliation_scheduler(
+            _settings(flex_query_id=123, flex_query_token=None)
+        )
+        assert result is None
+
+
+class TestStopReconciliationSchedulerNoState:
+    @pytest.mark.asyncio
+    async def test_none_state_is_idempotent(self) -> None:
+        from services.api import main as api_main
+
+        # Lifespan calls _stop_reconciliation_scheduler(None) when start returned None.
+        await api_main._stop_reconciliation_scheduler(None)
+
+
+class TestEntrypointFlexQueryMapping:
+    """Tests for sops yaml → API_FLEX_QUERY_ID + API_FLEX_QUERY_TOKEN mapping."""
+
+    def test_flex_query_credentials_mapped(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        from services.api import entrypoint
+
+        yaml_text = (
+            "postgres:\n"
+            "  app_service_password: hexpwd\n"
+            "ibkr:\n"
+            "  paper_account: DUQ_TEST\n"
+            "  flex_query_id: 991122\n"
+            "  flex_query_token: tok-redacted\n"
+        )
+        secrets_path = tmp_path / "decrypted.yaml"
+        secrets_path.write_text(yaml_text)
+        monkeypatch.setenv("API_SECRETS_PATH", str(secrets_path))
+        monkeypatch.delenv("API_FLEX_QUERY_ID", raising=False)
+        monkeypatch.delenv("API_FLEX_QUERY_TOKEN", raising=False)
+        monkeypatch.delenv("API_DATABASE_URL", raising=False)
+        monkeypatch.setenv("API_ENVIRONMENT", "paper")
+
+        called: dict[str, Any] = {}
+
+        def fake_execvp(cmd: str, argv: list[str]) -> None:
+            called["cmd"] = cmd
+
+        monkeypatch.setattr(entrypoint.os, "execvp", fake_execvp)
+        entrypoint.main(["true"])
+
+        import os
+
+        assert os.environ["API_FLEX_QUERY_ID"] == "991122"
+        assert os.environ["API_FLEX_QUERY_TOKEN"] == "tok-redacted"
+
+    def test_placeholder_flex_credentials_skipped(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        from services.api import entrypoint
+
+        yaml_text = (
+            "postgres:\n"
+            "  app_service_password: hexpwd\n"
+            "ibkr:\n"
+            "  paper_account: DUQ_TEST\n"
+            "  flex_query_id: <TODO_FLEX_QUERY_ID>\n"
+            "  flex_query_token: <TODO_FLEX_QUERY_TOKEN>\n"
+        )
+        secrets_path = tmp_path / "decrypted.yaml"
+        secrets_path.write_text(yaml_text)
+        monkeypatch.setenv("API_SECRETS_PATH", str(secrets_path))
+        monkeypatch.delenv("API_FLEX_QUERY_ID", raising=False)
+        monkeypatch.delenv("API_FLEX_QUERY_TOKEN", raising=False)
+        monkeypatch.delenv("API_DATABASE_URL", raising=False)
+        monkeypatch.setenv("API_ENVIRONMENT", "paper")
+
+        def fake_execvp(cmd: str, argv: list[str]) -> None:
+            pass
+
+        monkeypatch.setattr(entrypoint.os, "execvp", fake_execvp)
+        entrypoint.main(["true"])
+
+        import os
+
+        assert "API_FLEX_QUERY_ID" not in os.environ
+        assert "API_FLEX_QUERY_TOKEN" not in os.environ
 
 
 class TestEntrypointIbkrAccountMapping:
