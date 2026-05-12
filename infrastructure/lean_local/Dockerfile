@@ -27,6 +27,15 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends tini python3-yaml \
     && rm -rf /var/lib/apt/lists/*
 
+# Install structlog into the LEAN container's Python (miniconda-based;
+# /opt/miniconda3/bin/python3) so the strategy module
+# (`strategies/v1_trend_following/strategy.py`) can use it for the
+# `v1_indicator_compute_failed` log line. Pivot-PR-D 2026-05-12: the
+# strategy module imports structlog at top level; without it, LEAN's
+# `AlgorithmPythonWrapper` fails to load v1_strategy.py with
+# `No module named 'structlog'`.
+RUN /opt/miniconda3/bin/python3 -m pip install --no-cache-dir "structlog>=24.4"
+
 # Entrypoint script: resolves /run/secrets/decrypted.yaml → env vars then
 # execs LEAN's standard runtime. The entrypoint script comes from this
 # directory.
