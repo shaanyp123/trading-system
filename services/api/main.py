@@ -8,6 +8,11 @@ Wired in execution order:
        - Init asyncpg pool.
        - First-boot bootstrap: if no unconsumed/unexpired owner setup_token
          exists, create one, print raw to stdout, store hash. Idempotent.
+       - Worker-PR-1 follow-up (post-pivot 2026-05-12): start the
+         api-resident OrderPlacementWorker if an active accounts row +
+         IBKR account number resolve. Best-effort — a fresh deploy
+         without an accounts row or ib_gateway connectivity skips
+         worker startup with a warning rather than crashing.
   4. Middleware (RequestContext + CSRF + optional CORS).
   5. Error handlers (canonical envelope per dev-guide §3.6).
   6. Routes (health, setup, sse).
@@ -19,19 +24,23 @@ forbidden-paths CI gate.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from typing import Literal
 
 import structlog
 from fastapi import FastAPI
 
+from services.api import db as api_db
 from services.api import sse as sse_multiplexer
 from services.api.config import APISettings, get_settings
 from services.api.db import close_pool, init_pool, session_scope
 from services.api.errors import register_error_handlers
 from services.api.middleware import BotAuthMiddleware, LeanAuthMiddleware, register_middleware
+from services.api.repos.phase1 import PostgresPhase1QueryRepo
 from services.api.repos.setup_tokens import PostgresSetupTokenRepo
 from services.api.routes.alerts import router as alerts_router
 from services.api.routes.auth import router as auth_router
@@ -107,6 +116,132 @@ async def _bootstrap_owner_token() -> None:
         )
 
 
+def _audit_env_from_settings(settings: APISettings) -> Literal["paper", "live-small", "live-scale"]:
+    """Map APISettings.environment → audit_log.env enum value.
+
+    `dev` is the local-only env tag; it has no corresponding `audit_log.env`
+    CHECK constraint value so we degrade it to `paper` (the dry-run env tag).
+    """
+    if settings.environment in ("paper", "live-small", "live-scale"):
+        return settings.environment
+    return "paper"
+
+
+async def _start_order_placement_worker(settings: APISettings) -> tuple[object, object] | None:
+    """Construct + start the OrderPlacementWorker; return (worker, task) or None.
+
+    Best-effort: any failure to construct the worker (no active account,
+    ib_async unavailable, etc.) logs a warning and returns None. The api
+    still serves the rest of its surface.
+
+    The lifecycle of the IbkrClient connection is owned by the adapter
+    (auto-reconnect on transient disconnects). The connect() call here
+    is the initial best-effort handshake; if ib_gateway is down at boot
+    the worker.run_once() iterations will keep retrying with the
+    adapter's reconnect path.
+    """
+    if not settings.order_placement_worker_enabled:
+        log.warning("order_placement_worker_disabled_via_setting")
+        return None
+
+    # Lazy imports — keeps the rest of the api importable even when
+    # ib_async isn't installed (e.g., dev hosts running unit tests).
+    from services.execution.ibkr_adapter import IbAsyncIbkrClient
+    from services.execution.types import IbkrPlacementError
+    from services.risk.order_placement_worker import OrderPlacementWorker
+
+    # Resolve active account_id from the accounts table. If no account
+    # exists, defer startup — the operator must complete /setup before
+    # signals flow.
+    async with session_scope() as repo_session:
+        repo = PostgresPhase1QueryRepo(repo_session)
+        account_id = await repo.fetch_active_account_id()
+    if account_id is None:
+        log.warning(
+            "order_placement_worker_no_active_account",
+            note="run /setup before the worker can resolve an account_id",
+        )
+        return None
+
+    # Construct + best-effort connect. IBKR account number is optional —
+    # IbAsyncIbkrClient falls back to the default account on the TWS
+    # session when None is passed.
+    ibkr_account = settings.ibkr_account
+    ibkr_client = IbAsyncIbkrClient(
+        host=settings.ibkr_host,
+        port=settings.ibkr_port,
+        account_id=ibkr_account,
+        client_id=settings.ibkr_client_id,
+    )
+
+    try:
+        await ibkr_client.connect()
+    except IbkrPlacementError as exc:
+        log.warning(
+            "order_placement_worker_initial_ibkr_connect_failed",
+            host=settings.ibkr_host,
+            port=settings.ibkr_port,
+            error=str(exc),
+            note=(
+                "Worker will keep retrying via the adapter's reconnect "
+                "path on each run_once() iteration."
+            ),
+        )
+
+    worker = OrderPlacementWorker(
+        session_factory=api_db.get_session_factory(),
+        ibkr_client=ibkr_client,
+        account_id=account_id,
+        env=_audit_env_from_settings(settings),
+        poll_interval_seconds=settings.order_placement_poll_interval_seconds,
+    )
+    task = asyncio.create_task(worker.run_forever(), name="order_placement_worker.run_forever")
+    log.info(
+        "order_placement_worker_spawned",
+        account_id=str(account_id),
+        env=_audit_env_from_settings(settings),
+        ibkr_host=settings.ibkr_host,
+        ibkr_port=settings.ibkr_port,
+        ibkr_account=ibkr_account,
+        poll_interval=settings.order_placement_poll_interval_seconds,
+    )
+    return worker, task
+
+
+async def _stop_order_placement_worker(state: tuple[object, object] | None) -> None:
+    """Request stop + await task + disconnect the IBKR client. Best-effort."""
+    if state is None:
+        return
+    worker, task = state
+    try:
+        worker.request_stop()  # type: ignore[attr-defined]
+    except Exception:
+        log.exception("order_placement_worker_request_stop_failed")
+    # Give the worker a few seconds to finish its in-flight run_once.
+    try:
+        await asyncio.wait_for(task, timeout=15.0)  # type: ignore[arg-type]
+    except TimeoutError:
+        log.warning("order_placement_worker_shutdown_timeout")
+        task.cancel()  # type: ignore[attr-defined]
+        try:
+            await task  # type: ignore[misc]
+        except asyncio.CancelledError:
+            log.info("order_placement_worker_shutdown_cancelled")
+        except Exception:
+            log.exception("order_placement_worker_shutdown_unclean")
+    except Exception:
+        log.exception("order_placement_worker_task_join_failed")
+    # Disconnect the IBKR client. The worker holds a reference; pull it
+    # out via the internal attribute (the worker class predates the
+    # need for a public accessor; surfacing one is a future tweak).
+    ibkr_client = getattr(worker, "_ibkr_client", None)
+    if ibkr_client is not None:
+        try:
+            await ibkr_client.disconnect()
+        except Exception:
+            log.exception("order_placement_worker_ibkr_disconnect_failed")
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     settings = get_settings()
@@ -119,6 +254,7 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await init_pool(settings)
     sse_multiplexer.reset_state()
     sse_multiplexer.start_heartbeat()
+    worker_state: tuple[object, object] | None = None
     try:
         try:
             await _bootstrap_owner_token()
@@ -127,10 +263,19 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             # have run yet on this VPS. Log loudly and continue; operator
             # runs the bootstrap CLI after migrations finish.
             log.exception("setup_token_bootstrap_failed")
+        try:
+            worker_state = await _start_order_placement_worker(settings)
+        except Exception:
+            # Worker startup is best-effort; failure shouldn't take
+            # down the api. The operator can re-enable + restart once
+            # the underlying issue (ib_async install, accounts row,
+            # network) is resolved.
+            log.exception("order_placement_worker_startup_failed")
         log.info("api_ready")
         yield
     finally:
         log.info("api_stopping")
+        await _stop_order_placement_worker(worker_state)
         await sse_multiplexer.stop_heartbeat()
         await close_pool()
 

@@ -123,6 +123,29 @@ def main(argv: list[str] | None = None) -> int:
         if origin and not _looks_like_placeholder(origin):
             os.environ["API_WEBAUTHN_ORIGIN"] = origin
 
+    # Worker-PR-1 follow-up (post-pivot 2026-05-12): IBKR account
+    # number for the api-resident OrderPlacementWorker. Sourced from
+    # sops `ibkr.paper_account` (paper env) or `ibkr.live_account`
+    # (live envs). When unset the worker skips startup at lifespan —
+    # the api still serves requests, approved signals just queue in
+    # the signals table until the operator populates the field.
+    #
+    # Phase 1 selects paper vs live by env at this layer rather than
+    # spec'ing two separate API_* vars; APISettings.environment +
+    # the operator's deploy/.env determine which sops key gets
+    # promoted to the canonical IBKR_ACCOUNT slot.
+    if "API_IBKR_ACCOUNT" not in os.environ:
+        ibkr = secrets.get("ibkr") or {}
+        env_tag = os.environ.get("API_ENVIRONMENT") or os.environ.get("ENVIRONMENT", "dev")
+        if env_tag in ("paper", "dev"):
+            account_key = "paper_account"
+        else:
+            # live-small / live-scale → live_account
+            account_key = "live_account"
+        acc = ibkr.get(account_key)
+        if acc and not _looks_like_placeholder(acc):
+            os.environ["API_IBKR_ACCOUNT"] = str(acc)
+
     if "API_VERSION" not in os.environ:
         os.environ.setdefault("API_VERSION", os.environ.get("RELEASE_SHA", "dev"))
     if "API_ENVIRONMENT" not in os.environ:
