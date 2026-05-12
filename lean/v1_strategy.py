@@ -102,6 +102,9 @@ from decimal import Decimal
 # strategies.v1_trend_following.indicators import (...)` etc.).
 # The strategy module is broker-agnostic pure Python — no QC / LEAN
 # imports — so this import is safe to run inside LEAN's Python runtime.
+from strategies.v1_trend_following.lean_history_adapter import (  # type: ignore[import-not-found]
+    parse_history_to_bars,
+)
 from strategies.v1_trend_following.parameters import (  # type: ignore[import-not-found]
     V1Parameters,
 )
@@ -157,27 +160,6 @@ _API_TIMEOUT_SECONDS = 10.0
 # Phase 1 ceremony because `_derive_strategy_hash` sha1's any non-40-hex
 # suffix into a deterministic hash, preserving audit-chain integrity.
 _STRATEGY_VERSION_DEFAULT = f"{STRATEGY_NAME}@phase1-pivot-d"
-
-
-def _value_is_missing(value: object) -> bool:
-    """Return True if ``value`` is None / NaN / pandas-NaT / non-numeric.
-
-    Helper for the DataFrame branch of ``_build_bar_series``. pandas
-    represents missing OHLCV cells as ``float('nan')`` and missing
-    timestamps as ``NaT`` — both pass ``v is not None``, so a naive
-    ``v is None`` guard would let bad rows through and explode later
-    inside ``Decimal(str(nan))``. We coerce to float() to catch NaN
-    cleanly; non-numeric inputs short-circuit to True since we cannot
-    make a valid Bar from them anyway.
-    """
-    if value is None:
-        return True
-    try:
-        import math
-
-        return math.isnan(float(value))  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return True
 
 
 class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]  # noqa: F405
@@ -491,15 +473,23 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         market as "no bars for this session" and skips it; no rejection
         event is emitted.
 
-        Handles both LEAN's modern Python API (returns a pandas DataFrame
-        indexed on `(symbol, time)` MultiIndex with lowercase OHLCV columns)
-        AND the legacy iterable-of-`TradeBar` form. Detection is via
-        duck-typing on `iterrows`. The 2026-05-12 ceremony surfaced this
-        gap when the first cycle with seeded data emitted
-        `v1_history_unavailable` for every market — the legacy iteration
-        treated a DataFrame as an iterable of column-name strings, which
-        all skipped the `end_time is None: continue` branch and left
-        `bars` empty.
+        Parse logic lives in
+        ``strategies.v1_trend_following.lean_history_adapter.parse_history_to_bars``
+        — pure-Python, unit-tested, handles both the modern QC Python API
+        (DataFrame with MultiIndex ``(symbol, time)`` + lowercase OHLCV
+        columns) AND the legacy iterable-of-``TradeBar`` form. The wrapper
+        here keeps the LEAN-runtime-specific concerns: the
+        ``self.history(...)`` call, structured ``self.log(...)`` lines on
+        each failure mode, and the sort + dedup + ``BarSeries``
+        construction at the end.
+
+        The 2026-05-12 ceremony surfaced the DataFrame parsing gap when
+        the first cycle with seeded data emitted ``v1_history_unavailable``
+        for every market — the legacy iteration treated a DataFrame as an
+        iterable of column-name strings, which all skipped the
+        ``end_time is None: continue`` branch and left ``bars`` empty. PR
+        #129 fixed at the surface; the adapter + tests in this PR lock
+        the regression contract.
         """
         try:
             history = self.history(symbol, count, Resolution.DAILY)  # noqa: F405
@@ -509,82 +499,8 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         if history is None:
             return None
 
-        bars: list[Bar] = []
         try:
-            if hasattr(history, "iterrows"):
-                # Modern QC Python API: pandas DataFrame, MultiIndex
-                # `(symbol, time)` with lowercase columns
-                # (open / high / low / close / volume).
-                if getattr(history, "empty", False):
-                    return None
-                for ts, row in history.iterrows():
-                    # MultiIndex yields a tuple; the time component is the
-                    # last element. Single-index yields the Timestamp
-                    # directly.
-                    if isinstance(ts, tuple) and len(ts) >= 1:
-                        bar_time = ts[-1]
-                    else:
-                        bar_time = ts
-                    session = (
-                        bar_time.date() if hasattr(bar_time, "date") else _date.today()
-                    )
-                    try:
-                        open_v = row["open"]
-                        high_v = row["high"]
-                        low_v = row["low"]
-                        close_v = row["close"]
-                        volume_v = row["volume"] if "volume" in row else 0
-                    except (KeyError, IndexError):
-                        continue
-                    if any(_value_is_missing(v) for v in (open_v, high_v, low_v, close_v)):
-                        continue
-                    bars.append(
-                        Bar(
-                            session_date=session,
-                            open=Decimal(str(open_v)),
-                            high=Decimal(str(high_v)),
-                            low=Decimal(str(low_v)),
-                            close=Decimal(str(close_v)),
-                            volume=int(volume_v) if not _value_is_missing(volume_v) else 0,
-                        )
-                    )
-            else:
-                # Legacy iterable-of-TradeBar form. Preserved verbatim
-                # in case a future LEAN release reverts the API or a
-                # different code path (warmup, backtest replay) yields
-                # bar objects rather than a DataFrame.
-                for raw in history:
-                    end_time = getattr(raw, "end_time", None) or getattr(raw, "EndTime", None)
-                    if end_time is None:
-                        continue
-                    session = end_time.date() if hasattr(end_time, "date") else _date.today()
-                    open_v = getattr(raw, "open", None)
-                    if open_v is None:
-                        open_v = getattr(raw, "Open", None)
-                    high_v = getattr(raw, "high", None)
-                    if high_v is None:
-                        high_v = getattr(raw, "High", None)
-                    low_v = getattr(raw, "low", None)
-                    if low_v is None:
-                        low_v = getattr(raw, "Low", None)
-                    close_v = getattr(raw, "close", None)
-                    if close_v is None:
-                        close_v = getattr(raw, "Close", None)
-                    volume_v = getattr(raw, "volume", None)
-                    if volume_v is None:
-                        volume_v = getattr(raw, "Volume", 0)
-                    if any(v is None for v in (open_v, high_v, low_v, close_v)):
-                        continue
-                    bars.append(
-                        Bar(
-                            session_date=session,
-                            open=Decimal(str(open_v)),
-                            high=Decimal(str(high_v)),
-                            low=Decimal(str(low_v)),
-                            close=Decimal(str(close_v)),
-                            volume=int(volume_v) if volume_v is not None else 0,
-                        )
-                    )
+            bars = parse_history_to_bars(history)
         except Exception as exc:  # noqa: BLE001 -- log + skip
             self.log(f"v1_history_parse_failed market={market_key} exc={exc!r}")
             return None
