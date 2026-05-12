@@ -42,7 +42,8 @@ when ``live-mode = true`` and ``live-mode-brokerage = InteractiveBrokersBrokerag
 in ``lean.json``. The ``ib_gateway`` Docker container hosts the TWS API session
 (see ``deploy/ibkr/README.md``, Pivot-PR-B). For paper trading, the wrapper
 flows the same code paths but ``ib_gateway`` is configured with paper credentials
-and port 4002.
+and port 4004 (externally-published socat port; internal gateway on
+127.0.0.1:4002 — see ``deploy/ibkr/README.md`` Step 4).
 
 API convention: snake_case (QC migrated the Python API from PascalCase to
 snake_case ~2024; the local LEAN runtime accepts both but snake_case is the

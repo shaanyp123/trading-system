@@ -139,7 +139,7 @@ class IbAsyncIbkrClient:
         self,
         *,
         host: str = "ib_gateway",
-        port: int = 4002,
+        port: int = 4004,
         account_id: str | None = None,
         client_id: int = DEFAULT_CLIENT_ID,
         ib_factory: type[IB] | None = None,
@@ -149,9 +149,13 @@ class IbAsyncIbkrClient:
 
         :param host: hostname of the ib_gateway container. Defaults to the
             Docker DNS name on the internal network.
-        :param port: 4002 for paper, 4001 for live. Operator selects via
-            ``LEAN_LIVE_MODE`` env var (Pivot-PR-A); the post-pivot
-            ``docker-compose.yml`` substitutes accordingly.
+        :param port: 4004 for paper, 4003 for live — these are the
+            externally-published socat ports per gnzsnz/ib-gateway-docker
+            convention. The internal IB Gateway listens on 127.0.0.1:4002
+            (paper) / :4001 (live), but those are unreachable from outside
+            the container; socat publishes the externally-facing ports as
+            4004/4003. Discovered Pivot-PR-B Step 5 smoke 2026-05-12.
+            Operator selects paper-vs-live via ``LEAN_LIVE_MODE`` env var.
         :param account_id: IBKR account number (e.g., "U25655583"). When
             None, the adapter uses the default account on the TWS session.
         :param client_id: TWS API clientId; 1-7 per IBKR's docs.

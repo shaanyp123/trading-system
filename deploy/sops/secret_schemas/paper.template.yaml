@@ -23,8 +23,10 @@ ibkr:
   # the ib_gateway container. The operator's IBKR Pro account also has
   # an associated paper account (login + 2FA in IBKR portal under "Paper
   # Trading"). These fields are the paper-account username + password,
-  # NOT the live-account credentials. The TWS API listens on port 4002
-  # for paper, 4001 for live.
+  # NOT the live-account credentials. The TWS API listens internally on
+  # port 4002 (paper) / 4001 (live) — but external callers connect via
+  # socat at 4004 (paper) / 4003 (live) per gnzsnz convention; see
+  # deploy/ibkr/README.md Step 4.
   paper_username: <TODO_FROM_PIVOT_PR_B_BRINGUP>
   paper_password: <TODO_FROM_PIVOT_PR_B_BRINGUP>
   # Live credentials. Empty (or placeholder) until Week 8 cutover ceremony.

@@ -228,7 +228,7 @@ carryover entry:
 | `verify_chain` returns CHAIN BREAK | Something unrelated wrote a malformed audit row; not LEAN's fault | Escalate per `deploy/audit/README.md` incident-review procedure |
 | LEAN container restart-loops with `dotnet` segfault | Insufficient RAM (LEAN's .NET runtime needs ~500MB) | Check `free -h` on the VPS; if RAM is exhausted by other containers, consider upgrading from CCX13 → CCX23 (~$10/mo step-up) |
 | LEAN logs `Failed to load the algorithm. Cannot find class 'V1TrendFollowingAlgorithm' in file 'v1_strategy.py'` | The file rename from `v1_qc_algorithm.py` didn't take effect in the mounted volume | `docker compose down lean_local`; verify `ls /opt/trading/lean/v1_strategy.py` on VPS; if `v1_qc_algorithm.py` is still present, the git pull didn't apply (`git pull --ff-only` from VPS); re-up |
-| LEAN logs `Connection to ib_gateway:4002 refused` | `ib_gateway` container not yet running (Pivot-PR-B not deployed) | Expected during Pivot-PR-A scope. LEAN runs in backtest mode (`LEAN_LIVE_MODE=false` default) so this should not happen unless someone flipped the env var early. Verify `docker compose --env-file deploy/.env config | grep LEAN_LIVE_MODE`. |
+| LEAN logs `Connection to ib_gateway:4004 refused` | `ib_gateway` container not running OR socat process inside it died | Check `docker compose --env-file deploy/.env ps ib_gateway` — should be `Up (healthy)`. If unhealthy, restart: `docker compose --env-file deploy/.env restart ib_gateway` + wait ~120s for IBC login. Verify `LEAN_LIVE_MODE` env value by reading `deploy/.env` directly (do NOT use `docker compose config` — that resolves all `${VAR}` substitutions and prints secrets to stdout). |
 
 ---
 

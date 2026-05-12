@@ -135,7 +135,7 @@ Expected sequence (from `gnzsnz/ib-gateway`'s entrypoint + IBC):
 [gateway] Starting IBC v3.x.x
 [gateway] Starting TWS Gateway
 [gateway] Login to TWS Gateway succeeded
-[gateway] Server listening on port 4002
+[gateway] Server listening on port 4002 (then socat forwards 4004 → 4002)
 ```
 
 If you see `Login to TWS Gateway failed` or 2FA prompts, the operator
@@ -153,16 +153,21 @@ Status should be `Up (healthy)` within 2-3 min of container start.
 
 ---
 
-## Step 4 — Verify port 4002 is reachable from inside the network
+## Step 4 — Verify port 4004 is reachable from inside the network
+
+The gnzsnz image publishes the externally-facing TWS API port via socat
+on **4004 (paper)** / **4003 (live)** — NOT the internal gateway port
+4002/4001 (those are 127.0.0.1-only inside the container). Discovered
+Pivot-PR-B Step 5 smoke 2026-05-12.
 
 From inside the `internal` Docker network (using a one-off `curl` /
 `nc` container):
 
 ```bash
-docker compose --env-file deploy/.env exec api nc -zv ib_gateway 4002
+docker compose --env-file deploy/.env exec api nc -zv ib_gateway 4004
 ```
 
-Expected: `Connection to ib_gateway 4002 port [tcp/*] succeeded!`
+Expected: `Connection to ib_gateway 4004 port [tcp/*] succeeded!`
 
 If this fails, the gateway didn't actually start its listener; check
 `docker compose logs ib_gateway` for IBC errors.
@@ -183,7 +188,7 @@ from services.execution.ibkr_adapter import IbAsyncIbkrClient
 from services.execution.types import IbkrPlaceOrderRequest, IbkrContractRef
 
 async def main():
-    client = IbAsyncIbkrClient(host="ib_gateway", port=4002, client_id=1)
+    client = IbAsyncIbkrClient(host="ib_gateway", port=4004, client_id=1)
     state = await client.connect()
     print(f"connected: {state.is_connected} server_version={state.server_version}")
     contract = await client.resolve_contract("/MES")
@@ -241,7 +246,7 @@ import asyncio
 from services.execution.ibkr_adapter import IbAsyncIbkrClient
 
 async def main():
-    client = IbAsyncIbkrClient(host='ib_gateway', port=4002, client_id=1)
+    client = IbAsyncIbkrClient(host='ib_gateway', port=4004, client_id=1)
     await client.connect()
     positions = await client.get_positions()
     print(f'positions: {len(positions)}')
@@ -295,7 +300,7 @@ IBKR's paper-account credentials rotate manually via the IBKR portal
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `Login to TWS Gateway failed` in logs | Bad credentials OR 2FA timeout | Re-check sops fields; complete 2FA via IBKR mobile app within 30s of container start |
-| Port 4002 not listening | Container never finished IBC login | Wait 2-3 min; if still failing, check IBC logs for 2FA prompts |
+| Port 4004 not listening | Container never finished IBC login OR socat process died | Wait 2-3 min for login; check `docker exec trading-ib_gateway-1 ps auxf` for socat process; restart container if socat is gone |
 | `IbkrPlacementError: ib_gateway connect failed` | TWS API session never came up | Step 4's `nc` should show whether the port is reachable; if not, IBC didn't fully start |
 | `REJECTED category=outside_trading_hours` | CME market closed | Wait for next session (futures: Sun 17:00 ET → Fri 16:00 ET; daily 16:00-17:00 break) |
 | `REJECTED category=invalid_contract` | Futures-sim unavailable on paper account | Escalate per Step 0; pivot fallback to Option 2 if persistent |
