@@ -32,10 +32,10 @@ ibkr:
   # Paper account ID (distinct from `account_number` above which is the
   # live account). Find this in the IB Gateway boot log line
   #     "<DUQ_account> Trader Workstation Configuration (Simulated Trading)"
-  # or in the IBKR portal → Paper Trading → Account Profile. LEAN's
-  # InteractiveBrokersBrokerage rejects the connect handshake when this
-  # is empty in paper-ibkr / live-ibkr environments (Pivot-PR-F lean.json
-  # template references it via ${LEAN_IBKR_ACCOUNT}).
+  # or in the IBKR portal → Paper Trading → Account Profile.
+  # Read by the api's IBKR FlexQuery flow (services/api/entrypoint.py).
+  # Post-ceremony 2026-05-12: LEAN no longer reads this — its broker is
+  # the built-in PaperBrokerage simulator and needs no IBKR credentials.
   paper_account: <TODO_FROM_PIVOT_PR_F_BRINGUP>
   # Live credentials. Empty (or placeholder) until Week 8 cutover ceremony.
   # The operator deliberately defers populating these until 30-paper-session

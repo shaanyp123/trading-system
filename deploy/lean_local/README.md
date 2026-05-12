@@ -149,20 +149,24 @@ framework config with handler bindings, limits, paths), deep-merges our
 `/Lean/Algorithm/lean.json` template on top (with env-var substitution
 applied), patches `algorithm-location` + `data-folder` to absolute paths,
 selects the active environment from `LEAN_LIVE_MODE` (`backtesting`
-default; `paper-ibkr` when `true`), strips `$comment-*` keys, and writes
-the merged result back to the upstream config location so LEAN's launcher
-discovers it. Pre-PR-F the entrypoint wrote our template to `/Lean/lean.json`
-where LEAN never looked, so LEAN fell through to the upstream
-`BasicTemplateFrameworkAlgorithm` default and crash-looped on startup.
+default; `paper-internal` when `true`), strips `$comment-*` keys, and
+writes the merged result back to the upstream config location so LEAN's
+launcher discovers it. Pre-PR-F the entrypoint wrote our template to
+`/Lean/lean.json` where LEAN never looked, so LEAN fell through to the
+upstream `BasicTemplateFrameworkAlgorithm` default and crash-looped on
+startup.
 
-**Pre-flight for paper mode:** before flipping `LEAN_LIVE_MODE=true` in
-`deploy/.env`, the operator must populate `ibkr.paper_account` in
-`secrets/paper.enc.yaml` (the paper-trading account ID, distinct from
-the live `ibkr.account_number`). Find it in the ib_gateway boot log
-line "<DUQ_account> Trader Workstation Configuration (Simulated Trading)"
-or the IBKR portal → Paper Trading → Account Profile. LEAN's
-`InteractiveBrokersBrokerage` rejects the connect handshake when this
-field is empty.
+**Pre-flight for live-mode (POST-CEREMONY 2026-05-12):** no IBKR
+credentials are needed on the LEAN side. LEAN binds to the built-in
+`PaperBrokerage` simulator (`lean.json` `paper-internal` env). The api
+owns the real IBKR broker contract via `services/execution/ibkr_adapter.py`;
+LEAN only generates signals + POSTs them. The pre-ceremony plan bound
+LEAN to `InteractiveBrokersBrokerage` directly and required the operator
+to populate `ibkr.paper_account` + `paper_username` + `paper_password`
+in `secrets/paper.enc.yaml`; that requirement is **retired** — those
+sops fields are still read by the api's IBKR FlexQuery flow + the
+`ib_gateway` container's login, but LEAN no longer reads them. The
+only LEAN-required sops field is `lean.api_bearer_token` (Step 1).
 
 Then the heartbeat POST should land on the backend. On the api side:
 
@@ -203,6 +207,14 @@ If the cycle didn't fire after 24h, check LEAN's logs for warmup status
 before `is_warming_up` flips to False. In backtest mode warmup is
 instant; in live mode it waits real-time, so the first cycle may take
 ~10 calendar days from a fresh container.
+
+Note (POST-CEREMONY 2026-05-12): the `lean_cycle_heartbeat` log line
+fires regardless of whether the strategy generated any signals — even
+when `/Lean/Data/` is empty and `self.history(...)` returns nothing for
+every market, the heartbeat still POSTs. So a successful Step 5 means
+"daily cadence + auth + HTTP round-trip all working", not "signals are
+flowing". `event_type=signal_emitted` log lines are the next milestone
+after seed data lands in the `lean_data` volume.
 
 ---
 
@@ -250,7 +262,8 @@ carryover entry:
 | `verify_chain` returns CHAIN BREAK | Something unrelated wrote a malformed audit row; not LEAN's fault | Escalate per `deploy/audit/README.md` incident-review procedure |
 | LEAN container restart-loops with `dotnet` segfault | Insufficient RAM (LEAN's .NET runtime needs ~500MB) | Check `free -h` on the VPS; if RAM is exhausted by other containers, consider upgrading from CCX13 → CCX23 (~$10/mo step-up) |
 | LEAN logs `Failed to load the algorithm. Cannot find class 'V1TrendFollowingAlgorithm' in file 'v1_strategy.py'` | The file rename from `v1_qc_algorithm.py` didn't take effect in the mounted volume | `docker compose down lean_local`; verify `ls /opt/trading/lean/v1_strategy.py` on VPS; if `v1_qc_algorithm.py` is still present, the git pull didn't apply (`git pull --ff-only` from VPS); re-up |
-| LEAN logs `Connection to ib_gateway:4004 refused` | `ib_gateway` container not running OR socat process inside it died | Check `docker compose --env-file deploy/.env ps ib_gateway` — should be `Up (healthy)`. If unhealthy, restart: `docker compose --env-file deploy/.env restart ib_gateway` + wait ~120s for IBC login. Verify `LEAN_LIVE_MODE` env value by reading `deploy/.env` directly (do NOT use `docker compose config` — that resolves all `${VAR}` substitutions and prints secrets to stdout). |
+| LEAN logs `Sequence contains no matching element` shortly after Launcher startup | The configured brokerage assembly isn't in the `quantconnect/lean:latest` image (typically because the merged config picked `InteractiveBrokersBrokerage`, which requires the IBKR add-on DLL that QC ships separately) | Confirm `lean/lean.json` has `live-mode-brokerage = "PaperBrokerage"` under the `paper-internal` env, NOT `InteractiveBrokersBrokerage`. Pull the latest `main` on the VPS if the lean.json config is stale. See `Docs/decisions-log.md` 2026-05-12 'Post-ceremony session' entry for the full backstory. |
+| Need to verify the merged config inside the container | The entrypoint writes the deep-merged config to two locations; both must show `live-mode-brokerage: "PaperBrokerage"` | `docker compose exec lean_local cat /Lean/config.json \| python3 -c 'import json,sys; c=json.load(sys.stdin); print(c.get("environment"), c.get("environments",{}).get(c["environment"],{}).get("live-mode-brokerage"))'`. Expected: `paper-internal PaperBrokerage`. |
 
 ---
 
@@ -288,5 +301,7 @@ with the quarterly secrets rotation alongside the Discord bot bearer.
   endpoint.
 - `infrastructure/lean_local/entrypoint.sh`: container entrypoint that
   resolves sops → env vars → LEAN config.
-- `deploy/ibkr/README.md` (Pivot-PR-B): IBKR Gateway operator runbook for
-  the `paper-ibkr` + `live-ibkr` LEAN environments.
+- `deploy/ibkr/README.md` (Pivot-PR-B): IBKR Gateway operator runbook —
+  used by the api's `services/execution/ibkr_adapter.py` client, NOT by
+  LEAN. Post-ceremony 2026-05-12, LEAN's broker is the built-in
+  `PaperBrokerage` simulator (no IBKR contract on the LEAN side).
