@@ -4,8 +4,22 @@ The LEAN algorithm wrapper for `v1_trend_following`. **Post-pivot 2026-05-12
 architecture (Pivot-PR-A; DP-025 → Option 4):** this algorithm runs inside
 a Dockerized `lean_local` container on the operator's VPS. It POSTs signal
 events to the backend at `POST /api/internal/lean/signals` (shared-bearer
-auth) and routes orders to IBKR via `ib-async` through the `ib_gateway`
-container (Pivot-PR-B). **No QuantConnect Cloud involvement in production.**
+auth). **The api is the broker authority** — `services/execution/ibkr_adapter.py`
+dispatches approved signals to IBKR via `ib-async` through the `ib_gateway`
+container. **No QuantConnect Cloud involvement in production.**
+
+**Post-ceremony 2026-05-12:** LEAN-side broker swapped from
+`InteractiveBrokersBrokerage` → `PaperBrokerage`. The bare
+`quantconnect/lean:latest` image does NOT ship
+`QuantConnect.Brokerages.InteractiveBrokers.dll`, so live-mode boot with
+the IBKR broker crash-looped on LEAN's Composer broker-factory lookup
+(`Sequence contains no matching element`). PaperBrokerage is LEAN's
+built-in zero-dependency simulator; it satisfies LEAN's internal
+`IBrokerage` contract well enough for the strategy's subscription +
+scheduling machinery to function. The strategy never calls
+broker-mutating APIs — it only emits signals via HTTP POST — so the
+LEAN-side broker is purely vestigial. See `Docs/decisions-log.md`
+2026-05-12 entry "Post-ceremony session — LEAN container's IBKR DLL gap".
 
 The pre-pivot architecture (algorithm hosted on QC Cloud; backend polled
 QC ObjectStore for events; defensive trims via `/instructions/<n>.json`)
@@ -14,8 +28,9 @@ rationale.
 
 | File | Purpose |
 |---|---|
-| `v1_strategy.py` | `QCAlgorithm` subclass — renamed from `v1_qc_algorithm.py` per Pivot-PR-A Q3 resolution. Daily resolution, 17:30 ET signal cycle, IBKR brokerage model, parameter map via `self.get_parameter`. Pivot-PR-A scaffold: emits heartbeat POSTs via `urllib.request`. Strategy wiring (assemble bars, call generate_signals, POST each signal) lands in Pivot-PR-D. Uses LEAN's snake_case Python API. |
-| `lean.json` | LEAN project config. Reads `algorithm-language` + `algorithm-type-name` + `parameters` + `environments`. Post-pivot environments: `backtesting`, `paper-ibkr` (Pivot-PR-B), `live-ibkr` (Week 8). |
+| `v1_strategy.py` | `QCAlgorithm` subclass — renamed from `v1_qc_algorithm.py` per Pivot-PR-A Q3 resolution. Daily resolution, 17:30 ET signal cycle, IBKR brokerage MODEL (fee/slippage simulation only — `BrokerageName.INTERACTIVE_BROKERS_BROKERAGE` enum ships in the base image; the missing DLL is the LIVE broker, not the model), parameter map via `self.get_parameter`. Emits heartbeat + `signal_emitted` POSTs via `urllib.request`. Uses LEAN's snake_case Python API. |
+| `lean.json` | LEAN project config. Reads `algorithm-language` + `algorithm-type-name` + `parameters` + `environments`. Post-pivot environments: `backtesting` (CI golden tests + parameter sweeps) and `paper-internal` (live-mode against PaperBrokerage; selected when `LEAN_LIVE_MODE=true`). |
+| `lean_data` (Docker named volume) | Seed daily bars for the Phase 1 universe (`/MES /MNQ /MYM /M2K /MGC /MCL /MBT` futures + `TLT IEF SHY TIP` ETFs) mounted into the container at `/Lean/Data/`. Populated lazily by the operator — the boot smoke does NOT require this volume to be non-empty (the strategy survives empty `active_universe` by returning no signals; heartbeats still POST, the daily cadence still fires). To seed: download QC's public daily bars + `docker cp` into the volume via a transient container; see `deploy/lean_local/README.md`. NOT bind-mounted from this repo (compose uses a named volume — anything in `lean/Data/` in git would be ignored). |
 
 ---
 
@@ -31,27 +46,32 @@ smoke).
 
 ### Brokerage configuration
 
-LEAN's `lean.json` defines three environments:
+LEAN's `lean.json` defines two environments:
 
 * **`backtesting`** — runs historical backtests against QC's bundled bars
   (downloaded + cached in the `lean_data` Docker volume on first run).
   Used in CI golden tests + ad-hoc parameter sweeps. No broker
   dependency.
-* **`paper-ibkr`** — paper trading against IBKR's paper account via the
-  `ib_gateway` sidecar container (Pivot-PR-B). Connects to
-  `ib_gateway:4004` (the externally-published socat port; the internal
-  gateway listens on 127.0.0.1:4002 inside the container — see
-  `deploy/ibkr/README.md` Step 4). Use this for the 30-CME-session paper
-  clock before live cutover (Week 8).
-* **`live-ibkr`** — live trading against IBKR's live account via
-  `ib_gateway`. Connects to `ib_gateway:4003` (the externally-published
-  socat port; internal gateway on 127.0.0.1:4001). Production env after
-  the Week 8 cutover ceremony.
+* **`paper-internal`** — live-mode operation under LEAN's built-in
+  `PaperBrokerage` simulator. No real exchange connection — LEAN's
+  strategy never places orders. The api owns the real IBKR broker
+  contract via `services/execution/ibkr_adapter.py` (paper or live IBKR
+  port depending on the api's own configuration; LEAN's behavior is
+  identical either way). Used for the 30-CME-session paper clock + for
+  live operation. Handler bindings mirror upstream LEAN's `live-paper`
+  env with one substitution: `data-queue-handler` uses `FakeDataQueue`
+  (real built-in that aggregates fake ticks via `IDataQueueHandler` +
+  `IDataQueueUniverseProvider`) instead of upstream's `LiveDataQueue`
+  (which is a stub that throws `NotImplementedException` on Subscribe).
+  The strategy's `on_data` is a no-op so the fake ticks are dropped;
+  daily-resolution history comes from `SubscriptionDataReaderHistoryProvider`
+  reading `/Lean/Data/` on disk.
 
 Environment selection is done at container-start via the `LEAN_LIVE_MODE`
-env var (set in `deploy/.env`). The `lean_local` container's entrypoint
-resolves sops secrets → IBKR credentials → renders `lean.json` → launches
-LEAN's Launcher.
+env var (set in `deploy/.env` on the VPS): `false` → `backtesting`;
+`true` → `paper-internal`. The `lean_local` container's entrypoint
+resolves sops secrets → `LEAN_LOCAL_BEARER_TOKEN` env var → deep-merges
+`lean.json` on top of the upstream LEAN config → launches LEAN's Launcher.
 
 ### Authentication to the backend
 
@@ -87,7 +107,8 @@ picks up new code after a `git pull`.
 | Backtest log: `Failed to load the algorithm. Algorithm class not found.` | `algorithm-location` in `lean.json` doesn't match the actual filename in `/Lean/Algorithm/` | Confirm `lean.json::algorithm-location` = `"v1_strategy.py"` (was `v1_qc_algorithm.py` pre-pivot) |
 | Build errors like `"Resolution" has no attribute "Daily"` | The strategy uses PascalCase API; QC migrated to snake_case ~2024 | Method names are snake_case (`set_start_date`, `add_future`, `get_parameter`); enum values are SCREAMING_SNAKE (`Resolution.DAILY`); class names stay PascalCase. Check `v1_strategy.py` for any leftover PascalCase. |
 | Build error: `NameError: name 'AlgorithmImports' is not defined` | The first line `from AlgorithmImports import *` was deleted | Restore the import line at the top of `v1_strategy.py` |
-| Live (paper-ibkr) login fails | IBKR paper credentials missing or wrong port | See `deploy/ibkr/README.md` (Pivot-PR-B) — `ib_gateway` must boot healthy + accept the TWS API session BEFORE `lean_local` is started |
+| LEAN boot crash with `Sequence contains no matching element` | LEAN was bound to a brokerage assembly that isn't in the `quantconnect/lean:latest` image (e.g., `InteractiveBrokersBrokerage`) | Confirm `lean.json` has `live-mode-brokerage = "PaperBrokerage"` under the `paper-internal` env. The bare LEAN image ships PaperBrokerage but NOT the IBKR brokerage — see `Docs/decisions-log.md` 2026-05-12 'Post-ceremony session' entry. |
+| LEAN container boots but no historical data + no signals generated | `/Lean/Data/` empty — `SubscriptionDataReaderHistoryProvider` returns nothing | Expected during initial boot smoke. Populate `lean/Data/` with QC's public daily-bars datasets (CME micros + bond ETFs, ~90 days) when ready. The boot smoke succeeds without data — the daily cadence still fires + heartbeats still POST. |
 | Algorithm boots but `initialize` never seems to run | Method name typo — LEAN dispatches to `initialize` (snake_case) | Rename `def Initialize(self):` → `def initialize(self):`. Same for `OnData` → `on_data`. |
 | `signal_cycle_tick` log never appears | Algorithm is still in warmup (200 daily bars ≈ 200 calendar days) | Wait until LEAN's data feed has played through the warmup window. Backtest mode plays warmup instantly; live mode waits real-time |
 

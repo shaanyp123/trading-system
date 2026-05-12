@@ -37,13 +37,21 @@ via the ``lean_local`` entrypoint). The backend's ``LeanAuthMiddleware`` runs
 outermost in the request stack and constant-time-compares against
 ``services.api.config.APISettings.lean_local_bearer_token``.
 
-**Brokerage configuration:** LEAN Local routes orders to IBKR via ``ib-async``
-when ``live-mode = true`` and ``live-mode-brokerage = InteractiveBrokersBrokerage``
-in ``lean.json``. The ``ib_gateway`` Docker container hosts the TWS API session
-(see ``deploy/ibkr/README.md``, Pivot-PR-B). For paper trading, the wrapper
-flows the same code paths but ``ib_gateway`` is configured with paper credentials
-and port 4004 (externally-published socat port; internal gateway on
-127.0.0.1:4002 — see ``deploy/ibkr/README.md`` Step 4).
+**Brokerage configuration (POST-CEREMONY 2026-05-12):** LEAN binds to its
+built-in ``PaperBrokerage`` simulator (``live-mode-brokerage = PaperBrokerage``
+in ``lean.json``'s ``paper-internal`` env). The strategy never calls
+broker-mutating APIs (``self.market_order`` / ``self.limit_order`` / etc.) —
+it only emits signals via HTTP POST to the api. **The api owns the real
+IBKR broker contract via ``services/execution/ibkr_adapter.py``;** LEAN's
+brokerage object is read-only from the strategy's perspective (used only
+to satisfy ``self.portfolio[symbol]`` queries, which under PaperBrokerage
+return flat positions — correct post-pivot because LEAN doesn't own
+positions, the api does). The pre-ceremony plan bound LEAN to
+``InteractiveBrokersBrokerage`` directly, but the bare ``quantconnect/lean:latest``
+image doesn't ship ``QuantConnect.Brokerages.InteractiveBrokers.dll`` so
+live-mode boot crash-looped on LEAN's Composer broker-factory lookup
+(``Sequence contains no matching element``). See ``Docs/decisions-log.md``
+2026-05-12 entry "Post-ceremony session — LEAN container's IBKR DLL gap".
 
 API convention: snake_case (QC migrated the Python API from PascalCase to
 snake_case ~2024; the local LEAN runtime accepts both but snake_case is the
@@ -191,12 +199,21 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         self.set_time_zone("America/New_York")
         self.set_benchmark("SPY")
 
-        # Brokerage MODEL — controls backtest fees/slippage simulation. Match
-        # IBKR Margin since post-pivot Phase 1 runs LIVE against IBKR via
-        # `ib-async` through `ib_gateway` container. The LIVE broker is
-        # configured in lean.json's `environments.<env>.live-mode-brokerage`
-        # which is set to `InteractiveBrokersBrokerage` for both paper and
-        # live (only the credentials + port differ).
+        # Brokerage MODEL — controls fee/slippage simulation for any
+        # orders LEAN's simulator fills. Under PaperBrokerage (post-ceremony
+        # 2026-05-12), LEAN never actually places orders — the strategy only
+        # POSTs signals to the api, and the api dispatches via ib-async.
+        # The MODEL is still useful for the api side: real IBKR fills land
+        # with IBKR's fee schedule, and pinning the LEAN-side model to the
+        # IBKR profile keeps backtest cost simulations comparable to the
+        # api-side live fills. `BrokerageName.INTERACTIVE_BROKERS_BROKERAGE`
+        # is a pure-MODEL enum (it loads `InteractiveBrokersBrokerageModel`
+        # from `QuantConnect.Brokerages`, which ships in the base image);
+        # it does NOT depend on `QuantConnect.Brokerages.InteractiveBrokers.dll`
+        # (which is missing from `quantconnect/lean:latest` and was the
+        # cause of the post-ceremony 2026-05-12 boot crash). If a future
+        # LEAN release drops the IBKR model from its core assemblies the
+        # same way the brokerage was dropped, swap to `BrokerageName.DEFAULT`.
         self.set_brokerage_model(
             BrokerageName.INTERACTIVE_BROKERS_BROKERAGE,  # noqa: F405
             AccountType.MARGIN,  # noqa: F405

@@ -81,31 +81,20 @@ esac
 : "${LEAN_LOCAL_API_BASE_URL:=http://api:8000}"
 export LEAN_LOCAL_API_BASE_URL
 
-# Resolve IBKR credentials from sops for live-mode brokerage. Pivot-PR-B
-# wires these to LEAN's brokerage config (lean.json). For backtest mode
-# they're optional.
-if [ -z "${LEAN_IBKR_USERNAME:-}" ]; then
-    LEAN_IBKR_USERNAME="$(read_secret 'ibkr.paper_username')"
-    export LEAN_IBKR_USERNAME
-fi
-if [ -z "${LEAN_IBKR_PASSWORD:-}" ]; then
-    LEAN_IBKR_PASSWORD="$(read_secret 'ibkr.paper_password')"
-    export LEAN_IBKR_PASSWORD
-fi
-# Account ID lives in sops too. Canonical key is `ibkr.account_number`
-# (single field; the operator's IBKR Pro account is a single number
-# across paper and live envs). Per-env fallback `ibkr.paper_account`
-# preserved for forward-compat with future multi-account setups.
-# Pivot-PR-A originally let it default to empty string for backtest;
-# in paper/live mode IBKR rejects the connect handshake unless it's
-# populated.
-if [ -z "${LEAN_IBKR_ACCOUNT:-}" ]; then
-    LEAN_IBKR_ACCOUNT="$(read_secret 'ibkr.account_number')"
-    if [ -z "${LEAN_IBKR_ACCOUNT}" ]; then
-        LEAN_IBKR_ACCOUNT="$(read_secret 'ibkr.paper_account')"
-    fi
-    export LEAN_IBKR_ACCOUNT
-fi
+# Post-ceremony 2026-05-12: LEAN no longer needs IBKR credentials.
+# The bare `quantconnect/lean:latest` image does NOT ship the IBKR
+# brokerage assembly, so live-mode boot with `InteractiveBrokersBrokerage`
+# crash-looped on `Sequence contains no matching element` from LEAN's
+# Composer broker-factory lookup. The post-ceremony swap binds LEAN to
+# the built-in `PaperBrokerage` (zero IBKR dependency). The api owns
+# the real IBKR contract via `services/execution/ibkr_adapter.py` —
+# LEAN only generates signals + POSTs them. The `LEAN_IBKR_USERNAME` /
+# `LEAN_IBKR_PASSWORD` / `LEAN_IBKR_ACCOUNT` env-var reads that used to
+# live here are gone; the sops fields `ibkr.paper_username` /
+# `.paper_password` / `.account_number` are still read elsewhere
+# (`services/api/entrypoint.py` for the FlexQuery flow + `ib_gateway`
+# for the gateway login) — they stay in the encrypted bundle.
+# See Docs/decisions-log.md 2026-05-12 'Post-ceremony session' entry.
 
 # Deep-merge our template on top of upstream config.json. The upstream
 # config at /Lean/Launcher/bin/Debug/config.json is a full framework
@@ -244,9 +233,13 @@ merged = strip_comment_keys(deep_merge(upstream, template))
 merged["algorithm-location"] = "/Lean/Algorithm/v1_strategy.py"
 merged["data-folder"] = "/Lean/Data/"
 
-# Active environment: backtesting by default; paper-ibkr when LEAN_LIVE_MODE=true.
+# Active environment: backtesting by default; paper-internal when
+# LEAN_LIVE_MODE=true. (Post-ceremony 2026-05-12 rename: `paper-ibkr` →
+# `paper-internal` because the "ibkr" suffix was misleading — LEAN
+# itself no longer talks to IBKR; the api owns that contract via
+# services/execution/ibkr_adapter.py.)
 live_mode = os.environ.get("LEAN_LIVE_MODE", "false").strip().lower() == "true"
-merged["environment"] = "paper-ibkr" if live_mode else "backtesting"
+merged["environment"] = "paper-internal" if live_mode else "backtesting"
 
 serialized = json.dumps(merged, indent=2) + "\n"
 for out_path in (runtime_path, upstream_path):
