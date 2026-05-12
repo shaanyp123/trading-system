@@ -85,20 +85,25 @@ import urllib.request
 from datetime import date as _date
 from decimal import Decimal
 
-# Local strategy imports — `./strategies/` is mounted into the container by
-# docker-compose at `/Lean/Strategies` (read-only), and the lean_local
-# entrypoint adds `/Lean/Strategies` to PYTHONPATH so this resolves to
-# the v1_trend_following package. The strategy module is broker-agnostic
-# pure Python — no QC / LEAN imports — so this import is safe to run
-# inside LEAN's Python runtime.
-from v1_trend_following.parameters import V1Parameters  # type: ignore[import-not-found]
-from v1_trend_following.signals import (  # type: ignore[import-not-found]
+# Local strategy imports — `./strategies/` is mounted into the container
+# by docker-compose at `/Lean/strategies` (lowercase, read-only), and
+# the lean_local entrypoint adds `/Lean` to PYTHONPATH so the
+# `strategies` package namespace resolves. Imports use the
+# `strategies.v1_trend_following.X` convention to match the package's
+# internal absolute imports (strategy.py does `from
+# strategies.v1_trend_following.indicators import (...)` etc.).
+# The strategy module is broker-agnostic pure Python — no QC / LEAN
+# imports — so this import is safe to run inside LEAN's Python runtime.
+from strategies.v1_trend_following.parameters import (  # type: ignore[import-not-found]
+    V1Parameters,
+)
+from strategies.v1_trend_following.signals import (  # type: ignore[import-not-found]
     Bar,
     BarSeries,
     Direction,
     Position,
 )
-from v1_trend_following.strategy import (  # type: ignore[import-not-found]
+from strategies.v1_trend_following.strategy import (  # type: ignore[import-not-found]
     STRATEGY_NAME,
     V1TrendFollowing,
 )

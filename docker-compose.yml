@@ -423,7 +423,14 @@ services:
     volumes:
       # Algorithm code + shared strategy package mount.
       - ./lean:/Lean/Algorithm:ro
-      - ./strategies:/Lean/Strategies:ro
+      # Lowercase mount path — `strategies` is a Python package name; the
+      # internal absolute imports in the package use `from
+      # strategies.v1_trend_following.X import Y`, which requires the
+      # package directory to be reachable as `strategies` (lowercase) from
+      # PYTHONPATH. Pivot-PR-D 2026-05-12 fixup: mount was `Strategies`
+      # (uppercase) which exposed `v1_trend_following` at top level but
+      # not the `strategies.*` namespace, breaking sibling imports.
+      - ./strategies:/Lean/strategies:ro
       # LEAN data directory (QC bundled historical bars cached here).
       - lean_data:/Lean/Data
       # sops-decrypted bundle for bearer-token resolution at boot.
