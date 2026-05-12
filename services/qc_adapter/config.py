@@ -20,7 +20,7 @@ from functools import lru_cache
 from typing import Literal
 from uuid import UUID
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -45,7 +45,17 @@ class QCAdapterSettings(BaseSettings):
         description="Git SHA or build tag; surfaced in structlog records.",
     )
     log_level: Literal["DEBUG", "INFO", "WARN", "ERROR"] = Field(default="INFO")
+    # Docker compose env vars are always strings; pydantic-settings doesn't
+    # auto-coerce ``"0"`` to ``Literal[0, 1, 2, 3]``. ``before`` validator
+    # coerces incoming strings to int before Literal validation runs.
     phase_at_emit: Literal[0, 1, 2, 3] = Field(default=0)
+
+    @field_validator("phase_at_emit", mode="before")
+    @classmethod
+    def _coerce_phase_int(cls, v: object) -> object:
+        if isinstance(v, str):
+            return int(v)
+        return v
 
     # --- postgres ---------------------------------------------------------
     # Built by the entrypoint from sops keys postgres.app_service_password +
