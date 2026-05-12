@@ -3146,3 +3146,104 @@ audit_log row count unchanged (still 2 — the LEAN heartbeat path is operationa
 - Squash-merge fix PRs via `gh pr merge --squash --admin --delete-branch`
 - Force-push-with-lease on `claude/<name>` feature branches
 - Restart docker compose containers via `docker compose --env-file deploy/.env up -d --build <service>`
+
+---
+
+### 2026-05-12 — Phase 1 data-seed ceremony — ETF universe seeded to `trading_lean_data`; futures deferred; first real cycle pending 21:30 UTC
+
+- **Spec reference:** prior 2026-05-12 deploy-carryover entry (above), outstanding item #2 — "Populate the `lean_data` Docker volume with seed daily bars for the Phase 1 universe so the strategy can actually generate signals." Also `lean/README.md` file-index `lean_data` row + Troubleshooting "no historical data + no signals generated" row. Operator's session task spec: "seed the `lean_data` Docker volume on the VPS with daily bars for the Phase 1 universe so the strategy's `self.history(...)` calls return real `BarSeries` → indicators populate → `V1TrendFollowing.generate_signals(...)` produces non-empty results → `signal_emitted` events POST to the api → land in the `signals` table + audit_log."
+
+- **Spec said:** Phase 1 universe is 7 CME micro futures (`/MES /MNQ /MYM /M2K /MGC /MCL /MBT`) + 4 NYSE bond ETFs (`TLT IEF SHY TIP`). Operator's task spec named three viable paths (QC's `lean data download` CLI; third-party CSV → LEAN-format conversion; or DataBento via LEAN CLI integration). Window: at least `MA_SLOW_DAYS=200 + ATR_LOOKBACK_DAYS=20 + 5 pad = 225` calendar days. Expected disk: ~5-15 MB compressed.
+
+- **Three discoveries that shaped the ceremony:**
+
+  1. **`trading_lean_data` was NOT empty** — the prior session's "empty volume" assumption was wrong. The `quantconnect/lean:latest` image bundles 233 MB of tutorial data across `alternative/`, `cfd/`, `crypto/`, `cryptofuture/`, `equity/`, `forex/`, `future/`, `futureoption/`, `index/`, `indexoption/`, `option/`, plus `market-hours/` and `symbol-properties/`. On first compose-up the volume initializes from the image's `/Lean/Data/` so the operator inherits the tutorial bundle automatically. However: **the bundle covers `/ES` + `/GC` full-size demo contracts + popular equities (SPY/AAPL/QQQ/etc.); zero coverage of the Phase 1 universe.** Specifically: `future/cme/daily/` has only `es_*.zip`; `future/comex/daily/` has only `gc_*.zip`; `future/nymex/` has only a `margins/` subdirectory (no daily data); `equity/usa/daily/` has 21 tutorial tickers (`aaa.zip aapl.zip aig.zip bac.zip bno.zip eem.zip fb.zip foxa.zip gooav.zip goocv.zip goog.zip googl.zip ibm.zip iwm.zip nwsa.zip qqq.zip spy.zip uso.zip uw.zip wm.zip wmi.zip`) and **none of `tlt/ief/shy/tip`**. So the data-seed problem reduced to "add 4 ETFs + 7 futures to a populated volume", not "build a volume from scratch."
+
+  2. **QC's `lean data download` for futures is paid-tier.** QC's "US Futures Daily History by AlgoSeek" data package requires a paid organization tier; the public pricing page is gated behind login. The same DP-025-class tier dependency that retired the ObjectStore-poll architecture on Day 28 binds the futures-data-download path too. DataBento integration via LEAN CLI is workable but adds a third-party subscription. Costing the Phase 1 futures coverage at zero is structurally not possible via the canonical LEAN-format paths.
+
+  3. **The strategy gracefully tolerates per-market history gaps.** `lean/v1_strategy.py::_build_bar_series` returns `None` on any history failure (empty series, parse error, exception), the caller appends to `history_failures` and skips the market, the cycle's `active_universe` shrinks but the cycle still completes. So the ETF-only seed unlocks the end-to-end pipeline verification (heartbeat 202 → cycle invocation → strategy.generate_signals → signal_emitted POST → audit row) without requiring futures coverage on day one. Futures stay at `v1_history_unavailable` per cycle, the 4 ETFs generate real signals.
+
+- **Actual decision:** Option 1 — **seed the 4 bond ETFs only via free Yahoo Finance daily data**; defer the 7 futures to a future cost-impact decision. Cost: $0/mo. Hot-fix scope (no `risk-review-approved` label; pure data ceremony, no repo code changes; only `Docs/decisions-log.md` modified in-repo).
+
+- **Rationale:**
+  - **Cost.** The pre-authorization spec required pinging the operator before any paid subscription; ETF-only via Yahoo skips that gate entirely.
+  - **Operator-burn alignment.** The operator has previously declined paid data subscriptions in the burn ledger. Adding $7-50/mo for futures data is a decision that belongs in a dedicated discussion with cost-impact framing, not buried in a seed ceremony.
+  - **Pipeline-verification completeness.** All 4 phases of the post-pivot pipeline (LEAN history fetch → strategy.generate_signals → HTTP POST → api ingestion → audit chain row) are exercised by ETF-only signals. Verifying with 4 markets is sufficient to declare the end-to-end pipeline alive; the futures coverage is a universe-expansion concern, not a pipeline-correctness concern.
+  - **Reversibility.** Adding 4 ETF zips to the volume is fully reversible (`docker run --rm -v trading_lean_data:/Lean/Data alpine rm /Lean/Data/equity/usa/daily/{tlt,ief,shy,tip}.zip` etc.). Audit chain growth from real signals is the one irreversible piece — operator confirmed via explicit AskUserQuestion approval before the volume copy + restart.
+  - **Sub-universe alignment with strategy intent.** The Phase 1 strategy treats the bond-ETF cluster as the defensive arm of the universe. ETF-only first cycles are a coherent subset of the intended architecture (the bond ETFs ARE Phase 1; they're not a tutorial substitute).
+
+- **What was shipped (the ceremony, in operator-readable steps):**
+
+  1. **Sourced daily bars via `yfinance` 1.3.0** in a local Python virtualenv. Window: `start=2024-12-01` → `end=2026-05-12` (yfinance exclusive end, so last bar = 2026-05-11 finalized close — today's session is still open in real-time at the time of the ceremony, 14:48 ET). Per-ticker `yf.Ticker(t).history(...)` calls to avoid the multi-ticker SQLite cache lock that hit `TIP` on the first batched attempt. Each ticker returned **360 trading-day bars** (well above the 225-day warmup requirement). Latest closes:
+     - `TLT` $85.56
+     - `IEF` $94.64
+     - `SHY` $82.22
+     - `TIP` $111.31
+  2. **Cross-checked TLT close against public reference** — Yahoo Finance + web search reported TLT range on 2026-05-12 = $84.95-$85.46 (today, still open) versus our 2026-05-11 finalized close of $85.56 (yesterday) — both internally consistent given the small overnight move.
+  3. **Converted to LEAN equity-daily on-disk format.** Build script at `/tmp/lean_seed/build_seed.py` (operator-side artifact; not committed to repo). Output structure per ticker:
+     - `equity/usa/daily/<lower>.zip` — single `<lower>.csv` containing `YYYYMMDD 00:00,O*10000,H*10000,L*10000,C*10000,V` rows (LEAN's scaled-by-10000 deci-cent equity-daily convention). Verified via decode round-trip: TLT 2026-05-11 = `20260511 00:00,858800,859200,854900,855600,17699500` → 855600/10000 = $85.56 ✓.
+     - `equity/usa/map_files/<lower>.csv` — 2-row `<date>,<lower>,P` (NYSE Arca exchange code for bond ETFs).
+     - `equity/usa/factor_files/<lower>.csv` — 2-row `<date>,1,1,1` (no dividend or split adjustments — strategy uses raw closes).
+     - Per-ticker zip sizes: TLT 5759b, IEF 5306b, SHY 4496b, TIP 5226b. Total compressed staging: 22.5 KB across 12 files (4 zips + 4 map + 4 factor).
+  4. **Staged on VPS** at `/tmp/lean_seed_stage/` via `tar --no-mac-metadata --no-xattrs -czf` (macOS `tar` defaults emit `._<file>` AppleDouble metadata; `COPYFILE_DISABLE=1 + --no-mac-metadata` produces a clean archive). Initial scp attempt without these flags polluted the staging dir with `._<file>` sidecars; cleaned up and re-archived.
+  5. **`docker cp` into `trading_lean_data` volume** via transient `alpine` container with both the volume and the staging dir mounted: `docker run --rm -v trading_lean_data:/Lean/Data -v /tmp/lean_seed_stage:/seed:ro alpine cp -rv /seed/equity/. /Lean/Data/equity/`. Note `trading_lean_data` is the project-prefixed name (the docker-compose project is named `trading`); the literal `lean_data` name from the task spec does NOT exist on the host (I accidentally created an empty `lean_data` volume mid-investigation when a `docker run -v lean_data:...` auto-vivified it; cleaned up via `docker volume rm lean_data`). All 12 files landed in the correct subdirectories alongside the existing tutorial data (no overwrites; the 21 tutorial tickers remain untouched).
+  6. **Restarted `lean_local`** via `docker compose --env-file deploy/.env restart lean_local`. Container restart timestamp 2026-05-12 19:14:04 UTC. Boot trace:
+
+     ```
+     [lean_local_entrypoint] merged config written to /Lean/config.json + /Lean/Launcher/bin/Debug/config.json (environment=paper-internal, algorithm-type-name=V1TrendFollowingAlgorithm)
+     [lean_local_entrypoint] launching: dotnet /Lean/Launcher/bin/Debug/QuantConnect.Lean.Launcher.dll
+     20260512 19:14:04.360 TRACE:: Composer(): Loading Assemblies from /Lean/Launcher/bin/Debug/
+     20260512 19:14:06.793 TRACE:: JobQueue.NextJob(): Selected /Lean/Algorithm/v1_strategy.py
+     20260512 19:14:07.532 TRACE:: AlgorithmPythonWrapper(): Python version 3.11.14 ... : Importing python module v1_strategy
+     20260512 19:14:09.588 TRACE:: AlgorithmPythonWrapper(): v1_strategy successfully imported.
+     20260512 19:14:09.770 TRACE:: BrokerageSetupHandler.CreateBrokerage(): creating brokerage 'PaperBrokerage'
+     20260512 19:14:09.786 TRACE:: HistoryProviderManager.Initialize(): history providers [SubscriptionDataReaderHistoryProvider]
+     20260512 19:14:10.480 TRACE:: Log: 2026-05-12 15:14:09 v1_strategy initialized (post-pivot 2026-05-12, Pivot-PR-D) live_mode=True ... params_keys=[...]
+     20260512 19:14:10.480 TRACE:: Log: 2026-05-12 15:14:09 lean_signal_post_succeeded status=202 event_type=lean_strategy_initialized
+     ```
+
+     `api` side received the heartbeat at 19:14:09 UTC: `lean_event_received event_type=lean_strategy_initialized` → 202 Accepted in 1.67 ms. **NO `Sequence contains no matching element` errors. NO history-provider load errors. NO IBKR-DLL gap symptoms.** The only benign noise lines (suppressed in this entry but visible in `docker logs trading-lean_local-1`) are: (a) the `System.Private.ServiceModel.dll FileLoadException` (an unrelated assembly mismatch in the LEAN image's WCF support; pre-existed; no functional impact), (b) the `JobQueue.NextJob(): Not able to fetch brokerage factory with name: QuantConnect.Lean.Engine.DataFeeds.Queues.FakeDataQueue` line (LEAN's brokerage-factory probe over the registered handlers; `FakeDataQueue` correctly loads via `IDataQueueHandler`, not via `IBrokerageFactory`; same line was present in the prior boot trace).
+
+  7. **Deployed `cycle_watcher.sh` on VPS** at `/tmp/cycle_watcher.sh` (PID 1905692 at time of writing). Polls `docker logs trading-lean_local-1` every 30s for the post-baseline (`2026-05-12T19:15:00Z`) appearance of `v1_signals_generated|lean_signal_post_succeeded.*lean_cycle_heartbeat|lean_signal_post_succeeded.*signal_emitted` log lines. On first match: writes the matching lines + the api-side `lean_event_received` matches to `/tmp/cycle_status.txt` and exits 0. Times out after 4 hours (deadline `2026-05-12T23:16:00Z`) with `[watcher_timeout]` to the status file. Status file at `/tmp/cycle_status.txt` is the operator's self-verification surface.
+
+- **What is NOT yet verified (deferred to ~21:35 UTC re-engagement):**
+  - **21:30 UTC daily cycle fires** — at the time of writing (19:16 UTC) the next scheduled cycle is 8096 seconds (134.9 minutes) away. The strategy's `is_warming_up` flag will flip to False during LEAN's live-mode warmup replay of the 225-day window across the now-seeded ETF history (replays happen at accelerated speed; in practice completes within seconds of boot). When the wall-clock advances to 17:30 ET = 21:30 UTC, the daily scheduled action fires, the strategy iterates the 11 subscribed markets, builds `BarSeries` for the 4 ETFs (futures fail history fetch → `v1_history_unavailable` log → skip), calls `V1TrendFollowing.generate_signals(...)`, emits the heartbeat + N `signal_emitted` POSTs.
+  - **First real signals land in audit_log** — audit chain `verify_chain --env paper` currently `CHAIN OK: 2 rows verified` (unchanged from the prior carryover; both rows are Day 25 + Day 27 state transitions). After the cycle: chain grows from 2 to 2+N (where N = number of ETF signals the strategy emitted — plausible Phase-1 day-one range is 0-4 depending on Donchian breakout conditions). The operator should re-engage me at ~21:35 UTC OR check `cat /tmp/cycle_status.txt` on the VPS themselves OR ping me to verify.
+  - **First real `signals` table row** — `SELECT signal_uuid, market, direction, target_contracts, emitted_at_utc FROM signals ORDER BY emitted_at_utc DESC LIMIT 5` should return N populated rows post-cycle (currently empty).
+
+- **Cost / scope impact:**
+  - **$0/mo recurring**. No paid subscriptions. No third-party data dependency on the burn ledger.
+  - **One-time cost: ~5 minutes of operator-Claude time + ~30 minutes of fetch-convert-stage time** (most of which was investigation, not execution). The build script `/tmp/lean_seed/build_seed.py` is reusable for re-seeding (re-run with extended date range, re-cp into volume, restart).
+  - **Repo footprint:** only `Docs/decisions-log.md` modified. No code changes. No CI churn. The seed script is operator-side ceremony scaffolding; per the task spec it could optionally be canonicalized under `scripts/seed_lean_data.py` or `deploy/lean_local/seed.sh` (both hot-fix paths) if the operator wants a reproducible script in-repo. Filed as a follow-up.
+
+- **What stays:**
+  - All prior wiring through PR [#120](https://github.com/shaanyp123/trading-system/pull/120) + [#121](https://github.com/shaanyp123/trading-system/pull/121) stays in place — no retirement of any merged code surface.
+  - The 4 ETF zips + map_files + factor_files live in the `trading_lean_data` volume, sibling to the LEAN-bundled tutorial data. Volume is portable: a future docker compose down + up preserves the seeded data (the named volume's lifecycle is independent of the container's).
+  - The `ib_gateway` + `api`-side IBKR adapter contract is unchanged. When the operator later approves an ETF signal via the `/signals` page, the api dispatches via `services/execution/ibkr_adapter.py` to the IBKR paper account — that path was wired by Pivot-PR-B + #105 + #116 and is unaffected by the LEAN-side data layer.
+
+- **Outstanding follow-ups carried forward + new (in priority order):**
+
+  1. **NEW: Capture the 21:30 UTC cycle outcome.** Re-engage me at ~21:35 UTC OR inspect `cat /tmp/cycle_status.txt` on the VPS. Verify:
+     - `docker logs trading-lean_local-1 --since 24h | grep "v1_signals_generated"` shows at least one entry with `signals_emitted_count >= 1`
+     - `docker logs trading-api-1 --since 24h | grep "lean_event_received.*signal_emitted"` shows at least one 202 round-trip
+     - `psql -c "SELECT COUNT(*) FROM signals"` returns > 0
+     - `verify_chain --env paper` returns `CHAIN OK: 2+N rows verified` with hash linkage clean
+  2. **NEW: Decide futures data path.** Either subscribe to QC AlgoSeek US Futures Daily History data package, or DataBento via LEAN CLI, or accept 7-of-11 universe coverage indefinitely. Cost-impact decision requires explicit operator sign-off + sops field for the data provider's API key.
+  3. **Recon kill-switch hook** (Phase 1+ follow-up from prior session): when `plan.should_invoke_kill_switch=True`, wire `plan_invoke_kill_switch(trigger=RECON_MISMATCH, ...)` + `apply_state_transition(...)` into the apply path's `state_transition_hook` so actionable recon breaks auto-halt. `risk-review-approved` required.
+  4. **Discord push on reconciliation breaks** (Phase 1+ follow-up): currently a detected break writes the audit row + recon_breaks row but no `#alerts` embed fires. Route through `services/webhook_pusher/dispatcher.py::dispatch_alert`. Hot-fix scope.
+  5. **`prior_breaks` query** in `eod_cycle.run_eod_cycle` — add 24h-window query against `reconciliation_breaks WHERE resolved_at_utc IS NULL` so T+1 grace classification works once history exists.
+  6. **CLAUDE.md file-index refresh** — file index is stale relative to PRs #114-#121 + new `apps/web/src/components/nav/` + `services/reconciliation/eod_cycle.py` + the post-ceremony LEAN env rename. Hot-fix scope.
+  7. **Position view sync LEAN → api** (Phase 1+ follow-up from this session's entry): pull api positions into LEAN on each cycle so `MIN_HOLDING_DAYS` filter re-engages. Tracked but not load-bearing.
+  8. **NEW (low priority): Canonicalize the seed script.** Move `build_seed.py` from operator-side temp to `scripts/seed_lean_data.py` (hot-fix scope) so future re-seeds (e.g., re-fetching after a yfinance data quality fix, or extending the window) are reproducible from the repo. Document the operator runbook at `deploy/lean_local/seed-data.md`.
+
+- **Operator pre-authorizations (carry forward):**
+
+  - SSH to VPS via configured key at `root@178.156.239.84`
+  - `git push` for VPS-originated commits + feature branches
+  - Open-PR creation + `risk-review-approved` self-label
+  - Squash-merge fix PRs via `gh pr merge --squash --admin --delete-branch`
+  - Force-push-with-lease on `claude/<name>` feature branches
+  - Restart docker compose containers via `docker compose --env-file deploy/.env up -d --build <service>`
+  - **Carried from this session:** docker volume manipulation via transient containers (`docker run --rm -v trading_lean_data:... alpine ...`) for seed ceremonies
+
+- **Smoke-tested via:** (a) volume contents check `docker run --rm -v trading_lean_data:/Lean/Data alpine ls /Lean/Data/equity/usa/daily/ | grep -iE "tlt|ief|shy|tip"` → 4 zips present; (b) format round-trip `unzip -p /Lean/Data/equity/usa/daily/tlt.zip tlt.csv | tail -3` → 855600/10000 = $85.56 matches yfinance close; (c) post-restart heartbeat `docker logs trading-api-1 | grep "lean_strategy_initialized"` → 202 in 1.67ms; (d) audit chain `verify_chain --env paper` → `CHAIN OK: 2 rows verified` (unchanged; chain will grow at first signal_emitted post-21:30 UTC); (e) cycle_watcher PID alive `ps -ef | grep cycle_watcher | grep -v grep` → running.
