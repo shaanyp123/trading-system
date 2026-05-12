@@ -143,6 +143,39 @@ class LeanEventRequest(BaseModel):
             "'v1_trend_following@<git-sha>'."
         ),
     )
+    # Heartbeat-extra fields — LEAN's `_post_event("lean_cycle_heartbeat",
+    # extra={...})` includes these per-cycle summary counters. They were
+    # previously rejected because the model is `extra="forbid"` and didn't
+    # declare them; every cycle returned 422 and no heartbeat was ever
+    # ingested. Schema-side declaration is the canonical fix — the route
+    # handler can choose to persist or ignore them, but `extra="forbid"`
+    # remains in force for any other unknown field.
+    signals_emitted_count: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Heartbeat-only: count of signals LEAN emitted on this cycle. "
+            "Sum of ``result.signals`` from V1TrendFollowing.generate_signals."
+        ),
+    )
+    rejections_count: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Heartbeat-only: count of signal candidates LEAN rejected on this "
+            "cycle. Sum of ``result.rejections`` from V1TrendFollowing.generate_signals."
+        ),
+    )
+    error: str | None = Field(
+        default=None,
+        max_length=512,
+        description=(
+            "Heartbeat-only: error tag set when LEAN's per-cycle pipeline "
+            "raised before signals could be emitted (e.g., 'v1_params_build_failed', "
+            "'generate_signals_failed'). The full stack trace lands in the LEAN "
+            "container log; this is a short tag for cross-reference."
+        ),
+    )
 
 
 class LeanEventAccepted(BaseModel):
