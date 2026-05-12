@@ -208,6 +208,97 @@ async def _start_order_placement_worker(settings: APISettings) -> tuple[object, 
     return worker, task
 
 
+async def _start_reconciliation_scheduler(
+    settings: APISettings,
+) -> tuple[object, object] | None:
+    """Construct + start the ReconciliationScheduler; return (sched, task) or None.
+
+    Best-effort: requires both ``flex_query_id`` and ``flex_query_token``
+    populated in sops (mapped via ``services/api/entrypoint.py``). When
+    either is missing — or the operator has flipped
+    ``reconciliation_scheduler_enabled=False`` — the scheduler does not
+    start + a structured warning is logged so the operator knows to
+    populate sops + restart the api.
+
+    The cycle callback is built by :func:`services.reconciliation.eod_cycle.make_cycle_callback`
+    and fires once per America/New_York calendar day at 18:30 ET (per
+    backend-spec §2.6). Errors inside the callback are logged + swallowed
+    by the scheduler so a transient FlexQuery outage doesn't kill the
+    scheduler — tomorrow's cycle still fires.
+    """
+    if not settings.reconciliation_scheduler_enabled:
+        log.warning("reconciliation_scheduler_disabled_via_setting")
+        return None
+
+    if settings.flex_query_id is None or settings.flex_query_token is None:
+        log.warning(
+            "reconciliation_scheduler_flex_credentials_missing",
+            note=(
+                "Set ibkr.flex_query_id + ibkr.flex_query_token in sops to "
+                "enable the EOD reconciliation cycle. See "
+                "deploy/reconciliation/README.md."
+            ),
+        )
+        return None
+
+    from services.reconciliation.eod_cycle import EodCycleConfig, make_cycle_callback
+    from services.reconciliation.scheduler import ReconciliationScheduler
+
+    async with session_scope() as repo_session:
+        repo = PostgresPhase1QueryRepo(repo_session)
+        account_id = await repo.fetch_active_account_id()
+    if account_id is None:
+        log.warning(
+            "reconciliation_scheduler_no_active_account",
+            note="run /setup before the scheduler can resolve an account_id",
+        )
+        return None
+
+    config = EodCycleConfig(
+        account_id=account_id,
+        env=_audit_env_from_settings(settings),
+        flex_query_id=settings.flex_query_id,
+        flex_query_token=settings.flex_query_token.get_secret_value(),
+    )
+    callback = make_cycle_callback(
+        config=config,
+        session_factory=api_db.get_session_factory(),
+    )
+    scheduler = ReconciliationScheduler(callback=callback)
+    task = asyncio.create_task(scheduler.run_forever(), name="reconciliation_scheduler.run_forever")
+    log.info(
+        "reconciliation_scheduler_spawned",
+        account_id=str(account_id),
+        env=_audit_env_from_settings(settings),
+        flex_query_id=settings.flex_query_id,
+    )
+    return scheduler, task
+
+
+async def _stop_reconciliation_scheduler(state: tuple[object, object] | None) -> None:
+    """Request stop + await the scheduler task. Best-effort."""
+    if state is None:
+        return
+    scheduler, task = state
+    try:
+        scheduler.request_stop()  # type: ignore[attr-defined]
+    except Exception:
+        log.exception("reconciliation_scheduler_request_stop_failed")
+    try:
+        await asyncio.wait_for(task, timeout=15.0)  # type: ignore[arg-type]
+    except TimeoutError:
+        log.warning("reconciliation_scheduler_shutdown_timeout")
+        task.cancel()  # type: ignore[attr-defined]
+        try:
+            await task  # type: ignore[misc]
+        except asyncio.CancelledError:
+            log.info("reconciliation_scheduler_shutdown_cancelled")
+        except Exception:
+            log.exception("reconciliation_scheduler_shutdown_unclean")
+    except Exception:
+        log.exception("reconciliation_scheduler_task_join_failed")
+
+
 async def _stop_order_placement_worker(state: tuple[object, object] | None) -> None:
     """Request stop + await task + disconnect the IBKR client. Best-effort."""
     if state is None:
@@ -255,6 +346,7 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     sse_multiplexer.reset_state()
     sse_multiplexer.start_heartbeat()
     worker_state: tuple[object, object] | None = None
+    recon_state: tuple[object, object] | None = None
     try:
         try:
             await _bootstrap_owner_token()
@@ -271,10 +363,19 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             # the underlying issue (ib_async install, accounts row,
             # network) is resolved.
             log.exception("order_placement_worker_startup_failed")
+        try:
+            recon_state = await _start_reconciliation_scheduler(settings)
+        except Exception:
+            # Scheduler startup is best-effort; failure shouldn't take
+            # down the api. Most failure modes are config-time (missing
+            # sops fields, no active account) which we already log at
+            # WARNING from inside _start_reconciliation_scheduler.
+            log.exception("reconciliation_scheduler_startup_failed")
         log.info("api_ready")
         yield
     finally:
         log.info("api_stopping")
+        await _stop_reconciliation_scheduler(recon_state)
         await _stop_order_placement_worker(worker_state)
         await sse_multiplexer.stop_heartbeat()
         await close_pool()

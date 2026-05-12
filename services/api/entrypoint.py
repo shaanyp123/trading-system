@@ -25,9 +25,13 @@ import yaml
 DEFAULT_SECRETS_PATH = Path("/run/secrets/decrypted.yaml")
 
 
-def _looks_like_placeholder(value: str | None) -> bool:
-    if not value:
+def _looks_like_placeholder(value: Any) -> bool:
+    if value is None or value == "":
         return True
+    if not isinstance(value, str):
+        # Non-string sops values (e.g., yaml-int flex_query_id) cannot
+        # be `<TODO_...>` placeholders by construction; treat as real.
+        return False
     return value.startswith("<TODO") or value == "null"
 
 
@@ -149,6 +153,30 @@ def main(argv: list[str] | None = None) -> int:
                 acc = ibkr.get("live_account")
         if acc and not _looks_like_placeholder(acc):
             os.environ["API_IBKR_ACCOUNT"] = str(acc)
+
+    # Worker-PR-3b follow-up (post-pivot 2026-05-12): IBKR FlexQuery
+    # credentials for the api-resident ReconciliationScheduler. Sourced
+    # from sops `ibkr.flex_query_id` + `ibkr.flex_query_token`. When
+    # unset / placeholder, the scheduler does NOT start at api boot —
+    # the api still serves requests + the warning is visible in api
+    # logs at startup. Operator populates the sops fields once the
+    # IBKR-portal FlexQuery template is created.
+    if "API_FLEX_QUERY_ID" not in os.environ or "API_FLEX_QUERY_TOKEN" not in os.environ:
+        ibkr = secrets.get("ibkr") or {}
+        flex_id: Any = ibkr.get("flex_query_id")
+        flex_token: Any = ibkr.get("flex_query_token")
+        if (
+            "API_FLEX_QUERY_ID" not in os.environ
+            and flex_id
+            and not _looks_like_placeholder(flex_id)
+        ):
+            os.environ["API_FLEX_QUERY_ID"] = str(flex_id)
+        if (
+            "API_FLEX_QUERY_TOKEN" not in os.environ
+            and flex_token
+            and not _looks_like_placeholder(flex_token)
+        ):
+            os.environ["API_FLEX_QUERY_TOKEN"] = str(flex_token)
 
     if "API_VERSION" not in os.environ:
         os.environ.setdefault("API_VERSION", os.environ.get("RELEASE_SHA", "dev"))

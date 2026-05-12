@@ -292,6 +292,51 @@ class APISettings(BaseSettings):
             "of marginal DB pressure."
         ),
     )
+    # -- EOD reconciliation scheduler ---------------------------------------
+    #
+    # Worker-PR-3b follow-up (post-pivot 2026-05-12). Wires the
+    # FlexQuery → recon planner → apply pipeline into the api lifespan
+    # so the 18:30 ET daily cycle fires automatically.
+    #
+    # The scheduler starts at api boot only when BOTH
+    # ``flex_query_id`` AND ``flex_query_token`` are configured AND
+    # ``reconciliation_scheduler_enabled`` is True. Missing either
+    # secret → scheduler is skipped + a structured warning is logged
+    # so the operator knows to populate sops + restart the api.
+    #
+    # Operator workflow: pre-create the FlexQuery template in IBKR's
+    # portal (Reports → Flex Queries → Create), record the numeric ID +
+    # auto-generated token, then `sops secrets/<env>.enc.yaml` and
+    # set ``ibkr.flex_query_id`` + ``ibkr.flex_query_token``. The
+    # api's entrypoint (services/api/entrypoint.py) maps those onto
+    # ``API_FLEX_QUERY_ID`` + ``API_FLEX_QUERY_TOKEN`` env vars at
+    # container start.
+    reconciliation_scheduler_enabled: bool = Field(
+        default=True,
+        description=(
+            "When False, the api lifespan skips ReconciliationScheduler "
+            "startup. Use to pause the EOD recon cycle without affecting "
+            "the rest of the api (e.g., during an IBKR-side outage)."
+        ),
+    )
+    flex_query_id: int | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "IBKR FlexQuery template ID. Sourced from sops "
+            "`ibkr.flex_query_id`. When unset, the reconciliation "
+            "scheduler does not start (the api still serves requests; "
+            "a warning is logged at boot)."
+        ),
+    )
+    flex_query_token: SecretStr | None = Field(
+        default=None,
+        description=(
+            "IBKR FlexQuery auth token (per-template). Sourced from "
+            "sops `ibkr.flex_query_token`. When unset, the "
+            "reconciliation scheduler does not start."
+        ),
+    )
 
 
 @lru_cache(maxsize=1)
