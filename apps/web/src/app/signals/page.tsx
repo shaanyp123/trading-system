@@ -28,9 +28,9 @@ import { QueuedSignals } from '@/components/today/queued-signals';
 
 export default function SignalsPage(): JSX.Element {
   return (
-    <div className="space-y-4">
+    <div className="container mx-auto max-w-7xl space-y-4 p-4 md:p-6">
       <div className="space-y-1">
-        <h1 className="text-2xl font-semibold">Signals</h1>
+        <h1 className="font-mono text-2xl">Signals</h1>
         <p className="text-sm text-text-muted">
           Pending signals from the daily strategy cycle. Approve to dispatch
           to IBKR, reject with a diary entry, or defer to the next cycle. Also

@@ -2,6 +2,7 @@ import './globals.css';
 
 import type { Metadata, Viewport } from 'next';
 
+import { NavBar } from '@/components/nav/nav-bar';
 import { Providers } from '@/components/providers';
 
 export const metadata: Metadata = {
@@ -21,6 +22,7 @@ export default function RootLayout({ children }: Props) {
     <html lang="en" className="dark">
       <body>
         <Providers>
+          <NavBar />
           <main className="min-h-screen">{children}</main>
         </Providers>
       </body>
