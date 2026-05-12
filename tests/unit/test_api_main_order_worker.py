@@ -261,3 +261,88 @@ class TestEntrypointIbkrAccountMapping:
         import os
 
         assert "API_IBKR_ACCOUNT" not in os.environ
+
+    def test_account_number_canonical_takes_precedence(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        """`ibkr.account_number` is the canonical key — read it first."""
+        from services.api import entrypoint
+
+        yaml_text = (
+            "postgres:\n"
+            "  app_service_password: hexpwd\n"
+            "ibkr:\n"
+            "  account_number: DUQ_CANONICAL\n"
+            "  paper_account: DUQ_LEGACY_PAPER\n"
+        )
+        secrets_path = tmp_path / "decrypted.yaml"
+        secrets_path.write_text(yaml_text)
+        monkeypatch.setenv("API_SECRETS_PATH", str(secrets_path))
+        monkeypatch.delenv("API_IBKR_ACCOUNT", raising=False)
+        monkeypatch.delenv("API_DATABASE_URL", raising=False)
+        monkeypatch.setenv("API_ENVIRONMENT", "paper")
+
+        called: dict[str, Any] = {}
+
+        def fake_execvp(cmd: str, argv: list[str]) -> None:
+            called["cmd"] = cmd
+
+        monkeypatch.setattr(entrypoint.os, "execvp", fake_execvp)
+        entrypoint.main(["true"])
+        import os
+
+        assert os.environ["API_IBKR_ACCOUNT"] == "DUQ_CANONICAL"
+
+    def test_account_number_works_for_live_env_too(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        """Canonical key is env-agnostic — same field for paper + live."""
+        from services.api import entrypoint
+
+        yaml_text = (
+            "postgres:\n  app_service_password: hexpwd\nibkr:\n  account_number: U_CANONICAL\n"
+        )
+        secrets_path = tmp_path / "decrypted.yaml"
+        secrets_path.write_text(yaml_text)
+        monkeypatch.setenv("API_SECRETS_PATH", str(secrets_path))
+        monkeypatch.delenv("API_IBKR_ACCOUNT", raising=False)
+        monkeypatch.delenv("API_DATABASE_URL", raising=False)
+        monkeypatch.setenv("API_ENVIRONMENT", "live-small")
+
+        called: dict[str, Any] = {}
+
+        def fake_execvp(cmd: str, argv: list[str]) -> None:
+            called["cmd"] = cmd
+
+        monkeypatch.setattr(entrypoint.os, "execvp", fake_execvp)
+        entrypoint.main(["true"])
+        import os
+
+        assert os.environ["API_IBKR_ACCOUNT"] == "U_CANONICAL"
+
+    def test_falls_back_to_paper_account_when_canonical_missing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        """When `account_number` is absent, fall back to per-env legacy keys."""
+        from services.api import entrypoint
+
+        yaml_text = (
+            "postgres:\n  app_service_password: hexpwd\nibkr:\n  paper_account: DUQ_FALLBACK\n"
+        )
+        secrets_path = tmp_path / "decrypted.yaml"
+        secrets_path.write_text(yaml_text)
+        monkeypatch.setenv("API_SECRETS_PATH", str(secrets_path))
+        monkeypatch.delenv("API_IBKR_ACCOUNT", raising=False)
+        monkeypatch.delenv("API_DATABASE_URL", raising=False)
+        monkeypatch.setenv("API_ENVIRONMENT", "paper")
+
+        called: dict[str, Any] = {}
+
+        def fake_execvp(cmd: str, argv: list[str]) -> None:
+            called["cmd"] = cmd
+
+        monkeypatch.setattr(entrypoint.os, "execvp", fake_execvp)
+        entrypoint.main(["true"])
+        import os
+
+        assert os.environ["API_IBKR_ACCOUNT"] == "DUQ_FALLBACK"
