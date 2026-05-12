@@ -1,5 +1,21 @@
 name: ci
 
+# ============================================================================
+# CI workflow — reworked 2026-05-12 for cost efficiency.
+#
+# Design:
+# - `precheck` computes `[skip ci]` marker + per-area path filters.
+# - Always-on (cheap; ~30s combined): lint, dep-drift-check, gitleaks.
+# - Conditional (gated on relevant paths): typecheck, test, frontend-test,
+#   docker-build-* (one job per service).
+# - `ci-gate` is the ONLY job that branch protection should require.
+#   It depends on all conditional jobs via `needs:` and uses `if: always()`
+#   so jobs that correctly skip-because-not-applicable count as passing.
+#
+# See .github/workflows/README.md for full rationale, the `[skip ci]`
+# marker semantics, and how to add a new conditional job.
+# ============================================================================
+
 on:
   pull_request:
     branches: [main]
@@ -12,11 +28,98 @@ concurrency:
 
 permissions:
   contents: read
+  pull-requests: read  # dorny/paths-filter reads PR file list via the API
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # precheck: compute skip-ci marker + which areas of the repo changed.
+  # Downstream jobs gate on these outputs via their `if:` conditions.
+  # ---------------------------------------------------------------------------
+  precheck:
+    name: precheck (skip-ci + path filters)
+    runs-on: ubuntu-latest
+    outputs:
+      skip_all: ${{ steps.skip_check.outputs.skip_all }}
+      python_backend: ${{ steps.changes.outputs.python_backend }}
+      frontend: ${{ steps.changes.outputs.frontend }}
+      api: ${{ steps.changes.outputs.api }}
+      discord_bot: ${{ steps.changes.outputs.discord_bot }}
+      qc_adapter: ${{ steps.changes.outputs.qc_adapter }}
+      webhook_pusher: ${{ steps.changes.outputs.webhook_pusher }}
+      workflow_self: ${{ steps.changes.outputs.workflow_self }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # paths-filter falls back to git diff on push events
+
+      - name: Detect [skip ci] / [ci skip] markers
+        id: skip_check
+        env:
+          HEAD_COMMIT_MSG: ${{ github.event.head_commit.message }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+
+          # Reserve [skip ci] for genuine emergencies — path filters already
+          # cover the docs-only case automatically.
+          MARKER_RE='\[skip ci\]|\[ci skip\]|\[no ci\]|\[skip actions\]'
+
+          SKIP=false
+          if [ -n "${HEAD_COMMIT_MSG:-}" ] && echo "$HEAD_COMMIT_MSG" | grep -qE "$MARKER_RE"; then
+            echo "::notice title=Skip-CI marker detected::Found in commit message; expensive jobs will skip."
+            SKIP=true
+          elif [ -n "${PR_TITLE:-}" ] && echo "$PR_TITLE" | grep -qE "$MARKER_RE"; then
+            echo "::notice title=Skip-CI marker detected::Found in PR title; expensive jobs will skip."
+            SKIP=true
+          fi
+
+          echo "skip_all=$SKIP" >> "$GITHUB_OUTPUT"
+
+      - name: Compute changed paths
+        id: changes
+        # Pinned to v3 major; supply-chain risk is acceptable per dev-guide §11
+        # action-pinning policy (major-version pin OK; floating-tag is not).
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            workflow_self:
+              - '.github/workflows/ci.yml'
+              - 'scripts/check_dockerfile_deps_against_pyproject.py'
+            python_backend:
+              - 'services/**'
+              - 'strategies/**'
+              - 'infrastructure/**'
+              - 'tests/**'
+              - 'scripts/**'
+              - 'alembic/**'
+              - 'pyproject.toml'
+              - 'Makefile'
+              - 'conftest.py'
+            frontend:
+              - 'apps/web/**'
+              - 'packages/**'
+            api:
+              - 'services/api/**'
+              - 'pyproject.toml'
+            discord_bot:
+              - 'services/discord_bot/**'
+              - 'pyproject.toml'
+            qc_adapter:
+              - 'services/qc_adapter/**'
+              - 'pyproject.toml'
+            webhook_pusher:
+              - 'services/webhook_pusher/**'
+              - 'pyproject.toml'
+
+  # ---------------------------------------------------------------------------
+  # Always-on jobs (cheap; ~30s combined).
+  # ---------------------------------------------------------------------------
+
   lint:
     name: lint (ruff)
     runs-on: ubuntu-latest
+    needs: precheck
+    if: needs.precheck.outputs.skip_all != 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -41,6 +144,8 @@ jobs:
     # ran from inside the api container. This job fails CI on any future
     # drift between the two lists at the SAME PR that introduces it.
     runs-on: ubuntu-latest
+    needs: precheck
+    if: needs.precheck.outputs.skip_all != 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -51,6 +156,10 @@ jobs:
 
   gitleaks:
     name: gitleaks (secret scan)
+    # Universal security gate — intentionally NOT gated on skip_all. Per
+    # dev-guide §11, secret-scanning is uniform across every commit; the
+    # cost (~10s) is negligible. Emergency override requires explicit
+    # branch-protection admin bypass, not a commit-message marker.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -71,14 +180,17 @@ jobs:
         run: gitleaks detect --source . --no-git --redact --config .gitleaks.toml --verbose
 
   # ---------------------------------------------------------------------------
-  # typecheck + test were enabled 2026-05-05 once the first real code (v1
-  # strategy skeleton, PR #4) landed. docker-build stays commented until
-  # any service has a Dockerfile (Phase 0 Week 5+).
+  # Conditional Python jobs.
   # ---------------------------------------------------------------------------
 
   typecheck:
     name: typecheck (mypy --strict)
     runs-on: ubuntu-latest
+    needs: precheck
+    if: >-
+      needs.precheck.outputs.skip_all != 'true' &&
+      (needs.precheck.outputs.python_backend == 'true' ||
+       needs.precheck.outputs.workflow_self == 'true')
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -91,6 +203,11 @@ jobs:
   test:
     name: test (pytest --cov)
     runs-on: ubuntu-latest
+    needs: precheck
+    if: >-
+      needs.precheck.outputs.skip_all != 'true' &&
+      (needs.precheck.outputs.python_backend == 'true' ||
+       needs.precheck.outputs.workflow_self == 'true')
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -103,14 +220,21 @@ jobs:
       # services/audit, services/risk, services/execution once those land.
       - run: pytest --cov --cov-report=xml
 
+  # ---------------------------------------------------------------------------
   # Frontend gate. Day 20 (PR #66) shipped apps/web/ but did NOT add it to
-  # CI. This job closes the gap so a future Python-only diff that breaks
-  # the Next.js build (e.g., touching shared types under packages/api-types
-  # in Phase 1+) is caught at PR time, not at `make ci` time locally.
-  # Mirrors the `make frontend-test` target in the repo-root Makefile.
+  # CI. The Day 20 follow-up (PR #67) closed the gap. This rework gates the
+  # job to fire only when apps/web/** or packages/** changes (or when the
+  # workflow itself is modified — workflow_self).
+  # ---------------------------------------------------------------------------
+
   frontend-test:
     name: frontend-test (pnpm typecheck + lint + build)
     runs-on: ubuntu-latest
+    needs: precheck
+    if: >-
+      needs.precheck.outputs.skip_all != 'true' &&
+      (needs.precheck.outputs.frontend == 'true' ||
+       needs.precheck.outputs.workflow_self == 'true')
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -134,43 +258,183 @@ jobs:
         working-directory: apps/web
         run: pnpm build
 
-  # docker-build matrix: one job per service that ships a Dockerfile. New
-  # services join by appending an entry to `matrix.include` (NOT the legacy
-  # short-form `matrix.service: [...]` — moved to include-style Day 20 so
-  # apps/web/ can specify its own dockerfile path + build context without
-  # forcing repo-root context like the api + webhook_pusher containers).
-  # Day 5 onboards `api`; Day 10 PR #50 onboards `webhook_pusher`; Day 20
-  # PR #66 ships `apps/web/Dockerfile` and the Day-20-follow-up CI hygiene
-  # PR onboards it here.
-  docker-build:
-    name: docker build (${{ matrix.service }})
+  # ---------------------------------------------------------------------------
+  # docker-build: one job per service. Splitting the Day-20 matrix into
+  # separate jobs lets each service's build gate independently on its own
+  # path filter — backend-only PRs skip the web docker build, frontend-only
+  # PRs skip all four service builds, etc. New services join by copying one
+  # of these jobs + adding a matching filter to `precheck.changes` + adding
+  # to `ci-gate.needs` below.
+  #
+  # docker/build-push-action@v5 wires GHA buildx cache (type=gha) so warm
+  # rebuilds reuse layers between PR runs; cuts re-build time when only a
+  # late layer (e.g., app code, not base image deps) changes.
+  # ---------------------------------------------------------------------------
+
+  docker-build-api:
+    name: docker build (api)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - service: api
-            dockerfile: services/api/Dockerfile
-            context: .
-          - service: webhook_pusher
-            dockerfile: services/webhook_pusher/Dockerfile
-            context: .
-          - service: discord_bot
-            dockerfile: services/discord_bot/Dockerfile
-            context: .
-          - service: qc_adapter
-            dockerfile: services/qc_adapter/Dockerfile
-            context: .
-          - service: web
-            dockerfile: apps/web/Dockerfile
-            context: apps/web
+    needs: precheck
+    if: >-
+      needs.precheck.outputs.skip_all != 'true' &&
+      (needs.precheck.outputs.api == 'true' ||
+       needs.precheck.outputs.workflow_self == 'true')
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
       - name: Build image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          file: services/api/Dockerfile
+          context: .
+          tags: local/trading-api:${{ github.sha }}
+          push: false
+          load: true
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+
+  docker-build-discord_bot:
+    name: docker build (discord_bot)
+    runs-on: ubuntu-latest
+    needs: precheck
+    if: >-
+      needs.precheck.outputs.skip_all != 'true' &&
+      (needs.precheck.outputs.discord_bot == 'true' ||
+       needs.precheck.outputs.workflow_self == 'true')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          file: services/discord_bot/Dockerfile
+          context: .
+          tags: local/trading-discord_bot:${{ github.sha }}
+          push: false
+          load: true
+          cache-from: type=gha,scope=discord_bot
+          cache-to: type=gha,mode=max,scope=discord_bot
+
+  docker-build-qc_adapter:
+    name: docker build (qc_adapter)
+    runs-on: ubuntu-latest
+    needs: precheck
+    if: >-
+      needs.precheck.outputs.skip_all != 'true' &&
+      (needs.precheck.outputs.qc_adapter == 'true' ||
+       needs.precheck.outputs.workflow_self == 'true')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          file: services/qc_adapter/Dockerfile
+          context: .
+          tags: local/trading-qc_adapter:${{ github.sha }}
+          push: false
+          load: true
+          cache-from: type=gha,scope=qc_adapter
+          cache-to: type=gha,mode=max,scope=qc_adapter
+
+  docker-build-web:
+    name: docker build (web)
+    runs-on: ubuntu-latest
+    needs: precheck
+    if: >-
+      needs.precheck.outputs.skip_all != 'true' &&
+      (needs.precheck.outputs.frontend == 'true' ||
+       needs.precheck.outputs.workflow_self == 'true')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          file: apps/web/Dockerfile
+          context: apps/web
+          tags: local/trading-web:${{ github.sha }}
+          push: false
+          load: true
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,mode=max,scope=web
+
+  docker-build-webhook_pusher:
+    name: docker build (webhook_pusher)
+    runs-on: ubuntu-latest
+    needs: precheck
+    if: >-
+      needs.precheck.outputs.skip_all != 'true' &&
+      (needs.precheck.outputs.webhook_pusher == 'true' ||
+       needs.precheck.outputs.workflow_self == 'true')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          file: services/webhook_pusher/Dockerfile
+          context: .
+          tags: local/trading-webhook_pusher:${{ github.sha }}
+          push: false
+          load: true
+          cache-from: type=gha,scope=webhook_pusher
+          cache-to: type=gha,mode=max,scope=webhook_pusher
+
+  # ---------------------------------------------------------------------------
+  # ci-gate: the ONE job branch protection should require.
+  #
+  # `if: always()` so this runs even when upstream jobs skip. The verification
+  # step inspects each upstream's `result` and fails iff any are `failure` or
+  # `cancelled`. `skipped` (because a path filter excluded the job) counts as
+  # passing for branch-protection purposes — the whole point of the path-
+  # filter optimization.
+  #
+  # IMPORTANT: when adding a new conditional job to this workflow, also add
+  # it to this `needs:` list. Forgetting that means the job's failure will
+  # NOT block merge — silent supply-chain risk.
+  # ---------------------------------------------------------------------------
+
+  ci-gate:
+    name: ci-gate (required status check)
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - precheck
+      - lint
+      - dep-drift-check
+      - gitleaks
+      - typecheck
+      - test
+      - frontend-test
+      - docker-build-api
+      - docker-build-discord_bot
+      - docker-build-qc_adapter
+      - docker-build-web
+      - docker-build-webhook_pusher
+    steps:
+      - name: Verify no required job failed
+        env:
+          NEEDS_CONTEXT: ${{ toJSON(needs) }}
         run: |
-          docker buildx build \
-            --file ${{ matrix.dockerfile }} \
-            --tag local/trading-${{ matrix.service }}:${{ github.sha }} \
-            --load \
-            ${{ matrix.context }}
+          set -euo pipefail
+          echo "Upstream job results:"
+          echo "$NEEDS_CONTEXT" | jq .
+
+          # `success` and `skipped` both count as passing. `failure` and
+          # `cancelled` block the gate.
+          FAILED=$(echo "$NEEDS_CONTEXT" | jq -r '
+            to_entries
+            | map(select(.value.result == "failure" or .value.result == "cancelled"))
+            | .[].key
+          ')
+
+          if [ -n "$FAILED" ]; then
+            echo ""
+            echo "::error title=CI gate failed::These required jobs did not pass:"
+            echo "$FAILED" | sed 's/^/  - /'
+            exit 1
+          fi
+
+          echo ""
+          echo "✓ All required jobs passed or were skipped-because-not-applicable."
