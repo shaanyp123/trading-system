@@ -86,7 +86,8 @@ RUN python -m venv /opt/venv \
         "httpx>=0.28" \
         "structlog>=24.4" \
         "sqlalchemy[asyncio]>=2.0.36" \
-        "asyncpg>=0.30"
+        "asyncpg>=0.30" \
+        "pyyaml>=6.0"
 
 # Layer 2: copy the source tree. webhook_pusher is self-contained but
 # `services/__init__.py` may eventually re-export from sibling packages,
@@ -101,7 +102,7 @@ COPY services/ services/
 # inside the container (the gap that bit Day 11 / PR #47 with the api
 # image's transitive-import blind spot).
 RUN /opt/venv/bin/python -c \
-    "import services.webhook_pusher.cli, services.webhook_pusher.dispatcher, services.webhook_pusher.payloads, services.webhook_pusher.sender; import httpx; print('webhook_pusher import sanity OK')"
+    "import services.webhook_pusher.cli, services.webhook_pusher.dispatcher, services.webhook_pusher.payloads, services.webhook_pusher.sender, services.webhook_pusher.sse_subscriber, services.webhook_pusher.__main__; import httpx, yaml; print('webhook_pusher import sanity OK')"
 
 # ---- runtime ---------------------------------------------------------------
 FROM python:3.11-slim AS runtime
@@ -132,11 +133,22 @@ WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /build/services /app/services
 
+# Copy the SSE-runner entrypoint script. It maps sops yaml → env vars
+# then exec()s the python -m module. PR #106 follow-up 2026-05-12.
+COPY --chown=trading:trading services/webhook_pusher/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
 USER trading
 
-# Phase 0 entrypoint: stay alive so the operator runbook can `docker
-# compose exec webhook_pusher /opt/venv/bin/python -m services.webhook_pusher.cli ...`.
-# When the Week 4 dispatcher PR lands, replace CMD with the worker
-# entrypoint and add a real healthcheck.
-ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["sh", "-c", "echo 'webhook_pusher container started (Phase 0 placeholder; CLI-only invocation pattern — see deploy/webhook_pusher/README.md). Will be replaced by a real worker process in the Week 4 risk dispatcher PR.'; exec sleep infinity"]
+# tini is PID 1 so SIGTERM from `docker compose stop webhook_pusher` is
+# forwarded cleanly to the python process (which has its own signal
+# handler in __main__.py to flip the SSESubscriber's stop_event).
+ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
+
+# Long-lived SSE subscriber: drains the api's /api/sse/events stream
+# and POSTs Discord embeds to the #signals + #fills channels. The
+# operator's alert smoke runbook
+# (deploy/webhook_pusher/README.md) still works via `docker compose
+# exec webhook_pusher /opt/venv/bin/python -m services.webhook_pusher.cli ...`
+# because the cli module is intact.
+CMD ["/opt/venv/bin/python", "-m", "services.webhook_pusher"]
