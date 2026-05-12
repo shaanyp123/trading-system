@@ -339,7 +339,7 @@ services:
   ib_gateway:
     image: ghcr.io/gnzsnz/ib-gateway:stable
     restart: unless-stopped
-    networks: [internal]
+    networks: [internal, egress]
     environment:
       # paper or live; flipped at deploy time via deploy/.env LEAN_LIVE_MODE
       TWS_USERID: ${IB_GATEWAY_USERNAME:-}
