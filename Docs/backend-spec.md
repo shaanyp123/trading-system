@@ -4,6 +4,19 @@
 > **Companion document:** `prompt-b-frontend-spec.md` (Frontend) — references the canonical SSE event types, Discord command tables, IA naming, anomaly reason codes, and trade state enum defined here.
 > **Implementation rule:** every locked constraint from `prompt-a-backend-spec.md` is treated as an architectural invariant. Where genuine implementation choices remain, 2–3 options are presented with a recommendation. Strategic decisions are never re-opened.
 
+> **🔄 ARCHITECTURE PIVOT 2026-05-12 — read this before consulting any "Phase 1 vs Phase 2" content below.**
+>
+> Original spec (pre-pivot) described Phase 1 as QC-Cloud-mediated (algorithm on QC, backend polls ObjectStore, defensive trims via `/instructions/<n>.json`) and Phase 2 as direct-IBKR (LEAN Local + `ib-async` + IB Gateway). DP-025 surfaced at Day 28 deploy: QC's `/object/get` REST endpoint is gated behind the Institutional subscription tier, which the operator is not on. The entire ObjectStore-polling architecture is infeasible.
+>
+> **Operator decision Day 28 02:00 UTC: Option 4 — pull the original Phase 2 architecture forward into Phase 1.** Post-pivot operational reality:
+> - **Phase 1 = the architecture this spec calls "Phase 2"** (LEAN Local in Docker on the VPS, `ib-async` direct to `ib_gateway` container, IBKR FlexQuery for EOD reconciliation).
+> - **No Phase 2 cutover event exists.** §1.5 is RETIRED; the spec's Phase 1/Phase 2 split collapses.
+> - **`services/qc_adapter/**` stays in the repo** but is dormant under a `qc_adapter_backfill` docker-compose profile gate (per §1.4 line 233 retained backfill role). The Day 28 PR-A surface (12 modules + 50 tests + operator runbook) is preserved for institutional memory; the container is never started in production.
+> - **Sections marked `[RETIRED — pivot 2026-05-12]`** describe pre-pivot Phase 1 — preserved for history; not operationally active.
+> - **Tables with "Phase 1" + "Phase 2" columns:** read the Phase 2 column as operational reality. The Phase 1 column documents the QC-mediated path that never went live.
+>
+> See `Docs/decisions-log.md` 2026-05-12 entry "Phase-1 architecture pivot — QC ObjectStore → LEAN Local + direct IBKR (DP-025 → Option 4)" for full rationale, the 4 underlying decision points (DP-023/024/025/026), and the migration diff list.
+
 ---
 
 ## TABLE OF CONTENTS
@@ -76,7 +89,103 @@ trading/
 
 A pre-merge linter enforces the **Hot-Fix Whitelist** path classification by enumerating the file paths that are agent-mutable vs. PR-required, and by grepping for the constants matching `RISK_RING_*`, `KILL_SWITCH_*`, `MARGIN_*`, `CLUSTER_CAP_*`, `PARAMETER_RANGE_*` in any agent-deployed change.
 
-## 1.2 Phase 1 Architecture (months 2–5; live on QC; backend has NO direct IBKR)
+## 1.2 Phase 1 Architecture (post-pivot 2026-05-12; LEAN Local + direct IBKR)
+
+> **Pivot note:** the diagram + critical-contract paragraph below describe Phase 1 **post-pivot 2026-05-12**. The original Phase 1 plan (QC-Cloud-mediated, ObjectStore polling, instruction protocol) is **retained immediately below this current section as §1.2-RETIRED** for institutional memory. Operational reality from 2026-05-12 onward matches the diagram below.
+
+```mermaid
+graph TB
+  subgraph Hetzner_Falkenstein["Hetzner Falkenstein (~$5/mo)"]
+    WD[External Watchdog<br/>CX23 / Ubuntu LTS<br/>cron 5min ping]
+  end
+
+  subgraph Hetzner_Ashburn["Hetzner Cloud Ashburn — CCX13 (2vCPU/8GB)"]
+    direction TB
+    CADDY[Caddy<br/>Auto Let's Encrypt<br/>Reverse Proxy]
+
+    subgraph Docker_Compose["Docker Compose Stack"]
+      API[FastAPI Service<br/>HTTP + SSE<br/>+ /api/internal/lean/signals]
+      LEAN[LEAN Local<br/>quantconnect/lean:latest<br/>v1 Trend-Following<br/>17:30 ET cycle]
+      SIG[Signal Engine<br/>thin orchestration layer<br/>consumes LEAN POST]
+      RISK[Risk Engine<br/>Sizing + Rings + State Machine]
+      EXEC[Execution Service<br/>ib-async direct<br/>services/execution/ibkr_client.py]
+      RECON[Reconciliation Service<br/>intraday: ib-async reqPositions<br/>EOD: IBKR FlexQuery XML]
+      AUDIT[Audit Service<br/>Hash-chain writer<br/>SERIALIZABLE + advisory lock]
+      CALIB[Slippage Calibration<br/>OLS monthly cron]
+      AGENT[Claude Ops Agent<br/>Tool-use + cache]
+      DBOT[Discord Bot<br/>discord.py gateway]
+      WHP[Webhook Pusher<br/>Discord HTTP + Email]
+      MON[Monitoring/Health]
+
+      IBGW[IB Gateway<br/>gnzsnz/ib-gateway<br/>port 4002 paper / 4001 live<br/>internal network only]
+
+      PG[(PostgreSQL 16<br/>asyncpg + SQLAlchemy 2.x<br/>SERIALIZABLE on audit)]
+      DDB[(DuckDB on Parquet<br/>analytics)]
+      GITEA[(Gitea<br/>GitHub mirror<br/>daily sync)]
+    end
+
+    CADDY -.HTTPS.-> API
+    API <--> PG
+    LEAN -->|POST signal events<br/>shared bearer auth| API
+    API --> SIG
+    SIG --> RISK
+    RISK --> EXEC
+    EXEC <--> IBGW
+    RECON <--> IBGW
+    RECON --> AUDIT
+    EXEC --> AUDIT
+    AGENT --> EXEC
+    AGENT --> AUDIT
+    DBOT <--> API
+    WHP <--> API
+    MON --> WD
+    CALIB --> AUDIT
+  end
+
+  subgraph External["External Services"]
+    OPER[Operator<br/>Web + Discord]
+    IBKR[IBKR Pro<br/>TWS API direct]
+    FF[Forex Factory<br/>Trading Economics]
+    FRED[FRED API<br/>nice-to-have]
+    CLAUDE[Anthropic API<br/>Claude]
+    S3[S3 Object Lock<br/>backups + logs]
+    GH[GitHub<br/>+ GHCR]
+  end
+
+  IBGW <-. TWS API 4002/4001 .-> IBKR
+  WD -. /health 5min .-> CADDY
+  WD -. SMTP alert .-> OPER
+  OPER <-. HTTPS .-> CADDY
+  OPER <-. Discord WS .-> DBOT
+  WHP -. Webhook .-> OPER
+  SIG -. calendar pull .-> FF
+  AGENT --> CLAUDE
+  AUDIT -. WAL + nightly .-> S3
+  GITEA <-. daily mirror .-> GH
+
+  style LEAN fill:#e1f5ff
+  style IBGW fill:#e1f5ff
+  style EXEC fill:#fff4e6
+  style WD fill:#ffe6e6
+  style AUDIT fill:#e6ffe6
+```
+
+**Phase 1 critical contract (post-pivot):** the backend holds IBKR Pro credentials in sops-encrypted `secrets/<env>.enc.yaml` and connects directly to the broker via `ib_gateway` (Dockerized) using the `ib-async` Python library. LEAN runs locally in a separate `lean_local` container, hosts the v1 trend-following algorithm, and emits signal events to the backend via `POST /api/internal/lean/signals` (shared-bearer auth — `LeanAuthMiddleware` mirroring the Day 23 `BotAuthMiddleware` pattern). The execution path is signal-on-LEAN → POST to backend → risk-engine sizing → `ib-async.placeOrder` direct to IBKR.
+
+**Key constraints (post-pivot):**
+- IBKR credentials are sops-encrypted; the backend never logs them; gitleaks pre-commit hook covers source.
+- The `ib_gateway` container is on the `internal` Docker network only; port 4002 (paper) / 4001 (live) are not exposed to Caddy or the public internet.
+- LEAN Local's bearer auth is a sops-encrypted secret distinct from the Discord bot's (so a LEAN container compromise can't impersonate the bot or vice versa).
+- Audit chain integrity is preserved end-to-end. Every signal POSTed by LEAN → `signal_emitted` audit row; every `ib-async` fill confirmation → `order_filled` audit row. Hash chain unbroken.
+
+**Service inventory delta vs. spec §1.4 table:**
+- `qc_adapter` row: status flipped to "dormant under `qc_adapter_backfill` profile gate"; code preserved.
+- `ib_gateway` row: status flipped from "Phase 2 only" to "Phase 1+ always-on".
+- `lean_local` row: status flipped from "Phase 2 on-demand" to "Phase 1+ always-on".
+
+## 1.2-RETIRED Phase 1 Architecture (months 2–5; live on QC; backend has NO direct IBKR) — `[RETIRED — pivot 2026-05-12]`
+
+> **Status:** This section describes the ORIGINAL pre-pivot Phase 1 plan. RETIRED 2026-05-12 per DP-025 → Option 4. **Operational reality is described in §1.2 above.** Preserved for institutional memory + audit-chain continuity (the strategies code still mounts to LEAN; the `services/qc_adapter/**` code still tests under the `qc_adapter_backfill` profile gate).
 
 ```mermaid
 graph TB
@@ -156,9 +265,14 @@ graph TB
   style AUDIT fill:#e6ffe6
 ```
 
-**Phase 1 critical contract:** the backend never holds IBKR credentials. All broker interaction passes through the QC algorithm, which the operator has provisioned with their IBKR Pro live account credentials inside QC's secure vault. The instruction protocol (write to `/instructions/<n>.json`, poll, ack) is the ONLY path for backend-originated order action.
+**Pre-pivot Phase 1 critical contract (RETIRED):** the backend never holds IBKR credentials. All broker interaction passes through the QC algorithm, which the operator has provisioned with their IBKR Pro live account credentials inside QC's secure vault. The instruction protocol (write to `/instructions/<n>.json`, poll, ack) is the ONLY path for backend-originated order action.
 
-## 1.3 Phase 2 Architecture (months 5–9+; LEAN Local; direct IBKR)
+**Why this was retired:** DP-025 (Day 28, 2026-05-12). QC's `/object/get` REST endpoint is gated behind the Institutional subscription tier. The operator's Researcher-$60 tier allows `/object/list` (metadata) but blocks content fetch. The entire polling architecture is infeasible without an upgrade to Institutional (~10× cost), and there is no realistic pricing path to that tier from a solo-operator budget. See `Docs/decisions-log.md` 2026-05-12 entry for the full DP-025 narrative.
+
+## 1.3 Phase 2 Architecture (months 5–9+; LEAN Local; direct IBKR) — `[RETIRED — pivot 2026-05-12]`
+
+> **Status post-pivot:** This section described the originally-planned Phase 2 architecture. After the 2026-05-12 pivot, **this IS the Phase 1 architecture** (see §1.2 above for the current canonical description). There is no longer a "Phase 2" event — no cutover, no broker migration, no LEAN Local activation date. The architecture below is operationally live from Phase 1 onset onward. The text + diagram are preserved here for cross-reference continuity with sequence diagrams in §5 and the pre-pivot ai-and-strategy-overview narrative.
+
 
 ```mermaid
 graph TB
@@ -218,19 +332,19 @@ graph TB
   style AUDIT fill:#e6ffe6
 ```
 
-## 1.4 Service Inventory (Both Phases)
+## 1.4 Service Inventory (post-pivot 2026-05-12)
 
-| # | Service | Container | Hot-Fix? | Phase 1 | Phase 2 | Restart Policy |
+| # | Service | Container | Hot-Fix? | Phase 1 (post-pivot) | Pre-pivot Phase 1 (RETIRED) | Restart Policy |
 |---|---|---|---|---|---|---|
-| 1 | `api` | FastAPI + uvicorn | No (PR) | ✅ | ✅ | `unless-stopped` |
-| 2 | `signal` | Python | No (PR) | ✅ | ✅ | `unless-stopped` |
+| 1 | `api` | FastAPI + uvicorn | No (PR) | ✅ (+ `/api/internal/lean/signals`) | ✅ | `unless-stopped` |
+| 2 | `signal` | Python | No (PR) | ✅ thin orchestration over LEAN POST | ✅ scheduler-driven 17:30 ET | `unless-stopped` |
 | 3 | `risk` | Python | No (PR) | ✅ | ✅ | `unless-stopped` |
-| 4 | `execution` | Python | No (PR) | ✅ writes QC OS | ✅ ib-async | `unless-stopped` |
-| 5 | `reconciliation` | Python | No (PR) | ✅ from QC OS | ✅ direct TWS | `unless-stopped` |
+| 4 | `execution` | Python | No (PR) | ✅ ib-async direct via `ib_gateway` | ✅ writes QC OS instructions | `unless-stopped` |
+| 5 | `reconciliation` | Python | No (PR) | ✅ ib-async intraday + IBKR FlexQuery EOD | ✅ from QC OS `/state/portfolio.json` | `unless-stopped` |
 | 6 | `audit` | Python | No (PR) | ✅ | ✅ | `unless-stopped` |
-| 7 | `calibration` | Python (cron) | No (PR) | ✅ monthly | ✅ quarterly | `on-failure:3` |
+| 7 | `calibration` | Python (cron) | No (PR) | ✅ monthly | ✅ monthly | `on-failure:3` |
 | 8 | `scheduler` | APScheduler | No (PR) | ✅ | ✅ | `unless-stopped` |
-| 9 | `qc_adapter` | Python | No (PR) | ✅ | ⚠️ retained for backfill audit reads only | `unless-stopped` |
+| 9 | `qc_adapter` | Python | Yes (§2.3) | 💤 **dormant** under `qc_adapter_backfill` profile gate; PR-A code preserved | ✅ poll `/events` 60s, `/acks` 5s | `unless-stopped` (when profile enabled) |
 | 10 | `discord_bot` | Python (discord.py) | Partial | ✅ | ✅ | `unless-stopped` |
 | 11 | `webhook_pusher` | Python | Partial | ✅ | ✅ | `unless-stopped` |
 | 12 | `monitoring` | Python | Yes | ✅ | ✅ | `unless-stopped` |
@@ -239,12 +353,33 @@ graph TB
 | 15 | `duckdb` | (embedded; no container) | n/a | ✅ | ✅ | n/a |
 | 16 | `caddy` | caddy:2-alpine | n/a | ✅ | ✅ | `unless-stopped` |
 | 17 | `gitea` | gitea/gitea | n/a | ✅ | ✅ | `unless-stopped` |
-| 18 | `ib_gateway` | gnzsnz/ib-gateway | n/a | ❌ | ✅ | `unless-stopped` |
-| 19 | `lean_local` | quantconnect/lean | n/a | ❌ | ✅ on-demand | `no` |
+| 18 | `ib_gateway` | gnzsnz/ib-gateway | n/a | ✅ **Phase 1+ always-on** (port 4002 paper / 4001 live; internal network only) | ❌ Phase 2 only | `unless-stopped` |
+| 19 | `lean_local` | quantconnect/lean | n/a | ✅ **Phase 1+ always-on** (17:30 ET signal cycle) | ❌ Phase 2 on-demand | `unless-stopped` |
 
-External (separate VPS): `watchdog` on Hetzner **Falkenstein** (locked).
+**Post-pivot deltas vs. pre-pivot column:**
+- Row 4 `execution`: `ib-async` direct path is the canonical Phase 1+ path. The QC OS instruction-write code is RETIRED (lives in `services/qc_adapter/` but never executed in production).
+- Row 5 `reconciliation`: intraday source switches from QC OS `/state/portfolio.json` to `ib-async.reqPositions()` + `reqAccountSummary()`; EOD source switches from QC-pushed FlexQuery to backend-pulled FlexQuery via IBKR's FlexQuery web service (Phase 1+).
+- Row 9 `qc_adapter`: dormant. Code stays in repo for institutional memory + ad-hoc historical replay (Pivot-PR-A moves it under the `qc_adapter_backfill` docker-compose profile). The 50 unit + integration tests still run in CI as a regression net against re-introducing ObjectStore polling.
+- Row 18 `ib_gateway`: always-on from Phase 1 onset.
+- Row 19 `lean_local`: always-on from Phase 1 onset (not the original "Phase 2 on-demand" pattern).
 
-## 1.5 Phase 1 → Phase 2 Cutover (locked checklist)
+External (separate VPS): `watchdog` on Hetzner **Falkenstein** (locked; see §1.6).
+
+## 1.5 Phase 1 → Phase 2 Cutover (locked checklist) — `[RETIRED — pivot 2026-05-12]`
+
+> **Status post-pivot:** There is no longer a cutover event. Phase 1 architecture (§1.2 above) IS the originally-planned Phase 2 architecture. The 8-item pre-cutover checklist below was designed to validate the transition from QC-mediated to direct-IBKR; since direct-IBKR is now the Phase 1 starting point, the checklist's content folded into the Phase 1 Week 8 pre-live-funding checklist (see `implementation-guide.md` §3 Week 8). The text + diagram below are preserved for institutional memory.
+>
+> **Surviving items that DID move forward into Phase 1 Week 8 pre-live checklist:**
+> - CK3 (IB Gateway docker boots + paper login OK) — now Pivot-PR-B's A27 satisfier
+> - CK4 (ib-async paper test: place + cancel) — now Pivot-PR-B's mandatory smoke
+> - CK6 (audit chain integrity) — runs continuously via `verify_chain --env paper` per `deploy/audit/README.md`
+> - CK7 (S3 backup restored) — Week 8 pre-flight check
+> - CK8 (slippage calibration head pinned) — Week 8 pre-flight check
+>
+> **Retired items (made meaningless by the pivot):**
+> - CK1 (LEAN Local backtest reproduces Phase 1 last 30 sessions) — pre-pivot, this validated the QC→LEAN-Local parity gate. Post-pivot, LEAN Local is the live engine from day 1; no parity check needed because there's no QC algorithm to parity-check against.
+> - CK2 (vectorbt golden test weekly) — kept as ongoing parity gate but no longer cutover-gated.
+> - CK5 (no HALT_NEW in last 24h) — still operationally meaningful but applies to any pre-live milestone, not a specific cutover event.
 
 **Trigger:** operator selects cutover date `D` ≥ 5 CME sessions in advance via `/system/deployments/cutover/schedule` (Phase 2 API only — in Phase 1, scheduled via direct DB row by Claude Code under operator approval; web UI ships in Phase 2).
 
@@ -310,23 +445,19 @@ For each service: **Purpose → Inputs → Outputs → Dependencies → Configur
 
 ## 2.1 Data Ingestion
 
-### 2.1.1 Market Data Ingestion (per-phase split)
+### 2.1.1 Market Data Ingestion (post-pivot 2026-05-12)
 
-**Phase 1:** No direct market-data subscription. QC algorithm receives bars from QC's bundled feed, computes signals locally inside the algorithm, and pushes:
-- Bar close + signal triggers → ObjectStore `/state/bars/<market>/<session_date>.json` (60s cadence during session)
-- Signal-emit decisions → ObjectStore `/events/signals/<sequence>.jsonl` (at 17:30 ET cycle)
+**Phase 1+ (post-pivot):** LEAN Local runs in a Dockerized `lean_local` container on the operator's VPS. LEAN consumes historical bars from QuantConnect's bundled data (downloaded at container build / pull time; cached on disk volume) and live ticks via `ib-async`'s `reqMktData` / `reqHistoricalData` (snapshot + tick streams). LEAN computes signals inside the algorithm and POSTs `signal_emitted` events to the backend at `POST /api/internal/lean/signals` (shared-bearer auth). The backend's `signal` service is a thin orchestration layer that consumes those POSTs and dispatches to `risk` for sizing.
 
-The backend NEVER computes signals from raw bars in Phase 1. The signal engine consumes pre-emitted signal events from the QC adapter.
-
-**Phase 2:** Backend subscribes to IBKR market data via `ib-async`'s `reqMktData` / `reqHistoricalData` (snapshot + tick streams). LEAN Local also pulls historical bars from QC bundled data + IBKR live ticks. Phase 2 signal engine runs locally.
-
-| Property | Phase 1 | Phase 2 |
+| Property | Value (Phase 1+ post-pivot) | Pre-pivot Phase 1 (RETIRED) |
 |---|---|---|
-| Inputs | QC ObjectStore polled | IBKR live ticks via `ib-async`; QC bundled historical data via LEAN Local |
+| Inputs | IBKR live ticks via `ib-async` to `ib_gateway`; QC bundled historical bars cached in `lean_local` volume | QC ObjectStore polled |
 | Outputs | Parsed `bars` rows in Postgres + DuckDB Parquet historical store | Same |
-| Dependencies | QC adapter, audit | IB Gateway, audit |
-| Config | `QC_OBJECTSTORE_POLL_INTERVAL_SECONDS=60`, `QC_INSTRUCTION_POLL_INTERVAL_SECONDS=5` | `IBKR_MARKET_DATA_SUBSCRIPTION_LEVEL=...` |
-| Failure modes | QC ObjectStore unavailable > 10 min → HALT_NEW (defensive_envelope) | TWS disconnect > 5 min during CME session → HALT_NEW (routine) |
+| Dependencies | `ib_gateway`, `lean_local`, audit | QC adapter, audit |
+| Config | `IBKR_MARKET_DATA_SUBSCRIPTION_LEVEL` (per IBKR account), `LEAN_LOCAL_SCHEDULE_ET=17:30` | `QC_OBJECTSTORE_POLL_INTERVAL_SECONDS=60`, `QC_INSTRUCTION_POLL_INTERVAL_SECONDS=5` |
+| Failure modes | `ib_gateway` TWS disconnect > 5 min during CME session → HALT_NEW (routine); LEAN Local crash > 10 min → HALT_NEW (defensive_envelope) | QC ObjectStore unavailable > 10 min → HALT_NEW (defensive_envelope) |
+| Auth | LEAN→backend shared bearer via sops `lean.api_bearer_token`; IBKR→backend via `ib_gateway` TWS session (paper / live credentials sops-encrypted) | QC API token sops-encrypted; ObjectStore polled with HMAC HTTP Basic |
+| Smoke (A27 satisfier) | `deploy/lean_local/README.md` + `deploy/ibkr/README.md` (Pivot-PR-A + Pivot-PR-B) | `deploy/qc_adapter/README.md` (RETIRED) |
 
 ### 2.1.2 Calendar Ingestion (CRITICAL)
 
@@ -396,17 +527,18 @@ effective_io_concurrency = 200
 
 **Why DuckDB+Parquet, not TimescaleDB:** at this data volume (10–12 markets × daily bars × ~25 years history ≈ 100k rows total) and with vectorbt research running on the same VPS, DuckDB's columnar Parquet reads are dramatically faster for backtest scans, with zero operational overhead. Postgres remains the system-of-record for transactional state.
 
-## 2.3 Signal Engine
+## 2.3 Signal Engine (post-pivot 2026-05-12)
 
-| Property | Value |
-|---|---|
-| Purpose | Generate momentum/breakout signals on daily bars; emit `signal` events |
-| Inputs | Bars (Phase 1: parsed from QC adapter; Phase 2: local DuckDB), parameter set head, calendar, universe state |
-| Outputs | `signals` rows; `signal_emitted` audit events |
-| Schedule | APScheduler, 17:30 ET wall-clock daily (DST-aware via `zoneinfo.ZoneInfo("America/New_York")`) |
-| Per-market wait policy (locked) | Settlement available → emit immediately; else retry 5 min; 18:00 ET (30 min late) → use bid/ask midpoint with `unsettled` flag; 18:30 ET (60 min late) → drop signal that day (`market_drop_settlement_unavailable`); other markets unaffected |
-| Dependencies | Risk engine (sizing), audit |
-| Failure modes | Signal-engine crash → scheduler retries up to 3× with exponential backoff (10s, 60s, 5min); persistent failure → HALT_NEW (routine) |
+| Property | Value (Phase 1+ post-pivot) | Pre-pivot Phase 1 (RETIRED) |
+|---|---|---|
+| Purpose | Thin orchestration layer over LEAN Local POSTs; emit `signal_emitted` audit events; dispatch to risk engine | Same purpose; ran APScheduler 17:30 ET cycle reading from QC adapter |
+| Inputs | `POST /api/internal/lean/signals` (LEAN Local → backend, shared-bearer auth), parameter set head, calendar, universe state | Bars parsed from QC adapter, parameter set, calendar, universe state |
+| Outputs | `signals` rows; `signal_emitted` audit events | Same |
+| Schedule | LEAN's internal `OnData` loop runs at 17:30 ET (LEAN's `Schedule.On(DateRules.EveryDay, TimeRules.At(17, 30))` per `lean/v1_strategy.py`). Backend signal service is event-driven (no APScheduler trigger). | APScheduler 17:30 ET wall-clock daily |
+| Per-market wait policy (locked) | Settlement available → LEAN emits immediately; else LEAN retries 5 min; 18:00 ET (30 min late) → LEAN uses bid/ask midpoint with `unsettled` flag; 18:30 ET (60 min late) → LEAN drops signal that day (`market_drop_settlement_unavailable`); other markets unaffected | Same policy; enforced backend-side instead of LEAN-side |
+| Dependencies | LEAN Local container, api `/api/internal/lean/signals` endpoint, risk engine (sizing), audit | Risk engine (sizing), audit |
+| Failure modes | LEAN Local crash > 10 min during CME session → HALT_NEW (defensive_envelope); api signal endpoint 5xx → LEAN retries 3× with exponential backoff (10s, 60s, 5min); persistent failure → LEAN logs structlog `lean_signal_post_failed` + alerts backend via `liveness_probes` heartbeat gap | Signal-engine crash → scheduler retries 3× with exponential backoff; persistent failure → HALT_NEW (routine) |
+| Authentication | LEAN→backend uses shared bearer token from sops `lean.api_bearer_token`; `LeanAuthMiddleware` runs outermost (peer of Day 23 `BotAuthMiddleware`) and CSRF-skip when the bearer is valid | n/a (signal engine ran in-process; no auth boundary) |
 
 **Strategy v1 (authored by Claude Code; PR-required):**
 - **Entry signal:** Donchian channel breakout (`LOOKBACK_DAYS_DONCHIAN`-day high broken to upside, low broken to downside); confirmed by trend filter (close > `MA_FAST_DAYS` AND `MA_FAST_DAYS` > `MA_SLOW_DAYS`); confirmed by Hurst exponent ≥ `HURST_THRESHOLD` over the same lookback.
@@ -567,17 +699,19 @@ flowchart TD
   Q80 -- No --> RANK
 ```
 
-## 2.5 Execution Engine
+## 2.5 Execution Engine (post-pivot 2026-05-12)
 
-| Property | Phase 1 | Phase 2 |
+| Property | Value (Phase 1+ post-pivot) | Pre-pivot Phase 1 (RETIRED) |
 |---|---|---|
-| Order placement path | Write to QC ObjectStore `/instructions/<n>.json`; QC algorithm executes via IBKR | Direct via `ib-async` to IB Gateway |
+| Order placement path | Direct via `ib-async` (`IB.placeOrder()`) to `ib_gateway` container; TWS API session paper/live | Write to QC ObjectStore `/instructions/<n>.json`; QC algorithm executes via IBKR |
 | Order types | Limit-marketable for entries; stop-market for stops; limit at target for profit-target exits; calendar spread for rolls (when broker supports) | Same |
-| Idempotency | `client_order_id` 33-char format (locked) | Same |
-| Retry on rejection | Order Rejection Taxonomy (locked) | Same |
+| Idempotency | `client_order_id` 33-char format (locked); passed as `orderRef` field to IBKR | Same; passed via QC instruction protocol |
+| Retry on rejection | Order Rejection Taxonomy (locked); rejections parsed from IBKR's `error()` callbacks (error codes) | Same taxonomy; rejections parsed from QC ack payloads |
 | Macro pause | Applies to PLACEMENT only; signal generation runs regardless at 17:30 ET | Same |
-| Phase-1 round-trip target | p99 ≤ 20s | n/a (direct) |
-| Phase-1 kill-switch SLO | ≤ 30s | Phase 2: ≤ 5s |
+| Round-trip target | p99 ≤ 5s (direct path); typical 200-800ms | p99 ≤ 20s (QC poll-mediated round trip) |
+| Kill-switch SLO | ≤ 5s (direct path: signal HALT → `ib-async.cancelOrder()` for working orders) | ≤ 30s (write `/instructions/halt.json` → 5s poll → ack) |
+| Code path | `services/execution/ibkr_client.py` (Pivot-PR-B; `risk-review-approved` required per [A02]) | `services/qc_adapter/` instruction-write module (RETIRED) |
+| Smoke (A27 satisfier) | `deploy/ibkr/README.md` Pivot-PR-B precondition: `placeOrder` + `cancelOrder` round-trip on IBKR paper `/MES` BEFORE PR can merge | `deploy/qc_adapter/README.md` (RETIRED) |
 
 **`client_order_id` derivation (33 chars):**
 ```
@@ -592,19 +726,23 @@ Example: 9d2f7a1c-b54e83a1-4d9e7c1b2f0a-1
 
 `signal-emit-to-placement-attempt` is therefore NOT a bounded SLO — overnight queue is normal. The SLO is `signal-to-order placement latency: p50 ≤ 60s, p99 ≤ 5 min` measured `t_1 − t_0` where `t_0` = order placement attempted (scheduler dispatches order to broker after queueing window has cleared).
 
-## 2.6 Reconciliation
+## 2.6 Reconciliation (post-pivot 2026-05-12)
 
 Reconciliation evaluates whether the system's understanding of state matches the broker's authoritative state.
 
-| Property | Phase 1 | Phase 2 |
+| Property | Value (Phase 1+ post-pivot) | Pre-pivot Phase 1 (RETIRED) |
 |---|---|---|
-| Intraday cadence | Every 60s during CME session, from QC ObjectStore `/state/portfolio.json` push | Same cadence; data from TWS API real-time portfolio snapshot |
-| EOD cadence | Daily 18:30 ET — IBKR FlexQuery (XML) pulled by QC algorithm Phase 1 / direct backend Phase 2 |
-| Break detection | Per Reconciliation Tolerances Table |
-| Break action | Kill-switch (severity=routine) on any tolerance exceeded |
-| Special: dividend ex-date | Tolerances widen 2× for +24h, anchored to 17:00 ET MTM on ex-date |
+| Intraday cadence | Every 60s during CME session, from `ib-async.reqPositions()` + `reqAccountSummary()` real-time TWS snapshot | Every 60s, from QC ObjectStore `/state/portfolio.json` push |
+| EOD cadence | Daily 18:30 ET — IBKR FlexQuery XML pulled directly by backend via FlexQuery web service (token in sops `ibkr.flex_query_token`) | Daily 18:30 ET — IBKR FlexQuery (XML) pulled by QC algorithm, written to ObjectStore, polled by backend 5min after |
+| Break detection | Per Reconciliation Tolerances Table | Same |
+| Break action | Kill-switch (severity=routine) on any tolerance exceeded | Same |
+| Special: dividend ex-date | Tolerances widen 2× for +24h, anchored to 17:00 ET MTM on ex-date | Same |
+| Code path | `services/reconciliation/recon.py` (Day 9 PR #42 pure-policy planner) + `services/reconciliation/flex_query_fetcher.py` (Pivot-PR-C) + `services/reconciliation/ibkr_intraday.py` (Pivot-PR-C) | `services/reconciliation/recon.py` (same policy core) + `services/qc_adapter/` data source (RETIRED) |
+| Smoke (A27 satisfier) | `deploy/reconciliation/README.md` Pivot-PR-C precondition: pull a FlexQuery XML for the operator's paper account, parse, compare against backend `positions` table, log `reconciliation_check_passed` audit event | `deploy/qc_adapter/README.md` (RETIRED) |
 
 **Failure mode:** reconciliation stale > 60s during CME session → HALT_NEW (routine). The 60s threshold matches the freshness SLO; it is monitored independently as a meta-check (a separate "freshness-of-freshness" check that the recon service itself is alive).
+
+**FlexQuery setup precondition:** the operator must pre-create a FlexQuery template in IBKR Account Management (Reports → Flex Queries) with: positions, cash balances, trades, dividends, ex-date metadata. Save the FlexQuery ID + token to `secrets/<env>.enc.yaml` under `ibkr.flex_query_id` + `ibkr.flex_query_token`. The Pivot-PR-C runbook walks the operator through this; the FlexQuery template is reusable across paper + live and rotates with quarterly secret rotation.
 
 ## 2.7 Monitoring and Health
 
@@ -725,11 +863,33 @@ GRANT TRUNCATE ON audit_log TO dba_breakglass;
 4. Compare `chain_end_hash` against current DB chain tail (or supplied "anchor" timestamp)
 5. Exit 0 on success, non-zero with detailed error on failure
 
-## 2.11 QC Adapter
+## 2.11 QC Adapter — `[RETIRED for primary role; DORMANT backfill role retained — pivot 2026-05-12]`
 
-The QC Adapter is the bidirectional bridge between the Phase 1 backend and the QC algorithm. It is retained in Phase 2 for backfill audit reads only.
+> **Status post-pivot:** The QC Adapter was originally the primary bridge between the Phase 1 backend and the QC algorithm. After the 2026-05-12 pivot (DP-025 → Option 4), it is **dormant in production** under a `qc_adapter_backfill` docker-compose profile gate.
+>
+> **What's preserved:**
+> - The `services/qc_adapter/**` code surface (12 modules, ~100KB) — Day 28 PR-A
+> - The 50 unit + integration tests — run in CI as a regression net against accidental re-introduction
+> - The `deploy/qc_adapter/README.md` operator runbook — historical reference for the QC API contract
+> - The `qc_adapter_cursor` table (§3.19) — preserved in schema; rows untouched
+>
+> **What's no longer operational:**
+> - The container is never started by default `docker compose up -d` (profile-gated under `qc_adapter_backfill`)
+> - No polling against `/events`, `/acks`, `/state/portfolio.json`, or any other ObjectStore path occurs in production
+> - The instruction-write code path (`/instructions/<n>.json`) is wholly retired
+>
+> **When the dormant code might be invoked:** ad-hoc historical replay — if the operator ever wants to re-process pre-pivot ObjectStore content (none currently exists because production never wrote to QC; the pivot landed before any live Phase 1 traffic). In the absence of any historical content to replay, the dormant role is effectively "code documentation of the path not taken."
+>
+> **Re-enabling for backfill (procedure):**
+> 1. `docker compose --profile qc_adapter_backfill up -d qc_adapter`
+> 2. Operator confirms what's being replayed + writes a `decision_diary` entry with rationale
+> 3. Wait for `orchestrator_cycle_completed` log line
+> 4. `docker compose --profile qc_adapter_backfill stop qc_adapter` when replay complete
+> 5. `verify_chain --env paper` to confirm audit chain still walks
 
-| Direction | Path | Cadence | Phase |
+The tables and protocol descriptions below are preserved verbatim for institutional memory + audit-chain provenance traceability. **None of the directions, cadences, or schemas below describe Phase 1+ operational reality.**
+
+| Direction | Path | Cadence | Phase (pre-pivot) |
 |---|---|---|---|
 | QC → backend (audit events) | `/events/<sequence>.jsonl` | Backend polls every 60s | 1 (primary), 2 (backfill) |
 | QC → backend (state) | `/state/portfolio.json`, `/state/positions/*.json`, `/state/dt_count.json` | QC pushes every 60s during session; backend polls 60s | 1 only |
@@ -737,13 +897,13 @@ The QC Adapter is the bidirectional bridge between the Phase 1 backend and the Q
 | Backend → QC (instructions) | `/instructions/<sequence>.json` | Backend writes; QC polls every 5s | 1 only |
 | QC → backend (acks) | `/instruction_acks/<sequence>.json` | QC writes; backend polls every 5s | 1 only |
 
-**Cursor management:** `qc_adapter_cursor` table tracks last-consumed `sequence_no` per directory. On startup, adapter resumes from cursor.
+**Cursor management (preserved-for-replay):** `qc_adapter_cursor` table tracks last-consumed `sequence_no` per directory. On startup, adapter resumes from cursor.
 
-**Loss handling:** if a sequence gap is detected (e.g., `sequence_no` jumps from 1042 to 1045), adapter alerts and pulls from QC's logs API; backfilled records APPENDED at current chain tail with `repaired_for_sequence_no` provenance. Original gap remains visible.
+**Loss handling (preserved-for-replay):** if a sequence gap is detected (e.g., `sequence_no` jumps from 1042 to 1045), adapter alerts and pulls from QC's logs API; backfilled records APPENDED at current chain tail with `repaired_for_sequence_no` provenance. Original gap remains visible.
 
-**Schema parity (clarified):** golden test compares JCS-canonicalized `record_payload` byte-for-byte; metadata fields (`{ingest_clock_ts, ingest_uuid, sequence_no}`) validated for shape only.
+**Schema parity (preserved-for-replay):** golden test compares JCS-canonicalized `record_payload` byte-for-byte; metadata fields (`{ingest_clock_ts, ingest_uuid, sequence_no}`) validated for shape only. Tests in `tests/golden/test_qc_parity.py` (PR #45) + `tests/integration/test_qc_adapter_ingestion.py` (PR #84) still run in CI.
 
-**Failure mode:** unavailable > 10 min during CME session → HALT_NEW (defensive_envelope).
+**Failure mode (pre-pivot, RETIRED):** unavailable > 10 min during CME session → HALT_NEW (defensive_envelope). **Post-pivot:** the failure mode is N/A because the container is profile-gated off in production; if the operator manually enables `qc_adapter_backfill` and the upstream service is unavailable, the backfill replay fails locally without triggering a kill-switch (the container is not on the canonical health-check graph).
 
 ## 2.12 Watchdog (External)
 
@@ -1340,7 +1500,9 @@ CREATE TABLE vacation_mode (
 CREATE INDEX vacation_active ON vacation_mode(account_id, ended_at_utc) WHERE ended_at_utc IS NULL;
 ```
 
-## 3.19 `qc_adapter_cursor`
+## 3.19 `qc_adapter_cursor` — `[DORMANT — pivot 2026-05-12]`
+
+> **Status post-pivot:** Schema is preserved; rows are preserved. The 3 INSERT rows from alembic 0004 + the defensive re-seed in `2026-05-09_qc_adapter_cursor_seed.py` (PR #40) stay in place. The table is no longer written to or read from in normal Phase 1+ operation; rows would only be touched if the operator manually enables the `qc_adapter_backfill` docker-compose profile. See §2.11 for the dormant role description.
 
 ```sql
 CREATE TABLE qc_adapter_cursor (
@@ -2249,7 +2411,9 @@ Internal endpoints are bound to `127.0.0.1` only and use Bearer-token auth (sops
 
 ## 4.5 Webhook Payloads
 
-### 4.5.1 QC ObjectStore Polling Payloads
+### 4.5.1 QC ObjectStore Polling Payloads — `[RETIRED — pivot 2026-05-12]`
+
+> **Status post-pivot:** This payload schema is no longer in active use. The replacement is the new `POST /api/internal/lean/signals` endpoint (Pivot-PR-A) — LEAN Local pushes signal events directly to the backend rather than the backend polling an ObjectStore. The replacement schema is documented in §4.1.1 (when Pivot-PR-A lands) and follows the same Pydantic v2 `signals` shape used by the rest of the backend. The pre-pivot polling payload below is preserved for QC-Adapter-backfill-replay rendering only.
 
 Backend polls QC ObjectStore via authenticated REST. JSONL events schema:
 
@@ -2269,7 +2433,9 @@ Backend polls QC ObjectStore via authenticated REST. JSONL events schema:
 }
 ```
 
-### 4.5.2 Backend → QC Algorithm Instructions
+### 4.5.2 Backend → QC Algorithm Instructions — `[RETIRED — pivot 2026-05-12]`
+
+> **Status post-pivot:** The instruction protocol is wholly retired. Backend now places orders directly via `ib-async.placeOrder()` (Pivot-PR-B) and cancels via `ib-async.cancelOrder()` — no JSON-instruction-via-ObjectStore handshake. The Defensive Trim Protocol's semantics (which positions to trim, in what order, with what limits) are unchanged; only the transport changes. Defensive trims become direct `placeOrder` calls with `orderType='LMT'` + the trim limit price + 1× spread retry logic. Preserved below for historical contract reference.
 
 Per Phase 1 Defensive Trim Protocol (locked in `prompt-a-backend-spec.md`):
 
@@ -3114,7 +3280,9 @@ Three principles govern cascading-failure containment:
 
 ## 6.6 Specific Error Path Examples
 
-### 6.6.1 QC ObjectStore poll fails 5–9 min
+### 6.6.1 QC ObjectStore poll fails 5–9 min — `[RETIRED — pivot 2026-05-12]`
+
+> **Status post-pivot:** This error path no longer applies because there is no QC ObjectStore poll in production. The post-pivot equivalent is the IBKR Gateway disconnect path (§6.6.1-alt below). Original error path preserved verbatim for institutional memory.
 
 ```python
 async def poll_qc_objectstore():
@@ -3131,6 +3299,41 @@ async def poll_qc_objectstore():
             await risk_engine.halt_new(severity="defensive_envelope",
                                        reason="qc_objectstore_unavailable_gt_10min")
 ```
+
+### 6.6.1-alt IB Gateway disconnect during CME session (post-pivot 2026-05-12)
+
+```python
+async def ibkr_gateway_health_check_loop():
+    """
+    Pivot-PR-B; runs every 30s during CME session.
+    `ib.isConnected()` is ib-async's authoritative connection status check.
+    """
+    while True:
+        await asyncio.sleep(30)
+        if not ib.isConnected():
+            consecutive_disconnect_seconds += 30
+            if consecutive_disconnect_seconds < 300:  # < 5 min
+                log.warning("ib_gateway_disconnected",
+                            consecutive_seconds=consecutive_disconnect_seconds)
+                try:
+                    await ib.connectAsync(host="ib_gateway", port=4002, clientId=...)
+                    consecutive_disconnect_seconds = 0
+                except Exception as e:
+                    log.error("ib_gateway_reconnect_failed", error=str(e))
+            elif consecutive_disconnect_seconds < 600:  # 5-10 min
+                await alerts.fire(severity="P1", category="ib_gateway_degraded", ...)
+            else:  # >= 10 min
+                await risk_engine.halt_new(
+                    severity="routine",  # NOT defensive_envelope — broker is the
+                                         # canonical reachability path, so loss of
+                                         # the broker is operationally normal halt
+                                         # not defensive-comm-breakdown
+                    reason="ib_gateway_unreachable_gt_10min",
+                )
+                consecutive_disconnect_seconds = 0  # reset after halt
+```
+
+**Severity note:** Pre-pivot, QC ObjectStore loss was `defensive_envelope` because the ObjectStore was the comms layer (loss meant we couldn't reach the broker via ANY path). Post-pivot, `ib_gateway` loss is `routine` because (a) IBKR is the canonical broker, (b) reaching IBKR is a normal-business dependency not a defensive-comm-failure, (c) the 24h-replay-buffer SSE + watchdog email + Discord paths are all unaffected so operator can still receive halt notifications. The state machine §2.4.3 enum entry stays `routine`.
 
 ### 6.6.2 Audit write fails (5× retries exhausted)
 

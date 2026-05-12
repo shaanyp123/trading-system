@@ -21,6 +21,17 @@
 
 **Binding constraint:** §2 per-page table and §6 Discord-surface table are the contractual phase definitions. Where prose elsewhere differs from those tables, the tables win.
 
+> **🔄 ARCHITECTURE PIVOT 2026-05-12 — frontend impact summary.**
+>
+> The backend pivoted from QC-Cloud-mediated to direct-IBKR + LEAN Local on 2026-05-12 (see `Docs/backend-spec.md` top banner + `Docs/decisions-log.md` 2026-05-12 entry). **Frontend impact is minimal:**
+> - All page layouts, components, state shape, SSE event types, and routes are unchanged.
+> - The environment tags `paper` / `live-small` / `live-scale` still mean the same things — they now map to IBKR-paper / IBKR-live-small / IBKR-live-scale account contexts (instead of pre-pivot QC-paper / QC+IBKR-live).
+> - The Discord deep-link contracts are unchanged.
+> - The System page reconciliation status tile (§2.6.5) sources from `ib-async` intraday + IBKR FlexQuery EOD instead of QC ObjectStore — the surface and copy update, the data shape on the wire is unchanged.
+> - The Today page "queued signals" component still receives `signal_emitted` events via SSE; the upstream producer changes from QC-adapter to the LEAN-Local→`/api/internal/lean/signals`→`signal` service chain, but the SSE event shape sent to the browser is unchanged.
+>
+> **No frontend code is impacted by the pivot.** Day 20-27 work (Today / Trades / System / auth pages) ships forward.
+
 ---
 
 ## TABLE OF CONTENTS
@@ -246,7 +257,7 @@ Every post-auth page renders this bar via `apps/web/src/components/TopBar.tsx`. 
 | **Trades** | Filterable summary table (date/market filters); CSV export; **minimal per-trade detail PAGE at `/trades/:id`** (full-page; basic info: signal, market, direction, status, fill_price, fill_qty, P&L; ensures Discord deep-links don't 404) | Per-trade detail DRAWER (in-table preview), full decision-diary view in Trades, full attribution view, all filters, advanced search |
 | **Performance** | Equity curve (no benchmark overlay yet), monthly returns table; CSV export | Drawdown underwater, attribution, actual-vs-rule compare, tax estimate widget, PDF export, benchmark overlay, print stylesheet, environment-segregation toggle |
 | **Research** | (not in Phase 1; route 404) | Backtest viewer, parameter sandbox, regime analysis, A/B compare, walk-forward visualizer (strip chart) |
-| **System** | Kill-switch UI + state, **read-only Risk Envelope tile**, audit log basic table (date + event type + environment filter), reconciliation status (Phase 1 source: QC; Phase 2: TWS + FlexQuery), watchdog status, **minimal Account section: regenerate backup codes (re-auth)** | Risk envelope + propose-PR, deployments log + rollback, agent activity feed, full audit explorer with FTS + actor + hash-validity + repaired-events filters, operator-friendly PR review surface, convalescent banner refinements, operating cost dashboard, full operator account management |
+| **System** | Kill-switch UI + state, **read-only Risk Envelope tile**, audit log basic table (date + event type + environment filter), reconciliation status (Phase 1+ post-pivot 2026-05-12: IBKR TWS via `ib-async` intraday + IBKR FlexQuery EOD; see `Docs/backend-spec.md` §2.6 + `Docs/decisions-log.md` 2026-05-12 pivot entry), watchdog status, **minimal Account section: regenerate backup codes (re-auth)** | Risk envelope + propose-PR, deployments log + rollback, agent activity feed, full audit explorer with FTS + actor + hash-validity + repaired-events filters, operator-friendly PR review surface, convalescent banner refinements, operating cost dashboard, full operator account management |
 | **Calendar** | Read-only event list (next 30 days) | Tomorrow's ratification flow on web (Phase 1 ratification is Discord-only), holidays, contract expiration / roll schedule, manual event log |
 
 ## 2.2 `/` — Today (landing dashboard)

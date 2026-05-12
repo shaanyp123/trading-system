@@ -114,10 +114,14 @@ These are decisions you must NOT re-derive or contradict. Memorize:
 - Public health: `GET /api/health`
 - WebAuthn ceremonies are JS-driven via `navigator.credentials.*`; NO OAuth-style `/auth/callback`
 
-**Phase 1 architecture (CRITICAL):**
-- Backend has **NO direct IBKR connection**. Market data + broker state via QC ObjectStore push.
-- Defensive trims via instruction protocol (`/instructions/<seq>.json` + 5s poll + ack); Phase 1 round-trip ~20s p99
-- Phase 2 transitions to direct `ib-async`; instruction protocol retired
+**Phase 1 architecture (CRITICAL — REVISED 2026-05-12 per DP-025 → Option 4):**
+- **Backend HAS direct IBKR connection** via `ib-async` to a Dockerized `ib_gateway` container.
+- **LEAN runs locally on the operator's VPS** (Dockerized `lean_local` container per `quantconnect/lean:latest`); LEAN POSTs signal events to backend at `POST /api/internal/lean/signals` (shared-bearer auth, `LeanAuthMiddleware` analogous to Day 23's `BotAuthMiddleware`).
+- Order placement, cancellation, position queries, and EOD reconciliation are all direct against IBKR; **no instruction protocol; no QC ObjectStore polling**.
+- Reconciliation uses IBKR `reqPositions` + `reqAccountSummary` intraday and IBKR FlexQuery (XML) at 18:30 ET EOD.
+- Phase 2 collapses into Phase 1 — there is no longer a cutover event. The original Phase 2 architecture in backend-spec §1.3 IS Phase 1 post-pivot.
+- **Historical context:** Pre-pivot Phase 1 plan was QC-mediated (algorithm ran on QC Cloud, backend polled `/events`, wrote `/instructions/<n>.json` for defensive trims). That architecture was infeasible on the operator's QC subscription tier — `/object/get` is Institutional-tier gated (DP-025 discovered Day 28). The `services/qc_adapter/**` code remains in the repo under the `qc_adapter_backfill` Phase 2+ profile gate per backend-spec §1.4 (preserved for institutional memory + ad-hoc historical replay; not active in production).
+- See `Docs/decisions-log.md` 2026-05-12 entry "Phase-1 architecture pivot — QC ObjectStore → LEAN Local + direct IBKR" for the full rationale + diff list.
 
 **Backtest authority:**
 - LEAN authoritative for PR review surface backtest delta
@@ -2608,7 +2612,7 @@ Each entry: what NOT to do, why, what to do instead.
 
 **[A12]** DO NOT manually edit `paper_days_completed` in the `strategy_versions` table to bypass the 30-paper-day gate. The CI gate is mechanical for a reason: live trading with an untested strategy version is a capital risk.
 
-**[A13]** DO NOT write Python code that calls IBKR TWS API directly in Phase 1. Phase 1 has no direct IBKR connection. All broker interaction passes through the QC instruction protocol (`/instructions/<n>.json` → poll ack). Use `write_instruction()` + `poll_for_ack()`.
+**[A13]** **(REVISED 2026-05-12 — Phase-1 architecture pivot; inverts the original rule.)** DO write IBKR broker integration via `ib-async` from Phase 1 onward — direct TWS API path is now the canonical broker contract. The client lives at `services/execution/ibkr_client.py` (forbidden whitelist — `risk-review-approved` required). DO NOT re-introduce the QC ObjectStore instruction protocol (`/instructions/<n>.json` → poll ack); that path is RETIRED. The pre-pivot rule stated the opposite ("Phase 1 has no direct IBKR connection"); it was inverted when DP-025 surfaced that `/object/get` is QC-Institutional-tier-gated. See `Docs/decisions-log.md` 2026-05-12 entry. **Note** [A02] still binds — `services/execution/**` is on the forbidden whitelist; all changes require `risk-review-approved`.
 
 **[A14]** DO NOT use SES for email. Resend (`resend.com`) is locked. The `resend_api_key` in secrets; `Resend` Python SDK or HTTP client.
 

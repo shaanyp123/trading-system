@@ -490,47 +490,37 @@ The build is sequenced so that each phase de-risks the next. Skipping a phase is
 - Operator can read logs, deploy, restart any service, kill the system from Discord, ratify the calendar
 - v1 strategy backtest Sharpe ≥ 1.5 (otherwise: strategy review before Phase 1 starts)
 
-### Phase 1 — Live Track Record (months 2–5)
+### Phase 1 — Live Track Record (months 2–5; post-pivot 2026-05-12)
 
-**The first real money trades.** $15–25k IBKR Pro live, on a CME-Globex routing through QuantConnect's LEAN engine. The backend has **no broker credentials** in Phase 1 — every order is written to QC's ObjectStore and the QC algorithm executes it. This is intentional: we get a live track record without building a direct broker integration in the same step.
+**The first real money trades.** $15–25k IBKR Pro live, **direct via `ib-async` to an `ib_gateway` container running on the operator's VPS**; LEAN runs locally in a `lean_local` container alongside. The backend holds IBKR credentials in sops-encrypted secrets. No QuantConnect Cloud involvement in production.
 
-**Architecture quirk:** the backend writes "order instructions" to a shared file store (QC ObjectStore), the QC algorithm polls every 5 seconds, places the trade with IBKR, and writes back an acknowledgement. Round-trip latency target: p99 ≤ 20 seconds. This is slower than direct broker access but the trade-off is worth it — we ship Phase 1 in months, not quarters.
+**Architecture (post-pivot):** the operator's Hetzner VPS runs `lean_local` (which hosts the v1 trend-following algorithm), `ib_gateway` (which holds the TWS API session to IBKR), the FastAPI `api` (which receives LEAN's signal POSTs at `/api/internal/lean/signals` and orchestrates risk + execution), plus the rest of the Docker Compose stack from Phase 0. Round-trip latency target: p99 ≤ 5 seconds.
 
-**Phase 1 success criteria:**
+> **Pre-pivot narrative (RETIRED):** "$15–25k IBKR Pro live, on a CME-Globex routing through QuantConnect's LEAN engine. The backend has no broker credentials in Phase 1 — every order is written to QC's ObjectStore and the QC algorithm executes it. Architecture quirk: the backend writes order instructions to a shared file store (QC ObjectStore), the QC algorithm polls every 5 seconds... Round-trip latency target: p99 ≤ 20 seconds." Retired per DP-025 (QC's `/object/get` is Institutional-tier-gated; the polling architecture is infeasible on a solo-operator budget). See `Docs/decisions-log.md` 2026-05-12 entry.
+
+**Phase 1 success criteria (post-pivot):**
 
 - 6-month rolling live Sharpe ≥ 0.8
 - Max drawdown ≤ 15%
 - Signal acceptance ≥ 90% (post-universe-filter, post-Stage-5-rounding)
 - Zero audit chain breaks
 - Zero `incident_review` halts
-- Cost envelope ≤ $200/mo soft alert
+- Cost envelope ≤ $200/mo soft alert (post-pivot: the QC Researcher-$60/mo subscription drops — savings offset the higher Hetzner VPS spec needed to run LEAN Local + IBKR Gateway containers)
 - First slippage recalibration on real fills (month 4)
 - First agent-drafted parameter PR (month 4)
+- **Kill-switch SLO ≤ 5s** (the original "Phase 2 success criterion" promoted into Phase 1 because the direct-IBKR path meets it from day 1)
 
-### Phase 2 — Custom Infra Hardened (months 5–9)
+### Phase 2 — `[RETIRED — pivot 2026-05-12]`
 
-**Cutover to direct broker access.** LEAN runs locally on the operator's VPS. IB Gateway connects directly to IBKR via the TWS API. The backend now holds broker credentials. Round-trip latency target: ≤ 5 seconds.
+> **Status post-pivot:** "Phase 2: Custom Infra Hardened" was originally the cutover milestone — operator transitioned from QC-Cloud-mediated to direct-IBKR over Months 5–9. After the 2026-05-12 pivot, that transition is already complete at Phase 1 onset (via Pivot-PRs A through E). **There is no Phase 2 cutover event.** The architectural improvements originally scheduled here fold into continued Phase 1 evolution.
+>
+> Pre-pivot Phase 2 content preserved below for institutional memory.
 
-**Cutover gate.** Eight automated pre-cutover checks run the day before:
+**Pre-pivot Phase 2 plan (RETIRED):** Cutover to direct broker access. LEAN runs locally on the operator's VPS. IB Gateway connects directly to IBKR via the TWS API. The backend now holds broker credentials. Round-trip latency target: ≤ 5 seconds.
 
-1. LEAN Local backtest reproduces the last 30 Phase 1 sessions with P&L within 0.5% equity divergence
-2. vectorbt golden test passes on the latest weekly cron
-3. IB Gateway boots healthy + paper login OK
-4. ib-async paper test: place + cancel an order in the IBKR paper account
-5. No HALT_NEW in the last 24h
-6. Audit chain integrity verifies cleanly
-7. S3 backup successfully restored to staging within the last 4h
-8. Slippage calibration head version pinned
+Cutover gate: eight automated pre-cutover checks ran the day before (LEAN Local backtest reproduces last 30 Phase 1 sessions ≤ 0.5% divergence; vectorbt parity; IB Gateway boot health; ib-async paper test; no HALT_NEW in 24h; audit chain integrity; S3 restore < 4h ago; slippage calibration head pinned). Any single failure aborted the cutover. Cutover itself happened at session close: positions flatten via QC algorithm, audit log records `phase_cutover_started`, QC enters drain mode for 24h. Audit log was continuous across the cutover — single hash chain spanning both phases.
 
-Any single failure aborts the cutover. The cutover itself happens at session close: positions flatten via QC algorithm, audit log records `phase_cutover_started`, QC enters drain mode for 24h (so the QC adapter can verify post-cutover audit parity), and the first Phase 2 signal cycle runs at the next 17:30 ET. **The audit log is continuous across the cutover** — single hash chain spanning both phases.
-
-**Phase 2 success criteria:**
-
-- Zero audit gaps through cutover
-- First Phase 2 signal-to-fill round trip ≤ 5s SLO met
-- Phase 2 portfolio live Sharpe ≥ 1.2
-- Kill-switch SLO ≤ 5s
-- Operator can debug a degraded service via logs alone
+Pre-pivot Phase 2 success criteria (RETIRED): zero audit gaps through cutover; first Phase 2 signal-to-fill round trip ≤ 5s SLO met; Phase 2 portfolio live Sharpe ≥ 1.2; kill-switch SLO ≤ 5s; operator can debug a degraded service via logs alone.
 
 ### Phase 3 — Capital Scaling and F&F Prep (months 9–12)
 
@@ -561,17 +551,22 @@ Any single failure aborts the cutover. The cutover itself happens at session clo
 
 ### Changes between phases
 
-| Capability | Phase 0 | Phase 1 | Phase 2 | Phase 3 |
+| Capability | Phase 0 | Phase 1 (post-pivot 2026-05-12) | Phase 2 (RETIRED) | Phase 3 |
 |---|---|---|---|---|
-| Where the trading engine runs | QC Cloud (paper) | QC Cloud (live) | Backend VPS (LEAN Local) | Same as Phase 2 |
-| Who holds broker credentials | QC | QC | Backend | Backend |
-| Backend → broker latency | n/a | ~20s p99 | ≤ 5s | ≤ 5s |
-| Direct IBKR connection | ❌ | ❌ | ✅ ib-async | ✅ |
-| Slippage recalibration cadence | bootstrap (zero prior) | monthly | quarterly | quarterly |
-| Strategy count | 1 | 1 | 1 | 2+ (sequential adds) |
-| Account count | 1 | 1 | 1 | 2+ (F&F principals) |
-| Web UI surface | minimal | Phase-1 surfaces | full | full + F&F dashboards |
-| Polygon.io contingent | ❌ | ❌ | only if QC data gaps | only if QC data gaps |
+| Where the trading engine runs | QC Cloud (paper) — pre-pivot only; Day 4-28 work was QC paper | Backend VPS (LEAN Local from Day 29+) | RETIRED — was "Backend VPS (LEAN Local)" | Same as Phase 1+ |
+| Who holds broker credentials | QC (paper) | Backend (sops-encrypted IBKR creds) | RETIRED — was "Backend" | Backend |
+| Backend → broker latency | n/a | ≤ 5s direct via `ib-async` | RETIRED — was "≤ 5s" | ≤ 5s |
+| Direct IBKR connection | ❌ | ✅ ib-async direct via `ib_gateway` | RETIRED — was "✅ ib-async" | ✅ |
+| Slippage recalibration cadence | bootstrap (zero prior) | monthly | RETIRED — was "quarterly" | monthly (post-pivot keeps Phase-1 cadence; quarterly downgrade no longer planned) |
+| Strategy count | 1 | 1 (v2 prep begins Month 5) | RETIRED | 2+ (sequential adds) |
+| Account count | 1 | 1 | RETIRED | 2+ (F&F principals) |
+| Web UI surface | minimal | full from Phase 1 (Day 20-27 work shipped Phase-1 surfaces in Phase 0; Phase 2 features fold forward) | RETIRED — was "full" | full + F&F dashboards |
+| Polygon.io contingent | ❌ | only if QC bundled data gaps | RETIRED | only if data gaps |
+| QC ObjectStore polling | ❌ (paper signals were QC-LEAN-native; no backend poll) | ❌ (RETIRED architecture; `services/qc_adapter/**` is dormant under `qc_adapter_backfill` profile gate per backend-spec §1.4) | n/a | ❌ |
+
+**Post-pivot "what stays locked across all phases" additions:**
+- The direct-IBKR + LEAN Local architecture is the canonical broker path from Phase 1 onset onward. No re-introduction of QC-mediated paths is planned.
+- The `qc_adapter_backfill` profile gate is the only legitimate way to spin up `services/qc_adapter/` in production; it requires an explicit operator action + decision-diary entry.
 
 ### What never changes
 
