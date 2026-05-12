@@ -31,12 +31,13 @@ from services.api import sse as sse_multiplexer
 from services.api.config import APISettings, get_settings
 from services.api.db import close_pool, init_pool, session_scope
 from services.api.errors import register_error_handlers
-from services.api.middleware import BotAuthMiddleware, register_middleware
+from services.api.middleware import BotAuthMiddleware, LeanAuthMiddleware, register_middleware
 from services.api.repos.setup_tokens import PostgresSetupTokenRepo
 from services.api.routes.alerts import router as alerts_router
 from services.api.routes.auth import router as auth_router
 from services.api.routes.fills import router as fills_router
 from services.api.routes.health import router as health_router
+from services.api.routes.internal.lean import router as lean_router
 from services.api.routes.orders import router as orders_router
 from services.api.routes.positions import router as positions_router
 from services.api.routes.setup import router as setup_router
@@ -161,6 +162,15 @@ def create_app() -> FastAPI:
     # See services/api/middleware.BotAuthMiddleware docstring for the
     # full request-flow diagram.
     app.add_middleware(BotAuthMiddleware, settings=settings)  # type: ignore[arg-type]
+    # Pivot-PR-A (post-pivot 2026-05-12): LeanAuthMiddleware sits
+    # outermost-of-outermost (added AFTER BotAuthMiddleware so Starlette's
+    # last-added-outermost convention puts it first in the request flow).
+    # Order: LeanAuth → BotAuth → SessionStub → RequestContext → RateLimit
+    # → CSRF → routes. The Lean container POSTs to /api/internal/lean/signals
+    # bearing its own token (sourced from sops `lean.api_bearer_token`); if
+    # it doesn't match, the request falls through to BotAuth which tries the
+    # bot's token, then to SessionStub which fails closed in production envs.
+    app.add_middleware(LeanAuthMiddleware, settings=settings)  # type: ignore[arg-type]
     # Day 5 routes
     app.include_router(health_router)
     app.include_router(setup_router)
@@ -176,6 +186,12 @@ def create_app() -> FastAPI:
     app.include_router(alerts_router)
     # Day 26 — Week 7 Tue Trades page surface (backend-spec §4.1.2).
     app.include_router(trades_router)
+    # Pivot-PR-A (post-pivot 2026-05-12): /api/internal/lean/signals — POST
+    # endpoint for LEAN Local to push signal_emitted events. Shared-bearer
+    # auth via LeanAuthMiddleware (outermost in the middleware stack);
+    # writes audit row via services.audit.writer.append_audit_event;
+    # INSERTs into signals table.
+    app.include_router(lean_router)
     return app
 
 

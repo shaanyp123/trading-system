@@ -34,6 +34,9 @@ anthropic:
 discord:
   bot_token: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>            # see deploy/discord/README.md
   guild_id: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
+  # Day 23: shared bearer for discord_bot <-> api auth. 32-byte URL-safe
+  # base64; generated via `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'`.
+  api_bearer_token: <TODO_FROM_DAY_23_DISCORD_BOT_BRINGUP>
   webhook_urls:
     daily_brief: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
     signals: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
@@ -42,6 +45,19 @@ discord:
     critical: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
     ops: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
     audit: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
+
+lean:
+  # Pivot-PR-A (post-pivot 2026-05-12): shared bearer for lean_local <-> api
+  # auth. 32-byte URL-safe base64; generate via:
+  #   python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
+  # The lean_local container's entrypoint.sh reads this field via PyYAML
+  # at boot, exports as LEAN_LOCAL_BEARER_TOKEN env var, and the algorithm's
+  # _post_event() function uses it on every POST to /api/internal/lean/signals.
+  # The api side reads the SAME field (services/api/entrypoint.py) into
+  # API_LEAN_LOCAL_BEARER_TOKEN; LeanAuthMiddleware constant-time-compares.
+  # Distinct from discord.api_bearer_token so compromise of one container
+  # can't grant access via the other (defense-in-depth).
+  api_bearer_token: <TODO_FROM_PIVOT_PR_A_BRINGUP>
 
 forex_factory:
   api_token: null                 # FF mostly free; leave null until /api hits a 429

@@ -80,6 +80,17 @@ def main(argv: list[str] | None = None) -> int:
         if bb and not _looks_like_placeholder(bb):
             os.environ["API_DISCORD_BOT_BEARER_TOKEN"] = bb
 
+    # Pivot-PR-A (post-pivot 2026-05-12): LEAN Local bearer (sops yaml
+    # `lean.api_bearer_token`). When unset the api still boots —
+    # LeanAuthMiddleware degrades to a noop and the LEAN path is simply
+    # not served until the operator adds the secret per
+    # `deploy/lean_local/README.md`. Distinct from `discord.api_bearer_token`
+    # so a compromise of one container can't grant access via the other.
+    if "API_LEAN_LOCAL_BEARER_TOKEN" not in os.environ:
+        lb = (secrets.get("lean") or {}).get("api_bearer_token")
+        if lb and not _looks_like_placeholder(lb):
+            os.environ["API_LEAN_LOCAL_BEARER_TOKEN"] = lb
+
     # Day 21 carryover: TOTP column-encryption key (sops yaml
     # `totp.encryption_key`). Base64url-encoded 32-byte AES-256-GCM key
     # per services/api/config.py `totp_encryption_key`. When unset the

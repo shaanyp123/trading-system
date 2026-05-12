@@ -173,6 +173,37 @@ class APISettings(BaseSettings):
         ),
     )
 
+    # --- LEAN Local bearer auth (Pivot-PR-A — post-pivot 2026-05-12) ------
+    # Shared bearer token between the api and the `lean_local` Docker
+    # container running LEAN's algorithm engine on the operator's VPS. When
+    # LEAN's `v1_strategy.py` POSTs a signal event to `POST
+    # /api/internal/lean/signals`, it sets `Authorization: Bearer <token>`;
+    # `LeanAuthMiddleware` validates via constant-time compare and on match
+    # injects a service-account `SessionContext` (username=``lean-local``,
+    # role=``owner``, auth_strength=``strong``, is_phase0_stub=False).
+    #
+    # Distinct from `discord_bot_bearer_token`: separate sops fields so that
+    # compromise of one container doesn't grant access via the other (a
+    # compromised Discord bot can't impersonate LEAN, and vice-versa).
+    #
+    # When unset the middleware degrades to no-op (no LEAN path is served).
+    # Production must set this — the SessionStubMiddleware fail-close in
+    # live envs would otherwise reject LEAN's POSTs before any handler runs.
+    #
+    # Sourced from sops yaml `lean.api_bearer_token` per
+    # `deploy/lean_local/README.md`. Token format: 32-byte URL-safe base64
+    # (`secrets.token_urlsafe(32)`); rotates with the quarterly secrets
+    # rotation alongside the Discord bot token.
+    lean_local_bearer_token: SecretStr | None = Field(
+        default=None,
+        description=(
+            "Shared bearer token for LEAN Local → api authentication. "
+            "When set, LeanAuthMiddleware accepts requests bearing this "
+            "token in Authorization header and injects a service-account "
+            "SessionContext."
+        ),
+    )
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> APISettings:
