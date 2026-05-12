@@ -66,6 +66,7 @@ from services.webhook_pusher.event_pushes import (
     EventChannel,
     EventPushPlan,
     OrderFilledEvent,
+    OrderPlacedEvent,
     SignalDecisionEvent,
     SignalEmittedEvent,
     plan_event_push,
@@ -305,6 +306,44 @@ def _route_signal_event(
             return []
         plan = plan_event_push(channel=EventChannel.SIGNALS, event=decision_event)
         return [(EventChannel.SIGNALS, plan)]
+
+    if action == "placed":
+        try:
+            placed_event = OrderPlacedEvent(
+                signal_id=signal_id,
+                market=market,
+                direction=direction,
+                side=str(data.get("side", "")).lower(),
+                quantity=str(data.get("quantity", "")),
+                order_id=str(data.get("order_id", "")),
+                client_order_id=str(data.get("client_order_id", "")),
+                broker_order_id=(
+                    str(data["broker_order_id"]) if data.get("broker_order_id") else None
+                ),
+                broker_status=str(data.get("broker_status", "unknown")),
+                db_status=str(data.get("db_status", "unknown")),
+                placed_at_utc=_to_utc_datetime(data.get("placed_at_utc")),
+                environment=environment,
+                rejection_detail=(
+                    str(data["rejection_detail"]) if data.get("rejection_detail") else None
+                ),
+            )
+        except (ValueError, InvalidOperation, TypeError) as exc:
+            log.warning(
+                "sse_signal_placed_invalid_payload",
+                sequence_no=sequence_no,
+                error=str(exc),
+            )
+            return []
+        if not placed_event.order_id or not placed_event.client_order_id:
+            log.warning(
+                "sse_signal_placed_missing_order_id",
+                sequence_no=sequence_no,
+                signal_id=signal_id,
+            )
+            return []
+        plan = plan_event_push(channel=EventChannel.FILLS, event=placed_event)
+        return [(EventChannel.FILLS, plan)]
 
     # Unknown action; ignore silently.
     return []

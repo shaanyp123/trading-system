@@ -447,6 +447,44 @@ async def apply_order_placement(
         audit_event_uuid=str(audit_record.event_uuid),
     )
 
+    # Best-effort SSE fan-out so the webhook_pusher subscriber + web UI
+    # observe the broker-side state transition without polling. The api's
+    # SSE multiplexer is in-process (single-replica Phase 1) so the
+    # emit lands in the same event loop the worker runs on. Failures
+    # MUST NOT fail the placement — the orders row + audit event are
+    # already durable; SSE is a notification surface, consumers reconnect
+    # with Last-Event-ID + catch up from the replay buffer.
+    try:
+        from services.api.sse import emit_sse
+
+        await emit_sse(
+            "signal",
+            {
+                "action": "placed",
+                "signal_id": str(plan.signal_id),
+                "market": plan.market,
+                "direction": "long" if plan.side == "buy" else "short",
+                "side": plan.side,
+                "quantity": str(plan.quantity),
+                "order_id": str(order_id),
+                "client_order_id": plan.client_order_id,
+                "broker_order_id": (str(broker_order_id) if broker_order_id is not None else None),
+                "broker_status": broker_status,
+                "db_status": db_status,
+                "rejection_category": rejection_category,
+                "rejection_detail": rejection_detail,
+                "placed_at_utc": placed_at.isoformat(),
+                "environment": plan.env,
+                "audit_event_uuid": str(audit_record.event_uuid),
+            },
+        )
+    except Exception:
+        log.exception(
+            "order_placement_sse_emit_failed",
+            signal_id=str(plan.signal_id),
+            order_id=str(order_id),
+        )
+
     return OrderPlacementResult(
         signal_id=plan.signal_id,
         order_id=order_id,
