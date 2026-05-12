@@ -143,6 +143,8 @@ class _StubRepo:
         False,
     )
     last_audit_filter: dict[str, Any] | None = None
+    signal_summary: dict[str, Any] | None = None
+    last_signal_summary_args: tuple[UUID, UUID] | None = None
 
     def __post_init__(self) -> None:
         if self.positions_rows is None:
@@ -287,6 +289,14 @@ class _StubRepo:
 
     async def fetch_latest_balance_nav(self, account_id: UUID) -> Decimal | None:
         return self.nav
+
+    async def fetch_signal_summary(
+        self,
+        account_id: UUID,
+        signal_id: UUID,
+    ) -> dict[str, object] | None:
+        self.last_signal_summary_args = (account_id, signal_id)
+        return self.signal_summary
 
 
 def _bind_repo(override_dep: Any, route_module: Any, repo: Phase1QueryRepo) -> None:
@@ -522,6 +532,322 @@ class TestSignalDefer:
         )
         assert response.status_code == 409
         assert response.json()["error_code"] == "NO_ACTIVE_ACCOUNT"
+
+
+class TestSignalDecisionSSEEmit:
+    """Verify approve/reject/defer fire a `signal` SSE event on success.
+
+    The dispatcher is monkeypatched (it requires a real Postgres session
+    to walk the audit-first flow); we exercise only the route handler's
+    SSE emission path with a captured fake.
+    """
+
+    @pytest.mark.asyncio
+    async def test_approve_emits_signal_sse_on_success(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        account_id = uuid4()
+        signal_id = uuid4()
+        audit_uuid = uuid4()
+        repo = _StubRepo(
+            account_id=account_id,
+            signal_summary={
+                "market": "/MES",
+                "direction": "long",
+                "target_contracts": 1,
+                "decision_price": Decimal("5250.00"),
+                "strategy_hash": "0" * 40,
+                "parameter_set_hash": "0" * 64,
+                "emitted_at_utc": datetime.now(tz=UTC),
+                "env": "paper",
+                "status": "pending",
+            },
+        )
+        _bind_repo(override_dep, signals_route, repo)
+
+        captured_emits: list[tuple[str, dict[str, Any]]] = []
+
+        async def fake_emit_sse(event_type: str, data: dict[str, Any]) -> int:
+            captured_emits.append((event_type, data))
+            return 99
+
+        async def fake_apply(
+            plan: Any,
+            *,
+            session_factory: Any,
+            env: str,
+            phase_at_emit: int,
+        ) -> Any:
+            from services.risk.signal_dispatch import SignalDispatchResult
+
+            return SignalDispatchResult(
+                signal_id=plan.signal_id,
+                action=plan.action,
+                new_status=plan.new_status,
+                audit_event_uuid=audit_uuid,
+                audit_sequence_no=42,
+            )
+
+        monkeypatch.setattr(signals_route, "emit_sse", fake_emit_sse)
+        from services.api import db as api_db_module
+        from services.risk import signal_dispatch as sd_module
+
+        monkeypatch.setattr(sd_module, "apply_signal_dispatch", fake_apply)
+        monkeypatch.setattr(api_db_module, "get_session_factory", lambda: object())
+
+        response = await api_client.post(
+            f"/api/signals/{signal_id}/approve",
+            json={"override_size": 1},
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 200, response.text
+        assert len(captured_emits) == 1
+        event_type, data = captured_emits[0]
+        assert event_type == "signal"
+        assert data["action"] == "approved"
+        assert data["signal_id"] == str(signal_id)
+        assert data["market"] == "/MES"
+        assert data["direction"] == "long"
+        assert data["decided_by_user_id"] == "phase0-stub-owner"
+        assert data["audit_event_uuid"] == str(audit_uuid)
+        assert "diary_reasoning_text" not in data
+        assert repo.last_signal_summary_args == (account_id, signal_id)
+
+    @pytest.mark.asyncio
+    async def test_reject_emits_signal_sse_with_diary_reasoning(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        account_id = uuid4()
+        signal_id = uuid4()
+        audit_uuid = uuid4()
+        repo = _StubRepo(
+            account_id=account_id,
+            signal_summary={
+                "market": "/MNQ",
+                "direction": "short",
+                "target_contracts": 1,
+                "decision_price": Decimal("18250.00"),
+                "strategy_hash": "0" * 40,
+                "parameter_set_hash": "0" * 64,
+                "emitted_at_utc": datetime.now(tz=UTC),
+                "env": "paper",
+                "status": "pending",
+            },
+        )
+        _bind_repo(override_dep, signals_route, repo)
+
+        captured_emits: list[tuple[str, dict[str, Any]]] = []
+
+        async def fake_emit_sse(event_type: str, data: dict[str, Any]) -> int:
+            captured_emits.append((event_type, data))
+            return 100
+
+        async def fake_apply(plan: Any, **_: Any) -> Any:
+            from services.risk.signal_dispatch import SignalDispatchResult
+
+            return SignalDispatchResult(
+                signal_id=plan.signal_id,
+                action=plan.action,
+                new_status=plan.new_status,
+                audit_event_uuid=audit_uuid,
+                audit_sequence_no=43,
+            )
+
+        monkeypatch.setattr(signals_route, "emit_sse", fake_emit_sse)
+        from services.api import db as api_db_module
+        from services.risk import signal_dispatch as sd_module
+
+        monkeypatch.setattr(sd_module, "apply_signal_dispatch", fake_apply)
+        monkeypatch.setattr(api_db_module, "get_session_factory", lambda: object())
+
+        response = await api_client.post(
+            f"/api/signals/{signal_id}/reject",
+            json={
+                "decision_diary_entry": {
+                    "tag": "regime_concern",
+                    "reasoning_text": "vol regime elevated above z=2; defer entry",
+                },
+            },
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 200, response.text
+        assert len(captured_emits) == 1
+        _, data = captured_emits[0]
+        assert data["action"] == "rejected"
+        assert data["market"] == "/MNQ"
+        assert data["direction"] == "short"
+        assert data["diary_reasoning_text"] == "vol regime elevated above z=2; defer entry"
+
+    @pytest.mark.asyncio
+    async def test_defer_emits_signal_sse_with_action_deferred(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        account_id = uuid4()
+        signal_id = uuid4()
+        repo = _StubRepo(
+            account_id=account_id,
+            signal_summary={
+                "market": "TLT",
+                "direction": "long",
+                "target_contracts": 1,
+                "decision_price": Decimal("92.50"),
+                "strategy_hash": "0" * 40,
+                "parameter_set_hash": "0" * 64,
+                "emitted_at_utc": datetime.now(tz=UTC),
+                "env": "paper",
+                "status": "pending",
+            },
+        )
+        _bind_repo(override_dep, signals_route, repo)
+        captured_emits: list[tuple[str, dict[str, Any]]] = []
+
+        async def fake_emit_sse(event_type: str, data: dict[str, Any]) -> int:
+            captured_emits.append((event_type, data))
+            return 101
+
+        async def fake_apply(plan: Any, **_: Any) -> Any:
+            from services.risk.signal_dispatch import SignalDispatchResult
+
+            return SignalDispatchResult(
+                signal_id=plan.signal_id,
+                action=plan.action,
+                new_status=plan.new_status,
+                audit_event_uuid=uuid4(),
+                audit_sequence_no=44,
+            )
+
+        monkeypatch.setattr(signals_route, "emit_sse", fake_emit_sse)
+        from services.api import db as api_db_module
+        from services.risk import signal_dispatch as sd_module
+
+        monkeypatch.setattr(sd_module, "apply_signal_dispatch", fake_apply)
+        monkeypatch.setattr(api_db_module, "get_session_factory", lambda: object())
+
+        response = await api_client.post(
+            f"/api/signals/{signal_id}/defer",
+            json={
+                "decision_diary_entry": {
+                    "tag": "manual_judgment",
+                    "reasoning_text": "waiting for FOMC tomorrow",
+                },
+            },
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 200, response.text
+        assert len(captured_emits) == 1
+        _, data = captured_emits[0]
+        assert data["action"] == "deferred"
+        assert data["market"] == "TLT"
+
+    @pytest.mark.asyncio
+    async def test_approve_emit_failure_does_not_fail_request(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """If emit_sse raises, the request still returns 200; audit + signal row are durable."""
+        account_id = uuid4()
+        signal_id = uuid4()
+        repo = _StubRepo(
+            account_id=account_id,
+            signal_summary={
+                "market": "/MES",
+                "direction": "long",
+                "target_contracts": 1,
+                "decision_price": Decimal("5250.00"),
+                "strategy_hash": "0" * 40,
+                "parameter_set_hash": "0" * 64,
+                "emitted_at_utc": datetime.now(tz=UTC),
+                "env": "paper",
+                "status": "pending",
+            },
+        )
+        _bind_repo(override_dep, signals_route, repo)
+
+        async def boom(_event_type: str, _data: dict[str, Any]) -> int:
+            raise RuntimeError("SSE multiplexer crashed")
+
+        async def fake_apply(plan: Any, **_: Any) -> Any:
+            from services.risk.signal_dispatch import SignalDispatchResult
+
+            return SignalDispatchResult(
+                signal_id=plan.signal_id,
+                action=plan.action,
+                new_status=plan.new_status,
+                audit_event_uuid=uuid4(),
+                audit_sequence_no=45,
+            )
+
+        monkeypatch.setattr(signals_route, "emit_sse", boom)
+        from services.api import db as api_db_module
+        from services.risk import signal_dispatch as sd_module
+
+        monkeypatch.setattr(sd_module, "apply_signal_dispatch", fake_apply)
+        monkeypatch.setattr(api_db_module, "get_session_factory", lambda: object())
+
+        response = await api_client.post(
+            f"/api/signals/{signal_id}/approve",
+            json={"override_size": 1},
+            **_csrf_kwargs(),
+        )
+        # Audit + signal-row write succeeded; SSE failure is logged but
+        # doesn't propagate.
+        assert response.status_code == 200, response.text
+
+    @pytest.mark.asyncio
+    async def test_approve_no_summary_skips_emit_without_crash(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """If fetch_signal_summary returns None, the SSE emit is skipped."""
+        account_id = uuid4()
+        signal_id = uuid4()
+        repo = _StubRepo(account_id=account_id, signal_summary=None)
+        _bind_repo(override_dep, signals_route, repo)
+        captured_emits: list[tuple[str, dict[str, Any]]] = []
+
+        async def fake_emit_sse(event_type: str, data: dict[str, Any]) -> int:
+            captured_emits.append((event_type, data))
+            return 99
+
+        async def fake_apply(plan: Any, **_: Any) -> Any:
+            from services.risk.signal_dispatch import SignalDispatchResult
+
+            return SignalDispatchResult(
+                signal_id=plan.signal_id,
+                action=plan.action,
+                new_status=plan.new_status,
+                audit_event_uuid=uuid4(),
+                audit_sequence_no=46,
+            )
+
+        monkeypatch.setattr(signals_route, "emit_sse", fake_emit_sse)
+        from services.api import db as api_db_module
+        from services.risk import signal_dispatch as sd_module
+
+        monkeypatch.setattr(sd_module, "apply_signal_dispatch", fake_apply)
+        monkeypatch.setattr(api_db_module, "get_session_factory", lambda: object())
+
+        response = await api_client.post(
+            f"/api/signals/{signal_id}/approve",
+            json={"override_size": 1},
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 200
+        # No emit because summary was None.
+        assert captured_emits == []
 
 
 # ---------------------------------------------------------------------------

@@ -40,6 +40,7 @@ from services.api import db as api_db
 from services.api.errors import AppError
 from services.api.repos.phase1 import PostgresPhase1QueryRepo
 from services.api.schemas.lean import LeanEventAccepted, LeanEventRequest
+from services.api.sse import emit_sse
 from services.audit.event_types import AuditEventType
 from services.audit.writer import Environment, PhaseAtEmit
 from services.qc_adapter.payloads import QCEvent
@@ -241,6 +242,35 @@ async def post_lean_signal(
             target_contracts=body.target_contracts,
             **log_kwargs,
         )
+
+        # Best-effort SSE fan-out so the web /signals page + the
+        # webhook_pusher SSE subscriber pick up the freshly-emitted
+        # signal without polling. SSE failure must NOT fail the LEAN
+        # POST — the audit row + signals row are already durable and
+        # any reconnect-with-Last-Event-ID consumer will catch up via
+        # the replay buffer.
+        try:
+            await emit_sse(
+                "signal",
+                {
+                    "action": "emitted",
+                    "signal_id": str(result.signal_id),
+                    "market": body.market,
+                    "direction": body.direction,
+                    "target_contracts": body.target_contracts,
+                    "decision_price": str(body.decision_price),
+                    "emitted_at_utc": body.ts_utc.isoformat(),
+                    "environment": env,
+                    "strategy_version": body.strategy_version,
+                    "audit_event_uuid": str(result.audit_event_uuid),
+                },
+            )
+        except Exception:
+            log.exception(
+                "lean_signal_emitted_sse_emit_failed",
+                signal_id=str(result.signal_id),
+            )
+
         return LeanEventAccepted(
             received_at_utc=received_at,
             event_type=body.event_type,
