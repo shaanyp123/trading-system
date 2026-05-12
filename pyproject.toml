@@ -36,6 +36,12 @@ dependencies = [
   "resend>=2.4",
   "anthropic>=0.39",
   "pyyaml>=6.0",
+  # ib-async (Pivot-PR-B; post-pivot 2026-05-12): maintained fork of
+  # ib_insync. Async TWS API client wrapped by
+  # services/execution/ibkr_adapter.py to place + cancel + monitor IBKR
+  # orders. Talks to the ib_gateway Docker container on port 4002 (paper)
+  # / 4001 (live) using IBKR's TWS API protocol (NOT REST; binary framing).
+  "ib-async>=1.0.3",
 ]
 
 [project.optional-dependencies]
@@ -138,6 +144,18 @@ exclude = [
   "lean/",
   "alembic/versions/",   # generated migration files
 ]
+
+# ib_async has no published type stubs as of v1.0.3. The adapter at
+# services/execution/ibkr_adapter.py imports from this library at runtime
+# (and via TYPE_CHECKING for static analysis) — let mypy treat it as Any
+# rather than failing. Once typeshed (or the upstream lib) adds stubs,
+# remove this override.
+[[tool.mypy.overrides]]
+module = "ib_async"
+ignore_missing_imports = true
+[[tool.mypy.overrides]]
+module = "ib_async.*"
+ignore_missing_imports = true
 
 # ---------- pytest ----------
 [tool.pytest.ini_options]

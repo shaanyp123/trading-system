@@ -18,6 +18,25 @@ postgres:
 ibkr:
   account_number: U25655583       # operator's IBKR Pro account; submitted 2026-05-05
   flex_query_token: <TODO_FROM_WEEK_2_IBKR_FLEX_SETUP>
+  flex_query_id: <TODO_FROM_WEEK_2_IBKR_FLEX_SETUP>   # numeric ID from IBKR FlexQuery dashboard
+  # Pivot-PR-B (post-pivot 2026-05-12): paper-trading credentials for
+  # the ib_gateway container. The operator's IBKR Pro account also has
+  # an associated paper account (login + 2FA in IBKR portal under "Paper
+  # Trading"). These fields are the paper-account username + password,
+  # NOT the live-account credentials. The TWS API listens on port 4002
+  # for paper, 4001 for live.
+  paper_username: <TODO_FROM_PIVOT_PR_B_BRINGUP>
+  paper_password: <TODO_FROM_PIVOT_PR_B_BRINGUP>
+  # Live credentials. Empty (or placeholder) until Week 8 cutover ceremony.
+  # The operator deliberately defers populating these until 30-paper-session
+  # clock complete + funded account approved.
+  live_username: <TODO_FROM_WEEK_8_LIVE_CUTOVER>
+  live_password: <TODO_FROM_WEEK_8_LIVE_CUTOVER>
+  # TWS API client_id for the execution process. IBKR allows 1-7 distinct
+  # client IDs per TWS session. Phase 1 uses 1 (services/execution).
+  # Reserve 2-7 for future expansion (multi-strategy or read-only telemetry
+  # clients).
+  client_id: 1
 
 quantconnect:
   api_token: <TODO_FROM_DAY_3_QC_TOKEN_REGEN>      # QC token rotated post Day 1 leak
