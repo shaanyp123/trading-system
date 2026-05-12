@@ -528,7 +528,9 @@ class IbAsyncIbkrClient:
         """Build an ib_async Contract from our typed IbkrContractRef.
 
         Lazy-imports ib_async.Future + ib_async.Stock so the module can be
-        imported without the library installed.
+        imported without the library installed. Returns ``Any`` because the
+        ib_async type stubs aren't published (see pyproject.toml mypy
+        override).
         """
         from ib_async import Future, Stock
 

@@ -417,27 +417,38 @@ class TestListSignals:
 
 
 class TestSignalApprove:
+    """Pivot-PR-D (post-pivot 2026-05-12): the 501 stub is replaced by a real
+    dispatcher call. Tests now verify the no-account branch returns 409
+    NO_ACTIVE_ACCOUNT — exercising the dispatcher's full path requires a real
+    DB (covered separately by ``test_risk_signal_dispatch.py``).
+    """
+
     @pytest.mark.asyncio
-    async def test_returns_501_stub_with_canonical_envelope(
+    async def test_no_account_returns_409(
         self,
         api_client: AsyncClient,
+        override_dep: Any,
     ) -> None:
+        repo = _StubRepo(account_id=None)
+        _bind_repo(override_dep, signals_route, repo)
         signal_id = uuid4()
         response = await api_client.post(
             f"/api/signals/{signal_id}/approve",
             json={"override_size": 3},
             **_csrf_kwargs(),
         )
-        assert response.status_code == 501
+        assert response.status_code == 409
         body = response.json()
-        assert body["error_code"] == "SIGNAL_HANDLER_NOT_WIRED"
-        assert "Week 4 Wed" in body["message"]
+        assert body["error_code"] == "NO_ACTIVE_ACCOUNT"
 
     @pytest.mark.asyncio
     async def test_unknown_field_rejected_with_validation_error(
         self,
         api_client: AsyncClient,
+        override_dep: Any,
     ) -> None:
+        repo = _StubRepo(account_id=None)
+        _bind_repo(override_dep, signals_route, repo)
         signal_id = uuid4()
         response = await api_client.post(
             f"/api/signals/{signal_id}/approve",
@@ -451,10 +462,13 @@ class TestSignalApprove:
 
 class TestSignalReject:
     @pytest.mark.asyncio
-    async def test_with_diary_entry_returns_501_stub(
+    async def test_with_diary_entry_no_account_returns_409(
         self,
         api_client: AsyncClient,
+        override_dep: Any,
     ) -> None:
+        repo = _StubRepo(account_id=None)
+        _bind_repo(override_dep, signals_route, repo)
         signal_id = uuid4()
         response = await api_client.post(
             f"/api/signals/{signal_id}/reject",
@@ -466,14 +480,17 @@ class TestSignalReject:
             },
             **_csrf_kwargs(),
         )
-        assert response.status_code == 501
-        assert response.json()["error_code"] == "SIGNAL_HANDLER_NOT_WIRED"
+        assert response.status_code == 409
+        assert response.json()["error_code"] == "NO_ACTIVE_ACCOUNT"
 
     @pytest.mark.asyncio
     async def test_missing_diary_entry_returns_422(
         self,
         api_client: AsyncClient,
+        override_dep: Any,
     ) -> None:
+        repo = _StubRepo(account_id=None)
+        _bind_repo(override_dep, signals_route, repo)
         signal_id = uuid4()
         response = await api_client.post(
             f"/api/signals/{signal_id}/reject",
@@ -485,10 +502,13 @@ class TestSignalReject:
 
 class TestSignalDefer:
     @pytest.mark.asyncio
-    async def test_with_diary_entry_returns_501_stub(
+    async def test_with_diary_entry_no_account_returns_409(
         self,
         api_client: AsyncClient,
+        override_dep: Any,
     ) -> None:
+        repo = _StubRepo(account_id=None)
+        _bind_repo(override_dep, signals_route, repo)
         signal_id = uuid4()
         response = await api_client.post(
             f"/api/signals/{signal_id}/defer",
@@ -500,7 +520,8 @@ class TestSignalDefer:
             },
             **_csrf_kwargs(),
         )
-        assert response.status_code == 501
+        assert response.status_code == 409
+        assert response.json()["error_code"] == "NO_ACTIVE_ACCOUNT"
 
 
 # ---------------------------------------------------------------------------
