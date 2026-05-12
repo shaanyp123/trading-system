@@ -30,7 +30,8 @@ surface to make the adapter's calls compile + return controllable values.
 
 from __future__ import annotations
 
-from datetime import UTC
+import asyncio
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -391,6 +392,247 @@ class TestResolveContract:
         ref2 = await client.resolve_contract("/MES")
         # Same object instance (cache hit).
         assert ref1 is ref2
+
+
+# ---------------------------------------------------------------------------
+# TestSubscribeOrderStatus
+# ---------------------------------------------------------------------------
+
+
+class _OrderStatusEvent:
+    """Minimal stand-in for ib_async's IB.orderStatusEvent ('+=' Sigil)."""
+
+    def __init__(self) -> None:
+        self._handlers: list[Any] = []
+
+    def __iadd__(self, handler: Any) -> _OrderStatusEvent:
+        self._handlers.append(handler)
+        return self
+
+    def fire(self, trade: Any) -> None:
+        for handler in self._handlers:
+            handler(trade)
+
+    @property
+    def handler_count(self) -> int:
+        return len(self._handlers)
+
+
+def _fake_ib_with_event_class() -> type:
+    """A fake IB whose instance carries a real `orderStatusEvent` attr."""
+
+    class _FakeIBWithEvent:
+        def __init__(self) -> None:
+            self.serverVersion = 176
+            self._connected = False
+            self.orderStatusEvent = _OrderStatusEvent()
+            self.connectAsync = AsyncMock(side_effect=self._mark_connected)
+            self.qualifyContractsAsync = AsyncMock()
+            self.accountSummaryAsync = AsyncMock(return_value=[])
+            self.placeOrder = MagicMock(return_value=_default_trade())
+            self.cancelOrder = MagicMock()
+            self.openTrades = MagicMock(return_value=[])
+            self.positions = MagicMock(return_value=[])
+
+        async def _mark_connected(self, **_kw: Any) -> None:
+            self._connected = True
+
+        def isConnected(self) -> bool:
+            return self._connected
+
+        def disconnect(self) -> None:
+            self._connected = False
+
+    return _FakeIBWithEvent
+
+
+class TestSubscribeOrderStatus:
+    async def test_subscribe_attaches_once(self) -> None:
+        ib_cls = _fake_ib_with_event_class()
+        client = IbAsyncIbkrClient(ib_factory=ib_cls)
+        await client.connect()
+        ib_instance = client._ib  # type: ignore[attr-defined]
+        assert ib_instance is not None
+        cb: Any = AsyncMock()
+        await client.subscribe_order_status(cb)
+        assert ib_instance.orderStatusEvent.handler_count == 1
+        # Re-subscribing swaps the callback in place; the IB handler stays attached once.
+        cb2: Any = AsyncMock()
+        await client.subscribe_order_status(cb2)
+        assert ib_instance.orderStatusEvent.handler_count == 1
+
+    async def test_subscribe_swaps_callback(self) -> None:
+        ib_cls = _fake_ib_with_event_class()
+        client = IbAsyncIbkrClient(ib_factory=ib_cls)
+        await client.connect()
+        cb_old: Any = AsyncMock()
+        cb_new: Any = AsyncMock()
+        await client.subscribe_order_status(cb_old)
+        await client.subscribe_order_status(cb_new)
+        # Fire a trade with a valid Filled status; only the new callback runs.
+        ib_instance = client._ib  # type: ignore[attr-defined]
+        assert ib_instance is not None
+        trade = _build_trade_for_event(status="Filled")
+        ib_instance.orderStatusEvent.fire(trade)
+        # Yield to let the scheduled task run.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        cb_old.assert_not_called()
+        cb_new.assert_called_once()
+
+    async def test_callback_exception_swallowed(self) -> None:
+        ib_cls = _fake_ib_with_event_class()
+        client = IbAsyncIbkrClient(ib_factory=ib_cls)
+        await client.connect()
+        cb: Any = AsyncMock(side_effect=RuntimeError("misbehaving consumer"))
+        await client.subscribe_order_status(cb)
+        ib_instance = client._ib  # type: ignore[attr-defined]
+        assert ib_instance is not None
+        trade = _build_trade_for_event(status="Filled")
+        # No exception should propagate out of the event fire.
+        ib_instance.orderStatusEvent.fire(trade)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        cb.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# TestBuildOrderStatusUpdate
+# ---------------------------------------------------------------------------
+
+
+def _build_trade_for_event(
+    *,
+    status: str = "Filled",
+    order_ref: str = "strat123-param456-sig00000-0",
+    action: str = "BUY",
+    sec_type: str = "FUT",
+    symbol: str = "MES",
+    filled: float = 1.0,
+    remaining: float = 0.0,
+    avg_fill_price: float = 5234.75,
+    commissions: tuple[float, ...] = (1.25,),
+    order_id: int = 12345,
+    fill_times: tuple[datetime, ...] = (),
+) -> MagicMock:
+    """Construct a trade mock with the fields _build_order_status_update reads."""
+    from datetime import datetime as _dt
+
+    trade = MagicMock()
+    trade.order.orderRef = order_ref
+    trade.order.action = action
+    trade.order.orderId = order_id
+    trade.orderStatus.status = status
+    trade.orderStatus.filled = filled
+    trade.orderStatus.remaining = remaining
+    trade.orderStatus.avgFillPrice = avg_fill_price
+    trade.contract.secType = sec_type
+    trade.contract.symbol = symbol
+
+    fills = []
+    for i, comm in enumerate(commissions):
+        f = MagicMock()
+        f.commissionReport.commission = comm
+        f.time = fill_times[i] if i < len(fill_times) else _dt(2026, 5, 12, 21, 30 + i, tzinfo=UTC)
+        fills.append(f)
+    trade.fills = fills
+    return trade
+
+
+class TestBuildOrderStatusUpdate:
+    def test_filled_futures_translates_clean(self) -> None:
+        from decimal import Decimal
+
+        client = IbAsyncIbkrClient(ib_factory=_fake_ib_with_event_class())
+        trade = _build_trade_for_event()
+        update = client._build_order_status_update(trade)  # type: ignore[attr-defined]
+        assert update is not None
+        assert update.client_order_id == "strat123-param456-sig00000-0"
+        assert update.broker_order_id == 12345
+        assert update.status == "filled"
+        assert update.market == "/MES"
+        assert update.side == "buy"
+        assert update.cumulative_filled_quantity == Decimal("1.0")
+        assert update.avg_fill_price == Decimal("5234.75")
+        assert update.total_commission_usd == Decimal("1.25")
+        assert update.last_fill_at_utc is not None
+        assert update.observed_at_utc.tzinfo is UTC
+
+    def test_etf_market_no_slash_prefix(self) -> None:
+        client = IbAsyncIbkrClient(ib_factory=_fake_ib_with_event_class())
+        trade = _build_trade_for_event(sec_type="STK", symbol="TLT")
+        update = client._build_order_status_update(trade)  # type: ignore[attr-defined]
+        assert update is not None
+        assert update.market == "TLT"
+
+    def test_sell_action(self) -> None:
+        client = IbAsyncIbkrClient(ib_factory=_fake_ib_with_event_class())
+        trade = _build_trade_for_event(action="SELL")
+        update = client._build_order_status_update(trade)  # type: ignore[attr-defined]
+        assert update is not None
+        assert update.side == "sell"
+
+    def test_status_map_partial_fill(self) -> None:
+        client = IbAsyncIbkrClient(ib_factory=_fake_ib_with_event_class())
+        trade = _build_trade_for_event(status="PartiallyFilled")
+        update = client._build_order_status_update(trade)  # type: ignore[attr-defined]
+        assert update is not None
+        assert update.status == "partially_filled"
+
+    def test_status_map_submitted(self) -> None:
+        client = IbAsyncIbkrClient(ib_factory=_fake_ib_with_event_class())
+        trade = _build_trade_for_event(
+            status="Submitted", avg_fill_price=0.0, commissions=(), filled=0.0
+        )
+        update = client._build_order_status_update(trade)  # type: ignore[attr-defined]
+        assert update is not None
+        assert update.status == "submitted"
+        assert update.avg_fill_price is None
+        assert update.total_commission_usd == Decimal(0)
+
+    def test_status_map_unknown_collapses_to_submitted(self) -> None:
+        client = IbAsyncIbkrClient(ib_factory=_fake_ib_with_event_class())
+        trade = _build_trade_for_event(status="WeirdNewStatus")
+        update = client._build_order_status_update(trade)  # type: ignore[attr-defined]
+        assert update is not None
+        assert update.status == "submitted"
+
+    def test_missing_order_ref_returns_none(self) -> None:
+        client = IbAsyncIbkrClient(ib_factory=_fake_ib_with_event_class())
+        trade = _build_trade_for_event(order_ref="")
+        assert client._build_order_status_update(trade) is None  # type: ignore[attr-defined]
+
+    def test_commission_sum_across_multiple_fills(self) -> None:
+        from decimal import Decimal
+
+        client = IbAsyncIbkrClient(ib_factory=_fake_ib_with_event_class())
+        trade = _build_trade_for_event(commissions=(0.50, 0.75, 1.00))
+        update = client._build_order_status_update(trade)  # type: ignore[attr-defined]
+        assert update is not None
+        assert update.total_commission_usd == Decimal("2.25")
+
+    def test_last_fill_at_picks_max(self) -> None:
+        from datetime import datetime as _dt
+
+        client = IbAsyncIbkrClient(ib_factory=_fake_ib_with_event_class())
+        t0 = _dt(2026, 5, 12, 21, 30, tzinfo=UTC)
+        t1 = _dt(2026, 5, 12, 21, 35, tzinfo=UTC)
+        t2 = _dt(2026, 5, 12, 21, 33, tzinfo=UTC)
+        trade = _build_trade_for_event(commissions=(0.5, 0.5, 0.5), fill_times=(t0, t1, t2))
+        update = client._build_order_status_update(trade)  # type: ignore[attr-defined]
+        assert update is not None
+        assert update.last_fill_at_utc == t1
+
+    def test_naive_fill_time_coerced_to_utc(self) -> None:
+        from datetime import datetime as _dt
+
+        client = IbAsyncIbkrClient(ib_factory=_fake_ib_with_event_class())
+        naive = _dt(2026, 5, 12, 21, 30)
+        trade = _build_trade_for_event(commissions=(0.5,), fill_times=(naive,))
+        update = client._build_order_status_update(trade)  # type: ignore[attr-defined]
+        assert update is not None
+        assert update.last_fill_at_utc is not None
+        assert update.last_fill_at_utc.tzinfo is UTC
 
 
 # ---------------------------------------------------------------------------

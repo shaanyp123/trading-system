@@ -72,6 +72,7 @@ from services.execution.types import (
     IbkrOrderType,
     IbkrPlacementError,
     IbkrPlaceOrderRequest,
+    OrderStatusUpdate,
 )
 
 log = structlog.get_logger()
@@ -543,6 +544,13 @@ class OrderPlacementWorker:
         self._env: Environment = env
         self._poll_interval = poll_interval_seconds
         self._stop_event = asyncio.Event()
+        self._order_status_subscribed = False
+        # Tracks broker_order_ids we've already emitted a "fill" SSE for
+        # so a re-sent ``Filled`` status from IBKR on reconnect doesn't
+        # duplicate the embed. The set is in-process only; a process
+        # restart re-emits, which is acceptable — the dispatcher dedupes
+        # by `order_filled:<order_id>` at the webhook_pusher layer.
+        self._emitted_fill_order_ids: set[int] = set()
         self._log = log.bind(
             worker="order_placement",
             account_id=str(account_id),
@@ -603,6 +611,20 @@ class OrderPlacementWorker:
         self._log.info("order_placement_worker_started", poll_interval=self._poll_interval)
         try:
             while not self._stop_event.is_set():
+                # Best-effort: subscribe to the IBKR orderStatus stream on
+                # first iteration once the broker is reachable. We retry
+                # in subsequent iterations if it fails so a flapping
+                # connection at startup eventually wires the listener.
+                if not self._order_status_subscribed:
+                    try:
+                        await self._ibkr_client.subscribe_order_status(self._on_order_status)
+                        self._order_status_subscribed = True
+                        self._log.info("order_placement_orderstatus_subscribed")
+                    except Exception as exc:
+                        self._log.warning(
+                            "order_placement_orderstatus_subscribe_deferred",
+                            error=str(exc),
+                        )
                 try:
                     await self.run_once()
                 except Exception as exc:
@@ -613,6 +635,91 @@ class OrderPlacementWorker:
                     pass  # normal cadence
         finally:
             self._log.info("order_placement_worker_stopped")
+
+    async def _on_order_status(self, update: OrderStatusUpdate) -> None:
+        """Callback registered with the IBKR adapter's orderStatusEvent.
+
+        Acts on terminal-fill transitions only — emits a canonical
+        ``fill`` SSE envelope so the webhook_pusher subscriber routes it
+        to Discord ``#fills`` (and any future SSE consumer picks it up
+        too). Other transitions (Submitted, PartiallyFilled, Cancelled,
+        Rejected) are observed-only for now; the placeOrder path's
+        ``order_placed`` audit + SSE emit already covers Submitted, and
+        terminal cancel/reject paths land alongside the reconciliation
+        + retry follow-ups.
+
+        signal_id resolution: looked up by ``client_order_id`` from the
+        orders table. The placement path inserted the orders row before
+        the broker fill (audit-first); by the time the fill event
+        arrives, the row is durable. Missing rows are logged at WARNING
+        and the emit is skipped — IBKR fires Filled exactly once per
+        order so a missing row indicates either operator-manual TWS
+        activity (no signal_id available) or a race we should investigate.
+        """
+        if update.status != "filled":
+            return
+        if update.broker_order_id in self._emitted_fill_order_ids:
+            self._log.info(
+                "order_placement_fill_already_emitted",
+                broker_order_id=update.broker_order_id,
+                client_order_id=update.client_order_id,
+            )
+            return
+
+        async with self._session_factory() as session:
+            row = (
+                await session.execute(
+                    text("SELECT signal_id FROM orders WHERE client_order_id = :cid"),
+                    {"cid": update.client_order_id},
+                )
+            ).fetchone()
+        if row is None:
+            self._log.warning(
+                "order_placement_fill_unknown_order",
+                client_order_id=update.client_order_id,
+                broker_order_id=update.broker_order_id,
+            )
+            return
+
+        signal_id: UUID = row.signal_id
+        filled_at = update.last_fill_at_utc or update.observed_at_utc
+        fill_price = update.avg_fill_price or Decimal(0)
+        try:
+            from services.api.sse import emit_sse
+
+            await emit_sse(
+                "fill",
+                {
+                    "order_id": str(update.broker_order_id),
+                    "client_order_id": update.client_order_id,
+                    "signal_id": str(signal_id),
+                    "market": update.market,
+                    "side": update.side,
+                    "quantity": str(update.cumulative_filled_quantity),
+                    "fill_price": str(fill_price),
+                    "commission_usd": str(update.total_commission_usd),
+                    "filled_at_utc": filled_at.isoformat(),
+                    "environment": self._env,
+                },
+            )
+        except Exception:
+            self._log.exception(
+                "order_placement_fill_sse_emit_failed",
+                client_order_id=update.client_order_id,
+                broker_order_id=update.broker_order_id,
+            )
+            return
+
+        self._emitted_fill_order_ids.add(update.broker_order_id)
+        self._log.info(
+            "order_placement_fill_sse_emitted",
+            client_order_id=update.client_order_id,
+            broker_order_id=update.broker_order_id,
+            signal_id=str(signal_id),
+            quantity=str(update.cumulative_filled_quantity),
+            fill_price=str(fill_price),
+            commission_usd=str(update.total_commission_usd),
+        )
 
 
 __all__ = [

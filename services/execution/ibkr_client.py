@@ -39,6 +39,7 @@ from services.execution.types import (
     IbkrPlaceOrderRequest,
     IbkrPlaceOrderResult,
     IbkrPosition,
+    OrderStatusCallback,
 )
 
 
@@ -152,6 +153,37 @@ class IbkrClient(Protocol):
         Raises ``KeyError`` if the market is not in the Phase 1
         sub-universe (locked in
         ``strategies.v1_trend_following.parameters.V1_CANDIDATE_UNIVERSE``).
+        """
+        ...
+
+    async def subscribe_order_status(self, callback: OrderStatusCallback) -> None:
+        """Register an async callback fired on every order-status transition.
+
+        The callback receives a fully-populated
+        :class:`services.execution.types.OrderStatusUpdate` per IBKR
+        ``orderStatusEvent``. Implementations MUST:
+
+        * Be idempotent — calling twice with the same callback registers
+          the callback exactly once. (The adapter uses object-identity to
+          dedupe.)
+        * Schedule callback invocations off the broker event loop so a
+          slow callback can't backpressure the broker's event delivery.
+        * Catch exceptions raised by the callback + log them WITHOUT
+          re-raising — a misbehaving callback must not crash the broker
+          connection. Critical fill-handling logic still has to defend
+          itself, but the adapter provides the outer try/except.
+
+        Required pre-condition: :meth:`connect` must have been called at
+        least once (the underlying ``ib_async.IB`` instance has to exist
+        before its ``orderStatusEvent`` is attachable). Implementations
+        MAY assert this; the worker code path calls ``connect`` before
+        subscribing.
+
+        No deregistration API in Phase 1: the worker subscribes once at
+        startup and the adapter holds the reference for the process'
+        lifetime. Multi-callback support is deliberately out of scope —
+        the worker is the only consumer today and a single callback
+        keeps the eventual idempotency surface narrow.
         """
         ...
 

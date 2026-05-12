@@ -14,6 +14,7 @@ A06 enforced — all timestamps tz-aware UTC.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -215,6 +216,67 @@ class IbkrConnectionState:
     last_error: str | None
     client_id: int  # the TWS API clientId used by this process
     server_version: int | None  # IBKR TWS protocol version
+
+
+#: Broker-agnostic surface for one `orderStatusEvent` from the IBKR adapter.
+#: The IBKR side surfaces a richer enum (PendingSubmit / Submitted /
+#: PreSubmitted / PartiallyFilled / Filled / Cancelled / ApiCancelled /
+#: Inactive / ...); the adapter maps those down to this narrower locked
+#: set so subscribers don't have to care about the IBKR-specific ones.
+#:
+#: ``submitted`` collapses PendingSubmit + Submitted + PreSubmitted (the
+#: order is live at the broker, no fill yet). ``inactive`` is the
+#: post-cancel terminal state IBKR uses for a few odd code paths; we
+#: treat it as a no-op from the SSE consumer's perspective.
+OrderStatusKind = Literal[
+    "submitted",
+    "partially_filled",
+    "filled",
+    "cancelled",
+    "rejected",
+    "inactive",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class OrderStatusUpdate:
+    """One status-event update from the broker's order-status stream.
+
+    Surfaced through ``IbkrClient.subscribe_order_status`` so the
+    backend can react to live transitions (Submitted → PartiallyFilled
+    → Filled → ...) without polling. The IBKR side fires
+    ``orderStatusEvent`` for every transition; the adapter maps each
+    raw event to this dataclass before invoking the user callback.
+
+    The ``cumulative_filled_quantity`` + ``avg_fill_price`` +
+    ``total_commission_usd`` fields aggregate across all fills observed
+    so far on this order — so the consumer of a ``status='filled'``
+    update has everything it needs to render the Discord ``#fills``
+    embed and the web fills-feed row in one place.
+
+    ``last_fill_at_utc`` is ``None`` for pre-fill statuses (submitted,
+    rejected) where the order has no execution legs yet; ``observed_at_utc``
+    is always populated as the adapter's receipt timestamp so SSE
+    consumers can sort/correlate even without a fill timestamp.
+    """
+
+    client_order_id: str  # Trade.order.orderRef — the 33-char client ID
+    broker_order_id: int  # Trade.order.orderId
+    status: OrderStatusKind  # mapped from Trade.orderStatus.status
+    market: str  # derived from Trade.contract (e.g., "/MES" or "TLT")
+    side: IbkrOrderSide  # derived from Trade.order.action
+    cumulative_filled_quantity: Decimal  # Trade.orderStatus.filled
+    remaining_quantity: Decimal  # Trade.orderStatus.remaining
+    avg_fill_price: Decimal | None  # Trade.orderStatus.avgFillPrice; None pre-fill
+    total_commission_usd: Decimal  # sum across trade.fills[].commissionReport.commission
+    last_fill_at_utc: datetime | None  # most recent fill.time; None pre-fill
+    observed_at_utc: datetime  # adapter-side receipt timestamp
+
+
+#: Callback signature for ``IbkrClient.subscribe_order_status``. Async so
+#: the implementation can do DB lookups / SSE emits without blocking the
+#: ib_async event loop.
+OrderStatusCallback = Callable[[OrderStatusUpdate], Awaitable[None]]
 
 
 @dataclass(frozen=True, slots=True)
