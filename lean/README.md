@@ -39,11 +39,14 @@ LEAN's `lean.json` defines three environments:
   dependency.
 * **`paper-ibkr`** — paper trading against IBKR's paper account via the
   `ib_gateway` sidecar container (Pivot-PR-B). Connects to
-  `ib_gateway:4002`. Use this for the 30-CME-session paper clock before
-  live cutover (Week 8).
+  `ib_gateway:4004` (the externally-published socat port; the internal
+  gateway listens on 127.0.0.1:4002 inside the container — see
+  `deploy/ibkr/README.md` Step 4). Use this for the 30-CME-session paper
+  clock before live cutover (Week 8).
 * **`live-ibkr`** — live trading against IBKR's live account via
-  `ib_gateway`. Connects to `ib_gateway:4001`. Production env after the
-  Week 8 cutover ceremony.
+  `ib_gateway`. Connects to `ib_gateway:4003` (the externally-published
+  socat port; internal gateway on 127.0.0.1:4001). Production env after
+  the Week 8 cutover ceremony.
 
 Environment selection is done at container-start via the `LEAN_LIVE_MODE`
 env var (set in `deploy/.env`). The `lean_local` container's entrypoint

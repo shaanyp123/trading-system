@@ -42,7 +42,7 @@
       "ib-password": "${LEAN_IBKR_PASSWORD}",
       "ib-trading-mode": "paper",
       "ib-gateway-host": "ib_gateway",
-      "ib-gateway-port": "4002"
+      "ib-gateway-port": "4004"
     },
     "live-ibkr": {
       "$comment": "Live trading against IBKR's real account via ib_gateway container (Pivot-PR-B). Production env after Week 8 live cutover.",
@@ -53,7 +53,7 @@
       "ib-password": "${LEAN_IBKR_PASSWORD}",
       "ib-trading-mode": "live",
       "ib-gateway-host": "ib_gateway",
-      "ib-gateway-port": "4001"
+      "ib-gateway-port": "4003"
     }
   }
 }

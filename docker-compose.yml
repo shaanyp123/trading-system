@@ -320,11 +320,16 @@ services:
   #
   # gnzsnz/ib-gateway-docker hosts IB Gateway (IBKR's TWS API gateway) in
   # a container. The `services/execution/ibkr_adapter.py` connects via
-  # `ib-async` to this container on port 4002 (paper) / 4001 (live).
+  # `ib-async` to this container on port 4004 (paper) / 4003 (live) — the
+  # externally-published socat ports per gnzsnz convention. The internal
+  # IB Gateway listens on 127.0.0.1:4002 (paper) / :4001 (live) inside the
+  # container, but those ports are not reachable from outside; socat
+  # forwards from 0.0.0.0:4004/4003 to the internal listener. Discovered
+  # at Pivot-PR-B Step 5 smoke 2026-05-12.
   #
   # Networks: `internal` ONLY. NOT exposed to Caddy or the public internet.
   # The TWS API protocol is unauthenticated at the network layer (auth is
-  # via username/password at session-open + the `clientId`); exposing 4001/4002
+  # via username/password at session-open + the `clientId`); exposing 4003/4004
   # publicly would let anyone with the credentials place orders. Keep on
   # the internal Docker network only.
   #
@@ -363,12 +368,15 @@ services:
       TWS_ACCEPT_INCOMING: 'accept'
       READ_ONLY_API: 'no'
     healthcheck:
-      # Port 4002 (paper) is the TWS API listener; if the gateway is
-      # logged in + healthy, this port accepts TCP connections. Use
-      # bash's /dev/tcp pseudo-device because `nc` is NOT installed in
-      # the gnzsnz/ib-gateway:stable image (verified at deploy-time
+      # Probe the externally-published socat port (4004 paper / 4003 live)
+      # rather than the internal gateway port (4002/4001). Inside the
+      # container, both bind to localhost, but probing the socat port
+      # catches the failure mode where the gateway listens but socat dies
+      # — which would silently break every external caller. Use bash's
+      # /dev/tcp pseudo-device because `nc` is NOT installed in the
+      # gnzsnz/ib-gateway:stable image (verified at deploy-time
       # 2026-05-12); bash IS installed (/usr/bin/bash).
-      test: ['CMD-SHELL', 'bash -c "</dev/tcp/localhost/4002" 2>/dev/null || bash -c "</dev/tcp/localhost/4001" 2>/dev/null || exit 1']
+      test: ['CMD-SHELL', 'bash -c "</dev/tcp/localhost/4004" 2>/dev/null || bash -c "</dev/tcp/localhost/4003" 2>/dev/null || exit 1']
       interval: 60s
       timeout: 10s
       retries: 3
