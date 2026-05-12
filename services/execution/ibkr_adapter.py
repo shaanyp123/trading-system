@@ -39,6 +39,7 @@ against the real broker; we treat the smoke as a pre-deploy gate.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Final
@@ -50,12 +51,16 @@ from services.execution.types import (
     IbkrCancelOrderResult,
     IbkrConnectionState,
     IbkrContractRef,
+    IbkrOrderSide,
     IbkrOrderStatus,
     IbkrPlacementError,
     IbkrPlaceOrderRequest,
     IbkrPlaceOrderResult,
     IbkrPosition,
     IbkrRejectionCategory,
+    OrderStatusCallback,
+    OrderStatusKind,
+    OrderStatusUpdate,
 )
 
 if TYPE_CHECKING:
@@ -84,6 +89,27 @@ _IBKR_STATUS_MAP: Final[dict[str, IbkrOrderStatus]] = {
     "Cancelled": "cancelled",
     "Filled": "filled",
     "Inactive": "rejected",
+}
+
+
+#: Map from ib_async order-status strings to the broker-agnostic
+#: ``OrderStatusKind`` enum surfaced via ``subscribe_order_status``. Same
+#: source strings as ``_IBKR_STATUS_MAP`` but a different downstream
+#: enum — the placement path needs ``pending_submit`` separated from
+#: ``submitted`` because ``orders.status`` distinguishes them; the
+#: subscription path collapses them because consumers care about
+#: "is it live at the broker?" vs. "did it terminate?".
+_ORDER_STATUS_KIND_MAP: Final[dict[str, OrderStatusKind]] = {
+    "PendingSubmit": "submitted",
+    "PendingCancel": "submitted",
+    "PreSubmitted": "submitted",
+    "Submitted": "submitted",
+    "ApiPending": "submitted",
+    "ApiCancelled": "cancelled",
+    "Cancelled": "cancelled",
+    "PartiallyFilled": "partially_filled",
+    "Filled": "filled",
+    "Inactive": "inactive",
 }
 
 
@@ -184,6 +210,16 @@ class IbAsyncIbkrClient:
         self._ib: IB | None = None  # set on first connect()
         # Cache of resolved contract objects keyed by market symbol.
         self._contract_cache: dict[str, IbkrContractRef] = {}
+        # Single registered order-status callback + the asyncio loop it
+        # was registered on. The loop is captured at subscribe time
+        # because ib_async dispatches events from arbitrary threads and
+        # we need a stable loop to schedule the user's async callback
+        # back into.
+        self._order_status_callback: OrderStatusCallback | None = None
+        self._order_status_loop: asyncio.AbstractEventLoop | None = None
+        # Tracks whether we've already wired the IB event handler so
+        # subscribe_order_status is idempotent across reconnects.
+        self._order_status_wired: bool = False
 
     async def connect(self) -> IbkrConnectionState:
         if self._ib is None:
@@ -523,6 +559,160 @@ class IbAsyncIbkrClient:
         )
         self._contract_cache[market] = ref
         return ref
+
+    async def subscribe_order_status(self, callback: OrderStatusCallback) -> None:
+        """Wire ``callback`` onto ``ib.orderStatusEvent``.
+
+        Idempotent: subsequent calls with the same callable replace the
+        registered callback in place (no double-fire). The first call
+        attaches our internal sync handler to ``ib.orderStatusEvent``;
+        subsequent calls just swap the stored callback.
+
+        Captures the current running event loop so the sync handler
+        (invoked by ib_async from the network reader thread) can
+        ``asyncio.run_coroutine_threadsafe`` the user's async callback
+        back into the worker's loop.
+        """
+        ib = await self._ensure_connected()
+        self._order_status_callback = callback
+        try:
+            self._order_status_loop = asyncio.get_running_loop()
+        except RuntimeError as exc:  # pragma: no cover — only fires outside a running loop
+            raise RuntimeError(
+                "subscribe_order_status() must be called from within a running asyncio loop"
+            ) from exc
+
+        if not self._order_status_wired:
+            try:
+                ib.orderStatusEvent += self._on_order_status
+            except Exception as exc:  # pragma: no cover — ib_async should always expose this
+                log.error("ibkr_orderstatus_subscribe_failed", error=str(exc))
+                raise
+            self._order_status_wired = True
+            log.info(
+                "ibkr_orderstatus_subscribed",
+                client_id=self._client_id,
+            )
+
+    def _on_order_status(self, trade: Any) -> None:
+        """Sync handler attached to ib_async.IB.orderStatusEvent.
+
+        ib_async invokes this from its network reader thread on every
+        order-status transition. We schedule the user's async callback
+        back onto the loop captured at subscribe time + return immediately
+        so the reader thread isn't blocked.
+
+        Exceptions raised during update construction are swallowed (logged
+        only) so a malformed Trade can't kill the broker connection.
+        """
+        callback = self._order_status_callback
+        loop = self._order_status_loop
+        if callback is None or loop is None:
+            return
+        try:
+            update = self._build_order_status_update(trade)
+        except Exception as exc:
+            log.warning(
+                "ibkr_orderstatus_build_failed",
+                error=str(exc),
+                trade_repr=repr(trade)[:200],
+            )
+            return
+        if update is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self._invoke_callback(callback, update), loop)
+        except Exception as exc:  # pragma: no cover — loop should always accept
+            log.warning("ibkr_orderstatus_schedule_failed", error=str(exc))
+
+    async def _invoke_callback(
+        self, callback: OrderStatusCallback, update: OrderStatusUpdate
+    ) -> None:
+        """Wrap the user callback in a try/except so a misbehaving consumer
+        can't crash the IBKR adapter — IBKR events keep flowing."""
+        try:
+            await callback(update)
+        except Exception:
+            log.exception(
+                "ibkr_orderstatus_callback_error",
+                client_order_id=update.client_order_id,
+                status=update.status,
+            )
+
+    def _build_order_status_update(self, trade: Any) -> OrderStatusUpdate | None:
+        """Translate an ib_async Trade into an OrderStatusUpdate.
+
+        Returns ``None`` if the trade lacks the minimal fields we need
+        (no orderRef → no signal lookup possible; no order_status →
+        nothing to surface). Logs at warning so operators can debug
+        unusual transitions.
+        """
+        order = getattr(trade, "order", None)
+        order_status = getattr(trade, "orderStatus", None)
+        contract = getattr(trade, "contract", None)
+        if order is None or order_status is None or contract is None:
+            log.warning(
+                "ibkr_orderstatus_trade_missing_fields",
+                has_order=order is not None,
+                has_status=order_status is not None,
+                has_contract=contract is not None,
+            )
+            return None
+
+        client_order_id = getattr(order, "orderRef", "") or ""
+        if not client_order_id:
+            # Manual TWS-side orders carry no orderRef. We can't map them
+            # back to a signal so skip silently — this is expected when
+            # an operator places a hand order in TWS for diagnostics.
+            return None
+
+        raw_status = getattr(order_status, "status", "")
+        status: OrderStatusKind = _ORDER_STATUS_KIND_MAP.get(raw_status, "submitted")
+
+        action = getattr(order, "action", "").upper()
+        side: IbkrOrderSide = "buy" if action == "BUY" else "sell"
+
+        sec_type = getattr(contract, "secType", "")
+        symbol = getattr(contract, "symbol", "")
+        market = f"/{symbol}" if sec_type == "FUT" else symbol
+
+        cumulative = _to_decimal(getattr(order_status, "filled", 0))
+        remaining = _to_decimal(getattr(order_status, "remaining", 0))
+        avg_fill_price_raw = getattr(order_status, "avgFillPrice", 0)
+        avg_fill_price: Decimal | None = (
+            _to_decimal(avg_fill_price_raw) if avg_fill_price_raw not in (None, 0, 0.0) else None
+        )
+
+        # Aggregate commission across all fills on this trade.
+        total_commission = Decimal(0)
+        last_fill_at: datetime | None = None
+        for fill in getattr(trade, "fills", []) or []:
+            report = getattr(fill, "commissionReport", None)
+            if report is not None:
+                comm = getattr(report, "commission", None)
+                if comm is not None:
+                    total_commission += _to_decimal(comm)
+            fill_time = getattr(fill, "time", None)
+            if isinstance(fill_time, datetime):
+                aware = fill_time if fill_time.tzinfo is not None else fill_time.replace(tzinfo=UTC)
+                if last_fill_at is None or aware > last_fill_at:
+                    last_fill_at = aware
+
+        broker_order_id = int(getattr(order, "orderId", 0) or 0)
+
+        return OrderStatusUpdate(
+            client_order_id=client_order_id,
+            broker_order_id=broker_order_id,
+            status=status,
+            market=market,
+            side=side,
+            cumulative_filled_quantity=cumulative,
+            remaining_quantity=remaining,
+            avg_fill_price=avg_fill_price,
+            total_commission_usd=total_commission,
+            last_fill_at_utc=last_fill_at,
+            observed_at_utc=_ts_utc(),
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers

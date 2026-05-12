@@ -7,17 +7,23 @@ and the session factory.
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from decimal import Decimal
-from uuid import uuid4
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+from uuid import UUID, uuid4
 
 import pytest
 
+from services.execution.types import OrderStatusUpdate
 from services.risk.order_placement_worker import (
     DEFAULT_POLL_INTERVAL_SECONDS,
     RETRY_N_PHASE_1,
     ApprovedSignalRow,
     OrderPlacementError,
     OrderPlacementPlan,
+    OrderPlacementWorker,
     _broker_status_to_orders_status,
     _build_client_order_id,
     plan_order_placement,
@@ -228,3 +234,162 @@ class TestModuleContract:
 
         for name in mod.__all__:
             assert hasattr(mod, name), f"__all__ contains {name!r} but module lacks it"
+
+
+# ---------------------------------------------------------------------------
+# order_filled SSE subscription
+# ---------------------------------------------------------------------------
+
+
+def _build_status_update(
+    *,
+    status: str = "filled",
+    client_order_id: str = "aaaaaaaa-bbbbbbbb-cccccccc-0",
+    broker_order_id: int = 8800,
+    market: str = "/MES",
+    side: str = "buy",
+    cumulative: str = "1",
+    fill_price: str | None = "5234.75",
+    commission: str = "1.25",
+    last_fill_at: datetime | None = None,
+) -> OrderStatusUpdate:
+    return OrderStatusUpdate(
+        client_order_id=client_order_id,
+        broker_order_id=broker_order_id,
+        status=status,  # type: ignore[arg-type]
+        market=market,
+        side=side,  # type: ignore[arg-type]
+        cumulative_filled_quantity=Decimal(cumulative),
+        remaining_quantity=Decimal(0),
+        avg_fill_price=Decimal(fill_price) if fill_price is not None else None,
+        total_commission_usd=Decimal(commission),
+        last_fill_at_utc=last_fill_at or datetime(2026, 5, 12, 21, 32, 15, tzinfo=UTC),
+        observed_at_utc=datetime(2026, 5, 12, 21, 32, 15, tzinfo=UTC),
+    )
+
+
+def _build_worker_with_signal_lookup(*, signal_id: UUID) -> tuple[OrderPlacementWorker, MagicMock]:
+    """Wire a worker whose session_factory returns ``signal_id`` for any SELECT,
+    and an IBKR client whose subscribe_order_status is a no-op AsyncMock."""
+    session = MagicMock()
+    row = MagicMock()
+    row.signal_id = signal_id
+    fetched = MagicMock()
+    fetched.fetchone = MagicMock(return_value=row)
+    session.execute = AsyncMock(return_value=fetched)
+
+    @asynccontextmanager
+    async def factory() -> Any:
+        yield session
+
+    ibkr = MagicMock()
+    ibkr.subscribe_order_status = AsyncMock()
+
+    worker = OrderPlacementWorker(
+        session_factory=factory,  # type: ignore[arg-type]
+        ibkr_client=ibkr,
+        account_id=uuid4(),
+        env="paper",
+    )
+    return worker, session
+
+
+class TestOnOrderStatusEmit:
+    """Verify _on_order_status emits fill SSE only on terminal filled status."""
+
+    async def test_non_filled_status_ignored(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        worker, session = _build_worker_with_signal_lookup(signal_id=uuid4())
+        emit = AsyncMock(return_value=99)
+        monkeypatch.setattr("services.api.sse.emit_sse", emit)
+        await worker._on_order_status(_build_status_update(status="submitted"))
+        emit.assert_not_called()
+        # DB shouldn't be queried for non-fills.
+        session.execute.assert_not_called()
+
+    async def test_filled_emits_sse_with_expected_shape(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        signal_id = uuid4()
+        worker, _ = _build_worker_with_signal_lookup(signal_id=signal_id)
+        emit = AsyncMock(return_value=42)
+        monkeypatch.setattr("services.api.sse.emit_sse", emit)
+        await worker._on_order_status(
+            _build_status_update(
+                status="filled",
+                client_order_id="strategy-paramset-signal-0",
+                broker_order_id=1234,
+                market="/MES",
+                side="sell",
+                cumulative="2",
+                fill_price="5230.25",
+                commission="2.50",
+            )
+        )
+        emit.assert_awaited_once()
+        event_type, payload = emit.await_args.args  # type: ignore[union-attr]
+        assert event_type == "fill"
+        assert payload["order_id"] == "1234"
+        assert payload["client_order_id"] == "strategy-paramset-signal-0"
+        assert payload["signal_id"] == str(signal_id)
+        assert payload["market"] == "/MES"
+        assert payload["side"] == "sell"
+        assert payload["quantity"] == "2"
+        assert payload["fill_price"] == "5230.25"
+        assert payload["commission_usd"] == "2.50"
+        assert payload["environment"] == "paper"
+        assert payload["filled_at_utc"].endswith("+00:00")
+
+    async def test_filled_no_avg_price_emits_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        worker, _ = _build_worker_with_signal_lookup(signal_id=uuid4())
+        emit = AsyncMock(return_value=1)
+        monkeypatch.setattr("services.api.sse.emit_sse", emit)
+        await worker._on_order_status(_build_status_update(status="filled", fill_price=None))
+        _, payload = emit.await_args.args  # type: ignore[union-attr]
+        assert payload["fill_price"] == "0"
+
+    async def test_duplicate_filled_event_deduped_in_process(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worker, _ = _build_worker_with_signal_lookup(signal_id=uuid4())
+        emit = AsyncMock(return_value=1)
+        monkeypatch.setattr("services.api.sse.emit_sse", emit)
+        u = _build_status_update(status="filled", broker_order_id=9999)
+        await worker._on_order_status(u)
+        await worker._on_order_status(u)
+        assert emit.await_count == 1
+
+    async def test_unknown_client_order_id_logs_and_skips_emit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Stub a session factory whose SELECT returns no row.
+        session = MagicMock()
+        fetched = MagicMock()
+        fetched.fetchone = MagicMock(return_value=None)
+        session.execute = AsyncMock(return_value=fetched)
+
+        @asynccontextmanager
+        async def factory() -> Any:
+            yield session
+
+        ibkr = MagicMock()
+        ibkr.subscribe_order_status = AsyncMock()
+        worker = OrderPlacementWorker(
+            session_factory=factory,  # type: ignore[arg-type]
+            ibkr_client=ibkr,
+            account_id=uuid4(),
+            env="paper",
+        )
+        emit = AsyncMock()
+        monkeypatch.setattr("services.api.sse.emit_sse", emit)
+        await worker._on_order_status(_build_status_update(status="filled"))
+        emit.assert_not_called()
+
+    async def test_emit_sse_exception_swallowed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        worker, _ = _build_worker_with_signal_lookup(signal_id=uuid4())
+        emit = AsyncMock(side_effect=RuntimeError("multiplexer down"))
+        monkeypatch.setattr("services.api.sse.emit_sse", emit)
+        # Must not raise — the broker connection keeps flowing on emit failure.
+        await worker._on_order_status(_build_status_update(status="filled"))
+        # Not added to the dedupe set on failed emit (so a retry on the
+        # next event still attempts).
+        assert worker._emitted_fill_order_ids == set()
