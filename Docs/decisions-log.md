@@ -3247,3 +3247,93 @@ audit_log row count unchanged (still 2 — the LEAN heartbeat path is operationa
   - **Carried from this session:** docker volume manipulation via transient containers (`docker run --rm -v trading_lean_data:... alpine ...`) for seed ceremonies
 
 - **Smoke-tested via:** (a) volume contents check `docker run --rm -v trading_lean_data:/Lean/Data alpine ls /Lean/Data/equity/usa/daily/ | grep -iE "tlt|ief|shy|tip"` → 4 zips present; (b) format round-trip `unzip -p /Lean/Data/equity/usa/daily/tlt.zip tlt.csv | tail -3` → 855600/10000 = $85.56 matches yfinance close; (c) post-restart heartbeat `docker logs trading-api-1 | grep "lean_strategy_initialized"` → 202 in 1.67ms; (d) audit chain `verify_chain --env paper` → `CHAIN OK: 2 rows verified` (unchanged; chain will grow at first signal_emitted post-21:30 UTC); (e) cycle_watcher PID alive `ps -ef | grep cycle_watcher | grep -v grep` → running.
+
+---
+
+### 2026-05-12 — Phase 1 futures-data path memo — 4 options costed; DataBento via LEAN CLI is the recommended unblock (decision item #2 from the seed-ceremony entry above)
+
+- **Spec reference:** the seed-ceremony entry above flagged "Decide futures data path" as outstanding item #2 — "Either subscribe to QC AlgoSeek US Futures Daily History data package, or DataBento via LEAN CLI, or accept the current 4-of-11 universe coverage indefinitely". This memo costs out the 4 viable paths against the operator's burn ledger + Phase 1 strategic intent, and recommends a specific path. **The operator still owns the decision** — this memo is research that supports the decision, not the decision itself.
+
+- **Why this memo lands now:** the 21:30 UTC cycle-verification window (after the seed-ceremony restart at 19:14 UTC) is wall-clock-bound; ~2 hours of no-code-path-risk research time. Producing this memo in-window means the next time the operator engages on "should I buy futures data?", the cost-impact framing + recommendation is ready, not a re-investigation.
+
+- **Phase 1 universe gap recap.** Post-seed-ceremony coverage is 4-of-11: `TLT IEF SHY TIP` (bond ETFs, via yfinance free public data, seeded 2026-05-12). Uncovered: `/MES /MNQ /MYM /M2K /MGC /MCL /MBT` (7 CME micro futures). Strategy logic (`strategies/v1_trend_following/`) is universe-agnostic — Donchian/MA/Hurst/ATR all derive from daily OHLCV regardless of instrument type — so the gap is purely a data-availability constraint, not a logic constraint.
+
+- **The 4 options (costed):**
+
+  | Option | Year-1 cost | Recurring | Engineering | Architectural fit | Vendor count |
+  |---|---|---|---|---|---|
+  | **A. QC AlgoSeek via Lean CLI** | **$1,175-$2,480** | $965-$2,165/yr | Low (lean CLI handles format) | Perfect | +0 (operator already has QC org) |
+  | **B. DataBento via Lean CLI (Recommended)** | **~$0 (under $125 free credit)** | $0 (usage-based, no commitment) | Low (lean CLI integrates DataBento via `--data-provider-historical DataBento`) | Perfect | +1 (DataBento account + API key in sops) |
+  | **C. Yahoo continuous-futures-as-equities hack** | **$0** | $0 | Medium (~2h modify `lean/v1_strategy.py` to register futures as equities + remap LEAN-side market identifiers) | Degraded (LEAN loses continuous-contract roll detection; the api-side IBKR adapter still gets `market="/MES"` and resolves the front-month correctly) | +0 (yfinance already used for ETFs) |
+  | **D. Accept 4-of-11 indefinitely** | **$0** | $0 | $0 | Strategically incomplete — loses the trend-following futures arm; bond-ETF-only retains the defensive cluster but eliminates the cross-asset diversification Phase 1 was designed for | +0 |
+
+- **Option A — QC AlgoSeek via Lean CLI — detailed costing:**
+  - Per QC's `Documentation/05 Lean CLI/05 Datasets/05 QuantConnect/01 Download By Ticker/02 Costs/05 Futures.php`: "One file per ticker per data format. Trade, quote, and open interest data are separate files." + "1500 QCC = $15 USD" per file at daily resolution. **Consolidated per-ticker files (NOT per-day)** — a single trade-data file covers the entire historical window.
+  - For our 7 futures × 2 formats required (`trade` + `openinterest` — strategy's `data_mapping_mode=DataMappingMode.OPEN_INTEREST` requires OI; `quote` is unused so skip): 7 × 2 × $15 = **$210 one-time**.
+  - Plus mandatory subscriptions: "US Futures Security Master" $600-$1,800/yr depending on QC organization tier + "US Future Universe" $1/day = $365/yr.
+  - **Year-1 total: $210 + $600 + $365 = $1,175 minimum** (at lowest org tier); up to **$2,480** at higher tiers.
+  - Year-2+: $965-$2,165/yr (Security Master + Universe; data is one-time).
+  - Pros: drop-in to LEAN's `cme/daily/<ticker>_<format>.zip` + `cme/universes/<ticker>/` + factor/map files; zero strategy-side changes; full continuous-contract roll detection retained; same AlgoSeek source that powers QC Cloud backtests so backtest-vs-paper parity is automatic.
+  - Cons: 5x the price of the API/VPS monthly burn for daily resolution that competitors give effectively free. Vendor lock-in to QC for futures data going forward.
+
+- **Option B — DataBento via Lean CLI — detailed costing:**
+  - DataBento charges $/GB on uncompressed binary encoding. `ohlcv-1d` schema for CME futures (GLBX.MDP3 dataset) is ~50-100 bytes per record.
+  - For our 7 futures × 250 daily bars ≈ 1,750 records ≈ ~100 KB ≈ ~0.0001 GB.
+  - At even a conservative $10/GB rate: **<$0.01 one-time data cost.**
+  - DataBento ships **$125 in free credit to new accounts** (one-time, expires 6 months after signup). The 7-futures historical-OHLCV fetch consumes <0.01% of that credit.
+  - **Year-1 total: $0** (well within free credit).
+  - Year-2+: $0 if we don't re-fetch (the data lives in `trading_lean_data` and persists). If we need monthly refreshes for continuous-contract front-month rolls, that's another <$0.01/mo.
+  - Subscription model: usage-based / pay-as-you-go, **no commitment, no minimum**.
+  - Setup: signup → API key → `sops secrets/paper.enc.yaml` add `databento.api_key` → `lean data download --data-provider-historical DataBento --data-type Trade --resolution Daily --security-type Future --ticker MES,MNQ,MYM,M2K --start 20250901 --end 20260512 --databento-api-key $API_KEY` (one invocation per exchange — CME for MES/MNQ/MYM/M2K + COMEX for MGC + NYMEX for MCL + CME for MBT).
+  - Pros: essentially free; LEAN CLI native integration; CME-licensed source so settlement prices are authoritative; daily resolution is the cheapest tier in their stack; no commitment.
+  - Cons: +1 vendor relationship (DataBento account + API key rotation lifecycle in sops); credit expires 6 months after signup so plan signup to coincide with the fetch ceremony; needs operator-side account creation step.
+
+- **Option C — Yahoo continuous-futures-as-equities hack — detailed costing:**
+  - yfinance ships continuous-front-month proxy tickers: `MES=F MNQ=F YM=F RTY=F GC=F CL=F BTC=F` (note: Yahoo uses `YM` not `MYM`, `RTY` not `M2K`, `GC` not `MGC`, `CL` not `MCL`, `BTC` not `MBT` — full vs micro contracts; the mapping isn't 1:1 to our micros and may need careful selection of available Yahoo continuous proxies).
+  - To use these in LEAN, the strategy registers them as equities (`self.add_equity("MES_F_synthetic", ...)`) instead of futures (`self.add_future("/MES", ...)`). The api-side IBKR adapter still receives `market="/MES"` (with slash) because the strategy emits that explicitly in `signal_emitted.market` → IBKR routes to the real micro futures contract for order placement.
+  - Implementation effort: ~2 hours.
+    - Edit `lean/v1_strategy.py`: replace the `add_future(...)` loop with `add_equity(...)` for the 7 futures; preserve the `signal_emitted.market = "/MES"` convention (independent of LEAN's internal symbol).
+    - Extend `scripts/seed_lean_data.py`: take an optional `--symbol-map` arg to rename `MES_F` → some-LEAN-friendly ticker on disk.
+    - Add a sub-runbook section to `deploy/lean_local/seed-data.md` covering the futures-as-equities path.
+  - Pros: $0; reuses the proven yfinance + LEAN equity-daily path; ships fast.
+  - Cons (the real cost): LEAN loses continuous-contract roll detection (no `OpenInterest` data → no OI-weighted continuous; the strategy operates on Yahoo's already-adjusted continuous series, which has known seam discontinuities at roll dates). LEAN's PaperBrokerage already always reports flat positions (post-pivot 2026-05-12), so MIN_HOLDING_DAYS was already disabled — this change doesn't make it worse, but it doesn't restore the futures-side filter either. Strategic integrity question: are we okay with "LEAN thinks /MES is an equity proxy; the api knows it's the real micro contract"? **The architectural mismatch is contained at the LEAN layer; the api-side IBKR contract is unchanged.**
+  - Risk: yfinance's continuous-contract data quality is third-party-reliant. Roll-date handling varies. For ETFs (Phase-1 seed-ceremony today) the data is rock-solid; for futures the quality degrades.
+
+- **Option D — Accept 4-of-11 indefinitely — strategic implications:**
+  - Cost: $0 across all dimensions.
+  - Phase 1 strategic intent: the universe was specifically chosen to give cross-asset trend exposure (bonds for defensive + equity-index micros for offense + commodities micros for diversification + Bitcoin micros for non-correlated). Dropping the 7 futures retains only the defensive cluster.
+  - Live result with 4-of-11: signals only fire on bond ETF trend breakouts. In a sustained risk-on regime (equity indices trending up + bonds rangebound/down), the strategy generates zero signals indefinitely. In a risk-off regime (bonds trending up + equity indices trending down), bonds signals fire but the equity-side short opportunity is missed entirely.
+  - Acceptable if: (a) operator's Phase 1 goal is to validate the pipeline + audit + UX, not to generate alpha; (b) the budget really cannot accommodate even $0.01 of DataBento charge.
+  - Not acceptable if: Phase 1 graduation criteria require demonstrated signal generation across the full universe within the 30-CME-session paper clock.
+
+- **Recommendation: Option B (DataBento via Lean CLI).** Three reasons:
+  1. **Cost is essentially zero**, deep inside the free-credit window. No budget impact.
+  2. **Architectural fit is perfect** — same per-expiry-contract + universe layout as the existing tutorial `es_*.zip` + `cme/universes/es/`, no strategy-side changes, no LEAN-layer-vs-api-layer abstraction discrepancy.
+  3. **No commitment risk** — usage-based; if DataBento's pricing changes adversely later, the data we already fetched stays in the volume and the strategy keeps running. We can switch providers without re-paying for the historical seed.
+
+  The +1 vendor cost (a DataBento account in the operator's name, API key in sops) is real but small. The operator already manages 5+ vendor accounts (QC, IBKR, Cloudflare, Hetzner, Resend, Discord, GitHub); DataBento is administratively similar.
+
+- **Fallback recommendation: Option C (Yahoo hack)** if the operator declines the +1 vendor relationship. Saves the vendor onboarding effort + lifecycle; accepts the LEAN-layer architectural mismatch. Ships in ~2 hours of engineering.
+
+- **NOT recommended:**
+  - **Option A** — 5x-50x more expensive than B for identical data quality (both are CME-licensed). The only reason to pick A would be if the operator already has a QC paid org tier they're not utilizing — and even then the per-file cost is uncompetitive.
+  - **Option D** — accepts a strategic gap that defeats Phase 1's universe design. Only fits if the budget is hard-zero.
+
+- **Decision request:** operator picks one of B/C/D (A is dominated by B on cost and is not a viable recommendation). If B: operator signs up at databento.com, captures the API key, runs `sops secrets/paper.enc.yaml` to add `databento.api_key: <token>`, commits + pushes, then Claude proceeds with the `lean data download` invocation + docker cp ceremony per a B-specific extension of `deploy/lean_local/seed-data.md`. If C: Claude opens a hot-fix PR modifying `lean/v1_strategy.py` + `scripts/seed_lean_data.py` + `deploy/lean_local/seed-data.md`. If D: no further action; the decision is logged here as final.
+
+- **Cost / scope impact of THIS memo:** zero — pure decisions-log entry. No code changes. No CI churn beyond the doc lint pass. Hot-fix scope.
+
+- **What stays:** the Phase 1 seed ceremony (PR #122 + #123) is unaffected. Whichever option lands, it lands ON TOP of the existing 4-ETF seed without retiring anything.
+
+- **Outstanding follow-ups carried forward (priority order, unchanged except item #2 is now "execute Option B"):**
+
+  1. Capture the 21:30 UTC cycle outcome (still wall-clock-bound at the time of this memo; cycle_watcher.sh still polling).
+  2. **NEW (was "decide futures data path"; now "execute Option B" pending operator sign-off)** — operator confirms B vs C vs D + (if B) creates DataBento account + adds API key to sops.
+  3. Recon kill-switch hook (`risk-review-approved` required).
+  4. Discord push on reconciliation breaks (hot-fix).
+  5. `prior_breaks` query in `eod_cycle.run_eod_cycle`.
+  6. CLAUDE.md file-index refresh (stale relative to PRs #114-#123).
+  7. Position view sync LEAN → api.
+
+- **Operator pre-authorizations (unchanged):**
+  - SSH to VPS, `git push`, open-PR, squash-merge fix PRs, force-push-with-lease on `claude/<name>`, docker compose restart, docker volume manipulation via transient containers.
