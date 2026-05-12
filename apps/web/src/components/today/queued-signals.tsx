@@ -3,21 +3,18 @@
 /**
  * Queued Signals table -- frontend-spec §2.2.2 C.
  *
- * Phase 0: signals table is empty so `items` is always []. Component renders
- * the "No signals queued." empty state until the Week 4 Wed dispatcher PR
- * starts emitting signals.
+ * Reject/Defer open the DecisionDiaryModal (spec §3.1) which collects
+ * `{entry_class, tag, reasoning_text}` from the operator. Approve is a
+ * direct mutation (no diary required). When the Week 4 Wed dispatcher PR
+ * wires the real handler, both paths work end-to-end with no changes
+ * here.
  *
- * Action buttons (Approve / Reject / Defer) call the Day 15 endpoints which
- * 501-stub with `SIGNAL_HANDLER_NOT_WIRED`; the mutation onError surfaces a
- * P2 toast explaining the handler isn't wired yet. When the dispatcher lands
- * (Week 4 Wed) the buttons start working with zero changes here.
- *
- * Reject/Defer in the full spec opens a DecisionDiaryModal (§3.1) for the
- * tag + reasoning_text. Day 22 ships a minimal inline diary entry stub --
- * `manual_judgment` tag + a constant `Deferred via Today UI` reasoning
- * string -- so the button click reaches the 501 stub end-to-end. The proper
- * modal lands Phase 1 alongside the Decision Diary Modal component.
+ * Phase 0: signals table is empty so `items` is always []. Component
+ * renders the "No signals queued." empty state until the dispatcher
+ * starts emitting.
  */
+
+import { useState } from 'react';
 
 import { useSignalsPending } from '@/lib/api/queries';
 import {
@@ -27,6 +24,10 @@ import {
 } from '@/lib/api/mutations';
 import type { DecisionDiaryEntry, SignalSummary } from '@/lib/api/types';
 import { formatPrice } from '@/lib/format';
+import {
+  DecisionDiaryModal,
+  type DecisionDiaryContextKind,
+} from '@/components/decision-diary-modal';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import {
@@ -37,15 +38,6 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
-
-// Phase-0 placeholder diary entry -- replaced by the DecisionDiaryModal in
-// Phase 1 alongside §3.1 Decision Diary surface.
-const PHASE0_DIARY: DecisionDiaryEntry = {
-  entry_class: 'signal_response',
-  tag: 'manual_judgment',
-  reasoning_text:
-    'Phase-0 placeholder -- DecisionDiaryModal lands Phase 1 (frontend-spec §3.1).',
-};
 
 export function QueuedSignals(): JSX.Element {
   const { data, isLoading, isError } = useSignalsPending();
@@ -93,63 +85,98 @@ export function QueuedSignals(): JSX.Element {
   );
 }
 
+type DiaryModalState =
+  | { open: false }
+  | { open: true; kind: Extract<DecisionDiaryContextKind, 'signal_reject' | 'signal_defer'> };
+
 function SignalRow({ signal }: { signal: SignalSummary }): JSX.Element {
   const approve = useApproveSignal();
   const reject = useRejectSignal();
   const defer = useDeferSignal();
+  const [modal, setModal] = useState<DiaryModalState>({ open: false });
   const busy = approve.isPending || reject.isPending || defer.isPending;
   const anomaly = signal.anomaly_reasons[0];
+  const subjectLabel = `${signal.market} ${signal.direction}`;
+
+  const handleDiarySubmit = async (entry: DecisionDiaryEntry): Promise<void> => {
+    if (!modal.open) return;
+    const args = { signalId: signal.id, diary: entry };
+    try {
+      if (modal.kind === 'signal_reject') {
+        await reject.mutateAsync(args);
+      } else {
+        await defer.mutateAsync(args);
+      }
+      setModal({ open: false });
+    } catch {
+      // Toast surfaced by mutation onError; leave modal open so the
+      // operator can adjust + retry without retyping reasoning_text.
+    }
+  };
 
   return (
-    <TableRow>
-      <TableCell className="font-mono">{signal.market}</TableCell>
-      <TableCell>{signal.direction}</TableCell>
-      <TableCell className="font-mono tabular-nums">
-        {signal.target_contracts}
-      </TableCell>
-      <TableCell className="font-mono tabular-nums">
-        {formatPrice(signal.decision_price)}
-      </TableCell>
-      <TableCell>
-        {anomaly !== undefined ? (
-          <span
-            className="inline-flex items-center rounded-md bg-severity-p1/20 px-2 py-0.5 text-xs text-severity-p1"
-            title={signal.anomaly_reasons.join(', ')}
-          >
-            {anomaly.replaceAll('_', ' ')}
-          </span>
-        ) : (
-          <span className="text-text-muted">—</span>
-        )}
-      </TableCell>
-      <TableCell>
-        <div className="flex justify-end gap-1">
-          <Button
-            size="sm"
-            variant="default"
-            disabled={busy}
-            onClick={() => approve.mutate({ signalId: signal.id })}
-          >
-            Approve
-          </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={busy}
-            onClick={() => reject.mutate({ signalId: signal.id, diary: PHASE0_DIARY })}
-          >
-            Reject
-          </Button>
-          <Button
-            size="sm"
-            variant="ghost"
-            disabled={busy}
-            onClick={() => defer.mutate({ signalId: signal.id, diary: PHASE0_DIARY })}
-          >
-            Defer
-          </Button>
-        </div>
-      </TableCell>
-    </TableRow>
+    <>
+      <TableRow>
+        <TableCell className="font-mono">{signal.market}</TableCell>
+        <TableCell>{signal.direction}</TableCell>
+        <TableCell className="font-mono tabular-nums">
+          {signal.target_contracts}
+        </TableCell>
+        <TableCell className="font-mono tabular-nums">
+          {formatPrice(signal.decision_price)}
+        </TableCell>
+        <TableCell>
+          {anomaly !== undefined ? (
+            <span
+              className="inline-flex items-center rounded-md bg-severity-p1/20 px-2 py-0.5 text-xs text-severity-p1"
+              title={signal.anomaly_reasons.join(', ')}
+            >
+              {anomaly.replaceAll('_', ' ')}
+            </span>
+          ) : (
+            <span className="text-text-muted">—</span>
+          )}
+        </TableCell>
+        <TableCell>
+          <div className="flex justify-end gap-1">
+            <Button
+              size="sm"
+              variant="default"
+              disabled={busy}
+              onClick={() => approve.mutate({ signalId: signal.id })}
+            >
+              Approve
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={busy}
+              onClick={() => setModal({ open: true, kind: 'signal_reject' })}
+            >
+              Reject
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled={busy}
+              onClick={() => setModal({ open: true, kind: 'signal_defer' })}
+            >
+              Defer
+            </Button>
+          </div>
+        </TableCell>
+      </TableRow>
+      <DecisionDiaryModal
+        open={modal.open}
+        context={
+          modal.open
+            ? { kind: modal.kind, signalId: signal.id, subjectLabel }
+            : { kind: 'signal_reject', signalId: signal.id, subjectLabel }
+        }
+        onSubmit={handleDiarySubmit}
+        onClose={() => setModal({ open: false })}
+        isSubmitting={reject.isPending || defer.isPending}
+      />
+    </>
   );
 }
