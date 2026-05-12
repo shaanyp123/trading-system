@@ -3068,3 +3068,81 @@ This session's other deliverables (PRs [#114](https://github.com/shaanyp123/trad
   - Pull the api's position view into LEAN on each cycle so the LEAN-side `MIN_HOLDING_DAYS` filter re-engages.
   - Populate `lean/Data/` with seed daily bars for the Phase 1 universe (`/MES /MNQ /MYM /M2K /MGC /MCL /MBT` futures + `TLT IEF SHY TIP` ETFs) so the strategy can actually generate signals. The current boot smoke is end-to-end at the cadence + heartbeat layer; signal generation requires data. The boot doesn't crash without data — `self.history(...)` returns nothing, the strategy returns empty results, and the cycle still fires + the heartbeat still POSTs. Operator can populate the volume lazily as a separate ceremony.
   - Backfill the LEAN-side `BrokerageName.INTERACTIVE_BROKERS_BROKERAGE` model call in `v1_strategy.py::initialize` — under PaperBrokerage the model is used for backtest-fee simulation only, but the IBKR-flavored model is still a valid choice and matches the fees the real api-side IBKR fills will see. Keep as-is; no change needed. (If a future LEAN release drops the IBKR model from its core assemblies the same way the brokerage was dropped, swap to `BrokerageName.DEFAULT`.)
+
+---
+
+### 2026-05-12 — Post-ceremony deploy carryover — PR #120 merged + VPS at `bbf5cbe` + LEAN_LIVE_MODE=true sustained + initialize heartbeat round-trip green + audit chain CLEAN
+
+PR [#120](https://github.com/shaanyp123/trading-system/pull/120) merged squash via `gh pr merge --admin --delete-branch`. CI all green (12 checks: lint, forbidden-paths, dep-drift, gitleaks, typecheck, test, frontend-test, 5 docker builds). One rebase along the way to land the entry above on top of the discovery entry from PR #119; resolved as two parallel entries (the discovery entry above + this implementation entry + this carryover) rather than rewriting either. Branch deleted via GitHub API after `gh` couldn't delete locally (the `main` worktree at `/Users/shaanpatel/Documents/GitHub/Trading` blocked gh's auto-sync; harmless).
+
+**VPS state @ deploy completion (2026-05-12 18:14 UTC):**
+
+- HEAD: `bbf5cbe` (PR #120 merge commit; `git pull --ff-only` advanced from `b4db402` clean)
+- `/opt/trading/deploy/.env` adds `LEAN_LIVE_MODE=true` (appended, not replacing — first time the env var has persisted to disk per discovery #1 in the PR #119 entry above)
+- `docker compose --env-file deploy/.env up -d --build lean_local` rebuilt the lean_local image + recreated both `trading-lean_local-1` AND `trading-api-1` (api recreated because it depends on the same project; not the lean_local rebuild's fault — compose's default behavior)
+- All 8 containers `Up`: `trading-postgres-1 Up 4 days (healthy)`, `trading-caddy-1 Up 24h`, `trading-discord_bot-1 Up 24h`, `trading-webhook_pusher-1 Up 2h`, `trading-ib_gateway-1 Up 12h (healthy)`, `trading-nextjs-1 Up 57min (healthy)`, `trading-api-1 Up 4min (healthy)`, `trading-lean_local-1 Up 4min`
+
+**lean_local boot lines (literal, captured from `docker logs trading-lean_local-1 2>&1`):**
+
+```
+[lean_local_entrypoint] merged config written to /Lean/config.json + /Lean/Launcher/bin/Debug/config.json (environment=paper-internal, algorithm-type-name=V1TrendFollowingAlgorithm)
+[lean_local_entrypoint] api_base=http://api:8000 live_mode=true env=paper
+[lean_local_entrypoint] PYTHONPATH=/Lean/Launcher/bin/Debug:/Lean/Algorithm:/Lean
+[lean_local_entrypoint] launching: dotnet /Lean/Launcher/bin/Debug/QuantConnect.Lean.Launcher.dll
+20260512 18:10:31.756 TRACE:: Composer(): Loading Assemblies from /Lean/Launcher/bin/Debug/
+20260512 18:10:34.167 TRACE:: JobQueue.NextJob(): Not able to fetch brokerage factory with name: QuantConnect.Lean.Engine.DataFeeds.Queues.FakeDataQueue
+20260512 18:10:37.102 TRACE:: BrokerageSetupHandler.CreateBrokerage(): creating brokerage 'PaperBrokerage'
+20260512 18:10:37.119 TRACE:: HistoryProviderManager.Initialize(): history providers [SubscriptionDataReaderHistoryProvider]
+20260512 18:10:37.123 TRACE:: LiveTradingResultHandler.SendStatusUpdate(): status: 'LoggingIn'.  Logging into brokerage...
+20260512 18:10:37.230 TRACE:: BrokerageSetupHandler.Setup(): Fetching cash balance from brokerage...
+20260512 18:10:37.240 TRACE:: Brokerage.GetAccountHoldings(): sourcing holdings from provided brokerage data, found 0 entries
+20260512 18:10:38.746 TRACE:: Log: 2026-05-12 14:10:37 v1_strategy initialized (post-pivot 2026-05-12, Pivot-PR-D) live_mode=True api_base=http://api:8000 strategy_version=v1_trend_following@phase1-pivot-d params_keys=['ATR_LOOKBACK_DAYS', 'HURST_THRESHOLD', 'INSTRUMENT_VOL_LOOKBACK_DAYS', 'LOOKBACK_DAYS_DONCHIAN', 'MA_FAST_DAYS', 'MA_SLOW_DAYS', 'MIN_HOLDING_DAYS', 'ROLL_DAYS_BEFORE_EXPIRY', 'STARTING_CASH_USD', 'STOP_DISTANCE_ATR_MULT', 'VOL_TARGET_PCT_ANNUAL']
+20260512 18:10:38.746 TRACE:: Log: 2026-05-12 14:10:37 lean_signal_post_succeeded status=202 event_type=lean_strategy_initialized
+```
+
+**NO `Sequence contains no matching element` errors.** The IB-DLL gap is closed at the live-deploy level.
+
+The single TRACE line `JobQueue.NextJob(): Not able to fetch brokerage factory with name: QuantConnect.Lean.Engine.DataFeeds.Queues.FakeDataQueue` is benign noise — LEAN's `JobQueue` probes each registered handler against the brokerage-factory interface first, falls back to the actual handler interface when no match. FakeDataQueue is successfully loaded through its `IDataQueueHandler` + `IDataQueueUniverseProvider` interfaces; the algorithm boots cleanly past this point.
+
+**api side initialize heartbeat round-trip (literal, captured from `docker logs trading-api-1 --since 5m`):**
+
+```
+{"event_type": "lean_strategy_initialized", "algorithm_id": "v1_trend_following", "source_ts_utc": "2026-05-12T18:10:37.128424+00:00", "session_date_et": null, "equity_usd": null, "live_mode": null, "event": "lean_event_received", "trace_id": "c65d0b61bb464ec0", "path": "/api/internal/lean/signals", "method": "POST", "timestamp_utc": "2026-05-12T18:10:37.228658Z", "level": "info", "func_name": "post_lean_signal"}
+{"status_code": 202, "elapsed_ms": 3.69, "event": "request_completed", "trace_id": "c65d0b61bb464ec0", "path": "/api/internal/lean/signals", "method": "POST", "timestamp_utc": "2026-05-12T18:10:37.228943Z", "level": "info", "func_name": "dispatch"}
+```
+
+**Audit chain integrity:**
+
+```
+$ docker compose --env-file deploy/.env exec -T api /opt/venv/bin/python -m services.audit.verify_chain --env paper
+2026-05-12 18:14:02 [info     ] verify_chain_started           env=paper
+CHAIN OK: 2 rows verified
+2026-05-12 18:14:02 [info     ] verify_chain_passed            env=paper rows_walked=2
+```
+
+audit_log row count unchanged (still 2 — the LEAN heartbeat path is operational, not audit-relevant per backend-spec §3.30; only `signal_emitted` events write audit rows). The 2 production rows (Day 25 state-transition + Day 27 state-transition) verify clean end-to-end through the post-deploy chain walk.
+
+**Post-deploy steady-state (4+ minutes uptime):**
+
+- LEAN's data engine TICKS PER SECOND ~2.78M from FakeDataQueue's fake-tick generation; queue depth 0; isolator CPU 44%
+- No exceptions, no error log lines in `docker logs trading-lean_local-1 --since 5m | grep -iE "error|exception|fail|warn"` aside from the benign `SetBenchmark(SPY): no existing symbol found, benchmark security will be added with Equity type` (LEAN warning that fires once during `initialize`)
+- api log tail shows only `/api/health` watchdog pings — no errors
+
+**Next-session outstanding (in priority order):**
+
+1. **Wait for the 21:30 UTC (17:30 ET) cycle to fire** + capture the `lean_cycle_heartbeat` 202 round-trip. The boot smoke validated `lean_strategy_initialized`; the daily-cycle heartbeat is the next-cadence-tick proof point. If `MA_SLOW_DAYS=200`-day warmup hasn't completed (likely — fresh container + empty `lean_data` volume), the cycle still fires but `signals_emitted_count=0 rejections_count=0` per `on_daily_signal_cycle`'s warmup-skip branch.
+2. **Populate the `lean_data` Docker volume with seed daily bars** for the Phase 1 universe (CME micro futures `/MES /MNQ /MYM /M2K /MGC /MCL /MBT` + bond ETFs `TLT IEF SHY TIP`, last ~90+ days, daily resolution). QC publishes free public daily bars; ingestion via `docker cp` into the `lean_data` volume through a transient container. Once seeded, the strategy's `self.history(...)` returns non-empty `BarSeries` → indicators populate → real signals generate → operator approves via `/signals` page → api dispatches via `services/execution/ibkr_adapter.py`.
+3. **Recon kill-switch hook** (Phase 1+ follow-up from prior session): when `plan.should_invoke_kill_switch=True`, wire `plan_invoke_kill_switch(trigger=RECON_MISMATCH, ...)` + `apply_state_transition(...)` into the apply path's `state_transition_hook` so actionable recon breaks auto-halt. `risk-review-approved` required.
+4. **Discord push on reconciliation breaks** (Phase 1+ follow-up): currently a detected break writes the audit row + recon_breaks row but no `#alerts` embed fires. Route through `services/webhook_pusher/dispatcher.py::dispatch_alert`. Hot-fix scope.
+5. **`prior_breaks` query** in `eod_cycle.run_eod_cycle` — add 24h-window query against `reconciliation_breaks WHERE resolved_at_utc IS NULL` so T+1 grace classification works once history exists.
+6. **CLAUDE.md file-index refresh** — file index is stale relative to PRs #114-#120 + new `apps/web/src/components/nav/` + `services/reconciliation/eod_cycle.py` + the post-ceremony LEAN env rename. Hot-fix scope.
+7. **Position view sync LEAN → api** (Phase 1+ follow-up from this session's entry): pull api positions into LEAN on each cycle so `MIN_HOLDING_DAYS` filter re-engages. Tracked but not load-bearing.
+
+**Operator pre-authorizations (carry forward):**
+
+- SSH to VPS via configured key at `root@178.156.239.84`
+- `git push` for VPS-originated commits + feature branches
+- Open-PR creation + `risk-review-approved` self-label
+- Squash-merge fix PRs via `gh pr merge --squash --admin --delete-branch`
+- Force-push-with-lease on `claude/<name>` feature branches
+- Restart docker compose containers via `docker compose --env-file deploy/.env up -d --build <service>`
