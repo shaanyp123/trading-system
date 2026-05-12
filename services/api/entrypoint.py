@@ -125,24 +125,28 @@ def main(argv: list[str] | None = None) -> int:
 
     # Worker-PR-1 follow-up (post-pivot 2026-05-12): IBKR account
     # number for the api-resident OrderPlacementWorker. Sourced from
-    # sops `ibkr.paper_account` (paper env) or `ibkr.live_account`
-    # (live envs). When unset the worker skips startup at lifespan —
-    # the api still serves requests, approved signals just queue in
-    # the signals table until the operator populates the field.
+    # sops; canonical key is ``ibkr.account_number`` (single field —
+    # the operator's IBKR Pro account is a single number across paper
+    # and live; the env-tag distinction is in IBKR's portal, not in
+    # the account number). Per-env fallback keys
+    # ``ibkr.paper_account`` / ``ibkr.live_account`` are accepted for
+    # forward-compat with possible future multi-account setups.
     #
-    # Phase 1 selects paper vs live by env at this layer rather than
-    # spec'ing two separate API_* vars; APISettings.environment +
-    # the operator's deploy/.env determine which sops key gets
-    # promoted to the canonical IBKR_ACCOUNT slot.
+    # When unset / placeholder the worker still starts but the IBKR
+    # adapter falls back to the default account on the TWS session.
+    # That works for single-account setups; ``account_number`` makes
+    # the binding explicit for clearer audit logs + multi-account
+    # safety.
     if "API_IBKR_ACCOUNT" not in os.environ:
         ibkr = secrets.get("ibkr") or {}
         env_tag = os.environ.get("API_ENVIRONMENT") or os.environ.get("ENVIRONMENT", "dev")
-        if env_tag in ("paper", "dev"):
-            account_key = "paper_account"
-        else:
-            # live-small / live-scale → live_account
-            account_key = "live_account"
-        acc = ibkr.get(account_key)
+        # Canonical first; env-specific fallback second.
+        acc: Any = ibkr.get("account_number")
+        if not acc or _looks_like_placeholder(acc):
+            if env_tag in ("paper", "dev"):
+                acc = ibkr.get("paper_account")
+            else:
+                acc = ibkr.get("live_account")
         if acc and not _looks_like_placeholder(acc):
             os.environ["API_IBKR_ACCOUNT"] = str(acc)
 

@@ -92,11 +92,18 @@ if [ -z "${LEAN_IBKR_PASSWORD:-}" ]; then
     LEAN_IBKR_PASSWORD="$(read_secret 'ibkr.paper_password')"
     export LEAN_IBKR_PASSWORD
 fi
-# Account ID lives in sops too. Pivot-PR-A originally let it default
-# to empty string for backtest; in paper/live mode IBKR rejects the
-# connect handshake unless it's populated.
+# Account ID lives in sops too. Canonical key is `ibkr.account_number`
+# (single field; the operator's IBKR Pro account is a single number
+# across paper and live envs). Per-env fallback `ibkr.paper_account`
+# preserved for forward-compat with future multi-account setups.
+# Pivot-PR-A originally let it default to empty string for backtest;
+# in paper/live mode IBKR rejects the connect handshake unless it's
+# populated.
 if [ -z "${LEAN_IBKR_ACCOUNT:-}" ]; then
-    LEAN_IBKR_ACCOUNT="$(read_secret 'ibkr.paper_account')"
+    LEAN_IBKR_ACCOUNT="$(read_secret 'ibkr.account_number')"
+    if [ -z "${LEAN_IBKR_ACCOUNT}" ]; then
+        LEAN_IBKR_ACCOUNT="$(read_secret 'ibkr.paper_account')"
+    fi
     export LEAN_IBKR_ACCOUNT
 fi
 
