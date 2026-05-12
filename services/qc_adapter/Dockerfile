@@ -19,7 +19,7 @@
 # Auth model (per backend-spec §4.4 + QC's docs):
 #   HTTP Basic with username = QC numeric user_id, password =
 #   sha256("{api_token}:{timestamp}") hex. Both credentials come from
-#   sops `quantconnect.{organization_id,api_token}`. See
+#   sops `quantconnect.{user_id,api_token}`. See
 #   `deploy/qc_adapter/README.md` for the operator runbook.
 
 # ---- builder ---------------------------------------------------------------

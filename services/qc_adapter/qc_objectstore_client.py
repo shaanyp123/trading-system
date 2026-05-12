@@ -16,8 +16,8 @@ Auth model (QC docs § "Authentication"):
   or the timestamp is more than a few minutes off wall-clock.
 
 Operator's ``secrets/<env>.enc.yaml`` carries the credential pair under
-``quantconnect.organization_id`` (the user_id) and
-``quantconnect.api_token``; the entrypoint maps them to
+``quantconnect.user_id`` (numeric QC User ID — NOT the org slug; DP-023)
+and ``quantconnect.api_token``; the entrypoint maps them to
 ``QC_ADAPTER_QC_USER_ID`` and ``QC_ADAPTER_QC_API_TOKEN``.
 
 Retry contract: transient errors (HTTP 5xx, connection errors,

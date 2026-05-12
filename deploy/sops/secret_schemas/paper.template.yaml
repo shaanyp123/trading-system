@@ -21,7 +21,11 @@ ibkr:
 
 quantconnect:
   api_token: <TODO_FROM_DAY_3_QC_TOKEN_REGEN>      # QC token rotated post Day 1 leak
-  organization_id: <TODO_FROM_DAY_3_QC_ORG>
+  # Numeric QC User ID from quantconnect.com -> avatar -> My Account.
+  # NOT the organization slug (that's a hex string). The QC REST API uses
+  # this as the HTTP Basic auth username; the org slug is rejected with
+  # "UserID not valid" per DP-023.
+  user_id: <TODO_FROM_DAY_3_QC_USER_ID>
 
 anthropic:
   api_key: <TODO_FROM_WEEK_5_AGENT_BRINGUP>

@@ -23,8 +23,9 @@ it.
 - `/opt/trading` checked out at the PR-A commit (the Phase-1-onset
   pipeline build pt 1/5 — `git pull origin main` if the VPS is behind).
 - `secrets/paper.enc.yaml` contains the two QuantConnect fields:
-  - `quantconnect.organization_id` — the numeric QC **User ID** from the
-    QC account page → mapped to `QC_ADAPTER_QC_USER_ID` env var.
+  - `quantconnect.user_id` — the numeric QC **User ID** from the
+    QC account page (avatar → My Account) → mapped to `QC_ADAPTER_QC_USER_ID`
+    env var. NOT the organization slug (hex string).
   - `quantconnect.api_token` — QC API token (rotate via QC dashboard if
     suspected leaked) → mapped to `QC_ADAPTER_QC_API_TOKEN`.
 - `secrets/paper.enc.yaml` decryption working: the age key lives at
@@ -71,9 +72,9 @@ sops --decrypt secrets/paper.enc.yaml > /dev/shm/paper.decrypted.yaml
 chmod 600 /dev/shm/paper.decrypted.yaml
 
 # Both QC fields must be filled (NOT <TODO_…> placeholders).
-grep -E '^\s+(organization_id|api_token):' /dev/shm/paper.decrypted.yaml \
+grep -E '^\s+(user_id|api_token):' /dev/shm/paper.decrypted.yaml \
   | sed 's/api_token:.*/api_token: [REDACTED]/'
-# Expected: two lines, organization_id with a numeric value, api_token
+# Expected: two lines, user_id with a numeric value, api_token
 # present (redacted by this grep).
 
 # Clean up immediately if either is missing.
@@ -141,8 +142,10 @@ qc_no_new_keys ... last_consumed_sequence_no=0
 ```
 
 **On 401/403 from QC:** the auth pair is wrong. Re-check that
-`quantconnect.organization_id` is the QC user_id (not the organization
-name) — these are two different fields on the QC account page.
+`quantconnect.user_id` is the numeric QC User ID (NOT the organization
+slug/hex string) — find it via avatar → My Account on QC's site.
+DP-023 (Day 28 carryover) was exactly this: the sops field was filled
+with the organization slug and QC returned "UserID not valid".
 
 ## Step 5 — End-to-end paper round-trip (when QC algo emits)
 
