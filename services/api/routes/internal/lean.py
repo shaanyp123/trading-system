@@ -12,24 +12,20 @@ events directly to the backend instead of writing to QC's ObjectStore for
 the backend to poll. See ``Docs/decisions-log.md`` 2026-05-12 entry
 "Phase-1 architecture pivot" + backend-spec §1.2 (post-pivot).
 
-**Pivot-PR-A scope:** the heartbeat path only. LEAN's `v1_strategy.py`
-emits ``lean_strategy_initialized`` at algorithm initialize and
-``lean_cycle_heartbeat`` once per 17:30 ET signal cycle. The endpoint
-validates the bearer + body shape and logs structlog `lean_event_received`.
+**Event routing (post Worker-PR-4 2026-05-12):**
 
-**NOT in Pivot-PR-A scope** (returns 400 ``LEAN_EVENT_TYPE_NOT_WIRED``):
+* ``lean_strategy_initialized`` — log + 202 (Pivot-PR-A heartbeat path).
+* ``lean_cycle_heartbeat`` — log + 202 (Pivot-PR-A heartbeat path).
+* ``signal_emitted`` — validate full payload, write audit_log row +
+  INSERT signals row via ``services.qc_adapter.signal_ingestion.ingest_signal_emitted``
+  (canonical pattern; reused across QC adapter + LEAN paths post-pivot
+  since both produce backend-spec §3.30 SIGNAL_EMITTED events with
+  identical schema). Returns 202 with the minted ``signal_id`` +
+  ``audit_event_uuid`` so the operator can deep-link from /system page.
 
-* ``signal_emitted`` events. These land in Pivot-PR-D when the signal
-  dispatcher (``services/risk/signal_dispatch.py``) is wired. Pivot-PR-D
-  extends this endpoint to: validate the full signal payload, write a
-  ``signal_emitted`` audit row via ``services.audit.writer.append_audit_event``,
-  INSERT into the ``signals`` table, and emit an SSE ``signal_emitted``
-  envelope. None of that is in scope here.
-
-The endpoint deliberately writes NO audit_log row in Pivot-PR-A: the
-heartbeat / init events are operational signals (LEAN is alive) not
-strategy / risk / audit-relevant events. Anti-pattern A22 binds — never
-write audit_log rows for unimportant boots / heartbeats.
+Heartbeat events do NOT write to audit_log (A22: don't flood the chain
+with operational liveness pings). signal_emitted DOES write to audit_log
+(it's a strategy / risk-relevant event with downstream approval flows).
 """
 
 from __future__ import annotations
@@ -40,8 +36,17 @@ from typing import Annotated
 import structlog
 from fastapi import APIRouter, Depends, Request, status
 
+from services.api import db as api_db
 from services.api.errors import AppError
+from services.api.repos.phase1 import PostgresPhase1QueryRepo
 from services.api.schemas.lean import LeanEventAccepted, LeanEventRequest
+from services.audit.event_types import AuditEventType
+from services.audit.writer import Environment, PhaseAtEmit
+from services.qc_adapter.payloads import QCEvent
+from services.qc_adapter.signal_ingestion import (
+    SignalIngestError,
+    ingest_signal_emitted,
+)
 
 log = structlog.get_logger()
 
@@ -125,20 +130,127 @@ async def post_lean_signal(
         )
 
     if body.event_type == "signal_emitted":
-        # Future-PR scope. We log it as a separate event so a future
-        # introspection of api logs makes the wire-but-not-implemented gap
-        # explicit; this is the same pattern as the Day-15 501 stubs on
-        # /api/signals/:id/{approve,reject,defer}.
-        log.warning("lean_event_signal_emitted_not_wired", **log_kwargs)
-        raise AppError(
-            error_code="LEAN_EVENT_TYPE_NOT_WIRED",
-            message=(
-                "signal_emitted events are not yet accepted on this endpoint. "
-                "Pivot-PR-D wires the dispatcher; until then LEAN should emit "
-                "only heartbeat events. See Docs/decisions-log.md 2026-05-12."
+        # Worker-PR-4 (2026-05-12): wired end-to-end. Validate required
+        # payload fields here rather than via a model_validator on
+        # LeanEventRequest — Pydantic v2's model_validator surfaces
+        # ValueError objects inside the validation error ctx, which
+        # FastAPI's RequestValidationError handler fails to JSON-serialize
+        # cleanly. A boundary check at the route layer produces a clean
+        # canonical AppError envelope without ctx-serialization issues.
+        required = {
+            "market": body.market,
+            "direction": body.direction,
+            "target_contracts": body.target_contracts,
+            "decision_price": body.decision_price,
+            "sizing_trace": body.sizing_trace,
+            "strategy_version": body.strategy_version,
+        }
+        missing = sorted(name for name, value in required.items() if value is None)
+        if missing:
+            log.warning("lean_signal_emitted_missing_fields", missing=missing, **log_kwargs)
+            raise AppError(
+                error_code="LEAN_SIGNAL_PAYLOAD_INCOMPLETE",
+                message=(f"signal_emitted event_type requires fields: {missing}"),
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                details={"missing": missing},
+            )
+        # mypy narrowing — all values are non-None after the gate above.
+        assert body.market is not None
+        assert body.direction is not None
+        assert body.target_contracts is not None
+        assert body.decision_price is not None
+        assert body.sizing_trace is not None
+        assert body.strategy_version is not None
+
+        session_factory = api_db.get_session_factory()
+
+        # Resolve active account for this env. Phase 0/1 has exactly one
+        # active accounts row (single-operator).
+        async with session_factory() as repo_session:
+            repo = PostgresPhase1QueryRepo(repo_session)
+            account_id = await repo.fetch_active_account_id()
+        if account_id is None:
+            log.error("lean_signal_emitted_no_active_account", **log_kwargs)
+            raise AppError(
+                error_code="NO_ACTIVE_ACCOUNT",
+                message=(
+                    "No active accounts row found. Run the account bootstrap "
+                    "migration before accepting signal_emitted events."
+                ),
+                status_code=status.HTTP_409_CONFLICT,
+            )
+
+        # Map LEAN's live_mode → audit Environment Literal. live_mode=False
+        # means backtest — but our audit chain doesn't have a 'backtest'
+        # env; the closest mapping is 'paper' (the env we tag dry-run
+        # signals with so backtest verifications still walk the chain
+        # cleanly). For live_mode=True we'd source from APISettings.environment;
+        # Phase 1 is always 'paper' until the Week 8 cutover ceremony.
+        env: Environment = "paper"
+        phase_at_emit: PhaseAtEmit = 1
+
+        # Adapt the LEAN body into a QCEvent so we can reuse the canonical
+        # qc_adapter.signal_ingestion.ingest_signal_emitted pipeline. The
+        # QCEvent shape predates the pivot but its payload-validation +
+        # audit-first write + slippage-head bootstrap logic is shared between
+        # both ingest paths post-pivot. sequence_no=0 is a placeholder:
+        # qc_adapter uses it for cursor tracking against QC's ObjectStore;
+        # the LEAN path has no equivalent cursor, so 0 is the sentinel for
+        # "not from QC".
+        synthesized_event = QCEvent(
+            sequence_no=0,
+            event_type=AuditEventType.SIGNAL_EMITTED.value,
+            source_clock_ts=body.ts_utc,
+            qc_algorithm_version=body.strategy_version,
+            payload={
+                "market": body.market,
+                "direction": body.direction,
+                "target_contracts": body.target_contracts,
+                "decision_price": str(body.decision_price),
+                "sizing_trace": body.sizing_trace,
+            },
+        )
+
+        try:
+            result = await ingest_signal_emitted(
+                session_factory,
+                account_id=account_id,
+                env=env,
+                phase_at_emit=phase_at_emit,
+                event=synthesized_event,
+            )
+        except SignalIngestError as exc:
+            log.warning(
+                "lean_signal_emitted_invalid_payload",
+                error=str(exc),
+                **log_kwargs,
+            )
+            raise AppError(
+                error_code="LEAN_SIGNAL_PAYLOAD_INVALID",
+                message=f"signal_emitted payload validation failed: {exc}",
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                details={"event_type": body.event_type},
+            ) from exc
+
+        log.info(
+            "lean_signal_emitted_ingested",
+            signal_id=str(result.signal_id),
+            audit_event_uuid=str(result.audit_event_uuid),
+            market=body.market,
+            direction=body.direction,
+            target_contracts=body.target_contracts,
+            **log_kwargs,
+        )
+        return LeanEventAccepted(
+            received_at_utc=received_at,
+            event_type=body.event_type,
+            accepted=True,
+            note=(
+                f"signal_emitted accepted; audit_event_uuid={result.audit_event_uuid} "
+                f"signal_id={result.signal_id}. Approval flow at /signals."
             ),
-            status_code=status.HTTP_400_BAD_REQUEST,
-            details={"event_type": body.event_type},
+            signal_id=str(result.signal_id),
+            audit_event_uuid=str(result.audit_event_uuid),
         )
 
     # Should be unreachable due to LeanEventType Literal validation, but

@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -97,6 +97,52 @@ class LeanEventRequest(BaseModel):
         default=None,
         description="LEAN's `self.live_mode` flag (False=backtest; True=paper or live broker).",
     )
+    # Worker-PR-4 signal_emitted-specific fields. Required when event_type=
+    # "signal_emitted"; ignored otherwise. The route handler enforces
+    # presence — kept out of a Pydantic model_validator because v2 stuffs
+    # the raw ValueError into the validation-error ctx which FastAPI's
+    # RequestValidationError handler can't JSON-serialize.
+    market: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=32,
+        description=("Market identifier (e.g., '/MES', '/ES'). Required for signal_emitted."),
+    )
+    direction: Literal["long", "short", "flat"] | None = Field(
+        default=None,
+        description="Position-direction enum. Required for signal_emitted.",
+    )
+    target_contracts: int | None = Field(
+        default=None,
+        description=(
+            "Integer contract count from the V1 sizing pipeline. Required for "
+            "signal_emitted. May be 0 for a 'flat' direction signal."
+        ),
+    )
+    decision_price: Decimal | None = Field(
+        default=None,
+        description=(
+            "Mid-price at the LEAN signal cycle. Required for signal_emitted. "
+            "Decimal-as-string per dev-guide §3.8 / A05."
+        ),
+    )
+    sizing_trace: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Per-V1 sizing pipeline trace (gross_dollars, ATR-based stop, etc.). "
+            "Required for signal_emitted. Persisted as the signals.sizing_trace "
+            "JSONB column."
+        ),
+    )
+    strategy_version: str | None = Field(
+        default=None,
+        max_length=128,
+        description=(
+            "LEAN-side strategy version identifier — analog of QC's "
+            "`qc_algorithm_version`. Required for signal_emitted. Phase 1: "
+            "'v1_trend_following@<git-sha>'."
+        ),
+    )
 
 
 class LeanEventAccepted(BaseModel):
@@ -120,4 +166,20 @@ class LeanEventAccepted(BaseModel):
         default=None,
         max_length=256,
         description="Optional operator-visible note (e.g., 'liveness_probes upserted').",
+    )
+    # Worker-PR-4 signal_emitted response fields. Only populated when
+    # event_type=signal_emitted; the heartbeat path leaves them None.
+    signal_id: str | None = Field(
+        default=None,
+        description=(
+            "UUID of the row inserted into the signals table. Only set when "
+            "event_type=signal_emitted."
+        ),
+    )
+    audit_event_uuid: str | None = Field(
+        default=None,
+        description=(
+            "UUID of the matching signal_emitted row in audit_log. Only set "
+            "when event_type=signal_emitted."
+        ),
     )
