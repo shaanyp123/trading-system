@@ -311,11 +311,13 @@ async def apply_signal_dispatch(
     UUID. A retry (idempotent on the audit event UUID) re-applies Step 3
     when conditions clear.
     """
-    # Step 1: validate
+    # Step 1: validate. The signals table PK column is `id`, not
+    # `signal_id` — `signal_id` is the column name on `orders` (the FK
+    # back to signals.id). Pivot-PR-D 2026-05-12 fixup.
     async with session_factory() as session:
         row = (
             await session.execute(
-                text("SELECT status FROM signals WHERE signal_id = :sid"),
+                text("SELECT status FROM signals WHERE id = :sid"),
                 {"sid": plan.signal_id},
             )
         ).fetchone()
@@ -360,21 +362,37 @@ async def apply_signal_dispatch(
 
     # Step 3: UPDATE signal row. Separate transaction so the audit write
     # is durable independent of any failure here.
+    #
+    # Schema mapping (alembic 0002 `signals` table; spec §3.3):
+    #   - `status` (always set)
+    #   - `approved_at_utc` (set on approve)
+    #   - `rejected_at_utc` (set on reject)
+    #   - defer path has no dedicated timestamp column; only `status` updates.
+    #
+    # The audit_event UUID linkage (decided_by_user_id, decision_audit_event_uuid)
+    # lives in the audit row's payload (see plan_signal_approve /
+    # _reject / _defer payload construction). Adding dedicated linkage
+    # columns to the signals table is a follow-up alembic migration —
+    # spec §3.3 doesn't reserve them today; keeping the dispatcher
+    # schema-compatible with the shipped 0002 migration is the smallest-
+    # blast-radius fix for Pivot-PR-D's end-to-end ceremony.
+    if plan.action == "approve":
+        update_sql = (
+            "UPDATE signals SET status = :status, approved_at_utc = :decided_at WHERE id = :sid"
+        )
+    elif plan.action == "reject":
+        update_sql = (
+            "UPDATE signals SET status = :status, rejected_at_utc = :decided_at WHERE id = :sid"
+        )
+    else:  # defer
+        update_sql = "UPDATE signals SET status = :status WHERE id = :sid"
+
     async with session_factory() as session:
         await session.execute(
-            text(
-                "UPDATE signals "
-                "SET status = :status, "
-                "    decided_at_utc = :decided_at, "
-                "    decided_by_user_id = :user_id, "
-                "    decision_audit_event_uuid = :audit_uuid "
-                "WHERE signal_id = :sid"
-            ),
+            text(update_sql),
             {
                 "status": plan.new_status,
                 "decided_at": plan.decided_at_utc,
-                "user_id": plan.decided_by_user_id,
-                "audit_uuid": audit_record.event_uuid,
                 "sid": plan.signal_id,
             },
         )

@@ -270,7 +270,11 @@ echo "[lean_local_entrypoint] api_base=${LEAN_LOCAL_API_BASE_URL} live_mode=${LE
 # the import fails with "No module named 'AlgorithmImports'".
 # /Lean/Algorithm appears second so v1_strategy.py's siblings (none today,
 # but room to grow) are resolvable.
-export PYTHONPATH="/Lean/Launcher/bin/Debug:/Lean/Algorithm${PYTHONPATH:+:$PYTHONPATH}"
+# /Lean/Strategies (Pivot-PR-D 2026-05-12) is third — exposes the
+# broker-agnostic `v1_trend_following` package (mounted from repo
+# ./strategies via docker-compose.yml) to LEAN's Python runtime so
+# `from v1_trend_following.strategy import V1TrendFollowing` resolves.
+export PYTHONPATH="/Lean/Launcher/bin/Debug:/Lean/Algorithm:/Lean/Strategies${PYTHONPATH:+:$PYTHONPATH}"
 
 echo "[lean_local_entrypoint] PYTHONPATH=${PYTHONPATH}"
 echo "[lean_local_entrypoint] launching: $*"
