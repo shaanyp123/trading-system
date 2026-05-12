@@ -136,11 +136,33 @@ Expected boot sequence in the logs (from `infrastructure/lean_local/entrypoint.s
 + LEAN's own logs):
 
 ```
+[lean_local_entrypoint] merged config written to /Lean/Launcher/bin/Debug/config.json (environment=backtesting, algorithm-type-name=V1TrendFollowingAlgorithm)
 [lean_local_entrypoint] api_base=http://api:8000 live_mode=false env=paper
-[lean_local_entrypoint] launching: dotnet /Lean/QuantConnect.Lean.Launcher.dll
+[lean_local_entrypoint] launching: dotnet /Lean/Launcher/bin/Debug/QuantConnect.Lean.Launcher.dll
 ... LEAN startup ...
 Initialize: v1_strategy initialized (post-pivot 2026-05-12) live_mode=False api_base=http://api:8000 ...
 ```
+
+**Pivot-PR-F config merging (2026-05-12):** the entrypoint reads LEAN's
+default `/Lean/Launcher/bin/Debug/config.json` (the full upstream
+framework config with handler bindings, limits, paths), deep-merges our
+`/Lean/Algorithm/lean.json` template on top (with env-var substitution
+applied), patches `algorithm-location` + `data-folder` to absolute paths,
+selects the active environment from `LEAN_LIVE_MODE` (`backtesting`
+default; `paper-ibkr` when `true`), strips `$comment-*` keys, and writes
+the merged result back to the upstream config location so LEAN's launcher
+discovers it. Pre-PR-F the entrypoint wrote our template to `/Lean/lean.json`
+where LEAN never looked, so LEAN fell through to the upstream
+`BasicTemplateFrameworkAlgorithm` default and crash-looped on startup.
+
+**Pre-flight for paper mode:** before flipping `LEAN_LIVE_MODE=true` in
+`deploy/.env`, the operator must populate `ibkr.paper_account` in
+`secrets/paper.enc.yaml` (the paper-trading account ID, distinct from
+the live `ibkr.account_number`). Find it in the ib_gateway boot log
+line "<DUQ_account> Trader Workstation Configuration (Simulated Trading)"
+or the IBKR portal → Paper Trading → Account Profile. LEAN's
+`InteractiveBrokersBrokerage` rejects the connect handshake when this
+field is empty.
 
 Then the heartbeat POST should land on the backend. On the api side:
 

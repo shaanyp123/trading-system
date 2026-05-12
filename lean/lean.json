@@ -28,32 +28,46 @@
   "$comment-parameters": "Mirrors strategies/v1_trend_following/parameters.py V1_DEFAULTS. The algorithm reads them via self.get_parameter(...) with V1_DEFAULTS as fallback. Keys are the canonical agent `tighten_parameter` enum names (backend-spec §12.3) — never rename without a parameter_sets migration.",
 
   "environments": {
-    "$comment": "LEAN Local environments. The `lean_local` Docker container's entrypoint renders this section by env-var substitution before launching the LEAN runtime. Production env is selected via `LEAN_LIVE_MODE=true` + `ENVIRONMENT=paper|live-small|live-scale`.",
+    "$comment": "LEAN Local environments. The `lean_local` Docker container's entrypoint deep-merges this section on top of the upstream `/Lean/Launcher/bin/Debug/config.json` defaults (Pivot-PR-F). The handler bindings under paper-ibkr + live-ibkr below mirror upstream's `live-interactive` environment shape — without them, LEAN falls back to BacktestingSetupHandler + FileSystemDataFeed which can't drive a live IBKR session. Production env is selected via `LEAN_LIVE_MODE=true` + `ENVIRONMENT=paper|live-small|live-scale`.",
     "backtesting": {
       "live-mode": false,
-      "$comment": "Backtest against QC bundled historical bars. Used in CI golden tests + ad-hoc parameter sweeps. No broker dependency."
+      "$comment": "Backtest against QC bundled historical bars. Used in CI golden tests + ad-hoc parameter sweeps. No broker dependency. Inherits backtesting handlers from upstream config.json defaults via the entrypoint deep-merge."
     },
     "paper-ibkr": {
-      "$comment": "Paper trading against IBKR's paper account via ib_gateway container (Pivot-PR-B). Use this for the 30-CME-session paper clock before live cutover.",
+      "$comment": "Paper trading against IBKR's paper account via ib_gateway container (Pivot-PR-B). Use this for the 30-CME-session paper clock before live cutover. Handler bindings copied from upstream `live-interactive` env (Pivot-PR-F merge requirement).",
       "live-mode": true,
       "live-mode-brokerage": "InteractiveBrokersBrokerage",
+      "setup-handler": "QuantConnect.Lean.Engine.Setup.BrokerageSetupHandler",
+      "result-handler": "QuantConnect.Lean.Engine.Results.LiveTradingResultHandler",
+      "data-feed-handler": "QuantConnect.Lean.Engine.DataFeeds.LiveTradingDataFeed",
+      "data-queue-handler": ["InteractiveBrokersBrokerage"],
+      "real-time-handler": "QuantConnect.Lean.Engine.RealTime.LiveTradingRealTimeHandler",
+      "transaction-handler": "QuantConnect.Lean.Engine.TransactionHandlers.BrokerageTransactionHandler",
+      "history-provider": ["BrokerageHistoryProvider", "SubscriptionDataReaderHistoryProvider"],
       "ib-account": "${LEAN_IBKR_ACCOUNT}",
       "ib-user-name": "${LEAN_IBKR_USERNAME}",
       "ib-password": "${LEAN_IBKR_PASSWORD}",
       "ib-trading-mode": "paper",
-      "ib-gateway-host": "ib_gateway",
-      "ib-gateway-port": "4004"
+      "ib-host": "ib_gateway",
+      "ib-port": "4004"
     },
     "live-ibkr": {
-      "$comment": "Live trading against IBKR's real account via ib_gateway container (Pivot-PR-B). Production env after Week 8 live cutover.",
+      "$comment": "Live trading against IBKR's real account via ib_gateway container (Pivot-PR-B). Production env after Week 8 live cutover. Handler bindings copied from upstream `live-interactive` env (Pivot-PR-F merge requirement).",
       "live-mode": true,
       "live-mode-brokerage": "InteractiveBrokersBrokerage",
+      "setup-handler": "QuantConnect.Lean.Engine.Setup.BrokerageSetupHandler",
+      "result-handler": "QuantConnect.Lean.Engine.Results.LiveTradingResultHandler",
+      "data-feed-handler": "QuantConnect.Lean.Engine.DataFeeds.LiveTradingDataFeed",
+      "data-queue-handler": ["InteractiveBrokersBrokerage"],
+      "real-time-handler": "QuantConnect.Lean.Engine.RealTime.LiveTradingRealTimeHandler",
+      "transaction-handler": "QuantConnect.Lean.Engine.TransactionHandlers.BrokerageTransactionHandler",
+      "history-provider": ["BrokerageHistoryProvider", "SubscriptionDataReaderHistoryProvider"],
       "ib-account": "${LEAN_IBKR_ACCOUNT}",
       "ib-user-name": "${LEAN_IBKR_USERNAME}",
       "ib-password": "${LEAN_IBKR_PASSWORD}",
       "ib-trading-mode": "live",
-      "ib-gateway-host": "ib_gateway",
-      "ib-gateway-port": "4003"
+      "ib-host": "ib_gateway",
+      "ib-port": "4003"
     }
   }
 }

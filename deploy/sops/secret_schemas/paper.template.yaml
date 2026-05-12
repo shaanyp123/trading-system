@@ -29,6 +29,14 @@ ibkr:
   # deploy/ibkr/README.md Step 4.
   paper_username: <TODO_FROM_PIVOT_PR_B_BRINGUP>
   paper_password: <TODO_FROM_PIVOT_PR_B_BRINGUP>
+  # Paper account ID (distinct from `account_number` above which is the
+  # live account). Find this in the IB Gateway boot log line
+  #     "<DUQ_account> Trader Workstation Configuration (Simulated Trading)"
+  # or in the IBKR portal → Paper Trading → Account Profile. LEAN's
+  # InteractiveBrokersBrokerage rejects the connect handshake when this
+  # is empty in paper-ibkr / live-ibkr environments (Pivot-PR-F lean.json
+  # template references it via ${LEAN_IBKR_ACCOUNT}).
+  paper_account: <TODO_FROM_PIVOT_PR_F_BRINGUP>
   # Live credentials. Empty (or placeholder) until Week 8 cutover ceremony.
   # The operator deliberately defers populating these until 30-paper-session
   # clock complete + funded account approved.
