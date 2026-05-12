@@ -51,22 +51,18 @@ documented preferred form). Method names, enum values, and keyword arguments
 are all snake_case / SCREAMING_SNAKE_CASE. Class names (QCAlgorithm, Slice,
 Resolution, BrokerageName, etc.) remain PascalCase per Python convention.
 
-Day 29+ (post-pivot) status:
-- Brokerage: ``InteractiveBrokersBrokerage`` / ``Margin`` matching IBKR Pro.
-- Parameters: read from LEAN's parameter map (``self.get_parameter``) with
-  ``strategies.v1_trend_following.parameters.V1_DEFAULTS`` as fallback.
-- Warmup: 200 trading days (longest indicator lookback = MA_SLOW_DAYS).
-- ``on_daily_signal_cycle``: HTTP POSTs ``signal_emitted`` events to the
-  backend. Replaces the pre-pivot ``self.object_store.save(...)`` write.
-- Heartbeat: separate POST to the backend's liveness probe endpoint when
-  warming up (so the operator can confirm LEAN is alive even before the first
-  signal cycle).
-
-Strategy wiring (assemble ``BarSeries`` via ``self.history``, position snapshot
-via ``self.portfolio``, call ``V1TrendFollowing.generate_signals``) is the
-remaining work that lands inside this file. Pivot-PR-A ships the scaffold +
-HTTP POST plumbing; full strategy wiring follows in Pivot-PR-D when the
-signal dispatcher is wired end-to-end.
+**Pivot-PR-D (2026-05-12) — signal_emitted emission live.** The cycle now
+runs `V1TrendFollowing.generate_signals(...)` against the active universe
+and POSTs each emitted signal to the backend with the full payload required
+by `services/api/routes/internal/lean.py::post_lean_signal` (market /
+direction / target_contracts / decision_price / sizing_trace /
+strategy_version). Sizing for Phase 1 is the conservative single-lot
+allocation (target_contracts=1 per signal) — the full Stage 0-5 pipeline
+runs server-side as approved signals are dispatched (Worker-PR-1's
+order_placement_worker). The single-lot allocation gives the operator
+explicit per-signal approval control during the 30-CME-session paper
+clock; once the Stage 0-5 server-side path is wired, this scales to
+multi-contract per spec §2.4.1.
 
 This file is intentionally NOT in the project's mypy/ruff target set (see
 ``pyproject.toml`` ``exclude`` lists). LEAN's ``AlgorithmImports`` injects
@@ -86,13 +82,26 @@ import json
 import os
 import urllib.error
 import urllib.request
+from datetime import date as _date
+from decimal import Decimal
 
 # Local strategy imports — `./strategies/` is mounted into the container by
-# docker-compose. Wired in Pivot-PR-D when the dispatcher routes approved
-# signals to the execution layer; not used by the Pivot-PR-A scaffold below.
-#
-# from v1_trend_following.parameters import default_v1_parameters
-# from v1_trend_following.strategy import V1TrendFollowing
+# docker-compose at `/Lean/Strategies` (read-only), and the lean_local
+# entrypoint adds `/Lean/Strategies` to PYTHONPATH so this resolves to
+# the v1_trend_following package. The strategy module is broker-agnostic
+# pure Python — no QC / LEAN imports — so this import is safe to run
+# inside LEAN's Python runtime.
+from v1_trend_following.parameters import V1Parameters  # type: ignore[import-not-found]
+from v1_trend_following.signals import (  # type: ignore[import-not-found]
+    Bar,
+    BarSeries,
+    Direction,
+    Position,
+)
+from v1_trend_following.strategy import (  # type: ignore[import-not-found]
+    STRATEGY_NAME,
+    V1TrendFollowing,
+)
 
 
 # Phase 1 sub-universe — keep aligned with `strategies/v1_trend_following/parameters.py`
@@ -125,6 +134,18 @@ _API_BASE_URL_DEFAULT = "http://api:8000"
 _API_TIMEOUT_SECONDS = 10.0
 
 
+# Strategy version identifier sent in `signal_emitted` payloads. Format mirrors
+# the QC adapter convention `qc_algorithm_version` (backend-spec §3.3 / §4.5.1)
+# so the audit-side `strategy_hash` derivation in
+# `services.qc_adapter.signal_ingestion._derive_strategy_hash` continues to
+# work without modification. Phase 1 carries a static string — once a build
+# system stamps the git SHA into a constant at deploy time, this becomes
+# `f"{STRATEGY_NAME}@{git_sha}"`. The static string is acceptable for the
+# Phase 1 ceremony because `_derive_strategy_hash` sha1's any non-40-hex
+# suffix into a deterministic hash, preserving audit-chain integrity.
+_STRATEGY_VERSION_DEFAULT = f"{STRATEGY_NAME}@phase1-pivot-d"
+
+
 class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]  # noqa: F405
     """LEAN Local entry-point. Daily resolution; 17:30 ET signal cycle.
 
@@ -148,6 +169,9 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         # emit signals into a black hole.
         self._api_base_url = os.environ.get("LEAN_LOCAL_API_BASE_URL", _API_BASE_URL_DEFAULT)
         self._api_bearer_token = os.environ.get("LEAN_LOCAL_BEARER_TOKEN", "")
+        self._strategy_version_str = os.environ.get(
+            "LEAN_STRATEGY_VERSION", _STRATEGY_VERSION_DEFAULT
+        )
         if not self._api_bearer_token:
             raise RuntimeError(
                 "LEAN_LOCAL_BEARER_TOKEN env var missing or empty. "
@@ -173,6 +197,14 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
             AccountType.MARGIN,  # noqa: F405
         )
 
+        # Track symbol references per market key so `on_daily_signal_cycle`
+        # can iterate the universe + assemble BarSeries from the history
+        # provider. Futures keys are `/MES` form (matching V1_CANDIDATE_UNIVERSE);
+        # ETF keys are bare tickers like `TLT`. The dict value is a LEAN Symbol
+        # object — opaque to us but accepted by `self.history()` /
+        # `self.portfolio[...]` / `self.securities[...]`.
+        self._market_subscriptions: dict[str, object] = {}
+
         # Subscribe to micro futures (continuous contract via QC's `Future` API).
         for ticker in PHASE1_FUTURES:
             future = self.add_future(
@@ -183,17 +215,23 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
                 contract_depth_offset=0,
             )
             future.set_filter(0, 90)  # rolling 0-90 day window for contract selection
+            self._market_subscriptions[f"/{ticker}"] = future.symbol
 
         # Subscribe to bond ETFs.
         for ticker in PHASE1_ETFS:
-            self.add_equity(
+            equity = self.add_equity(
                 ticker,
                 resolution=Resolution.DAILY,  # noqa: F405
                 extended_market_hours=False,
             )
+            self._market_subscriptions[ticker] = equity.symbol
 
         # Warmup — longest indicator lookback is MA_SLOW_DAYS (default 200).
-        self.set_warm_up(int(params["MA_SLOW_DAYS"]), Resolution.DAILY)  # noqa: F405
+        # Pad slightly so the first signal cycle has enough history for ATR
+        # (which needs lookback + 1 prior bar) without an off-by-one trim.
+        self._strategy_min_bars: int | None = None
+        warmup_days = int(params["MA_SLOW_DAYS"]) + int(params["ATR_LOOKBACK_DAYS"]) + 5
+        self.set_warm_up(warmup_days, Resolution.DAILY)  # noqa: F405
 
         # Daily 17:30 ET scheduled action — fires after CME settlement.
         self.schedule.on(
@@ -203,9 +241,11 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         )
 
         self._params = params
+        self._v1_parameters: V1Parameters | None = None  # built lazily on first cycle
         self.log(
-            f"v1_strategy initialized (post-pivot 2026-05-12) "
+            f"v1_strategy initialized (post-pivot 2026-05-12, Pivot-PR-D) "
             f"live_mode={self.live_mode} api_base={self._api_base_url} "
+            f"strategy_version={self._strategy_version_str} "
             f"params_keys={sorted(params.keys())}"
         )
 
@@ -221,50 +261,419 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         return
 
     def on_daily_signal_cycle(self):
-        """17:30 ET daily — POST each emitted signal to backend `/api/internal/lean/signals`.
+        """17:30 ET daily — run V1 strategy + POST each signal to the backend.
 
-        Post-pivot 2026-05-12 scaffold: emits a heartbeat POST per cycle so the
-        backend's `liveness_probes` table sees the algorithm alive. Strategy
-        wiring (assemble bars, call generate_signals, POST each signal) lands
-        in Pivot-PR-D when the dispatcher routes approved signals to execution.
+        Order of operations (Pivot-PR-D scope):
+
+        1. Skip if still warming up.
+        2. Build / refresh `V1Parameters` (lazy; depends on `self._params`
+           which is set in `initialize()`).
+        3. For each subscribed market, assemble `BarSeries` via `self.history`.
+        4. Snapshot positions via `self.portfolio`.
+        5. Call `V1TrendFollowing.generate_signals(...)`.
+        6. POST a `lean_cycle_heartbeat` event with the per-cycle summary
+           (signal count, rejection count, equity, live_mode flag) so the
+           backend's `liveness_probes` table sees the algorithm alive even
+           on no-signal days.
+        7. For each emitted signal, POST a `signal_emitted` event with the
+           full payload required by
+           `services/api/routes/internal/lean.py::post_lean_signal`.
+
+        Sizing for Phase 1 is conservative single-lot allocation
+        (`target_contracts=1`). The full Stage 0-5 sizing pipeline runs
+        server-side when approved signals are dispatched to the broker
+        (Worker-PR-1 `services/risk/order_placement_worker.py`); the strategy
+        contributes the indicator snapshot (Stage 0 `strategy_inputs`).
         """
         if self.is_warming_up:
             return
 
-        session_date = self.time.date().isoformat()
+        session_date = self.time.date()
         equity = self.portfolio.total_portfolio_value
-        msg = (
-            f"signal_cycle_tick utc={self.utc_time} et={self.time} "
-            f"session_date={session_date} equity={equity}"
-        )
-        self.log(msg)
 
-        # Post-pivot scaffold: heartbeat only. The full strategy wiring lands in
-        # Pivot-PR-D. The shape of the POST is:
-        #
-        #     POST /api/internal/lean/signals
-        #     Authorization: Bearer <token>
-        #     Content-Type: application/json
-        #
-        #     {
-        #       "event_type": "lean_cycle_heartbeat",
-        #       "session_date_et": "<YYYY-MM-DD>",
-        #       "equity_usd": "<Decimal-as-string>",
-        #       "live_mode": <bool>
-        #     }
-        #
-        # Pivot-PR-D will switch this to N parallel POSTs per signal with
-        # event_type="signal_emitted" and the full sizing_trace payload per
-        # backend-spec §4.5.1-replacement.
+        # Step 2: ensure V1Parameters exist + cached.
+        try:
+            v1_params = self._get_v1_parameters()
+        except Exception as exc:  # noqa: BLE001 -- log + heartbeat-only fallback
+            self.log(f"v1_params_build_failed session_date={session_date} exc={exc!r}")
+            self._post_event(
+                "lean_cycle_heartbeat",
+                extra={
+                    "session_date_et": session_date.isoformat(),
+                    "equity_usd": str(equity),
+                    "live_mode": bool(self.live_mode),
+                    "signals_emitted_count": 0,
+                    "rejections_count": 0,
+                    "error": "v1_params_build_failed",
+                },
+            )
+            return
+
+        strategy = V1TrendFollowing(parameters=v1_params)
+        self._strategy_min_bars = strategy.min_required_bars
+
+        # Step 3-4: build active universe + positions.
+        active_universe: dict[str, BarSeries] = {}
+        current_positions: dict[str, Position] = {}
+        history_failures: list[str] = []
+        for market_key, symbol in self._market_subscriptions.items():
+            series = self._build_bar_series(
+                market_key=market_key,
+                symbol=symbol,
+                count=strategy.min_required_bars + 5,
+            )
+            if series is None:
+                history_failures.append(market_key)
+                continue
+            active_universe[market_key] = series
+            current_positions[market_key] = self._snapshot_position(
+                market_key=market_key, symbol=symbol
+            )
+
+        if history_failures:
+            self.log(
+                f"v1_history_unavailable session_date={session_date} "
+                f"failed_markets={history_failures}"
+            )
+
+        # Step 5: run the strategy.
+        try:
+            result = strategy.generate_signals(
+                active_universe=active_universe,
+                current_positions=current_positions,
+                as_of_session_date=session_date,
+            )
+        except Exception as exc:  # noqa: BLE001 -- log + heartbeat-only fallback
+            self.log(
+                f"v1_generate_signals_failed session_date={session_date} exc={exc!r}"
+            )
+            self._post_event(
+                "lean_cycle_heartbeat",
+                extra={
+                    "session_date_et": session_date.isoformat(),
+                    "equity_usd": str(equity),
+                    "live_mode": bool(self.live_mode),
+                    "signals_emitted_count": 0,
+                    "rejections_count": 0,
+                    "error": "generate_signals_failed",
+                },
+            )
+            return
+
+        signals_count = len(result.signals)
+        rejections_count = len(result.rejections)
+        self.log(
+            f"v1_signals_generated session_date={session_date} "
+            f"signals_emitted_count={signals_count} rejections_count={rejections_count}"
+        )
+
+        # Step 6: heartbeat with per-cycle summary (always emitted so
+        # liveness_probes sees the algorithm alive even when no signals).
         self._post_event(
             "lean_cycle_heartbeat",
             extra={
-                "session_date_et": session_date,
+                "session_date_et": session_date.isoformat(),
                 "equity_usd": str(equity),
                 "live_mode": bool(self.live_mode),
+                "signals_emitted_count": signals_count,
+                "rejections_count": rejections_count,
             },
         )
+
+        # Step 7: emit each signal.
+        for signal in result.signals:
+            target_contracts = self._naive_target_contracts(equity=equity)
+            if target_contracts <= 0:
+                self.log(
+                    f"v1_signal_skipped_zero_size session_date={session_date} "
+                    f"market={signal.market} equity={equity}"
+                )
+                continue
+            sizing_trace = self._build_minimal_sizing_trace(
+                signal=signal,
+                target_contracts=target_contracts,
+                equity=equity,
+            )
+            self._post_event(
+                "signal_emitted",
+                extra={
+                    "session_date_et": session_date.isoformat(),
+                    "equity_usd": str(equity),
+                    "live_mode": bool(self.live_mode),
+                    "market": signal.market,
+                    "direction": signal.direction.value,
+                    "target_contracts": target_contracts,
+                    "decision_price": str(signal.decision_price),
+                    "sizing_trace": sizing_trace,
+                    "strategy_version": self._strategy_version_str,
+                },
+            )
         return
+
+    # ------------------------------------------------------------------
+    # Strategy plumbing helpers (Pivot-PR-D)
+    # ------------------------------------------------------------------
+
+    def _get_v1_parameters(self) -> V1Parameters:
+        """Build (and cache) the `V1Parameters` dataclass from the LEAN parameter map.
+
+        Lazy — built on the first `on_daily_signal_cycle` rather than in
+        `initialize()` so a malformed parameter is surfaced as a cycle log
+        line (after warmup) instead of crashing the algorithm at boot.
+        """
+        if self._v1_parameters is not None:
+            return self._v1_parameters
+        raw = self._params
+        self._v1_parameters = V1Parameters(
+            lookback_days_donchian=int(raw["LOOKBACK_DAYS_DONCHIAN"]),
+            ma_fast_days=int(raw["MA_FAST_DAYS"]),
+            ma_slow_days=int(raw["MA_SLOW_DAYS"]),
+            hurst_threshold=Decimal(str(raw["HURST_THRESHOLD"])),
+            stop_distance_atr_mult=Decimal(str(raw["STOP_DISTANCE_ATR_MULT"])),
+            atr_lookback_days=int(raw["ATR_LOOKBACK_DAYS"]),
+            min_holding_days=int(raw["MIN_HOLDING_DAYS"]),
+            vol_target_pct_annual=Decimal(str(raw["VOL_TARGET_PCT_ANNUAL"])),
+            instrument_vol_lookback_days=int(raw["INSTRUMENT_VOL_LOOKBACK_DAYS"]),
+            roll_days_before_expiry=int(raw["ROLL_DAYS_BEFORE_EXPIRY"]),
+        )
+        return self._v1_parameters
+
+    def _build_bar_series(
+        self, *, market_key: str, symbol: object, count: int
+    ) -> BarSeries | None:
+        """Call `self.history(symbol, count, Resolution.DAILY)` → `BarSeries`.
+
+        Returns None on any failure (insufficient history, history API
+        error, malformed bars). The strategy pipeline interprets a missing
+        market as "no bars for this session" and skips it; no rejection
+        event is emitted.
+
+        Bar attribute access uses snake_case (LEAN's preferred modern
+        Python API form) with PascalCase fallback for backward compat with
+        older LEAN runtimes.
+        """
+        try:
+            history = self.history(symbol, count, Resolution.DAILY)  # noqa: F405
+        except Exception as exc:  # noqa: BLE001 -- log + skip; alternative is crash
+            self.log(f"v1_history_call_failed market={market_key} exc={exc!r}")
+            return None
+        if history is None:
+            return None
+
+        bars: list[Bar] = []
+        try:
+            for raw in history:
+                # LEAN's modern Python API returns objects with snake_case
+                # attributes (bar.open / bar.end_time / etc.). Older versions
+                # use PascalCase (bar.Open / bar.EndTime). Try both so the
+                # algorithm survives a runtime API shift between releases.
+                end_time = getattr(raw, "end_time", None) or getattr(raw, "EndTime", None)
+                if end_time is None:
+                    continue
+                # LEAN's TradeBar.end_time is the close-of-bar timestamp.
+                # For a daily bar in America/New_York the .date() is the
+                # session date.
+                session = end_time.date() if hasattr(end_time, "date") else _date.today()
+                open_v = getattr(raw, "open", None)
+                if open_v is None:
+                    open_v = getattr(raw, "Open", None)
+                high_v = getattr(raw, "high", None)
+                if high_v is None:
+                    high_v = getattr(raw, "High", None)
+                low_v = getattr(raw, "low", None)
+                if low_v is None:
+                    low_v = getattr(raw, "Low", None)
+                close_v = getattr(raw, "close", None)
+                if close_v is None:
+                    close_v = getattr(raw, "Close", None)
+                volume_v = getattr(raw, "volume", None)
+                if volume_v is None:
+                    volume_v = getattr(raw, "Volume", 0)
+                if any(v is None for v in (open_v, high_v, low_v, close_v)):
+                    continue
+                bars.append(
+                    Bar(
+                        session_date=session,
+                        open=Decimal(str(open_v)),
+                        high=Decimal(str(high_v)),
+                        low=Decimal(str(low_v)),
+                        close=Decimal(str(close_v)),
+                        volume=int(volume_v) if volume_v is not None else 0,
+                    )
+                )
+        except Exception as exc:  # noqa: BLE001 -- log + skip
+            self.log(f"v1_history_parse_failed market={market_key} exc={exc!r}")
+            return None
+
+        if not bars:
+            return None
+        # BarSeries `__post_init__` enforces strictly-increasing session_date.
+        # LEAN returns bars in chronological order but defend against accidental
+        # reverse-iteration or duplicate dates.
+        bars.sort(key=lambda b: b.session_date)
+        deduped: list[Bar] = []
+        prev: _date | None = None
+        for b in bars:
+            if prev is None or b.session_date > prev:
+                deduped.append(b)
+                prev = b.session_date
+        try:
+            return BarSeries(market=market_key, bars=tuple(deduped))
+        except ValueError as exc:
+            self.log(f"v1_barseries_invalid market={market_key} exc={exc!r}")
+            return None
+
+    def _snapshot_position(self, *, market_key: str, symbol: object) -> Position:
+        """Snapshot `self.portfolio[symbol]` to the strategy's `Position` dataclass.
+
+        Returns a FLAT position when no holdings or holdings of zero quantity.
+        The strategy's `MIN_HOLDING_DAYS` check needs `opened_at_session_date`;
+        LEAN exposes this via `holding.invested_since` (modern) or `.InvestedSince`
+        (older). When neither is available, falls back to None which the
+        strategy treats as "unknown — apply MIN_HOLDING_DAYS check using
+        the current session date" (conservative; produces TREND_FILTER_FAILED
+        or MIN_HOLDING_DAYS_NOT_SATISFIED rather than crashing).
+        """
+        holding = None
+        try:
+            holding = self.portfolio[symbol]
+        except Exception:  # noqa: BLE001 -- portfolio dict may not contain symbol
+            holding = None
+        if holding is None:
+            return Position(
+                market=market_key,
+                direction=Direction.FLAT,
+                quantity=0,
+                avg_cost=Decimal("0"),
+                opened_at_session_date=None,
+            )
+
+        quantity_raw = getattr(holding, "quantity", None)
+        if quantity_raw is None:
+            quantity_raw = getattr(holding, "Quantity", 0)
+        try:
+            quantity = int(quantity_raw)
+        except (TypeError, ValueError):
+            quantity = 0
+
+        if quantity > 0:
+            direction = Direction.LONG
+        elif quantity < 0:
+            direction = Direction.SHORT
+        else:
+            direction = Direction.FLAT
+
+        avg_price = getattr(holding, "average_price", None)
+        if avg_price is None:
+            avg_price = getattr(holding, "AveragePrice", 0)
+        try:
+            avg_cost = Decimal(str(avg_price))
+        except Exception:  # noqa: BLE001
+            avg_cost = Decimal("0")
+
+        opened_at: _date | None = None
+        if direction is not Direction.FLAT:
+            invested_since = getattr(holding, "invested_since", None) or getattr(
+                holding, "InvestedSince", None
+            )
+            if invested_since is not None and hasattr(invested_since, "date"):
+                try:
+                    opened_at = invested_since.date()
+                except Exception:  # noqa: BLE001
+                    opened_at = None
+
+        return Position(
+            market=market_key,
+            direction=direction,
+            quantity=quantity,
+            avg_cost=avg_cost,
+            opened_at_session_date=opened_at,
+        )
+
+    def _naive_target_contracts(self, *, equity) -> int:
+        """Conservative single-lot allocation for Phase 1.
+
+        Returns `1` when equity > 0, else 0. The full Stage 0-5 sizing
+        pipeline (services/risk/sizing.py) runs server-side when the
+        operator approves a signal and the order_placement_worker picks
+        it up; LEAN emits single-lot candidates because:
+
+          (a) Phase 1 starting equity is $15k-$25k; most micro-futures
+              contracts have notional ~$10k-$30k so 1 lot is the natural
+              single-position allocation.
+          (b) Operator approves each signal individually via the /signals
+              page — they retain sizing control.
+          (c) Server-side Stage 0-5 sizing depends on contract metadata
+              + correlation matrices that LEAN doesn't carry. Pushing
+              sizing into LEAN duplicates the risk engine and creates a
+              second source of truth.
+        """
+        try:
+            if Decimal(str(equity)) > 0:
+                return 1
+        except Exception:  # noqa: BLE001
+            return 0
+        return 0
+
+    def _build_minimal_sizing_trace(
+        self,
+        *,
+        signal,
+        target_contracts: int,
+        equity,
+    ) -> dict:
+        """Stage 0-shaped trace populated with strategy_inputs only.
+
+        Matches the `Stage0Trace` TypedDict from
+        `strategies/v1_trend_following/sizing_trace.py` (TypedDict, total=False).
+        Stages 1-5 are left absent (consumers tolerate `None` per the
+        TypedDict's `total=False` declaration). The full Stage 0-5 trace
+        is written by the server-side risk engine when the operator-
+        approved signal is dispatched (Worker-PR-1).
+
+        The trace is the payload's `sizing_trace` field; it lands in the
+        `signals.sizing_trace` JSONB column on backend insert.
+        """
+        snapshot = signal.indicators_snapshot
+        strategy_inputs = {
+            signal.market: {
+                "donchian_high": str(snapshot["donchian_high"]),
+                "donchian_low": str(snapshot["donchian_low"]),
+                "ma_fast": str(snapshot["ma_fast"]),
+                "ma_slow": str(snapshot["ma_slow"]),
+                "hurst": str(snapshot["hurst"]),
+                "atr": str(snapshot["atr"]),
+                "stop_price": str(signal.stop_price),
+                "lookback_days_donchian": int(snapshot["lookback_days_donchian"]),
+            }
+        }
+        return {
+            "schema_version": 1,
+            "stage_0_universe": {
+                "active_markets": [signal.market],
+                "excluded": [],
+                "strategy_inputs": strategy_inputs,
+            },
+            # Phase 1 sentinel: the conservative single-lot sizing decision
+            # taken on the LEAN side. Stage 1-5 will be appended server-side
+            # by the risk engine when the operator-approved signal is
+            # dispatched. Including the LEAN sizing decision under a stable
+            # key lets downstream review surfaces (PR review, audit
+            # explorer) attribute the contract count to the LEAN-side
+            # decision rather than guessing.
+            "lean_naive_sizing": {
+                "target_contracts": target_contracts,
+                "equity_usd": str(equity),
+                "rationale": (
+                    "Phase 1 conservative single-lot allocation pending "
+                    "server-side Stage 0-5 sizing (Worker-PR-1)."
+                ),
+            },
+        }
+
+    # ------------------------------------------------------------------
+    # HTTP POST plumbing (Pivot-PR-A)
+    # ------------------------------------------------------------------
 
     def _post_event(self, event_type: str, extra: dict | None = None) -> None:
         """POST a heartbeat or signal event to the backend.
@@ -277,7 +686,7 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         body = {
             "event_type": event_type,
             "ts_utc": self.utc_time.isoformat(),
-            "algorithm_id": "v1_trend_following",
+            "algorithm_id": STRATEGY_NAME,
         }
         if extra:
             body.update(extra)
@@ -301,7 +710,10 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
                 else:
                     self.log(f"lean_signal_post_succeeded status={status} event_type={event_type}")
         except urllib.error.HTTPError as exc:
-            self.log(f"lean_signal_post_http_error status={exc.code} event_type={event_type} reason={exc.reason}")
+            self.log(
+                f"lean_signal_post_http_error status={exc.code} "
+                f"event_type={event_type} reason={exc.reason}"
+            )
         except urllib.error.URLError as exc:
             self.log(f"lean_signal_post_url_error event_type={event_type} reason={exc.reason}")
         except Exception as exc:  # noqa: BLE001  -- best-effort net I/O
