@@ -2,6 +2,19 @@
 
 You are working on a solo-operator algorithmic trading system. The operator is non-coding (finance background, no programming) and relies on you for all implementation.
 
+> **🔄 ARCHITECTURE PIVOT 2026-05-12 — read this BEFORE consulting any other foundation doc.**
+>
+> The original Phase 1 architecture (QC-Cloud-mediated; backend polls QC ObjectStore for events; defensive trims via `/instructions/<n>.json`; cutover to direct-IBKR in Phase 2 ~Month 5) was retired on 2026-05-12 when DP-025 surfaced at Day 28 deploy: QC's `/object/get` REST endpoint is gated behind the Institutional subscription tier ($500+/mo), which is not viable on a solo-operator budget.
+>
+> **Operator decision Day 28 02:00 UTC: Option 4 — pull the original Phase 2 architecture forward into Phase 1.** Post-pivot operational reality:
+> - **Phase 1 starts on direct IBKR** via `ib-async` to a Dockerized `ib_gateway` container
+> - **LEAN runs locally** in a Dockerized `lean_local` container on the operator's VPS from Phase 1 onset
+> - **LEAN POSTs `signal_emitted` events** to backend at `POST /api/internal/lean/signals` (shared-bearer auth)
+> - **There is no Phase 2 cutover event**; the Phase 1 / Phase 2 split collapses
+> - **`services/qc_adapter/**` code stays in repo** as dormant under `qc_adapter_backfill` docker-compose profile gate (Pivot-PR-A moves it there)
+>
+> See `Docs/decisions-log.md` 2026-05-12 entry "Phase-1 architecture pivot — QC ObjectStore → LEAN Local + direct IBKR (DP-025 → Option 4)" for the full rationale, the 4 underlying decision points (DP-023/024/025/026), and the diff manifest across all 6 foundation docs.
+
 ## Read these at the start of every session
 
 1. **`Docs/claude-dev-guide.md` §1 (Session Protocol)** — how to start/end a session, ambiguity protocol, test-before-commit rule
@@ -12,8 +25,8 @@ You are working on a solo-operator algorithmic trading system. The operator is n
 
 ## Critical constraints
 
-- **Phase 1 backend has NO direct IBKR connection.** Market data + broker state via QuantConnect ObjectStore push. Do NOT call TWS API directly until Phase 2 cutover.
-- **Forbidden file path whitelist** — see `Docs/claude-dev-guide.md` §11 anti-pattern `[A02]`. Modifying `services/risk/**`, `services/signal/**`, `services/audit/**`, `services/execution/**`, `services/reconciliation/**`, `services/calibration/**`, `services/agent/decisions/**`, `services/agent/risk_actions/**`, `services/agent/parameter_changes/**`, `services/agent/prompts/decision/**`, or `alembic/**` requires `risk-review-approved` PR label. Pre-merge linter will block otherwise.
+- **Phase 1 backend HAS direct IBKR connection (post-pivot 2026-05-12).** Market data + broker state via `ib-async` to a Dockerized `ib_gateway` container. LEAN runs locally on the VPS in a `lean_local` container and POSTs signal events to `POST /api/internal/lean/signals`. **Pre-pivot rule (RETIRED):** "Phase 1 backend has NO direct IBKR connection. Market data + broker state via QuantConnect ObjectStore push. Do NOT call TWS API directly until Phase 2 cutover." See `Docs/decisions-log.md` 2026-05-12 entry + `Docs/claude-dev-guide.md` §1.5 + anti-pattern [A13] revised.
+- **Forbidden file path whitelist** — see `Docs/claude-dev-guide.md` §11 anti-pattern `[A02]`. Modifying `services/risk/**`, `services/signal/**`, `services/audit/**`, `services/execution/**`, `services/reconciliation/**`, `services/calibration/**`, `services/agent/decisions/**`, `services/agent/risk_actions/**`, `services/agent/parameter_changes/**`, `services/agent/prompts/decision/**`, or `alembic/**` requires `risk-review-approved` PR label. Pre-merge linter will block otherwise. **The new IBKR client at `services/execution/ibkr_client.py` (Pivot-PR-B) is on this list; the new LEAN signals endpoint at `services/api/routes/internal/lean.py` (Pivot-PR-A) is on the §2.3 hot-fix whitelist via `services/api/**`.**
 - **No `print()`, no stdlib `logging`** — use `structlog` with canonical fields (see dev guide §3).
 - **No `float` for money** — use `decimal.Decimal`. Serialize as strings in API payloads.
 - **No `bcrypt`** — Argon2id via `argon2-cffi`. (Locked.)

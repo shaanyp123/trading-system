@@ -2854,3 +2854,152 @@ PR-A of the Phase-1-onset 5-PR build chain ready to merge. Regular review (no `r
 ### Day 28 carryover verdict
 
 Day 28 carryover closed at 02:00 UTC after PR-A's 18-files-4014-insertions code shipped clean through 3 sequential CI runs (PR #84 → #85 → #86) and 3 sequential VPS deploy attempts — each successive deploy resolved one platform-contract assumption that the previous deploy uncovered. PR-A merged. PR #85 (DP-023 string-to-int coercion fix) merged. PR #86 (DP-024 organization_id → user_id rename) merged. The qc_adapter container booted cleanly with correct auth on the third attempt — but **DP-025 (QC Institutional-tier gating of `/object/get`) is a scope-level blocker** for the entire backend-spec §1.4 / §2.11 / §4.5.1 ObjectStore polling architecture on the operator's current QC subscription tier. Operator decision @ 02:00 UTC: **Option 4 — pivot to LEAN Local + IBKR paper, pulling backend-spec §1.5 Phase 2 architecture forward into Phase 1.** Audit chain integrity preserved (2 rows; `verify_chain --env paper` clean). qc_adapter container stopped + its merged code surface stays in place under the `qc_adapter_backfill` profile gate (Phase 2+ retained role per spec §1.4 line 233). 4 new DPs (DP-023 through DP-026) added to the register. Pattern carved out: §6.8 / A27 operator runbooks for third-party API integrations MUST smoke the **most-restricted endpoint** the integration depends on, not just the auth endpoint — DP-025 was caught at deploy time when a curl probe during PR-A scope-triage would have surfaced it pre-code. Phase-1 architecture pivot scoped to fresh session via the handoff prompt below; estimated 3-5 PRs + 1-2 days operator-side.
+
+---
+
+### 2026-05-12 — Day 29 — Phase-1 architecture pivot — QC ObjectStore → LEAN Local + direct IBKR (DP-025 → Option 4)
+
+> **This entry is the canonical record of the 2026-05-12 architecture pivot.** Future agents reading the specs should consult this entry to understand why the foundation docs read the way they do post-pivot. It documents (a) what changed in each foundation doc, (b) what the new code surfaces will look like across Pivot-PR-A through Pivot-PR-E, (c) which references in the docs were NOT touched and where pre-pivot text remains for institutional memory, and (d) the process patterns carved out for future pivots.
+
+- **Spec reference:** `Docs/decisions-log.md` 2026-05-12 Day 28 carryover entry (the prior entry above this one) — full DP-025 discovery narrative + Option 4 selection rationale. The 6 affected foundation docs and their pre-pivot section anchors are listed in the brief that initiated this session (preserved in conversation transcript; the key sections are `Docs/backend-spec.md` §1.2/1.3/1.4/1.5/2.1.1/2.3/2.5/2.6/2.11/3.19/4.5.1/4.5.2/6.6.1 + `Docs/claude-dev-guide.md` §1.5 + [A13] + `implementation-guide.md` §3 Week 7 Thu + §4 Phase 1 milestone + §5 Phase 2 milestone + §8 DPR + `Docs/frontend-spec.md` §2 system page row + `Docs/ai-and-strategy-overview.md` Phase 1/Phase 2 narrative + §9 phase changes table + `CLAUDE.md` orientation surface).
+
+- **Stage 0 PR scope (this entry's PR):** **doc-only**; touches no production code; regular review (no `risk-review-approved` label required because no whitelist paths are modified). 6 foundation docs + this decisions-log entry are the totality of the diff. The 5 Stage-1 PRs (Pivot-PR-A through Pivot-PR-E) deliver the new code surfaces and ship over the following 1-2 days.
+
+- **Why pivot now vs. defer:**
+  - The pre-pivot Phase 1 plan was built on a critical assumption (the operator's QC subscription tier supports `/object/get`) that turned out to be false at deploy time. The 5-PR Phase-1-onset build chain (PR-A QC adapter fetcher merged Day 28; PR-B/C/D/E planned) was authored against that assumption.
+  - Continuing on the pre-pivot path would have required either (a) upgrading to QC Institutional (~$500-1000/mo; outside the $200/mo soft budget ceiling), (b) building an Option-2 bridge (QC algorithm `WebRequest` direct posts; new in-algo retry queue + auth secret managed inside the QC algo's code), or (c) deferring Phase-1 live trading.
+  - Option 4 (pivot to LEAN Local + direct IBKR) is strictly better than (b) on architecture quality: lower latency (≤5s vs 20s round-trip), no third-party intermediary, no QC-tier-specific risks. It IS the originally-planned Phase 2 architecture (spec §1.3) — operationally proven design, just pulled forward by ~3 months.
+  - Day 1-28 hardening built all the supporting infrastructure: audit chain writer, risk engine, signal sizing, web UI, Discord bot, ib_gateway docker pattern is well-documented, ib-async is a mature OSS library. The remaining gap is: 5 PRs to deliver the new pipeline + 6 foundation docs to reflect the new architecture.
+
+- **Diff manifest across the 6 foundation docs (Stage 0 PR contents):**
+
+  **1. `Docs/claude-dev-guide.md`** (~2 edits, ~50 lines added)
+     - **§1.5 "Phase 1 architecture (CRITICAL)" entry:** flipped in-place. Pre-pivot text said "Backend has NO direct IBKR connection. Market data + broker state via QC ObjectStore push." Post-pivot text says "Backend HAS direct IBKR connection via `ib-async` to a Dockerized `ib_gateway` container. LEAN runs locally on the operator's VPS. Order placement, cancellation, position queries, and EOD reconciliation are all direct against IBKR; no instruction protocol; no QC ObjectStore polling." Includes historical context paragraph explaining the flip and pointing at this decisions-log entry.
+     - **§11 [A13] anti-pattern:** flipped in-place. Pre-pivot text said "DO NOT write Python code that calls IBKR TWS API directly in Phase 1." Post-pivot text says "DO write IBKR broker integration via `ib-async` from Phase 1 onward — direct TWS API path is now the canonical broker contract. The client lives at `services/execution/ibkr_client.py` (forbidden whitelist — `risk-review-approved` required)." Notes that [A02] still binds (`services/execution/**` on the forbidden whitelist).
+
+  **2. `Docs/backend-spec.md`** (~10 edits, ~300 lines added/modified)
+     - **Top-of-file architecture pivot banner** added — explains the QC ObjectStore → LEAN Local + direct IBKR shift, points at this decisions-log entry, instructs readers that sections marked `[RETIRED — pivot 2026-05-12]` describe pre-pivot Phase 1.
+     - **§1.2 "Phase 1 Architecture":** new post-pivot section authored in-place with new mermaid diagram (no QC Cloud subgraph; LEAN Local + IB Gateway in the Hetzner Ashburn stack); new critical-contract paragraph; new service inventory delta. Pre-pivot §1.2 content preserved verbatim as **new §1.2-RETIRED** subsection (with the original QC-mediated diagram + critical-contract text).
+     - **§1.3 "Phase 2 Architecture":** marked `[RETIRED — pivot 2026-05-12]` at the header. Banner explains that post-pivot, this IS the Phase 1 architecture (see §1.2 above). Original Phase 2 narrative preserved below the banner for cross-reference continuity with §5 sequence diagrams.
+     - **§1.4 "Service Inventory":** table rewritten with "Phase 1 (post-pivot)" + "Pre-pivot Phase 1 (RETIRED)" columns. Row 4 `execution` flipped from "writes QC OS" to "ib-async direct"; Row 5 `reconciliation` flipped from "from QC OS" to "ib-async + FlexQuery direct"; Row 9 `qc_adapter` flipped to "dormant under `qc_adapter_backfill` profile gate"; Row 18 `ib_gateway` flipped from "Phase 2 only" to "Phase 1+ always-on"; Row 19 `lean_local` flipped from "Phase 2 on-demand" to "Phase 1+ always-on".
+     - **§1.5 "Phase 1 → Phase 2 Cutover":** header marked `[RETIRED — pivot 2026-05-12]`. Banner explains there is no longer a cutover event. Lists which of the 8 pre-cutover-checklist items folded into the new Week 8 pre-live checklist (CK3 + CK4 + CK6 + CK7 + CK8) vs. which were retired (CK1 + CK2 + CK5). Original 8-step checklist + sequence diagram preserved verbatim.
+     - **§2.1.1 "Market Data Ingestion":** table rewritten with "Phase 1+ post-pivot" + "Pre-pivot Phase 1 (RETIRED)" columns. Inputs flipped from "QC ObjectStore polled" to "IBKR live ticks via ib-async + QC bundled historical bars cached in lean_local volume". Dependencies flipped to `ib_gateway` + `lean_local`. Failure modes flipped to TWS disconnect / LEAN Local crash. Config flipped from QC poll intervals to `IBKR_MARKET_DATA_SUBSCRIPTION_LEVEL` + `LEAN_LOCAL_SCHEDULE_ET`.
+     - **§2.3 "Signal Engine":** table rewritten with same pattern. Inputs flipped from "Bars parsed from QC adapter" to "`POST /api/internal/lean/signals` (LEAN Local → backend, shared-bearer auth)". Schedule flipped from APScheduler-driven to LEAN's internal `Schedule.On()` loop. Authentication added: LEAN→backend uses shared bearer token from sops `lean.api_bearer_token`; `LeanAuthMiddleware` runs outermost analogously to Day 23 `BotAuthMiddleware`.
+     - **§2.5 "Execution Engine":** table rewritten. Order placement path flipped from "Write to QC ObjectStore `/instructions/<n>.json`" to "Direct via ib-async to ib_gateway container". Round-trip target flipped from p99 ≤ 20s to p99 ≤ 5s. Kill-switch SLO flipped from ≤ 30s to ≤ 5s. Code path flipped from `services/qc_adapter/` to `services/execution/ibkr_client.py` (Pivot-PR-B).
+     - **§2.6 "Reconciliation":** table rewritten. Intraday cadence source flipped from "QC ObjectStore `/state/portfolio.json` push" to "`ib-async.reqPositions()` + `reqAccountSummary()` real-time TWS snapshot". EOD source flipped from "QC algorithm pushes FlexQuery to ObjectStore" to "backend pulls FlexQuery XML directly via IBKR FlexQuery web service (token in sops `ibkr.flex_query_token`)". Added FlexQuery setup precondition section explaining the operator-side template creation step.
+     - **§2.11 "QC Adapter":** header marked `[RETIRED for primary role; DORMANT backfill role retained — pivot 2026-05-12]`. Comprehensive banner explains the dormant status — code preserved, tests still run in CI, container profile-gated under `qc_adapter_backfill`, only invoked for ad-hoc historical replay (which won't happen because production never wrote to QC pre-pivot). Re-enabling procedure documented in the banner. Original tables + protocol descriptions preserved verbatim below the banner for institutional memory.
+     - **§3.19 "qc_adapter_cursor" table:** header marked `[DORMANT — pivot 2026-05-12]`. Schema preserved; rows preserved; backfill-replay role noted.
+     - **§4.5.1 "QC ObjectStore Polling Payloads":** header marked `[RETIRED — pivot 2026-05-12]`. Replacement endpoint documented (`POST /api/internal/lean/signals` from Pivot-PR-A). Original payload schema preserved for backfill-replay.
+     - **§4.5.2 "Backend → QC Algorithm Instructions":** header marked `[RETIRED — pivot 2026-05-12]`. Banner explains that defensive trims become direct `placeOrder` calls with limit price + 1× spread retry logic. Original payload schema preserved.
+     - **§6.6.1 "QC ObjectStore poll fails 5–9 min":** header marked `[RETIRED — pivot 2026-05-12]`. New **§6.6.1-alt "IB Gateway disconnect during CME session"** authored with `ibkr_gateway_health_check_loop()` Python skeleton + severity-classification note (post-pivot severity is `routine` not `defensive_envelope` — IBKR is the canonical broker, not a comm-breakdown surface).
+
+  **3. `Docs/frontend-spec.md`** (~2 edits, ~15 lines added)
+     - **Top-of-file pivot impact banner** added — explains the backend pivot, lists what's unchanged on the frontend (page layouts, components, state shape, SSE event types, routes, Discord deep-link contracts, env tags), and what changes (System page reconciliation status copy/source; Today page queued-signals upstream producer).
+     - **§2 per-page table (System row):** reconciliation status description flipped from "Phase 1 source: QC; Phase 2: TWS + FlexQuery" to "Phase 1+ post-pivot 2026-05-12: IBKR TWS via `ib-async` intraday + IBKR FlexQuery EOD". Cross-references backend-spec §2.6 + this decisions-log entry.
+
+  **4. `implementation-guide.md`** (~5 edits, ~150 lines added)
+     - **Top-of-file pivot banner** added — explains the build-history flip; documents that Days 1-27 work is locked in production; Day 28 PR-A merged but dormant; Day 29+ work flips to the Pivot-PR sequence.
+     - **§1.5 Environment Tags table:** flipped `[paper]` and `[live]` row descriptions to IBKR-paper / IBKR-live (was QC paper / QC live). Pre-pivot column preserved.
+     - **§3 Week 7 Thu line:** ceremony re-spec'd. Pre-pivot Thu line preserved as italic block-quote below the new line.
+     - **§3 Week 7 verification gate + risks + if-blocked:** rewritten end-to-end. Pre-pivot gate items + risks + blockers preserved as italic block-quote.
+     - **§3 Week 8 Thu line + pre-flight checklist + verification gate:** rewritten end-to-end. Pre-pivot Thu line preserved.
+     - **§4 Phase 1 Milestone Plan:** Month 2 "Live Trading Begins" key-milestones flipped from "executed via QC on real IBKR Pro account" to "executed via ib-async direct to IBKR Pro through ib_gateway (no QC Cloud involvement)". Pre-pivot framing preserved as block-quote.
+     - **§4 Month 5:** "Phase 2 Prep Begins" renamed to "Continued Operations + Second-Strategy Prep (post-pivot 2026-05-12)". Pre-pivot 8-item pre-cutover checklist content marked retired with brief explanation of which items folded into Week 8 pre-live checklist.
+     - **§5 Phase 2 Milestone Plan:** header marked `[RETIRED — pivot 2026-05-12]`. Banner + re-mapping table explains how pre-pivot Phase 2 milestones shift to fold into Phase 1 evolution or Phase 3. Original Phase 2 content preserved below for institutional memory.
+     - **§8 Decision-Point Register:** appended DP-021 + DP-022 + DP-023 + DP-024 + DP-025 + DP-026 to the table (6 new DP rows). DP-021 + DP-022 capture the Day 25 carryover programming-pattern + grant-matrix discoveries that were previously only in decisions-log; DP-023 through DP-026 capture the Day 28 carryover discoveries documented in the prior entry.
+
+  **5. `Docs/ai-and-strategy-overview.md`** (~3 edits, ~30 lines added)
+     - **Phase 1 narrative:** rewritten. Pre-pivot narrative (QC ObjectStore + 20s round-trip) preserved as block-quote.
+     - **Phase 2 narrative:** marked `[RETIRED — pivot 2026-05-12]`. Pre-pivot text preserved.
+     - **§9 "what changes between phases" table:** Phase 1 + Phase 2 columns rewritten. Phase 2 column entries become "RETIRED — was X" rows. New row added documenting QC ObjectStore polling status as ❌ across all phases post-pivot.
+
+  **6. `CLAUDE.md`** (~2 edits, ~20 lines added)
+     - **Top-of-file pivot banner** added — orientation surface for fresh sessions; mirrors the dev-guide §1.5 lock content.
+     - **Critical constraints section:** first bullet flipped from "Phase 1 backend has NO direct IBKR connection" to "Phase 1 backend HAS direct IBKR connection (post-pivot 2026-05-12)". Forbidden-whitelist note extended with reference to Pivot-PR-A + Pivot-PR-B path scoping.
+
+  **NOT modified in Stage 0 (preserved for institutional memory; future agents will read these as pre-pivot historical context):**
+  - **Backend-spec sequence diagrams in §5** — these show participants like QCA (QC Adapter) + QCOS (QC ObjectStore) + IBKR. The diagrams are accurate descriptions of pre-pivot architecture and are preserved unchanged. Future agents reading these should reference the top-of-file pivot banner + §1.2 to understand that the diagrams describe pre-pivot Phase 1 (which never went into live production).
+  - **Backend-spec docker-compose example block (lines 3815-3854)** — preserved as-is. The actual production docker-compose.yml (in the repo root) is updated by Pivot-PR-A.
+  - **Backend-spec env-tag definitions §10 (lines 4061-4063)** — `paper` / `live-small` / `live-scale` tag definitions still reference "QC paper account (or IBKR paper Phase 2)" in the table. Preserved as-is; the env tags themselves are still correct semantically (the tag values haven't changed; only the underlying broker mapping has).
+  - **Backend-spec §6.2 failure cross-reference (line 791)** — preserved. The "QC adapter" row in the failure-cross-ref table is historically accurate for the pre-pivot architecture; post-pivot it's effectively dormant code.
+  - **`ibkr_local_symbol` + `ibkr_con_id` columns in §3.29 `contracts` table** — these existed pre-pivot for Phase 2 readiness; they're now Phase 1+ active. No edit needed because the columns and their semantics are unchanged.
+  - **Implementation-guide §3 Week 3 (QC adapter scaffold) + Week 4 (golden tests) + Week 5-6 (other Phase 0 work) status notes** — preserved verbatim. These document the historical build steps that produced the now-dormant `services/qc_adapter/**` code. Future agents reading the carryover notes should understand they describe pre-pivot work; the post-pivot equivalent week-by-week breakdown is in Day 29+ work.
+  - **`lean/v1_qc_algorithm.py` filename** — will be renamed to `lean/v1_strategy.py` by Pivot-PR-A; references in foundation docs to the old filename are noted but not edited in Stage 0 (the rename is a code change, not a spec change).
+  - **`Docs/decisions-log.md` historical entries (Days 1-27)** — preserved verbatim. These are append-only by convention.
+
+- **Stage 1 PR roadmap (Pivot-PR-A through Pivot-PR-E):**
+
+  **Pivot-PR-A — LEAN Local + internal lean signals endpoint** (`risk-review-approved` NOT required — `services/api/**` is hot-fix whitelist; new `infrastructure/lean_local/` is new path off any whitelist; the qc_adapter docker-compose move is also off the forbidden whitelist).
+  - Rename `lean/v1_qc_algorithm.py` → `lean/v1_strategy.py` (preserves all algorithm code; only the filename drops the `qc_` prefix since it's no longer QC-Cloud-hosted)
+  - Add `services/api/routes/internal/lean.py` — `POST /api/internal/lean/signals` accepts `signal_emitted` events from LEAN Local; validates against the existing audit-event taxonomy; writes audit row via `append_audit_event`; INSERTs into `signals` table; returns 201 with `signal_uuid`.
+  - Add `LeanAuthMiddleware` (or extend `BotAuthMiddleware` to multi-bearer) in `services/api/middleware.py`. Shared bearer from sops `lean.api_bearer_token` (separate secret from `discord.api_bearer_token` so compromise of one container doesn't grant access via the other). Sets `request.state.is_lean_authenticated = True` + injects a strong-auth `SessionContext(user_id="lean-local", username="lean-local", role="owner")`.
+  - Add `lean_local` service block to `docker-compose.yml` — `quantconnect/lean:latest` image; mounts `./lean/` as the algorithm directory + `./strategies/` for shared Python; env vars for `LEAN_LOCAL_BEARER_TOKEN` + `LEAN_LOCAL_API_BASE_URL=http://api:8000` + `LEAN_LOCAL_SCHEDULE_ET=17:30`.
+  - Move `qc_adapter` service block under `profiles: [qc_adapter_backfill]` so `docker compose up -d` skips it by default.
+  - Add `infrastructure/lean_local/` directory with `config.json` (LEAN algorithm config — broker = "IBKR-paper" or "IBKR-live"; data feed = "IBKR + QC bundled"; environment = paper/live-small/live-scale) + `bootstrap.py` (Python that LEAN imports; reads the bearer token from env; POSTs signal events on `OnData` callback).
+  - Write `deploy/lean_local/README.md` operator runbook — A27 satisfier per dev-guide §6.8 alternative (b). Steps: verify sops has `lean.api_bearer_token` populated → build + up `lean_local` container → confirm `lean_strategy_initialized` log line → wait for first bar ingestion at 17:30 ET → confirm `lean_signal_post_succeeded` log line → confirm row in `signals` table → confirm `signal_emitted` audit row → `verify_chain --env paper` still clean.
+  - Tests: unit tests for `LeanAuthMiddleware` (no-header pass-through, valid bearer 200, invalid bearer 401) + unit tests for `/api/internal/lean/signals` endpoint (happy path inserts row, invalid payload 422, valid auth + invalid market 422) + integration test via testcontainers postgres exercising the full POST → audit-write → signal-row write cycle.
+  - A01/A05/A06/A22/A27 BINDING + must be satisfied.
+
+  **Pivot-PR-B — IBKR client + IB Gateway container** (`risk-review-approved` REQUIRED — `services/execution/**` on forbidden whitelist).
+  - `services/execution/ibkr_client.py` — async wrapper over `ib-async` (formerly `ib_insync`; library renamed). Connection management to `ib_gateway:4002` (paper) / `ib_gateway:4001` (live) with auto-reconnect; `placeOrder()` / `cancelOrder()` / `reqPositions()` / `reqAccountSummary()` / `cancelAllOrders()`; uses `client_order_id` 33-char format per spec §2.5; `orderRef` field threaded through; rejection callback mapping per spec §6.3 Order Rejection Taxonomy.
+  - `services/execution/dispatch.py` — order-placement orchestrator (signal approved → sizing → place + monitor + reconcile). Audit-first per spec §2.10.1.
+  - Add `ib_gateway` service block to `docker-compose.yml` — `gnzsnz/ib-gateway` image; env vars for `TRADING_MODE` (paper/live) + `TWS_USERID` + `TWS_PASSWORD` from sops; port 4002/4001 exposed on the `internal` Docker network ONLY (NOT to Caddy or public).
+  - Write `deploy/ibkr/README.md` operator runbook with the A27-required smoke: place a $1 paper market order on `/MES`, confirm fill via `ib-async`, confirm fill row lands in `fills` table + chain. **Mandatory precondition smoke before PR can merge:** futures-sim availability on the operator's paper account.
+  - Tests: respx-mocked `ib-async` for unit tests (won't actually hit a TWS session); integration tests against a real `ib_gateway` paper container in CI (`gnzsnz/ib-gateway` supports a `IBC_TEST_MODE` env var for ephemeral non-production startup).
+  - A01/A02/A05/A06/A22/A27 BINDING + must be satisfied.
+
+  **Pivot-PR-C — Reconciliation via IBKR FlexQuery + intraday `ib-async`** (`risk-review-approved` REQUIRED — `services/reconciliation/**` on forbidden whitelist).
+  - `services/reconciliation/flex_query_fetcher.py` — IBKR FlexQuery web service client (XML pull); parses FlexQuery output into the same `ReconciliationPlan` shape that Day 9 PR #42 already accepts as input.
+  - `services/reconciliation/ibkr_intraday.py` — `ib-async.reqPositions()` + `reqAccountSummary()` cycle for intraday recon.
+  - Update `services/reconciliation/recon.py` to consume from the new fetchers (the pure-policy planner is unchanged; only the data source switches).
+  - Write `deploy/reconciliation/README.md` operator runbook.
+  - Tests: respx-mocked FlexQuery + mocked `ib-async`; integration tests.
+  - A01/A02/A05/A06/A22/A27 BINDING + must be satisfied.
+
+  **Pivot-PR-D — Signal mutation handlers** (`risk-review-approved` REQUIRED — `services/risk/**` on forbidden whitelist).
+  - `services/risk/signal_dispatch.py` — orchestrates the approved-signal path: SELECT signal → sizing (existing Day 6-9 PR #28 sizing.py) → call `services/execution/dispatch.py.place_order()` (Pivot-PR-B) → log `signal_approved` + `order_placed` audit events.
+  - Update `services/api/routes/signals.py` to unstub the 3 Day-15 501 handlers (`/api/signals/:id/{approve,reject,defer}`).
+  - Tests: unit tests for `signal_dispatch.py` + integration test for the approve→placeOrder cycle.
+  - A01/A02/A05/A06/A22 BINDING + must be satisfied.
+
+  **Pivot-PR-E — Discord channel pushes + ceremony execution** (`risk-review-approved` NOT required — `services/webhook_pusher/**` is off both whitelists; `services/discord_bot/**` is hot-fix).
+  - Extend `services/webhook_pusher/dispatcher.py` to handle `signal_emitted` events → `#signals` embed; `order_filled` events → `#fills` embed.
+  - Wire the Discord `#signals` Approve button → POST `/api/signals/:id/approve` (from Pivot-PR-D).
+  - Execute the Week 7 Thu ceremony: trigger a paper signal cycle, watch Discord, click Approve, watch fill, confirm position + trade row.
+  - Tests: respx-mocked Discord HTTP + integration tests.
+
+- **Constraints on Stage-1 PRs:**
+  - Audit chain integrity is sacrosanct. Current 2 production audit rows must continue to verify clean via `verify_chain --env paper`. Any new write path routes through `services.audit.writer.append_audit_event` (anti-pattern A01).
+  - PR-A's merged code stays in place. `services/qc_adapter/**` is NOT deleted — it's dormant. The Dockerfile builds + 50 unit/integration tests pass. The container moves to a `qc_adapter_backfill` profile gate in docker-compose.
+  - DP-025 lesson: the §6.8 / A27 operator runbook MUST smoke the most-restricted endpoint the integration depends on, NOT just the auth endpoint. For IBKR via ib-async: that's `placeOrder` + `cancelOrder` round-trip on the paper account, not just gateway connection. Surface the smoke result as a precondition for the PR being mergeable.
+  - IBKR Pro account is approved; futures-trading approval is PENDING. IBKR paper accounts grant simulated full-feature access regardless of live futures status — paper trades on `/MES`, `/MNQ`, `/MCL` should work pre-futures-approval. Verify this at the start of Pivot-PR-B before wiring any code: SSH into the operator's IBKR portal (paper account) and confirm futures instruments are available for simulated trading. If they're NOT available pre-futures-approval, fall back to Option 2 (QC algorithm direct POST with retry queue) as a temporary bridge.
+
+- **Process patterns carved out (apply to future pivots):**
+  - **Spec-first refactor banners:** when an architecture pivot retires a section of the spec, mark the section header with `[RETIRED — <reason + date>]` and preserve the original content for institutional memory. Future agents can read the historical text + the banner + the decisions-log entry to fully understand "the architecture chose X over Y; here's why." Wholesale deletion loses the institutional memory that prevented re-introduction of a known-bad approach.
+  - **Foundation doc top-of-file banners:** for pivots that affect multiple sections of a doc, add a single top-of-file banner pointing at the decisions-log entry. Future agents reading the doc cold will see the banner first and have the right framing for everything that follows.
+  - **Dormant code via docker-compose profile gates:** retired services that should stay in the repo (for institutional memory + ad-hoc backfill + regression-net tests) move under named profile gates (`qc_adapter_backfill`) so default `docker compose up -d` skips them. The tests still run in CI; the code is still importable; the container is just never started in production.
+  - **DP register as the canonical decision-history surface:** every architecture decision worth preserving for future agents goes in `implementation-guide.md` §8 with full ID + trigger + choice + default + action + rationale. The decisions-log captures the narrative; the DP register captures the structured decision data. Both surfaces are append-only.
+
+- **Pre-authorization granted by operator (this session):**
+  - SSH-delegated VPS deploy after each Pivot-PR-X merges (same Day 24-27 pattern)
+  - Workstation `git push` for any VPS-originated commits via format-patch → `git am` → `git push` cycle
+  - IBKR paper-account smoke as part of Pivot-PR-B's A27 satisfier (placeOrder + cancelOrder round-trip on /MES paper)
+  - `risk-review-approved` label self-application on Pivot-PR-B/C/D at PR-open time (operator still reviews + gates the merge)
+
+- **Q1-Q4 resolutions (from session-start scope triage):**
+  - **Q1 IBKR client path:** `services/execution/ibkr_client.py` (existing forbidden-whitelist directory; on `[A02]`). Operator: blanket ✓.
+  - **Q2 LEAN signal output:** Option (b) — LEAN POSTs to `/api/internal/lean/signals` with shared-bearer auth. Operator: blanket ✓.
+  - **Q3 Strategy file rename:** rename `lean/v1_qc_algorithm.py` → `lean/v1_strategy.py`. Operator: blanket ✓.
+  - **Q4 qc_adapter long-term fate:** Option (a) — keep dormant under `qc_adapter_backfill` profile gate; do not delete. Operator: blanket ✓.
+
+- **Outstanding (out-of-scope for Stage 0; flagged for Stage 1 attention):**
+  - The Phase-1 cost model needs updating: pre-pivot model assumed QC Researcher-$60/mo + minimal IBKR data subscriptions. Post-pivot drops the QC subscription but may need IBKR real-time market data ($1.50-25/mo per data package). Net change probably $0-30/mo; tracked but not load-bearing for Stage 0.
+  - LEAN Local container resource footprint: a `quantconnect/lean:latest` container is ~1GB image + 200-500MB RAM at runtime; with `ib_gateway` (~300MB RAM) + existing 7 containers, the Hetzner CCX13 (8GB RAM) may need verification. If pressed, upgrade to CCX23 (16GB) at ~$10/mo step-up. Tracked but not load-bearing for Stage 0.
+  - The `lean/lean.json` config + LEAN Algorithm class hierarchy may need adjustment for the IBKR brokerage path; LEAN supports IBKR natively but the operator must configure the brokerage = "IBKR" path. Tracked for Pivot-PR-A.
+  - Pre-flight smoke for Pivot-PR-A's mandatory precondition: the `lean_local` container must be able to authenticate against the api's `/api/internal/lean/signals` endpoint. Smoke is `curl --header "Authorization: Bearer <test-token>" --data '{"market":"/MES","direction":"long",...}' http://api:8000/api/internal/lean/signals` returning 201.
+
+---
+
+### 2026-05-12 — Day 29 — Stage 0 verdict
+
+Stage 0 of the Phase-1 pivot closed at the doc-only-PR level. 6 foundation docs received surgical edits: dev-guide §1.5 + [A13] flipped in-place; backend-spec top-banner + §1.2 (new diagram + critical-contract) + §1.3 retired + §1.4 service inventory rewritten + §1.5 cutover retired + §2.1.1/§2.3/§2.5/§2.6 tables rewritten + §2.11 dormant + §3.19 dormant + §4.5.1/§4.5.2 retired + §6.6.1 retired with new §6.6.1-alt; frontend-spec top-banner + §2 system-page row updated; implementation-guide top-banner + §1.5 env tags + §3 Week 7 Thu + Week 7 verification gate + Week 8 cutover ceremony + §4 Phase 1 milestone + §5 Phase 2 retired + §8 DPR appended (6 new DPs DP-021..026); ai-and-strategy-overview Phase 1 narrative + Phase 2 retired + §9 phase changes table updated; CLAUDE.md top-banner + Critical Constraints updated. All retired sections preserve their original content for institutional memory; section headers carry `[RETIRED — pivot 2026-05-12]` markers; banners explain the pivot rationale and point at this decisions-log entry. Stage 1 (5 Pivot-PRs) commences after Stage 0 PR opens for operator review.
