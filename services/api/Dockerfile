@@ -79,6 +79,7 @@ RUN python -m venv /opt/venv \
         "resend>=2.4" \
         "anthropic>=0.39" \
         "pyyaml>=6.0" \
+        "ib-async>=1.0.3" \
         "psycopg2-binary>=2.9"
 
 # Layer 2: copy the rest of the source tree we actually run.

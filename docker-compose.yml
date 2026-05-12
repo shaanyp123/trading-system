@@ -316,20 +316,51 @@ services:
       - ./deploy/grafana:/etc/grafana/provisioning:ro
       - grafana_data:/var/lib/grafana
 
-  # ---- Phase 2 only (profile-gated; never start in Phase 1) -------------
+  # ---- IBKR Gateway (Pivot-PR-B; post-pivot 2026-05-12) ----------------
   #
-  # POST-PIVOT 2026-05-12 NOTE: ib_gateway + lean_local are no longer
-  # `phase2`-only — they are the canonical Phase 1+ broker + algorithm
-  # path. The Pivot-PR-A scope below adds `lean_local` as an always-on
-  # service (no profile gate). Pivot-PR-B will add `ib_gateway` similarly.
-  # The `phase2` profile is retained on the blocks below for compatibility
-  # until Pivot-PR-B lands; Pivot-PR-B removes the `phase2` gate and adds
-  # the build context + env vars + sops mount.
+  # gnzsnz/ib-gateway-docker hosts IB Gateway (IBKR's TWS API gateway) in
+  # a container. The `services/execution/ibkr_adapter.py` connects via
+  # `ib-async` to this container on port 4002 (paper) / 4001 (live).
+  #
+  # Networks: `internal` ONLY. NOT exposed to Caddy or the public internet.
+  # The TWS API protocol is unauthenticated at the network layer (auth is
+  # via username/password at session-open + the `clientId`); exposing 4001/4002
+  # publicly would let anyone with the credentials place orders. Keep on
+  # the internal Docker network only.
+  #
+  # Credentials: TWS_USERID + TWS_PASSWORD from sops `ibkr.paper_username`/
+  # `ibkr.paper_password` (paper) or `ibkr.live_username`/`ibkr.live_password`
+  # (live). The image's entrypoint reads them directly; we mount the sops
+  # bundle as a secret + the operator runbook
+  # (`deploy/ibkr/README.md`) walks through wiring.
+  #
+  # TRADING_MODE env var flips paper vs live (controls which port the
+  # gateway listens on + which IBKR account it connects to).
   ib_gateway:
-    image: gnzsnz/ib-gateway:latest
+    image: ghcr.io/gnzsnz/ib-gateway:stable
     restart: unless-stopped
     networks: [internal]
-    profiles: ['phase2']
+    environment:
+      # paper or live; flipped at deploy time via deploy/.env LEAN_LIVE_MODE
+      TWS_USERID: ${IB_GATEWAY_USERNAME:-}
+      TWS_PASSWORD: ${IB_GATEWAY_PASSWORD:-}
+      TRADING_MODE: ${IB_GATEWAY_MODE:-paper}
+      # gnzsnz image-specific config — read at boot.
+      VNC_SERVER_PASSWORD: ${IB_GATEWAY_VNC_PASSWORD:-}
+      TZ: America/New_York
+      # IBC (IB Controller) settings — auto-login + auto-restart at scheduled
+      # IBKR maintenance windows (which would otherwise need manual restart).
+      AUTO_RESTART_TIME: '11:59 PM'
+      RELOGIN_AFTER_TWOFA_TIMEOUT: 'yes'
+      TWOFA_DEVICE: 'YubiKey'  # operator's chosen 2FA device per Day 4 carryover
+    healthcheck:
+      # Port 4002 (paper) is the TWS API listener; if the gateway is
+      # logged in + healthy, this port accepts TCP connections.
+      test: ['CMD-SHELL', 'nc -z localhost 4002 || nc -z localhost 4001 || exit 1']
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s  # IBC takes ~90s to log in fresh
 
   # lean_local — LEAN algorithm engine (Pivot-PR-A; post-pivot 2026-05-12).
   #
