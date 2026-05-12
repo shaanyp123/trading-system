@@ -66,7 +66,14 @@ services:
       context: .
       dockerfile: services/api/Dockerfile
     restart: unless-stopped
-    networks: [internal]
+    # The api needs egress in addition to internal to reach IBKR's
+    # FlexQuery REST endpoint at ndcdyn.interactivebrokers.com (used
+    # by the reconciliation scheduler at services/reconciliation/**).
+    # Pre Worker-PR-3a (2026-05-12) the api was internal-only and
+    # FlexQuery calls failed at DNS resolution. The Caddy reverse-proxy
+    # path to /api remains via the internal network — egress only
+    # affects outbound DNS+TCP from the api container itself.
+    networks: [internal, egress]
     environment:
       API_ENVIRONMENT: ${ENVIRONMENT:-paper}
       API_VERSION: ${RELEASE_SHA:-dev}
