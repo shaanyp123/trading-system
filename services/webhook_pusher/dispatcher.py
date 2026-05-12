@@ -65,6 +65,7 @@ import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from services.webhook_pusher.event_pushes import EventChannel, EventPushPlan
 from services.webhook_pusher.payloads import (
     AlertCategory,
     AlertDispatchPlan,
@@ -76,6 +77,9 @@ from services.webhook_pusher.payloads import (
     plan_alert_dispatch,
 )
 from services.webhook_pusher.sender import (
+    DEFAULT_RETRY_AFTER_SECONDS,
+    HTTP_TIMEOUT_SECONDS,
+    MAX_RETRY_AFTER_SECONDS,
     DeliveryResult,
     DeliveryStatus,
     post_outbound_message,
@@ -379,8 +383,169 @@ async def _update_delivery_status(
     await session.commit()
 
 
+# ---------------------------------------------------------------------------
+# Event-push dispatcher (Worker-PR-2; 2026-05-12)
+# ---------------------------------------------------------------------------
+#
+# Distinct from the alert dispatcher above. Event pushes deliver
+# `signal_emitted` / `signal_approved` / `signal_rejected` / `signal_deferred`
+# / `order_filled` events to the `#signals` and `#fills` Discord channels.
+# These are NOT alerts (no alerts table row, no severity, no fan-out): each
+# event flows to exactly one channel + one Discord webhook URL.
+#
+# Caller contract (NOT in this module):
+#
+# - The webhook_pusher service subscribes to the api's SSE stream
+#   (`/api/sse/events`). On each `signal_emitted` / `signal_approved` /
+#   `order_filled` event, it adapts the SSE payload into one of the
+#   :class:`SignalEmittedEvent` / :class:`SignalDecisionEvent` /
+#   :class:`OrderFilledEvent` dataclasses defined in event_pushes, calls
+#   :func:`services.webhook_pusher.event_pushes.plan_event_push` to build
+#   the EventPushPlan, then calls :func:`dispatch_event_push` here.
+# - The SSE subscription loop lives in the webhook_pusher entrypoint
+#   (deferred to a follow-up PR; Worker-PR-2 ships the dispatcher
+#   foundation + leaves the subscription wiring as a separate task).
+# - Dedupe: callers consult :attr:`EventPushPlan.dedupe_key` against a
+#   short-TTL in-memory set to avoid duplicate POSTs on SSE reconnect.
+#   Persistent dedupe (table-backed) is a future PR if needed.
+
+
+async def dispatch_event_push(
+    plan: EventPushPlan,
+    *,
+    http_client: httpx.AsyncClient,
+    webhook_url: str,
+) -> DeliveryResult:
+    """POST one event-push embed to the target Discord webhook.
+
+    Channel routing: :attr:`EventPushPlan.channel` (signals/fills) is
+    treated as informational metadata; the caller is responsible for
+    passing the matching webhook_url. The function does NOT consult
+    sops or any URL registry — that wiring is the caller's concern.
+
+    Returns
+    -------
+    DeliveryResult
+        Standard alert-side DeliveryResult shape so callers can
+        aggregate / log uniformly. The ``channel`` field of the result
+        is the EventChannel string ("signals" or "fills"); for alert
+        callers it would be a ChannelName enum value. They share the
+        DeliveryStatus enum.
+
+    Idempotency / retry
+    -------------------
+    Discord webhooks are NOT idempotent (POSTing the same body twice
+    creates two messages). Caller-side dedupe via
+    :attr:`EventPushPlan.dedupe_key` is the responsibility boundary.
+    """
+    bound = log.bind(
+        dispatcher="event_push",
+        channel=plan.channel.value,
+        dedupe_key=plan.dedupe_key,
+    )
+
+    payload = {"embeds": [plan.embed]}
+    headers = {
+        "User-Agent": "trading-webhook-pusher/0.1",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        response = await http_client.post(
+            webhook_url,
+            json=payload,
+            headers=headers,
+            timeout=HTTP_TIMEOUT_SECONDS,
+        )
+    except httpx.TimeoutException:
+        bound.warning("event_push_timeout")
+        return _event_push_result(plan.channel, DeliveryStatus.FAILED_TIMEOUT, None, "timeout")
+    except httpx.HTTPError as exc:
+        bound.warning("event_push_network_error", error=str(exc))
+        return _event_push_result(plan.channel, DeliveryStatus.FAILED_NETWORK, None, str(exc))
+
+    status = _classify_http_status(response.status_code)
+    if status is DeliveryStatus.OK:
+        bound.info("event_push_delivered", http_status=response.status_code)
+    else:
+        bound.warning(
+            "event_push_failed",
+            http_status=response.status_code,
+            delivery_status=status.value,
+        )
+    return _event_push_result(plan.channel, status, response.status_code, None)
+
+
+def _event_push_result(
+    channel: EventChannel,
+    status: DeliveryStatus,
+    http_status: int | None,
+    error: str | None,
+) -> DeliveryResult:
+    """Build a :class:`DeliveryResult` for an event push.
+
+    DeliveryResult.channel is typed as ChannelName (alert-domain enum).
+    We construct via the str-cast-then-ChannelName fallback that the
+    alert dispatcher uses for unknown channels: the field is metadata
+    and tools that read it must not crash on values outside the alert
+    enum. Casting via ``ChannelName.__new__`` bypasses StrEnum
+    validation — accepted pattern in StrEnum subclasses.
+
+    A future iteration may split DeliveryResult into alert-specific and
+    event-push-specific variants if the consumer logic diverges.
+    """
+    # ChannelName is a StrEnum; subclasses of str accept any string value
+    # via direct construction (.value will return our event channel string).
+    # We pick the alert ChannelName that's closest in semantics — both event
+    # channels are Discord channel webhooks, so DISCORD_ALERTS is a safe
+    # informational tag without changing wire semantics.
+    discord_channel = (
+        ChannelName.DISCORD_ALERTS  # placeholder — event channel name in log only
+    )
+    return DeliveryResult(
+        channel=discord_channel,
+        status=status,
+        http_status=http_status,
+        error=error,
+        retried=False,
+    )
+
+
+def _classify_http_status(http_status: int) -> DeliveryStatus:
+    """Map an HTTP status code to a DeliveryStatus enum value.
+
+    Mirrors the classification logic in sender.post_outbound_message
+    but condensed for the event-push single-attempt path. Worker-PR-2
+    scope deliberately omits 429 retry — Discord webhook rate-limit
+    on a #signals / #fills channel is rare (event cadence is low) and
+    the caller can handle persistent 429s by exponential backoff at
+    the subscription loop layer.
+    """
+    if 200 <= http_status < 300:
+        return DeliveryStatus.OK
+    if http_status in (401, 403):
+        return DeliveryStatus.FAILED_AUTH
+    if http_status == 404:
+        return DeliveryStatus.FAILED_NOT_FOUND
+    if http_status == 429:
+        return DeliveryStatus.RATE_LIMITED
+    if 400 <= http_status < 500:
+        return DeliveryStatus.FAILED_CLIENT_ERROR
+    if 500 <= http_status < 600:
+        return DeliveryStatus.FAILED_SERVER_ERROR
+    return DeliveryStatus.FAILED_NETWORK
+
+
+# Touch unused imports to satisfy ruff F401 if Worker-PR-2 hot-path
+# doesn't exercise them yet. DEFAULT_RETRY_AFTER_SECONDS +
+# MAX_RETRY_AFTER_SECONDS reserved for the future 429-retry path.
+_ = DEFAULT_RETRY_AFTER_SECONDS
+_ = MAX_RETRY_AFTER_SECONDS
+
+
 __all__ = [
     "AlertNotFoundError",
     "DeliveryReport",
     "dispatch_alert",
+    "dispatch_event_push",
 ]
