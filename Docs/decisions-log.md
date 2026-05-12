@@ -3582,3 +3582,84 @@ audit_log row count unchanged (still 2 — the LEAN heartbeat path is operationa
 - **What stays:** all prior wiring is unaffected. PRs #122-#129 stay merged. The 4 ETF seed + the CI path-filter + the cross-check script + the DataFrame fix all stay in place. This PR is a quality + test-coverage delta on top of PR #129; not a re-architecture.
 
 - **Operator pre-authorizations (carried):** SSH to VPS, `git push`, PR creation, squash-merge feature PRs, force-push-with-lease, docker compose restart.
+
+---
+
+### 2026-05-12 — Post-PR-#130 session continued — Tiingo cross-check PASS (ETF pre-live gate LOCKED); LEAN CLI's DataBento integration NOT viable for our strategy's continuous-futures needs
+
+- **Spec reference:** `deploy/lean_local/seed-data.md` Step 7 Option B (Tiingo 360-row cross-check pre-live gate); `Docs/decisions-log.md` 2026-05-12 entries "Phase 1 futures-data path memo" (PR #124 — recommended Option B / lean CLI for futures) + "ETF data-quality cross-check" (PR #126 — operator-side Tiingo signup as the gate). Both gates were re-opened this session after the operator completed signups for `databento.com` + `tiingo.com` and added the two new sops fields via PR #131.
+
+- **What ran this session (in order):**
+
+  **1. PR #131 sops keys.** Operator committed `secrets(paper): add databento.api_key + tiingo.api_key` on local main (commit `5a387c3`); push rejected by branch protection. Agent routed via feature branch `claude/sops-databento-tiingo` → PR #131 → CI green in ~12s (path-filter behaved correctly — only always-on jobs ran, expensive jobs skipped per PR #127 design) → squash-merged + branch deleted (merge commit `b912b98`). VPS pulled cleanly; sops re-decrypt verified both fields present (6 top-level sections; databento.api_key length 32 chars; tiingo.api_key length 40 chars).
+
+  **2. Tiingo 360-row cross-check (Phase B of the session prompt) — PASS.** Ran `scripts/verify_seed_data.py --source tiingo` against the `trading_lean_data` volume via transient `python:3.11-slim` container. Result: **4-of-4 ETFs PASS at the 1bp close-price divergence threshold:**
+
+    ```
+    Ticker     LEAN rows   Cross rows   Shared   Only LEAN   Only cross      Max bp   Breaches  Result
+    --------------------------------------------------------------------------------------------------
+    TLT              360          360      360           0            0    0.5788bp          0  PASS
+    IEF              360          360      360           0            0    0.0000bp          0  PASS
+    SHY              360          360      360           0            0    0.6070bp          0  PASS
+    TIP              360          360      360           0            0    0.0000bp          0  PASS
+    ```
+
+    Max divergence 0.6070bp (SHY at 2025-07-15: $82.3800 LEAN vs $82.3750 Tiingo — sub-cent on an $82 ETF). All 360 dates match perfectly with 0 missing on either side. yfinance (seed source) and Tiingo (independent cross-source) agree to 0-0.6bp on every observation. **ETF pre-live gate LOCKED at the seed-data layer.** Closes the deferred item from PR #126's Option B path.
+
+  **3. Runbook bug (deploy/lean_local/seed-data.md Step 7) discovered + fixed.** The runbook's Tiingo extraction used a 2-step awk pattern (`awk "/^tiingo:/,/^[a-z]/" | awk "/api_key:/ {print \$2; exit}"`). The pattern returned empty in this session because the operator's `paper.enc.yaml` uses 4-space indentation on nested keys; the awk range-pattern `/^[a-z]/` matched the next top-level key as a section terminator correctly, but a subtle interaction with bash-`-s` heredoc escaping ate the field-2 extraction. **Replacement pattern: `python3` + `yaml.safe_load` — captured this session as the right idiom for sops-decrypted secret extraction.** Runbook updated in this PR.
+
+  **4. LEAN CLI DataBento probe (Phase C-1 of the session prompt) — B1 NOT VIABLE for our strategy.** With operator confirmation to pursue B1 (LEAN CLI native), agent installed lean CLI 1.0.225 on the VPS in a venv + pinned `click<8.2` to fix a stale `get_metavar(ctx=...)` API issue. QC org probe via direct HMAC-authed `/api/v2/organizations/list` returned: **org `SPRAT Capital` id `a3d7fe4da507e67661877333cd7273c5` type `Researcher`** — confirms the Researcher tier qualifies for the lean CLI's "paid tier" gate. `lean login` succeeded. `lean init --organization a3d7fe4...` scaffolded a fresh data folder. Then the probes:
+
+    | Probe | Result | Source line from lean CLI |
+    |---|---|---|
+    | `--data-type Trade --ticker MES --market cme --start 20260401 --end 20260501` | FAIL — canonical symbol rejected | `DataBentoDataDownloader does not support canonical symbols. Falling back to chain provider. No contracts were found. Do you have universe data?` |
+    | `--data-type Universe --ticker MES --market cme ...` | EXPLICITLY REJECTED | `Error: The Databento data provider does not support QCDataType.Universe. Please choose a supported data from: ['Trade', 'Quote'].` |
+    | `--data-type Bulk --ticker MES --market cme ...` | EXPLICITLY REJECTED | `Error: The Databento data provider does not support QCDataType.Bulk. Please choose a supported data from: ['Trade', 'Quote'].` |
+
+    **`OpenInterest` not separately probed but implicitly unsupported** because the explicit allowed list returned by the CLI is `['Trade', 'Quote']` — no `OpenInterest`. This corrects PR #124's memo which assumed the lean CLI would support all data types DataBento offers; the actual integration is narrower.
+
+    The strategy `lean/v1_strategy.py` uses `add_future(..., data_mapping_mode=DataMappingMode.OPEN_INTEREST, ...)` + `.set_filter(0, 90)`. LEAN's continuous-contract construction under this mode requires per-day universe files + per-expiry-contract open interest. **Neither is fetchable via the lean CLI + DataBento path.** Without those, the lean CLI's chain-provider falls back to "no contracts found" and writes no data. B1 is dead for our strategy without a separate universe + OI source.
+
+- **Why this surfaces now and not in PR #124's research:** PR #124's memo cited the lean CLI's `lean data download --data-provider-historical DataBento --data-type Trade ...` shape and assumed the integration supported all data types. The memo did not actually run a probe (it was a costing memo, not an implementation). Today's probes are the first time the actual integration was exercised against real DataBento creds + real org auth; the narrower data-type support is the surprise.
+
+- **Implication for the strategy's data needs:**
+  - **Trade data (OHLCV)**: B1-fetchable via lean CLI — IF we provide per-expiry contract symbols (e.g., `MESM6`, `MESU6`, `MESZ6`, ...) rather than canonical `MES`. This is workable but tedious: 7 micros × ~8 active expiries over the 2024-09 → 2026-05 window × 1 invocation each = ~56 invocations. Manageable.
+  - **Open Interest**: NOT B1-fetchable. Must come from a separate source — DataBento Python SDK (B2 path), Yahoo, or QC's bundled US Futures Daily History (which is paid-extra on Researcher tier per the QC datasets pricing page).
+  - **Universe (per-day active-contracts)**: NOT B1-fetchable. Same alternatives as OI.
+  - **map_files (per-ticker symbol-hash + roll-state)**: QC-internal continuous-contract identifier syntax (e.g., `es uik2f7cj4v0h`); cannot be hand-rolled correctly.
+  - **factor_files (JSON-per-line with `BackwardsRatioScale`, `BackwardsPanamaCanalScale`, `ForwardPanamaCanalScale`, `DataMappingMode`)**: continuous-contract price adjustment math that requires roll-history computation across all the contracts; cannot be hand-rolled in a session.
+
+- **Three realistic paths for the next session (operator decides):**
+
+  **Path 1 — B2 simplified-equity-feed (was Option C in PR #124's memo).** Treat the 7 micros as continuous-front-month equity-style daily feeds via yfinance pseudo-tickers (`MES=F`/`MNQ=F`/`MYM=F`/`M2K=F`/`MGC=F`/`MCL=F`/`MBT=F`). Extend `scripts/seed_lean_data.py` to optionally write the LEAN equity-daily format for these synthesized tickers. Modify `lean/v1_strategy.py` (HOT-FIX) + `strategies/v1_trend_following/parameters.py` (RISK-REVIEW-APPROVED) so the strategy uses `add_equity` instead of `add_future` for the 7 markets, OR keeps `add_future` but skips the continuous-contract roll semantics. Doesn't get true continuous-contract roll-day handling; the strategy adapts on the daily decision boundary. ~2-3h scope; one PR with risk-review label.
+
+  **Path 2 — Hybrid B1 + DataBento Python SDK.** Use lean CLI for Trade data (per-expiry contracts, 7 micros × ~8 expiries × 1 invocation = ~56 invocations). Use DataBento Python SDK separately to fetch OI + Universe data via `statistics` and `definition` schemas. Write a custom converter for the universe files + a synthesizer for the map_files/factor_files JSON-per-line format. Requires reverse-engineering LEAN's continuous-contract adjustment math (`BackwardsRatioScale` + `BackwardsPanamaCanalScale` are documented in LEAN source but non-trivial to compute correctly). ~1-2 weeks of scope; multiple PRs; complex correctness verification.
+
+  **Path 3 — Accept 4-of-11 universe coverage indefinitely.** Strategy generates signals on ETFs only (`TLT IEF SHY TIP`). The 7 micros stay uncovered; the candidate list at the strategy layer keeps them but they fail at `_build_bar_series` (returns None) and fall into `history_failures` per cycle — already observed live yesterday. Phase 1 paper-clock progresses on bonds. Defer futures coverage to Phase 2+ when more bandwidth is available OR until QC offers DataBento OI/Universe support natively. ~0h scope; no PR needed.
+
+  **Agent recommendation: Path 1.** Reasoning:
+    - $0 incremental cost (uses existing yfinance free path).
+    - ~2-3h scope is tractable in a single session.
+    - Doesn't require reverse-engineering LEAN's continuous-contract math (sidesteps the complexity).
+    - Gets to 11-of-11 universe coverage with realistic per-cycle signals on micros.
+    - Tradeoff: loses true continuous-contract roll-day handling — but for daily-resolution Donchian breakout, this is a minor effect (roll dates are well-understood; signals at roll boundaries get a 1-day discontinuity). The strategy's `MIN_HOLDING_DAYS=14` filter absorbs single-day roll noise.
+    - Risk-review-approved label needed for the `strategies/v1_trend_following/parameters.py` change (the candidate universe stays the same; only the LEAN subscription primitive changes). Manageable.
+
+- **What's in scope for this PR:**
+  - Decisions-log entry (this entry).
+  - `deploy/lean_local/seed-data.md` runbook bug fix: replace the buggy awk extraction in Step 7 Option B with the `python3 + yaml.safe_load` pattern that actually works.
+  - `CLAUDE.md` header summary update: ETF pre-live gate LOCKED + futures-seed B1 found unviable + sops keys populated.
+  - VPS cleanup recorded: `/tmp/lean_seed_futures` removed; `/opt/trading/lean_cli_venv` removed; `/root/.lean` removed. The VPS is in a clean state matching pre-session conditions (modulo the merged PRs #130 + #131).
+
+- **What's NOT in scope:**
+  - The actual futures-seed (deferred per blocker findings).
+  - Strategy code changes (Path 1 requires `risk-review-approved` PR; not part of this docs PR).
+  - Path 2 reverse-engineering work (multi-week scope).
+
+- **Hot-fix scope:** `Docs/decisions-log.md` + `deploy/lean_local/seed-data.md` + `CLAUDE.md`. No code changes; no risk-review-approved label needed.
+
+- **What stays:** all prior wiring is unaffected. PRs #122-#131 stay merged. ETFs are now cross-checked end-to-end (yfinance seed → Tiingo independent verification, 4-of-4 PASS at <1bp). The 7 micros remain uncovered pending operator's path decision.
+
+- **Operator pre-authorizations (carried):** SSH to VPS, `git push`, PR creation, squash-merge feature PRs, force-push-with-lease, docker compose restart.
+
+- **Operator follow-up:** Local main on the workstation has commit `5a387c3` (the sops commit) which is now a sibling of `origin/main`'s `b912b98` (the squash-merge of that same change via PR #131). Next time the operator works locally, `git fetch origin && git reset --hard origin/main` aligns local main with the merged state. (Standard post-squash-merge cleanup; not unique to this PR.)
