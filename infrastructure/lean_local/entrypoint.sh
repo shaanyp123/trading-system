@@ -100,14 +100,20 @@ if [ -z "${LEAN_IBKR_ACCOUNT:-}" ]; then
     export LEAN_IBKR_ACCOUNT
 fi
 
-# Deep-merge our template on top of upstream config.json. LEAN reads
-# from /Lean/Launcher/bin/Debug/config.json (the upstream framework
-# config with handler bindings + limits + paths) and ignores our
-# partial /Lean/Algorithm/lean.json. We solve this by reading both,
-# deep-merging (template overrides defaults), patching absolute paths,
-# selecting the active environment from LEAN_LIVE_MODE, and writing
-# the result back to its canonical location.
+# Deep-merge our template on top of upstream config.json. The upstream
+# config at /Lean/Launcher/bin/Debug/config.json is a full framework
+# config (handler bindings + limits + paths + 30+ env stubs); our
+# /Lean/Algorithm/lean.json is partial. LEAN's Config class loads the
+# active config from CWD (Directory.GetCurrentDirectory() + "config.json")
+# — NOT BaseDirectory + "config.json". Discovered Pivot-PR-F deploy
+# 2026-05-12 via a sentinel-value injection test: an algorithm-location
+# value written to /Lean/Launcher/bin/Debug/config.json was IGNORED by
+# LEAN, while the same value at /Lean/config.json was picked up. So we
+# write the merged result to BOTH locations: /Lean/config.json (the
+# location LEAN actually reads) and /Lean/Launcher/bin/Debug/config.json
+# (in case a future LEAN version or sub-launcher reads BaseDirectory).
 UPSTREAM_CONFIG="${LEAN_UPSTREAM_CONFIG:-/Lean/Launcher/bin/Debug/config.json}"
+RUNTIME_CONFIG="${LEAN_RUNTIME_CONFIG:-/Lean/config.json}"
 TEMPLATE_PATH="${LEAN_CONFIG_TEMPLATE:-/Lean/Algorithm/lean.json}"
 
 if [ ! -f "$UPSTREAM_CONFIG" ]; then
@@ -121,14 +127,18 @@ if [ ! -f "$TEMPLATE_PATH" ]; then
     exit 3
 fi
 
-python3 - "$UPSTREAM_CONFIG" "$TEMPLATE_PATH" <<'PY_EOF'
+python3 - "$UPSTREAM_CONFIG" "$TEMPLATE_PATH" "$RUNTIME_CONFIG" <<'PY_EOF'
 """Deep-merge our lean.json template on top of upstream LEAN config.
 
 The upstream config at /Lean/Launcher/bin/Debug/config.json is JSONC
 (with // line comments). We strip those, merge our template's keys
 in (skipping $comment-* keys), patch absolute paths, pick the
-environment from LEAN_LIVE_MODE, and write the result back to the
-upstream location so LEAN's launcher picks it up.
+environment from LEAN_LIVE_MODE, and write the result to BOTH
+/Lean/config.json (the CWD-relative path LEAN's Config class actually
+reads) AND /Lean/Launcher/bin/Debug/config.json (overwriting the
+upstream default so we have a single source of truth for the merged
+config; future LEAN versions or sub-launchers that read BaseDirectory
+also get our config).
 """
 
 import json
@@ -138,6 +148,7 @@ import sys
 
 upstream_path = sys.argv[1]
 template_path = sys.argv[2]
+runtime_path = sys.argv[3]
 
 
 def strip_jsonc_line_comments(s: str) -> str:
@@ -230,12 +241,15 @@ merged["data-folder"] = "/Lean/Data/"
 live_mode = os.environ.get("LEAN_LIVE_MODE", "false").strip().lower() == "true"
 merged["environment"] = "paper-ibkr" if live_mode else "backtesting"
 
-with open(upstream_path, "w") as fh:
-    json.dump(merged, fh, indent=2)
-    fh.write("\n")
+serialized = json.dumps(merged, indent=2) + "\n"
+for out_path in (runtime_path, upstream_path):
+    with open(out_path, "w") as fh:
+        fh.write(serialized)
 
 print(
     "[lean_local_entrypoint] merged config written to "
+    + runtime_path
+    + " + "
     + upstream_path
     + " (environment="
     + merged["environment"]
@@ -247,6 +261,18 @@ print(
 PY_EOF
 
 echo "[lean_local_entrypoint] api_base=${LEAN_LOCAL_API_BASE_URL} live_mode=${LEAN_LIVE_MODE:-false} env=${ENVIRONMENT:-paper}"
+
+# LEAN's Python algorithms `from AlgorithmImports import *` at module
+# top. AlgorithmImports.py lives at /Lean/Launcher/bin/Debug/ alongside
+# the .NET launcher assemblies. Since our WORKDIR is /Lean (so LEAN's
+# Config class reads /Lean/config.json from CWD), Python's default
+# sys.path doesn't include the launcher directory. Without this prefix,
+# the import fails with "No module named 'AlgorithmImports'".
+# /Lean/Algorithm appears second so v1_strategy.py's siblings (none today,
+# but room to grow) are resolvable.
+export PYTHONPATH="/Lean/Launcher/bin/Debug:/Lean/Algorithm${PYTHONPATH:+:$PYTHONPATH}"
+
+echo "[lean_local_entrypoint] PYTHONPATH=${PYTHONPATH}"
 echo "[lean_local_entrypoint] launching: $*"
 
 # exec replaces our shell so SIGTERM from tini propagates to LEAN.
