@@ -26,6 +26,12 @@ volumes:
   prometheus_data:
   grafana_data:
   gitea_data:
+  # Pivot-PR-A (post-pivot 2026-05-12): LEAN's data directory. LEAN
+  # downloads + caches QC bundled historical bars here at first run. The
+  # operator can pre-populate this volume by mounting a directory of
+  # downloaded LEAN data, or let LEAN download fresh at container start
+  # (slower first cycle but no operator-side prep needed).
+  lean_data:
 
 services:
 
@@ -157,15 +163,24 @@ services:
     profiles: ['phase1']
     depends_on: [postgres]
 
-  # qc_adapter — QC ObjectStore poll worker (Day 28 / Week 7 Thu).
-  # Polls QC's REST surface for signal_emitted + order_filled +
-  # reconciliation events at 60s/60s/5s cadences (per backend-spec §3.19 +
-  # §1.4), writes parsed events to audit_log + signals + data_quality_events.
-  # Networks:
-  #   internal — Postgres writes via app_service role
-  #   egress   — outbound TLS to https://www.quantconnect.com/api/v2
-  # Auth: shared sops-decrypted (qc_user_id, api_token) pair.
-  # See deploy/qc_adapter/README.md for the operator runbook.
+  # qc_adapter — QC ObjectStore poll worker.
+  #
+  # POST-PIVOT 2026-05-12 (Pivot-PR-A): DORMANT under the `qc_adapter_backfill`
+  # docker-compose profile. Default `docker compose up -d` skips this service.
+  # Bring up only for ad-hoc historical replay via:
+  #
+  #     docker compose --profile qc_adapter_backfill up -d qc_adapter
+  #
+  # See backend-spec §1.4 + §2.11 (post-pivot) for the dormant role + spec
+  # `Docs/decisions-log.md` 2026-05-12 entry for the full pivot rationale.
+  # The container's 50 unit + integration tests still run in CI as a
+  # regression net against accidentally re-introducing ObjectStore polling.
+  #
+  # Pre-pivot description: "Polls QC's REST surface for signal_emitted +
+  # order_filled + reconciliation events at 60s/60s/5s cadences (per
+  # backend-spec §3.19 + §1.4); writes parsed events to audit_log + signals
+  # + data_quality_events." Retired because QC's `/object/get` endpoint is
+  # gated behind the Institutional subscription tier (DP-025).
   qc_adapter:
     image: ghcr.io/${GHCR_OWNER:?set GHCR_OWNER in deploy/.env}/trading-qc-adapter:${RELEASE_SHA:-latest}
     build:
@@ -173,6 +188,7 @@ services:
       dockerfile: services/qc_adapter/Dockerfile
     restart: unless-stopped
     networks: [internal, egress]
+    profiles: ['qc_adapter_backfill']
     environment:
       ENVIRONMENT: ${ENVIRONMENT:-paper}
       LOG_LEVEL: ${QC_ADAPTER_LOG_LEVEL:-INFO}
@@ -301,14 +317,59 @@ services:
       - grafana_data:/var/lib/grafana
 
   # ---- Phase 2 only (profile-gated; never start in Phase 1) -------------
+  #
+  # POST-PIVOT 2026-05-12 NOTE: ib_gateway + lean_local are no longer
+  # `phase2`-only — they are the canonical Phase 1+ broker + algorithm
+  # path. The Pivot-PR-A scope below adds `lean_local` as an always-on
+  # service (no profile gate). Pivot-PR-B will add `ib_gateway` similarly.
+  # The `phase2` profile is retained on the blocks below for compatibility
+  # until Pivot-PR-B lands; Pivot-PR-B removes the `phase2` gate and adds
+  # the build context + env vars + sops mount.
   ib_gateway:
     image: gnzsnz/ib-gateway:latest
     restart: unless-stopped
     networks: [internal]
     profiles: ['phase2']
 
+  # lean_local — LEAN algorithm engine (Pivot-PR-A; post-pivot 2026-05-12).
+  #
+  # Runs `quantconnect/lean:latest` on the operator's Hetzner VPS. Mounts
+  # `./lean/` as the algorithm directory + `./strategies/` for shared
+  # Python. POSTs signal events to `http://api:8000/api/internal/lean/signals`
+  # using the shared bearer from sops `lean.api_bearer_token`.
+  #
+  # Networks: `internal` only (no egress; QC bundled data is mounted as a
+  # volume; live market data flows via `ib_gateway` on the internal net
+  # when Pivot-PR-B lands).
+  #
+  # The container runs in BACKTEST mode by default until Pivot-PR-B wires
+  # `ib_gateway`. To switch to paper trading (live-mode against IBKR paper),
+  # the operator sets `LEAN_LIVE_MODE=true` in `deploy/.env` after
+  # Pivot-PR-B confirms IBKR paper account access.
+  #
+  # See `deploy/lean_local/README.md` for the operator runbook.
   lean_local:
     image: quantconnect/lean:latest
-    restart: 'no'
+    build:
+      context: .
+      dockerfile: infrastructure/lean_local/Dockerfile
+    restart: unless-stopped
     networks: [internal]
-    profiles: ['phase2']
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-paper}
+      LEAN_LIVE_MODE: ${LEAN_LIVE_MODE:-false}
+      LEAN_LOCAL_API_BASE_URL: ${LEAN_LOCAL_API_BASE_URL:-http://api:8000}
+      # LEAN_LOCAL_BEARER_TOKEN comes in via the sops-decrypted bundle
+      # volume below + the lean_local entrypoint reads sops yaml
+      # `lean.api_bearer_token` → env var.
+    volumes:
+      # Algorithm code + shared strategy package mount.
+      - ./lean:/Lean/Algorithm:ro
+      - ./strategies:/Lean/Strategies:ro
+      # LEAN data directory (QC bundled historical bars cached here).
+      - lean_data:/Lean/Data
+      # sops-decrypted bundle for bearer-token resolution at boot.
+      - ${SECRETS_DIR:-/opt/trading/secrets-decrypted}:/run/secrets:ro
+    depends_on:
+      api:
+        condition: service_healthy

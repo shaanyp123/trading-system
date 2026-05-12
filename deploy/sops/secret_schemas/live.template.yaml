@@ -46,6 +46,7 @@ discord:
   # tell at a glance (frontend-spec §1.5: cross-environment segregation).
   bot_token: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
   guild_id: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
+  api_bearer_token: <TODO_FROM_DAY_23_DISCORD_BOT_BRINGUP>  # Day 23
   webhook_urls:
     daily_brief: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
     signals: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
@@ -54,6 +55,11 @@ discord:
     critical: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
     ops: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
     audit: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
+
+lean:
+  # Pivot-PR-A (post-pivot 2026-05-12) — see deploy/lean_local/README.md.
+  # Distinct from discord.api_bearer_token. 32-byte URL-safe base64.
+  api_bearer_token: <TODO_FROM_PIVOT_PR_A_BRINGUP>
 
 forex_factory:
   api_token: null

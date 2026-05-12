@@ -21,6 +21,7 @@ anthropic: null         # not used in dev
 discord:
   bot_token: MOCK_dev_bot_token
   guild_id: MOCK_dev_guild_id
+  api_bearer_token: MOCK_dev_discord_api_bearer       # Day 23
   webhook_urls:
     daily_brief: MOCK_dev_webhook_daily_brief
     signals: MOCK_dev_webhook_signals
@@ -30,6 +31,9 @@ discord:
     ops: MOCK_dev_webhook_ops
     audit: MOCK_dev_webhook_audit
     # ask_agent: lands in Phase 2 per frontend-spec §1481
+
+lean:
+  api_bearer_token: MOCK_dev_lean_api_bearer          # Pivot-PR-A post-pivot 2026-05-12
 
 forex_factory: null
 trading_economics: null
