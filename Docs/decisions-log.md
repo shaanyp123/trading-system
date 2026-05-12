@@ -3464,3 +3464,69 @@ audit_log row count unchanged (still 2 — the LEAN heartbeat path is operationa
   - **New this session:** repo branch-protection mutations via `gh api --method PUT repos/.../branches/main/protection`. Justified by the explicit operator directive ("You do 2") and the narrow scope (modifying the required-status-checks list only; not user-access settings, not the `forbidden-paths` workflow itself, not the `enforce_admins` toggle).
 - **Verification:** this entry's PR is the canonical post-merge demonstration. Docs-only diff vs `main` → `python_backend = false`, `frontend = false`, all per-service filters = false, `workflow_self = false` → only `precheck + lint + dep-drift + gitleaks + ci-gate` fire (~30s wall-time expected). If the full matrix fires anyway, the path-filter wiring is broken and needs a follow-up fix.
 - **Smoke-tested via:** (a) `python3 -c 'import yaml; yaml.safe_load(open(".github/workflows/ci.yml"))'` → 13 jobs parse cleanly; (b) `make lint` (ruff format --check + ruff check) → 211 files clean; (c) `make dep-drift-check` → 20 runtime deps match between pyproject.toml and services/api/Dockerfile; (d) PR [#127](https://github.com/shaanyp123/trading-system/pull/127) opened and merged at 2026-05-12T20:58:53Z (commit `1542d35`); (e) branch protection update verified via `gh api repos/.../branches/main/protection --jq '.required_status_checks | {strict, contexts}'` → `{strict: true, contexts: ["forbidden-paths (...)", "ci-gate (...)"]}`. The ~30s docs-only wall-time figure is theoretical until this entry's PR fires CI under the post-merge configuration.
+
+
+---
+
+### 2026-05-12 — First post-seed cycle fires clean at pipeline level; latent strategy-side bug in `_build_bar_series` surfaces; fix + redeploy
+
+- **Spec reference:** the seed-ceremony entry above defined the cycle-verification gate ("at 21:30 UTC, `v1_signals_generated` should fire with `signals_emitted_count >= 1` if any of the 4 ETFs has a Donchian breakout"). This entry is the post-cycle outcome record. `lean/v1_strategy.py` is on the §2.3 hot-fix whitelist (`lean/**`).
+
+- **What fired at 21:30 UTC (literal cycle log + api log; captured live):**
+
+  ```
+  20260512 21:30:02.881 TRACE:: Log: 2026-05-12 17:30:01 v1_history_unavailable session_date=2026-05-12 failed_markets=['/MES', '/MNQ', '/MYM', '/M2K', '/MGC', '/MCL', '/MBT', 'TLT', 'IEF', 'SHY', 'TIP']
+  20260512 21:30:02.881 TRACE:: Log: 2026-05-12 17:30:01 v1_signals_generated session_date=2026-05-12 signals_emitted_count=0 rejections_count=0
+  20260512 21:30:02.881 TRACE:: Log: 2026-05-12 17:30:01 lean_signal_post_succeeded status=202 event_type=lean_cycle_heartbeat
+  ```
+
+  api side (literal): `{"event_type": "lean_cycle_heartbeat", "algorithm_id": "v1_trend_following", "source_ts_utc": "2026-05-12T21:30:01.003630+00:00", "session_date_et": "2026-05-12", "equity_usd": "15000.0", "live_mode": true, ...}` → 202 Accepted in 3.32 ms.
+
+- **What this PROVES (pipeline-level proof points all green):**
+  - LEAN boot + algorithm import + initialize() succeeds (post-seed boot heartbeat 202 at 19:14 UTC; cycle scheduler armed)
+  - 17:30 ET wall-clock scheduler fires precisely (cycle log timestamp `17:30:01` ET = `21:30:01` UTC, within the 1s tolerance)
+  - `is_warming_up` flipped False (warmup replay consumed the seeded ETF history at boot; the strategy's `if self.is_warming_up: return` early-exit branch did NOT fire — confirmed by the presence of `v1_signals_generated` log line)
+  - `self.portfolio.total_portfolio_value` returns the configured starting cash ($15,000.00 — matches the `STARTING_CASH_USD` parameter)
+  - LEAN's `urllib.request.urlopen` POST → backend's `/api/internal/lean/signals` route → `LeanAuthMiddleware` constant-time-bearer validation → POSITIVE
+  - api's Pydantic `LeanEventRequest` schema accepts the heartbeat payload (signals_emitted_count + rejections_count + error fields all present per PR #118)
+  - api 202 round-trip in 3.32 ms over the Docker `internal-only` network
+  - Audit chain unchanged at 2 rows (`lean_cycle_heartbeat` is operational, not audit-relevant per backend-spec §3.30)
+
+- **What this REVEALS (the bug):** all 11 markets — INCLUDING the 4 ETFs with seeded data — went to `history_failures` in `_build_bar_series`. The 7 micro futures failing is expected (no seeded data; tracked as decision item #2 / DataBento). But the 4 ETFs (TLT/IEF/SHY/TIP) have 360 valid daily bars in the volume in proper LEAN equity-daily format (decoded round-trip vs spy.zip; cross-validated against Google Finance via PR #126). They should NOT have failed.
+
+- **Root cause (identified via read-only diagnostic; no code change needed to confirm):** `lean/v1_strategy.py::_build_bar_series` iterates `self.history(symbol, count, Resolution.DAILY)` as if it returns an iterable of `TradeBar` objects with `.end_time` / `.open` / `.high` etc. attributes. In QC's modern Python API (used by `quantconnect/lean:latest`), this signature returns a **pandas DataFrame** indexed on `(symbol, time)` MultiIndex with lowercase OHLCV columns (`open`, `high`, `low`, `close`, `volume`). The legacy `for raw in history` loop iterates over column NAMES (strings: `'open'`, `'high'`, ...). `getattr("open", "end_time", None)` returns None. The `if end_time is None: continue` branch fires for every iteration. `bars` ends empty. `_build_bar_series` returns None. All markets land in `history_failures`. Net effect: the strategy CANNOT generate signals for any market under the modern API, regardless of seed data.
+
+- **Why didn't this surface earlier:**
+  - `lean/v1_strategy.py` is excluded from `pyproject.toml`'s mypy + ruff targets (per the file's docstring: "we don't enforce backend conventions here" — LEAN's `AlgorithmImports` injects symbols mypy can't resolve). So static analysis never caught the iteration mismatch.
+  - No unit tests cover `_build_bar_series` directly — the function depends on `QCAlgorithm` symbols which are runtime-only. Test coverage focused on the broker-agnostic `strategies/v1_trend_following/` package (where 16 tests pass against `BarSeries` inputs directly).
+  - Every prior LEAN cycle (Day 4 paper-clock start, the pre-pivot QC Cloud runs, the post-pivot `lean_local` cycles before today) ran with **empty seed data**. `self.history()` returned an empty DataFrame OR threw on missing files — both paths short-circuited to "return None" without reaching the iteration mismatch.
+  - **Today's seed ceremony brought us to the first call site where `self.history()` returned a non-empty DataFrame.** The latent bug fired immediately. The seed itself is correct (PR #126's spot-check proved data integrity to the penny); the parser was the problem.
+
+- **The fix (~70 lines added in `_build_bar_series` + 20-line module-level helper `_value_is_missing`):**
+  - **Duck-type on `hasattr(history, "iterrows")`** to detect the DataFrame return shape vs the legacy iterable-of-TradeBar shape.
+  - **DataFrame branch (modern path):** iterate via `history.iterrows()` → `(ts, row)` tuples. Handle MultiIndex (tuple) + single-index (Timestamp) timestamps. Extract OHLCV via `row["open"]` / `row["high"]` / etc. with KeyError guard. Filter NaN values via `_value_is_missing()` helper (pandas returns `float('nan')` for missing cells; the prior `v is None` guard let NaN through and exploded inside `Decimal(str(nan))`).
+  - **Legacy branch (preserved verbatim):** falls back to the original `getattr(raw, 'end_time')` iteration for forward + back compat across LEAN releases. If a future release reverts to iterables (or a different code path like warmup replay yields TradeBar objects), the strategy still works.
+  - **`_value_is_missing(value: object) -> bool`** module-level helper handles None / NaN / NaT / non-numeric inputs cleanly. Defensive — operator script wants full breadth.
+  - **Zero changes to downstream contract:** `BarSeries(market=..., bars=tuple(...))` construction is unchanged. The strategy's `generate_signals()` interface is unchanged. `Bar` dataclass is unchanged.
+
+- **Smoke-tested via:** (a) `python3 -c 'import ast; ast.parse(open("lean/v1_strategy.py").read())'` → syntax OK; (b) `make lint` → 211 files clean (lean/v1_strategy.py is excluded from ruff targets but the change passes Python syntax + the rest of the repo lints); (c) `make typecheck` → mypy strict clean on 138 source files (lean/v1_strategy.py is excluded from mypy targets too). (d) Pending: live verification on next 21:30 UTC cycle (tomorrow 2026-05-13) — the strategy will fire against the 4 ETFs with seeded data; if any qualifies for a Donchian breakout per V1 parameters, `signal_emitted` events will POST + audit chain will grow from 2 to 2+N rows. (e) The fix is forward+backward compatible: if QC reverts the API shape in a future release, the legacy branch keeps the strategy working.
+
+- **Cost / scope impact:**
+  - Single PR; `lean/v1_strategy.py` + `Docs/decisions-log.md` only.
+  - Hot-fix scope (no `risk-review-approved` label).
+  - CI burn estimate post-#127-path-filters: the change touches `lean/**` which is NOT one of the path-filter triggers in the new `ci.yml`. Expectation: only the always-on set fires (precheck + lint + dep-drift + gitleaks + ci-gate, ~30-60s total). Validates the path-filter design from PR #127 in real-world conditions. **If full matrix fires anyway, the path-filter wiring for `lean/**` needs a follow-up fix.**
+  - VPS deploy: `git pull --ff-only` + `docker compose restart lean_local` (the strategy file is volume-mounted into the container; no image rebuild needed per `lean/README.md`).
+  - Audit chain integrity: unaffected by this PR (no audit-relevant code changes).
+
+- **Outstanding follow-ups (priority order):**
+  1. **NEW (highest, this PR):** Deploy + verify next 21:30 UTC cycle reports `v1_history_unavailable failed_markets=['/MES', ..., '/MBT']` (only the 7 futures; ETFs are absent from the list because their history now parses correctly). If signals_emitted_count > 0, capture the signal payloads + verify audit chain grows clean.
+  2. Decide futures data path (item from prior memo) — DataBento recommended; pending operator signup.
+  3. Recon kill-switch hook (`risk-review-approved` required).
+  4. Discord push on reconciliation breaks (hot-fix).
+  5. `prior_breaks` query in `eod_cycle.run_eod_cycle`.
+  6. Position view sync LEAN → api.
+  7. Operator-side Tiingo signup for full 360-row historical cross-check.
+
+- **What stays:** all prior wiring is unaffected. PR #122-#128 stay merged. The 4 ETF seed + the CI path-filter + the cross-check script all stay in place. This PR is a single-function fix to a latent bug; not a re-architecture.
+
+- **Operator pre-authorizations (carried):** SSH to VPS, `git push`, PR creation, squash-merge fix PRs, force-push-with-lease, docker compose restart.
