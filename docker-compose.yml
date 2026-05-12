@@ -157,11 +157,31 @@ services:
     profiles: ['phase1']
     depends_on: [postgres]
 
+  # qc_adapter — QC ObjectStore poll worker (Day 28 / Week 7 Thu).
+  # Polls QC's REST surface for signal_emitted + order_filled +
+  # reconciliation events at 60s/60s/5s cadences (per backend-spec §3.19 +
+  # §1.4), writes parsed events to audit_log + signals + data_quality_events.
+  # Networks:
+  #   internal — Postgres writes via app_service role
+  #   egress   — outbound TLS to https://www.quantconnect.com/api/v2
+  # Auth: shared sops-decrypted (qc_user_id, api_token) pair.
+  # See deploy/qc_adapter/README.md for the operator runbook.
   qc_adapter:
-    image: ghcr.io/${GHCR_OWNER}/trading-qc-adapter:${RELEASE_SHA:-latest}
+    image: ghcr.io/${GHCR_OWNER:?set GHCR_OWNER in deploy/.env}/trading-qc-adapter:${RELEASE_SHA:-latest}
+    build:
+      context: .
+      dockerfile: services/qc_adapter/Dockerfile
     restart: unless-stopped
     networks: [internal, egress]
-    profiles: ['phase1']
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-paper}
+      LOG_LEVEL: ${QC_ADAPTER_LOG_LEVEL:-INFO}
+      QC_ADAPTER_PHASE_AT_EMIT: ${QC_ADAPTER_PHASE_AT_EMIT:-0}
+      # QC_ADAPTER_DATABASE_URL, QC_ADAPTER_QC_USER_ID, QC_ADAPTER_QC_API_TOKEN
+      # come in via the sops-decrypted bundle volume below + the
+      # entrypoint reads them with the env_prefix QC_ADAPTER_.
+    volumes:
+      - ${SECRETS_DIR:-/opt/trading/secrets-decrypted}:/run/secrets:ro
     depends_on: [postgres]
 
   # Discord bot — Day 23 (Week 6 Thu) onwards. Default profile (no
