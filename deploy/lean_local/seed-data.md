@@ -289,23 +289,38 @@ Then run the script against the live volume:
 # Stage the script on the VPS
 scp scripts/verify_seed_data.py root@178.156.239.84:/tmp/verify_seed_data.py
 
-# Decrypt sops to surface the key (file-only, never to stdout)
-ssh root@178.156.239.84 '
-  export SOPS_AGE_KEY_FILE=/etc/credstore.encrypted/age_key
-  sops --decrypt secrets/paper.enc.yaml > /dev/shm/paper.decrypted.yaml
-  chmod 600 /dev/shm/paper.decrypted.yaml
-  TIINGO_KEY=$(awk "/^tiingo:/,/^[a-z]/" /dev/shm/paper.decrypted.yaml | \
-               awk "/api_key:/ {print \$2; exit}")
-  # Sanity-check key was captured (non-empty length only; never echo the key itself)
-  echo "tiingo key length: ${#TIINGO_KEY}"
-  docker run --rm \
-    -v trading_lean_data:/Lean/Data:ro \
-    -v /tmp/verify_seed_data.py:/verify.py:ro \
-    -e TIINGO_KEY="$TIINGO_KEY" \
-    python:3.11-slim \
-    sh -c "python /verify.py --data-dir /Lean/Data --source tiingo --tiingo-api-key \"\$TIINGO_KEY\""
-  shred -u /dev/shm/paper.decrypted.yaml
-'
+# Decrypt sops + extract key + run cross-check (file-only secret handling)
+ssh root@178.156.239.84 'bash -s' <<'REMOTE_EOF'
+set -e
+export SOPS_AGE_KEY_FILE=/etc/credstore.encrypted/age_key
+sops --decrypt /opt/trading/secrets/paper.enc.yaml > /dev/shm/paper.decrypted.yaml
+chmod 600 /dev/shm/paper.decrypted.yaml
+
+# Extract the Tiingo key via python yaml.safe_load. Prior versions of this
+# runbook used `awk "/^tiingo:/,/^[a-z]/" | awk "/api_key:/ {print $2; exit}"`
+# which failed under bash-`-s` heredoc invocation against sops files using
+# 4-space indentation (2026-05-12 session captured the bug). yaml.safe_load
+# is the canonical extraction pattern for sops-decrypted nested keys.
+eval "$(python3 << 'PYEOF'
+import yaml
+d = yaml.safe_load(open("/dev/shm/paper.decrypted.yaml"))
+print(f'export TIINGO_KEY="{d.get("tiingo", {}).get("api_key", "")}"')
+PYEOF
+)"
+shred -u /dev/shm/paper.decrypted.yaml
+
+# Sanity-check key was captured (LENGTH only; NEVER echo the value itself)
+echo "tiingo key length: ${#TIINGO_KEY}"
+[ -z "$TIINGO_KEY" ] && { echo "ERROR: tiingo.api_key empty"; exit 3; }
+
+docker run --rm \
+  -v trading_lean_data:/Lean/Data:ro \
+  -v /tmp/verify_seed_data.py:/verify.py:ro \
+  -e TIINGO_KEY="$TIINGO_KEY" \
+  python:3.11-slim \
+  sh -c 'python /verify.py --data-dir /Lean/Data --source tiingo --tiingo-api-key "$TIINGO_KEY"'
+unset TIINGO_KEY
+REMOTE_EOF
 ```
 
 **Expected output (clean case):**
@@ -329,6 +344,13 @@ Exit code 0. **On exit 1** (any row > threshold), the per-ticker
 close + signed bp divergence. Operator inspects, decides whether to:
 (a) accept (e.g., a known dividend ex-date that yfinance handles
 differently from Tiingo); (b) reject + re-seed from a different source.
+
+**2026-05-12 actual run (Option B executed for the first time):** 4-of-4
+PASS. Max divergence 0.6070bp on SHY (sub-cent on $82 ETF; well under
+the 1bp threshold). All 360 dates match perfectly with 0 missing on
+either side. ETF pre-live gate LOCKED. See `Docs/decisions-log.md`
+2026-05-12 entry "Post-PR-#130 session continued" for the full result
+table.
 
 **On exit 2** (cross-source fetch failed): check the per-ticker
 `FETCH FAILED — ...` line. The most common causes are rate-limiting
