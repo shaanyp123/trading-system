@@ -48,6 +48,7 @@ COLOR_SIGNAL_EMITTED = 0x3498DB  # blue — informational; awaiting operator act
 COLOR_SIGNAL_APPROVED = 0x2ECC71  # green — operator approved
 COLOR_SIGNAL_REJECTED = 0x95A5A6  # gray — operator rejected
 COLOR_SIGNAL_DEFERRED = 0xF39C12  # amber — operator deferred
+COLOR_ORDER_PLACED = 0x3498DB  # blue — broker accepted; awaiting fill
 COLOR_ORDER_FILLED = 0x2ECC71  # green — broker confirmed fill
 COLOR_ORDER_REJECTED = 0xE74C3C  # red — broker rejected order
 
@@ -89,6 +90,34 @@ class SignalDecisionEvent:
     decided_by_user_id: str
     environment: str
     diary_reasoning_text: str | None = None  # populated for reject/defer
+
+
+@dataclass(frozen=True, slots=True)
+class OrderPlacedEvent:
+    """Payload subset for an ``order_placed`` embed (post-PR-#106 follow-up).
+
+    Emitted when ``services.risk.order_placement_worker.apply_order_placement``
+    finishes its IBKR placeOrder + audit + INSERT pipeline. The order is
+    accepted by the broker but the actual fill (or cancellation, or
+    rejection) happens asynchronously — that path will emit a separate
+    ``order_filled`` event once the IBKR orderStatus subscription wires
+    in. This event closes the operator's "did my approve work?" loop
+    even before the fill lands.
+    """
+
+    signal_id: str
+    market: str
+    direction: str  # "long" | "short"
+    side: str  # "buy" | "sell"
+    quantity: str  # Decimal-as-string per A05
+    order_id: str  # internal orders.id UUID
+    client_order_id: str
+    broker_order_id: str | None  # null on rejection-at-submit
+    broker_status: str  # IBKR side: submitted / working / filled / rejected / ...
+    db_status: str  # orders.status enum: working / filled / rejected / ...
+    placed_at_utc: datetime
+    environment: str
+    rejection_detail: str | None = None  # populated when broker_status=rejected
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,6 +261,58 @@ def build_signal_decision_embed(event: SignalDecisionEvent) -> dict[str, Any]:
     }
 
 
+def build_order_placed_embed(event: OrderPlacedEvent) -> dict[str, Any]:
+    """Build the Discord embed for an ``order_placed`` event.
+
+    Title varies by broker_status:
+      * accepted → blue "PLACED" embed (most common path)
+      * rejected → red "REJECTED" embed with rejection_detail field
+    """
+    if event.broker_status == "rejected":
+        color = COLOR_ORDER_REJECTED
+        title = f"x REJECTED: {event.side.upper()} {event.quantity} {event.market}"
+    else:
+        color = COLOR_ORDER_PLACED
+        title = f">> PLACED: {event.side.upper()} {event.quantity} {event.market}"
+
+    fields: list[dict[str, Any]] = [
+        {"name": "Side", "value": event.side, "inline": True},
+        {"name": "Qty", "value": str(event.quantity), "inline": True},
+        {"name": "Direction", "value": event.direction, "inline": True},
+        {"name": "Broker status", "value": event.broker_status, "inline": True},
+        {"name": "DB status", "value": event.db_status, "inline": True},
+        {"name": "Env", "value": event.environment, "inline": True},
+        {
+            "name": "Placed",
+            "value": _format_et_date(event.placed_at_utc),
+            "inline": False,
+        },
+    ]
+    if event.rejection_detail:
+        # Truncate to Discord's 1024-char field-value max.
+        detail = event.rejection_detail[:1020] + (
+            "..." if len(event.rejection_detail) > 1020 else ""
+        )
+        fields.append({"name": "Rejection reason", "value": detail, "inline": False})
+
+    broker_id_segment = (
+        f" | broker_order_id: {event.broker_order_id}" if event.broker_order_id else ""
+    )
+    return {
+        "title": title,
+        "color": color,
+        "fields": fields,
+        "footer": {
+            "text": (
+                f"client_order_id: {event.client_order_id} | "
+                f"signal_id: {event.signal_id}"
+                f"{broker_id_segment}"
+            )
+        },
+        "timestamp": event.placed_at_utc.isoformat(),
+    }
+
+
 def build_order_filled_embed(event: OrderFilledEvent) -> dict[str, Any]:
     """Build the Discord embed for a confirmed order fill."""
     notional = event.quantity * event.fill_price
@@ -273,12 +354,13 @@ def build_order_filled_embed(event: OrderFilledEvent) -> dict[str, Any]:
 def plan_event_push(
     *,
     channel: EventChannel,
-    event: SignalEmittedEvent | SignalDecisionEvent | OrderFilledEvent,
+    event: SignalEmittedEvent | SignalDecisionEvent | OrderPlacedEvent | OrderFilledEvent,
 ) -> EventPushPlan:
     """Build the dispatch plan for a single event push.
 
     Routing:
         SignalEmittedEvent or SignalDecisionEvent → EventChannel.SIGNALS
+        OrderPlacedEvent                          → EventChannel.FILLS
         OrderFilledEvent                          → EventChannel.FILLS
 
     The caller passes the channel explicitly so the routing logic stays
@@ -294,6 +376,11 @@ def plan_event_push(
             raise ValueError("SignalDecisionEvent must route to EventChannel.SIGNALS")
         embed = build_signal_decision_embed(event)
         dedupe_key = f"signal_{event.decision.lower()}:{event.signal_id}"
+    elif isinstance(event, OrderPlacedEvent):
+        if channel != EventChannel.FILLS:
+            raise ValueError("OrderPlacedEvent must route to EventChannel.FILLS")
+        embed = build_order_placed_embed(event)
+        dedupe_key = f"order_placed:{event.order_id}"
     elif isinstance(event, OrderFilledEvent):
         if channel != EventChannel.FILLS:
             raise ValueError("OrderFilledEvent must route to EventChannel.FILLS")

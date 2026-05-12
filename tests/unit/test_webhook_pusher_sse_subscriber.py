@@ -172,6 +172,26 @@ def _signal_emitted_data(**overrides: Any) -> dict[str, Any]:
     return base
 
 
+def _signal_placed_data(**overrides: Any) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "action": "placed",
+        "signal_id": "55555555-5555-5555-5555-555555555555",
+        "market": "/MES",
+        "direction": "long",
+        "side": "buy",
+        "quantity": "1",
+        "order_id": "66666666-6666-6666-6666-666666666666",
+        "client_order_id": "v1abc-paramx-sigy-0",
+        "broker_order_id": "12345",
+        "broker_status": "submitted",
+        "db_status": "working",
+        "placed_at_utc": "2026-05-12T18:06:00Z",
+        "environment": "paper",
+    }
+    base.update(overrides)
+    return base
+
+
 def _signal_decision_data(action: str, **overrides: Any) -> dict[str, Any]:
     base: dict[str, Any] = {
         "action": action,
@@ -271,6 +291,49 @@ class TestRouteEvent:
         )
         plans = route_event(frame)
         assert plans == []
+
+    def test_signal_placed_routes_to_fills_channel(self) -> None:
+        """`signal` event with action=placed → #fills channel + order_placed dedupe key."""
+        frame = SSEFrame(
+            event_type="signal",
+            sequence_no=20,
+            data=_signal_placed_data(),
+            raw_id="20",
+        )
+        plans = route_event(frame)
+        assert len(plans) == 1
+        channel, plan = plans[0]
+        assert channel == EventChannel.FILLS
+        assert plan.dedupe_key.startswith("order_placed:")
+
+    def test_signal_placed_missing_order_id_dropped(self) -> None:
+        frame = SSEFrame(
+            event_type="signal",
+            sequence_no=21,
+            data=_signal_placed_data(order_id="", client_order_id=""),
+            raw_id="21",
+        )
+        plans = route_event(frame)
+        assert plans == []
+
+    def test_signal_placed_rejected_status_renders_red_embed(self) -> None:
+        """broker_status=rejected → embed uses COLOR_ORDER_REJECTED."""
+        from services.webhook_pusher.event_pushes import COLOR_ORDER_REJECTED
+
+        frame = SSEFrame(
+            event_type="signal",
+            sequence_no=22,
+            data=_signal_placed_data(
+                broker_status="rejected",
+                db_status="rejected",
+                rejection_detail="insufficient margin",
+            ),
+            raw_id="22",
+        )
+        plans = route_event(frame)
+        assert len(plans) == 1
+        _, plan = plans[0]
+        assert plan.embed["color"] == COLOR_ORDER_REJECTED
 
     def test_fill_routes_to_fills_channel(self) -> None:
         frame = SSEFrame(
