@@ -7,7 +7,7 @@
 # `live` matches `paper` schema-wise. The ONLY differences are:
 #   - account_number (live vs paper)
 #   - flex_query_token (different IBKR token for live data)
-#   - quantconnect organization_id (live trading node, separate from paper)
+#   - quantconnect user_id (live trading node — may be same QC User ID as paper)
 #   - rp_id/origin (apex spratcapital.com vs paper.spratcapital.com)
 #   - bearer tokens (independently generated; do not share with paper)
 #
@@ -30,7 +30,10 @@ quantconnect:
   # included). Token MAY be shared with paper if same QC organization holds
   # both backtest and live algos; spec is silent. Default: same token, single org.
   api_token: <TODO_FROM_DAY_3_QC_TOKEN_REGEN>
-  organization_id: <TODO_FROM_DAY_3_QC_ORG>
+  # Numeric QC User ID (avatar -> My Account on quantconnect.com).
+  # NOT the organization slug — QC's REST API rejects the slug with
+  # "UserID not valid" (DP-023 from PR-A carryover).
+  user_id: <TODO_FROM_DAY_3_QC_USER_ID>
 
 anthropic:
   # Same Anthropic workspace as paper; agent operates against both envs.

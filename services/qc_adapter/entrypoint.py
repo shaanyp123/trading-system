@@ -15,7 +15,7 @@ Mirrors ``services/api/entrypoint.py`` + ``services/discord_bot/entrypoint.py``:
 Required sops keys (sourced from ``deploy/qc_adapter/README.md``):
 
   * ``postgres.app_service_password``  → ``QC_ADAPTER_DATABASE_URL``
-  * ``quantconnect.organization_id``   → ``QC_ADAPTER_QC_USER_ID``
+  * ``quantconnect.user_id``           → ``QC_ADAPTER_QC_USER_ID``
   * ``quantconnect.api_token``         → ``QC_ADAPTER_QC_API_TOKEN``
 
 Optional (defaults in services/qc_adapter/config.py apply when unset):
@@ -83,12 +83,12 @@ def main(argv: list[str] | None = None) -> int:
         assert isinstance(pg_password, str)
         os.environ["QC_ADAPTER_DATABASE_URL"] = _build_database_url(pg_password)
 
-    # --- Required: QC user_id (sops yaml `quantconnect.organization_id`) -----
+    # --- Required: QC user_id (sops yaml `quantconnect.user_id`) ------------
     if "QC_ADAPTER_QC_USER_ID" not in os.environ:
-        qc_user_id = (secrets.get("quantconnect") or {}).get("organization_id")
+        qc_user_id = (secrets.get("quantconnect") or {}).get("user_id")
         if _looks_like_placeholder(qc_user_id):
             return _exit(
-                f"quantconnect.organization_id missing or placeholder in "
+                f"quantconnect.user_id missing or placeholder in "
                 f"{secrets_path}; this is the numeric QC user_id used for "
                 f"HTTP Basic auth (see deploy/qc_adapter/README.md)",
             )

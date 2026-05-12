@@ -72,10 +72,9 @@ class QCAdapterSettings(BaseSettings):
     #   Authorization: Basic base64(<qc_user_id>:<sha256(<api_token>:<ts>)>)
     #   Timestamp: <ts>
     # ``qc_user_id`` is the numeric "User ID" from the QC account page —
-    # sourced from sops yaml ``quantconnect.organization_id`` per
-    # ``deploy/qc_adapter/README.md`` (QC's docs ambiguously call this
-    # field "user_id" in the auth section + "organization_id" elsewhere;
-    # the operator's secret schema persists it under ``organization_id``).
+    # sourced from sops yaml ``quantconnect.user_id`` per
+    # ``deploy/qc_adapter/README.md``. The QC REST API rejects the
+    # organization slug here with "UserID not valid" (DP-023).
     qc_user_id: str = Field(
         ...,
         description="QC numeric user ID for HTTP Basic auth.",
