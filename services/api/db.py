@@ -93,6 +93,19 @@ async def session_scope() -> AsyncGenerator[AsyncSession, None]:
         yield session
 
 
+def get_session_factory() -> async_sessionmaker[AsyncSession]:
+    """Return the configured session factory for callers needing the factory directly.
+
+    Used by callers that need to spin multiple short-lived sessions (e.g.
+    the audit-first dispatch pattern from Pivot-PR-D's
+    ``services.risk.signal_dispatch.apply_signal_dispatch``). Raises
+    RuntimeError if the pool isn't initialized.
+    """
+    if _session_factory is None:
+        raise RuntimeError("DB pool not initialized; call init_pool() first")
+    return _session_factory
+
+
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
     """FastAPI dependency: per-request session that auto-rolls-back on raise."""
     if _session_factory is None:
