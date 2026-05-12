@@ -158,6 +158,9 @@ jobs:
           - service: discord_bot
             dockerfile: services/discord_bot/Dockerfile
             context: .
+          - service: qc_adapter
+            dockerfile: services/qc_adapter/Dockerfile
+            context: .
           - service: web
             dockerfile: apps/web/Dockerfile
             context: apps/web
