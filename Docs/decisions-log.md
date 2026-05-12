@@ -2756,3 +2756,101 @@ Day 27 carryover closed at 23:40 UTC after a clean operator-delegated VPS deploy
 ### Day 28 09:00 PR-A verdict
 
 PR-A of the Phase-1-onset 5-PR build chain ready to merge. Regular review (no `risk-review-approved` label — zero forbidden paths). 12 new code files (8 services/qc_adapter/ modules + 1 docker-compose edit + 3 test files) + 1 operator runbook + 3 doc files. **897/897 unit + integration tests pass** (was 847 baseline; +50 new tests). All gates green: `make lint` (ruff format + ruff check), `mypy --strict` 120 source files clean, `make test` 70.9s. Frontend gate fails locally on `tsc: command not found` (worktree-only; node_modules not installed in this clone) — CI will run it green. A01/A05/A06/A22/A27 all BINDING + satisfied. **PR-A unblocks PR-B (signal mutation handlers); PR-B unblocks PR-C (order placement); PR-C+D unblock PR-E (Discord pushes + the ceremony itself).** Estimated cumulative wall-time to the Week 7 Thu ceremony close: ~10-14h across the remaining 4 PRs.
+
+---
+
+### 2026-05-12 — Day 28 carryover — PR-A deploy + 2 hot-fix follow-ups (PR #85 + #86) + QC tier blocker discovery + Phase-1 architectural pivot to LEAN Local + IBKR paper (Option 4)
+
+- **Spec reference:** PR #84 merged at 23:55 UTC. Carryover deploy follows the Day 24-27 operator-delegated SSH pattern; operator authorization: "You can deploy now." Three sequential discoveries during the deploy: (1) DP-023 string-to-Literal[int] coercion bug; (2) DP-024 sops field `organization_id` was being passed as Basic-auth username when QC's API actually expects a numeric `user_id` for that field AND a separate `organizationId` POST parameter; (3) DP-025 QC subscription tier blocks `/object/get` entirely with the message "Due to data licensing restrictions, export from the object-store can only be enabled for Institutional accounts." DP-025 is a **scope-level blocker** — the entire backend-spec §1.4/§2.11/§4.5.1 ObjectStore polling architecture is infeasible on the operator's current QC subscription tier.
+
+- **VPS baseline (pre-deploy 23:55 UTC):** HEAD `c2f0468` (Day 27 carryover close). All 6 containers healthy. `audit_log` 2 rows. `risk_state` CONVALESCENT.
+
+- **Deploy attempt #1 (00:30 UTC) — DP-023 caught:**
+  - `git pull --ff-only origin main` advanced VPS to `7359f9d` (PR #84 squash-merge — PR-A's 18 files / 4014 insertions).
+  - `docker compose build qc_adapter` succeeded in 14.4s.
+  - `docker compose up -d qc_adapter` succeeded; container started; first boot crashed in a restart loop with: `ValidationError: phase_at_emit Input should be 0, 1, 2 or 3 [type=literal_error, input_value='0', input_type=str]`.
+  - **DP-023:** `docker-compose.yml` passes `QC_ADAPTER_PHASE_AT_EMIT="0"` as an env var (all docker env vars are strings). `pydantic-settings` does NOT auto-coerce strings to `Literal[0, 1, 2, 3]` integer literals — strict-match by default.
+  - **Fix:** `@field_validator("phase_at_emit", mode="before")` coerces incoming strings to int before Literal validation runs. Shipped as PR #85 (regular review; `services/qc_adapter/**` on hot-fix whitelist).
+  - **PR #85 timeline:** opened 00:40 → 12 CI checks green @ 00:55 → squash-merged @ 01:05 as commit `9832eae`.
+  - **Pattern carved out:** any pydantic-settings config field declared with integer Literal values needs a `mode="before"` validator if it's expected to come in via docker-compose env vars. The api/discord_bot configs use string Literals so don't hit this; qc_adapter was the first case.
+
+- **Deploy attempt #2 (01:10 UTC) — auth fails with QC "UserID not valid":**
+  - VPS pulled `9832eae` (PR #85). Rebuild + recreate qc_adapter. Container boot clean: `qc_adapter_booting → qc_adapter_account_resolved → qc_adapter_orchestrator_started`. All 3 directory loops alive at 60/60/5s cadences.
+  - **But:** every list_keys call returns `QC success=false for '/object-store/list': ['UserID not valid (a3d7fe4da507e67661877333cd7273c5) REF #m2scDQ8GD7']`. The 32-char hex value `a3d7fe4da507e67661877333cd7273c5` is the operator's QC organization slug, NOT the numeric User ID that QC's HTTP Basic auth requires.
+  - **DP-024:** The Q1 ambiguity I surfaced at session start ("Is `quantconnect.organization_id` actually the user_id used for Basic auth?") was wrong in my default — `organization_id` in the sops template was misleadingly named; QC actually distinguishes between `userId` (numeric, Basic auth username) and `organizationId` (hex slug, POST body parameter for ObjectStore endpoints).
+  - Operator pulled their numeric QC User ID from `quantconnect.com → avatar → My Account` (6-digit numeric value) and updated sops: dropped `quantconnect.organization_id` + added `quantconnect.user_id: <numeric>`. Committed locally on VPS in 2 commits (`4b4cadb` + `8cc8658`).
+  - **Code-side rename:** PR #86 shipped the matching change — `services/qc_adapter/entrypoint.py` reads `quantconnect.user_id` (was `organization_id`); `deploy/sops/secret_schemas/{paper,live}.template.yaml` renamed + inline-commented the field; `deploy/qc_adapter/README.md` + 3 module docstrings updated. **VPS deploy key is read-only**; the 2 operator commits had to be cherry-picked locally via `git format-patch` + `git am` before pushing from my workstation (carved-out pattern: any VPS-originated commits route through this format-patch → am → push cycle until the deploy key gets write access).
+  - **PR #86 timeline:** opened 01:35 → 12 CI checks green @ 01:39 → squash-merged @ 01:40 as commit `a27884a`.
+
+- **Deploy attempt #3 (01:40 UTC) — DP-025 discovered (the hard stop):**
+  - VPS pulled `a27884a` (PR #86). Hard-reset VPS branch to origin/main (VPS had 2 local sops commits that were squash-superseded by `a27884a`; `git reset --hard origin/main` was the safe path since the contents already merged via the PR).
+  - Rebuild --no-cache + recreate qc_adapter. Container boot still fail-closed at entrypoint with `quantconnect.user_id missing or placeholder in /run/secrets/decrypted.yaml`. Root cause: the `/opt/trading/secrets-decrypted/decrypted.yaml` host file is the pre-decrypted artifact mounted into the container; it was stale (Day 24 ceremony version, still had `organization_id`). Manually re-decrypted via `sops --decrypt secrets/paper.enc.yaml > /opt/trading/secrets-decrypted/decrypted.yaml && chmod 600 ...` to pull in the operator's `user_id` field. Restarted container.
+  - **DP-026 (process-level):** the sops re-decryption is not automated; the VPS bringup script (`deploy/day5-bringup.sh`) handles initial decryption but every subsequent sops change requires a manual re-decrypt step. The runbooks document this implicitly (sops edit → commit → push → re-decrypt → recreate); should be made explicit in `deploy/qc_adapter/README.md` Step 1.5 OR automated via a watcher.
+  - Post-restart, the auth pair worked — no more `UserID not valid` errors. But every list call returned `QC response not JSON for '/object-store/list': Expecting value: line 1 column 1 (char 0)`. Empty body / non-JSON response.
+  - **Direct curl probe from the `trading_egress` Docker network** (using `docker run --rm --network trading_egress curlimages/curl`):
+    - `POST /api/v2/authenticate` with the new Basic-auth pair → `{"success":true}` ✅ (auth pair validated)
+    - `POST /api/v2/object-store/list` → returns the QC homepage 404 HTML (endpoint path is wrong)
+    - `POST /api/v2/object/list` (singular!) with `path=events/` → `{"errors":["Required parameter organizationId is missing."],"success":false}` — endpoint exists; needs `organizationId` POST parameter
+    - `POST /api/v2/object/list` with `organizationId=<32-char-hex>&path=heartbeat/` → `{"objects":[...124 files...], "success":true}` — works; the operator's QC algorithm has been writing one heartbeat JSON per day since 2026-01-01
+    - `POST /api/v2/object/get` for any key → **`{"errors":["Due to data licensing restrictions, export from the object-store can only be enabled for Institutional accounts. If you're interested in enabling this feature for your organization please contact support@quantconnect.com to learn more."],"success":false}`** ❌
+  - **DP-025 (the scope-level blocker):** QC's public REST API `/object/get` endpoint is gated behind the **Institutional subscription tier**. The operator's current tier allows `/object/list` (metadata only) but blocks content fetch. The entire backend-spec §1.4 + §2.11 + §4.5.1 ObjectStore polling architecture is **infeasible** on this tier — the orchestrator can enumerate keys but cannot download their contents, so signal/order/fill/recon events cannot be ingested.
+  - The QC adapter container was stopped cleanly at 01:43 UTC (was in retry-and-backoff loop; not productive without `/object/get` access; running it indefinitely would burn auth-call quota for no gain). `audit_log` row count unchanged at 2; `signals` row count = 0 (graceful failure semantics worked as designed — no rogue writes during the retry storms).
+
+- **Operator decision @ 02:00 UTC: Option 4 — LEAN Local + IBKR paper (pull Phase 2 architecture forward to Phase 1):**
+
+  Four architectural options were surfaced:
+
+  | Option | Description | Reliability | Cost | Verdict |
+  |---|---|---|---|---|
+  | 1 | Upgrade QC subscription to Institutional | 9/10 | $200+/mo | Rejected — exceeds Phase-0 budget |
+  | 2 | QC algorithm `WebRequest`s directly to backend `/api/internal/qc/events` | 6/10 (latency in algo hot loop + no QC-side persistence + in-algo retry queue is non-trivial + auth secret in QC algorithm config) | $0 incremental | Fallback if IBKR pivot blocked |
+  | 3 | Defer Phase-1 live trading | n/a | $0 | Rejected — postpones ceremony indefinitely |
+  | **4** | **LEAN Local on VPS + IBKR paper account (backend-spec §1.5 Phase 2 architecture, pulled forward)** | **8/10** | **$0 incremental (IBKR paper is free; LEAN is OSS; ~$0-25/mo for real-time IBKR market data if needed)** | **CHOSEN** |
+
+  **Why Option 4 wins:**
+  - Spec was always going to cut over to LEAN Local + direct IBKR at Phase 2 (backend-spec §1.5); doing it now skips ObjectStore polling entirely instead of building a 5-PR bridge and immediately retiring it.
+  - LEAN is open-source; `quantconnect/lean` Docker image is documented + maintained.
+  - IBKR paper trading is free + behaviorally close to live; the simulated fill engine is the strongest test environment available pre-live.
+  - Eliminates QC subscription tier dependency; eliminates the QC-side persistence-vs-network-reliability tradeoff Option 2 had to solve.
+  - The 30-session minimum from backend-spec §11.1 still holds (the spirit is "test the SYSTEM, not the broker") — restart the session counter at the IBKR cutover.
+
+  **Catches the operator flagged:**
+  - **IBKR Pro account is approved BUT futures-trading approval is still pending.** IBKR paper accounts get a simulated full-feature environment regardless of live futures approval — paper trades on `/MES`, `/MNQ`, `/MCL` should work pre-futures-approval (IBKR paper grants broad simulated permissions). Worth verifying in the new session before committing wired code.
+  - All 5 PRs of the original Phase-1-onset chain (PR-A merged + PR-B/C/D/E planned) need to be re-spec'd. The work doesn't shrink — it shifts from "QC poll layer + instruction protocol + ack layer" to "LEAN Local container + IBKR Gateway container + ib-async wiring + direct fill ingestion via FlexQuery + IBKR statement reconciliation." Similar cumulative time (~10-14h); different scaffolding.
+
+  **What stays:**
+  - **PR-A's merged code stays in place but goes dormant.** `services/qc_adapter/**` remains importable + tested but no longer runs in production. The container is stopped + the service block in `docker-compose.yml` will be profile-gated under `qc_adapter_backfill` (Phase 2+ retained role per backend-spec §1.4 line 233 "retained for backfill audit reads only"). PR-A's 50 tests still pass + still gate CI.
+  - **Audit log integrity is preserved.** `verify_chain --env paper` returns `CHAIN OK: 2 rows verified` (genesis → seq=1 Day 25 halt → seq=2 Day 27 resume). The pivot doesn't disturb the chain; new writes from LEAN Local / ib-async route through the same `append_audit_event` writer.
+  - **Strategy code stays.** `strategies/v1_trend_following/{parameters,indicators,signals,strategy,sizing_trace,audit_events}.py` is broker-agnostic and runs identically under LEAN Local. The QC algorithm wrapper at `lean/v1_qc_algorithm.py` becomes the LEAN-Local entrypoint (no longer "QC's algorithm runtime"); the file may be renamed during the pivot.
+  - **All 7 currently-running services stay (api, caddy, discord_bot, nextjs, postgres, qc_adapter [stopped], webhook_pusher).** Phase-1 pivot adds 2 new services (`lean_local` + `ib_gateway`) profile-gated until the pivot PRs land.
+
+- **DP-023 / DP-024 / DP-025 / DP-026 added to the Decision-Point Register** (DP numbering inherits from prior carryover entries; DP-022 was the alembic 0006 grant fix from Day 25; DP-023-026 are new this session).
+
+- **Files in this carryover doc PR (single commit):**
+  - `Docs/decisions-log.md` — this entry + Day 28 carryover verdict.
+  - `CLAUDE.md` — date stamp Day 28 09:00 → Day 28 carryover; VPS commit pointer `7359f9d → a27884a → stopped`; Phase-1 architecture state changed from "Phase-1-onset 5-PR build chain in progress" → "Phase-1 pivoted to LEAN Local + IBKR paper (Option 4); pivot scoped to fresh session".
+  - `implementation-guide.md` §3 Week 7 Thu line 421 — carryover status note appended documenting the DP-025 discovery + Option 4 pivot.
+
+- **VPS production state at 2026-05-12 02:00 UTC (Day 28 carryover close):**
+  - Apex domain + Caddy auto-TLS healthy (Day 5 → 28, stable across 18 deploy cycles)
+  - 6 of 7 containers healthy: api, caddy, discord_bot, nextjs, postgres, webhook_pusher — all `Up` healthy. The 7th container, qc_adapter, is **intentionally stopped** pending Option 4 pivot.
+  - HEAD: `a27884a` (PR #86 squash-merge — the doc PR atop this entry advances HEAD one more commit when merged).
+  - alembic at head `20260518_audit_seq_grant` (8 migrations applied; unchanged since Day 25).
+  - `audit_log`: 2 rows — seq=1 state_transition_normal_to_halt (Day 25); seq=2 state_transition_halt_to_convalescent (Day 27). Hash chain: genesis → 1 → 2 walks clean. **No rogue writes during PR-A deploy attempts** (graceful failure semantics worked as designed across all 3 deploy attempts).
+  - `risk_state`: CONVALESCENT (unchanged since Day 27).
+  - `signals`: 0 rows.
+  - `qc_adapter_cursor`: rows preserved but `consecutive_failures` elevated (35 / 35 / 388 for events / state_portfolio / instruction_acks respectively from the failed list calls during deploy attempt #2-3). These will reset to 0 on first successful poll once Option 4 pivot lands OR when qc_adapter is permanently retired.
+  - WebAuthn passkey + TOTP + backup codes from Day 24 ceremony intact.
+
+- **Pattern carved out by Day 28 carryover for future architectural blockers:**
+  - **Smoke against real external APIs early.** PR-A had A27 satisfied via the operator runbook (`deploy/qc_adapter/README.md`), which itself satisfied dev-guide §6.8 alternative (b). BUT the runbook is a checklist; it does NOT exercise the platform contract before deploy. If we'd run a `curl /authenticate` + `curl /object/get` test during PR-A scope-triage (e.g. by adding the curl probes to the operator runbook as Step 0.5 "verify the credentials work AND `get` is permitted before building any code"), DP-025 would have been caught BEFORE writing 4000+ lines of polling-architecture code. **New rule for §6.8 / A27 satisfiers on third-party API integrations:** the operator runbook MUST include an end-to-end smoke that exercises the **most-restricted endpoint** the integration depends on, not just the auth endpoint. For QC ObjectStore: that's `/object/get`, not `/authenticate`. Pattern reusable for IBKR (smoke `placeOrder` + `cancelOrder` paper-account round-trip before wiring `services/execution/`), Resend (smoke `POST /emails` before wiring webhook_pusher's email path), etc.
+  - **VPS deploy key write access.** Day 28 hit it twice — PR-A hot-fix had to be rebased onto stale main; PR-B (this doc carryover) is again pushed from my workstation because VPS `git push` errors with "The key you are authenticating with has been marked as read only." Either (a) give the VPS deploy key write access (security risk: any code path that lands a malicious commit on disk could git-push to main) OR (b) keep the current pattern of `format-patch → am → push from workstation` (cleaner security boundary; just an extra friction step that operator workflows should bake in).
+  - **DP-pattern numbering scales linearly.** DP-001 through DP-026 in ~28 days; ~1 new DP per session. Future sessions will continue to discover platform-contract assumptions that don't survive contact. Document discipline per dev-guide §1.3 (escalate over decide) is the right default; some DPs only surface at deploy time, not code review.
+
+- **Day 28+ readiness:** **Phase-1 architecture pivot to LEAN Local + IBKR paper (Option 4) scoped to fresh session.** This session does NOT touch the spec rewrites — the new session takes them on as a coherent unit (4 foundation docs + 2 new code surfaces + docker-compose + runbooks). Handoff prompt drafted at the end of this session. Estimated new-session scope: ~1-2 days operator-side, ~3-5 PRs Claude-side.
+
+---
+
+### Day 28 carryover verdict
+
+Day 28 carryover closed at 02:00 UTC after PR-A's 18-files-4014-insertions code shipped clean through 3 sequential CI runs (PR #84 → #85 → #86) and 3 sequential VPS deploy attempts — each successive deploy resolved one platform-contract assumption that the previous deploy uncovered. PR-A merged. PR #85 (DP-023 string-to-int coercion fix) merged. PR #86 (DP-024 organization_id → user_id rename) merged. The qc_adapter container booted cleanly with correct auth on the third attempt — but **DP-025 (QC Institutional-tier gating of `/object/get`) is a scope-level blocker** for the entire backend-spec §1.4 / §2.11 / §4.5.1 ObjectStore polling architecture on the operator's current QC subscription tier. Operator decision @ 02:00 UTC: **Option 4 — pivot to LEAN Local + IBKR paper, pulling backend-spec §1.5 Phase 2 architecture forward into Phase 1.** Audit chain integrity preserved (2 rows; `verify_chain --env paper` clean). qc_adapter container stopped + its merged code surface stays in place under the `qc_adapter_backfill` profile gate (Phase 2+ retained role per spec §1.4 line 233). 4 new DPs (DP-023 through DP-026) added to the register. Pattern carved out: §6.8 / A27 operator runbooks for third-party API integrations MUST smoke the **most-restricted endpoint** the integration depends on, not just the auth endpoint — DP-025 was caught at deploy time when a curl probe during PR-A scope-triage would have surfaced it pre-code. Phase-1 architecture pivot scoped to fresh session via the handoff prompt below; estimated 3-5 PRs + 1-2 days operator-side.
