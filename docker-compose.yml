@@ -353,6 +353,15 @@ services:
       AUTO_RESTART_TIME: '11:59 PM'
       RELOGIN_AFTER_TWOFA_TIMEOUT: 'yes'
       TWOFA_DEVICE: 'YubiKey'  # operator's chosen 2FA device per Day 4 carryover
+      # TWS_ACCEPT_INCOMING + READ_ONLY_API populate gnzsnz's IBC config.ini
+      # template (verified at /home/ibgateway/ibc/config.ini.tmpl). Without
+      # TWS_ACCEPT_INCOMING=accept the gateway pops a headless "Accept incoming
+      # connection from <api-container-IP>" dialog on every TWS API connect
+      # and hangs the handshake (TCP socket open but apiStart never resolves).
+      # Discovered Pivot-PR-B Step 5 smoke 2026-05-12. READ_ONLY_API=no is
+      # required for placeOrder/cancelOrder; empty defaults to read-only.
+      TWS_ACCEPT_INCOMING: 'accept'
+      READ_ONLY_API: 'no'
     healthcheck:
       # Port 4002 (paper) is the TWS API listener; if the gateway is
       # logged in + healthy, this port accepts TCP connections. Use
