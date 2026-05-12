@@ -218,21 +218,36 @@ class TestValidBearer:
         assert body["event_type"] == "lean_strategy_initialized"
         assert "received_at_utc" in body
 
-    async def test_signal_emitted_not_wired_yet(
+    async def test_signal_emitted_missing_required_fields(
         self,
         client_with_lean_token: AsyncClient,
     ) -> None:
-        """Pivot-PR-A scope: signal_emitted returns 400 LEAN_EVENT_TYPE_NOT_WIRED."""
+        """Worker-PR-4 (2026-05-12): signal_emitted without payload fields → 422.
+
+        Route-layer boundary check (NOT pydantic model_validator —
+        Pydantic v2 ctx-serialization issue) returns canonical AppError
+        envelope with error_code=LEAN_SIGNAL_PAYLOAD_INCOMPLETE.
+        """
         body = _heartbeat_body()
         body["event_type"] = "signal_emitted"
+        # No signal-emit fields populated → handler should reject.
         resp = await client_with_lean_token.post(
             _LEAN_PATH,
             headers={"Authorization": _LEAN_AUTH_HEADER},
             json=body,
         )
-        assert resp.status_code == 400
+        assert resp.status_code == 422
         envelope = resp.json()
-        assert envelope["error_code"] == "LEAN_EVENT_TYPE_NOT_WIRED"
+        assert envelope["error_code"] == "LEAN_SIGNAL_PAYLOAD_INCOMPLETE"
+        # All 6 signal-emit fields should appear in details.missing.
+        assert set(envelope["details"]["missing"]) == {
+            "market",
+            "direction",
+            "target_contracts",
+            "decision_price",
+            "sizing_trace",
+            "strategy_version",
+        }
 
     async def test_invalid_event_type_rejected_by_pydantic(
         self,
