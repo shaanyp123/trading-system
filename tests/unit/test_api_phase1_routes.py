@@ -45,6 +45,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 import pytest
@@ -574,13 +575,7 @@ class TestSignalDecisionSSEEmit:
             captured_emits.append((event_type, data))
             return 99
 
-        async def fake_apply(
-            plan: Any,
-            *,
-            session_factory: Any,
-            env: str,
-            phase_at_emit: int,
-        ) -> Any:
+        async def fake_apply(plan: Any, **_: Any) -> Any:
             from services.risk.signal_dispatch import SignalDispatchResult
 
             return SignalDispatchResult(
@@ -597,6 +592,12 @@ class TestSignalDecisionSSEEmit:
 
         monkeypatch.setattr(sd_module, "apply_signal_dispatch", fake_apply)
         monkeypatch.setattr(api_db_module, "get_session_factory", lambda: object())
+        # PR-H: approve_signal reads risk_state before dispatch. Stub
+        # the helper to return NORMAL so the gate passes; reject/defer
+        # tests below don't exercise this path (the route only calls
+        # fetch_current_risk_state on approve), but patching is a
+        # no-op for those + keeps the fixture symmetric.
+        monkeypatch.setattr(sd_module, "fetch_current_risk_state", AsyncMock(return_value="NORMAL"))
 
         response = await api_client.post(
             f"/api/signals/{signal_id}/approve",
@@ -665,6 +666,12 @@ class TestSignalDecisionSSEEmit:
 
         monkeypatch.setattr(sd_module, "apply_signal_dispatch", fake_apply)
         monkeypatch.setattr(api_db_module, "get_session_factory", lambda: object())
+        # PR-H: approve_signal reads risk_state before dispatch. Stub
+        # the helper to return NORMAL so the gate passes; reject/defer
+        # tests below don't exercise this path (the route only calls
+        # fetch_current_risk_state on approve), but patching is a
+        # no-op for those + keeps the fixture symmetric.
+        monkeypatch.setattr(sd_module, "fetch_current_risk_state", AsyncMock(return_value="NORMAL"))
 
         response = await api_client.post(
             f"/api/signals/{signal_id}/reject",
@@ -731,6 +738,12 @@ class TestSignalDecisionSSEEmit:
 
         monkeypatch.setattr(sd_module, "apply_signal_dispatch", fake_apply)
         monkeypatch.setattr(api_db_module, "get_session_factory", lambda: object())
+        # PR-H: approve_signal reads risk_state before dispatch. Stub
+        # the helper to return NORMAL so the gate passes; reject/defer
+        # tests below don't exercise this path (the route only calls
+        # fetch_current_risk_state on approve), but patching is a
+        # no-op for those + keeps the fixture symmetric.
+        monkeypatch.setattr(sd_module, "fetch_current_risk_state", AsyncMock(return_value="NORMAL"))
 
         response = await api_client.post(
             f"/api/signals/{signal_id}/defer",
@@ -794,6 +807,12 @@ class TestSignalDecisionSSEEmit:
 
         monkeypatch.setattr(sd_module, "apply_signal_dispatch", fake_apply)
         monkeypatch.setattr(api_db_module, "get_session_factory", lambda: object())
+        # PR-H: approve_signal reads risk_state before dispatch. Stub
+        # the helper to return NORMAL so the gate passes; reject/defer
+        # tests below don't exercise this path (the route only calls
+        # fetch_current_risk_state on approve), but patching is a
+        # no-op for those + keeps the fixture symmetric.
+        monkeypatch.setattr(sd_module, "fetch_current_risk_state", AsyncMock(return_value="NORMAL"))
 
         response = await api_client.post(
             f"/api/signals/{signal_id}/approve",
@@ -839,6 +858,12 @@ class TestSignalDecisionSSEEmit:
 
         monkeypatch.setattr(sd_module, "apply_signal_dispatch", fake_apply)
         monkeypatch.setattr(api_db_module, "get_session_factory", lambda: object())
+        # PR-H: approve_signal reads risk_state before dispatch. Stub
+        # the helper to return NORMAL so the gate passes; reject/defer
+        # tests below don't exercise this path (the route only calls
+        # fetch_current_risk_state on approve), but patching is a
+        # no-op for those + keeps the fixture symmetric.
+        monkeypatch.setattr(sd_module, "fetch_current_risk_state", AsyncMock(return_value="NORMAL"))
 
         response = await api_client.post(
             f"/api/signals/{signal_id}/approve",

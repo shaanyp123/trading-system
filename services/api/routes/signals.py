@@ -218,6 +218,7 @@ async def approve_signal(
     from services.risk.signal_dispatch import (
         SignalDispatchError,
         apply_signal_dispatch,
+        fetch_current_risk_state,
         plan_signal_approve,
     )
 
@@ -229,6 +230,10 @@ async def approve_signal(
     # surfaces SIGNAL_NOT_FOUND with a clearer error than a partial
     # SSE emit would.
     summary = await repo.fetch_signal_summary(account_id, signal_id)
+    # PR-H: read the current risk_state BEFORE dispatch. If the system
+    # is HALT_NEW, the dispatcher raises SIGNAL_BLOCKED_BY_HALT which
+    # maps to HTTP 409 below. NORMAL + CONVALESCENT permit.
+    risk_state = await fetch_current_risk_state(get_session_factory(), account_id=account_id)
     decided_at_utc = datetime.now(tz=UTC)
     plan = plan_signal_approve(
         signal_id=signal_id,
@@ -243,6 +248,7 @@ async def approve_signal(
             session_factory=get_session_factory(),  # module-level factory from db.py
             env=env,
             phase_at_emit=phase,
+            current_risk_state=risk_state,
         )
     except SignalDispatchError as err:
         log.warning(
@@ -254,7 +260,7 @@ async def approve_signal(
             404
             if err.error_code == "SIGNAL_NOT_FOUND"
             else 409
-            if err.error_code == "SIGNAL_NOT_PENDING"
+            if err.error_code in ("SIGNAL_NOT_PENDING", "SIGNAL_BLOCKED_BY_HALT")
             else 400
         )
         raise AppError(
