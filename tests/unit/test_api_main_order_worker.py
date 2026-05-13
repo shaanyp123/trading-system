@@ -766,6 +766,297 @@ class TestAlertDispatchHookFired:
         assert dispatched["email_identity"] is None
 
 
+class TestBuildStateTransitionHook:
+    """PR-J: ``_build_state_transition_hook`` returns a callable closure.
+
+    Phase 1 always returns a hook (no opt-out setting yet). The
+    closure reads risk_state, plans the transition, applies it, then
+    emits SSE. We exercise each branch with mocked DB sessions +
+    mocked state-machine internals.
+    """
+
+    def test_returns_callable(self) -> None:
+        from services.api import main as api_main
+
+        hook = api_main._build_state_transition_hook(_settings())
+        assert hook is not None
+        assert callable(hook)
+
+
+class TestStateTransitionHookFired:
+    """The PR-J hook closure: read risk_state → plan → apply → SSE."""
+
+    @pytest.mark.asyncio
+    async def test_already_halted_is_noop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """If risk_state is already HALT_NEW, the hook logs + returns
+        without invoking plan_invoke_kill_switch."""
+        from contextlib import asynccontextmanager
+        from unittest.mock import MagicMock
+        from uuid import uuid4
+
+        from services.api import main as api_main
+        from services.reconciliation.apply import ReconciliationKillSwitchContext
+
+        def factory() -> Any:
+            session = MagicMock()
+
+            async def execute(stmt: Any, params: Any = None) -> Any:
+                from types import SimpleNamespace as _NS
+
+                result = MagicMock()
+                # risk_state already HALT_NEW.
+                result.fetchone = MagicMock(
+                    return_value=_NS(
+                        state="HALT_NEW",
+                        severity="routine",
+                        convalescent_session_count=0,
+                    )
+                )
+                return result
+
+            session.execute = execute  # type: ignore[method-assign]
+
+            @asynccontextmanager
+            async def cm() -> Any:
+                yield session
+
+            return cm()
+
+        monkeypatch.setattr(api_main.api_db, "get_session_factory", lambda: factory)
+
+        plan_calls: list[Any] = []
+
+        def fake_plan(*args: Any, **kwargs: Any) -> Any:
+            plan_calls.append(kwargs)
+            raise AssertionError("plan_invoke_kill_switch should NOT be called when already halted")
+
+        from services.risk import state_machine as sm
+
+        monkeypatch.setattr(sm, "plan_invoke_kill_switch", fake_plan)
+
+        hook = api_main._build_state_transition_hook(_settings())
+        assert hook is not None
+
+        ctx = ReconciliationKillSwitchContext(
+            account_id=uuid4(),
+            env="paper",
+            actionable_break_count=1,
+            primary_audit_event_uuid=uuid4(),
+        )
+        # Should NOT raise; should NOT call plan_invoke_kill_switch.
+        await hook(ctx)
+        assert plan_calls == []
+
+    @pytest.mark.asyncio
+    async def test_no_risk_state_row_logs_and_returns(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If no current risk_state row exists, the hook logs a warning
+        + returns without crashing."""
+        from contextlib import asynccontextmanager
+        from unittest.mock import MagicMock
+        from uuid import uuid4
+
+        from services.api import main as api_main
+        from services.reconciliation.apply import ReconciliationKillSwitchContext
+
+        def factory() -> Any:
+            session = MagicMock()
+
+            async def execute(stmt: Any, params: Any = None) -> Any:
+                result = MagicMock()
+                result.fetchone = MagicMock(return_value=None)
+                return result
+
+            session.execute = execute  # type: ignore[method-assign]
+
+            @asynccontextmanager
+            async def cm() -> Any:
+                yield session
+
+            return cm()
+
+        monkeypatch.setattr(api_main.api_db, "get_session_factory", lambda: factory)
+
+        hook = api_main._build_state_transition_hook(_settings())
+        assert hook is not None
+
+        ctx = ReconciliationKillSwitchContext(
+            account_id=uuid4(),
+            env="paper",
+            actionable_break_count=1,
+            primary_audit_event_uuid=uuid4(),
+        )
+        # Should NOT raise.
+        await hook(ctx)
+
+    @pytest.mark.asyncio
+    async def test_normal_state_invokes_full_pipeline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """NORMAL → plan_invoke_kill_switch + apply_state_transition + SSE emit."""
+        from contextlib import asynccontextmanager
+        from unittest.mock import MagicMock
+        from uuid import uuid4
+
+        from services.api import main as api_main
+        from services.reconciliation.apply import ReconciliationKillSwitchContext
+
+        def factory() -> Any:
+            session = MagicMock()
+
+            async def execute(stmt: Any, params: Any = None) -> Any:
+                from types import SimpleNamespace as _NS
+
+                result = MagicMock()
+                result.fetchone = MagicMock(
+                    return_value=_NS(
+                        state="NORMAL",
+                        severity=None,
+                        convalescent_session_count=0,
+                    )
+                )
+                return result
+
+            session.execute = execute  # type: ignore[method-assign]
+
+            @asynccontextmanager
+            async def cm() -> Any:
+                yield session
+
+            return cm()
+
+        monkeypatch.setattr(api_main.api_db, "get_session_factory", lambda: factory)
+
+        # Mock plan_invoke_kill_switch to return a sentinel plan.
+        sentinel_plan = MagicMock(reason="recon_mismatch")
+        plan_calls: list[Any] = []
+
+        def fake_plan(*args: Any, **kwargs: Any) -> Any:
+            plan_calls.append(kwargs)
+            return sentinel_plan
+
+        from services.risk import state_machine as sm
+
+        monkeypatch.setattr(sm, "plan_invoke_kill_switch", fake_plan)
+
+        # Mock apply_state_transition.
+        applied_audit_uuid = uuid4()
+        applied_calls: list[Any] = []
+
+        async def fake_apply(*, plan: Any, db: Any, account_id: Any, env: Any, phase_at_emit: Any):
+            applied_calls.append(
+                {"plan": plan, "account_id": account_id, "env": env, "phase": phase_at_emit}
+            )
+            return MagicMock(
+                state_transition_audit_event_uuid=applied_audit_uuid,
+                new_state="HALT_NEW",
+                new_severity="routine",
+            )
+
+        from services.risk import dispatch as risk_dispatch
+
+        monkeypatch.setattr(risk_dispatch, "apply_state_transition", fake_apply)
+
+        # Mock SSE emit.
+        sse_calls: list[Any] = []
+
+        async def fake_emit(event_type: str, data: dict[str, Any]) -> int:
+            sse_calls.append((event_type, data))
+            return 99
+
+        monkeypatch.setattr(api_main.sse_multiplexer, "emit_sse", fake_emit)
+
+        hook = api_main._build_state_transition_hook(_settings())
+        assert hook is not None
+
+        triggering_uuid = uuid4()
+        ctx = ReconciliationKillSwitchContext(
+            account_id=uuid4(),
+            env="paper",
+            actionable_break_count=2,
+            primary_audit_event_uuid=triggering_uuid,
+        )
+        await hook(ctx)
+
+        # plan_invoke_kill_switch called with RECON_MISMATCH trigger.
+        assert len(plan_calls) == 1
+        from services.risk.state_machine import TransitionTrigger
+
+        assert plan_calls[0]["trigger"] == TransitionTrigger.RECON_MISMATCH
+        # apply_state_transition called.
+        assert len(applied_calls) == 1
+        # SSE emit happened.
+        assert len(sse_calls) == 1
+        assert sse_calls[0][0] == "risk_state"
+        sse_data = sse_calls[0][1]
+        assert sse_data["state"] == "HALT_NEW"
+        assert sse_data["severity"] == "routine"
+        assert sse_data["audit_event_uuid"] == str(applied_audit_uuid)
+        assert sse_data["triggered_by"] == "auto_halt_recon_mismatch"
+        assert sse_data["triggering_audit_event_uuid"] == str(triggering_uuid)
+
+    @pytest.mark.asyncio
+    async def test_apply_failure_swallowed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An apply_state_transition exception should NOT propagate —
+        the audit chain + alerts have already landed; the scheduler
+        should continue ticking. Operator sees the error in logs."""
+        from contextlib import asynccontextmanager
+        from unittest.mock import MagicMock
+        from uuid import uuid4
+
+        from services.api import main as api_main
+        from services.reconciliation.apply import ReconciliationKillSwitchContext
+
+        def factory() -> Any:
+            session = MagicMock()
+
+            async def execute(stmt: Any, params: Any = None) -> Any:
+                from types import SimpleNamespace as _NS
+
+                result = MagicMock()
+                result.fetchone = MagicMock(
+                    return_value=_NS(
+                        state="NORMAL",
+                        severity=None,
+                        convalescent_session_count=0,
+                    )
+                )
+                return result
+
+            session.execute = execute  # type: ignore[method-assign]
+
+            @asynccontextmanager
+            async def cm() -> Any:
+                yield session
+
+            return cm()
+
+        monkeypatch.setattr(api_main.api_db, "get_session_factory", lambda: factory)
+
+        from services.risk import dispatch as risk_dispatch
+        from services.risk import state_machine as sm
+
+        monkeypatch.setattr(sm, "plan_invoke_kill_switch", lambda **k: MagicMock(reason="x"))
+
+        async def boom(**kwargs: Any) -> None:
+            raise RuntimeError("DB unreachable")
+
+        monkeypatch.setattr(risk_dispatch, "apply_state_transition", boom)
+
+        hook = api_main._build_state_transition_hook(_settings())
+        assert hook is not None
+        # Must not raise.
+        await hook(
+            ReconciliationKillSwitchContext(
+                account_id=uuid4(),
+                env="paper",
+                actionable_break_count=1,
+                primary_audit_event_uuid=uuid4(),
+            )
+        )
+
+
 class TestEntrypointAlertDispatchMapping:
     """sops yaml → API_DISCORD_WEBHOOK_URL_* + API_RESEND_* mappings."""
 

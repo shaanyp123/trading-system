@@ -83,6 +83,7 @@ from services.audit.writer import Environment, PhaseAtEmit, append_audit_event
 from services.reconciliation.apply import (
     AlertDispatchHook,
     ReconciliationApplyResult,
+    StateTransitionHook,
     apply_reconciliation_plan,
 )
 from services.reconciliation.flex_query_fetcher import (
@@ -603,6 +604,7 @@ async def run_eod_cycle(
     session_factory: async_sessionmaker[Any],
     flex_client_factory: Callable[[], IbkrFlexQueryClient] | None = None,
     alert_dispatch_hook: AlertDispatchHook | None = None,
+    state_transition_hook: StateTransitionHook | None = None,
 ) -> ReconciliationApplyResult | None:
     """Execute one EOD reconciliation cycle end-to-end.
 
@@ -700,6 +702,7 @@ async def run_eod_cycle(
         env=config.env,
         phase_at_emit=config.phase_at_emit,
         alert_dispatch_hook=alert_dispatch_hook,
+        state_transition_hook=state_transition_hook,
     )
     duration_s = (datetime.now(tz=UTC) - started_at).total_seconds()
     log.info(
@@ -720,20 +723,26 @@ def make_cycle_callback(
     config: EodCycleConfig,
     session_factory: async_sessionmaker[Any],
     alert_dispatch_hook: AlertDispatchHook | None = None,
+    state_transition_hook: StateTransitionHook | None = None,
 ) -> CycleCallback:
     """Build the :class:`CycleCallback` the scheduler invokes per session day.
 
     The returned callable closes over ``config`` + ``session_factory`` +
-    (optional) ``alert_dispatch_hook`` so the scheduler doesn't need to
-    know about any of them. It signals to the scheduler by raising on
+    (optional) ``alert_dispatch_hook`` + (optional)
+    ``state_transition_hook`` so the scheduler doesn't need to know
+    about any of them. It signals to the scheduler by raising on
     terminal failure (which the scheduler catches + logs) or returning
     normally on success / soft-failure.
 
-    The api lifespan glue layer (Phase 1+ follow-up) constructs the
-    ``alert_dispatch_hook`` from sops-decrypted Discord webhook URLs +
-    Resend identity, then passes it here. Phase 1 day-1 boots without
-    the hook — actionable breaks land in audit + reconciliation_breaks
-    rows but no Discord push fires.
+    PR-J: when ``state_transition_hook`` is wired, the recon apply
+    orchestrator fires it whenever ``plan.should_invoke_kill_switch``
+    is True (an actionable break exists outside the grace window).
+    The hook is responsible for issuing the
+    NORMAL/CONVALESCENT → HALT_NEW transition (auto-halt).
+
+    The api lifespan glue layer constructs both hooks; Phase 1 day-1
+    boots without them — actionable breaks still land in audit +
+    reconciliation_breaks rows.
     """
 
     async def _cycle(session_date: date) -> None:
@@ -742,6 +751,7 @@ def make_cycle_callback(
             config=config,
             session_factory=session_factory,
             alert_dispatch_hook=alert_dispatch_hook,
+            state_transition_hook=state_transition_hook,
         )
 
     return _cycle
