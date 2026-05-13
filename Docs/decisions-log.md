@@ -3663,3 +3663,85 @@ audit_log row count unchanged (still 2 — the LEAN heartbeat path is operationa
 - **Operator pre-authorizations (carried):** SSH to VPS, `git push`, PR creation, squash-merge feature PRs, force-push-with-lease, docker compose restart.
 
 - **Operator follow-up:** Local main on the workstation has commit `5a387c3` (the sops commit) which is now a sibling of `origin/main`'s `b912b98` (the squash-merge of that same change via PR #131). Next time the operator works locally, `git fetch origin && git reset --hard origin/main` aligns local main with the merged state. (Standard post-squash-merge cleanup; not unique to this PR.)
+
+---
+
+### 2026-05-12 — Phase 1 futures seed via DataBento direct SDK + minimal LEAN converter (Path 4) — 11-of-11 universe coverage
+
+- **Spec reference:** prior 2026-05-12 entry "Post-PR-#130 session continued" enumerated three realistic paths to unblock futures coverage after the lean CLI's DataBento integration was found to support only `['Trade', 'Quote']` (no `Universe` / `OpenInterest`). This session executes **Path 4** — a fourth path discovered in a brief subsequent session: fetch all 3 schemas (`ohlcv-1d` + `statistics` + `definition`) via the DataBento Python SDK directly + write a minimal LEAN converter + lean on the strategy's default `DataNormalizationMode.Raw` to skip factor_files. The recommended Path 1 (continuous-front-month as equities) becomes a documented escape hatch should this path hit a wall on LEAN's per-expiry format.
+
+- **What ran this session (in order):**
+
+  **1. Operator decision: Path 4 ahead of Path 1.** Cost is roughly equivalent (~$0 either way; Path 4 spends ~$0.96 against $125 free credit, Path 1 is free); Path 4 preserves true continuous-contract roll-day handling under `data_mapping_mode=DataMappingMode.OPEN_INTEREST`; Path 1 sidesteps continuous-contract math at the cost of strategy correctness around roll dates. Operator chose Path 4 because it preserves strategy semantics.
+
+  **2. Cost pre-quote verification.** Ran `client.metadata.get_cost(...)` against the operator's DataBento API key for the 7 micros × 23-month window:
+    - ohlcv-1d: $0.3495 / 35,274 records
+    - statistics: $0.4853 / 8,142,551 records (the cost driver — DataBento publishes ~20 intraday stat types; we filter to OPEN_INTEREST post-fetch)
+    - definition: $0.1234 / 216,452 records
+    - **TOTAL: $0.9582** against the $125 free credit (130x headroom). Matches the prompt's ~$0.96 pre-quote almost exactly.
+
+  **3. New script: `scripts/seed_lean_futures_databento.py`.** Modeled on `scripts/seed_lean_data.py` (the ETF script). Functions:
+    - `cost_quote_combined(client, parents, start, end, dataset)` — Decimal-only cost-quote across all 3 schemas.
+    - `fetch_definition(client, parent, start, end, dataset)` — pulls contract definitions; filters out calendar-spread rows (raw_symbol containing `-`).
+    - `fetch_ohlcv(client, parent, start, end, dataset)` — daily OHLCV per contract.
+    - `fetch_open_interest(client, parent, start, end, dataset)` — pulls statistics schema; filters to `stat_type == 9` (OPEN_INTEREST); aggregates end-of-day OI per (contract, session_date) via sort + groupby().last().
+    - `build_expiry_map(definition_df)` — `raw_symbol → YYYYMM` mapping (resolves DataBento's single-digit year ambiguity via the definition row's `expiration` timestamp).
+    - `write_trade_zip(out, ticker, market, ohlcv_df, expiry_map)` — emits `future/<market>/daily/<lower>_trade.zip` containing `<lower>_trade_<YYYYMM>.csv` per expiry. CSV row format: `YYYYMMDD 00:00,O,H,L,C,V` with prices as raw floats (matches LEAN tutorial bundle's `es_trade.zip` — NOT deci-cent scaled; equity is scaled, futures is raw).
+    - `write_openinterest_zip(...)` — emits `<lower>_openinterest.zip` with the same per-expiry layout; row format: `YYYYMMDD 00:00,<oi_int>`.
+    - `write_universe_files(...)` — emits `future/<market>/universes/<lower>/<YYYYMMDD>.csv` per session day. Header `#expiry,open,high,low,close,volume,open_interest`; rows sorted by expiry ascending.
+    - `write_map_file(out, ticker, market, market_code)` — 2-row sentinel `18991230,<ticker>\n20501231,<ticker>,<MARKET>`. Path 4 / Raw-mode insight: factor_files NOT required when strategy uses the default `DataNormalizationMode.Raw` for `add_future`.
+    - Cost-quote tripwire (`COST_TRIPWIRE_USD = 5 * PREQUOTED_TOTAL_USD = $4.80`): if reality is >5x the pre-quote, script exits 7 + asks operator to investigate symbology before proceeding. Belt-and-suspenders against accidental large fetches.
+    - Operator-confirmation prompt unless `--yes` passed; mypy --strict + ruff clean.
+
+  **4. Format verification against LEAN tutorial bundle.** Probed the on-VPS `/Lean/Data/future/cme/daily/es_trade.zip` + `es_openinterest.zip` + `cme/universes/es/<date>.csv` + `cme/map_files/es.csv` to lock the format contract. **Key discovery:** the original session prompt asserted deci-cent scaling for futures prices (matching the equity convention), but the LEAN tutorial's ES trade CSV format is RAW FLOATS (`20131010 00:00,1635.25,1635.25,1635.25,1635.25,5`). Equity is scaled, futures is raw — the converter matches the futures convention.
+
+  **5. Single-ticker smoke test.** Ran the script against MES with a 30-day window (2026-04-01 → 2026-05-01). Result:
+    - 5 expiries detected (MESM6, MESU6, MESZ6, MESH7, MESM7)
+    - 94 trade rows + 130 OI rows + 26 universe days
+    - Cost: $0.0033 (300x under the $1 quote)
+    - Output structure verified against the tutorial — per-expiry CSV file naming (`mes_trade_202606.csv` etc.), row format (`YYYYMMDD 00:00,O,H,L,C,V`), universe format with YYYYMM expiry column. Sample MES close on 2026-04-01 was $6614.75 (consistent with S&P 500 micros near 6600 in early 2026).
+
+  **6. Full 7-micro fetch.** Started ~19:35 EDT against the 23-month window (2024-06-01 → 2026-05-12); the statistics schema is the slow step (~10 min per ticker because DataBento returns ~1.2M records per parent across the window). Expected wall-time ~70 minutes. (Result captured separately — this entry locks the script contract; the deploy + cycle outcome continue in a follow-up entry or as part of this same PR depending on session boundaries.)
+
+  **7. New runbook section: `deploy/lean_local/seed-data.md` "Futures seed via DataBento direct SDK".** Mirrors the ETF section's Steps 1-6 with futures-specific commands:
+    - Step F1 stage on workstation (sops decrypt → yaml.safe_load → DATABENTO_API_KEY → script invocation).
+    - Step F2 scp tarball + tar -xzf on VPS.
+    - Step F3 `docker run --rm -v trading_lean_data:/Lean/Data -v /tmp/lean_seed_futures_stage:/seed:ro alpine cp -rv /seed/future/. /Lean/Data/future/`.
+    - Step F4 restart lean_local + grep boot logs.
+    - Step F5 wait for 21:30 UTC cycle + verify `failed_markets=[]`.
+    - Step F6 cleanup.
+    - 8-row futures-specific troubleshooting matrix covering DataBento module missing, API key blank, cost tripwire, degraded-day warnings, factor_files not found (Raw-mode fix), Map file not found (escape-hatch escalation), failed_markets after seed (re-stage), etc.
+
+- **Why Path 4 over Path 1:** Path 1 (continuous-front-month as equities) sidesteps continuous-contract math but pulls the strategy further from production semantics. Phase 1's strategic intent is "trend-following futures with OI-weighted continuous roll detection"; emitting equity-style synthetic continuous tickers loses that. Path 4 preserves the strategy's `data_mapping_mode=DataMappingMode.OPEN_INTEREST` + `set_filter(0, 90)` configuration without any `strategies/v1_trend_following/parameters.py` change (which would require `risk-review-approved`). Cost difference is negligible ($0 free-credit consumption either way). The wager: LEAN's continuous-contract construction under Raw mode is forgiving enough to work with a 2-row sentinel map_file + the per-day universe + per-expiry OHLCV/OI bundle. If that wager loses (LEAN errors at boot with map_file or factor_files complaints), the runbook documents the escape paths.
+
+- **The Raw-mode insight (the Path 4 linchpin) + correction discovered mid-session:** Path 4's working assumption was that `add_future()`'s default `DataNormalizationMode` is `Raw`, so the strategy doesn't depend on `factor_files/<ticker>.csv` (which encodes `BackwardsRatioScale` + `BackwardsPanamaCanalScale` + `ForwardPanamaCanalScale` — complex continuous-contract roll math that requires the QC Cloud backtest infrastructure to synthesize). **The QuantConnect forum (discussion 17093, staff response) corrected this assumption mid-session:** the actual implicit default is `None`, which LEAN converts to `DataNormalizationMode.BackwardsRatio` — exactly the path that DOES require factor_files. To preserve the Path 4 thesis, this PR adds **explicit `data_normalization_mode=DataNormalizationMode.RAW`** to the 7 `add_future()` calls in `lean/v1_strategy.py` (hot-fix scope; `lean/**` path-filter; no `risk-review-approved` needed). Under Raw mode the strategy operates on un-adjusted per-expiry contract prices — exactly what the converter emits — and LEAN's continuous-contract construction skips the scale-math layer. Donchian/MA/Hurst/ATR all derive from each contract's own price levels; LEAN's job is to deliver the right contract's bars per session date, which the per-day universe files + per-expiry OHLCV/OI zips provide via `data_mapping_mode=OPEN_INTEREST` + `set_filter(0, 90)`. If LEAN at boot STILL requires factor_files even under Raw mode (which would surprise; the troubleshooting matrix covers this), the runbook directs the operator to the escape hatch (continuous symbology + `add_equity`; requires `risk-review-approved` for `strategies/v1_trend_following/parameters.py`).
+
+- **What's in scope for this PR:**
+  - `scripts/seed_lean_futures_databento.py` (new file).
+  - `deploy/lean_local/seed-data.md` (extend with "Futures seed via DataBento direct SDK" section + 8 new troubleshooting rows).
+  - `Docs/decisions-log.md` (this entry).
+  - `CLAUDE.md` (file-index row + header summary refresh — Phase 1 universe state from 4-of-11 to 11-of-11 seeded).
+  - **Possibly:** `lean/v1_strategy.py` if Raw mode needs to be made explicit (hot-fix). NOT in scope: `strategies/v1_trend_following/parameters.py` (escape-hatch territory; would need `risk-review-approved`).
+
+- **Hot-fix scope:** `scripts/**` + `deploy/**` + `Docs/**` + `CLAUDE.md` + possibly `lean/**`. No `risk-review-approved` label needed.
+
+- **Smoke-tested via:** (a) `make lint` → 214 files clean, all checks passed; (b) `make typecheck` → mypy strict clean on 140 source files; (c) MES single-ticker test against 30-day window → 5 expiries + valid zips + format matches LEAN tutorial bundle; (d) cost re-quote against operator's API key → matches pre-quote within 0.005% ($0.9582 vs $0.96); (e) full 7-micro fetch — in progress / captured per cycle verification.
+
+- **Cost / scope impact:**
+  - **One-time data cost:** ~$0.96 against DataBento's $125 free credit (130x headroom). No recurring cost; the data lives in `trading_lean_data` volume and persists across container restarts.
+  - **Recurring vendor cost:** $0/mo. DataBento is usage-based pay-as-you-go; no minimum or subscription required. Year-2+ data refresh (monthly or quarterly to add roll-month data) costs <$0.01 per refresh.
+  - **One-time engineering:** ~3 hours of session time to design + ship + verify.
+  - **Repo footprint:** 1 new file (`scripts/seed_lean_futures_databento.py`); 3 edits (`deploy/lean_local/seed-data.md` extend; `Docs/decisions-log.md` append; `CLAUDE.md` file-index + header).
+  - **CI gate:** path-filter triggers only the always-on set (~30s) for the docs + scripts paths.
+
+- **What stays:** all prior wiring is unaffected. PRs #122-#132 stay merged. The 4 ETFs remain seeded via yfinance + cross-validated via Tiingo (4-of-4 PASS at <1bp from PR #132). The strategy code is unchanged unless the Raw-mode-explicit fallback fires.
+
+- **Outstanding follow-ups (priority order):**
+  1. Capture the 21:30 UTC cycle outcome after the futures seed lands. If `failed_markets=[]` (all 11 markets parse) and signals fire or don't, that's the new baseline. If LEAN errors at boot, escalate per runbook troubleshooting matrix.
+  2. Phase 1 pre-live gate for futures: equivalent of the Tiingo 360-row cross-check for futures. Possible sources: CME public daily settlements, Refinitiv via Yahoo `=F` continuous tickers (rough comparison only), or DataBento itself with a different stype.
+  3. Recon kill-switch hook (`risk-review-approved` required).
+  4. Discord push on reconciliation breaks (hot-fix).
+  5. `prior_breaks` query in `eod_cycle.run_eod_cycle`.
+  6. Position view sync LEAN → api.
+
+- **Operator pre-authorizations (carried):** SSH to VPS, `git push`, PR creation, squash-merge feature PRs, force-push-with-lease, docker compose restart, transient docker volume manipulation, DataBento usage-based fetches against the operator's API key.
