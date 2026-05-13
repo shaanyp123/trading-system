@@ -39,6 +39,7 @@ from services.discord_bot.api_client import (
     ApiClientHTTPError,
     HealthResponse,
     PositionsResponse,
+    SignalApproveResponse,
 )
 
 # ---------------------------------------------------------------------------
@@ -367,11 +368,159 @@ def build_status_embed(
     return embed
 
 
+# ---------------------------------------------------------------------------
+# /approve — confirm + post-confirm embeds
+# ---------------------------------------------------------------------------
+
+
+def build_approve_invalid_uuid_embed(
+    *,
+    raw_signal_id: str,
+) -> discord.Embed:
+    """Operator typed something that's not a UUID — render an ephemeral hint.
+
+    Truncates ``raw_signal_id`` to 100 chars in the title to avoid
+    embed-title-too-long crashes if the operator pastes garbage.
+    """
+    truncated = raw_signal_id if len(raw_signal_id) <= 100 else raw_signal_id[:97] + "..."
+    return discord.Embed(
+        title="❌ Invalid signal_id",
+        description=(
+            f"`{truncated}` doesn't look like a UUID.\n\n"
+            "Copy the signal_id from the `#signals` channel embed footer "
+            "(format: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`)."
+        ),
+        color=EMBED_COLOR_WARNING,
+    )
+
+
+def build_approve_confirm_embed(
+    *,
+    signal_id: str,
+    environment: str,
+) -> discord.Embed:
+    """Build the confirm-before-approve embed.
+
+    Mirror of :func:`build_halt_confirm_embed` shape: WARNING amber +
+    explanation of side-effects + the trigger field. The
+    ``ApproveConfirmView`` (registered alongside) attaches the
+    ✓ Approve / ✗ Cancel buttons.
+
+    Phase 1+ enhancement: pre-fetch the signal via
+    ``GET /api/signals?id_prefix=...`` to display market + direction +
+    target_contracts in the confirm body so the operator sees what they're
+    about to approve. Today the bot only has the UUID (the operator
+    copied it from `#signals`); deferred to keep PR C scope tight.
+    """
+    embed = discord.Embed(
+        title="🟢 Confirm signal approval",
+        description=(
+            "Approving this signal will:\n"
+            "1. UPDATE the signal row to `status='approved'` + write a "
+            "`signal_approved` audit event.\n"
+            "2. Hand off to the `OrderPlacementWorker` which forwards to "
+            "IBKR within ~5s.\n\n"
+            "RESUME / cancel via `/system` → kill-switch if you need to "
+            "halt before the order fires."
+        ),
+        color=EMBED_COLOR_WARNING,
+    )
+    embed.add_field(
+        name="Signal ID",
+        value=f"`{signal_id}`",
+        inline=False,
+    )
+    embed.set_footer(text=f"trading-system bot · {environment} · click ✓ to approve or ✗ to cancel")
+    return embed
+
+
+def build_approve_success_embed(
+    *,
+    environment: str,
+    response: SignalApproveResponse,
+) -> discord.Embed:
+    """Post-confirm success embed when the api accepted the approval.
+
+    OK green color (the action succeeded; the operator's followup is
+    "watch `#fills` for the broker confirmation"). Surfaces the
+    audit_event_uuid + audit_sequence_no for cross-reference with the
+    audit log + system page.
+    """
+    embed = discord.Embed(
+        title=f"✅ Signal approved — {response.signal_id[:8]}",
+        description=(
+            f"Status: `{response.new_status}`\n"
+            f"Audit: `{response.audit_event_uuid}` (seq #{response.audit_sequence_no})\n\n"
+            "OrderPlacementWorker will forward to IBKR within ~5s. "
+            "Watch `#fills` for the broker confirmation embed."
+        ),
+        color=EMBED_COLOR_OK,
+    )
+    embed.set_footer(text=f"trading-system bot · {environment}")
+    return embed
+
+
+def build_approve_error_embed(
+    *,
+    environment: str,
+    error: ApiClientHTTPError,
+) -> discord.Embed:
+    """Post-confirm error embed when the api rejected the approval.
+
+    Special-cases the two operator-actionable error codes per the api's
+    ``services.api.routes.signals.approve_signal`` mapping:
+
+      * 404 ``SIGNAL_NOT_FOUND`` — operator typed/pasted a stale UUID.
+      * 409 ``SIGNAL_NOT_PENDING`` — fast-double-click race; the signal
+        was already approved/rejected by another path (web, prior /approve).
+
+    Other errors (auth, 5xx, validation) render the canonical envelope
+    via :func:`format_kill_switch_invoke_failure` (the same helper used
+    for halt errors — the format is generic).
+    """
+    if error.error_code == "SIGNAL_NOT_FOUND":
+        embed = discord.Embed(
+            title="❌ Signal not found",
+            description=(
+                "The api doesn't have a signal with that ID. The signal_id "
+                "may have been mistyped, or the signal predates the "
+                "current accounts row.\n\n"
+                "Check `#signals` for the latest pending signals + their "
+                "embed-footer UUIDs."
+            ),
+            color=EMBED_COLOR_WARNING,
+        )
+    elif error.error_code == "SIGNAL_NOT_PENDING":
+        embed = discord.Embed(
+            title="⚠️ Signal not pending",
+            description=(
+                "The signal already left the `pending` state — likely "
+                "approved/rejected by another path (web `/signals` page, "
+                "or a prior `/approve`). The api row is correct as-is.\n\n"
+                "Check the audit log entry on the system page if you "
+                "need to confirm who acted."
+            ),
+            color=EMBED_COLOR_WARNING,
+        )
+    else:
+        embed = discord.Embed(
+            title=f"❌ Approve failed — {error.error_code}",
+            description=format_kill_switch_invoke_failure(error),
+            color=EMBED_COLOR_CRITICAL,
+        )
+    embed.set_footer(text=f"trading-system bot · {environment}")
+    return embed
+
+
 __all__ = [
     "EMBED_COLOR_CRITICAL",
     "EMBED_COLOR_INFO",
     "EMBED_COLOR_OK",
     "EMBED_COLOR_WARNING",
+    "build_approve_confirm_embed",
+    "build_approve_error_embed",
+    "build_approve_invalid_uuid_embed",
+    "build_approve_success_embed",
     "build_halt_confirm_embed",
     "build_halt_invoke_error_embed",
     "build_halt_invoke_success_embed",

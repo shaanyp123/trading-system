@@ -59,6 +59,8 @@ from services.discord_bot.api_client import (
     KillSwitchInvokeResponse,
     PositionRow,
     PositionsResponse,
+    SignalApprovePayload,
+    SignalApproveResponse,
 )
 from services.discord_bot.config import BotSettings
 from services.discord_bot.embeds import (
@@ -66,6 +68,10 @@ from services.discord_bot.embeds import (
     EMBED_COLOR_INFO,
     EMBED_COLOR_OK,
     EMBED_COLOR_WARNING,
+    build_approve_confirm_embed,
+    build_approve_error_embed,
+    build_approve_invalid_uuid_embed,
+    build_approve_success_embed,
     build_halt_confirm_embed,
     build_halt_invoke_error_embed,
     build_halt_invoke_success_embed,
@@ -89,6 +95,12 @@ __all__ = [
     "KillSwitchInvokeResponse",
     "PositionRow",
     "PositionsResponse",
+    "SignalApprovePayload",
+    "SignalApproveResponse",
+    "build_approve_confirm_embed",
+    "build_approve_error_embed",
+    "build_approve_invalid_uuid_embed",
+    "build_approve_success_embed",
     "build_halt_confirm_embed",
     "build_halt_invoke_error_embed",
     "build_halt_invoke_success_embed",

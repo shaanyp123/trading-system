@@ -220,6 +220,71 @@ Discord: type `/positions` → bot responds with positions embed (empty
 or mock data)") + extra coverage of the `/halt` confirm flow + the
 501-stub error embed UX.
 
+### `/approve <signal_id>` — confirm-button flow
+
+Operator workflow: when a signal lands in `#signals`, copy the signal_id
+from the embed footer (formatted UUID with hyphens), then run `/approve <id>`
+in any channel.
+
+#### Bad-input verification (no api call)
+
+1. Type `/approve not-a-uuid` and hit Enter.
+2. Bot replies ephemerally with:
+   ```
+   ❌ Invalid signal_id
+   `not-a-uuid` doesn't look like a UUID.
+   Copy the signal_id from the #signals channel embed footer
+   (format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).
+   ```
+3. No api round-trip; verify via api logs:
+   ```bash
+   docker compose --env-file deploy/.env logs api 2>&1 | grep "POST /api/signals" | tail -3
+   # No new line for the bad-UUID attempt.
+   ```
+
+#### Stale-UUID verification (api round-trip → SIGNAL_NOT_FOUND)
+
+1. Type `/approve 00000000-0000-0000-0000-000000000000` and hit Enter.
+2. Bot replies with ephemeral confirm embed + ✓ Approve / ✗ Cancel.
+3. Click **✓ Approve**.
+4. Bot edits the message to:
+   ```
+   ❌ Signal not found
+   The api doesn't have a signal with that ID. ...
+   ```
+
+#### Happy-path verification (requires a real pending signal)
+
+If LEAN has emitted a signal and `#signals` shows an embed:
+
+1. Copy the signal_id from the `#signals` embed footer.
+2. Type `/approve <signal_id>` and hit Enter.
+3. Bot replies with confirm embed; click **✓ Approve**.
+4. Bot edits to:
+   ```
+   ✅ Signal approved — <first-8-chars>
+   Status: approved
+   Audit: <audit_event_uuid> (seq #<N>)
+   OrderPlacementWorker will forward to IBKR within ~5s. Watch #fills
+   for the broker confirmation embed.
+   ```
+5. Within ~5s, `#fills` channel should receive a fill embed (assuming
+   IBKR accepts the order).
+6. Verify api log:
+   ```bash
+   docker compose --env-file deploy/.env logs api 2>&1 | grep "signal_approve_processed" | tail -1
+   ```
+
+#### Cancel-path verification
+
+1. Type `/approve <any-real-pending-signal-id>` and hit Enter.
+2. Click **✗ Cancel**.
+3. Bot edits to "Approve cancelled. System unchanged. No api call was made."
+4. Verify the signal stays `status='pending'`:
+   ```sql
+   SELECT id, status FROM signals WHERE id = '<signal_id>';
+   ```
+
 ---
 
 ## Step 5 — Cleanup
