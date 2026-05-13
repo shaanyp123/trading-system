@@ -3872,3 +3872,76 @@ audit_log row count unchanged (still 2 — the LEAN heartbeat path is operationa
   - Recon scheduler armed at 22:30 UTC daily; current state = waiting for next cycle (NAV section enable will unblock).
   - First post-seed SIGNAL cycle: tomorrow 2026-05-13 21:30 UTC. Completely independent of FlexQuery — runs on the LEAN local container + seeded data + strategy code. Signal approval flow (web `/signals` page → `OrderPlacementWorker` → IBKR paper) verified live + ready.
 - **Operator pre-authorizations (unchanged):** SSH to VPS, `git push`, PR creation, squash-merge, docker compose restart, sops edit, branch cleanup.
+
+---
+
+### 2026-05-13 — PR #138 close-out follow-ups #1, #2, #4, #5 — three independent PRs ship the post-pivot recon-alerting + Discord-approval pipeline end-to-end
+
+- **Spec reference:**
+  - `Docs/backend-spec.md` §2.6 (reconciliation tolerances + grace + T+1) + §3.27 (alert_category enum) + §2.10.1 (audit-first ordering) + §6.6 (bot ↔ api auth) + §1.6 (Discord channels per severity).
+  - `Docs/claude-dev-guide.md` §1.5 LOCKED (Resend = email provider; Discord = primary; Argon2id; etc.) + §11 [A02] (forbidden-whitelist for `services/reconciliation/**`) + §2.3 (hot-fix whitelist for `services/api/**` + `services/discord_bot/**`).
+  - PR #138 (FlexQuery debug close-out) entry above lists outstanding follow-ups #1–#5; this entry closes #1 + #2 + #4 + #5 (operator deferred #3, the api/entrypoint.py float-secret guard).
+- **Spec said:**
+  - PR #135 added `AlertDescriptor` + `alert_dispatch_hook` to recon, but the closure constructor was deferred. Severity was hard-coded `"P2"` (so all breaks → `#alerts` only, no P0 escalation).
+  - PR #135 left the planner's `prior_breaks=()` placeholder in `eod_cycle.run_eod_cycle`; T+1 grace classification couldn't fire until a real query landed.
+  - PR #71 (Day 23) shipped `/positions` + `/halt` + `/status` slash commands but no signal-approval surface. Signal approval was web-only via the Day 22 `apps/web/src/app/signals/page.tsx`; operators had to open the browser to act on `#signals` embeds.
+- **Actual decision (this entry):** ship the four follow-ups as **three independent PRs** so each can land cleanly without forcing a single mega-PR review:
+
+  **PR A — `feat(reconciliation): magnitude-based severity classifier + T+1 prior-breaks query`** (closes #4 + #5, A02 binding, `risk-review-approved` required).
+  - `services/reconciliation/recon.py` — adds `_classify_severity(brk) -> AlertSeverityLiteral` + two locked constants:
+    - `CASH_P0_THRESHOLD_USD = Decimal("1000.00")` (cash divergence > $1000 → P0 → `#alerts` + `#critical` + Resend email)
+    - `POSITION_P0_DELTA_CONTRACTS = Decimal("5")` (position divergence > 5 contracts (abs delta) → P0)
+    - Else → `DEFAULT_RECONCILIATION_ALERT_SEVERITY` ("P2" → `#alerts` only)
+    - Strict `>` comparison so an exact-threshold delta stays P2 (avoids float-rounding surprises even though we're on Decimal).
+  - `services/reconciliation/eod_cycle.py` — adds `DEFAULT_PRIOR_BREAKS_WINDOW_HOURS = 36` constant + `_METRIC_BY_STRING` reverse-map + `fetch_prior_breaks_within_grace_window(session_factory, *, account_id, window_hours)` helper. Replaces the `prior_breaks=()` placeholder in `run_eod_cycle` with a real SELECT against `reconciliation_breaks WHERE resolved_at_utc IS NULL AND detected_at_utc > NOW() - INTERVAL '36 hour'`.
+  - **Why the query lives in `eod_cycle.py` and not `services/api/repos/phase1.py`:** keeps `services/reconciliation/**` self-contained without an `api/repos` cross-dependency. Same shape as the existing `build_backend_view` helper.
+  - 22 new tests: 13 in `TestSeverityClassifier` (both metrics, both signs, strict-`>` boundary at exact threshold) + 9 in `TestPriorBreaksLookup` (empty path, both metric mappings, decimal precision, unknown-metric skip, end-to-end through `run_eod_cycle` proving grace classification drops the duplicate alert).
+
+  **PR B — `feat(api): construct alert_dispatch_hook closure for Discord push on recon breaks`** (closes #2, hot-fix whitelist).
+  - `services/api/config.py` — adds 5 new SecretStr/str fields: `discord_webhook_url_alerts` + `discord_webhook_url_critical` + `resend_api_key` + `resend_from_address` + `resend_to_address`.
+  - `services/api/entrypoint.py` — extends sops yaml → env-var mapping for `discord.webhook_urls.{alerts,critical}` + `resend.{api_key,from_address,to_address}`. Same sops fields `webhook_pusher` already consumes (per `deploy/webhook_pusher/README.md`); the api now reads them too.
+  - `services/api/main.py` — adds `_build_alert_dispatch_hook(settings) -> AlertDispatchHook | None` + wires the result into `_start_reconciliation_scheduler`'s `make_cycle_callback` call. Returns None when `discord.webhook_urls.alerts` is unset (logs `alert_dispatch_hook_skipped_no_webhook_url`); recon cycle still runs end-to-end + alerts log apply-layer WARNING.
+  - The closure: opens its own session_factory()-session for the `INSERT INTO alerts (...) RETURNING id`, then a per-call `httpx.AsyncClient` + fresh session for the `dispatch_alert(...)` invocation. Daily cadence makes per-call client setup OK; lifecycle simplification is worth more than connection pooling.
+  - **Closure deferral pattern:** `session_factory = api_db.get_session_factory()` resolves INSIDE the closure (not at construction). This lets a unit test build the hook without `init_pool()` running; the closure itself only fires at scheduler-fire time when the pool is up.
+  - `deploy/reconciliation/README.md` — adds "Discord push on recon breaks" section with sops-fields table + 3 wiring states (none/partial/full) + manual verification via api boot logs + #alerts channel observation.
+  - 8 new tests: `TestBuildAlertDispatchHook` (5) + `TestAlertDispatchHookFired` (2; via fake session_factory + monkeypatched `dispatch_alert`) + `TestEntrypointAlertDispatchMapping` (3 incl. defensive missing-block test).
+
+  **PR C — `feat(discord_bot): add /approve <signal_id> slash command`** (closes #1, hot-fix whitelist).
+  - `services/discord_bot/api_client.py` — adds `SignalApprovePayload` + `SignalApproveResponse` Pydantic models + `approve_signal(signal_id, *, override_size=None)` async method.
+  - `services/discord_bot/embeds.py` — 4 new pure-function builders: `build_approve_invalid_uuid_embed` (truncates long garbage to keep title <256), `build_approve_confirm_embed`, `build_approve_success_embed`, `build_approve_error_embed` (special-cases `SIGNAL_NOT_FOUND` + `SIGNAL_NOT_PENDING` with operator-actionable hints; otherwise renders canonical envelope).
+  - `services/discord_bot/commands/approve.py` (new) — `register_approve(tree, *, api_client, environment, guild)` + `ApproveConfirmView`. Mirror of `HaltConfirmView` shape (60s timeout, invoker-only check, consumed-once flag). ✓ button uses `ButtonStyle.success` (green) for visual contrast with halt's `danger` red — operator's at-a-glance action class is unambiguous.
+  - `services/discord_bot/main.py` + `commands/__init__.py` + `__init__.py` — wires `register_approve` into `TradingBotClient._register_commands` alongside positions/halt/status. Boot logs `discord_commands_synced command_count=4 commands=['approve', 'halt', 'positions', 'status']`.
+  - `deploy/discord_bot/README.md` — adds "/approve <signal_id> — confirm-button flow" section under Step 4 Live Smoke. Covers 4 verification paths (bad-input no api round-trip + stale-UUID round-trip → SIGNAL_NOT_FOUND embed + happy path → audit + #fills + cancel).
+  - **Scope intentionally narrow — only `/approve`:** /reject + /defer require a `DecisionDiaryEntry` (10-2000 char reasoning + 5-value enum tag); multi-line input in slash UX is awkward + the web `DecisionDiaryModal` is the right surface. Phase 1+ can add /reject + /defer with modal-style interactions if operator demand emerges. No `--override-size` either.
+  - 25 new tests: 11 in command tests (4 input validation + 7 confirm view) + 14 in embed tests (3+4+4+3 across 4 builders).
+
+- **Rationale:**
+  - **Three PRs vs one** — A02 forces a `risk-review-approved` label on PR A (recon scope). PR B + PR C are hot-fix whitelist (api + discord_bot scope, not on the forbidden list). Bundling all three would force the higher review bar on the api + discord_bot files unnecessarily; splitting keeps each PR's review surface tight to its own discipline.
+  - **PR ordering matters for live verification but NOT for merge:** the operator can squash-merge any in any order. PR A's classifier feeds the severity values consumed by PR B's closure; if PR B merges first the closure receives "P2" for everything (PR #135's behavior — works correctly, just no P0 escalation until PR A lands). Recommended: A → B → C so the operator sees the full P0 path during smoke.
+  - **Cash threshold $1000 + position threshold 5 contracts:** operator pre-authorized these in PR #138 close-out follow-up list. Conservative defaults — operator can tune after the first real P0 fires. Documented inline in `recon.py` with the trade-off note (5 contracts on /MES = ~$130k notional; on /MBT = ~$35k — asymmetric but unavoidable until contracts.contract_multiplier is plumbed into the planner; Phase 1+ enhancement noted).
+  - **36h prior-breaks window:** T+1 (24h) + half-day buffer (12h). Friday-detected breaks don't get weekend coverage through Monday's recon (~72h elapsed); documented as a known limitation. Operator monitors via the system page. Phase 2 follow-up: switch to business-days math or extend to 72h unconditionally if a real Friday-break trips this.
+  - **Discord /approve scope:** operator-requested in PR #138 close-out. Scope = approve-only by deliberate design — adding /reject + /defer would require modal-style discord.py interactions which are heavyweight for the current single-operator volume. Web `DecisionDiaryModal` (PR #115) is the right surface for operations that need text input.
+- **Cost / scope impact:**
+  - Engineering: ~5h end-to-end across all three PRs + this entry + CLAUDE.md updates.
+  - Runtime: zero per-cycle additional cost (severity classifier is constant-time per break; prior_breaks query is a single SELECT on an indexed table; alert dispatch hook only fires on actual breaks; Discord /approve is on-demand operator action).
+  - Discord cost: zero additional (P0 escalation routes to existing channels + Resend free tier).
+  - Sops material: zero new fields. The 5 new api config fields read sops keys that `webhook_pusher` already consumes — operator sops state is unchanged.
+  - Test coverage: +55 tests across 3 PRs. Total project test count: 1240 baseline → 1295 after all three merge.
+- **Outstanding follow-ups (not closed by this session):**
+  1. **#3 from prior session (operator deferred):** `services/api/entrypoint.py` defensive guard against float-typed secrets (the YAML numeric-coercion footgun documented in PR #138). Operator chose to ship the three above first; can add as a small follow-up PR later. Today's gotcha is documented in the decisions-log so any future operator hitting it has a paper trail.
+  2. **NAV-relative cash threshold:** today's $1000 absolute may prove too noisy at scale. Switch to bp-of-NAV (e.g., 5bp of `equity_baseline`) once the absolute threshold proves operationally insufficient. One-line change in `_classify_severity`.
+  3. **Notional-based position threshold:** today's 5-contract symmetric across markets means /MES gets ~$130k notional sensitivity but /MBT gets ~$35k. Switch to `contract_multiplier`-based notional once the planner has access to the contracts table (deferred until needed).
+  4. **Friday-weekend grace window:** if a real Friday-detected break trips the 36h limit, switch to business-days math.
+  5. **Auto kill-switch on actionable break:** the existing `state_transition_hook` seam in `apply.py` is wired for None today (operator manually halts via `/system` page or `/halt` Discord command). Auto-halt lands when the risk-dispatch state-transition contract is exercised end-to-end.
+  6. **/reject + /defer Discord commands:** if operator demand emerges (Phase 1+ enhancement). Requires modal-style discord.py interactions for the DecisionDiaryEntry text input.
+- **VPS state at session close:**
+  - origin/main HEAD: `f18192d` (PR #138 merged; pre-this-session-PRs).
+  - All three PRs (A/B/C) opened + ready for operator review + merge:
+    - PR #139 — recon severity + prior_breaks (`risk-review-approved` required)
+    - PR #140 — api alert_dispatch_hook closure (hot-fix)
+    - PR #141 — Discord /approve (hot-fix)
+  - All Python `make ci` (lint + dep-drift + typecheck + pytest) green locally on each branch.
+  - Frontend-test step skipped locally (no node_modules); GitHub Actions handles `pnpm install` in CI.
+  - Recon scheduler armed at 22:30 UTC daily, still failing FlexQuery (operator NAV-section enable from PR #138's outstanding follow-up #1 still pending). Independent of this session's work.
+  - First post-seed signal cycle was scheduled for 2026-05-13 21:30 UTC; this session ran ahead of that and didn't observe its outcome. Operator can verify post-cycle.
+- **Operator pre-authorizations (unchanged):** SSH to VPS, `git push`, PR creation, squash-merge, docker compose restart, sops edit, branch cleanup, `risk-review-approved` label on PR #139.
