@@ -294,6 +294,35 @@ def _build_worker_with_signal_lookup(*, signal_id: UUID) -> tuple[OrderPlacement
     return worker, session
 
 
+def _stub_process_fill_event_returning(
+    *,
+    signal_id: UUID,
+    new_order_status: str = "filled",
+) -> AsyncMock:
+    """Build an AsyncMock that stands in for ``process_fill_event``.
+
+    PR-G integration: ``_on_order_status`` now delegates to
+    ``services.risk.fill_processor.process_fill_event`` instead of doing
+    its own SELECT + SSE emit. The existing TestOnOrderStatusEmit suite
+    asserts on the SSE shape, so we monkeypatch the facade to return a
+    FillApplyResult containing the test's signal_id; the worker reads
+    that + emits the same fill envelope.
+    """
+    from services.risk.fill_processor import FillApplyResult
+
+    result = FillApplyResult(
+        audit_event_uuids=(uuid4(),),
+        signal_id=signal_id,
+        account_id=uuid4(),
+        fill_id=uuid4(),
+        position_id=uuid4(),
+        trade_id=uuid4(),
+        balance_id=uuid4(),
+        new_order_status=new_order_status,  # type: ignore[arg-type]
+    )
+    return AsyncMock(return_value=result)
+
+
 class TestOnOrderStatusEmit:
     """Verify _on_order_status emits fill SSE only on terminal filled status."""
 
@@ -313,6 +342,10 @@ class TestOnOrderStatusEmit:
         worker, _ = _build_worker_with_signal_lookup(signal_id=signal_id)
         emit = AsyncMock(return_value=42)
         monkeypatch.setattr("services.api.sse.emit_sse", emit)
+        monkeypatch.setattr(
+            "services.risk.fill_processor.process_fill_event",
+            _stub_process_fill_event_returning(signal_id=signal_id),
+        )
         await worker._on_order_status(
             _build_status_update(
                 status="filled",
@@ -338,11 +371,25 @@ class TestOnOrderStatusEmit:
         assert payload["commission_usd"] == "2.50"
         assert payload["environment"] == "paper"
         assert payload["filled_at_utc"].endswith("+00:00")
+        # PR-G additions: the SSE envelope now carries the row PKs +
+        # audit_event_uuid so the consumer can deep-link without an
+        # extra DB roundtrip.
+        assert "fill_id" in payload
+        assert "position_id" in payload
+        assert "trade_id" in payload
+        assert "balance_id" in payload
+        assert payload["new_order_status"] == "filled"
+        assert payload["audit_event_uuid"] is not None
 
     async def test_filled_no_avg_price_emits_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        worker, _ = _build_worker_with_signal_lookup(signal_id=uuid4())
+        signal_id = uuid4()
+        worker, _ = _build_worker_with_signal_lookup(signal_id=signal_id)
         emit = AsyncMock(return_value=1)
         monkeypatch.setattr("services.api.sse.emit_sse", emit)
+        monkeypatch.setattr(
+            "services.risk.fill_processor.process_fill_event",
+            _stub_process_fill_event_returning(signal_id=signal_id),
+        )
         await worker._on_order_status(_build_status_update(status="filled", fill_price=None))
         _, payload = emit.await_args.args  # type: ignore[union-attr]
         assert payload["fill_price"] == "0"
@@ -350,9 +397,14 @@ class TestOnOrderStatusEmit:
     async def test_duplicate_filled_event_deduped_in_process(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        worker, _ = _build_worker_with_signal_lookup(signal_id=uuid4())
+        signal_id = uuid4()
+        worker, _ = _build_worker_with_signal_lookup(signal_id=signal_id)
         emit = AsyncMock(return_value=1)
         monkeypatch.setattr("services.api.sse.emit_sse", emit)
+        monkeypatch.setattr(
+            "services.risk.fill_processor.process_fill_event",
+            _stub_process_fill_event_returning(signal_id=signal_id),
+        )
         u = _build_status_update(status="filled", broker_order_id=9999)
         await worker._on_order_status(u)
         await worker._on_order_status(u)
@@ -381,15 +433,33 @@ class TestOnOrderStatusEmit:
         )
         emit = AsyncMock()
         monkeypatch.setattr("services.api.sse.emit_sse", emit)
+        # process_fill_event returns None when fetch_fill_context yields
+        # None (unknown client_order_id); the worker's branch logs at
+        # WARNING + skips the emit. Stub returning None mirrors that
+        # contract without needing to fake the inner DB queries.
+        monkeypatch.setattr(
+            "services.risk.fill_processor.process_fill_event",
+            AsyncMock(return_value=None),
+        )
         await worker._on_order_status(_build_status_update(status="filled"))
         emit.assert_not_called()
 
     async def test_emit_sse_exception_swallowed(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        worker, _ = _build_worker_with_signal_lookup(signal_id=uuid4())
+        signal_id = uuid4()
+        worker, _ = _build_worker_with_signal_lookup(signal_id=signal_id)
         emit = AsyncMock(side_effect=RuntimeError("multiplexer down"))
         monkeypatch.setattr("services.api.sse.emit_sse", emit)
+        monkeypatch.setattr(
+            "services.risk.fill_processor.process_fill_event",
+            _stub_process_fill_event_returning(signal_id=signal_id),
+        )
         # Must not raise — the broker connection keeps flowing on emit failure.
         await worker._on_order_status(_build_status_update(status="filled"))
-        # Not added to the dedupe set on failed emit (so a retry on the
-        # next event still attempts).
-        assert worker._emitted_fill_order_ids == set()
+        # PR-G change: the audit + tables are durable on SSE failure, so
+        # we DO add to the dedupe set (a re-fired Filled wouldn't write
+        # a second fills row anyway thanks to UNIQUE(broker_fill_id, created_at),
+        # but the dedupe set is the cheap fast path). Pre-PR-G the
+        # dedupe set was deliberately NOT updated; post-PR-G it IS.
+        assert worker._emitted_fill_order_ids == {
+            _build_status_update(status="filled").broker_order_id
+        }
