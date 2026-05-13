@@ -43,6 +43,56 @@ def _load_secrets(path: Path) -> dict[str, Any]:
     return loaded or {}
 
 
+def _find_float_secret_paths(node: Any, *, path: tuple[str, ...] = ()) -> list[str]:
+    """Walk a sops-decrypted dict tree; return dotted paths of any float leaves.
+
+    Catches the YAML numeric-coercion gotcha documented in
+    ``Docs/decisions-log.md`` 2026-05-12 (late) — IBKR's 24-digit FlexQuery
+    token, when stored unquoted in sops yaml, round-trips through sops's
+    internal float-aware writer as ``"1.527484903607521e+23"`` (scientific
+    notation = float64 approximation; precision-loss silently mangles the
+    token). The float→str coercion on next `sops -d` read produces a
+    Python ``float`` where the api expected a ``str``.
+
+    Fix: catch floats in secret context at boot, exit with operator-readable
+    hint pointing at the quote-the-value fix + the decisions-log entry.
+
+    A05-adjacent: money values are Decimal, but secrets are strings. The
+    spec doesn't enumerate "no float secrets" because all canonical secret
+    fields (passwords, tokens, API keys, emails, account numbers) ARE
+    strings by construction. A float in the secrets bundle is a sentinel
+    that YAML numeric coercion ate something.
+
+    Returns
+    -------
+    list[str]
+        Dotted paths (e.g., ``["ibkr.flex_query_token"]``). Empty list if
+        no floats found. Sorted for deterministic exit output.
+
+    Edge cases:
+      * Ints are allowed (sops yaml legitimately carries int values like
+        ``ibkr.flex_query_id: 1505530`` — confirmed via the existing
+        ``_looks_like_placeholder`` carve-out for non-string sops values).
+      * Bools are allowed (yaml-loaded as bool, not float).
+      * NoneType is allowed (covered by ``_looks_like_placeholder``).
+      * Lists are walked recursively (a yaml list-of-numbers would expose
+        the same gotcha; defensive coverage).
+    """
+    matches: list[str] = []
+    if isinstance(node, float):
+        matches.append(".".join(path) if path else "<root>")
+        return matches
+    if isinstance(node, dict):
+        for key, value in node.items():
+            matches.extend(_find_float_secret_paths(value, path=(*path, str(key))))
+        return matches
+    if isinstance(node, list):
+        for idx, value in enumerate(node):
+            matches.extend(_find_float_secret_paths(value, path=(*path, f"[{idx}]")))
+        return matches
+    return matches
+
+
 def _build_database_url(pg_password: str) -> str:
     host = os.environ.get("API_DB_HOST", "postgres")
     port = os.environ.get("API_DB_PORT", "5432")
@@ -59,6 +109,26 @@ def _exit(message: str, code: int = 2) -> int:
 def main(argv: list[str] | None = None) -> int:
     secrets_path = Path(os.environ.get("API_SECRETS_PATH", str(DEFAULT_SECRETS_PATH)))
     secrets = _load_secrets(secrets_path)
+
+    # Defensive guard against the YAML numeric-coercion gotcha documented
+    # in Docs/decisions-log.md 2026-05-12 (late). PyYAML's safe_load turns
+    # unquoted scientific-notation values into Python floats; if any leaf
+    # secret is a float, sops likely round-tripped a long-digit string
+    # through float64 and lost precision. Fail loud + tell the operator
+    # the fix is to quote the value in sops.
+    float_paths = _find_float_secret_paths(secrets)
+    if float_paths:
+        path_list = ", ".join(f"`{p}`" for p in sorted(float_paths))
+        return _exit(
+            f"sops bundle at {secrets_path} contains float-typed value(s) at: "
+            f"{path_list}. "
+            "This usually means YAML numeric coercion ate a long-digit "
+            "string secret (e.g., IBKR FlexQuery token). Edit "
+            "`secrets/<env>.enc.yaml` via `sops` and wrap the value in "
+            'double quotes (e.g., `flex_query_token: "152748490360752094531342"`), '
+            "then re-deploy. See Docs/decisions-log.md 2026-05-12 (late) "
+            "'FlexQuery debug journey' for the full root cause + fix.",
+        )
 
     if "API_DATABASE_URL" not in os.environ:
         pg_password = (secrets.get("postgres") or {}).get("app_service_password")
