@@ -43,7 +43,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any, Final, Literal
 from uuid import UUID
 
 import structlog
@@ -54,6 +54,48 @@ from services.audit.event_types import AuditEventType
 from services.audit.writer import Environment, PhaseAtEmit, append_audit_event
 
 log = structlog.get_logger()
+
+
+#: Risk-state values that PERMIT new signal dispatch. ``NORMAL`` is the
+#: steady-state. ``CONVALESCENT`` permits trading per backend-spec §2.5
+#: (the system has graduated from HALT_NEW + is in a 5-clean-session
+#: probation window; new signals continue to flow but at reduced size
+#: which is a separate concern from this gate). ``HALT_NEW`` rejects.
+RISK_STATES_PERMITTING_DISPATCH: Final[frozenset[str]] = frozenset({"NORMAL", "CONVALESCENT"})
+
+
+async def fetch_current_risk_state(
+    session_factory: async_sessionmaker[Any],
+    *,
+    account_id: UUID,
+) -> str | None:
+    """Read ``risk_state.state`` for the current is_current=TRUE row.
+
+    Returns ``None`` if no current row exists. Phase 1 invariant: the
+    bootstrap migration + the kill-switch transitions both maintain
+    exactly one is_current=TRUE row per account; ``None`` is a
+    degenerate state that surfaces a bug (e.g., fresh deploy without
+    the bootstrap row, or a manual psql DELETE).
+
+    The dispatch gate treats ``None`` as fail-open — if the schema
+    invariant breaks, we don't want to lock the operator out of
+    signal flow. The operator's response is to seed the row via psql
+    or wait for the next kill-switch transition.
+
+    Schema reference: alembic 0003 ``risk_state`` table; partial unique
+    index ``risk_state_current ON (account_id, is_current) WHERE
+    is_current = TRUE`` enforces the one-row-per-account invariant.
+    """
+    async with session_factory() as session:
+        row = (
+            await session.execute(
+                text("SELECT state FROM risk_state WHERE account_id = :acct AND is_current = TRUE"),
+                {"acct": account_id},
+            )
+        ).fetchone()
+    if row is None:
+        return None
+    return str(row.state)
 
 
 # ---------------------------------------------------------------------------
@@ -296,9 +338,18 @@ async def apply_signal_dispatch(
     session_factory: async_sessionmaker[Any],
     env: Environment,
     phase_at_emit: PhaseAtEmit = 1,
+    current_risk_state: str | None = None,
 ) -> SignalDispatchResult:
     """Execute the dispatch plan with audit-first ordering.
 
+    Step 0 (PR-H): if ``plan.action == 'approve'`` AND
+        ``current_risk_state == 'HALT_NEW'`` → raise
+        :class:`SignalDispatchError` with code ``SIGNAL_BLOCKED_BY_HALT``.
+        The reject + defer paths are NOT gated — the operator can always
+        record a reject/defer decision (the diary entry IS the signal,
+        not the placement). NORMAL + CONVALESCENT permit; None (no
+        risk_state row) fails open per :func:`fetch_current_risk_state`
+        docstring.
     Step 1: validate the signal exists + is in 'pending' status (SELECT FOR UPDATE).
     Step 2: write the audit event (signal_approved / signal_rejected /
         signal_deferred) via ``append_audit_event``. SERIALIZABLE retries +
@@ -310,7 +361,34 @@ async def apply_signal_dispatch(
     succeeds, the audit row is durable; the route returns the audit event
     UUID. A retry (idempotent on the audit event UUID) re-applies Step 3
     when conditions clear.
+
+    Parameters
+    ----------
+    current_risk_state:
+        Snapshot of ``risk_state.state`` for the account at dispatch
+        time. Read by the caller via :func:`fetch_current_risk_state`
+        and passed as a string ("NORMAL" / "HALT_NEW" / "CONVALESCENT").
+        ``None`` skips the gate (fail-open — see helper docstring).
+        Only the ``approve`` path is gated; reject + defer always
+        proceed so the operator can clear out pending signals during
+        a halt.
     """
+    # Step 0: PR-H risk-state gate. Only the approve path is gated;
+    # reject/defer always proceed (operators need to record decisions
+    # during a halt + the diary entry IS the audit-traceable rationale).
+    if plan.action == "approve" and current_risk_state == "HALT_NEW":
+        raise SignalDispatchError(
+            error_code="SIGNAL_BLOCKED_BY_HALT",
+            message=(
+                "System is HALT_NEW; new signal approvals are blocked. "
+                "Resume from /system page → CONVALESCENT before approving."
+            ),
+            details={
+                "signal_id": str(plan.signal_id),
+                "current_risk_state": current_risk_state,
+            },
+        )
+
     # Step 1: validate. The signals table PK column is `id`, not
     # `signal_id` — `signal_id` is the column name on `orders` (the FK
     # back to signals.id). Pivot-PR-D 2026-05-12 fixup.
@@ -422,12 +500,14 @@ _ = asyncio
 
 
 __all__ = [
+    "RISK_STATES_PERMITTING_DISPATCH",
     "DecisionDiaryEntryInput",
     "SignalDispatchAction",
     "SignalDispatchError",
     "SignalDispatchPlan",
     "SignalDispatchResult",
     "apply_signal_dispatch",
+    "fetch_current_risk_state",
     "plan_signal_approve",
     "plan_signal_defer",
     "plan_signal_reject",

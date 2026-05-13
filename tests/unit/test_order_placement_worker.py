@@ -463,3 +463,153 @@ class TestOnOrderStatusEmit:
         assert worker._emitted_fill_order_ids == {
             _build_status_update(status="filled").broker_order_id
         }
+
+
+# ---------------------------------------------------------------------------
+# PR-H: HALT_NEW gate on run_once
+# ---------------------------------------------------------------------------
+
+
+class TestHaltGuard:
+    """run_once must short-circuit when risk_state is HALT_NEW. The
+    approve-time gate in apply_signal_dispatch covers the operator-side
+    block (signal can't transition to 'approved' under HALT); this
+    worker-side gate covers the racy edge case where a signal was
+    approved before the halt fired + is now sitting in the table."""
+
+    async def test_halt_new_skips_drain(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When fetch_current_risk_state returns 'HALT_NEW', run_once
+        returns 0 + does NOT call fetch_approved_signals."""
+        from services.risk import order_placement_worker as worker_mod
+
+        fetch_signals_calls: list[None] = []
+
+        async def _fake_fetch_signals(*args: Any, **kwargs: Any) -> list[Any]:
+            fetch_signals_calls.append(None)
+            return []
+
+        monkeypatch.setattr(
+            "services.risk.signal_dispatch.fetch_current_risk_state",
+            AsyncMock(return_value="HALT_NEW"),
+        )
+        monkeypatch.setattr(worker_mod, "fetch_approved_signals", _fake_fetch_signals)
+
+        session = MagicMock()
+        session.execute = AsyncMock()
+
+        @asynccontextmanager
+        async def factory() -> Any:
+            yield session
+
+        ibkr = MagicMock()
+        worker = OrderPlacementWorker(
+            session_factory=factory,  # type: ignore[arg-type]
+            ibkr_client=ibkr,
+            account_id=uuid4(),
+            env="paper",
+        )
+        placed = await worker.run_once()
+        assert placed == 0
+        assert fetch_signals_calls == []  # fetch_approved_signals NOT called
+
+    async def test_normal_proceeds_to_drain(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """NORMAL passes the gate; fetch_approved_signals is called."""
+        from services.risk import order_placement_worker as worker_mod
+
+        fetch_signals_calls: list[None] = []
+
+        async def _fake_fetch_signals(*args: Any, **kwargs: Any) -> list[Any]:
+            fetch_signals_calls.append(None)
+            return []  # empty list → no signals to drain → returns 0 but proves call
+
+        monkeypatch.setattr(
+            "services.risk.signal_dispatch.fetch_current_risk_state",
+            AsyncMock(return_value="NORMAL"),
+        )
+        monkeypatch.setattr(worker_mod, "fetch_approved_signals", _fake_fetch_signals)
+
+        session = MagicMock()
+        session.execute = AsyncMock()
+
+        @asynccontextmanager
+        async def factory() -> Any:
+            yield session
+
+        ibkr = MagicMock()
+        worker = OrderPlacementWorker(
+            session_factory=factory,  # type: ignore[arg-type]
+            ibkr_client=ibkr,
+            account_id=uuid4(),
+            env="paper",
+        )
+        await worker.run_once()
+        assert len(fetch_signals_calls) == 1
+
+    async def test_convalescent_proceeds_to_drain(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """CONVALESCENT also passes the gate (per backend-spec §2.5)."""
+        from services.risk import order_placement_worker as worker_mod
+
+        fetch_signals_calls: list[None] = []
+
+        async def _fake_fetch_signals(*args: Any, **kwargs: Any) -> list[Any]:
+            fetch_signals_calls.append(None)
+            return []
+
+        monkeypatch.setattr(
+            "services.risk.signal_dispatch.fetch_current_risk_state",
+            AsyncMock(return_value="CONVALESCENT"),
+        )
+        monkeypatch.setattr(worker_mod, "fetch_approved_signals", _fake_fetch_signals)
+
+        session = MagicMock()
+        session.execute = AsyncMock()
+
+        @asynccontextmanager
+        async def factory() -> Any:
+            yield session
+
+        ibkr = MagicMock()
+        worker = OrderPlacementWorker(
+            session_factory=factory,  # type: ignore[arg-type]
+            ibkr_client=ibkr,
+            account_id=uuid4(),
+            env="paper",
+        )
+        await worker.run_once()
+        assert len(fetch_signals_calls) == 1
+
+    async def test_none_risk_state_proceeds_fail_open(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """None risk_state (no row) skips the gate (fail-open per
+        fetch_current_risk_state docstring)."""
+        from services.risk import order_placement_worker as worker_mod
+
+        fetch_signals_calls: list[None] = []
+
+        async def _fake_fetch_signals(*args: Any, **kwargs: Any) -> list[Any]:
+            fetch_signals_calls.append(None)
+            return []
+
+        monkeypatch.setattr(
+            "services.risk.signal_dispatch.fetch_current_risk_state",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(worker_mod, "fetch_approved_signals", _fake_fetch_signals)
+
+        session = MagicMock()
+        session.execute = AsyncMock()
+
+        @asynccontextmanager
+        async def factory() -> Any:
+            yield session
+
+        ibkr = MagicMock()
+        worker = OrderPlacementWorker(
+            session_factory=factory,  # type: ignore[arg-type]
+            ibkr_client=ibkr,
+            account_id=uuid4(),
+            env="paper",
+        )
+        await worker.run_once()
+        assert len(fetch_signals_calls) == 1
