@@ -232,11 +232,28 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
 
         # Subscribe to micro futures (continuous contract via QC's `Future` API).
         for ticker in PHASE1_FUTURES:
+            # data_normalization_mode=Raw — required for the Path 4 futures-seed
+            # strategy. add_future()'s default normalization mode is
+            # BackwardsRatio (per QC docs forum 17093 staff response: "if you
+            # use a data normalization mode that's not in the list, LEAN
+            # automatically converts it to DataNormalizationMode.BackwardsRatio").
+            # BackwardsRatio requires factor_files/<ticker>.csv with the
+            # continuous-contract scale math (BackwardsRatioScale, etc.) which
+            # is QC-internal and cannot be synthesized in a seed converter.
+            # Raw mode operates on un-adjusted per-expiry contract prices —
+            # exactly what the seed at scripts/seed_lean_futures_databento.py
+            # produces. Donchian/MA/Hurst/ATR all derive from each contract's
+            # own price levels; LEAN's job is to deliver the right contract's
+            # bars per session date (universe + OI files handle that under
+            # data_mapping_mode=OPEN_INTEREST). See Docs/decisions-log.md
+            # 2026-05-12 entry "Phase 1 futures seed via DataBento direct SDK
+            # + minimal LEAN converter (Path 4)".
             future = self.add_future(
                 f"/{ticker}",
                 resolution=Resolution.DAILY,  # noqa: F405
                 extended_market_hours=False,
                 data_mapping_mode=DataMappingMode.OPEN_INTEREST,  # noqa: F405
+                data_normalization_mode=DataNormalizationMode.RAW,  # noqa: F405
                 contract_depth_offset=0,
             )
             future.set_filter(0, 90)  # rolling 0-90 day window for contract selection
