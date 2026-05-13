@@ -113,16 +113,19 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # Runtime apt deps: libssl/libffi for asyncpg native bits; tini for
 # proper PID-1 signal handling so docker stop terminates the container
-# cleanly. NO curl (no healthcheck endpoint to hit yet — added when the
-# Week 4 dispatcher PR exposes a real /health). NO ca-certificates? —
-# httpx uses certifi via Python; we still need ca-certificates for the
-# system OpenSSL that asyncpg uses for TLS to Postgres if Phase 1+ ever
-# turns on TLS in transit.
+# cleanly. procps for pgrep — docker-compose healthcheck checks the
+# SSE-subscriber python process is alive via
+# `pgrep -f services.webhook_pusher`. NO curl (no healthcheck HTTP
+# endpoint to hit yet — added when a real /health surface lands). NO
+# ca-certificates? — httpx uses certifi via Python; we still need
+# ca-certificates for the system OpenSSL that asyncpg uses for TLS to
+# Postgres if Phase 1+ ever turns on TLS in transit.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         libffi8 \
         libssl3 \
         ca-certificates \
+        procps \
         tini \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1000 trading \
