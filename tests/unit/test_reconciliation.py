@@ -31,8 +31,10 @@ import pytest
 from services.reconciliation.recon import (
     CASH_ABS_TOLERANCE_USD,
     CASH_BPS_TOLERANCE,
+    CASH_P0_THRESHOLD_USD,
     DEFAULT_RECONCILIATION_ALERT_SEVERITY,
     DIVIDEND_WIDENING_FACTOR,
+    POSITION_P0_DELTA_CONTRACTS,
     POSITION_QTY_TOLERANCE,
     RECONCILIATION_BREAK_ALERT_CATEGORY,
     AlertDescriptor,
@@ -1102,3 +1104,171 @@ class TestAlertDescriptors:
         )
         assert isinstance(plan.alerts, tuple)
         assert hasattr(plan, "alerts")
+
+
+# ---------------------------------------------------------------------------
+# Severity classifier — magnitude-based P0 escalation
+# ---------------------------------------------------------------------------
+
+
+class TestSeverityClassifier:
+    """Severity selection per actionable break.
+
+    Locked thresholds (operator pre-authorized):
+
+    - Cash: ``> $1000`` → P0; else P2.
+    - Position: ``> 5`` contracts (abs delta) → P0; else P2.
+
+    Strict ``>`` comparison means an exact-threshold break stays P2.
+    Symmetric on direction: ``abs(delta)`` is what's compared, so
+    short-side divergences classify identically to long-side at the
+    same magnitude.
+
+    Grace-period continuations don't emit alerts at all (covered by
+    :class:`TestAlertDescriptors`); this class focuses purely on the
+    P0-vs-P2 selection for actionable alerts.
+    """
+
+    def test_locked_cash_threshold_constant(self) -> None:
+        # Operator pre-authorized $1000 in PR #138 close-out follow-up.
+        # If a future PR shifts this, also revisit
+        # `services/reconciliation/recon.py` docstring + decisions-log
+        # entry justifying the change.
+        assert CASH_P0_THRESHOLD_USD == Decimal("1000.00")
+
+    def test_locked_position_threshold_constant(self) -> None:
+        # Operator pre-authorized 5 contracts in PR #138 close-out follow-up.
+        # Contract-count-based; Phase 1+ may switch to notional once
+        # `contract_multiplier` is plumbed into the planner.
+        assert POSITION_P0_DELTA_CONTRACTS == Decimal("5")
+
+    def test_small_cash_break_is_p2(self) -> None:
+        # equity 1M → bps band $100. delta $150 > $100 tolerance → break;
+        # but $150 < $1000 P0 threshold → P2.
+        plan = plan_reconciliation_check(
+            backend_view=_backend(cash="1000150.00", equity="1000000.00"),
+            broker_view=_broker(cash="1000000.00"),
+            detected_at_utc=TS,
+        )
+        assert len(plan.alerts) == 1
+        assert plan.alerts[0].severity == "P2"
+
+    def test_large_cash_break_is_p0(self) -> None:
+        # delta $1500 > $1000 P0 threshold → P0.
+        plan = plan_reconciliation_check(
+            backend_view=_backend(cash="1001500.00", equity="1000000.00"),
+            broker_view=_broker(cash="1000000.00"),
+            detected_at_utc=TS,
+        )
+        assert len(plan.alerts) == 1
+        assert plan.alerts[0].severity == "P0"
+
+    def test_cash_break_at_exact_threshold_is_p2(self) -> None:
+        # Strict > comparison: $1000.00 delta is P2, $1000.01 is P0.
+        # equity 1M → bps band $100; delta $1000 > $100 → break; but
+        # $1000 NOT > $1000 → stays P2.
+        plan = plan_reconciliation_check(
+            backend_view=_backend(cash="1001000.00", equity="1000000.00"),
+            broker_view=_broker(cash="1000000.00"),
+            detected_at_utc=TS,
+        )
+        assert len(plan.alerts) == 1
+        # delta should be exactly the threshold
+        assert plan.alerts[0].payload["delta"] == "1000.00"
+        assert plan.alerts[0].severity == "P2"
+
+    def test_cash_break_one_cent_above_threshold_is_p0(self) -> None:
+        # Boundary verification of strict-> comparison: $1000.01 → P0.
+        plan = plan_reconciliation_check(
+            backend_view=_backend(cash="1001000.01", equity="1000000.00"),
+            broker_view=_broker(cash="1000000.00"),
+            detected_at_utc=TS,
+        )
+        assert len(plan.alerts) == 1
+        assert plan.alerts[0].severity == "P0"
+
+    def test_negative_cash_break_classifies_on_abs_delta(self) -> None:
+        # Broker shows MORE cash than backend → negative delta. Symmetric:
+        # |delta| of $1500 → P0 regardless of sign.
+        plan = plan_reconciliation_check(
+            backend_view=_backend(cash="998500.00", equity="1000000.00"),
+            broker_view=_broker(cash="1000000.00"),
+            detected_at_utc=TS,
+        )
+        assert len(plan.alerts) == 1
+        # delta is signed; the classifier reads abs(delta) so direction
+        # is irrelevant.
+        assert plan.alerts[0].payload["delta"] == "-1500.00"
+        assert plan.alerts[0].severity == "P0"
+
+    def test_small_position_break_is_p2(self) -> None:
+        # 1-contract divergence on /MES → break; 1 < 5 P0 threshold → P2.
+        plan = plan_reconciliation_check(
+            backend_view=_backend({"MES": "3"}),
+            broker_view=_broker({"MES": "2"}),
+            detected_at_utc=TS,
+        )
+        assert len(plan.alerts) == 1
+        assert plan.alerts[0].severity == "P2"
+
+    def test_large_position_break_is_p0(self) -> None:
+        # 10-contract divergence on /MES → break; 10 > 5 P0 threshold → P0.
+        plan = plan_reconciliation_check(
+            backend_view=_backend({"MES": "10"}),
+            broker_view=_broker(),
+            detected_at_utc=TS,
+        )
+        assert len(plan.alerts) == 1
+        assert plan.alerts[0].severity == "P0"
+
+    def test_position_break_at_exact_threshold_is_p2(self) -> None:
+        # Strict > comparison: 5 contracts is P2, 6 is P0.
+        plan = plan_reconciliation_check(
+            backend_view=_backend({"MES": "5"}),
+            broker_view=_broker(),
+            detected_at_utc=TS,
+        )
+        assert len(plan.alerts) == 1
+        assert plan.alerts[0].payload["delta"] == "5"
+        assert plan.alerts[0].severity == "P2"
+
+    def test_position_break_one_above_threshold_is_p0(self) -> None:
+        # Boundary verification of strict-> comparison: 6 contracts → P0.
+        plan = plan_reconciliation_check(
+            backend_view=_backend({"MES": "6"}),
+            broker_view=_broker(),
+            detected_at_utc=TS,
+        )
+        assert len(plan.alerts) == 1
+        assert plan.alerts[0].severity == "P0"
+
+    def test_negative_position_break_classifies_on_abs_delta(self) -> None:
+        # Broker LONG; backend FLAT → delta negative. Symmetric: |delta|
+        # of 10 contracts → P0 regardless of direction.
+        plan = plan_reconciliation_check(
+            backend_view=_backend(),
+            broker_view=_broker({"MES": "10"}),
+            detected_at_utc=TS,
+        )
+        assert len(plan.alerts) == 1
+        assert plan.alerts[0].payload["delta"] == "-10"
+        assert plan.alerts[0].severity == "P0"
+
+    def test_mixed_severities_in_one_cycle(self) -> None:
+        # One small (P2) cash break + one large (P0) position break in
+        # the same cycle. Each alert classified independently.
+        plan = plan_reconciliation_check(
+            backend_view=_backend(
+                {"MES": "10"},
+                cash="1000150.00",  # $150 small cash break
+                equity="1000000.00",
+            ),
+            broker_view=_broker(cash="1000000.00"),
+            detected_at_utc=TS,
+        )
+        # 2 breaks: position (10 contracts on /MES) + cash ($150).
+        assert len(plan.alerts) == 2
+        # Sorted alphabetically: /MES position first, then cash (None).
+        sev_by_market = {a.payload["market"]: a.severity for a in plan.alerts}
+        assert sev_by_market["MES"] == "P0"
+        assert sev_by_market[None] == "P2"

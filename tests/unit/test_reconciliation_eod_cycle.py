@@ -22,8 +22,10 @@ import pytest
 
 from services.reconciliation.apply import AlertDispatchContext
 from services.reconciliation.eod_cycle import (
+    DEFAULT_PRIOR_BREAKS_WINDOW_HOURS,
     EodCycleConfig,
     build_broker_view,
+    fetch_prior_breaks_within_grace_window,
     make_cycle_callback,
     run_eod_cycle,
 )
@@ -34,7 +36,7 @@ from services.reconciliation.flex_query_fetcher import (
     FlexQueryFetchError,
     ReconciliationSnapshot,
 )
-from services.reconciliation.recon import BrokerSource
+from services.reconciliation.recon import BrokerSource, PriorBreak, ReconciliationMetric
 
 
 def _build_snapshot(
@@ -158,9 +160,18 @@ class TestBuildBrokerView:
 
 
 def _stub_session_factory(
-    *, positions: list[dict[str, Any]], balance: dict[str, Any] | None
+    *,
+    positions: list[dict[str, Any]],
+    balance: dict[str, Any] | None,
+    prior_breaks: list[dict[str, Any]] | None = None,
 ) -> Any:
-    """Build a fake session_factory that returns the supplied snapshot rows."""
+    """Build a fake session_factory that returns the supplied snapshot rows.
+
+    ``prior_breaks`` defaults to ``[]`` — the empty list models the
+    Phase 1 day-1 boot path (no prior cycles have populated
+    ``reconciliation_breaks`` yet) and is the right default for tests
+    that don't care about grace classification.
+    """
 
     def _make_row(d: dict[str, Any]) -> MagicMock:
         row = MagicMock()
@@ -169,6 +180,7 @@ def _stub_session_factory(
         return row
 
     session = MagicMock()
+    prior_break_rows = prior_breaks if prior_breaks is not None else []
 
     async def execute(stmt: Any, params: Any) -> MagicMock:
         sql = str(stmt)
@@ -179,6 +191,8 @@ def _stub_session_factory(
             result.fetchone = MagicMock(
                 return_value=_make_row(balance) if balance is not None else None
             )
+        elif "reconciliation_breaks" in sql:
+            result.fetchall = MagicMock(return_value=[_make_row(b) for b in prior_break_rows])
         return result
 
     session.execute = execute  # type: ignore[method-assign]
@@ -627,6 +641,206 @@ class TestAlertDispatchHookEndToEnd:
         assert "kwargs" in captured
         # Hook is None.
         assert captured["kwargs"]["alert_dispatch_hook"] is None
+
+
+# ---------------------------------------------------------------------------
+# Prior-breaks SQL lookup feeding the planner's grace classification
+# ---------------------------------------------------------------------------
+
+
+class TestPriorBreaksLookup:
+    """``fetch_prior_breaks_within_grace_window`` reads unresolved breaks
+    within the T+1 grace window + maps them to the planner's
+    :class:`PriorBreak` shape.
+
+    Pure-policy tests with the stub session_factory; SQL semantics
+    (the ``NOW() - INTERVAL '<N> hour'`` filter) are exercised at
+    integration-test time. Here we assert:
+
+    * Empty table → ``()`` (Phase 1 day-1 boot).
+    * Populated table → mapped to ``PriorBreak(metric, market, delta)``.
+    * Unknown metric → skipped + warning emitted (defensive against a
+      Phase-2 metric value landing before the planner enum is updated).
+    * Window-hours param threads through to the SQL params dict.
+    """
+
+    async def test_empty_table_returns_empty_tuple(self) -> None:
+        factory = _stub_session_factory(positions=[], balance=None, prior_breaks=[])
+        prior = await fetch_prior_breaks_within_grace_window(factory, account_id=uuid4())
+        assert prior == ()
+
+    async def test_default_returns_empty_tuple(self) -> None:
+        # No prior_breaks supplied → defaults to [] → empty tuple.
+        factory = _stub_session_factory(positions=[], balance=None)
+        prior = await fetch_prior_breaks_within_grace_window(factory, account_id=uuid4())
+        assert prior == ()
+
+    async def test_position_break_mapped_to_prior_break(self) -> None:
+        factory = _stub_session_factory(
+            positions=[],
+            balance=None,
+            prior_breaks=[{"metric": "position_qty", "market": "/MES", "delta": Decimal("1")}],
+        )
+        prior = await fetch_prior_breaks_within_grace_window(factory, account_id=uuid4())
+        assert prior == (
+            PriorBreak(
+                metric=ReconciliationMetric.POSITION_QTY,
+                market="/MES",
+                delta=Decimal("1"),
+            ),
+        )
+
+    async def test_cash_break_with_null_market(self) -> None:
+        # Cash breaks have market=NULL in the schema; planner accepts
+        # market=None on PriorBreak.
+        factory = _stub_session_factory(
+            positions=[],
+            balance=None,
+            prior_breaks=[{"metric": "cash_usd", "market": None, "delta": Decimal("250.00")}],
+        )
+        prior = await fetch_prior_breaks_within_grace_window(factory, account_id=uuid4())
+        assert len(prior) == 1
+        assert prior[0].metric is ReconciliationMetric.CASH_USD
+        assert prior[0].market is None
+        assert prior[0].delta == Decimal("250.00")
+
+    async def test_unknown_metric_skipped(self) -> None:
+        # A future Phase 2 metric (e.g., 'net_liquidation') landing in
+        # the schema before the planner enum is updated should be
+        # silently dropped — never crash the cycle.
+        factory = _stub_session_factory(
+            positions=[],
+            balance=None,
+            prior_breaks=[
+                {"metric": "net_liquidation", "market": None, "delta": Decimal("100.00")},
+                {"metric": "position_qty", "market": "/MES", "delta": Decimal("1")},
+            ],
+        )
+        prior = await fetch_prior_breaks_within_grace_window(factory, account_id=uuid4())
+        # Only the known position_qty row survives.
+        assert len(prior) == 1
+        assert prior[0].metric is ReconciliationMetric.POSITION_QTY
+
+    async def test_decimal_precision_preserved(self) -> None:
+        # A05: Decimal-via-str round-trip preserves precision.
+        factory = _stub_session_factory(
+            positions=[],
+            balance=None,
+            prior_breaks=[
+                {
+                    "metric": "cash_usd",
+                    "market": None,
+                    "delta": Decimal("1234.567890"),
+                }
+            ],
+        )
+        prior = await fetch_prior_breaks_within_grace_window(factory, account_id=uuid4())
+        assert prior[0].delta == Decimal("1234.567890")
+
+    async def test_default_window_hours_constant(self) -> None:
+        # Locked default: T+1 (24h) + half-day buffer (12h) = 36h.
+        # Friday-detected breaks need weekend coverage through Monday;
+        # documented limitation, see eod_cycle.py docstring.
+        assert DEFAULT_PRIOR_BREAKS_WINDOW_HOURS == 36
+
+    async def test_run_eod_cycle_threads_prior_breaks_to_planner(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # End-to-end: run_eod_cycle calls the helper + threads the result
+        # into plan_reconciliation_check. Verifies the prior-break is
+        # classified as grace continuation (no alert fires).
+        config = EodCycleConfig(
+            account_id=uuid4(),
+            env="paper",
+            flex_query_id=1,
+            flex_query_token="t",
+        )
+        # FlexQuery + backend disagree on /MES by 1 contract — same delta
+        # as the prior break we'll seed below.
+        snap = _build_snapshot(
+            positions=(_flex_pos(symbol="MES", quantity="1"),),
+            cash_balances=(FlexCashBalance(currency="USD", balance=Decimal("100000")),),
+        )
+        client = MagicMock()
+        client.fetch_snapshot = AsyncMock(return_value=snap)
+
+        factory = _stub_session_factory(
+            positions=[{"market": "/MES", "qty": 2}],
+            balance={"cash_usd": Decimal("100000"), "net_liquidation": Decimal("105000")},
+            # Prior break with same (metric, market, delta) as today's
+            # break — should classify as grace, drop the alert.
+            prior_breaks=[{"metric": "position_qty", "market": "/MES", "delta": Decimal("1")}],
+        )
+
+        captured: dict[str, Any] = {}
+
+        async def fake_apply(plan: Any, **kwargs: Any) -> MagicMock:
+            captured["plan"] = plan
+            return MagicMock(
+                alerts_dispatched_count=0,
+                kill_switch_invoked=False,
+            )
+
+        monkeypatch.setattr(
+            "services.reconciliation.eod_cycle.apply_reconciliation_plan", fake_apply
+        )
+
+        await run_eod_cycle(
+            config=config, session_factory=factory, flex_client_factory=lambda: client
+        )
+
+        plan = captured["plan"]
+        # The break is detected (it's still in breaks_detected) but
+        # classified as within-grace and no alert fires.
+        assert len(plan.breaks_detected) == 1
+        assert plan.breaks_detected[0].within_grace_period is True
+        assert plan.actionable_break_count == 0
+        assert plan.alerts == ()
+
+    async def test_prior_break_with_different_delta_does_not_grace(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Prior delta=1; today delta=2 → mismatch → today's break is
+        # actionable + alert fires.
+        config = EodCycleConfig(
+            account_id=uuid4(),
+            env="paper",
+            flex_query_id=1,
+            flex_query_token="t",
+        )
+        snap = _build_snapshot(
+            positions=(_flex_pos(symbol="MES", quantity="1"),),
+            cash_balances=(FlexCashBalance(currency="USD", balance=Decimal("100000")),),
+        )
+        client = MagicMock()
+        client.fetch_snapshot = AsyncMock(return_value=snap)
+        factory = _stub_session_factory(
+            positions=[{"market": "/MES", "qty": 3}],
+            balance={"cash_usd": Decimal("100000"), "net_liquidation": Decimal("105000")},
+            # Prior delta=1, today delta=2 — different → not grace.
+            prior_breaks=[{"metric": "position_qty", "market": "/MES", "delta": Decimal("1")}],
+        )
+
+        captured: dict[str, Any] = {}
+
+        async def fake_apply(plan: Any, **kwargs: Any) -> MagicMock:
+            captured["plan"] = plan
+            return MagicMock(alerts_dispatched_count=0, kill_switch_invoked=False)
+
+        monkeypatch.setattr(
+            "services.reconciliation.eod_cycle.apply_reconciliation_plan", fake_apply
+        )
+
+        await run_eod_cycle(
+            config=config, session_factory=factory, flex_client_factory=lambda: client
+        )
+
+        plan = captured["plan"]
+        # Today's delta=2 ≠ prior's delta=1 → actionable + alert fires.
+        assert len(plan.breaks_detected) == 1
+        assert plan.breaks_detected[0].within_grace_period is False
+        assert plan.actionable_break_count == 1
+        assert len(plan.alerts) == 1
 
 
 class TestModuleContract:
