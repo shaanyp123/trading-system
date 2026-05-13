@@ -79,10 +79,33 @@ def _settings(**overrides: Any) -> Any:
         reconciliation_scheduler_enabled=True,
         flex_query_id=12345,
         flex_query_token=None,  # SecretStr in real settings; helper handles None
+        # PR for follow-up #2 — alert_dispatch_hook construction reads these.
+        # Default None means the hook is skipped (the operator-friendly
+        # pre-sops-population state).
+        discord_webhook_url_alerts=None,
+        discord_webhook_url_critical=None,
+        resend_api_key=None,
+        resend_from_address=None,
+        resend_to_address=None,
     )
     for k, v in overrides.items():
         setattr(base, k, v)
     return base
+
+
+class _SecretStub:
+    """Lightweight SecretStr stand-in carrying a `.get_secret_value()` method.
+
+    Real `APISettings` fields are pydantic SecretStr; tests don't go through
+    pydantic-settings construction, so we provide the .get_secret_value
+    contract here.
+    """
+
+    def __init__(self, value: str) -> None:
+        self._value = value
+
+    def get_secret_value(self) -> str:
+        return self._value
 
 
 class TestAuditEnvFromSettings:
@@ -466,3 +489,429 @@ class TestEntrypointIbkrAccountMapping:
         import os
 
         assert os.environ["API_IBKR_ACCOUNT"] == "DUQ_FALLBACK"
+
+
+# ---------------------------------------------------------------------------
+# PR for follow-up #2 — alert_dispatch_hook construction
+# ---------------------------------------------------------------------------
+
+
+class TestBuildAlertDispatchHook:
+    """``_build_alert_dispatch_hook`` returns a closure or None.
+
+    None when sops Discord URLs aren't populated (the operator hasn't
+    populated `discord.webhook_urls.alerts` yet). Closure when at least
+    `discord_webhook_url_alerts` is set; the closure runs INSERT alerts
+    + dispatch_alert when fired.
+
+    Email identity is independent: present iff ALL THREE Resend fields
+    populated. Missing any → email_identity stays None (the dispatcher
+    will trip on a P0 alert; P2 alerts unaffected).
+    """
+
+    def test_no_discord_alerts_url_returns_none(self) -> None:
+        from services.api import main as api_main
+
+        hook = api_main._build_alert_dispatch_hook(_settings())  # all None
+        assert hook is None
+
+    def test_with_alerts_url_returns_callable(self) -> None:
+        from services.api import main as api_main
+
+        hook = api_main._build_alert_dispatch_hook(
+            _settings(discord_webhook_url_alerts=_SecretStub("https://discord.test/a"))
+        )
+        assert hook is not None
+        assert callable(hook)
+
+    def test_with_critical_url_includes_in_webhook_map(self) -> None:
+        # End-to-end: the closure when fired should include #critical
+        # in its webhook_urls map. We don't actually fire the closure
+        # here (that needs an in-process DB); the integration test in
+        # the next class spies on the captured webhook_urls dict.
+        from services.api import main as api_main
+
+        hook = api_main._build_alert_dispatch_hook(
+            _settings(
+                discord_webhook_url_alerts=_SecretStub("https://discord.test/a"),
+                discord_webhook_url_critical=_SecretStub("https://discord.test/c"),
+            )
+        )
+        assert hook is not None
+
+    def test_partial_resend_config_skips_email_identity(self) -> None:
+        # Missing to_address → email_identity stays None → P0 dispatch
+        # would trip the planner; P2 unaffected.
+        from services.api import main as api_main
+
+        hook = api_main._build_alert_dispatch_hook(
+            _settings(
+                discord_webhook_url_alerts=_SecretStub("https://discord.test/a"),
+                resend_api_key=_SecretStub("re_test"),
+                resend_from_address="from@test",
+                # to_address still None
+            )
+        )
+        # Returns a callable but email_identity will be None inside the
+        # closure (closes over None).
+        assert hook is not None
+
+    def test_full_resend_config_constructs_email_identity(self) -> None:
+        from services.api import main as api_main
+
+        hook = api_main._build_alert_dispatch_hook(
+            _settings(
+                discord_webhook_url_alerts=_SecretStub("https://discord.test/a"),
+                discord_webhook_url_critical=_SecretStub("https://discord.test/c"),
+                resend_api_key=_SecretStub("re_test"),
+                resend_from_address="from@test",
+                resend_to_address="to@test",
+            )
+        )
+        assert hook is not None
+
+
+class TestAlertDispatchHookFired:
+    """The hook closure: INSERTs alerts row + invokes dispatch_alert.
+
+    Two-session lifecycle: one session for the INSERT, one for the
+    dispatcher's read+UPDATE. Both come from a stub session_factory.
+    """
+
+    @pytest.mark.asyncio
+    async def test_hook_inserts_then_dispatches(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from contextlib import asynccontextmanager
+        from unittest.mock import MagicMock
+        from uuid import uuid4
+
+        from services.api import main as api_main
+        from services.reconciliation.apply import AlertDispatchContext
+        from services.reconciliation.recon import AlertDescriptor
+
+        # Stub session_factory: two sessions get opened; the first INSERTs
+        # + RETURNING the alert id, the second is consumed by dispatch_alert.
+        new_alert_id = uuid4()
+
+        sessions_opened: list[MagicMock] = []
+
+        def factory() -> Any:
+            session = MagicMock()
+            sessions_opened.append(session)
+
+            async def execute(stmt: Any, params: Any = None) -> Any:
+                from types import SimpleNamespace as _NS
+
+                result = MagicMock()
+                result.fetchone = MagicMock(return_value=_NS(id=new_alert_id))
+                return result
+
+            async def commit() -> None:
+                return None
+
+            session.execute = execute  # type: ignore[method-assign]
+            session.commit = commit  # type: ignore[method-assign]
+
+            @asynccontextmanager
+            async def cm() -> Any:
+                yield session
+
+            return cm()
+
+        # api_db.get_session_factory returns the factory.
+        monkeypatch.setattr(api_main.api_db, "get_session_factory", lambda: factory)
+
+        # Stub dispatch_alert so we don't actually fan out to Discord.
+        dispatched: dict[str, Any] = {}
+
+        async def fake_dispatch(
+            *,
+            session: Any,
+            alert_id: Any,
+            http_client: Any,
+            webhook_urls: Any,
+            email_identity: Any,
+        ) -> Any:
+            dispatched["alert_id"] = alert_id
+            dispatched["webhook_urls"] = dict(webhook_urls)
+            dispatched["email_identity"] = email_identity
+            return MagicMock(short_circuited=False, delivery_status={"discord_alerts": "ok"})
+
+        # Patch where main.py looks it up (lazy-imported inside _build_alert_dispatch_hook).
+        from services.webhook_pusher import dispatcher as wpd
+
+        monkeypatch.setattr(wpd, "dispatch_alert", fake_dispatch)
+
+        hook = api_main._build_alert_dispatch_hook(
+            _settings(
+                discord_webhook_url_alerts=_SecretStub("https://discord.test/a"),
+                discord_webhook_url_critical=_SecretStub("https://discord.test/c"),
+                resend_api_key=_SecretStub("re_test"),
+                resend_from_address="from@test",
+                resend_to_address="to@test",
+            )
+        )
+        assert hook is not None
+
+        ctx = AlertDispatchContext(
+            descriptor=AlertDescriptor(
+                triggering_break_index=0,
+                severity="P0",
+                category="reconciliation_break",
+                title="Reconciliation break: cash divergence $1500.00",
+                body="EOD reconciliation detected a cash divergence.\nDelta: 1500.00",
+                payload={
+                    "metric": "cash_usd",
+                    "market": None,
+                    "delta": "1500.00",
+                    "tolerance": "5.00",
+                },
+            ),
+            triggering_audit_event_uuid=uuid4(),
+            account_id=uuid4(),
+            env="paper",
+        )
+
+        await hook(ctx)
+
+        # INSERT happened (1 session).
+        assert len(sessions_opened) >= 1
+        # Dispatch happened with the right shape.
+        assert dispatched["alert_id"] == new_alert_id
+        assert "discord_alerts" in dispatched["webhook_urls"]
+        assert "discord_critical" in dispatched["webhook_urls"]
+        assert dispatched["email_identity"] is not None
+        # Email identity carries the from/to/api_key.
+        ei = dispatched["email_identity"]
+        assert ei.from_address == "from@test"
+        assert ei.to_address == "to@test"
+        assert ei.resend_api_key == "re_test"
+
+    @pytest.mark.asyncio
+    async def test_hook_skips_email_when_resend_unwired(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # P2-only path: only #alerts URL set; no Resend → email_identity
+        # stays None when the closure passes it to dispatch_alert.
+        from contextlib import asynccontextmanager
+        from unittest.mock import MagicMock
+        from uuid import uuid4
+
+        from services.api import main as api_main
+        from services.reconciliation.apply import AlertDispatchContext
+        from services.reconciliation.recon import AlertDescriptor
+
+        def factory() -> Any:
+            session = MagicMock()
+
+            async def execute(stmt: Any, params: Any = None) -> Any:
+                from types import SimpleNamespace as _NS
+
+                result = MagicMock()
+                result.fetchone = MagicMock(return_value=_NS(id=uuid4()))
+                return result
+
+            async def commit() -> None:
+                return None
+
+            session.execute = execute  # type: ignore[method-assign]
+            session.commit = commit  # type: ignore[method-assign]
+
+            @asynccontextmanager
+            async def cm() -> Any:
+                yield session
+
+            return cm()
+
+        monkeypatch.setattr(api_main.api_db, "get_session_factory", lambda: factory)
+
+        dispatched: dict[str, Any] = {}
+
+        async def fake_dispatch(
+            *,
+            session: Any,
+            alert_id: Any,
+            http_client: Any,
+            webhook_urls: Any,
+            email_identity: Any,
+        ) -> Any:
+            dispatched["email_identity"] = email_identity
+            return MagicMock(short_circuited=False, delivery_status={"discord_alerts": "ok"})
+
+        from services.webhook_pusher import dispatcher as wpd
+
+        monkeypatch.setattr(wpd, "dispatch_alert", fake_dispatch)
+
+        hook = api_main._build_alert_dispatch_hook(
+            _settings(
+                discord_webhook_url_alerts=_SecretStub("https://discord.test/a"),
+                # Only api_key set, missing from/to → email_identity None.
+                resend_api_key=_SecretStub("re_test"),
+            )
+        )
+        assert hook is not None
+        ctx = AlertDispatchContext(
+            descriptor=AlertDescriptor(
+                triggering_break_index=0,
+                severity="P2",
+                category="reconciliation_break",
+                title="Reconciliation break: /MES position divergence 1 contract",
+                body="EOD reconciliation detected a position divergence on /MES.",
+                payload={"metric": "position_qty", "market": "/MES", "delta": "1"},
+            ),
+            triggering_audit_event_uuid=uuid4(),
+            account_id=uuid4(),
+            env="paper",
+        )
+        await hook(ctx)
+        assert dispatched["email_identity"] is None
+
+
+class TestEntrypointAlertDispatchMapping:
+    """sops yaml → API_DISCORD_WEBHOOK_URL_* + API_RESEND_* mappings."""
+
+    def test_full_alert_dispatch_credentials_mapped(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        from services.api import entrypoint
+
+        yaml_text = (
+            "postgres:\n"
+            "  app_service_password: hexpwd\n"
+            "discord:\n"
+            "  webhook_urls:\n"
+            "    alerts: https://discord.com/api/webhooks/A\n"
+            "    critical: https://discord.com/api/webhooks/C\n"
+            "resend:\n"
+            "  api_key: re_yaml_test\n"
+            "  from_address: ops@example.com\n"
+            "  to_address: ops@example.com\n"
+        )
+        secrets_path = tmp_path / "decrypted.yaml"
+        secrets_path.write_text(yaml_text)
+        monkeypatch.setenv("API_SECRETS_PATH", str(secrets_path))
+        for key in (
+            "API_DISCORD_WEBHOOK_URL_ALERTS",
+            "API_DISCORD_WEBHOOK_URL_CRITICAL",
+            "API_RESEND_API_KEY",
+            "API_RESEND_FROM_ADDRESS",
+            "API_RESEND_TO_ADDRESS",
+            "API_DATABASE_URL",
+        ):
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv("API_ENVIRONMENT", "paper")
+
+        def fake_execvp(cmd: str, argv: list[str]) -> None:
+            return None
+
+        monkeypatch.setattr(entrypoint.os, "execvp", fake_execvp)
+        entrypoint.main(["true"])
+        import os
+
+        assert os.environ["API_DISCORD_WEBHOOK_URL_ALERTS"] == "https://discord.com/api/webhooks/A"
+        assert (
+            os.environ["API_DISCORD_WEBHOOK_URL_CRITICAL"] == "https://discord.com/api/webhooks/C"
+        )
+        assert os.environ["API_RESEND_API_KEY"] == "re_yaml_test"
+        assert os.environ["API_RESEND_FROM_ADDRESS"] == "ops@example.com"
+        assert os.environ["API_RESEND_TO_ADDRESS"] == "ops@example.com"
+
+    def test_partial_alert_dispatch_credentials_partial_promotion(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        # Only the #alerts URL populated; #critical + Resend absent →
+        # only API_DISCORD_WEBHOOK_URL_ALERTS lands in env. Hook will
+        # construct without #critical + email but the closure is still
+        # callable (P2 alerts succeed; P0 alerts will trip dispatcher).
+        from services.api import entrypoint
+
+        yaml_text = (
+            "postgres:\n"
+            "  app_service_password: hexpwd\n"
+            "discord:\n"
+            "  webhook_urls:\n"
+            "    alerts: https://discord.com/api/webhooks/A\n"
+        )
+        secrets_path = tmp_path / "decrypted.yaml"
+        secrets_path.write_text(yaml_text)
+        monkeypatch.setenv("API_SECRETS_PATH", str(secrets_path))
+        for key in (
+            "API_DISCORD_WEBHOOK_URL_ALERTS",
+            "API_DISCORD_WEBHOOK_URL_CRITICAL",
+            "API_RESEND_API_KEY",
+            "API_RESEND_FROM_ADDRESS",
+            "API_RESEND_TO_ADDRESS",
+            "API_DATABASE_URL",
+        ):
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv("API_ENVIRONMENT", "paper")
+
+        def fake_execvp(cmd: str, argv: list[str]) -> None:
+            return None
+
+        monkeypatch.setattr(entrypoint.os, "execvp", fake_execvp)
+        entrypoint.main(["true"])
+        import os
+
+        assert os.environ["API_DISCORD_WEBHOOK_URL_ALERTS"] == "https://discord.com/api/webhooks/A"
+        assert "API_DISCORD_WEBHOOK_URL_CRITICAL" not in os.environ
+        assert "API_RESEND_API_KEY" not in os.environ
+
+    def test_placeholder_url_skipped(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        from services.api import entrypoint
+
+        yaml_text = (
+            "postgres:\n"
+            "  app_service_password: hexpwd\n"
+            "discord:\n"
+            "  webhook_urls:\n"
+            "    alerts: <TODO_DISCORD_ALERTS_URL>\n"
+        )
+        secrets_path = tmp_path / "decrypted.yaml"
+        secrets_path.write_text(yaml_text)
+        monkeypatch.setenv("API_SECRETS_PATH", str(secrets_path))
+        for key in (
+            "API_DISCORD_WEBHOOK_URL_ALERTS",
+            "API_DATABASE_URL",
+        ):
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv("API_ENVIRONMENT", "paper")
+
+        def fake_execvp(cmd: str, argv: list[str]) -> None:
+            return None
+
+        monkeypatch.setattr(entrypoint.os, "execvp", fake_execvp)
+        entrypoint.main(["true"])
+        import os
+
+        assert "API_DISCORD_WEBHOOK_URL_ALERTS" not in os.environ
+
+    def test_missing_webhook_urls_block_does_not_crash(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        # `discord:` present but `webhook_urls:` missing → no env vars set.
+        # Locks the `(secrets.get("discord") or {}).get("webhook_urls") or {}`
+        # defensive chain.
+        from services.api import entrypoint
+
+        yaml_text = "postgres:\n  app_service_password: hexpwd\ndiscord:\n  api_bearer_token: xyz\n"
+        secrets_path = tmp_path / "decrypted.yaml"
+        secrets_path.write_text(yaml_text)
+        monkeypatch.setenv("API_SECRETS_PATH", str(secrets_path))
+        for key in (
+            "API_DISCORD_WEBHOOK_URL_ALERTS",
+            "API_DISCORD_WEBHOOK_URL_CRITICAL",
+            "API_DATABASE_URL",
+        ):
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv("API_ENVIRONMENT", "paper")
+
+        def fake_execvp(cmd: str, argv: list[str]) -> None:
+            return None
+
+        monkeypatch.setattr(entrypoint.os, "execvp", fake_execvp)
+        # Should NOT raise.
+        entrypoint.main(["true"])
+        import os
+
+        assert "API_DISCORD_WEBHOOK_URL_ALERTS" not in os.environ
+        assert "API_DISCORD_WEBHOOK_URL_CRITICAL" not in os.environ

@@ -25,14 +25,18 @@ forbidden-paths CI gate.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import secrets
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Literal
+from uuid import UUID
 
+import httpx
 import structlog
 from fastapi import FastAPI
+from sqlalchemy import text
 
 from services.api import db as api_db
 from services.api import sse as sse_multiplexer
@@ -208,6 +212,172 @@ async def _start_order_placement_worker(settings: APISettings) -> tuple[object, 
     return worker, task
 
 
+def _build_alert_dispatch_hook(
+    settings: APISettings,
+) -> object | None:
+    """Construct the recon ``alert_dispatch_hook`` closure or return None.
+
+    Closes the seam left by PR #135: the recon planner emits
+    :class:`AlertDescriptor` rows, the apply orchestrator fires per-alert
+    callbacks, and this is where the api lifespan turns a callback into
+    "INSERT alerts row + invoke `dispatch_alert`" — the operator-visible
+    Discord push.
+
+    Returns ``None`` (cleanly skipping the hook installation) when sops
+    Discord URLs aren't populated. The reconciliation cycle still runs
+    end-to-end + alerts log a WARNING from
+    :func:`services.reconciliation.apply._dispatch_alerts` ("hook not
+    wired") so the operator knows what to populate.
+
+    P0 escalation (Resend email) requires ALL of api_key + from_address +
+    to_address. Missing any → ``email_identity`` stays ``None`` + the
+    dispatcher's planner raises on a P0 break. P2-only environments
+    (Phase 1 day-1) don't need the email_identity since SEVERITY_TO_CHANNELS
+    routes P2 to ``#alerts`` only.
+
+    Returns ``object | None`` to dodge a circular import — the actual
+    hook signature is ``services.reconciliation.apply.AlertDispatchHook``
+    and the value is exactly that, but stating it here would force an
+    import-at-module-load of the recon module (which loads the apply
+    module which loads the audit writer ...) at module top.
+    """
+    # Lazy imports keep module-load fast + avoid the circular-import surface.
+    from services.reconciliation.apply import AlertDispatchContext
+    from services.webhook_pusher.dispatcher import dispatch_alert
+    from services.webhook_pusher.payloads import (
+        AlertCategory,
+        AlertSeverity,
+        ChannelName,
+        EmailIdentity,
+    )
+
+    if settings.discord_webhook_url_alerts is None:
+        log.warning(
+            "alert_dispatch_hook_skipped_no_webhook_url",
+            note=(
+                "discord.webhook_urls.alerts not in sops; reconciliation "
+                "cycle will run + alerts will log a 'hook not wired' "
+                "warning. Wire the sops field + restart api to enable."
+            ),
+        )
+        return None
+
+    webhook_urls: dict[ChannelName, str] = {
+        ChannelName.DISCORD_ALERTS: settings.discord_webhook_url_alerts.get_secret_value(),
+    }
+    if settings.discord_webhook_url_critical is not None:
+        webhook_urls[ChannelName.DISCORD_CRITICAL] = (
+            settings.discord_webhook_url_critical.get_secret_value()
+        )
+
+    email_identity: EmailIdentity | None = None
+    if (
+        settings.resend_api_key is not None
+        and settings.resend_from_address is not None
+        and settings.resend_to_address is not None
+    ):
+        email_identity = EmailIdentity(
+            from_address=settings.resend_from_address,
+            to_address=settings.resend_to_address,
+            resend_api_key=settings.resend_api_key.get_secret_value(),
+        )
+
+    log.info(
+        "alert_dispatch_hook_constructed",
+        channels=[c.value for c in webhook_urls],
+        email_wired=email_identity is not None,
+    )
+
+    async def _hook(ctx: AlertDispatchContext) -> None:
+        # Resolve session_factory inside the closure so a test can build
+        # the hook without init_pool() running (the closure itself only
+        # fires at scheduler-fire time, by which point the pool is up).
+        session_factory = api_db.get_session_factory()
+        """Per-alert: INSERT alerts row + dispatch via webhook_pusher.
+
+        Two separate sessions per call:
+
+        1. INSERT into alerts using a fresh session_factory()-opened
+           session so we don't share state with the recon apply
+           orchestrator (which has its own session-per-event lifecycle).
+        2. Open a fresh httpx.AsyncClient + session for the dispatch.
+           Daily cadence makes per-call client OK; pooling is unnecessary
+           and the lifetime simplification is worth the per-call setup.
+
+        Errors propagate per the apply contract — the api-side scheduler
+        catches + logs at ``_start_reconciliation_scheduler``'s outer
+        try/except so a single Discord 5xx doesn't kill the loop.
+        """
+        # Combine title + body into the alerts.message column per the
+        # recommendation in services/reconciliation/apply.AlertDispatchContext
+        # docstring. The recon planner's title is short; body has the
+        # quantitative split. message is what shows up in the operator's
+        # Discord embed body.
+        message_text = f"{ctx.descriptor.title}\n\n{ctx.descriptor.body}"
+        async with session_factory() as ins_session:
+            row = (
+                await ins_session.execute(
+                    text(
+                        "INSERT INTO alerts ("
+                        "    account_id, severity, category, message, detail, "
+                        "    triggering_audit_event_uuid"
+                        ") VALUES ("
+                        "    :acct, :sev, :cat, :msg, CAST(:detail AS JSONB), :tau"
+                        ") RETURNING id"
+                    ),
+                    {
+                        "acct": ctx.account_id,
+                        "sev": ctx.descriptor.severity,
+                        "cat": ctx.descriptor.category,
+                        "msg": message_text,
+                        # Cast Python dict → JSON via SA's JSONB; serialize
+                        # explicitly so Decimal-as-str + None survive.
+                        "detail": json.dumps(ctx.descriptor.payload),
+                        "tau": ctx.triggering_audit_event_uuid,
+                    },
+                )
+            ).fetchone()
+            assert row is not None
+            alert_id = UUID(str(row.id))
+            await ins_session.commit()
+
+        log.info(
+            "reconciliation_alert_inserted",
+            alert_id=str(alert_id),
+            severity=ctx.descriptor.severity,
+            category=ctx.descriptor.category,
+            account_id=str(ctx.account_id),
+            env=ctx.env,
+        )
+
+        # Side note on enum cross-check: the dispatcher's planner reads
+        # AlertSeverity + AlertCategory enums from the DB row, not from
+        # the descriptor. Validating here is defense-in-depth — if a
+        # future planner change leaks a non-canonical value past
+        # Decimal-as-str checks, this raises before the http fan-out
+        # even attempts a malformed Discord webhook POST.
+        AlertSeverity(ctx.descriptor.severity)
+        AlertCategory(ctx.descriptor.category)
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as http_client:
+            async with session_factory() as disp_session:
+                report = await dispatch_alert(
+                    session=disp_session,
+                    alert_id=alert_id,
+                    http_client=http_client,
+                    webhook_urls=webhook_urls,
+                    email_identity=email_identity,
+                )
+        log.info(
+            "reconciliation_alert_dispatched",
+            alert_id=str(alert_id),
+            short_circuited=report.short_circuited,
+            delivery_status=dict(report.delivery_status),
+        )
+
+    return _hook
+
+
 async def _start_reconciliation_scheduler(
     settings: APISettings,
 ) -> tuple[object, object] | None:
@@ -260,9 +430,11 @@ async def _start_reconciliation_scheduler(
         flex_query_id=settings.flex_query_id,
         flex_query_token=settings.flex_query_token.get_secret_value(),
     )
+    alert_dispatch_hook = _build_alert_dispatch_hook(settings)
     callback = make_cycle_callback(
         config=config,
         session_factory=api_db.get_session_factory(),
+        alert_dispatch_hook=alert_dispatch_hook,  # type: ignore[arg-type]
     )
     scheduler = ReconciliationScheduler(callback=callback)
     task = asyncio.create_task(scheduler.run_forever(), name="reconciliation_scheduler.run_forever")
@@ -271,6 +443,7 @@ async def _start_reconciliation_scheduler(
         account_id=str(account_id),
         env=_audit_env_from_settings(settings),
         flex_query_id=settings.flex_query_id,
+        alert_dispatch_hook_wired=alert_dispatch_hook is not None,
     )
     return scheduler, task
 

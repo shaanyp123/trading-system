@@ -338,6 +338,80 @@ class APISettings(BaseSettings):
         ),
     )
 
+    # --- Discord + Resend for the recon-break alert dispatch hook --------
+    #
+    # When the reconciliation scheduler detects an actionable break, the
+    # api lifespan-constructed `alert_dispatch_hook` INSERTs an alerts
+    # row + invokes `services.webhook_pusher.dispatcher.dispatch_alert`
+    # which fans out to the Discord webhook URLs + Resend email below.
+    #
+    # All four fields are sops-sourced (per `deploy/webhook_pusher/README.md`
+    # which already documents these for the standalone webhook_pusher
+    # smoke; the api now consumes the SAME sops fields):
+    #
+    #   - discord.webhook_urls.alerts    → Discord #alerts channel
+    #     (P2 + P1 + P0 alerts ALL hit this channel)
+    #   - discord.webhook_urls.critical  → Discord #critical channel
+    #     (P0-only escalation; missing → P0 alerts skip the #critical leg
+    #      with a structured warning, the dispatcher will raise on the
+    #      missing channel since SEVERITY_TO_CHANNELS includes it for P0)
+    #   - resend.api_key                 → Resend HTTP API auth bearer
+    #   - resend.from_address            → "From" header on the email
+    #   - resend.to_address              → "To" header on the email
+    #
+    # When `discord.webhook_urls.alerts` is unset (Phase 1 day-1 boot
+    # before sops fields are populated), the api skips constructing the
+    # hook — recon still runs end-to-end + alerts log a WARNING from
+    # `services.reconciliation.apply._dispatch_alerts` ("hook not wired").
+    #
+    # P0 escalation (Resend) requires ALL of api_key + from_address +
+    # to_address. If any one is missing, `email_identity` stays None +
+    # the dispatcher's planner raises on a P0 break (the operator sees
+    # a `reconciliation_alert_dispatch_failed` log line + the alerts
+    # row's `delivery_status` JSONB shows the channel-level failure).
+    discord_webhook_url_alerts: SecretStr | None = Field(
+        default=None,
+        description=(
+            "Discord webhook URL for the #alerts channel. Sourced from "
+            "sops `discord.webhook_urls.alerts`. Required for the "
+            "reconciliation alert_dispatch_hook to fire; when unset the "
+            "hook is skipped (recon still runs)."
+        ),
+    )
+    discord_webhook_url_critical: SecretStr | None = Field(
+        default=None,
+        description=(
+            "Discord webhook URL for the #critical channel. Sourced "
+            "from sops `discord.webhook_urls.critical`. Required for P0 "
+            "escalation; if unset, P0 alerts will hit dispatcher "
+            "validation (SEVERITY_TO_CHANNELS includes #critical for P0)."
+        ),
+    )
+    resend_api_key: SecretStr | None = Field(
+        default=None,
+        description=(
+            "Resend HTTP API key. Sourced from sops `resend.api_key`. "
+            "Required for P0 email escalation; missing → "
+            "email_identity stays None + P0 alerts trip dispatcher "
+            "validation."
+        ),
+    )
+    resend_from_address: str | None = Field(
+        default=None,
+        description=(
+            "Resend `from` address. Sourced from sops "
+            "`resend.from_address`. See resend_api_key for the "
+            "missing-value semantics."
+        ),
+    )
+    resend_to_address: str | None = Field(
+        default=None,
+        description=(
+            "Resend `to` address. Sourced from sops `resend.to_address`. "
+            "See resend_api_key for the missing-value semantics."
+        ),
+    )
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> APISettings:

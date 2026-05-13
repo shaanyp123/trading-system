@@ -178,6 +178,35 @@ def main(argv: list[str] | None = None) -> int:
         ):
             os.environ["API_FLEX_QUERY_TOKEN"] = str(flex_token)
 
+    # Reconciliation alert_dispatch_hook (PR for follow-up #2; closes the
+    # operator-visibility seam from PR #135). Sources Discord webhook URLs
+    # + Resend identity from sops — same fields the standalone
+    # webhook_pusher uses (per `deploy/webhook_pusher/README.md`). When
+    # `discord.webhook_urls.alerts` is unset, the api skips constructing
+    # the hook entirely + recon still runs (see services/api/main.py
+    # `_build_alert_dispatch_hook` for the soft-fail semantics).
+    webhook_urls = (secrets.get("discord") or {}).get("webhook_urls") or {}
+    if "API_DISCORD_WEBHOOK_URL_ALERTS" not in os.environ:
+        url = webhook_urls.get("alerts")
+        if url and not _looks_like_placeholder(url):
+            os.environ["API_DISCORD_WEBHOOK_URL_ALERTS"] = url
+    if "API_DISCORD_WEBHOOK_URL_CRITICAL" not in os.environ:
+        url = webhook_urls.get("critical")
+        if url and not _looks_like_placeholder(url):
+            os.environ["API_DISCORD_WEBHOOK_URL_CRITICAL"] = url
+    if "API_RESEND_API_KEY" not in os.environ:
+        rk = (secrets.get("resend") or {}).get("api_key")
+        if rk and not _looks_like_placeholder(rk):
+            os.environ["API_RESEND_API_KEY"] = rk
+    if "API_RESEND_FROM_ADDRESS" not in os.environ:
+        fa = (secrets.get("resend") or {}).get("from_address")
+        if fa and not _looks_like_placeholder(fa):
+            os.environ["API_RESEND_FROM_ADDRESS"] = fa
+    if "API_RESEND_TO_ADDRESS" not in os.environ:
+        ta = (secrets.get("resend") or {}).get("to_address")
+        if ta and not _looks_like_placeholder(ta):
+            os.environ["API_RESEND_TO_ADDRESS"] = ta
+
     if "API_VERSION" not in os.environ:
         os.environ.setdefault("API_VERSION", os.environ.get("RELEASE_SHA", "dev"))
     if "API_ENVIRONMENT" not in os.environ:

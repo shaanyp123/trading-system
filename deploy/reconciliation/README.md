@@ -110,16 +110,90 @@ API_RECONCILIATION_SCHEDULER_ENABLED=false
 Restart the api. The api keeps running; the recon cycle does not fire
 until the toggle is flipped back to `true`.
 
+## Discord push on recon breaks
+
+The api lifespan constructs an `alert_dispatch_hook` closure that fires
+once per ACTIONABLE break (grace-period continuations are skipped):
+
+1. INSERT one row into the `alerts` table with
+   `severity` (P2 default; P0 when cash > $1000 or position > 5
+   contracts), `category='reconciliation_break'`, message rendering
+   the operator-readable title + body, payload JSONB carrying the
+   quantitative split, and `triggering_audit_event_uuid` for cross-
+   reference with the audit page.
+2. Invoke `services.webhook_pusher.dispatcher.dispatch_alert` which
+   fans out to:
+   - **P2:** Discord `#alerts` channel only.
+   - **P0:** `#alerts` + `#critical` + Resend email.
+
+### Sops fields the hook consumes
+
+```yaml
+discord:
+  webhook_urls:
+    alerts: https://discord.com/api/webhooks/<id>/<token>     # required
+    critical: https://discord.com/api/webhooks/<id>/<token>   # required for P0
+resend:
+  api_key: re_xxxxxxxxxxxxxxxxxxxx           # required for P0 (email)
+  from_address: ops@yourdomain.com           # required for P0
+  to_address: ops@yourdomain.com             # required for P0
+```
+
+`webhook_pusher` already consumes these (see
+`deploy/webhook_pusher/README.md`); the api now reads the SAME sops
+fields. No new sops material if you've already deployed `webhook_pusher`.
+
+### Wiring states
+
+- `discord.webhook_urls.alerts` **unset** → api logs
+  `alert_dispatch_hook_skipped_no_webhook_url` at boot. Recon cycle
+  still runs end-to-end; alerts are dropped on the floor with an
+  apply-layer WARNING (`reconciliation_alerts_dropped_no_hook`).
+- `discord.webhook_urls.alerts` **set**, `#critical` **unset** → P2
+  alerts deliver successfully; P0 alerts trip the dispatcher's planner
+  validation (SEVERITY_TO_CHANNELS includes #critical for P0). The
+  alert row's `delivery_status` JSONB shows the per-channel failure.
+- All five fields **set** → P2 + P0 paths both work. P0 includes the
+  Resend email leg.
+
+### Manual verification
+
+After deploying:
+
+```bash
+# 1. Inspect api boot logs for hook construction:
+ssh root@<vps> 'docker compose logs api 2>&1 | grep -E "alert_dispatch_hook_(constructed|skipped)" | tail -3'
+#   expect:  alert_dispatch_hook_constructed channels=['discord_alerts', 'discord_critical'] email_wired=true
+#   OR:      alert_dispatch_hook_skipped_no_webhook_url
+
+# 2. Force a manual recon cycle break (test path; NOT for live):
+#    Use psql to insert a fake position into positions_current that
+#    diverges from FlexQuery, then wait for the 22:30 UTC cycle OR
+#    restart the api with API_RECONCILIATION_SCHEDULER_TEST_MODE if
+#    that escape hatch is wired (Phase 1+ follow-up; today the
+#    operator waits for natural cycle).
+
+# 3. After cycle fires, check #alerts channel for the embed:
+#    Title: "Reconciliation break: <market> position divergence <N> contracts"
+#    Color: yellow (P2) or red (P0)
+```
+
 ## Phase 1+ follow-ups (not in this PR)
 
 - **Kill-switch hook:** when `should_invoke_kill_switch` is True (actionable
   break outside grace period), the api today logs but does NOT auto-halt.
   Operator manually halts via the `/system` page. Auto-halt lands when the
   risk-dispatch state-transition contract is exercised end-to-end.
-- **Prior-breaks lookup:** today the planner's `prior_breaks` is empty so
-  every detected break is actionable. The follow-up adds a query against
-  `reconciliation_breaks WHERE resolved_at_utc IS NULL AND detected_at_utc > now() - INTERVAL '24 hours'`
-  so the T+1 grace window classification works.
-- **Discord push:** detected breaks should produce a `#alerts` embed via
-  the existing `dispatch_alert` path. The wiring lands alongside the broader
-  P0/P1 alert routing follow-up.
+- **NAV-relative cash threshold:** today's $1000 absolute P0 threshold
+  may prove too noisy at scale; switching to bp-of-NAV (e.g., 5bp of
+  equity baseline) is a single planner edit when the absolute number
+  proves operationally insufficient.
+- **Notional-based position threshold:** today's 5-contract threshold
+  is asymmetric between high-multiplier markets (/MES 50x SPX → ~$130k)
+  and low-multiplier markets (/MBT 0.1x BTC → ~$35k). Switch to
+  contract_multiplier-based notional once the planner has the contracts
+  table available.
+- **Friday-weekend grace window:** today's 36h prior-breaks lookup
+  doesn't span the weekend (Friday → Monday is ~72h). Switch to
+  business-days math or extend window unconditionally if a real
+  Friday-detected break trips this.
