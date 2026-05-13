@@ -3981,3 +3981,92 @@ audit_log row count unchanged (still 2 — the LEAN heartbeat path is operationa
   3. After next 22:30 UTC cycle: `verify_chain --env paper` still passes; if real broker positions exist, `psql SELECT count(*) FROM positions_current, balances, fills, trades` shows non-zero counts post-fill
   4. Approve a real signal → IBKR fill → 4 new audit rows visible via `SELECT event_type, sequence_no FROM audit_log ORDER BY sequence_no DESC LIMIT 8`
 
+## 2026-05-13 (session 2) — Paper-trading production drill + defensive infra PRs (#152–#154)
+
+- **Context:** Prior session (PRs #146–#151 above) shipped PR-G/H/I/J/K — the fill side, risk-state gate, recon pre-write, auto-halt closure, and attribution roll-up planner. None had been exercised end-to-end against the real production paper system. This session's primary mission was a production signal-injection drill to validate the PR-G/H/I/J wiring, plus three defensive-infra PRs to close silent-failure surfaces.
+
+### Phase A — Production signal-injection drill (FOUND 2 IBKR-side defects)
+
+- **Drill design:** Inject one synthetic `signal_emitted` event mimicking what LEAN emits — `/MNQ` long, 1 contract, decision_price `22500.00`, all sizing_trace fields explicitly marked `anomaly_reasons=["production_drill_synthetic_signal"]` for greppability. Approve via the Discord bot bearer (only auth path that doesn't require WebAuthn while operator is away). Watch IBKR paper fill. Verify PR-G writes all 5 tables (fills / positions_current / balances / trades / orders.status) + 4 audit rows.
+- **What worked (audit-chain layers, PR-H gate, OrderPlacementWorker):**
+  1. **Signal injection** — `POST /api/internal/lean/signals` returned 202 with `signal_id=019e226b-ed0b-71ff-b441-154e449dcb2f` + `audit_event_uuid=019e226b-ecf1-7360-a312-4a507f9f35d1`. Audit chain extended seq=4 (signal_emitted) + seq=5 (slippage_calibration_recalibrated bootstrap on first signal arrival per `services/qc_adapter/signal_ingestion.py`).
+  2. **Bot-bearer approval** — `POST /api/signals/<id>/approve` (PR-H gate: state=NORMAL → permits) returned 200 + `audit_sequence_no=6` (signal_approved). Auth path traversed `BotAuthMiddleware` → bot session injected → CSRF skip → handler → `apply_signal_dispatch` → audit + UPDATE.
+  3. **OrderPlacementWorker** picked up the approved signal within 5s (next poll tick). Wrote orders row + appended `order_placed` audit row (seq=7). `ibkr_order_placed` log line shows `broker_order_id=3, status=pending_submit`.
+- **What broke (two real production defects):**
+  1. **`/MNQ` continuous symbol → IBKR ValidationError.** ib-async logged:
+     ```
+     IBKR API validation warning: Trade(contract=Future(symbol='MNQ', exchange='CME', currency='USD'),
+       order=LimitOrder(orderId=3, ...lmtPrice=22500.0, tif='DAY', orderRef='d11bc1dc-d511e94c-019e226b-0'),
+       orderStatus=OrderStatus(orderId=3, status='ValidationError', ...),
+       log=[...TradeLogEntry(..., status='ValidationError',
+         message="Warning 321, reqId 3: Error validating request.-'bD' : cause - Please enter a local symbol or an expiry", errorCode=321)])
+     ```
+     IBKR cannot route a futures order without a specific contract month. The backend's `services/execution/ibkr_adapter.py::place_order` is sending a generic `Future(symbol='MNQ', exchange='CME', currency='USD')` — no `lastTradeDateOrContractMonth`. This is production-blocking for the entire futures universe (`/MES /MNQ /MYM /M2K /MGC /MCL /MBT`). ETFs (TLT/IEF/SHY/TIP) would route fine because they're `Stock`-typed; the bug is futures-only.
+  2. **IBKR `ValidationError` status not propagated to backend `orders` row.** The OrderPlacementWorker's `_on_order_status` callback only acts on `status='filled'`. When IBKR fires `status='ValidationError'`, the backend ignores it; `orders.status` stays at `'pending'` forever, `rejection_reason` stays NULL. The order is dead on the broker side but the backend doesn't know. This is a separate defect from the symbol issue and would also affect Cancelled / Rejected lifecycle events.
+- **Final drill state (audit chain CLEAN at 7 rows; no fill data):**
+  | sequence_no | event_type | source |
+  |---|---|---|
+  | 1 | state_transition_normal_to_halt | (prior session) |
+  | 2 | state_transition_halt_to_convalescent | (prior session) |
+  | 3 | state_transition_convalescent_to_normal | (prior session) |
+  | 4 | signal_emitted | DRILL |
+  | 5 | slippage_calibration_recalibrated | DRILL bootstrap |
+  | 6 | signal_approved | DRILL (bot bearer) |
+  | 7 | order_placed | DRILL (worker) |
+
+  `verify_chain --env paper` returns `CHAIN OK: 7 rows verified` post-drill. Tables populated: `signals` (1 row, status=pending → approved → orders row created), `orders` (1 row, status=pending forever). Tables empty: `fills` / `positions_current` / `balances` / `trades` (correctly, since no fill ever fired).
+- **Defects → operator follow-up needed:**
+  1. **Continuous-futures resolver.** `services/execution/ibkr_adapter.py::place_order` must resolve continuous symbols (`/MNQ`) to a specific contract month (`MNQM6` for June 2026, or whatever the front month is) before submitting to IBKR. Options:
+     - **(a) Strategy-side resolution.** LEAN's `v1_strategy.py` already uses `DataMappingMode.OPEN_INTEREST` + per-expiry zips for backtest; expose the resolved Symbol to the `signal_emitted` payload, and the backend uses that.
+     - **(b) Backend-side resolution.** Backend queries IBKR for the front-month contract via `reqContractDetails` before placing the order. Adds latency + a failure mode but keeps LEAN simple.
+     - **(c) Universe-only-ETFs Phase 1.** Disable futures markets in production until the resolver lands; backtest-only on futures.
+     A02 BINDS — `services/execution/**` is on the forbidden whitelist. Needs `risk-review-approved`.
+  2. **OrderStatus lifecycle propagation.** Extend `_on_order_status` in `services/risk/order_placement_worker.py` to react to `cancelled` / `rejected` / `ValidationError` statuses by updating `orders.status` + `rejection_reason` + emitting an `order_rejected` or `order_cancelled` audit event. A02 BINDS — needs `risk-review-approved`.
+  3. **Cleanup of the orphan order.** The drill's orders row at `id=019e226c-de19-7c13-9084-873ed850d0d7` (signal_id `019e226b-ed0b-71ff-b441-154e449dcb2f`) is in `status='pending'`. IBKR has already rejected it (ValidationError) so it's NOT in IBKR's open orders. Backend cleanup: manual `UPDATE orders SET status='rejected', rejection_reason='IBKR_VALIDATION_ERROR_321_MISSING_EXPIRY' WHERE id='019e226c-de19-7c13-9084-873ed850d0d7';` once operator decides on the policy. Recon at 22:30 UTC will see broker has 0 /MNQ positions vs backend's 0 /MNQ in positions_current → no break (positions match; orphan order is irrelevant to recon). This is documented in Phase B.2 below.
+
+### Phase B — Natural-cycle observation
+
+- **21:30 UTC LEAN cycle:** [PLACEHOLDER — captured post-session via separate observation; the orchestration agent's session ended before this fired. Operator should grep lean_local logs for the cycle outcome + check `signals` table for any new rows since 17:39 UTC. Expected: zero new signals (LEAN's v1_trend_following typically does not fire daily; only on regime breaks). If signals DID fire, they sit at `status=pending` awaiting operator approval — DO NOT auto-approve.]
+- **22:30 UTC recon cycle:** [PLACEHOLDER — same as above. Expected: recon converges (broker 0 /MNQ = backend 0 /MNQ in positions_current). The orphan orders row is irrelevant to recon. No PR-J auto-halt expected. risk_state should remain NORMAL.]
+
+### Phase C — Three defensive-infra PRs opened (no merge in session)
+
+- **PR #152 — `feat(deploy): add docker healthchecks to 4 unmonitored containers`.** Adds healthcheck stanzas for `caddy` (wget against admin API), `lean_local` (pgrep launcher .dll), `discord_bot` (pgrep services.discord_bot), `webhook_pusher` (pgrep services.webhook_pusher). Adds `procps` to runtime stages of `services/discord_bot/Dockerfile` + `services/webhook_pusher/Dockerfile` since python:3.11-slim lacks pgrep by default. caddy:2-alpine + quantconnect/lean:latest already ship the tools. Hot-fix scope (`deploy/**` + `services/**/Dockerfile`); no `risk-review-approved` label.
+- **PR #153 — `fix(web): post-pivot label — recon source is IBKR FlexQuery, not QC`.** Single-line copy fix in `apps/web/src/components/system/reconciliation-tile.tsx:87` — "QC (Phase 1)" → "IBKR FlexQuery". Leftover from pre-pivot ObjectStore architecture (DP-025 retired 2026-05-12). `pnpm typecheck` + `pnpm lint --max-warnings 0` pass. Hot-fix scope (`apps/web/**`); no label.
+- **PR #154 — `feat(api): LEAN heartbeat freshness probe — System page surface`.** New `services/api/heartbeats.py` (in-memory `HeartbeatRegistry` keyed by `HeartbeatService` Literal = "lean_cycle"; asyncio.Lock-serialized writes; module-level singleton). LEAN POST path stamps the registry on every `lean_strategy_initialized` / `lean_cycle_heartbeat`. New `GET /api/system/heartbeats` returns per-service `last_heartbeat_utc` / `seconds_since` / freshness ∈ {fresh, stale, unknown} / count. Stale threshold for `lean_cycle` = 26h. 22 unit tests across 6 `Test*` classes. **Scope intentionally narrow** — registry + endpoint only; the lifespan coroutine that fires `dispatch_alert(severity="P2", category="heartbeat_stale")` + the `HEARTBEAT_STALE_DETECTED` audit event type land in follow-ups. **Why in-memory:** writing heartbeats to `audit_log` per cycle floutes the "no operational pings in the chain" rule (A22 + the comment atop `services/api/schemas/lean.py`); `liveness_probes` is semantically a watchdog-ack channel. Hot-fix scope (`services/api/**` only); no `risk-review-approved` label.
+- **CI state at session end:** Each PR's branch ran `make lint` + `make typecheck` + `make test` locally green. Full test suite at 1513 (was 1491 pre-session; +22 from PR #154 heartbeat tests). mypy --strict clean across 144 source files (was 142).
+
+### Audit taxonomy growth
+
+No new event types this session. The PR #154 follow-up will add `HEARTBEAT_STALE_DETECTED` when the alerting coroutine lands.
+
+### VPS state at session end
+
+- origin/main HEAD: `1561ae1` (PR #151; unchanged from session start — no PRs merged this session).
+- 3 PRs opened + ready for operator review: #152 (healthchecks), #153 (label), #154 (heartbeat probe).
+- audit_log: 7 rows (was 3; +4 from drill: signal_emitted + slippage_bootstrap + signal_approved + order_placed).
+- signals: 1 row (status=approved).
+- orders: 1 row (status=pending; orphan — IBKR rejected with ValidationError 321; needs operator cleanup decision per defect #2 above).
+- fills / positions_current / balances / trades: empty (drill did not produce a fill).
+- risk_state: NORMAL.
+
+### Operator follow-ups (ordered by urgency)
+
+1. **Defect #1 (continuous-futures resolver in IBKR adapter)** — blocks live trading for the entire futures universe. Highest priority. A02 binding; needs `risk-review-approved` PR.
+2. **Defect #2 (OrderStatus ValidationError/Cancelled/Rejected propagation)** — backend orders table can drift from broker reality. High priority. A02 binding; needs `risk-review-approved` PR.
+3. **Orphan orders cleanup** — manual UPDATE on row `019e226c-de19-7c13-9084-873ed850d0d7` (drill artifact). Trivial once defect #2 is fixed (would have auto-resolved). Low priority.
+4. **Review + merge** PRs #152, #153, #154 in any order (independent).
+5. **PR #154 follow-up: alerting coroutine + `HEARTBEAT_STALE_DETECTED` audit event.** Builds on the in-memory registry; needs `risk-review-approved` for the audit-taxonomy + services/risk additions.
+6. **PR-G exit path** (still outstanding from prior session) — `UnsupportedFillScenarioError` raised on exit fills; needs the close-trade logic. Not addressed this session.
+7. **PR-K wiring into eod_cycle** — depends on PR-G exit path.
+
+### What this session proved + did not prove
+
+- **Proved:** Signal-injection POST path (LEAN bearer auth + payload validation + signal_emitted ingestion + slippage bootstrap) works in production. Discord bot bearer auth path bypasses CSRF + WebAuthn correctly. PR-H state gate permits NORMAL approvals. OrderPlacementWorker claims + places orders. Audit chain integrity holds across the new code paths (chain CLEAN at 7 rows post-drill).
+- **NOT proved:** The fill side (PR-G `fill_processor.process_fill_event`). IBKR rejected the order before any orderStatus=filled event fired. The 4 audit rows + 5 tables PR-G writes are still untested in production. To prove PR-G, the operator needs either (a) defect #1 fixed + retry with a real futures contract month, or (b) inject an ETF signal (TLT/IEF/SHY/TIP — Stock-typed, no expiry needed) and verify fill end-to-end.
+
+### Operator pre-authorizations carried forward
+
+SSH to VPS, git push, gh pr create (NOT merge — explicit prompt safety rail), branch creation off main, sops READ (not edit), curl against `/api/**` via LEAN bearer + bot bearer (already in sops).
+
+
