@@ -41,12 +41,19 @@ hook (which the api lifespan wires to insert an alerts row + invoke
 the api wiring follow-up PR lands), alerts are dropped on the floor +
 a structured warning is logged so the operator knows to wire it.
 
-**Prior-breaks lookup deliberately empty in Phase 1:** the planner's
-``prior_breaks`` parameter classifies today's breaks as within-grace
-vs. actionable. Phase 1 starts the recon ledger from zero (no prior
-breaks); the empty tuple means everything detected today is actionable.
-The follow-up PR adding the prior-breaks query lands when the recon
-table has its first row of history to query against.
+**Prior-breaks lookup wired:** the planner's ``prior_breaks`` parameter
+classifies today's breaks as within-grace vs. actionable. We materialize
+prior breaks from ``reconciliation_breaks`` via
+:func:`fetch_prior_breaks_within_grace_window` — unresolved rows whose
+``detected_at_utc`` falls within the T+1 grace window
+(:data:`DEFAULT_PRIOR_BREAKS_WINDOW_HOURS` = 36h, which is T+1 + a
+half-day buffer for late-Friday breaks bridging the weekend).
+
+When the table is empty (Phase 1 day-1, before the first cycle inserts
+anything), the helper returns ``()`` cleanly + everything detected today
+is actionable. Resolved rows + rows older than the window are excluded
+so the planner doesn't fire a stale grace-classification long after the
+operator has manually closed a break.
 
 **A02 BINDS** — ``services/reconciliation/**`` is on the forbidden
 whitelist; `risk-review-approved` required.
@@ -86,6 +93,8 @@ from services.reconciliation.recon import (
     BackendView,
     BrokerSource,
     BrokerView,
+    PriorBreak,
+    ReconciliationMetric,
     plan_reconciliation_check,
 )
 
@@ -98,6 +107,34 @@ log = structlog.get_logger()
 #: as-is. Matches the convention enforced in
 #: ``strategies.v1_trend_following.parameters.V1_CANDIDATE_UNIVERSE``.
 _FUTURES_ASSET_CATEGORIES: Final[frozenset[str]] = frozenset({"FUT"})
+
+
+#: Default lookback window for prior-break classification. T+1 (24h) +
+#: a half-day buffer (12h) = 36h. Covers the operationally common case:
+#: an EOD recon at 18:30 ET on day N detects a break; tomorrow's EOD at
+#: 18:30 ET on day N+1 (~24h later) classifies the same break as a
+#: grace-period continuation, not a fresh break worth re-alerting on.
+#:
+#: Friday-detected breaks need weekend coverage through Monday's recon
+#: (~72h elapsed). The 36h window does NOT cover that case — Monday's
+#: cycle would treat Friday's break as fresh. Documented as a known
+#: limitation; operators monitor weekend breaks via the system page +
+#: re-classify manually if needed. Phase 2 follow-up could switch the
+#: window to business-days math (skip weekends) or extend to 72h
+#: unconditionally if operator demand emerges.
+DEFAULT_PRIOR_BREAKS_WINDOW_HOURS: Final[int] = 36
+
+
+# Reverse map from the schema's TEXT ``metric`` column → the planner's
+# enum. Schema values are free-form per backend-spec §3.15 + alembic
+# 0004; we lock the reverse here to the canonical pair the planner emits.
+# Unknown values (e.g., a Phase 2 ``net_liquidation`` metric) skip the
+# row rather than crash — the planner's grace-match key requires a
+# known metric, so an unknown row would never match anyway.
+_METRIC_BY_STRING: Final[dict[str, ReconciliationMetric]] = {
+    ReconciliationMetric.POSITION_QTY.value: ReconciliationMetric.POSITION_QTY,
+    ReconciliationMetric.CASH_USD.value: ReconciliationMetric.CASH_USD,
+}
 
 
 CycleCallback = Callable[[date], Awaitable[None]]
@@ -227,6 +264,76 @@ def build_broker_view(snapshot: ReconciliationSnapshot) -> BrokerView:
     )
 
 
+async def fetch_prior_breaks_within_grace_window(
+    session_factory: async_sessionmaker[Any],
+    *,
+    account_id: UUID,
+    window_hours: int = DEFAULT_PRIOR_BREAKS_WINDOW_HOURS,
+) -> tuple[PriorBreak, ...]:
+    """Materialize unresolved prior breaks within the T+1 grace window.
+
+    Reads from ``reconciliation_breaks`` filtered by:
+
+      * ``account_id`` — the cycle's account.
+      * ``resolved_at_utc IS NULL`` — operator hasn't manually closed it
+        and no subsequent cycle has re-resolved it.
+      * ``detected_at_utc > NOW() - INTERVAL '<window_hours> hours'`` —
+        within the grace window. Older unresolved breaks are stale; the
+        operator should have triaged them by now and the planner doesn't
+        re-classify them as grace continuations on every cycle.
+
+    Returns a tuple of :class:`PriorBreak` matching the planner's input
+    shape. Empty tuple on first run / empty table is the normal Phase 1
+    boot path — every detected break today is then actionable.
+
+    Rows whose ``metric`` is unknown (not in :data:`_METRIC_BY_STRING`)
+    are skipped silently — a Phase 2 metric like ``net_liquidation``
+    landing in the schema before the planner knows about it would never
+    match a current break anyway, so the row contributes nothing.
+
+    Uses ``app_service`` Postgres role (inherited via session_factory)
+    per alembic 0006 grants. SELECT-only.
+
+    A05 enforced: ``Decimal(str(row.delta))`` round-trip preserves
+    precision and avoids float coercion. A06: ``NOW()`` is timezone-aware
+    on Postgres 16 with the ``timestamptz`` column type.
+    """
+    async with session_factory() as session:
+        rows = (
+            await session.execute(
+                text(
+                    "SELECT metric, market, delta "
+                    "FROM reconciliation_breaks "
+                    "WHERE account_id = :acct "
+                    "  AND resolved_at_utc IS NULL "
+                    "  AND detected_at_utc > NOW() - "
+                    "      (:window_hours * INTERVAL '1 hour') "
+                    "ORDER BY detected_at_utc DESC"
+                ),
+                {"acct": account_id, "window_hours": window_hours},
+            )
+        ).fetchall()
+
+    prior: list[PriorBreak] = []
+    for row in rows:
+        metric_str = row.metric
+        if metric_str not in _METRIC_BY_STRING:
+            log.warning(
+                "reconciliation_eod_cycle_prior_break_unknown_metric",
+                metric=metric_str,
+                market=row.market,
+            )
+            continue
+        prior.append(
+            PriorBreak(
+                metric=_METRIC_BY_STRING[metric_str],
+                market=row.market,
+                delta=Decimal(str(row.delta)),
+            )
+        )
+    return tuple(prior)
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -284,11 +391,21 @@ async def run_eod_cycle(
 
     backend_view = await build_backend_view(session_factory, account_id=config.account_id)
     broker_view = build_broker_view(snapshot)
+    prior_breaks = await fetch_prior_breaks_within_grace_window(
+        session_factory, account_id=config.account_id
+    )
+    log.info(
+        "reconciliation_eod_cycle_prior_breaks_loaded",
+        account_id=str(config.account_id),
+        env=config.env,
+        count=len(prior_breaks),
+        window_hours=DEFAULT_PRIOR_BREAKS_WINDOW_HOURS,
+    )
 
     plan = plan_reconciliation_check(
         backend_view=backend_view,
         broker_view=broker_view,
-        prior_breaks=(),
+        prior_breaks=prior_breaks,
         detected_at_utc=snapshot.pulled_at_utc,
     )
 
@@ -347,10 +464,12 @@ def make_cycle_callback(
 
 
 __all__ = [
+    "DEFAULT_PRIOR_BREAKS_WINDOW_HOURS",
     "CycleCallback",
     "EodCycleConfig",
     "build_backend_view",
     "build_broker_view",
+    "fetch_prior_breaks_within_grace_window",
     "make_cycle_callback",
     "run_eod_cycle",
 ]

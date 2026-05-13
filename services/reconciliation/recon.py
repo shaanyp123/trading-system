@@ -61,14 +61,14 @@ Alert descriptors emitted (Phase 1 — operator-visibility wiring):
   audit + reconciliation_breaks row but NO alert — the operator already
   saw the alert on the first detection, repeating it on every cycle
   would be operational noise.
-- Severity is fixed at ``"P2"`` in Phase 1 → routed to the ``#alerts``
-  Discord channel only via the existing severity-to-channels table in
-  ``services.webhook_pusher.payloads.SEVERITY_TO_CHANNELS``. P0/P1
-  escalation (e.g., >5% position divergence to ``#critical`` + email)
-  is deferred to a follow-up PR after the operator sees the first real
-  break and decides the policy. The natural trigger for that follow-up
-  is ``should_invoke_kill_switch`` — a confirmed actionable break is
-  what's already shifted to P0 in the existing planner shape.
+- Severity per break is computed by :func:`_classify_severity` from
+  break magnitude. Default :data:`DEFAULT_RECONCILIATION_ALERT_SEVERITY`
+  ("P2" → routed to the ``#alerts`` Discord channel only via
+  ``services.webhook_pusher.payloads.SEVERITY_TO_CHANNELS``); escalates
+  to "P0" (→ ``#alerts`` + ``#critical`` + email) when cash divergence
+  exceeds :data:`CASH_P0_THRESHOLD_USD` ($1000) or position divergence
+  exceeds :data:`POSITION_P0_DELTA_CONTRACTS` (5 contracts). Thresholds
+  are operator-tunable; revisit when the first real P0 fires.
 - Category is fixed at ``"reconciliation_break"`` (canonical
   ``services.webhook_pusher.payloads.AlertCategory.RECONCILIATION_BREAK``
   string value; also a member of the alembic 0004 ``alert_category``
@@ -188,11 +188,48 @@ AlertSeverityLiteral = Literal["P0", "P1", "P2"]
 AlertCategoryLiteral = Literal["reconciliation_break"]
 
 
-#: Locked default severity for reconciliation-break alerts in Phase 1.
-#: All breaks → P2 → ``#alerts`` Discord channel only. P0/P1 escalation
-#: (e.g. >5% position divergence → ``#critical`` + email) is a follow-up
-#: PR after the operator sees the first real break + decides the policy.
+#: Default severity floor for reconciliation-break alerts in Phase 1.
+#: Used as the fallback when neither the cash nor position threshold is
+#: crossed. P0 escalation thresholds live in
+#: :data:`CASH_P0_THRESHOLD_USD` + :data:`POSITION_P0_DELTA_CONTRACTS`
+#: below; the classifier in :func:`_classify_severity` picks P0 vs this.
+#:
+#: Routing: P2 → ``#alerts`` Discord channel only;
+#: P0 → ``#alerts`` + ``#critical`` + Resend email (per
+#: ``services.webhook_pusher.payloads.SEVERITY_TO_CHANNELS``).
 DEFAULT_RECONCILIATION_ALERT_SEVERITY: Final[AlertSeverityLiteral] = "P2"
+
+
+#: Cash-divergence threshold above which a reconciliation break escalates
+#: to P0 (→ ``#alerts`` + ``#critical`` + Resend email). Strict ``>``
+#: comparison: a delta of exactly $1000.00 is P2, $1000.01 is P0.
+#:
+#: Operator pre-authorized this default in the PR #138 close-out follow-up
+#: list. Conservative-vs-noisy trade-off: $1000 on a 6-figure NAV is ~1bp
+#: divergence — well above tolerance band ($5 abs / 1bp bps), so anything
+#: > $1000 is meaningful enough to wake the operator. Tunable post-launch
+#: once the operator sees the first real cash break magnitudes; revisit
+#: in the decisions-log entry that ships with this PR.
+#:
+#: Phase 1+ enhancement: switch to a NAV-relative threshold (e.g., 5bp of
+#: equity baseline) once the planner has access to NAV (currently it does,
+#: via ``backend_view.equity_baseline`` — but the bps-of-NAV lift is
+#: deferred until the absolute threshold proves operationally insufficient).
+CASH_P0_THRESHOLD_USD: Final[Decimal] = Decimal("1000.00")
+
+
+#: Position-divergence threshold (in contracts) above which a
+#: reconciliation break escalates to P0. Strict ``>`` comparison: a delta
+#: of exactly 5 contracts is P2, 6 is P0. Symmetric on direction
+#: (``abs(delta)`` is what's compared).
+#:
+#: Operator pre-authorized this default in the PR #138 close-out follow-up
+#: list. Contract-count-based (not notional) for simplicity — Phase 1+
+#: can switch to notional once the planner knows ``contract_multiplier``
+#: per market. On /MES (50x SPX) 5 contracts ~= $130k notional; on /MBT
+#: (0.1x BTC) 5 contracts ~= $35k notional. Conservative for /MES, noisy
+#: for /MBT — operator can tune after first real position break fires.
+POSITION_P0_DELTA_CONTRACTS: Final[Decimal] = Decimal("5")
 
 
 #: Locked category for reconciliation-break alerts. Mirrors
@@ -344,10 +381,12 @@ class AlertDescriptor:
       ``audit_event_uuid`` after audit writes land. This lets the hook
       stamp ``alerts.triggering_audit_event_uuid`` correctly for
       cross-reference in the operator's incident-review workflow.
-    - ``severity`` — locked to ``"P2"`` in Phase 1 per
-      :data:`DEFAULT_RECONCILIATION_ALERT_SEVERITY`. Routes to
-      ``#alerts`` Discord channel only via the existing
-      ``SEVERITY_TO_CHANNELS`` table.
+    - ``severity`` — computed per break by :func:`_classify_severity`
+      from break magnitude. Default
+      :data:`DEFAULT_RECONCILIATION_ALERT_SEVERITY` ("P2" →
+      ``#alerts``-only); escalates to "P0" (→ ``#alerts`` + ``#critical``
+      + email) when cash > :data:`CASH_P0_THRESHOLD_USD` or position
+      > :data:`POSITION_P0_DELTA_CONTRACTS`.
     - ``category`` — locked to ``"reconciliation_break"`` per
       :data:`RECONCILIATION_BREAK_ALERT_CATEGORY` (matches alembic 0004
       ``alert_category`` Postgres enum + canonical
@@ -777,6 +816,12 @@ def _build_alerts(
     orchestrator uses this index to look up the matching audit event
     UUID after the audit writes land.
 
+    Severity per break is computed by :func:`_classify_severity` —
+    crosses :data:`CASH_P0_THRESHOLD_USD` or
+    :data:`POSITION_P0_DELTA_CONTRACTS` → P0 (→ ``#alerts`` + ``#critical``
+    + email); else :data:`DEFAULT_RECONCILIATION_ALERT_SEVERITY` (P2 →
+    ``#alerts``-only).
+
     Title + body are operator-readable English strings. Payload is a
     JSONB-friendly dict with Decimal-as-str (A05) + ISO-format timestamps
     (A06) so it can land directly into ``alerts.detail`` JSONB.
@@ -789,7 +834,7 @@ def _build_alerts(
         alerts.append(
             AlertDescriptor(
                 triggering_break_index=idx,
-                severity=DEFAULT_RECONCILIATION_ALERT_SEVERITY,
+                severity=_classify_severity(brk),
                 category=RECONCILIATION_BREAK_ALERT_CATEGORY,
                 title=_render_alert_title(brk),
                 body=_render_alert_body(brk, ts_iso=ts_iso),
@@ -797,6 +842,47 @@ def _build_alerts(
             )
         )
     return tuple(alerts)
+
+
+def _classify_severity(brk: ReconciliationBreak) -> AlertSeverityLiteral:
+    """Pick alert severity for one actionable break.
+
+    P0 (→ ``#alerts`` + ``#critical`` + email) when:
+
+    * ``CASH_USD`` break with ``abs(delta) > CASH_P0_THRESHOLD_USD`` ($1000)
+    * ``POSITION_QTY`` break with
+      ``abs(delta) > POSITION_P0_DELTA_CONTRACTS`` (5)
+
+    Else: :data:`DEFAULT_RECONCILIATION_ALERT_SEVERITY` (P2 →
+    ``#alerts``-only).
+
+    Strict ``>`` comparison: an exact-threshold delta is P2, anything
+    above the threshold is P0. Symmetric on direction
+    (``abs(delta)`` is what's compared, not signed delta).
+
+    Phase 1+ extensions (deferred until operator sees first real break):
+
+    * NAV-relative cash threshold (e.g., 5bp of equity baseline) when the
+      $1000 absolute proves too noisy at scale.
+    * Notional-based position threshold using ``contract_multiplier`` from
+      the contracts table; switches the operator-friendly /MES vs /MBT
+      asymmetry (5 contracts /MES ≈ $130k vs /MBT ≈ $35k).
+
+    A02-safe: pure policy. The classifier is exercised only by
+    :func:`_build_alerts` which itself runs inside the planner — the
+    apply orchestrator + the api scheduler glue do not call this directly.
+    """
+    if brk.metric is ReconciliationMetric.CASH_USD:
+        if abs(brk.delta) > CASH_P0_THRESHOLD_USD:
+            return "P0"
+        return DEFAULT_RECONCILIATION_ALERT_SEVERITY
+    if brk.metric is ReconciliationMetric.POSITION_QTY:
+        if abs(brk.delta) > POSITION_P0_DELTA_CONTRACTS:
+            return "P0"
+        return DEFAULT_RECONCILIATION_ALERT_SEVERITY
+    # Defensive: any future ReconciliationMetric value falls back to the
+    # default severity until its threshold policy is added here.
+    return DEFAULT_RECONCILIATION_ALERT_SEVERITY
 
 
 def _render_alert_title(brk: ReconciliationBreak) -> str:
@@ -866,8 +952,10 @@ def _render_alert_payload(brk: ReconciliationBreak, *, ts_iso: str) -> dict[str,
 __all__ = [
     "CASH_ABS_TOLERANCE_USD",
     "CASH_BPS_TOLERANCE",
+    "CASH_P0_THRESHOLD_USD",
     "DEFAULT_RECONCILIATION_ALERT_SEVERITY",
     "DIVIDEND_WIDENING_FACTOR",
+    "POSITION_P0_DELTA_CONTRACTS",
     "POSITION_QTY_TOLERANCE",
     "RECONCILIATION_BREAK_ALERT_CATEGORY",
     "AlertCategoryLiteral",
