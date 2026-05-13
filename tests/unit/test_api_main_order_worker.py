@@ -915,3 +915,254 @@ class TestEntrypointAlertDispatchMapping:
 
         assert "API_DISCORD_WEBHOOK_URL_ALERTS" not in os.environ
         assert "API_DISCORD_WEBHOOK_URL_CRITICAL" not in os.environ
+
+
+# ---------------------------------------------------------------------------
+# PR E — float-secret guard (closes PR #138 follow-up #3)
+# ---------------------------------------------------------------------------
+
+
+class TestFindFloatSecretPaths:
+    """``_find_float_secret_paths`` walks the sops dict tree + returns dotted
+    paths where leaf values are Python floats.
+
+    Catches the YAML numeric-coercion gotcha from Docs/decisions-log.md
+    2026-05-12 (late) — IBKR's 24-digit FlexQuery token, unquoted in sops,
+    round-trips through sops's float-aware writer as scientific notation,
+    next read returns Python float instead of str.
+    """
+
+    def test_empty_dict_returns_empty(self) -> None:
+        from services.api.entrypoint import _find_float_secret_paths
+
+        assert _find_float_secret_paths({}) == []
+
+    def test_top_level_float_detected(self) -> None:
+        from services.api.entrypoint import _find_float_secret_paths
+
+        assert _find_float_secret_paths({"flex_token": 1.527e23}) == ["flex_token"]
+
+    def test_nested_float_detected_with_dotted_path(self) -> None:
+        from services.api.entrypoint import _find_float_secret_paths
+
+        secrets = {"ibkr": {"flex_query_token": 1.527e23, "flex_query_id": 1505530}}
+        assert _find_float_secret_paths(secrets) == ["ibkr.flex_query_token"]
+
+    def test_int_not_detected(self) -> None:
+        # ibkr.flex_query_id is legitimately an int per sops yaml; must
+        # NOT trip the guard.
+        from services.api.entrypoint import _find_float_secret_paths
+
+        assert _find_float_secret_paths({"ibkr": {"flex_query_id": 1505530}}) == []
+
+    def test_str_not_detected(self) -> None:
+        # Strings (passwords, tokens, etc.) are the expected type for
+        # secret leaves; must NOT trip the guard.
+        from services.api.entrypoint import _find_float_secret_paths
+
+        secrets = {
+            "postgres": {"app_service_password": "hexpwd"},
+            "ibkr": {"flex_query_token": "152748490360752094531342"},
+            "discord": {"api_bearer_token": "abc-def"},
+        }
+        assert _find_float_secret_paths(secrets) == []
+
+    def test_bool_and_none_not_detected(self) -> None:
+        # YAML booleans + nulls don't coerce to float; harmless.
+        from services.api.entrypoint import _find_float_secret_paths
+
+        secrets = {"flag": True, "missing": None, "other_flag": False}
+        assert _find_float_secret_paths(secrets) == []
+
+    def test_multiple_floats_returned(self) -> None:
+        from services.api.entrypoint import _find_float_secret_paths
+
+        secrets = {
+            "ibkr": {"flex_query_token": 1.5e23},
+            "discord": {"api_bearer_token": 2.5e23},
+        }
+        result = _find_float_secret_paths(secrets)
+        assert set(result) == {"ibkr.flex_query_token", "discord.api_bearer_token"}
+
+    def test_list_walked_recursively(self) -> None:
+        from services.api.entrypoint import _find_float_secret_paths
+
+        secrets = {"webhook_urls": ["url-1", 1.5e23, "url-2"]}
+        assert _find_float_secret_paths(secrets) == ["webhook_urls.[1]"]
+
+    def test_deeply_nested_float_detected(self) -> None:
+        from services.api.entrypoint import _find_float_secret_paths
+
+        secrets = {"a": {"b": {"c": {"d": 1.5e23}}}}
+        assert _find_float_secret_paths(secrets) == ["a.b.c.d"]
+
+    def test_root_float_returns_root_label(self) -> None:
+        from services.api.entrypoint import _find_float_secret_paths
+
+        assert _find_float_secret_paths(1.5e23) == ["<root>"]
+
+
+class TestEntrypointFloatSecretGuard:
+    """``main()`` exits with the operator-readable hint when a float secret
+    is detected. End-to-end wiring of the guard.
+    """
+
+    def test_float_token_exits_with_hint(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Any,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from services.api import entrypoint
+
+        # Simulate sops yaml that has been mangled by YAML numeric coercion.
+        # PyYAML safe_load sees `1.527484903607521e+23` as float, NOT str.
+        yaml_text = (
+            "postgres:\n"
+            "  app_service_password: hexpwd\n"
+            "ibkr:\n"
+            "  flex_query_token: 1.527484903607521e+23\n"
+        )
+        secrets_path = tmp_path / "decrypted.yaml"
+        secrets_path.write_text(yaml_text)
+        monkeypatch.setenv("API_SECRETS_PATH", str(secrets_path))
+        monkeypatch.delenv("API_DATABASE_URL", raising=False)
+        monkeypatch.setenv("API_ENVIRONMENT", "paper")
+
+        called: dict[str, Any] = {}
+
+        def fake_execvp(cmd: str, argv: list[str]) -> None:
+            called["cmd"] = cmd
+
+        monkeypatch.setattr(entrypoint.os, "execvp", fake_execvp)
+        exit_code = entrypoint.main(["true"])
+        assert exit_code == 2
+        captured = capsys.readouterr()
+        # Operator-readable hint surfaces the path + the fix + paper trail.
+        assert "ibkr.flex_query_token" in captured.err
+        assert "double quotes" in captured.err
+        assert "decisions-log" in captured.err
+        # Did NOT proceed to exec uvicorn.
+        assert "cmd" not in called
+
+    def test_well_quoted_string_token_passes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        from services.api import entrypoint
+
+        # Same value but quoted → loaded as str → passes the guard.
+        yaml_text = (
+            "postgres:\n"
+            "  app_service_password: hexpwd\n"
+            "ibkr:\n"
+            '  flex_query_token: "152748490360752094531342"\n'
+        )
+        secrets_path = tmp_path / "decrypted.yaml"
+        secrets_path.write_text(yaml_text)
+        monkeypatch.setenv("API_SECRETS_PATH", str(secrets_path))
+        monkeypatch.delenv("API_DATABASE_URL", raising=False)
+        monkeypatch.delenv("API_FLEX_QUERY_TOKEN", raising=False)
+        monkeypatch.setenv("API_ENVIRONMENT", "paper")
+
+        called: dict[str, Any] = {}
+
+        def fake_execvp(cmd: str, argv: list[str]) -> None:
+            called["cmd"] = cmd
+
+        monkeypatch.setattr(entrypoint.os, "execvp", fake_execvp)
+        entrypoint.main(["true"])
+        assert "cmd" in called
+        import os
+
+        assert os.environ["API_FLEX_QUERY_TOKEN"] == "152748490360752094531342"
+
+    def test_int_id_alongside_quoted_token_passes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        # Regression case: ibkr.flex_query_id is legitimately an int +
+        # ibkr.flex_query_token is a quoted string. Neither trips the
+        # guard. The canonical sops shape post-PR-#137 fix.
+        from services.api import entrypoint
+
+        yaml_text = (
+            "postgres:\n"
+            "  app_service_password: hexpwd\n"
+            "ibkr:\n"
+            "  flex_query_id: 1505530\n"
+            '  flex_query_token: "152748490360752094531342"\n'
+            "  paper_account: DUQ_TEST\n"
+        )
+        secrets_path = tmp_path / "decrypted.yaml"
+        secrets_path.write_text(yaml_text)
+        monkeypatch.setenv("API_SECRETS_PATH", str(secrets_path))
+        for key in (
+            "API_DATABASE_URL",
+            "API_FLEX_QUERY_ID",
+            "API_FLEX_QUERY_TOKEN",
+            "API_IBKR_ACCOUNT",
+        ):
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv("API_ENVIRONMENT", "paper")
+
+        called: dict[str, Any] = {}
+
+        def fake_execvp(cmd: str, argv: list[str]) -> None:
+            called["cmd"] = cmd
+
+        monkeypatch.setattr(entrypoint.os, "execvp", fake_execvp)
+        entrypoint.main(["true"])
+        assert "cmd" in called
+
+    def test_multiple_floats_all_surface_in_error(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Any,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # If two secrets got float-coerced, both paths surface in the
+        # error so the operator fixes them in one sops edit.
+        from services.api import entrypoint
+
+        yaml_text = (
+            "postgres:\n"
+            "  app_service_password: hexpwd\n"
+            "ibkr:\n"
+            "  flex_query_token: 1.527484903607521e+23\n"
+            "discord:\n"
+            "  api_bearer_token: 9.876543210987654e+22\n"
+        )
+        secrets_path = tmp_path / "decrypted.yaml"
+        secrets_path.write_text(yaml_text)
+        monkeypatch.setenv("API_SECRETS_PATH", str(secrets_path))
+        monkeypatch.delenv("API_DATABASE_URL", raising=False)
+        monkeypatch.setenv("API_ENVIRONMENT", "paper")
+
+        def fake_execvp(cmd: str, argv: list[str]) -> None:
+            return None
+
+        monkeypatch.setattr(entrypoint.os, "execvp", fake_execvp)
+        exit_code = entrypoint.main(["true"])
+        assert exit_code == 2
+        captured = capsys.readouterr()
+        assert "ibkr.flex_query_token" in captured.err
+        assert "discord.api_bearer_token" in captured.err
+
+    def test_missing_secrets_file_no_false_positive(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        # When the sops bundle doesn't exist (dev mode), the guard sees
+        # an empty dict + does not trip. The downstream pg_password
+        # check fires instead with the canonical placeholder exit.
+        from services.api import entrypoint
+
+        monkeypatch.setenv("API_SECRETS_PATH", str(tmp_path / "nonexistent.yaml"))
+        monkeypatch.delenv("API_DATABASE_URL", raising=False)
+        monkeypatch.setenv("API_ENVIRONMENT", "paper")
+
+        def fake_execvp(cmd: str, argv: list[str]) -> None:
+            return None
+
+        monkeypatch.setattr(entrypoint.os, "execvp", fake_execvp)
+        exit_code = entrypoint.main(["true"])
+        # exit 2 from missing postgres password, NOT from the float guard.
+        assert exit_code == 2
