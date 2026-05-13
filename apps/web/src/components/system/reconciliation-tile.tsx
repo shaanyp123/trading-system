@@ -84,7 +84,7 @@ function ReconciliationBody({
         <span className="text-text-muted">Source</span>
         <span>
           <span className="rounded-md bg-env-paper/20 px-2 py-0.5 text-xs text-env-paper">
-            QC (Phase 1)
+            IBKR FlexQuery
           </span>
         </span>
       </div>
