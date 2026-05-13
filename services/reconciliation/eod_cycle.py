@@ -70,7 +70,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_EVEN, Decimal
 from typing import Any, Final
 from uuid import UUID
 
@@ -78,7 +78,8 @@ import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from services.audit.writer import Environment, PhaseAtEmit
+from services.audit.event_types import AuditEventType
+from services.audit.writer import Environment, PhaseAtEmit, append_audit_event
 from services.reconciliation.apply import (
     AlertDispatchHook,
     ReconciliationApplyResult,
@@ -123,6 +124,18 @@ _FUTURES_ASSET_CATEGORIES: Final[frozenset[str]] = frozenset({"FUT"})
 #: window to business-days math (skip weekends) or extend to 72h
 #: unconditionally if operator demand emerges.
 DEFAULT_PRIOR_BREAKS_WINDOW_HOURS: Final[int] = 36
+
+
+#: Source string for the per-recon ``balances`` row INSERTed by
+#: :func:`refresh_backend_from_broker_snapshot`. Constrained by the
+#: table CHECK constraint in alembic 0002. ``flexquery_eod`` is the
+#: canonical post-pivot source for the daily snapshot.
+BALANCE_SOURCE_FROM_FLEX: Final[str] = "flexquery_eod"
+
+
+#: Quantization for the ``positions_current.unrealized_pnl`` UPDATE.
+#: Schema is NUMERIC(20, 4); round half-even to match.
+PNL_QUANTIZER: Final[Decimal] = Decimal("0.0001")
 
 
 # Reverse map from the schema's TEXT ``metric`` column → the planner's
@@ -335,6 +348,251 @@ async def fetch_prior_breaks_within_grace_window(
 
 
 # ---------------------------------------------------------------------------
+# PR-I: Broker-snapshot refresh (writes BEFORE recon planner runs)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class BackendRefreshResult:
+    """Outcome of :func:`refresh_backend_from_broker_snapshot`.
+
+    Returned to ``run_eod_cycle`` for structured logging; not required
+    by the caller for correctness (the audit + table mutations are
+    durable independent of this object).
+    """
+
+    balance_row_id: UUID | None
+    """PK of the new balances row, or None if INSERT was skipped (e.g.,
+    snapshot had no account_summary)."""
+
+    positions_marked_count: int
+    """Count of positions_current rows whose unrealized_pnl + last_mark_ts
+    were UPDATEd. Equals the number of broker positions whose
+    (account_id, market, contract_id) matched a backend row."""
+
+    audit_event_uuids: tuple[UUID, ...]
+    """Minted audit_event_uuids in declared order:
+    [BALANCE_SNAPSHOT_RECORDED, POSITION_MARK_TO_MARKET x N]."""
+
+
+def _market_from_flex_symbol(symbol: str, sec_type: str) -> str:
+    """Map a FlexQuery ``symbol`` + ``sec_type`` to the backend's
+    ``positions_current.market`` convention. Futures get a leading ``/``;
+    everything else passes through as-is. Mirrors the convention used
+    by :func:`build_broker_view`."""
+    return f"/{symbol}" if sec_type in _FUTURES_ASSET_CATEGORIES else symbol
+
+
+async def refresh_backend_from_broker_snapshot(
+    snapshot: ReconciliationSnapshot,
+    *,
+    session_factory: async_sessionmaker[Any],
+    account_id: UUID,
+    env: Environment,
+    phase_at_emit: PhaseAtEmit = 1,
+) -> BackendRefreshResult:
+    """Write the broker snapshot's cash + positions to the backend BEFORE
+    the recon planner runs.
+
+    Audit-first per spec §2.10.1:
+
+      1. Append BALANCE_SNAPSHOT_RECORDED audit row (own SERIALIZABLE
+         transaction via append_audit_event). Capture event_uuid.
+      2. INSERT new ``balances`` row carrying the audit_event_uuid + the
+         snapshot's NLV + cash. Source = ``flexquery_eod``.
+      3. For each FlexQuery position with non-zero quantity:
+         a. If a matching ``positions_current`` row exists for
+            ``(account_id, market, contract_id=NULL)`` — append a
+            POSITION_MARK_TO_MARKET audit row + UPDATE the row's
+            ``unrealized_pnl + last_mark_ts``.
+         b. If no row exists — skip silently. The recon planner that
+            runs next will flag the divergence as a position-qty break
+            (backend has 0, broker has N) and the alert fires through
+            the standard path.
+
+    Why audit-first matters here: the unrealized_pnl + balances values
+    are derivative state. If we UPDATE the row without an audit event
+    and the audit append later fails, the operator sees a row with
+    mark data they can't trace back to a recon cycle. Audit-first
+    inverts: the audit row anchors the change.
+
+    No state-transition hook is invoked from this function. Recon
+    detection + kill-switch fan-out happens in
+    :func:`apply_reconciliation_plan` after the planner runs against
+    the refreshed backend view. PR-J wires the state hook there.
+
+    A05 enforced: Decimals throughout. A06 enforced:
+    ``snapshot.pulled_at_utc`` is tz-aware (asserted at module load
+    of the flex_query_fetcher).
+    """
+    if snapshot.pulled_at_utc.tzinfo is None:
+        raise ValueError("snapshot.pulled_at_utc must be tz-aware UTC per [A06]")
+
+    audit_uuids: list[UUID] = []
+
+    # Step 1+2: balance snapshot audit + INSERT.
+    summary = snapshot.account_summary
+    balance_audit_payload: dict[str, Any] = {
+        "account_id": str(account_id),
+        "snapshot_ts": snapshot.pulled_at_utc.isoformat(),
+        "trigger": "eod_recon_refresh",
+        "source": BALANCE_SOURCE_FROM_FLEX,
+        "broker_cash_usd": str(summary.cash_usd),
+        "broker_net_liquidation_usd": str(summary.net_liquidation_usd),
+        "broker_stock_market_value_usd": str(summary.stock_market_value_usd),
+        "broker_bond_market_value_usd": str(summary.bond_market_value_usd),
+        "broker_futures_pnl_usd": str(summary.futures_pnl_usd),
+    }
+    async with session_factory() as audit_session:
+        bal_record = await append_audit_event(
+            audit_session,
+            AuditEventType.BALANCE_SNAPSHOT_RECORDED,
+            balance_audit_payload,
+            account_id=account_id,
+            env=env,
+            phase_at_emit=phase_at_emit,
+            source_clock_ts=snapshot.pulled_at_utc,
+        )
+    audit_uuids.append(bal_record.event_uuid)
+
+    balance_row_id: UUID | None = None
+    async with session_factory() as bal_session:
+        async with bal_session.begin():
+            bal_row = (
+                await bal_session.execute(
+                    text(
+                        "INSERT INTO balances ("
+                        "    account_id, snapshot_ts, net_liquidation, "
+                        "    cash_usd, excess_liquidity, used_margin_pct, source"
+                        ") VALUES ("
+                        "    :acct, :ts, :nlv, :cash, :excess, :margin, :source"
+                        ") RETURNING id"
+                    ),
+                    {
+                        "acct": account_id,
+                        "ts": snapshot.pulled_at_utc,
+                        "nlv": summary.net_liquidation_usd,
+                        "cash": summary.cash_usd,
+                        # Phase 1 placeholder: equals cash until broker-side
+                        # excess_liquidity calc is wired (Phase 2+).
+                        "excess": summary.cash_usd,
+                        "margin": Decimal("0"),
+                        "source": BALANCE_SOURCE_FROM_FLEX,
+                    },
+                )
+            ).fetchone()
+            if bal_row is not None:
+                balance_row_id = UUID(str(bal_row.id))
+
+    # Step 3: per-position mark-to-market.
+    positions_marked = 0
+    for pos in snapshot.positions:
+        if pos.quantity == 0:
+            continue  # closed; recon ignores zero-qty rows anyway
+
+        market = _market_from_flex_symbol(pos.symbol, pos.sec_type)
+
+        # Phase 1 contract_id=NULL match. If/when contract resolution
+        # lands (Phase 2+), this query expands to take a contract_id.
+        async with session_factory() as lookup_session:
+            row = (
+                await lookup_session.execute(
+                    text(
+                        "SELECT id, quantity, avg_cost FROM positions_current "
+                        "WHERE account_id = :acct AND market = :market "
+                        "  AND contract_id IS NULL"
+                    ),
+                    {"acct": account_id, "market": market},
+                )
+            ).fetchone()
+        if row is None:
+            log.info(
+                "reconciliation_refresh_position_not_in_backend",
+                account_id=str(account_id),
+                env=env,
+                market=market,
+                broker_quantity=str(pos.quantity),
+            )
+            continue
+
+        prior_qty = int(row.quantity)
+        prior_avg = Decimal(str(row.avg_cost))
+
+        # Prefer broker-supplied unrealized_pnl; fall back to compute
+        # from (market_price - avg_cost) * qty when missing.
+        if pos.unrealized_pnl_usd is not None:
+            new_upnl = pos.unrealized_pnl_usd
+        elif pos.market_price_usd is not None:
+            new_upnl = (pos.market_price_usd - prior_avg) * Decimal(prior_qty)
+        else:
+            log.warning(
+                "reconciliation_refresh_no_mark_price",
+                account_id=str(account_id),
+                env=env,
+                market=market,
+                note="broker snapshot has neither market_price_usd nor unrealized_pnl_usd",
+            )
+            continue
+
+        new_upnl_q = new_upnl.quantize(PNL_QUANTIZER, rounding=ROUND_HALF_EVEN)
+
+        mark_audit_payload: dict[str, Any] = {
+            "account_id": str(account_id),
+            "position_id": str(row.id),
+            "market": market,
+            "trigger": "eod_recon_refresh",
+            "source": BALANCE_SOURCE_FROM_FLEX,
+            "quantity": prior_qty,
+            "avg_cost": str(prior_avg),
+            "broker_market_price_usd": (
+                str(pos.market_price_usd) if pos.market_price_usd is not None else None
+            ),
+            "broker_unrealized_pnl_usd": (
+                str(pos.unrealized_pnl_usd) if pos.unrealized_pnl_usd is not None else None
+            ),
+            "computed_unrealized_pnl_usd": str(new_upnl_q),
+            "last_mark_ts": snapshot.pulled_at_utc.isoformat(),
+        }
+        async with session_factory() as audit_session:
+            mark_record = await append_audit_event(
+                audit_session,
+                AuditEventType.POSITION_MARK_TO_MARKET,
+                mark_audit_payload,
+                account_id=account_id,
+                env=env,
+                phase_at_emit=phase_at_emit,
+                source_clock_ts=snapshot.pulled_at_utc,
+            )
+        audit_uuids.append(mark_record.event_uuid)
+
+        async with session_factory() as upd_session:
+            async with upd_session.begin():
+                await upd_session.execute(
+                    text(
+                        "UPDATE positions_current SET "
+                        "    unrealized_pnl = :upnl, last_mark_ts = :ts "
+                        "WHERE id = :pid"
+                    ),
+                    {"upnl": new_upnl_q, "ts": snapshot.pulled_at_utc, "pid": row.id},
+                )
+        positions_marked += 1
+
+    log.info(
+        "reconciliation_backend_refreshed",
+        account_id=str(account_id),
+        env=env,
+        balance_row_id=str(balance_row_id) if balance_row_id else None,
+        positions_marked=positions_marked,
+        audit_event_count=len(audit_uuids),
+    )
+    return BackendRefreshResult(
+        balance_row_id=balance_row_id,
+        positions_marked_count=positions_marked,
+        audit_event_uuids=tuple(audit_uuids),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
@@ -388,6 +646,32 @@ async def run_eod_cycle(
             message=exc.message,
         )
         return None
+
+    # PR-I: write broker-side state (cash + NLV + position marks) to
+    # backend BEFORE building the backend view. After this step, the
+    # backend view reflects the freshly-written rows; recon's diff is
+    # against current state (not stale data). The recon planner still
+    # runs unchanged and will flag any remaining divergence — e.g.,
+    # position qty mismatches between backend's positions_current and
+    # the broker's positions (which the refresh path doesn't reconcile
+    # automatically; that's the recon's job).
+    refresh_result = await refresh_backend_from_broker_snapshot(
+        snapshot,
+        session_factory=session_factory,
+        account_id=config.account_id,
+        env=config.env,
+        phase_at_emit=config.phase_at_emit,
+    )
+    log.info(
+        "reconciliation_eod_cycle_backend_refreshed",
+        account_id=str(config.account_id),
+        env=config.env,
+        balance_row_id=(
+            str(refresh_result.balance_row_id) if refresh_result.balance_row_id else None
+        ),
+        positions_marked=refresh_result.positions_marked_count,
+        refresh_audit_event_count=len(refresh_result.audit_event_uuids),
+    )
 
     backend_view = await build_backend_view(session_factory, account_id=config.account_id)
     broker_view = build_broker_view(snapshot)
@@ -464,12 +748,16 @@ def make_cycle_callback(
 
 
 __all__ = [
+    "BALANCE_SOURCE_FROM_FLEX",
     "DEFAULT_PRIOR_BREAKS_WINDOW_HOURS",
+    "PNL_QUANTIZER",
+    "BackendRefreshResult",
     "CycleCallback",
     "EodCycleConfig",
     "build_backend_view",
     "build_broker_view",
     "fetch_prior_breaks_within_grace_window",
     "make_cycle_callback",
+    "refresh_backend_from_broker_snapshot",
     "run_eod_cycle",
 ]
