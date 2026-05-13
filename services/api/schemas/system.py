@@ -325,9 +325,54 @@ class WatchdogStatusResponse(BaseModel):
     server_now: datetime
 
 
+class HeartbeatItem(BaseModel):
+    """One service's heartbeat snapshot for ``GET /api/system/heartbeats``.
+
+    ``freshness`` collapses ``last_heartbeat_utc`` + age into one of three
+    operator-readable labels:
+
+      * ``fresh`` — last heartbeat within the service's stale threshold
+      * ``stale`` — last heartbeat older than threshold (operator should
+        investigate; follow-up PR fires a Discord P2 alert here)
+      * ``unknown`` — no heartbeat recorded since api last restarted;
+        not a signal of trouble on its own, just "first cycle pending"
+
+    ``last_heartbeat_utc`` is the source-clock timestamp (LEAN's
+    ``self.utc_time`` for cycle heartbeats), NOT the api receive time.
+    ``count`` accumulates across the api's current uptime — a useful
+    cross-check ("we expect ~1 LEAN cycle per weekday; count=14 over a
+    month tracks").
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    service: Literal["lean_cycle"]
+    last_heartbeat_utc: datetime | None
+    received_at_utc: datetime | None
+    seconds_since_last_heartbeat: int | None
+    stale_threshold_s: int
+    freshness: Literal["fresh", "stale", "unknown"]
+    count: int
+
+
+class HeartbeatsResponse(BaseModel):
+    """Backend response for ``GET /api/system/heartbeats``.
+
+    Phase 1 ships a single service (``lean_cycle``); follow-up PRs extend
+    ``items`` with ``reconciliation_eod`` + ``order_placement_worker``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[HeartbeatItem]
+    server_now: datetime
+
+
 __all__ = [
     "AuditLogEntry",
     "AuditLogPageResponse",
+    "HeartbeatItem",
+    "HeartbeatsResponse",
     "KillSwitchInvokeRequest",
     "KillSwitchResumeRequest",
     "KillSwitchStatus",

@@ -38,6 +38,7 @@ from fastapi import APIRouter, Depends, Request, status
 
 from services.api import db as api_db
 from services.api.errors import AppError
+from services.api.heartbeats import get_heartbeat_registry
 from services.api.repos.phase1 import PostgresPhase1QueryRepo
 from services.api.schemas.lean import LeanEventAccepted, LeanEventRequest
 from services.api.sse import emit_sse
@@ -122,6 +123,22 @@ async def post_lean_signal(
     }
 
     if body.event_type in ("lean_strategy_initialized", "lean_cycle_heartbeat"):
+        # Update the in-memory heartbeat registry so the operator can see
+        # "LEAN last cycled at T" on the System page + so a follow-up PR
+        # can fire an alert when no heartbeat has arrived in >26h.
+        # Closes a silent-failure surface — pre-this, LEAN's cron stopping
+        # produced no observable signal.
+        try:
+            registry = get_heartbeat_registry()
+            await registry.record(
+                "lean_cycle",
+                source_clock_utc=body.ts_utc,
+                received_at_utc=received_at,
+            )
+        except Exception:
+            # Registry failure must NOT fail the heartbeat POST: this is a
+            # passive observability surface, not a critical path. Log + drop.
+            log.exception("lean_heartbeat_registry_record_failed", **log_kwargs)
         log.info("lean_event_received", **log_kwargs)
         return LeanEventAccepted(
             received_at_utc=received_at,
