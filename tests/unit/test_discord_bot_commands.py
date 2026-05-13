@@ -41,7 +41,9 @@ from services.discord_bot.api_client import (
     HealthResponse,
     KillSwitchInvokeResponse,
     PositionsResponse,
+    SignalApproveResponse,
 )
+from services.discord_bot.commands.approve import ApproveConfirmView, register_approve
 from services.discord_bot.commands.halt import HaltConfirmView, register_halt
 from services.discord_bot.commands.positions import register_positions
 from services.discord_bot.commands.status import register_status
@@ -55,7 +57,7 @@ def _stub_api_client() -> ApiClient:
     """Construct a real ApiClient instance and replace its async methods.
 
     The bot code uses ``ApiClient`` as a typed contract; we don't subclass
-    or mock the entire class, just replace the three async methods with
+    or mock the entire class, just replace the four async methods with
     AsyncMocks that the tests configure per-case.
     """
     client = ApiClient(
@@ -66,6 +68,7 @@ def _stub_api_client() -> ApiClient:
     client.get_health = AsyncMock()  # type: ignore[method-assign]
     client.get_positions_current = AsyncMock()  # type: ignore[method-assign]
     client.invoke_kill_switch = AsyncMock()  # type: ignore[method-assign]
+    client.approve_signal = AsyncMock()  # type: ignore[method-assign]
     return client
 
 
@@ -423,25 +426,261 @@ class TestStatusCommand:
 
 
 # ---------------------------------------------------------------------------
-# Registration sanity (smoke that all 3 register fns run without error)
+# /approve input validation + happy path → confirm view
+# ---------------------------------------------------------------------------
+
+
+_VALID_UUID = "12345678-1234-5678-1234-567812345678"
+
+
+class TestApproveInputValidation:
+    async def test_invalid_uuid_returns_ephemeral_error(self, stub_client: ApiClient) -> None:
+        tree = _build_tree()
+        register_approve(tree, api_client=stub_client, environment="paper")
+        callback = _command_callback(tree, "approve")
+        interaction = _build_mock_interaction()
+
+        await callback(interaction, "not-a-uuid")
+
+        interaction.response.send_message.assert_awaited_once()
+        embed = interaction.response.send_message.await_args.kwargs["embed"]
+        assert "Invalid signal_id" in (embed.title or "")
+        assert interaction.response.send_message.await_args.kwargs["ephemeral"] is True
+        # Must NOT have called the api
+        stub_client.approve_signal.assert_not_called()  # type: ignore[attr-defined]
+
+    async def test_empty_uuid_rejected(self, stub_client: ApiClient) -> None:
+        # Whitespace-only stripped → empty string → not a UUID.
+        tree = _build_tree()
+        register_approve(tree, api_client=stub_client, environment="paper")
+        callback = _command_callback(tree, "approve")
+        interaction = _build_mock_interaction()
+
+        await callback(interaction, "   ")
+
+        interaction.response.send_message.assert_awaited_once()
+        embed = interaction.response.send_message.await_args.kwargs["embed"]
+        assert "Invalid signal_id" in (embed.title or "")
+        stub_client.approve_signal.assert_not_called()  # type: ignore[attr-defined]
+
+    async def test_truncates_long_garbage_in_title(self, stub_client: ApiClient) -> None:
+        # Pasting a paragraph as signal_id shouldn't crash with
+        # embed-title-too-long. Title is capped at 100 chars.
+        tree = _build_tree()
+        register_approve(tree, api_client=stub_client, environment="paper")
+        callback = _command_callback(tree, "approve")
+        interaction = _build_mock_interaction()
+
+        long_garbage = "x" * 500
+        await callback(interaction, long_garbage)
+
+        embed = interaction.response.send_message.await_args.kwargs["embed"]
+        # Discord caps title at 256 — render should be safely under that.
+        assert len(embed.title or "") < 200
+
+    async def test_happy_path_sends_confirm_view(self, stub_client: ApiClient) -> None:
+        tree = _build_tree()
+        register_approve(tree, api_client=stub_client, environment="paper")
+        callback = _command_callback(tree, "approve")
+        interaction = _build_mock_interaction()
+
+        await callback(interaction, _VALID_UUID)
+
+        interaction.response.send_message.assert_awaited_once()
+        kwargs = interaction.response.send_message.await_args.kwargs
+        assert kwargs["ephemeral"] is True
+        embed = kwargs["embed"]
+        # Confirm body mentions the signal_id verbatim.
+        full_text = (embed.description or "") + " ".join((f.value or "") for f in embed.fields)
+        assert _VALID_UUID in full_text
+        view = kwargs["view"]
+        assert isinstance(view, ApproveConfirmView)
+        # Must NOT have called the api yet — only after the operator clicks ✓.
+        stub_client.approve_signal.assert_not_called()  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# ApproveConfirmView buttons
+# ---------------------------------------------------------------------------
+
+
+class TestApproveConfirmView:
+    async def test_confirm_button_invokes_api_success(self, stub_client: ApiClient) -> None:
+        stub_client.approve_signal.return_value = SignalApproveResponse(  # type: ignore[attr-defined]
+            signal_id=_VALID_UUID,
+            new_status="approved",
+            audit_event_uuid="aud-1",
+            audit_sequence_no=42,
+            intent_to_place_order=True,
+        )
+        view = ApproveConfirmView(
+            api_client=stub_client,
+            invoker_id=100,
+            signal_id=_VALID_UUID,
+            environment="paper",
+        )
+        interaction = _build_mock_interaction(user_id=100)
+        confirm_button = _find_button(view, "approve_confirm")
+
+        await confirm_button.callback(interaction)
+
+        stub_client.approve_signal.assert_awaited_once_with(_VALID_UUID)  # type: ignore[attr-defined]
+        interaction.followup.send.assert_awaited_once()
+        embed = interaction.followup.send.await_args.kwargs["embed"]
+        # Success embed: title carries the first-8-chars of the signal id;
+        # body carries the audit_event_uuid + audit_sequence_no.
+        assert "Signal approved" in (embed.title or "")
+        assert "aud-1" in (embed.description or "")
+        assert "#42" in (embed.description or "")
+        # Both buttons disabled after confirm fires.
+        assert confirm_button.disabled is True
+
+    async def test_confirm_button_renders_signal_not_found_special_case(
+        self, stub_client: ApiClient
+    ) -> None:
+        stub_client.approve_signal.side_effect = ApiClientHTTPError(  # type: ignore[attr-defined]
+            status_code=404,
+            error_code="SIGNAL_NOT_FOUND",
+            message="No such signal",
+        )
+        view = ApproveConfirmView(
+            api_client=stub_client,
+            invoker_id=100,
+            signal_id=_VALID_UUID,
+            environment="paper",
+        )
+        interaction = _build_mock_interaction(user_id=100)
+        confirm_button = _find_button(view, "approve_confirm")
+
+        await confirm_button.callback(interaction)
+
+        embed = interaction.followup.send.await_args.kwargs["embed"]
+        assert "Signal not found" in (embed.title or "")
+        # Operator-actionable hint pointing at #signals embed footer.
+        assert "#signals" in (embed.description or "")
+
+    async def test_confirm_button_renders_signal_not_pending_special_case(
+        self, stub_client: ApiClient
+    ) -> None:
+        stub_client.approve_signal.side_effect = ApiClientHTTPError(  # type: ignore[attr-defined]
+            status_code=409,
+            error_code="SIGNAL_NOT_PENDING",
+            message="Signal already actioned",
+        )
+        view = ApproveConfirmView(
+            api_client=stub_client,
+            invoker_id=100,
+            signal_id=_VALID_UUID,
+            environment="paper",
+        )
+        interaction = _build_mock_interaction(user_id=100)
+        confirm_button = _find_button(view, "approve_confirm")
+
+        await confirm_button.callback(interaction)
+
+        embed = interaction.followup.send.await_args.kwargs["embed"]
+        assert "Signal not pending" in (embed.title or "")
+        # Mentions the audit log path so the operator can confirm who acted.
+        assert "audit log" in (embed.description or "").lower()
+
+    async def test_confirm_button_renders_generic_error(self, stub_client: ApiClient) -> None:
+        stub_client.approve_signal.side_effect = ApiClientHTTPError(  # type: ignore[attr-defined]
+            status_code=503,
+            error_code="SERVICE_UNAVAILABLE",
+            message="db down",
+        )
+        view = ApproveConfirmView(
+            api_client=stub_client,
+            invoker_id=100,
+            signal_id=_VALID_UUID,
+            environment="paper",
+        )
+        interaction = _build_mock_interaction(user_id=100)
+        confirm_button = _find_button(view, "approve_confirm")
+
+        await confirm_button.callback(interaction)
+
+        embed = interaction.followup.send.await_args.kwargs["embed"]
+        # Generic error path renders the canonical envelope.
+        assert "SERVICE_UNAVAILABLE" in (embed.title or "")
+        assert "db down" in (embed.description or "")
+
+    async def test_cancel_button_edits_message(self, stub_client: ApiClient) -> None:
+        view = ApproveConfirmView(
+            api_client=stub_client,
+            invoker_id=100,
+            signal_id=_VALID_UUID,
+            environment="paper",
+        )
+        interaction = _build_mock_interaction(user_id=100)
+        cancel_button = _find_button(view, "approve_cancel")
+
+        await cancel_button.callback(interaction)
+
+        interaction.response.edit_message.assert_awaited_once()
+        kwargs = interaction.response.edit_message.await_args.kwargs
+        embed = kwargs["embed"]
+        assert "cancel" in (embed.title or "").lower()
+        # Must NOT have called the api.
+        stub_client.approve_signal.assert_not_called()  # type: ignore[attr-defined]
+
+    async def test_interaction_check_rejects_non_invoker(self, stub_client: ApiClient) -> None:
+        # Single-operator deployment but defensive against guild-share.
+        view = ApproveConfirmView(
+            api_client=stub_client,
+            invoker_id=100,
+            signal_id=_VALID_UUID,
+            environment="paper",
+        )
+        intruder_interaction = _build_mock_interaction(user_id=999)
+
+        result = await view.interaction_check(intruder_interaction)
+        assert result is False
+        intruder_interaction.response.send_message.assert_awaited_once()
+        msg = intruder_interaction.response.send_message.await_args.args[0]
+        assert "operator who invoked" in msg
+
+    async def test_interaction_check_rejects_after_consume(self, stub_client: ApiClient) -> None:
+        view = ApproveConfirmView(
+            api_client=stub_client,
+            invoker_id=100,
+            signal_id=_VALID_UUID,
+            environment="paper",
+        )
+        # Manually flip the consumed flag (simulates a fast double-click
+        # where the second interaction lands while the first is in-flight).
+        view._consumed = True
+
+        interaction = _build_mock_interaction(user_id=100)
+        result = await view.interaction_check(interaction)
+        assert result is False
+        interaction.response.send_message.assert_awaited_once()
+        msg = interaction.response.send_message.await_args.args[0]
+        assert "already been used" in msg
+
+
+# ---------------------------------------------------------------------------
+# Registration sanity (smoke that all 4 register fns run without error)
 # ---------------------------------------------------------------------------
 
 
 class TestRegistrationSanity:
-    def test_all_three_commands_register_without_guild(self, stub_client: ApiClient) -> None:
+    def test_all_commands_register_without_guild(self, stub_client: ApiClient) -> None:
         tree = _build_tree()
         register_positions(tree, api_client=stub_client, environment="paper")
         register_halt(tree, api_client=stub_client, environment="paper")
         register_status(tree, api_client=stub_client)
+        register_approve(tree, api_client=stub_client, environment="paper")
         names = {cmd.name for cmd in tree.get_commands()}
-        assert {"positions", "halt", "status"}.issubset(names)
+        assert {"positions", "halt", "status", "approve"}.issubset(names)
 
-    def test_all_three_commands_register_with_guild(self, stub_client: ApiClient) -> None:
+    def test_all_commands_register_with_guild(self, stub_client: ApiClient) -> None:
         guild = discord.Object(id=12345)
         tree = _build_tree()
         register_positions(tree, api_client=stub_client, environment="paper", guild=guild)
         register_halt(tree, api_client=stub_client, environment="paper", guild=guild)
         register_status(tree, api_client=stub_client, guild=guild)
+        register_approve(tree, api_client=stub_client, environment="paper", guild=guild)
         # Guild-scoped commands aren't returned by get_commands() with no guild arg
         names = {cmd.name for cmd in tree.get_commands(guild=guild)}
-        assert {"positions", "halt", "status"}.issubset(names)
+        assert {"positions", "halt", "status", "approve"}.issubset(names)
