@@ -16,18 +16,22 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
 from services.reconciliation.apply import AlertDispatchContext
 from services.reconciliation.eod_cycle import (
     DEFAULT_PRIOR_BREAKS_WINDOW_HOURS,
+    BackendRefreshResult,
     EodCycleConfig,
     build_broker_view,
     fetch_prior_breaks_within_grace_window,
     make_cycle_callback,
     run_eod_cycle,
+)
+from services.reconciliation.eod_cycle import (
+    refresh_backend_from_broker_snapshot as _real_refresh,
 )
 from services.reconciliation.flex_query_fetcher import (
     FlexAccountSummary,
@@ -37,6 +41,30 @@ from services.reconciliation.flex_query_fetcher import (
     ReconciliationSnapshot,
 )
 from services.reconciliation.recon import BrokerSource, PriorBreak, ReconciliationMetric
+
+
+@pytest.fixture(autouse=True)
+def _patch_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No-op the PR-I refresh inside ``run_eod_cycle`` by default.
+
+    The orchestrator tests (TestRunEodCycleOrchestrator, etc.) don't
+    mock the additional DB calls + audit writes that the refresh
+    introduces, so we stub it to return a zero-effort
+    BackendRefreshResult. PR-I-specific tests in
+    TestRefreshBackendFromBrokerSnapshot bypass via the
+    top-level-imported ``_real_refresh`` symbol (captured BEFORE the
+    monkeypatch fires).
+    """
+
+    async def _noop(*args: Any, **kwargs: Any) -> BackendRefreshResult:
+        return BackendRefreshResult(
+            balance_row_id=None, positions_marked_count=0, audit_event_uuids=()
+        )
+
+    monkeypatch.setattr(
+        "services.reconciliation.eod_cycle.refresh_backend_from_broker_snapshot",
+        _noop,
+    )
 
 
 def _build_snapshot(
@@ -849,3 +877,440 @@ class TestModuleContract:
 
         for name in mod.__all__:
             assert hasattr(mod, name), f"__all__ contains {name!r} but module lacks it"
+
+
+# ---------------------------------------------------------------------------
+# PR-I: refresh_backend_from_broker_snapshot
+# ---------------------------------------------------------------------------
+
+
+def _refresh_session_factory(
+    *,
+    position_rows_by_market: dict[str, dict[str, Any] | None],
+    new_balance_id: UUID | None = None,
+) -> tuple[Any, list[str], list[dict[str, Any]]]:
+    """Build a fake session_factory for refresh tests.
+
+    Tracks the SQL strings executed (for ordering assertions) +
+    captures INSERT parameter sets. Returns the factory plus the
+    captured-sql + captured-params lists for inspection.
+
+    ``position_rows_by_market`` maps market → MagicMock-style row
+    dict (id / quantity / avg_cost) OR None when the SELECT should
+    return no row.
+
+    ``new_balance_id`` is the UUID surfaced by the balances INSERT
+    RETURNING id; defaults to a fresh uuid4.
+    """
+    if new_balance_id is None:
+        new_balance_id = uuid4()
+    executed_sql: list[str] = []
+    executed_params: list[dict[str, Any]] = []
+
+    def _make_row(d: dict[str, Any]) -> MagicMock:
+        row = MagicMock()
+        for k, v in d.items():
+            setattr(row, k, v)
+        return row
+
+    async def execute(stmt: Any, params: Any) -> MagicMock:
+        sql = str(stmt)
+        executed_sql.append(sql)
+        executed_params.append(dict(params))
+        result = MagicMock()
+        if "INSERT INTO balances" in sql:
+            result.fetchone = MagicMock(return_value=_make_row({"id": new_balance_id}))
+        elif "SELECT id, quantity, avg_cost FROM positions_current" in sql:
+            market = params["market"]
+            row = position_rows_by_market.get(market)
+            result.fetchone = MagicMock(return_value=_make_row(row) if row is not None else None)
+        elif "UPDATE positions_current" in sql:
+            result.fetchone = MagicMock(return_value=None)
+        else:
+            result.fetchone = MagicMock(return_value=None)
+        return result
+
+    @asynccontextmanager
+    async def _begin_cm() -> Any:
+        yield None
+
+    session = MagicMock()
+    session.execute = execute  # type: ignore[method-assign]
+    # session.begin must return a FRESH async-cm each call (the refresh
+    # function calls it once per balance INSERT + once per position
+    # UPDATE; reusing a single cm fails on the second __aenter__).
+    session.begin = MagicMock(side_effect=lambda: _begin_cm())
+
+    @asynccontextmanager
+    async def _factory_cm() -> Any:
+        yield session
+
+    factory = MagicMock()
+    factory.side_effect = lambda: _factory_cm()
+    return factory, executed_sql, executed_params
+
+
+def _audit_record_mock(event_uuid: UUID | None = None) -> MagicMock:
+    rec = MagicMock()
+    rec.event_uuid = event_uuid or uuid4()
+    rec.sequence_no = 1
+    return rec
+
+
+class TestRefreshBackendFromBrokerSnapshot:
+    """PR-I: writes balance + position marks from broker snapshot
+    BEFORE the recon planner runs."""
+
+    async def test_naive_pulled_at_rejected(self) -> None:
+        refresh_backend_from_broker_snapshot = _real_refresh  # captured before autouse monkeypatch
+
+        # Build a snapshot with a naive datetime — we hand-craft the
+        # dataclass so the constructor's TZ-aware default doesn't kick in.
+        naive_snapshot = ReconciliationSnapshot(
+            pulled_at_utc=datetime(2026, 5, 12, 22, 30),  # naive
+            account_summary=FlexAccountSummary(
+                account_id="DUQ825170",
+                report_date=datetime(2026, 5, 12).date(),
+                net_liquidation_usd=Decimal("100000"),
+                cash_usd=Decimal("100000"),
+                stock_market_value_usd=Decimal(0),
+                bond_market_value_usd=Decimal(0),
+                futures_pnl_usd=Decimal(0),
+            ),
+            positions=(),
+            cash_balances=(),
+        )
+        factory, _, _ = _refresh_session_factory(position_rows_by_market={})
+
+        from unittest.mock import patch
+
+        with patch(
+            "services.reconciliation.eod_cycle.append_audit_event",
+            new=AsyncMock(side_effect=lambda *a, **k: _audit_record_mock()),
+        ):
+            with pytest.raises(ValueError, match="tz-aware UTC"):
+                await refresh_backend_from_broker_snapshot(
+                    naive_snapshot,
+                    session_factory=factory,
+                    account_id=uuid4(),
+                    env="paper",
+                )
+
+    async def test_empty_positions_writes_balance_only(self) -> None:
+        from unittest.mock import patch
+
+        refresh_backend_from_broker_snapshot = _real_refresh  # captured before autouse monkeypatch
+
+        snapshot = _build_snapshot(positions=())
+        factory, executed_sql, _ = _refresh_session_factory(position_rows_by_market={})
+
+        with patch(
+            "services.reconciliation.eod_cycle.append_audit_event",
+            new=AsyncMock(side_effect=lambda *a, **k: _audit_record_mock()),
+        ):
+            result = await refresh_backend_from_broker_snapshot(
+                snapshot,
+                session_factory=factory,
+                account_id=uuid4(),
+                env="paper",
+            )
+        assert result.balance_row_id is not None
+        assert result.positions_marked_count == 0
+        # 1 audit event (BALANCE_SNAPSHOT_RECORDED); no positions audits.
+        assert len(result.audit_event_uuids) == 1
+        # The balances INSERT happened.
+        assert any("INSERT INTO balances" in s for s in executed_sql)
+        # No positions_current UPDATE happened.
+        assert not any("UPDATE positions_current" in s for s in executed_sql)
+
+    async def test_matching_position_marked_and_audit_emitted(self) -> None:
+        from unittest.mock import patch
+
+        refresh_backend_from_broker_snapshot = _real_refresh  # captured before autouse monkeypatch
+
+        position_id = uuid4()
+        snapshot = _build_snapshot(positions=(_flex_pos(symbol="MES", quantity="2"),))
+        factory, executed_sql, executed_params = _refresh_session_factory(
+            position_rows_by_market={
+                "/MES": {
+                    "id": position_id,
+                    "quantity": 2,
+                    "avg_cost": Decimal("5230"),
+                }
+            }
+        )
+        audit_calls: list[Any] = []
+
+        async def _fake_audit(*args: Any, **kwargs: Any) -> MagicMock:
+            audit_calls.append(args[1])  # event_type
+            return _audit_record_mock()
+
+        with patch(
+            "services.reconciliation.eod_cycle.append_audit_event",
+            new=_fake_audit,
+        ):
+            result = await refresh_backend_from_broker_snapshot(
+                snapshot,
+                session_factory=factory,
+                account_id=uuid4(),
+                env="paper",
+            )
+        # 1 balance audit + 1 position-mark audit = 2
+        assert len(result.audit_event_uuids) == 2
+        assert result.positions_marked_count == 1
+        # Both events fired with the right types.
+        from services.audit.event_types import AuditEventType
+
+        assert audit_calls == [
+            AuditEventType.BALANCE_SNAPSHOT_RECORDED,
+            AuditEventType.POSITION_MARK_TO_MARKET,
+        ]
+        # UPDATE happened.
+        assert any("UPDATE positions_current" in s for s in executed_sql)
+        # UPDATE was scoped to the matched position_id.
+        update_params = next(
+            p
+            for s, p in zip(executed_sql, executed_params, strict=True)
+            if "UPDATE positions_current" in s
+        )
+        assert update_params["pid"] == position_id
+
+    async def test_position_not_in_backend_is_skipped(self) -> None:
+        from unittest.mock import patch
+
+        refresh_backend_from_broker_snapshot = _real_refresh  # captured before autouse monkeypatch
+
+        # Broker has /MES position; backend has NO row for /MES → skip.
+        snapshot = _build_snapshot(positions=(_flex_pos(symbol="MES", quantity="2"),))
+        factory, executed_sql, _ = _refresh_session_factory(position_rows_by_market={"/MES": None})
+
+        with patch(
+            "services.reconciliation.eod_cycle.append_audit_event",
+            new=AsyncMock(side_effect=lambda *a, **k: _audit_record_mock()),
+        ):
+            result = await refresh_backend_from_broker_snapshot(
+                snapshot,
+                session_factory=factory,
+                account_id=uuid4(),
+                env="paper",
+            )
+        # 1 balance audit; 0 position audits.
+        assert len(result.audit_event_uuids) == 1
+        assert result.positions_marked_count == 0
+        # No UPDATE happened.
+        assert not any("UPDATE positions_current" in s for s in executed_sql)
+
+    async def test_zero_quantity_position_skipped(self) -> None:
+        from unittest.mock import patch
+
+        refresh_backend_from_broker_snapshot = _real_refresh  # captured before autouse monkeypatch
+
+        snapshot = _build_snapshot(positions=(_flex_pos(symbol="MES", quantity="0"),))
+        factory, executed_sql, _ = _refresh_session_factory(position_rows_by_market={})
+
+        with patch(
+            "services.reconciliation.eod_cycle.append_audit_event",
+            new=AsyncMock(side_effect=lambda *a, **k: _audit_record_mock()),
+        ):
+            result = await refresh_backend_from_broker_snapshot(
+                snapshot,
+                session_factory=factory,
+                account_id=uuid4(),
+                env="paper",
+            )
+        assert result.positions_marked_count == 0
+        assert len(result.audit_event_uuids) == 1  # balance only
+        # The lookup query wasn't even issued for the zero-qty position.
+        assert not any(
+            "SELECT id, quantity, avg_cost FROM positions_current" in s for s in executed_sql
+        )
+
+    async def test_broker_supplied_upnl_used_directly(self) -> None:
+        from unittest.mock import patch
+
+        refresh_backend_from_broker_snapshot = _real_refresh  # captured before autouse monkeypatch
+
+        position_id = uuid4()
+        # FlexPos sets unrealized_pnl_usd=20 by default.
+        snapshot = _build_snapshot(positions=(_flex_pos(symbol="MES", quantity="2"),))
+        factory, executed_sql, executed_params = _refresh_session_factory(
+            position_rows_by_market={
+                "/MES": {
+                    "id": position_id,
+                    "quantity": 2,
+                    "avg_cost": Decimal("5230"),
+                }
+            }
+        )
+        with patch(
+            "services.reconciliation.eod_cycle.append_audit_event",
+            new=AsyncMock(side_effect=lambda *a, **k: _audit_record_mock()),
+        ):
+            await refresh_backend_from_broker_snapshot(
+                snapshot,
+                session_factory=factory,
+                account_id=uuid4(),
+                env="paper",
+            )
+        update_params = next(
+            p
+            for s, p in zip(executed_sql, executed_params, strict=True)
+            if "UPDATE positions_current" in s
+        )
+        assert update_params["upnl"] == Decimal("20.0000")
+
+    async def test_computed_upnl_when_broker_omits_it(self) -> None:
+        from unittest.mock import patch
+
+        refresh_backend_from_broker_snapshot = _real_refresh  # captured before autouse monkeypatch
+
+        # FlexPos but unrealized_pnl_usd = None.
+        pos = FlexPosition(
+            account_id="DUQ825170",
+            symbol="MES",
+            sec_type="FUT",
+            quantity=Decimal("2"),
+            avg_cost_usd=Decimal("5230"),
+            market_price_usd=Decimal("5240"),  # mark
+            market_value_usd=None,
+            unrealized_pnl_usd=None,  # not supplied
+        )
+        snapshot = _build_snapshot(positions=(pos,))
+        position_id = uuid4()
+        factory, executed_sql, executed_params = _refresh_session_factory(
+            position_rows_by_market={
+                "/MES": {
+                    "id": position_id,
+                    "quantity": 2,
+                    "avg_cost": Decimal("5230"),
+                }
+            }
+        )
+        with patch(
+            "services.reconciliation.eod_cycle.append_audit_event",
+            new=AsyncMock(side_effect=lambda *a, **k: _audit_record_mock()),
+        ):
+            await refresh_backend_from_broker_snapshot(
+                snapshot,
+                session_factory=factory,
+                account_id=uuid4(),
+                env="paper",
+            )
+        # uPnL = (5240 - 5230) * 2 = 20
+        update_params = next(
+            p
+            for s, p in zip(executed_sql, executed_params, strict=True)
+            if "UPDATE positions_current" in s
+        )
+        assert update_params["upnl"] == Decimal("20.0000")
+
+    async def test_no_mark_skips_silently(self) -> None:
+        """Both market_price_usd and unrealized_pnl_usd None → skip."""
+        from unittest.mock import patch
+
+        refresh_backend_from_broker_snapshot = _real_refresh  # captured before autouse monkeypatch
+
+        pos = FlexPosition(
+            account_id="DUQ825170",
+            symbol="MES",
+            sec_type="FUT",
+            quantity=Decimal("2"),
+            avg_cost_usd=Decimal("5230"),
+            market_price_usd=None,
+            market_value_usd=None,
+            unrealized_pnl_usd=None,
+        )
+        snapshot = _build_snapshot(positions=(pos,))
+        position_id = uuid4()
+        factory, executed_sql, _ = _refresh_session_factory(
+            position_rows_by_market={
+                "/MES": {
+                    "id": position_id,
+                    "quantity": 2,
+                    "avg_cost": Decimal("5230"),
+                }
+            }
+        )
+        with patch(
+            "services.reconciliation.eod_cycle.append_audit_event",
+            new=AsyncMock(side_effect=lambda *a, **k: _audit_record_mock()),
+        ):
+            result = await refresh_backend_from_broker_snapshot(
+                snapshot,
+                session_factory=factory,
+                account_id=uuid4(),
+                env="paper",
+            )
+        assert result.positions_marked_count == 0
+        # 1 balance audit only.
+        assert len(result.audit_event_uuids) == 1
+        # No UPDATE.
+        assert not any("UPDATE positions_current" in s for s in executed_sql)
+
+    async def test_etf_no_slash_prefix(self) -> None:
+        from unittest.mock import patch
+
+        refresh_backend_from_broker_snapshot = _real_refresh  # captured before autouse monkeypatch
+
+        snapshot = _build_snapshot(
+            positions=(_flex_pos(symbol="TLT", sec_type="STK", quantity="100"),)
+        )
+        factory, executed_sql, executed_params = _refresh_session_factory(
+            position_rows_by_market={
+                "TLT": {
+                    "id": uuid4(),
+                    "quantity": 100,
+                    "avg_cost": Decimal("85"),
+                }
+            }
+        )
+        with patch(
+            "services.reconciliation.eod_cycle.append_audit_event",
+            new=AsyncMock(side_effect=lambda *a, **k: _audit_record_mock()),
+        ):
+            result = await refresh_backend_from_broker_snapshot(
+                snapshot,
+                session_factory=factory,
+                account_id=uuid4(),
+                env="paper",
+            )
+        # TLT (ETF) matched without slash prefix.
+        assert result.positions_marked_count == 1
+        # Lookup used market='TLT' (no slash).
+        lookup_params = next(
+            p
+            for s, p in zip(executed_sql, executed_params, strict=True)
+            if "SELECT id, quantity, avg_cost FROM positions_current" in s
+        )
+        assert lookup_params["market"] == "TLT"
+
+    async def test_two_matching_positions_emit_three_audits(self) -> None:
+        from unittest.mock import patch
+
+        refresh_backend_from_broker_snapshot = _real_refresh  # captured before autouse monkeypatch
+
+        snapshot = _build_snapshot(
+            positions=(
+                _flex_pos(symbol="MES", quantity="2"),
+                _flex_pos(symbol="MNQ", quantity="1"),
+            )
+        )
+        factory, _, _ = _refresh_session_factory(
+            position_rows_by_market={
+                "/MES": {"id": uuid4(), "quantity": 2, "avg_cost": Decimal("5230")},
+                "/MNQ": {"id": uuid4(), "quantity": 1, "avg_cost": Decimal("18000")},
+            }
+        )
+        with patch(
+            "services.reconciliation.eod_cycle.append_audit_event",
+            new=AsyncMock(side_effect=lambda *a, **k: _audit_record_mock()),
+        ):
+            result = await refresh_backend_from_broker_snapshot(
+                snapshot,
+                session_factory=factory,
+                account_id=uuid4(),
+                env="paper",
+            )
+        # 1 balance + 2 positions = 3.
+        assert len(result.audit_event_uuids) == 3
+        assert result.positions_marked_count == 2

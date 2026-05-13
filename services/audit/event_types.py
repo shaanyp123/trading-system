@@ -79,6 +79,9 @@ class AuditEventType(StrEnum):
     # POSITION_* event + BALANCE_SNAPSHOT_RECORDED + TRADE_*; the
     # ORDER_FILLED row above remains the broker-side confirmation. See
     # backend-spec §3.30 for the locked taxonomy.
+    # PR-I also emits BALANCE_SNAPSHOT_RECORDED + POSITION_MARK_TO_MARKET
+    # for the per-recon broker-snapshot refresh path BEFORE the recon
+    # planner runs.
     POSITION_OPENED = "position_opened"
     POSITION_UPDATED = "position_updated"
     POSITION_CLOSED = "position_closed"
