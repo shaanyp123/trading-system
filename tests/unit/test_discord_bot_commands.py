@@ -684,3 +684,64 @@ class TestRegistrationSanity:
         # Guild-scoped commands aren't returned by get_commands() with no guild arg
         names = {cmd.name for cmd in tree.get_commands(guild=guild)}
         assert {"positions", "halt", "status", "approve"}.issubset(names)
+
+
+# ---------------------------------------------------------------------------
+# Discord constraints — slash command descriptions ≤100 chars
+# ---------------------------------------------------------------------------
+
+
+class TestSlashCommandDescriptionLength:
+    """Discord caps slash-command descriptions at 100 chars; over that
+    triggers ``CommandSyncFailure (HTTP 400, error code 50035)`` at
+    ``tree.sync()`` time — silently passes Python lint + unit tests until
+    the bot tries to register against the gateway in production.
+
+    Locks the contract for ALL registered commands by walking the tree
+    after every register() runs. Future commands automatically get the
+    coverage; no per-command opt-in required.
+
+    Discord constants per developer docs (locked here so a future API
+    bump that loosens the limit is a deliberate edit, not a silent
+    drift):
+      * Command name: 1-32 chars
+      * Command description: 1-100 chars
+    """
+
+    DISCORD_COMMAND_DESCRIPTION_MAX = 100
+
+    def test_all_command_descriptions_within_discord_limit(self, stub_client: ApiClient) -> None:
+        tree = _build_tree()
+        register_positions(tree, api_client=stub_client, environment="paper")
+        register_halt(tree, api_client=stub_client, environment="paper")
+        register_status(tree, api_client=stub_client)
+        register_approve(tree, api_client=stub_client, environment="paper")
+
+        too_long: list[tuple[str, int]] = []
+        for cmd in tree.get_commands():
+            desc = cmd.description or ""
+            if len(desc) > self.DISCORD_COMMAND_DESCRIPTION_MAX:
+                too_long.append((cmd.name, len(desc)))
+
+        assert too_long == [], (
+            f"Discord caps slash-command descriptions at "
+            f"{self.DISCORD_COMMAND_DESCRIPTION_MAX} chars; the following "
+            f"exceed: {too_long}. Shorten the description in the matching "
+            f"register_* function. (Caught at gateway-sync as "
+            f"CommandSyncFailure HTTP 400 error code 50035 in production.)"
+        )
+
+    def test_all_command_names_within_discord_limit(self, stub_client: ApiClient) -> None:
+        # Discord caps slash-command name at 32 chars (lowercase, hyphens
+        # OK). Phase-0 names are 5-9 chars; locking the bound prevents a
+        # future verbose name from regressing.
+        tree = _build_tree()
+        register_positions(tree, api_client=stub_client, environment="paper")
+        register_halt(tree, api_client=stub_client, environment="paper")
+        register_status(tree, api_client=stub_client)
+        register_approve(tree, api_client=stub_client, environment="paper")
+
+        for cmd in tree.get_commands():
+            assert 1 <= len(cmd.name) <= 32, (
+                f"Discord requires command name 1-32 chars; got {cmd.name!r} (len {len(cmd.name)})"
+            )
