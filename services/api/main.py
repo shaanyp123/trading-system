@@ -378,6 +378,180 @@ def _build_alert_dispatch_hook(
     return _hook
 
 
+def _build_state_transition_hook(
+    settings: APISettings,
+) -> object | None:
+    """Construct the recon ``state_transition_hook`` closure or return None.
+
+    PR-J: closes the auto-halt seam left by PR #135. The recon planner
+    flags actionable breaks (``plan.should_invoke_kill_switch=True``);
+    the apply orchestrator fires this hook AFTER audit + breaks +
+    alerts have landed. The hook is responsible for:
+
+      1. Reading the current ``risk_state`` for the account
+      2. Planning the transition via
+         ``services.risk.state_machine.plan_invoke_kill_switch(
+             trigger=TransitionTrigger.RECON_MISMATCH, ...)``
+      3. Applying via ``services.risk.dispatch.apply_state_transition``
+      4. Emitting the ``risk_state`` SSE envelope so the web /system
+         page updates in real-time
+
+    Returns ``object | None`` to dodge a circular import (the actual
+    hook signature is :class:`services.reconciliation.apply.StateTransitionHook`).
+
+    Returns ``None`` only if explicitly disabled via a future settings
+    knob; today the hook always installs.
+
+    The closure deliberately catches ``Exception`` around the
+    state-transition pipeline. The audit chain + alerts have already
+    fired by the time the hook runs; a transient state-machine failure
+    (DB unreachable, etc.) shouldn't kill the scheduler. The operator
+    sees the error in logs + the un-halted state via /system, can
+    invoke kill-switch manually.
+    """
+    from datetime import UTC
+    from datetime import datetime as _dt
+
+    from services.api.db import get_session_factory
+    from services.reconciliation.apply import ReconciliationKillSwitchContext
+    from services.risk.dispatch import apply_state_transition
+    from services.risk.state_machine import (
+        HaltSeverity,
+        RiskState,
+        TransitionTrigger,
+        plan_invoke_kill_switch,
+    )
+
+    log.info("state_transition_hook_constructed")
+
+    async def _hook(ctx: ReconciliationKillSwitchContext) -> None:
+        """Auto-halt the system on actionable recon break.
+
+        Fetches current ``risk_state`` → plans NORMAL/CONVALESCENT →
+        HALT_NEW via ``plan_invoke_kill_switch(trigger=RECON_MISMATCH)``
+        → applies via ``apply_state_transition`` → emits SSE.
+
+        If the system is ALREADY HALT_NEW (e.g., a prior cycle's break
+        triggered the halt + recovery hasn't happened), the policy
+        layer's IllegalTransitionError fires; we log + swallow because
+        the desired state is already reached.
+        """
+        session_factory = get_session_factory()
+
+        # Step 1: read current state.
+        async with session_factory() as session:
+            row = (
+                await session.execute(
+                    text(
+                        "SELECT state, severity, convalescent_session_count "
+                        "FROM risk_state WHERE account_id = :acct AND is_current = TRUE"
+                    ),
+                    {"acct": ctx.account_id},
+                )
+            ).fetchone()
+        if row is None:
+            log.warning(
+                "state_transition_hook_no_current_risk_state",
+                account_id=str(ctx.account_id),
+                env=ctx.env,
+                note=(
+                    "No is_current=TRUE risk_state row; the auto-halt "
+                    "cannot proceed. Operator should bootstrap the row "
+                    "via the System page or psql."
+                ),
+            )
+            return
+
+        current_state = RiskState(row.state)
+        current_severity = HaltSeverity(row.severity) if row.severity else None
+        current_counter = row.convalescent_session_count
+
+        if current_state == RiskState.HALT_NEW:
+            # Already halted — desired terminal state. No-op + log.
+            log.info(
+                "state_transition_hook_already_halted",
+                account_id=str(ctx.account_id),
+                env=ctx.env,
+                current_severity=current_severity.value if current_severity else None,
+                actionable_break_count=ctx.actionable_break_count,
+            )
+            return
+
+        # Step 2: plan the transition.
+        try:
+            plan = plan_invoke_kill_switch(
+                current_state=current_state,
+                current_severity=current_severity,
+                convalescent_counter=current_counter or 0,
+                trigger=TransitionTrigger.RECON_MISMATCH,
+                triggered_by="risk_engine",
+                timestamp_utc=_dt.now(tz=UTC).isoformat(),
+            )
+        except Exception:
+            log.exception(
+                "state_transition_hook_plan_failed",
+                account_id=str(ctx.account_id),
+                env=ctx.env,
+            )
+            return
+
+        # Step 3: apply. apply_state_transition takes an AsyncSession,
+        # not a session_factory, so open one for the apply.
+        try:
+            async with session_factory() as apply_session:
+                applied = await apply_state_transition(
+                    plan=plan,
+                    db=apply_session,
+                    account_id=ctx.account_id,
+                    env=ctx.env,
+                    phase_at_emit=1,
+                )
+        except Exception:
+            log.exception(
+                "state_transition_hook_apply_failed",
+                account_id=str(ctx.account_id),
+                env=ctx.env,
+            )
+            return
+
+        log.warning(
+            "state_transition_hook_halt_invoked",
+            account_id=str(ctx.account_id),
+            env=ctx.env,
+            new_state=applied.new_state,
+            new_severity=applied.new_severity,
+            actionable_break_count=ctx.actionable_break_count,
+            primary_audit_event_uuid=str(ctx.primary_audit_event_uuid),
+            state_transition_audit_event_uuid=str(applied.state_transition_audit_event_uuid),
+        )
+
+        # Step 4: SSE emit so the web /system page updates immediately.
+        try:
+            await sse_multiplexer.emit_sse(
+                "risk_state",
+                {
+                    "state": applied.new_state,
+                    "severity": applied.new_severity,
+                    "reason": plan.reason,
+                    "audit_event_uuid": str(applied.state_transition_audit_event_uuid),
+                    "triggered_by": "auto_halt_recon_mismatch",
+                    "triggering_audit_event_uuid": str(ctx.primary_audit_event_uuid),
+                    "environment": ctx.env,
+                },
+            )
+        except Exception:
+            log.exception(
+                "state_transition_hook_sse_emit_failed",
+                account_id=str(ctx.account_id),
+                env=ctx.env,
+            )
+            # SSE failure doesn't undo the state transition; consumers
+            # will reconnect with Last-Event-ID + catch up.
+            return
+
+    return _hook
+
+
 async def _start_reconciliation_scheduler(
     settings: APISettings,
 ) -> tuple[object, object] | None:
@@ -431,10 +605,12 @@ async def _start_reconciliation_scheduler(
         flex_query_token=settings.flex_query_token.get_secret_value(),
     )
     alert_dispatch_hook = _build_alert_dispatch_hook(settings)
+    state_transition_hook = _build_state_transition_hook(settings)
     callback = make_cycle_callback(
         config=config,
         session_factory=api_db.get_session_factory(),
         alert_dispatch_hook=alert_dispatch_hook,  # type: ignore[arg-type]
+        state_transition_hook=state_transition_hook,  # type: ignore[arg-type]
     )
     scheduler = ReconciliationScheduler(callback=callback)
     task = asyncio.create_task(scheduler.run_forever(), name="reconciliation_scheduler.run_forever")
@@ -444,6 +620,7 @@ async def _start_reconciliation_scheduler(
         env=_audit_env_from_settings(settings),
         flex_query_id=settings.flex_query_id,
         alert_dispatch_hook_wired=alert_dispatch_hook is not None,
+        state_transition_hook_wired=state_transition_hook is not None,
     )
     return scheduler, task
 
