@@ -73,6 +73,20 @@ class AuditEventType(StrEnum):
     MANUAL_CLOSE_INVOKED = "manual_close_invoked"
     ROLL_INITIATED = "roll_initiated"
     ROLL_COMPLETED = "roll_completed"
+    # ---------- Position / balance / trade lifecycle ----------
+    # Emitted by the fill processor (services/risk/fill_processor.py)
+    # downstream of an IBKR Filled status. Each fill produces one
+    # POSITION_* event + BALANCE_SNAPSHOT_RECORDED + TRADE_*; the
+    # ORDER_FILLED row above remains the broker-side confirmation. See
+    # backend-spec §3.30 for the locked taxonomy.
+    POSITION_OPENED = "position_opened"
+    POSITION_UPDATED = "position_updated"
+    POSITION_CLOSED = "position_closed"
+    POSITION_MARK_TO_MARKET = "position_mark_to_market"
+    BALANCE_SNAPSHOT_RECORDED = "balance_snapshot_recorded"
+    TRADE_OPENED = "trade_opened"
+    TRADE_CLOSED = "trade_closed"
+    ATTRIBUTION_ROLLUP_RECORDED = "attribution_rollup_recorded"
 
     # ---------- Risk / state machine ----------
     STATE_TRANSITION_NORMAL_TO_HALT = "state_transition_normal_to_halt"

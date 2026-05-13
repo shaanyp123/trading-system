@@ -639,22 +639,40 @@ class OrderPlacementWorker:
     async def _on_order_status(self, update: OrderStatusUpdate) -> None:
         """Callback registered with the IBKR adapter's orderStatusEvent.
 
-        Acts on terminal-fill transitions only — emits a canonical
-        ``fill`` SSE envelope so the webhook_pusher subscriber routes it
-        to Discord ``#fills`` (and any future SSE consumer picks it up
-        too). Other transitions (Submitted, PartiallyFilled, Cancelled,
+        Acts on terminal-fill transitions only. PR-G (post-pivot 2026-05-13)
+        wires the fill end-to-end through
+        :func:`services.risk.fill_processor.process_fill_event`, which
+        writes the audit chain (ORDER_FILLED → POSITION_OPENED/UPDATED →
+        BALANCE_SNAPSHOT_RECORDED → optional TRADE_OPENED), then INSERTs
+        into ``fills``, UPDATEs ``orders.status``, UPSERTs
+        ``positions_current``, INSERTs ``balances``, and INSERT/UPDATEs
+        ``trades``. Then emits the canonical ``fill`` SSE envelope with
+        the new audit_event_uuid stamped for cross-reference.
+
+        Pre-PR-G: this callback emitted SSE only; the tables stayed
+        empty. Post-PR-G: a single Filled status from IBKR is the
+        complete propagation event.
+
+        Dedupe semantics preserved: the worker acts ONCE per
+        broker_order_id. IBKR may re-fire Filled on reconnect; the
+        in-process set short-circuits those.
+
+        Error handling:
+          * :class:`fill_processor.UnsupportedFillScenarioError` —
+            exit / hedging case (out of PR-G scope). Logged at WARNING;
+            the operator manually reconciles via the Audit page +
+            psql. The dedupe set is NOT updated so a follow-up retry
+            (after the operator's manual repair) can proceed.
+          * :class:`fill_processor.FillProcessingError` — terminal
+            failure. Logged at ERROR; same retry semantics as above.
+          * Any other exception — logged at EXCEPTION; SSE NOT emitted
+            because we don't have an audit linkage to stamp.
+
+        Other transitions (Submitted, PartiallyFilled, Cancelled,
         Rejected) are observed-only for now; the placeOrder path's
         ``order_placed`` audit + SSE emit already covers Submitted, and
         terminal cancel/reject paths land alongside the reconciliation
         + retry follow-ups.
-
-        signal_id resolution: looked up by ``client_order_id`` from the
-        orders table. The placement path inserted the orders row before
-        the broker fill (audit-first); by the time the fill event
-        arrives, the row is durable. Missing rows are logged at WARNING
-        and the emit is skipped — IBKR fires Filled exactly once per
-        order so a missing row indicates either operator-manual TWS
-        activity (no signal_id available) or a race we should investigate.
         """
         if update.status != "filled":
             return
@@ -666,14 +684,73 @@ class OrderPlacementWorker:
             )
             return
 
-        async with self._session_factory() as session:
-            row = (
-                await session.execute(
-                    text("SELECT signal_id FROM orders WHERE client_order_id = :cid"),
-                    {"cid": update.client_order_id},
-                )
-            ).fetchone()
-        if row is None:
+        # Lazy import to avoid module-load cycle (fill_processor imports
+        # audit.writer which imports models; routing risk → audit → models
+        # is OK but keeping the import inside the callback is consistent
+        # with the existing import-locality pattern in this file).
+        from services.risk.fill_processor import (
+            FillIngestPayload,
+            FillProcessingError,
+            UnsupportedFillScenarioError,
+            process_fill_event,
+        )
+
+        filled_at = update.last_fill_at_utc or update.observed_at_utc
+        fill_price = update.avg_fill_price or Decimal(0)
+        commission_usd = update.total_commission_usd
+        # broker_fill_id convention: aggregate IBKR fills are exposed via
+        # a single Filled status with cumulative totals (no per-execution
+        # exec_id surfaced through ib-async's orderStatusEvent). Use a
+        # stable f"{broker_order_id}:agg" suffix so a re-fired Filled on
+        # reconnect hits the UNIQUE(broker_fill_id, created_at)
+        # constraint and we catch the dupe at the I/O layer too (defense
+        # in depth on top of the dedupe set).
+        broker_fill_id = f"{update.broker_order_id}:agg"
+        payload = FillIngestPayload(
+            broker_fill_id=broker_fill_id,
+            cumulative_filled_quantity=int(update.cumulative_filled_quantity),
+            fill_quantity=int(update.cumulative_filled_quantity),
+            fill_price=fill_price,
+            commission_usd=commission_usd,
+            filled_at_utc=filled_at,
+        )
+
+        try:
+            result = await process_fill_event(
+                session_factory=self._session_factory,
+                client_order_id=update.client_order_id,
+                payload=payload,
+                env=self._env,
+            )
+        except UnsupportedFillScenarioError as exc:
+            self._log.warning(
+                "order_placement_fill_unsupported_scenario",
+                client_order_id=update.client_order_id,
+                broker_order_id=update.broker_order_id,
+                error_code=exc.error_code,
+                error=str(exc),
+                details=exc.details,
+            )
+            return
+        except FillProcessingError as exc:
+            self._log.error(
+                "order_placement_fill_processing_failed",
+                client_order_id=update.client_order_id,
+                broker_order_id=update.broker_order_id,
+                error_code=exc.error_code,
+                error=str(exc),
+                details=exc.details,
+            )
+            return
+        except Exception:
+            self._log.exception(
+                "order_placement_fill_unexpected_error",
+                client_order_id=update.client_order_id,
+                broker_order_id=update.broker_order_id,
+            )
+            return
+
+        if result is None:
             self._log.warning(
                 "order_placement_fill_unknown_order",
                 client_order_id=update.client_order_id,
@@ -681,9 +758,16 @@ class OrderPlacementWorker:
             )
             return
 
-        signal_id: UUID = row.signal_id
-        filled_at = update.last_fill_at_utc or update.observed_at_utc
-        fill_price = update.avg_fill_price or Decimal(0)
+        # SSE emit — best-effort, after the durable writes have landed.
+        # The audit_event_uuid in the envelope is the ORDER_FILLED row
+        # (audit_event_uuids[0]) — the broker-side confirmation event
+        # the operator deep-links from. Position / balance / trade audit
+        # uuids are NOT in the envelope to keep the wire shape stable;
+        # downstream consumers can pull them via the audit-event page if
+        # needed.
+        order_filled_audit_uuid = (
+            str(result.audit_event_uuids[0]) if result.audit_event_uuids else None
+        )
         try:
             from services.api.sse import emit_sse
 
@@ -692,14 +776,20 @@ class OrderPlacementWorker:
                 {
                     "order_id": str(update.broker_order_id),
                     "client_order_id": update.client_order_id,
-                    "signal_id": str(signal_id),
+                    "signal_id": str(result.signal_id),
                     "market": update.market,
                     "side": update.side,
                     "quantity": str(update.cumulative_filled_quantity),
                     "fill_price": str(fill_price),
-                    "commission_usd": str(update.total_commission_usd),
+                    "commission_usd": str(commission_usd),
                     "filled_at_utc": filled_at.isoformat(),
                     "environment": self._env,
+                    "fill_id": str(result.fill_id),
+                    "position_id": str(result.position_id),
+                    "trade_id": str(result.trade_id),
+                    "balance_id": str(result.balance_id),
+                    "new_order_status": result.new_order_status,
+                    "audit_event_uuid": order_filled_audit_uuid,
                 },
             )
         except Exception:
@@ -708,17 +798,27 @@ class OrderPlacementWorker:
                 client_order_id=update.client_order_id,
                 broker_order_id=update.broker_order_id,
             )
+            # We DO add to the dedupe set even on SSE failure — the audit +
+            # tables are durable, this is just a notification path. A
+            # re-fired Filled would write a second fills row (UNIQUE
+            # constraint catches it at the SQL layer too).
+            self._emitted_fill_order_ids.add(update.broker_order_id)
             return
 
         self._emitted_fill_order_ids.add(update.broker_order_id)
         self._log.info(
-            "order_placement_fill_sse_emitted",
+            "order_placement_fill_propagated",
             client_order_id=update.client_order_id,
             broker_order_id=update.broker_order_id,
-            signal_id=str(signal_id),
+            fill_id=str(result.fill_id),
+            position_id=str(result.position_id),
+            trade_id=str(result.trade_id),
+            balance_id=str(result.balance_id),
+            new_order_status=result.new_order_status,
             quantity=str(update.cumulative_filled_quantity),
             fill_price=str(fill_price),
-            commission_usd=str(update.total_commission_usd),
+            commission_usd=str(commission_usd),
+            audit_event_uuid=order_filled_audit_uuid,
         )
 
 
