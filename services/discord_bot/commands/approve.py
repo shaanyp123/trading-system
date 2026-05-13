@@ -230,10 +230,14 @@ def register_approve(
 
     @tree.command(
         name="approve",
-        description=(
-            "Approve a pending signal by ID. Confirms before invoking; "
-            "OrderPlacementWorker forwards to IBKR within ~5s."
-        ),
+        # NOTE: Discord caps slash-command description at 100 chars. The
+        # regression test in tests/unit/test_discord_bot_commands.py
+        # (TestSlashCommandDescriptionLength) locks this at the bot's
+        # boot path so a future edit can't silently regress past the
+        # limit (which fires as a CommandSyncFailure at gateway-sync time,
+        # not a Python error — caught here in production by PR #144 after
+        # PR #141 shipped an over-length description).
+        description="Approve a pending signal by UUID. Confirms then forwards to IBKR via OrderPlacementWorker.",
         guild=guild,
     )
     @app_commands.describe(
