@@ -54,9 +54,33 @@ Audit events emitted (taxonomy §3.30; mirrored in
   today's snapshot. Default ``resolution_path = grace_period``;
   the API layer overrides to ``manual`` when a human acted.
 
-A22 reminder: tests must NOT actually emit audit events. This module
-returns :class:`PendingAuditEvent` dataclasses as data; tests inspect the
-plan struct only.
+Alert descriptors emitted (Phase 1 — operator-visibility wiring):
+
+- One :class:`AlertDescriptor` per ACTIONABLE break (i.e., breaks
+  outside the T+1 grace period). Continuation-grace breaks emit the
+  audit + reconciliation_breaks row but NO alert — the operator already
+  saw the alert on the first detection, repeating it on every cycle
+  would be operational noise.
+- Severity is fixed at ``"P2"`` in Phase 1 → routed to the ``#alerts``
+  Discord channel only via the existing severity-to-channels table in
+  ``services.webhook_pusher.payloads.SEVERITY_TO_CHANNELS``. P0/P1
+  escalation (e.g., >5% position divergence to ``#critical`` + email)
+  is deferred to a follow-up PR after the operator sees the first real
+  break and decides the policy. The natural trigger for that follow-up
+  is ``should_invoke_kill_switch`` — a confirmed actionable break is
+  what's already shifted to P0 in the existing planner shape.
+- Category is fixed at ``"reconciliation_break"`` (canonical
+  ``services.webhook_pusher.payloads.AlertCategory.RECONCILIATION_BREAK``
+  string value; also a member of the alembic 0004 ``alert_category``
+  Postgres enum).
+- The descriptor carries ``triggering_break_index`` (positional index
+  into ``breaks_detected``) so the apply orchestrator can resolve the
+  matching ``audit_event_uuid`` after the audit writes land.
+
+A22 reminder: tests must NOT actually emit audit events OR write the
+alerts row OR hit live Discord. This module returns
+:class:`PendingAuditEvent` + :class:`AlertDescriptor` dataclasses as
+data; the dispatch I/O is the apply orchestrator's responsibility.
 
 Schema mapping (``alembic/versions/0004_ops_tables.py`` row
 ``reconciliation_breaks``):
@@ -146,6 +170,35 @@ ReconciliationAuditEventType = Literal[
     "reconciliation_break_detected",
     "reconciliation_break_resolved",
 ]
+
+
+# Locked-taxonomy alert severity (mirrors
+# ``services.webhook_pusher.payloads.AlertSeverity`` + alembic 0004
+# ``alerts.severity`` CHECK constraint). Recon-side string literal so the
+# pure-policy module stays decoupled from webhook_pusher imports.
+AlertSeverityLiteral = Literal["P0", "P1", "P2"]
+
+
+# Subset of the alembic 0004 ``alert_category`` Postgres enum that this
+# module emits — Phase 1 only emits ``"reconciliation_break"``. Adding a
+# new category value here REQUIRES the same value in the alembic enum
+# (forbidden-whitelist alembic/** PR) AND in
+# ``services.webhook_pusher.payloads.AlertCategory``. The Postgres enum
+# is the source of truth.
+AlertCategoryLiteral = Literal["reconciliation_break"]
+
+
+#: Locked default severity for reconciliation-break alerts in Phase 1.
+#: All breaks → P2 → ``#alerts`` Discord channel only. P0/P1 escalation
+#: (e.g. >5% position divergence → ``#critical`` + email) is a follow-up
+#: PR after the operator sees the first real break + decides the policy.
+DEFAULT_RECONCILIATION_ALERT_SEVERITY: Final[AlertSeverityLiteral] = "P2"
+
+
+#: Locked category for reconciliation-break alerts. Mirrors
+#: ``services.webhook_pusher.payloads.AlertCategory.RECONCILIATION_BREAK``
+#: and the alembic 0004 ``alert_category`` enum value.
+RECONCILIATION_BREAK_ALERT_CATEGORY: Final[AlertCategoryLiteral] = "reconciliation_break"
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +321,57 @@ class ResolvedPriorBreak:
 
 
 @dataclass(frozen=True, slots=True)
+class AlertDescriptor:
+    """One operator-facing alert to be dispatched per actionable break.
+
+    Emitted by ``plan_reconciliation_check`` for each break in
+    ``breaks_detected`` whose ``within_grace_period`` is False. Grace-
+    period continuations do NOT emit alerts — the operator already saw
+    the alert on the first detection; repeating it every cycle would be
+    operational noise.
+
+    Pure-policy data: this dataclass describes what to dispatch. The
+    apply orchestrator's ``alert_dispatch_hook`` callback owns the I/O
+    (alerts table INSERT + ``services.webhook_pusher.dispatcher.dispatch_alert``).
+
+    Fields:
+
+    - ``triggering_break_index`` — positional index into
+      ``plan.breaks_detected`` that triggered this alert. The apply
+      orchestrator uses positional alignment with ``plan.audit_events``
+      (where ``audit_events[i]`` is the ``reconciliation_break_detected``
+      event for ``breaks_detected[i]``) to resolve the matching
+      ``audit_event_uuid`` after audit writes land. This lets the hook
+      stamp ``alerts.triggering_audit_event_uuid`` correctly for
+      cross-reference in the operator's incident-review workflow.
+    - ``severity`` — locked to ``"P2"`` in Phase 1 per
+      :data:`DEFAULT_RECONCILIATION_ALERT_SEVERITY`. Routes to
+      ``#alerts`` Discord channel only via the existing
+      ``SEVERITY_TO_CHANNELS`` table.
+    - ``category`` — locked to ``"reconciliation_break"`` per
+      :data:`RECONCILIATION_BREAK_ALERT_CATEGORY` (matches alembic 0004
+      ``alert_category`` Postgres enum + canonical
+      ``AlertCategory.RECONCILIATION_BREAK``).
+    - ``title`` — operator-readable short headline (becomes alerts.message
+      after the hook typically combines it with ``body``).
+    - ``body`` — operator-readable multi-line summary. The hook
+      implementer is free to combine ``title`` + ``body`` into
+      ``alerts.message`` (recommended: ``f"{title}\\n\\n{body}"``) or
+      put ``body`` into the alerts.detail JSONB as a "body" key.
+    - ``payload`` — JSONB-friendly detail dict for ``alerts.detail``
+      JSONB. Decimal values are stringified per A05; tz-aware datetimes
+      are ISO-format strings per A06.
+    """
+
+    triggering_break_index: int
+    severity: AlertSeverityLiteral
+    category: AlertCategoryLiteral
+    title: str
+    body: str
+    payload: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
 class ReconciliationPlan:
     """The full result of a reconciliation check.
 
@@ -283,7 +387,11 @@ class ReconciliationPlan:
        ``resolution_path``.
     3. If ``len(breaks_detected) == 0``: append the
        ``reconciliation_check_passed`` audit event.
-    4. If ``should_invoke_kill_switch`` is True: invoke
+    4. For each :class:`AlertDescriptor` in ``alerts``: invoke
+       ``alert_dispatch_hook(AlertDispatchContext(...))`` (after audit-
+       chain writes have landed per spec §2.10.1) which inserts the
+       alerts row + fans out via webhook_pusher.dispatch_alert.
+    5. If ``should_invoke_kill_switch`` is True: invoke
        ``plan_invoke_kill_switch(trigger=RECON_MISMATCH, ...)`` and apply
        the resulting ``StateTransitionPlan``.
 
@@ -292,6 +400,11 @@ class ReconciliationPlan:
     ``break_detected`` events first (grace + actionable), then
     ``break_resolved`` events, then a single ``check_passed`` event when
     no breaks were detected today.
+
+    The ``alerts`` tuple is independent of ``audit_events`` ordering —
+    one descriptor per ACTIONABLE break (grace-period continuations are
+    skipped). Each descriptor's ``triggering_break_index`` points into
+    ``breaks_detected`` for positional audit_event_uuid resolution.
     """
 
     breaks_detected: tuple[ReconciliationBreak, ...]
@@ -299,6 +412,9 @@ class ReconciliationPlan:
     audit_events: tuple[PendingAuditEvent, ...]
     actionable_break_count: int
     should_invoke_kill_switch: bool
+    # Default `()` keeps backwards compat with pre-existing test
+    # constructors. The planner always passes the field explicitly.
+    alerts: tuple[AlertDescriptor, ...] = ()
 
 
 class ReconciliationError(ValueError):
@@ -394,12 +510,18 @@ def plan_reconciliation_check(
         detected_at_utc=detected_at_utc,
     )
 
+    alerts = _build_alerts(
+        breaks_detected=breaks_detected,
+        detected_at_utc=detected_at_utc,
+    )
+
     actionable_count = sum(1 for b in breaks_detected if not b.within_grace_period)
 
     return ReconciliationPlan(
         breaks_detected=breaks_detected,
         breaks_resolved=breaks_resolved,
         audit_events=audit_events,
+        alerts=alerts,
         actionable_break_count=actionable_count,
         should_invoke_kill_switch=actionable_count > 0,
     )
@@ -639,11 +761,118 @@ def _build_audit_events(
     return tuple(events)
 
 
+def _build_alerts(
+    *,
+    breaks_detected: tuple[ReconciliationBreak, ...],
+    detected_at_utc: datetime,
+) -> tuple[AlertDescriptor, ...]:
+    """Build operator-facing :class:`AlertDescriptor` rows.
+
+    One descriptor per ACTIONABLE break (i.e., not within grace period).
+    Grace-period continuations are SKIPPED — re-firing the same alert on
+    every cycle would create operator-noise during T+1 recovery windows.
+
+    ``triggering_break_index`` is the index of the break within
+    ``breaks_detected`` (not the actionable-only index). The apply
+    orchestrator uses this index to look up the matching audit event
+    UUID after the audit writes land.
+
+    Title + body are operator-readable English strings. Payload is a
+    JSONB-friendly dict with Decimal-as-str (A05) + ISO-format timestamps
+    (A06) so it can land directly into ``alerts.detail`` JSONB.
+    """
+    alerts: list[AlertDescriptor] = []
+    ts_iso = detected_at_utc.isoformat()
+    for idx, brk in enumerate(breaks_detected):
+        if brk.within_grace_period:
+            continue
+        alerts.append(
+            AlertDescriptor(
+                triggering_break_index=idx,
+                severity=DEFAULT_RECONCILIATION_ALERT_SEVERITY,
+                category=RECONCILIATION_BREAK_ALERT_CATEGORY,
+                title=_render_alert_title(brk),
+                body=_render_alert_body(brk, ts_iso=ts_iso),
+                payload=_render_alert_payload(brk, ts_iso=ts_iso),
+            )
+        )
+    return tuple(alerts)
+
+
+def _render_alert_title(brk: ReconciliationBreak) -> str:
+    """Operator-readable headline for one break.
+
+    Examples:
+      - "Reconciliation break: /MES position divergence 1 contract"
+      - "Reconciliation break: /MES position divergence 3 contracts"
+      - "Reconciliation break: cash divergence $150.00"
+    """
+    if brk.metric is ReconciliationMetric.POSITION_QTY:
+        contract_word = "contract" if abs(brk.delta) == Decimal("1") else "contracts"
+        # Use absolute value in the title so the operator reads "1 contract" not
+        # "-1 contracts"; sign is preserved in body + payload for full detail.
+        return (
+            f"Reconciliation break: {brk.market} position divergence "
+            f"{abs(brk.delta)} {contract_word}"
+        )
+    # CASH_USD
+    return f"Reconciliation break: cash divergence ${abs(brk.delta)}"
+
+
+def _render_alert_body(brk: ReconciliationBreak, *, ts_iso: str) -> str:
+    """Operator-readable multi-line summary for one break.
+
+    Format chosen so the operator can scan triage state on a phone-sized
+    Discord card without expanding the embed. Order: situation,
+    quantitative split, tolerance band, source, detection timestamp.
+    """
+    metric_label = (
+        "position quantity" if brk.metric is ReconciliationMetric.POSITION_QTY else "cash"
+    )
+    market_clause = f" on {brk.market}" if brk.market is not None else ""
+    return (
+        f"EOD reconciliation detected a {metric_label} divergence{market_clause}.\n"
+        f"\n"
+        f"Backend view: {brk.expected}\n"
+        f"Broker view:  {brk.actual}\n"
+        f"Delta:        {brk.delta}\n"
+        f"Tolerance:    {brk.tolerance}\n"
+        f"Source:       {brk.source.value}\n"
+        f"Detected at:  {ts_iso}"
+    )
+
+
+def _render_alert_payload(brk: ReconciliationBreak, *, ts_iso: str) -> dict[str, Any]:
+    """Build the alerts.detail JSONB payload for one break.
+
+    A05 enforced: Decimal-as-str. A06 enforced: ISO-format timestamp.
+    Mirror shape with the reconciliation_break_detected audit event
+    payload so the operator's triage view can render either source
+    interchangeably.
+    """
+    return {
+        "metric": brk.metric.value,
+        "market": brk.market,
+        "expected": str(brk.expected),
+        "actual": str(brk.actual),
+        "delta": str(brk.delta),
+        "tolerance": str(brk.tolerance),
+        "source": brk.source.value,
+        "within_grace_period": brk.within_grace_period,
+        "detected_at_utc": ts_iso,
+    }
+
+
 __all__ = [
     "CASH_ABS_TOLERANCE_USD",
     "CASH_BPS_TOLERANCE",
+    "DEFAULT_RECONCILIATION_ALERT_SEVERITY",
     "DIVIDEND_WIDENING_FACTOR",
     "POSITION_QTY_TOLERANCE",
+    "RECONCILIATION_BREAK_ALERT_CATEGORY",
+    "AlertCategoryLiteral",
+    "AlertDescriptor",
+    "AlertSeverityLiteral",
     "BackendView",
     "BrokerSource",
     "BrokerView",

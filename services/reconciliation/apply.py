@@ -39,6 +39,25 @@ break audit row + ``reconciliation_breaks`` row still land). This
 decouples the recon module from any specific state-machine wiring —
 the hook is the seam.
 
+**Alert dispatch:** for each :class:`AlertDescriptor` in ``plan.alerts``
+(one per actionable break — grace-period continuations are skipped per
+the planner contract), the caller's ``alert_dispatch_hook`` callback
+fires. The hook receives the descriptor + the matching
+``audit_event_uuid`` (resolved via positional alignment with
+``plan.audit_events[: len(plan.breaks_detected)]``) and is responsible
+for inserting the alerts row + invoking
+``services.webhook_pusher.dispatcher.dispatch_alert``. The hook is
+optional; if not provided, alerts are NOT dispatched (the audit chain +
+reconciliation_breaks rows still land — so the operator can recover the
+break via psql or the Audit page after wiring the hook). Same shape /
+same A02 boundary as ``state_transition_hook``.
+
+The alert dispatch hook fires AFTER audit writes + reconciliation_breaks
+INSERTs + breaks_resolved UPDATEs (audit-first per backend-spec §2.10.1:
+operator-visible side-effects come AFTER durable evidence). It fires
+BEFORE the state_transition_hook so the operator gets the alert about
+the break before the system halts.
+
 **A02 BINDS** — `services/reconciliation/**` is on the forbidden
 whitelist; `risk-review-approved` required.
 **A01 enforced** — audit writes flow exclusively through
@@ -62,6 +81,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from services.audit.event_types import AuditEventType
 from services.audit.writer import Environment, PhaseAtEmit, append_audit_event
 from services.reconciliation.recon import (
+    AlertDescriptor,
     PendingAuditEvent,
     ReconciliationBreak,
     ReconciliationPlan,
@@ -105,6 +125,13 @@ class ReconciliationApplyResult:
     resolved_break_count: int
     """Count of prior breaks whose ``resolved_at_utc`` was stamped."""
 
+    alerts_dispatched_count: int
+    """Count of ``alert_dispatch_hook`` invocations. Equals
+    ``len(plan.alerts)`` iff the hook was provided. Zero when the hook
+    is None — alerts in the plan are then dropped (operator must
+    rebuild from audit log; see ``deploy/reconciliation/README.md`` for
+    the recovery procedure)."""
+
     kill_switch_invoked: bool
     """True if the state-transition hook fired."""
 
@@ -125,6 +152,27 @@ scheduler) is responsible for constructing + applying a
 """
 
 
+AlertDispatchHook = Callable[["AlertDispatchContext"], Awaitable[None]]
+"""Callback fired once per :class:`AlertDescriptor` in ``plan.alerts``.
+
+The hook receives the descriptor + the audit_event_uuid for the
+triggering break (resolved by positional alignment in the apply
+orchestrator) and is responsible for:
+
+  1. INSERT one row into the ``alerts`` table with severity / category
+     / message / detail / triggering_audit_event_uuid stamped from
+     descriptor + context fields.
+  2. Invoke
+     :func:`services.webhook_pusher.dispatcher.dispatch_alert` with the
+     newly minted alert_id + an httpx client + webhook URL map.
+
+The hook is invoked AFTER audit + reconciliation_breaks writes land
+(audit-first per spec §2.10.1). Errors raised inside the hook propagate
+— the api-side wiring is expected to catch + log so a Discord outage
+doesn't kill the EOD cycle.
+"""
+
+
 @dataclass(frozen=True, slots=True)
 class ReconciliationKillSwitchContext:
     """Context payload passed to the state-transition hook.
@@ -142,6 +190,36 @@ class ReconciliationKillSwitchContext:
     """The first ``reconciliation_break_detected`` audit_event_uuid from
     this apply. Carried in the kill-switch audit payload as the
     `triggered_by_audit_event_uuid` field for cross-reference."""
+
+
+@dataclass(frozen=True, slots=True)
+class AlertDispatchContext:
+    """Context payload passed to the alert dispatch hook.
+
+    The hook implementer translates these fields into an alerts row
+    INSERT + a ``dispatch_alert`` call. Typical mapping:
+
+      INSERT INTO alerts
+        (account_id, severity, category, message, detail,
+         triggering_audit_event_uuid)
+      VALUES
+        (account_id, descriptor.severity, descriptor.category,
+         f"{descriptor.title}\\n\\n{descriptor.body}",
+         descriptor.payload, triggering_audit_event_uuid)
+      RETURNING id;
+    """
+
+    descriptor: AlertDescriptor
+    """The pure-policy alert descriptor produced by the planner."""
+
+    triggering_audit_event_uuid: UUID
+    """The ``reconciliation_break_detected`` audit_event_uuid for the
+    break that triggered this alert. Stamped into
+    ``alerts.triggering_audit_event_uuid`` so the operator can
+    cross-reference between the Audit page and the Alerts page."""
+
+    account_id: UUID
+    env: Environment
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +249,7 @@ async def apply_reconciliation_plan(
     env: Environment,
     phase_at_emit: PhaseAtEmit = 1,
     state_transition_hook: StateTransitionHook | None = None,
+    alert_dispatch_hook: AlertDispatchHook | None = None,
     resolved_at_utc: datetime | None = None,
     resolution_path: ResolutionPathLiteral = "manual",
 ) -> ReconciliationApplyResult:
@@ -242,6 +321,32 @@ async def apply_reconciliation_plan(
             resolution_path=resolution_path,
         )
 
+    alerts_dispatched_count = 0
+    if plan.alerts and alert_dispatch_hook is not None:
+        alerts_dispatched_count = await _dispatch_alerts(
+            plan.alerts,
+            audit_uuids=tuple(detected_uuids),
+            account_id=account_id,
+            env=env,
+            alert_dispatch_hook=alert_dispatch_hook,
+        )
+    elif plan.alerts:
+        # Hook not wired: log a single structured warning so the operator
+        # knows alerts were dropped on the floor (the audit chain +
+        # reconciliation_breaks rows still landed, so recovery is possible
+        # via psql or the Audit page).
+        log.warning(
+            "reconciliation_alerts_dropped_no_hook",
+            account_id=str(account_id),
+            env=env,
+            alerts_pending=len(plan.alerts),
+            note=(
+                "alert_dispatch_hook is None; alerts in plan.alerts will not "
+                "be delivered. Wire the hook in the scheduler glue layer "
+                "(see deploy/reconciliation/README.md)."
+            ),
+        )
+
     kill_switch_invoked = False
     if plan.should_invoke_kill_switch and state_transition_hook is not None:
         if not detected_uuids:
@@ -274,12 +379,14 @@ async def apply_reconciliation_plan(
         breaks_detected=n_detected,
         breaks_resolved=resolved_count,
         actionable_break_count=plan.actionable_break_count,
+        alerts_dispatched=alerts_dispatched_count,
         kill_switch_invoked=kill_switch_invoked,
     )
     return ReconciliationApplyResult(
         audit_event_uuids=tuple(audit_uuids),
         inserted_break_ids=tuple(inserted_break_ids),
         resolved_break_count=resolved_count,
+        alerts_dispatched_count=alerts_dispatched_count,
         kill_switch_invoked=kill_switch_invoked,
     )
 
@@ -379,6 +486,55 @@ async def _insert_breaks(
     return inserted_ids
 
 
+async def _dispatch_alerts(
+    alerts: tuple[AlertDescriptor, ...],
+    *,
+    audit_uuids: tuple[UUID, ...],
+    account_id: UUID,
+    env: Environment,
+    alert_dispatch_hook: AlertDispatchHook,
+) -> int:
+    """Fire ``alert_dispatch_hook`` once per :class:`AlertDescriptor`.
+
+    Resolves each descriptor's triggering audit_event_uuid by positional
+    alignment with ``audit_uuids`` (which is the detected-break-only
+    slice of the apply's audit_uuids list — see the call site in
+    :func:`apply_reconciliation_plan`).
+
+    Hook invocation order matches descriptor order. Errors propagate;
+    the api-side wiring is expected to catch + log Discord delivery
+    failures via the dispatcher's own resilience path so a transient
+    webhook outage doesn't kill the EOD cycle.
+
+    Defensive on triggering_break_index out-of-bounds: if a malformed
+    plan somehow points at a non-existent break index, log an error +
+    skip the alert rather than crash (preserves audit row durability +
+    surfaces the bug for the next deploy).
+    """
+    dispatched = 0
+    for desc in alerts:
+        if not 0 <= desc.triggering_break_index < len(audit_uuids):
+            log.error(
+                "reconciliation_alert_invariant_violated_index",
+                triggering_break_index=desc.triggering_break_index,
+                audit_uuids_len=len(audit_uuids),
+                account_id=str(account_id),
+                env=env,
+            )
+            continue
+        triggering_uuid = audit_uuids[desc.triggering_break_index]
+        await alert_dispatch_hook(
+            AlertDispatchContext(
+                descriptor=desc,
+                triggering_audit_event_uuid=triggering_uuid,
+                account_id=account_id,
+                env=env,
+            )
+        )
+        dispatched += 1
+    return dispatched
+
+
 async def _resolve_prior_breaks(
     resolved: tuple[ResolvedPriorBreak, ...],
     *,
@@ -435,6 +591,8 @@ async def _resolve_prior_breaks(
 
 
 __all__ = [
+    "AlertDispatchContext",
+    "AlertDispatchHook",
     "ReconciliationApplyResult",
     "ReconciliationKillSwitchContext",
     "ResolutionPathLiteral",

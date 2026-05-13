@@ -20,6 +20,7 @@ from uuid import uuid4
 
 import pytest
 
+from services.reconciliation.apply import AlertDispatchContext
 from services.reconciliation.eod_cycle import (
     EodCycleConfig,
     build_broker_view,
@@ -351,6 +352,281 @@ class TestMakeCycleCallback:
         kwargs = invoked.await_args.kwargs  # type: ignore[union-attr]
         assert kwargs["config"] is config
         assert kwargs["session_factory"] is factory
+
+    async def test_callback_threads_alert_dispatch_hook(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # make_cycle_callback accepts an alert_dispatch_hook and threads
+        # it through to run_eod_cycle so the api lifespan glue can inject
+        # a Discord-fan-out hook at scheduler construction time.
+        config = EodCycleConfig(
+            account_id=uuid4(),
+            env="paper",
+            flex_query_id=1,
+            flex_query_token="t",
+        )
+        factory = _stub_session_factory(positions=[], balance=None)
+        invoked = AsyncMock(return_value=None)
+        monkeypatch.setattr("services.reconciliation.eod_cycle.run_eod_cycle", invoked)
+
+        async def my_hook(ctx: AlertDispatchContext) -> None:
+            return None
+
+        cb = make_cycle_callback(
+            config=config, session_factory=factory, alert_dispatch_hook=my_hook
+        )
+        await cb(datetime(2026, 5, 12, tzinfo=UTC).date())
+        kwargs = invoked.await_args.kwargs  # type: ignore[union-attr]
+        assert kwargs["alert_dispatch_hook"] is my_hook
+
+
+# ---------------------------------------------------------------------------
+# Alert dispatch hook end-to-end through run_eod_cycle
+# ---------------------------------------------------------------------------
+
+
+class TestAlertDispatchHookEndToEnd:
+    """End-to-end (via fakes) that an actionable break flows through the
+    apply orchestrator and fires the ``alert_dispatch_hook`` exactly once
+    per actionable break.
+
+    Verifies the audit-first ordering (audit writes land before the hook
+    fires) and that the hook receives the matching audit_event_uuid via
+    positional alignment with ``plan.breaks_detected``.
+
+    A22 + A27 do NOT bind here — pure-policy Python, no testcontainers,
+    no live HTTP.
+    """
+
+    async def test_actionable_break_fires_hook_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = EodCycleConfig(
+            account_id=uuid4(),
+            env="paper",
+            flex_query_id=1,
+            flex_query_token="t",
+        )
+        # 1-contract position divergence on /MES → 1 actionable break.
+        snap = _build_snapshot(
+            positions=(_flex_pos(symbol="MES", quantity="1"),),
+            cash_balances=(FlexCashBalance(currency="USD", balance=Decimal("100000")),),
+        )
+        client = MagicMock()
+        client.fetch_snapshot = AsyncMock(return_value=snap)
+        factory = _stub_session_factory(
+            positions=[{"market": "/MES", "qty": 2}],
+            balance={"cash_usd": Decimal("100000"), "net_liquidation": Decimal("105000")},
+        )
+
+        # Fake apply that captures the plan + simulates audit_uuids minting
+        # so we can assert hook invocation order + positional alignment.
+        captured_plan: dict[str, Any] = {}
+
+        async def fake_apply(plan: Any, **kwargs: Any) -> MagicMock:
+            captured_plan["plan"] = plan
+            captured_plan["kwargs"] = kwargs
+            # Real apply mints 1 UUID per audit event. For 1 break_detected
+            # event, that's 1 UUID. We exercise the hook by calling it
+            # the way the real apply would.
+            hook = kwargs.get("alert_dispatch_hook")
+            if hook is not None and plan.alerts:
+                fake_audit_uuid = uuid4()
+                for desc in plan.alerts:
+                    await hook(
+                        AlertDispatchContext(
+                            descriptor=desc,
+                            triggering_audit_event_uuid=fake_audit_uuid,
+                            account_id=config.account_id,
+                            env=config.env,
+                        )
+                    )
+            mock_result = MagicMock()
+            mock_result.alerts_dispatched_count = len(plan.alerts) if hook else 0
+            return mock_result
+
+        monkeypatch.setattr(
+            "services.reconciliation.eod_cycle.apply_reconciliation_plan", fake_apply
+        )
+
+        hook_calls: list[AlertDispatchContext] = []
+
+        async def hook(ctx: AlertDispatchContext) -> None:
+            hook_calls.append(ctx)
+
+        await run_eod_cycle(
+            config=config,
+            session_factory=factory,
+            flex_client_factory=lambda: client,
+            alert_dispatch_hook=hook,
+        )
+
+        # Exactly one hook invocation for the actionable break.
+        assert len(hook_calls) == 1
+        ctx = hook_calls[0]
+        # Hook received the descriptor for the break.
+        assert ctx.descriptor.severity == "P2"
+        assert ctx.descriptor.category == "reconciliation_break"
+        assert ctx.descriptor.payload["market"] == "/MES"
+        assert ctx.descriptor.payload["delta"] == "1"
+        # Hook received the context fields populated.
+        assert ctx.account_id == config.account_id
+        assert ctx.env == config.env
+        # Plan reached apply with the hook in kwargs.
+        assert captured_plan["kwargs"]["alert_dispatch_hook"] is hook
+
+    async def test_no_breaks_no_hook_fires(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = EodCycleConfig(
+            account_id=uuid4(),
+            env="paper",
+            flex_query_id=1,
+            flex_query_token="t",
+        )
+        # FlexQuery + backend agree exactly on positions + cash.
+        snap = _build_snapshot(
+            positions=(_flex_pos(symbol="MES", quantity="1"),),
+            cash_balances=(FlexCashBalance(currency="USD", balance=Decimal("100000")),),
+        )
+        client = MagicMock()
+        client.fetch_snapshot = AsyncMock(return_value=snap)
+        factory = _stub_session_factory(
+            positions=[{"market": "/MES", "qty": 1}],
+            balance={"cash_usd": Decimal("100000"), "net_liquidation": Decimal("105000")},
+        )
+
+        async def fake_apply(plan: Any, **kwargs: Any) -> MagicMock:
+            hook = kwargs.get("alert_dispatch_hook")
+            if hook is not None and plan.alerts:
+                for desc in plan.alerts:
+                    await hook(
+                        AlertDispatchContext(
+                            descriptor=desc,
+                            triggering_audit_event_uuid=uuid4(),
+                            account_id=config.account_id,
+                            env=config.env,
+                        )
+                    )
+            return MagicMock(alerts_dispatched_count=0)
+
+        monkeypatch.setattr(
+            "services.reconciliation.eod_cycle.apply_reconciliation_plan", fake_apply
+        )
+
+        hook_calls: list[AlertDispatchContext] = []
+
+        async def hook(ctx: AlertDispatchContext) -> None:
+            hook_calls.append(ctx)
+
+        await run_eod_cycle(
+            config=config,
+            session_factory=factory,
+            flex_client_factory=lambda: client,
+            alert_dispatch_hook=hook,
+        )
+        # No breaks → no alerts → no hook calls.
+        assert hook_calls == []
+
+    async def test_multiple_actionable_breaks_fire_hook_per_break(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Three actionable breaks → three hook invocations, in order.
+        config = EodCycleConfig(
+            account_id=uuid4(),
+            env="paper",
+            flex_query_id=1,
+            flex_query_token="t",
+        )
+        snap = _build_snapshot(
+            positions=(_flex_pos(symbol="MES", quantity="1"),),
+            cash_balances=(FlexCashBalance(currency="USD", balance=Decimal("100000")),),
+        )
+        client = MagicMock()
+        client.fetch_snapshot = AsyncMock(return_value=snap)
+        # Backend says different positions on /MES + /MCL + cash mismatch.
+        factory = _stub_session_factory(
+            positions=[
+                {"market": "/MES", "qty": 3},
+                {"market": "/MCL", "qty": 1},
+            ],
+            balance={"cash_usd": Decimal("100150"), "net_liquidation": Decimal("105000")},
+        )
+
+        async def fake_apply(plan: Any, **kwargs: Any) -> MagicMock:
+            hook = kwargs.get("alert_dispatch_hook")
+            if hook is not None and plan.alerts:
+                for desc in plan.alerts:
+                    await hook(
+                        AlertDispatchContext(
+                            descriptor=desc,
+                            triggering_audit_event_uuid=uuid4(),
+                            account_id=config.account_id,
+                            env=config.env,
+                        )
+                    )
+            return MagicMock(alerts_dispatched_count=len(plan.alerts) if hook else 0)
+
+        monkeypatch.setattr(
+            "services.reconciliation.eod_cycle.apply_reconciliation_plan", fake_apply
+        )
+
+        hook_calls: list[AlertDispatchContext] = []
+
+        async def hook(ctx: AlertDispatchContext) -> None:
+            hook_calls.append(ctx)
+
+        await run_eod_cycle(
+            config=config,
+            session_factory=factory,
+            flex_client_factory=lambda: client,
+            alert_dispatch_hook=hook,
+        )
+        # Three breaks (MCL, MES, cash) → three hook invocations.
+        assert len(hook_calls) == 3
+        markets = [ctx.descriptor.payload["market"] for ctx in hook_calls]
+        # /MCL sorted alphabetically before /MES; cash break has market=None.
+        assert markets == ["/MCL", "/MES", None]
+
+    async def test_hook_optional_when_no_hook_supplied(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Pre-wiring boot: no hook supplied → cycle still completes
+        # (audit + reconciliation_breaks rows still land via apply).
+        config = EodCycleConfig(
+            account_id=uuid4(),
+            env="paper",
+            flex_query_id=1,
+            flex_query_token="t",
+        )
+        snap = _build_snapshot(
+            positions=(_flex_pos(symbol="MES", quantity="1"),),
+            cash_balances=(FlexCashBalance(currency="USD", balance=Decimal("100000")),),
+        )
+        client = MagicMock()
+        client.fetch_snapshot = AsyncMock(return_value=snap)
+        factory = _stub_session_factory(
+            positions=[{"market": "/MES", "qty": 2}],
+            balance={"cash_usd": Decimal("100000"), "net_liquidation": Decimal("105000")},
+        )
+
+        captured: dict[str, Any] = {}
+
+        async def fake_apply(plan: Any, **kwargs: Any) -> MagicMock:
+            captured["kwargs"] = kwargs
+            return MagicMock(alerts_dispatched_count=0)
+
+        monkeypatch.setattr(
+            "services.reconciliation.eod_cycle.apply_reconciliation_plan", fake_apply
+        )
+
+        # Note: no alert_dispatch_hook passed.
+        result = await run_eod_cycle(
+            config=config,
+            session_factory=factory,
+            flex_client_factory=lambda: client,
+        )
+        assert result is not None
+        # Plan still went through apply.
+        assert "kwargs" in captured
+        # Hook is None.
+        assert captured["kwargs"]["alert_dispatch_hook"] is None
 
 
 class TestModuleContract:

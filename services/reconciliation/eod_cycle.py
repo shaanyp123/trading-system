@@ -32,6 +32,15 @@ once the dispatcher's state-transition contract is exercised. Until
 then, an actionable break still lands in audit + reconciliation_breaks;
 the operator can manually halt via the System page kill-switch UI.
 
+**Alert dispatch hook:** the ``alert_dispatch_hook`` parameter flows
+through to :func:`services.reconciliation.apply.apply_reconciliation_plan`
+unchanged. When set, every actionable break in ``plan.alerts`` fires the
+hook (which the api lifespan wires to insert an alerts row + invoke
+``services.webhook_pusher.dispatcher.dispatch_alert``). When unset
+(Phase 1 day-1 boot, before sops Discord webhook URLs are populated +
+the api wiring follow-up PR lands), alerts are dropped on the floor +
+a structured warning is logged so the operator knows to wire it.
+
 **Prior-breaks lookup deliberately empty in Phase 1:** the planner's
 ``prior_breaks`` parameter classifies today's breaks as within-grace
 vs. actionable. Phase 1 starts the recon ledger from zero (no prior
@@ -64,6 +73,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from services.audit.writer import Environment, PhaseAtEmit
 from services.reconciliation.apply import (
+    AlertDispatchHook,
     ReconciliationApplyResult,
     apply_reconciliation_plan,
 )
@@ -227,6 +237,7 @@ async def run_eod_cycle(
     config: EodCycleConfig,
     session_factory: async_sessionmaker[Any],
     flex_client_factory: Callable[[], IbkrFlexQueryClient] | None = None,
+    alert_dispatch_hook: AlertDispatchHook | None = None,
 ) -> ReconciliationApplyResult | None:
     """Execute one EOD reconciliation cycle end-to-end.
 
@@ -287,6 +298,7 @@ async def run_eod_cycle(
         account_id=config.account_id,
         env=config.env,
         phase_at_emit=config.phase_at_emit,
+        alert_dispatch_hook=alert_dispatch_hook,
     )
     duration_s = (datetime.now(tz=UTC) - started_at).total_seconds()
     log.info(
@@ -306,18 +318,30 @@ def make_cycle_callback(
     *,
     config: EodCycleConfig,
     session_factory: async_sessionmaker[Any],
+    alert_dispatch_hook: AlertDispatchHook | None = None,
 ) -> CycleCallback:
     """Build the :class:`CycleCallback` the scheduler invokes per session day.
 
-    The returned callable closes over ``config`` + ``session_factory``
-    so the scheduler doesn't need to know about either. It signals to
-    the scheduler by raising on terminal failure (which the scheduler
-    catches + logs) or returning normally on success / soft-failure.
+    The returned callable closes over ``config`` + ``session_factory`` +
+    (optional) ``alert_dispatch_hook`` so the scheduler doesn't need to
+    know about any of them. It signals to the scheduler by raising on
+    terminal failure (which the scheduler catches + logs) or returning
+    normally on success / soft-failure.
+
+    The api lifespan glue layer (Phase 1+ follow-up) constructs the
+    ``alert_dispatch_hook`` from sops-decrypted Discord webhook URLs +
+    Resend identity, then passes it here. Phase 1 day-1 boots without
+    the hook — actionable breaks land in audit + reconciliation_breaks
+    rows but no Discord push fires.
     """
 
     async def _cycle(session_date: date) -> None:
         del session_date  # unused; we don't anchor the cycle on calendar date today
-        await run_eod_cycle(config=config, session_factory=session_factory)
+        await run_eod_cycle(
+            config=config,
+            session_factory=session_factory,
+            alert_dispatch_hook=alert_dispatch_hook,
+        )
 
     return _cycle
 

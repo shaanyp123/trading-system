@@ -31,8 +31,11 @@ import pytest
 from services.reconciliation.recon import (
     CASH_ABS_TOLERANCE_USD,
     CASH_BPS_TOLERANCE,
+    DEFAULT_RECONCILIATION_ALERT_SEVERITY,
     DIVIDEND_WIDENING_FACTOR,
     POSITION_QTY_TOLERANCE,
+    RECONCILIATION_BREAK_ALERT_CATEGORY,
+    AlertDescriptor,
     BackendView,
     BrokerSource,
     BrokerView,
@@ -834,3 +837,268 @@ class TestReconciliationBreakShape:
         assert isinstance(ev, PendingAuditEvent)
         with pytest.raises((AttributeError, Exception)):
             ev.event_type = "reconciliation_check_passed"  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# Alert descriptors — operator-visible Discord push for actionable breaks
+# ---------------------------------------------------------------------------
+
+
+class TestAlertDescriptors:
+    """One :class:`AlertDescriptor` is emitted for each ACTIONABLE break.
+
+    Continuation-grace breaks emit the audit + reconciliation_breaks row
+    but NO alert (operator already saw the alert on first detection;
+    re-firing on every cycle would be operator-noise).
+
+    Phase 1 defaults: severity ``P2`` (→ #alerts only) + category
+    ``reconciliation_break``. P0/P1 escalation deferred to a follow-up
+    PR (operator decides policy after first real break).
+    """
+
+    def test_no_breaks_emits_no_alerts(self) -> None:
+        plan = plan_reconciliation_check(
+            backend_view=_backend(),
+            broker_view=_broker(),
+            detected_at_utc=TS,
+        )
+        assert plan.alerts == ()
+
+    def test_one_position_break_emits_one_alert(self) -> None:
+        plan = plan_reconciliation_check(
+            backend_view=_backend({"MES": "3"}),
+            broker_view=_broker({"MES": "2"}),
+            detected_at_utc=TS,
+        )
+        assert len(plan.alerts) == 1
+        alert = plan.alerts[0]
+        assert alert.triggering_break_index == 0
+        assert alert.severity == DEFAULT_RECONCILIATION_ALERT_SEVERITY
+        assert alert.category == RECONCILIATION_BREAK_ALERT_CATEGORY
+
+    def test_one_cash_break_emits_one_alert(self) -> None:
+        plan = plan_reconciliation_check(
+            backend_view=_backend(cash="1000101.00", equity="1000000.00"),
+            broker_view=_broker(cash="1000000.00"),
+            detected_at_utc=TS,
+        )
+        assert len(plan.alerts) == 1
+        alert = plan.alerts[0]
+        assert alert.payload["metric"] == "cash_usd"
+        assert alert.payload["market"] is None
+
+    def test_multiple_actionable_breaks_emit_multiple_alerts(self) -> None:
+        plan = plan_reconciliation_check(
+            backend_view=_backend(
+                {"MCL": "0", "MES": "3"},
+                cash="100100.00",
+                equity="1000.00",  # bps band $0.10; abs $5 floor binds
+            ),
+            broker_view=_broker(
+                {"MCL": "1", "MES": "2"},
+                cash="100000.00",
+            ),
+            detected_at_utc=TS,
+        )
+        # 3 breaks → 3 alerts.
+        assert len(plan.alerts) == 3
+        # Alerts in same order as breaks_detected (alphabetic markets, cash last).
+        triggering_indices = [a.triggering_break_index for a in plan.alerts]
+        assert triggering_indices == [0, 1, 2]
+        # Each alert points at its corresponding break.
+        for alert, brk in zip(plan.alerts, plan.breaks_detected, strict=True):
+            assert alert.payload["metric"] == brk.metric.value
+            assert alert.payload["market"] == brk.market
+
+    def test_grace_break_emits_no_alert(self) -> None:
+        # Prior delta=1; today delta=1 → grace classification → no alert.
+        prior = (
+            PriorBreak(
+                metric=ReconciliationMetric.POSITION_QTY,
+                market="MES",
+                delta=Decimal("1"),
+            ),
+        )
+        plan = plan_reconciliation_check(
+            backend_view=_backend({"MES": "3"}),
+            broker_view=_broker({"MES": "2"}),
+            prior_breaks=prior,
+            detected_at_utc=TS,
+        )
+        # The break is still detected + audit-logged (with within_grace_period=True),
+        # but NO alert fires for the grace continuation.
+        assert len(plan.breaks_detected) == 1
+        assert plan.breaks_detected[0].within_grace_period is True
+        assert plan.alerts == ()
+
+    def test_mixed_grace_and_actionable_only_actionable_alerts(self) -> None:
+        # MES is grace (matches prior), MCL is new actionable.
+        # Expected: 2 breaks_detected, 1 alert (for MCL).
+        prior = (
+            PriorBreak(
+                metric=ReconciliationMetric.POSITION_QTY,
+                market="MES",
+                delta=Decimal("1"),
+            ),
+        )
+        plan = plan_reconciliation_check(
+            backend_view=_backend({"MES": "3", "MCL": "1"}),
+            broker_view=_broker({"MES": "2"}),
+            prior_breaks=prior,
+            detected_at_utc=TS,
+        )
+        assert len(plan.breaks_detected) == 2
+        assert plan.actionable_break_count == 1
+        # Only one alert — for MCL (the actionable break).
+        assert len(plan.alerts) == 1
+        alert = plan.alerts[0]
+        # MCL sorted before MES → MCL at index 0; alert points at it.
+        assert alert.triggering_break_index == 0
+        assert plan.breaks_detected[alert.triggering_break_index].market == "MCL"
+        assert plan.breaks_detected[alert.triggering_break_index].within_grace_period is False
+
+    def test_payload_uses_decimal_as_string(self) -> None:
+        # Anti-pattern A05: Decimal-as-str in JSONB payloads.
+        plan = plan_reconciliation_check(
+            backend_view=_backend({"MES": "3"}),
+            broker_view=_broker({"MES": "2"}),
+            detected_at_utc=TS,
+        )
+        alert = plan.alerts[0]
+        for field_name in ("expected", "actual", "delta", "tolerance"):
+            assert isinstance(alert.payload[field_name], str), (
+                f"{field_name} must be Decimal-as-str (A05)"
+            )
+
+    def test_payload_uses_iso_timestamp_with_tz(self) -> None:
+        # Anti-pattern A06: aware-UTC ISO format in payloads.
+        plan = plan_reconciliation_check(
+            backend_view=_backend({"MES": "3"}),
+            broker_view=_broker({"MES": "2"}),
+            detected_at_utc=TS,
+        )
+        alert = plan.alerts[0]
+        assert alert.payload["detected_at_utc"] == TS.isoformat()
+        # Sanity: the ISO string has a tz offset suffix (not naive).
+        assert "+" in alert.payload["detected_at_utc"] or "Z" in alert.payload["detected_at_utc"]
+
+    def test_locked_severity_constant_is_p2(self) -> None:
+        # Phase 1 contract: all reconciliation-break alerts are P2.
+        # If a future PR lifts severity to P0 (e.g., >5% divergence
+        # auto-escalation), update this assertion + the routing follow-up.
+        assert DEFAULT_RECONCILIATION_ALERT_SEVERITY == "P2"
+
+    def test_locked_category_constant(self) -> None:
+        # Mirror of alembic 0004 `alert_category` enum +
+        # services.webhook_pusher.payloads.AlertCategory.RECONCILIATION_BREAK.
+        assert RECONCILIATION_BREAK_ALERT_CATEGORY == "reconciliation_break"
+
+    def test_alert_descriptor_is_frozen_dataclass(self) -> None:
+        plan = plan_reconciliation_check(
+            backend_view=_backend({"MES": "3"}),
+            broker_view=_broker({"MES": "2"}),
+            detected_at_utc=TS,
+        )
+        alert = plan.alerts[0]
+        assert isinstance(alert, AlertDescriptor)
+        with pytest.raises((AttributeError, Exception)):
+            alert.severity = "P0"  # type: ignore[misc]
+
+    def test_title_for_position_break_singular_contract(self) -> None:
+        plan = plan_reconciliation_check(
+            backend_view=_backend({"MES": "3"}),
+            broker_view=_broker({"MES": "2"}),
+            detected_at_utc=TS,
+        )
+        alert = plan.alerts[0]
+        # Delta = 1 → singular "contract".
+        assert "1 contract" in alert.title
+        assert "MES" in alert.title
+        assert "Reconciliation break" in alert.title
+
+    def test_title_for_position_break_plural_contracts(self) -> None:
+        plan = plan_reconciliation_check(
+            backend_view=_backend({"MES": "5"}),
+            broker_view=_broker({"MES": "2"}),
+            detected_at_utc=TS,
+        )
+        alert = plan.alerts[0]
+        # Delta = 3 → plural "contracts".
+        assert "3 contracts" in alert.title
+
+    def test_title_for_cash_break_includes_amount(self) -> None:
+        plan = plan_reconciliation_check(
+            backend_view=_backend(cash="1000150.00", equity="1000000.00"),
+            broker_view=_broker(cash="1000000.00"),
+            detected_at_utc=TS,
+        )
+        alert = plan.alerts[0]
+        assert "cash divergence" in alert.title
+        assert "$150.00" in alert.title
+
+    def test_body_contains_quantitative_split(self) -> None:
+        plan = plan_reconciliation_check(
+            backend_view=_backend({"MES": "3"}),
+            broker_view=_broker({"MES": "2"}),
+            detected_at_utc=TS,
+        )
+        alert = plan.alerts[0]
+        # Body should be operator-readable + include backend/broker values.
+        assert "Backend view:" in alert.body
+        assert "Broker view:" in alert.body
+        assert "Delta:" in alert.body
+        assert "Tolerance:" in alert.body
+        assert "Source:" in alert.body
+        assert "Detected at:" in alert.body
+
+    def test_payload_keys_match_audit_event_payload(self) -> None:
+        # Operator triage: payload should mirror the canonical taxonomy
+        # so the operator sees the same fields whether reading from
+        # alerts.detail or audit_log payload_jcs.
+        plan = plan_reconciliation_check(
+            backend_view=_backend({"MES": "3"}),
+            broker_view=_broker({"MES": "2"}),
+            detected_at_utc=TS,
+        )
+        alert = plan.alerts[0]
+        # Required keys per the canonical break-detected payload.
+        expected_keys = {
+            "metric",
+            "market",
+            "expected",
+            "actual",
+            "delta",
+            "tolerance",
+            "source",
+            "within_grace_period",
+            "detected_at_utc",
+        }
+        assert expected_keys.issubset(alert.payload.keys())
+
+    def test_triggering_break_index_aligns_with_breaks_detected(self) -> None:
+        # Critical invariant for the apply orchestrator: each alert's
+        # triggering_break_index MUST be a valid index into breaks_detected.
+        plan = plan_reconciliation_check(
+            backend_view=_backend(
+                {"MCL": "0", "MES": "3"},
+                cash="100100.00",
+                equity="1000.00",
+            ),
+            broker_view=_broker(
+                {"MCL": "1", "MES": "2"},
+                cash="100000.00",
+            ),
+            detected_at_utc=TS,
+        )
+        for alert in plan.alerts:
+            assert 0 <= alert.triggering_break_index < len(plan.breaks_detected)
+
+    def test_alerts_preserved_in_plan_field_position(self) -> None:
+        # ReconciliationPlan exposes alerts as a top-level tuple field.
+        plan = plan_reconciliation_check(
+            backend_view=_backend({"MES": "3"}),
+            broker_view=_broker({"MES": "2"}),
+            detected_at_utc=TS,
+        )
+        assert isinstance(plan.alerts, tuple)
+        assert hasattr(plan, "alerts")

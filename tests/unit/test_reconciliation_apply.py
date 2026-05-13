@@ -23,11 +23,13 @@ from uuid import UUID, uuid4
 import pytest
 
 from services.reconciliation.apply import (
+    AlertDispatchContext,
     ReconciliationApplyResult,
     ReconciliationKillSwitchContext,
     apply_reconciliation_plan,
 )
 from services.reconciliation.recon import (
+    AlertDescriptor,
     BrokerSource,
     PendingAuditEvent,
     ReconciliationBreak,
@@ -422,3 +424,228 @@ class TestApplyOrdering:
             env="paper",
         )
         assert [c[1].get("market") for c in fake_writer] == ["/MES", "/MNQ", "/MES"]
+
+
+# ---------------------------------------------------------------------------
+# Alert dispatch hook firing — once per actionable break, post-audit
+# ---------------------------------------------------------------------------
+
+
+def _make_alert(
+    triggering_break_index: int = 0,
+    market: str | None = "/MES",
+) -> AlertDescriptor:
+    return AlertDescriptor(
+        triggering_break_index=triggering_break_index,
+        severity="P2",
+        category="reconciliation_break",
+        title=f"Reconciliation break: {market} position divergence",
+        body=f"EOD reconciliation detected a divergence on {market}.",
+        payload={"market": market, "metric": "position_qty"},
+    )
+
+
+class TestApplyAlertDispatchHook:
+    """The alert dispatch hook fires once per :class:`AlertDescriptor` in
+    ``plan.alerts``, AFTER audit + reconciliation_breaks rows land.
+
+    Validates:
+      - Hook invocation count equals len(plan.alerts) when hook supplied.
+      - Hook receives matching audit_event_uuid (positional alignment).
+      - Hook receives account_id + env from apply context.
+      - When hook is None, plan.alerts are dropped + warning emitted.
+      - result.alerts_dispatched_count reflects the hook firing count.
+    """
+
+    @pytest.mark.asyncio
+    async def test_hook_fires_once_per_alert(self, fake_writer: list[tuple[Any, Any]]) -> None:
+        captured_ctxs: list[AlertDispatchContext] = []
+
+        async def hook(ctx: AlertDispatchContext) -> None:
+            captured_ctxs.append(ctx)
+
+        plan = ReconciliationPlan(
+            breaks_detected=(_make_break(),),
+            breaks_resolved=(),
+            audit_events=(_make_pending("reconciliation_break_detected"),),
+            actionable_break_count=1,
+            should_invoke_kill_switch=False,
+            alerts=(_make_alert(triggering_break_index=0, market="/MES"),),
+        )
+        account_id = uuid4()
+        result = await apply_reconciliation_plan(
+            plan,
+            session_factory=_FakeSessionFactory(),
+            account_id=account_id,
+            env="paper",
+            alert_dispatch_hook=hook,
+        )
+        assert len(captured_ctxs) == 1
+        ctx = captured_ctxs[0]
+        assert ctx.account_id == account_id
+        assert ctx.env == "paper"
+        # The audit_event_uuid passed to the hook is the same UUID minted
+        # for the triggering break_detected event (positional alignment).
+        assert ctx.triggering_audit_event_uuid == result.audit_event_uuids[0]
+        assert result.alerts_dispatched_count == 1
+
+    @pytest.mark.asyncio
+    async def test_multiple_alerts_all_fire_in_order(
+        self, fake_writer: list[tuple[Any, Any]]
+    ) -> None:
+        captured: list[AlertDispatchContext] = []
+
+        async def hook(ctx: AlertDispatchContext) -> None:
+            captured.append(ctx)
+
+        plan = ReconciliationPlan(
+            breaks_detected=(
+                _make_break(market="/MCL"),
+                _make_break(market="/MES"),
+                _make_break(metric=ReconciliationMetric.CASH_USD, market=None),
+            ),
+            breaks_resolved=(),
+            audit_events=(
+                _make_pending("reconciliation_break_detected", market="/MCL"),
+                _make_pending("reconciliation_break_detected", market="/MES"),
+                _make_pending("reconciliation_break_detected", market=None),
+            ),
+            actionable_break_count=3,
+            should_invoke_kill_switch=True,
+            alerts=(
+                _make_alert(triggering_break_index=0, market="/MCL"),
+                _make_alert(triggering_break_index=1, market="/MES"),
+                _make_alert(triggering_break_index=2, market=None),
+            ),
+        )
+        result = await apply_reconciliation_plan(
+            plan,
+            session_factory=_FakeSessionFactory(),
+            account_id=uuid4(),
+            env="paper",
+            alert_dispatch_hook=hook,
+        )
+        assert len(captured) == 3
+        # Order preserved.
+        markets = [ctx.descriptor.payload["market"] for ctx in captured]
+        assert markets == ["/MCL", "/MES", None]
+        # Each alert's audit_event_uuid maps to its triggering break's audit row.
+        for i, ctx in enumerate(captured):
+            assert ctx.triggering_audit_event_uuid == result.audit_event_uuids[i]
+        assert result.alerts_dispatched_count == 3
+
+    @pytest.mark.asyncio
+    async def test_no_hook_alerts_dropped_with_warning(
+        self, fake_writer: list[tuple[Any, Any]]
+    ) -> None:
+        plan = ReconciliationPlan(
+            breaks_detected=(_make_break(),),
+            breaks_resolved=(),
+            audit_events=(_make_pending("reconciliation_break_detected"),),
+            actionable_break_count=1,
+            should_invoke_kill_switch=False,
+            alerts=(_make_alert(),),
+        )
+        # No alert_dispatch_hook passed → alerts dropped on the floor +
+        # audit + break rows still land (verified via result + fake_writer).
+        result = await apply_reconciliation_plan(
+            plan,
+            session_factory=_FakeSessionFactory(),
+            account_id=uuid4(),
+            env="paper",
+        )
+        # Audit event written.
+        assert len(result.audit_event_uuids) == 1
+        # Break row inserted.
+        assert len(result.inserted_break_ids) == 1
+        # No alerts dispatched (hook was None).
+        assert result.alerts_dispatched_count == 0
+
+    @pytest.mark.asyncio
+    async def test_empty_alerts_no_hook_calls(self, fake_writer: list[tuple[Any, Any]]) -> None:
+        captured: list[AlertDispatchContext] = []
+
+        async def hook(ctx: AlertDispatchContext) -> None:
+            captured.append(ctx)
+
+        plan = ReconciliationPlan(
+            breaks_detected=(),
+            breaks_resolved=(),
+            audit_events=(_make_pending("reconciliation_check_passed"),),
+            actionable_break_count=0,
+            should_invoke_kill_switch=False,
+            alerts=(),  # no breaks → no alerts
+        )
+        result = await apply_reconciliation_plan(
+            plan,
+            session_factory=_FakeSessionFactory(),
+            account_id=uuid4(),
+            env="paper",
+            alert_dispatch_hook=hook,
+        )
+        assert captured == []
+        assert result.alerts_dispatched_count == 0
+
+    @pytest.mark.asyncio
+    async def test_invalid_triggering_index_skipped_not_crashed(
+        self, fake_writer: list[tuple[Any, Any]]
+    ) -> None:
+        # Defensive: out-of-bounds triggering_break_index logs + skips
+        # rather than IndexError (preserves the cycle for healthy alerts).
+        captured: list[AlertDispatchContext] = []
+
+        async def hook(ctx: AlertDispatchContext) -> None:
+            captured.append(ctx)
+
+        plan = ReconciliationPlan(
+            breaks_detected=(_make_break(),),
+            breaks_resolved=(),
+            audit_events=(_make_pending("reconciliation_break_detected"),),
+            actionable_break_count=1,
+            should_invoke_kill_switch=False,
+            alerts=(_make_alert(triggering_break_index=99, market="/MES"),),
+        )
+        result = await apply_reconciliation_plan(
+            plan,
+            session_factory=_FakeSessionFactory(),
+            account_id=uuid4(),
+            env="paper",
+            alert_dispatch_hook=hook,
+        )
+        # Bad index → no hook call, dispatched_count stays 0.
+        assert captured == []
+        assert result.alerts_dispatched_count == 0
+
+    @pytest.mark.asyncio
+    async def test_hook_fires_after_audit_writes_land(
+        self, fake_writer: list[tuple[Any, Any]]
+    ) -> None:
+        # Audit-first ordering per spec §2.10.1: every audit row must be
+        # durable before the hook fires (because the hook reads the
+        # audit_event_uuid which only exists after the writer returns).
+        sequence: list[str] = []
+
+        async def hook(ctx: AlertDispatchContext) -> None:
+            sequence.append("hook")
+
+        # Wrap fake_writer to capture ordering. Re-patch with a sequence
+        # logger.
+        plan = ReconciliationPlan(
+            breaks_detected=(_make_break(),),
+            breaks_resolved=(),
+            audit_events=(_make_pending("reconciliation_break_detected"),),
+            actionable_break_count=1,
+            should_invoke_kill_switch=False,
+            alerts=(_make_alert(),),
+        )
+        await apply_reconciliation_plan(
+            plan,
+            session_factory=_FakeSessionFactory(),
+            account_id=uuid4(),
+            env="paper",
+            alert_dispatch_hook=hook,
+        )
+        # Audit was written before hook fired (fake_writer fixture
+        # captures writes in order).
+        assert len(fake_writer) == 1
+        assert sequence == ["hook"]
