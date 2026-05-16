@@ -271,6 +271,19 @@ class OrderStatusUpdate:
     total_commission_usd: Decimal  # sum across trade.fills[].commissionReport.commission
     last_fill_at_utc: datetime | None  # most recent fill.time; None pre-fill
     observed_at_utc: datetime  # adapter-side receipt timestamp
+    rejection_reason: str | None = None
+    """IBKR-side error message for terminal-reject events (Defect #2 fix
+    2026-05-16). Populated when ``status`` is one of ``cancelled``,
+    ``rejected``, or ``inactive`` AND the underlying ib_async ``Trade``
+    has a ``log`` entry with a message (the IBKR error code + text).
+
+    For the futures-validation case that surfaced today, this carries
+    e.g. ``"321 - Please enter a local symbol or an expiry"`` so the
+    backend can stamp ``orders.rejection_reason`` + the
+    ``order_rejected`` audit payload's ``rejection_reason`` field.
+
+    None for non-terminal statuses (submitted, filled, partially_filled)
+    or when IBKR provides no message on the rejection."""
 
 
 #: Callback signature for ``IbkrClient.subscribe_order_status``. Async so
