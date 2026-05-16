@@ -127,14 +127,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # (gateway WSS requires TLS); ca-certificates for httpx's verify chain;
 # tini for proper PID-1 signal handling so docker stop terminates the
 # bot cleanly (else discord.py's gateway WS may not close gracefully and
-# Discord's session takes ~60s to clean up server-side). NO curl (no
-# healthcheck endpoint to hit — discord.py exposes no HTTP listener; the
-# Phase-1 IPC listener PR adds one).
+# Discord's session takes ~60s to clean up server-side). procps for
+# pgrep — docker-compose healthcheck checks the bot process is alive
+# via `pgrep -f services.discord_bot`. NO curl (no healthcheck HTTP
+# endpoint to hit — discord.py exposes no HTTP listener; the Phase-1
+# IPC listener PR adds one).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         libffi8 \
         libssl3 \
         ca-certificates \
+        procps \
         tini \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1000 trading \

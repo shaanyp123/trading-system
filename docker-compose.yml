@@ -54,6 +54,17 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    # Probe Caddy's admin API (default bound on 127.0.0.1:2019 inside
+    # the container). A 200 from /config/ proves the admin server is
+    # alive — which proves Caddy itself is alive without depending on
+    # external reachability of port 443. caddy:2-alpine ships wget via
+    # busybox; --spider does a HEAD and exits 0/1 only.
+    healthcheck:
+      test: ['CMD-SHELL', 'wget --spider -q http://localhost:2019/config/ || exit 1']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   # ---- API (FastAPI + uvicorn) -----------------------------------------
   # Phase 0 Day 5 brings this up. `build:` lets the operator build locally
@@ -236,6 +247,18 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    # Process-existence probe. The bot's main loop is a discord.py
+    # gateway WebSocket connection — no HTTP listener to hit. If
+    # `services.discord_bot.entrypoint` died but tini (PID 1) is still
+    # alive, the container would otherwise look healthy. pgrep matches
+    # the full command line so tini's own argv doesn't false-positive.
+    # procps installed in services/discord_bot/Dockerfile runtime stage.
+    healthcheck:
+      test: ['CMD-SHELL', 'pgrep -f services.discord_bot || exit 1']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
   webhook_pusher:
     # PR #106 follow-up (2026-05-12): long-lived SSE subscriber. Drains
@@ -258,6 +281,18 @@ services:
       # entrypoint.sh reads /run/secrets/decrypted.yaml.
       - ${SECRETS_DIR:-/opt/trading/secrets-decrypted}:/run/secrets:ro
     depends_on: [postgres]
+    # Process-existence probe. The SSE subscriber is a long-lived Python
+    # loop with no HTTP listener — pgrep is the closest signal we have
+    # to "is the consumer still draining /api/sse/events". If the python
+    # process died but tini (PID 1) is alive, this returns 1 and Compose
+    # restarts the container. procps installed in
+    # services/webhook_pusher/Dockerfile runtime stage.
+    healthcheck:
+      test: ['CMD-SHELL', 'pgrep -f services.webhook_pusher || exit 1']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
   # ---- Next.js frontend (web UI) ----------------------------------------
   # Day 20 (Week 6 Mon): scaffold + 10 placeholder routes. Phase 0 Wed
@@ -443,3 +478,15 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    # Probe the LEAN launcher process. The quantconnect/lean:latest
+    # image ships procps under the dotnet/Ubuntu base; pgrep is at
+    # /usr/bin/pgrep. The .dll path matches the CMD verbatim
+    # (`/Lean/Launcher/bin/Debug/QuantConnect.Lean.Launcher.dll`) so a
+    # crashed launcher trips the check while tini (PID 1) stays alive.
+    # start_period covers LEAN's ~60s warm-up before the first cycle.
+    healthcheck:
+      test: ['CMD-SHELL', 'pgrep -f QuantConnect.Lean.Launcher || exit 1']
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
