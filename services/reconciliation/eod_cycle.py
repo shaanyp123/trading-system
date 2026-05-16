@@ -258,6 +258,32 @@ def build_broker_view(snapshot: ReconciliationSnapshot) -> BrokerView:
     so the recon's symmetric-difference comparison doesn't generate
     false-positive breaks for closed positions FlexQuery still includes
     in the snapshot.
+
+    **Cash source selection (post-2026-05-16 fix):** the FlexQuery XML
+    response carries cash in TWO independent sections:
+
+    * ``EquitySummaryByReportDateInBase.cash`` → parsed into
+      ``snapshot.account_summary.cash_usd``. Populated unconditionally
+      by any FlexQuery template with the AccountInformation section
+      enabled (the default).
+    * ``CashReportCurrency.endingCash`` per-currency rows → parsed into
+      ``snapshot.cash_balances``. Populated ONLY when the template has
+      the "Cash Report" section explicitly enabled.
+
+    ``refresh_backend_from_broker_snapshot`` (PR-I) writes to the
+    backend ``balances`` table from ``account_summary.cash_usd``; this
+    function was reading ``cash_balances``. When the operator's template
+    is missing the Cash Report section, the two sources disagree —
+    backend gets the correct cash, but the recon planner sees broker
+    cash = 0 and flags a false-positive break every cycle.
+
+    Fix: ``cash_balances`` remains the primary source (more granular,
+    per-currency, preferred when available). When ``cash_balances`` is
+    empty AND ``account_summary.cash_usd`` is non-zero, fall back to
+    the account-summary value with a structured log line so the
+    operator knows the template is producing partial data + can update
+    the template if desired. The fallback ensures recon converges
+    even with a partially-configured FlexQuery template.
     """
     positions: dict[str, Decimal] = {}
     for pos in snapshot.positions:
@@ -267,9 +293,30 @@ def build_broker_view(snapshot: ReconciliationSnapshot) -> BrokerView:
         positions[market] = positions.get(market, Decimal(0)) + pos.quantity
 
     cash_usd = Decimal(0)
+    cash_balances_had_usd_row = False
     for bal in snapshot.cash_balances:
         if bal.currency == "USD":
             cash_usd += bal.balance
+            cash_balances_had_usd_row = True
+
+    if not cash_balances_had_usd_row:
+        # FlexQuery template is missing the Cash Report section (or it
+        # returned no USD row). Fall back to the account summary's cash
+        # value, which is populated by AccountInformation in every
+        # template. Log so the operator can see why we fell back.
+        fallback_cash = snapshot.account_summary.cash_usd
+        log.info(
+            "recon_broker_view_cash_fallback_to_account_summary",
+            cash_balances_count=len(snapshot.cash_balances),
+            account_summary_cash_usd=str(fallback_cash),
+            hint=(
+                "FlexQuery template appears to be missing the 'Cash Report' "
+                "section. Backend will use account_summary.cash_usd; consider "
+                "updating the template to include Cash Report for granular "
+                "per-currency reconciliation."
+            ),
+        )
+        cash_usd = fallback_cash
 
     return BrokerView(
         positions=positions,

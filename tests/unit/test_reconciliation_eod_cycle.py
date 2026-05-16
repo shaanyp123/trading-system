@@ -72,12 +72,13 @@ def _build_snapshot(
     positions: tuple[FlexPosition, ...] = (),
     cash_balances: tuple[FlexCashBalance, ...] = (),
     nav: str = "100000.00",
+    account_summary_cash_usd: str = "0",
 ) -> ReconciliationSnapshot:
     summary = FlexAccountSummary(
         account_id="DUQ825170",
         report_date=datetime(2026, 5, 12).date(),
         net_liquidation_usd=Decimal(nav),
-        cash_usd=Decimal(0),
+        cash_usd=Decimal(account_summary_cash_usd),
         stock_market_value_usd=Decimal(0),
         bond_market_value_usd=Decimal(0),
         futures_pnl_usd=Decimal(0),
@@ -185,6 +186,84 @@ class TestBuildBrokerView:
         snap = _build_snapshot(positions=(_flex_pos(symbol="MES", quantity="-1"),))
         view = build_broker_view(snap)
         assert view.positions == {"/MES": Decimal("-1")}
+
+
+class TestBuildBrokerViewCashFallback:
+    """Tests for the 2026-05-16 fix: fall back to account_summary.cash_usd
+    when cash_balances is empty.
+
+    Real-world FlexQuery templates often have the AccountInformation
+    section (populates account_summary.cash_usd) enabled but NOT the
+    Cash Report section (populates cash_balances). Without the
+    fallback, the recon planner sees backend_cash from PR-I (=
+    account_summary.cash_usd) vs broker_cash from build_broker_view
+    (= sum of cash_balances = 0) and emits a false-positive break
+    every cycle.
+    """
+
+    def test_empty_cash_balances_falls_back_to_account_summary(self) -> None:
+        import structlog
+
+        snap = _build_snapshot(
+            cash_balances=(),
+            account_summary_cash_usd="19997.51",
+        )
+        with structlog.testing.capture_logs() as captured:
+            view = build_broker_view(snap)
+        assert view.cash_usd == Decimal("19997.51")
+        # Fallback emits a structured log so the operator can see why we
+        # diverged from the Cash Report path.
+        events = [c.get("event") for c in captured]
+        assert "recon_broker_view_cash_fallback_to_account_summary" in events
+        fallback = next(
+            c
+            for c in captured
+            if c.get("event") == "recon_broker_view_cash_fallback_to_account_summary"
+        )
+        assert fallback["cash_balances_count"] == 0
+        assert fallback["account_summary_cash_usd"] == "19997.51"
+
+    def test_empty_cash_balances_with_zero_account_summary_still_zero(self) -> None:
+        # When BOTH sources are 0 (truly no cash), fallback returns 0;
+        # no false-positive triggered.
+        snap = _build_snapshot(cash_balances=(), account_summary_cash_usd="0")
+        view = build_broker_view(snap)
+        assert view.cash_usd == Decimal("0")
+
+    def test_non_usd_only_balances_falls_back(self) -> None:
+        # A template with Cash Report enabled but the account holds
+        # only EUR cash — no USD row. We still fall back to the
+        # account_summary's USD value (which may be the USD-converted
+        # NAV from the AccountInformation section).
+        snap = _build_snapshot(
+            cash_balances=(FlexCashBalance(currency="EUR", balance=Decimal("500")),),
+            account_summary_cash_usd="1000.00",
+        )
+        view = build_broker_view(snap)
+        assert view.cash_usd == Decimal("1000.00")  # not the EUR balance
+
+    def test_populated_usd_cash_balances_does_not_fall_back(self) -> None:
+        # When cash_balances HAS a USD row, that's the source — the
+        # account_summary value is ignored (the per-currency Cash Report
+        # is more granular + the spec-canonical source).
+        snap = _build_snapshot(
+            cash_balances=(FlexCashBalance(currency="USD", balance=Decimal("5000")),),
+            account_summary_cash_usd="9999",  # different value; must be ignored
+        )
+        view = build_broker_view(snap)
+        assert view.cash_usd == Decimal("5000")
+
+    def test_zero_usd_cash_balance_is_authoritative_not_fallback(self) -> None:
+        # If the template has Cash Report enabled AND the account
+        # actually has $0 USD (recorded as a USD row with balance=0),
+        # we trust that — don't fall back. The fallback fires ONLY when
+        # there's no USD row at all.
+        snap = _build_snapshot(
+            cash_balances=(FlexCashBalance(currency="USD", balance=Decimal("0")),),
+            account_summary_cash_usd="9999",  # ignored — USD row is authoritative
+        )
+        view = build_broker_view(snap)
+        assert view.cash_usd == Decimal("0")
 
 
 def _stub_session_factory(
