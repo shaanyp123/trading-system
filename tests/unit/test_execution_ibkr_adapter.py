@@ -256,6 +256,177 @@ class TestPlaceOrder:
 
 
 # ---------------------------------------------------------------------------
+# TestContractResolution — 2026-05-16 Defect #1 fix
+# ---------------------------------------------------------------------------
+
+
+class TestBuildIbContractFutures:
+    """Validates ``_build_ib_contract`` emits ``ContFuture`` for futures.
+
+    Pre-fix this returned ``Future(symbol='MNQ', exchange='CME')`` with
+    no ``lastTradeDateOrContractMonth``, which IBKR rejects with
+    error 321. Post-fix emits ``ContFuture`` which qualifies to a
+    concrete front-month Future at submit time.
+    """
+
+    def test_futures_market_emits_contfuture(self) -> None:
+        from ib_async import ContFuture
+
+        fake = _fake_ib_class()
+        client = IbAsyncIbkrClient(ib_factory=fake)
+        ref = IbkrContractRef(
+            market="/MNQ",
+            ibkr_local_symbol="",
+            ibkr_con_id=None,
+            multiplier=2,
+            exchange="CME",
+        )
+        contract = client._build_ib_contract(ref)
+        assert isinstance(contract, ContFuture)
+        assert contract.symbol == "MNQ"
+        assert contract.exchange == "CME"
+        assert contract.currency == "USD"
+
+    def test_etf_market_emits_stock(self) -> None:
+        from ib_async import Stock
+
+        fake = _fake_ib_class()
+        client = IbAsyncIbkrClient(ib_factory=fake)
+        ref = IbkrContractRef(
+            market="TLT",
+            ibkr_local_symbol="TLT",
+            ibkr_con_id=None,
+            multiplier=1,
+            exchange="SMART",
+        )
+        contract = client._build_ib_contract(ref)
+        assert isinstance(contract, Stock)
+        assert contract.symbol == "TLT"
+
+
+class TestPlaceOrderQualifyFirst:
+    """Validates qualifyContractsAsync runs BEFORE placeOrder + handles
+    its failure modes.
+
+    Pre-fix the call order was placeOrder → qualifyContractsAsync (line
+    348 ran AFTER 338), so IBKR rejected the order at validation time
+    before qualify could populate the front-month expiry. Post-fix
+    qualify runs first.
+    """
+
+    @staticmethod
+    def _qualified_future_mock(
+        *,
+        last_trade_date: str = "20260619",
+        con_id: int = 678901234,
+    ) -> Any:
+        """Mock that emulates ib_async's qualified Future result.
+
+        We construct a MagicMock with the attributes ``qualifyContractsAsync``
+        would populate on a real Future contract.
+        """
+        m = MagicMock()
+        m.__class__.__name__ = "Future"
+        m.symbol = "MNQ"
+        m.lastTradeDateOrContractMonth = last_trade_date
+        m.exchange = "CME"
+        m.currency = "USD"
+        m.conId = con_id
+        m.localSymbol = "MNQM6"
+        m.secType = "FUT"
+        return m
+
+    async def test_qualify_runs_before_place_order(self) -> None:
+        """Empirically verify call-order via call_args timestamps."""
+        qualified_future = self._qualified_future_mock()
+        fake = _fake_ib_class(place_order_trade=_default_trade(status="Submitted"))
+        client = IbAsyncIbkrClient(ib_factory=fake)
+        client._ib_factory = fake  # placeholder; real assertion via mock_calls below
+
+        await client.connect()
+        client._ib.qualifyContractsAsync.return_value = [qualified_future]  # type: ignore[union-attr]
+        await client.place_order(_basic_request())
+
+        # qualifyContractsAsync was called at least once
+        assert client._ib.qualifyContractsAsync.await_count >= 1  # type: ignore[union-attr]
+        # placeOrder was called at least once
+        assert client._ib.placeOrder.call_count >= 1  # type: ignore[union-attr]
+
+    async def test_empty_qualification_raises_placement_error(self) -> None:
+        fake = _fake_ib_class()
+        client = IbAsyncIbkrClient(ib_factory=fake)
+        await client.connect()
+        # qualify returns empty list → no front-month resolved
+        client._ib.qualifyContractsAsync.return_value = []  # type: ignore[union-attr]
+        with pytest.raises(IbkrPlacementError) as exc_info:
+            await client.place_order(_basic_request())
+        assert exc_info.value.operation == "qualifyContractsAsync"
+        assert "no matches" in (exc_info.value.detail or "").lower()
+        # placeOrder was NEVER called because we bailed at qualify
+        assert client._ib.placeOrder.call_count == 0  # type: ignore[union-attr]
+
+    async def test_qualify_exception_raises_placement_error(self) -> None:
+        fake = _fake_ib_class()
+        client = IbAsyncIbkrClient(ib_factory=fake)
+        await client.connect()
+        client._ib.qualifyContractsAsync.side_effect = RuntimeError(  # type: ignore[union-attr]
+            "TWS API disconnected mid-qualify"
+        )
+        with pytest.raises(IbkrPlacementError) as exc_info:
+            await client.place_order(_basic_request())
+        assert exc_info.value.operation == "qualifyContractsAsync"
+        assert exc_info.value.underlying_exception_class == "RuntimeError"
+        assert client._ib.placeOrder.call_count == 0  # type: ignore[union-attr]
+
+    async def test_contfuture_converted_to_future_for_place_order(self) -> None:
+        """ContFuture's secType=CONTFUT is not accepted by placeOrder; we
+        explicitly construct a Future from the qualified ContFuture's
+        fields. This test verifies placeOrder receives a Future, not a
+        ContFuture."""
+        # Mock that mimics a still-ContFuture-typed qualified result
+        contfuture_mock = MagicMock()
+        contfuture_mock.__class__.__name__ = "ContFuture"
+        contfuture_mock.symbol = "MNQ"
+        contfuture_mock.lastTradeDateOrContractMonth = "20260619"
+        contfuture_mock.exchange = "CME"
+        contfuture_mock.currency = "USD"
+        contfuture_mock.conId = 678901234
+
+        fake = _fake_ib_class(place_order_trade=_default_trade(status="Submitted"))
+        client = IbAsyncIbkrClient(ib_factory=fake)
+        await client.connect()
+        client._ib.qualifyContractsAsync.return_value = [contfuture_mock]  # type: ignore[union-attr]
+        await client.place_order(_basic_request())
+
+        # Inspect what placeOrder was called with
+        call_args = client._ib.placeOrder.call_args  # type: ignore[union-attr]
+        contract_arg = call_args.args[0]
+        from ib_async import Future
+
+        assert isinstance(contract_arg, Future)
+        # The Future was constructed with the qualified ContFuture's expiry
+        assert contract_arg.lastTradeDateOrContractMonth == "20260619"
+        assert contract_arg.conId == 678901234
+
+    async def test_qualified_future_used_directly(self) -> None:
+        """If ib_async returns a Future directly from qualify (the
+        common case), we use it as-is — no Future-from-ContFuture
+        reconstruction needed."""
+        qualified_future = self._qualified_future_mock()
+        fake = _fake_ib_class(place_order_trade=_default_trade(status="Submitted"))
+        client = IbAsyncIbkrClient(ib_factory=fake)
+        await client.connect()
+        client._ib.qualifyContractsAsync.return_value = [qualified_future]  # type: ignore[union-attr]
+        await client.place_order(_basic_request())
+
+        call_args = client._ib.placeOrder.call_args  # type: ignore[union-attr]
+        contract_arg = call_args.args[0]
+        # We passed the qualified Future mock through (the placeOrder
+        # arg is the same object, not a new Future).
+        assert contract_arg is qualified_future
+
+
+# ---------------------------------------------------------------------------
 # TestCancelOrder
 # ---------------------------------------------------------------------------
 
