@@ -71,6 +71,13 @@ from services.api.auth import sessions as sessions_mod
 from services.api.config import APISettings, get_settings
 from services.api.db import get_session
 from services.api.errors import AppError
+from services.api.heartbeats import (
+    HEARTBEAT_STALE_THRESHOLDS_S,
+    HeartbeatRegistry,
+    HeartbeatService,
+    classify_freshness,
+    get_heartbeat_registry,
+)
 from services.api.repos.phase1 import (
     AuditLogRow,
     ParameterSetRow,
@@ -82,6 +89,8 @@ from services.api.schemas.common import EPOCH_SENTINEL_UTC
 from services.api.schemas.system import (
     AuditLogEntry,
     AuditLogPageResponse,
+    HeartbeatItem,
+    HeartbeatsResponse,
     KillSwitchInvokeRequest,
     KillSwitchResumeRequest,
     KillSwitchStatus,
@@ -862,6 +871,77 @@ async def watchdog_status(
         region=None,
         server_now=now,
     )
+
+
+# ---------------------------------------------------------------------------
+# Service-heartbeat freshness (this PR — silent-failure closure)
+# ---------------------------------------------------------------------------
+
+
+_HEARTBEAT_SERVICES: Final[tuple[HeartbeatService, ...]] = ("lean_cycle",)
+
+
+def _get_heartbeat_registry() -> HeartbeatRegistry:
+    """FastAPI dependency hook so tests can override with a fresh registry."""
+    return get_heartbeat_registry()
+
+
+@router.get(
+    "/api/system/heartbeats",
+    tags=["system"],
+    response_model=HeartbeatsResponse,
+)
+async def list_heartbeats(
+    session: SessionContext = Depends(get_session_context),
+    registry: HeartbeatRegistry = Depends(_get_heartbeat_registry),
+) -> HeartbeatsResponse:
+    """Per-service heartbeat freshness for the System page.
+
+    Closes a silent-failure surface: pre-this-endpoint, LEAN could stop
+    cycling and the operator would only notice when the next /signals
+    refresh showed yesterday's data. This endpoint exposes the in-memory
+    :class:`services.api.heartbeats.HeartbeatRegistry` (updated by the
+    LEAN POST path on every ``lean_cycle_heartbeat`` /
+    ``lean_strategy_initialized`` event).
+
+    Phase 1 ships ``lean_cycle`` only. Follow-up PRs extend
+    ``_HEARTBEAT_SERVICES`` with ``reconciliation_eod`` +
+    ``order_placement_worker`` as those producers also call
+    :meth:`HeartbeatRegistry.record`.
+
+    Empty registry (api just booted; no heartbeats since restart) →
+    every item carries ``freshness='unknown'`` + null timestamps. NOT
+    rendered as a fault — that's the documented "first-cycle pending"
+    branch in the frontend tile.
+    """
+    now = datetime.now(tz=UTC)
+    snapshot = registry.snapshot()
+    items: list[HeartbeatItem] = []
+    for svc in _HEARTBEAT_SERVICES:
+        record = snapshot.get(svc)
+        freshness = classify_freshness(svc, record, now_utc=now)
+        if record is None:
+            seconds_since: int | None = None
+            last_hb: datetime | None = None
+            received_at: datetime | None = None
+            count = 0
+        else:
+            seconds_since = max(int((now - record.last_heartbeat_utc).total_seconds()), 0)
+            last_hb = record.last_heartbeat_utc
+            received_at = record.received_at_utc
+            count = record.count
+        items.append(
+            HeartbeatItem(
+                service=svc,
+                last_heartbeat_utc=last_hb,
+                received_at_utc=received_at,
+                seconds_since_last_heartbeat=seconds_since,
+                stale_threshold_s=HEARTBEAT_STALE_THRESHOLDS_S[svc],
+                freshness=freshness,
+                count=count,
+            )
+        )
+    return HeartbeatsResponse(items=items, server_now=now)
 
 
 __all__ = ["router"]
