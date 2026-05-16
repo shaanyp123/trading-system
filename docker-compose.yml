@@ -54,13 +54,20 @@ services:
     depends_on:
       api:
         condition: service_healthy
-    # Probe Caddy's admin API (default bound on 127.0.0.1:2019 inside
-    # the container). A 200 from /config/ proves the admin server is
-    # alive — which proves Caddy itself is alive without depending on
-    # external reachability of port 443. caddy:2-alpine ships wget via
-    # busybox; --spider does a HEAD and exits 0/1 only.
+    # Process-existence probe. Originally tried Caddy's admin API on
+    # localhost:2019, but our Caddyfile global block doesn't enable the
+    # admin server explicitly + the alpine default has it disabled in
+    # production builds (verified 2026-05-16 deploy smoke: wget to :2019
+    # got Connection refused on a healthy Caddy). Public-port probes
+    # also don't work — Caddy redirects http→https and there's no cert
+    # for localhost, so wget gets a TLS handshake failure.
+    #
+    # pgrep is the simplest reliable signal: caddy:2-alpine ships
+    # pgrep via busybox + the entrypoint runs as PID 1 named "caddy".
+    # When the Caddy process is alive, pgrep returns 0; when it dies,
+    # tini exits + container restarts.
     healthcheck:
-      test: ['CMD-SHELL', 'wget --spider -q http://localhost:2019/config/ || exit 1']
+      test: ['CMD-SHELL', 'pgrep -f caddy || exit 1']
       interval: 30s
       timeout: 5s
       retries: 3
