@@ -1393,3 +1393,372 @@ class TestRefreshBackendFromBrokerSnapshot:
         # 1 balance + 2 positions = 3.
         assert len(result.audit_event_uuids) == 3
         assert result.positions_marked_count == 2
+
+
+# ---------------------------------------------------------------------------
+# PR-K wiring (2026-05-16) — attribution rollup at recon end
+# ---------------------------------------------------------------------------
+
+
+class TestFetchClosedTradesForSessionDate:
+    """The SELECT helper for PR-K's daily rollup.
+
+    Today (pre-exit-fill-path) every test returns empty — no trades have
+    state='closed' because services/risk/fill_processor.py raises
+    UnsupportedFillScenarioError on exit fills. The empty-result path
+    is the most important contract right now.
+    """
+
+    @pytest.mark.asyncio
+    async def test_empty_when_no_closed_trades(self) -> None:
+        from datetime import date
+
+        from services.reconciliation.eod_cycle import fetch_closed_trades_for_session_date
+
+        # Fake session.execute returns 0 rows.
+        @asynccontextmanager
+        async def _session_cm() -> Any:
+            sess = MagicMock()
+            res = MagicMock()
+            res.fetchall = MagicMock(return_value=[])
+            sess.execute = AsyncMock(return_value=res)
+            yield sess
+
+        factory = MagicMock(side_effect=lambda: _session_cm())
+        result = await fetch_closed_trades_for_session_date(
+            factory,
+            account_id=uuid4(),
+            env="paper",
+            session_date_et=date(2026, 5, 16),
+        )
+        assert result == ()
+
+    @pytest.mark.asyncio
+    async def test_populated_trades_map_to_dataclass(self) -> None:
+        from datetime import date
+
+        from services.reconciliation.eod_cycle import fetch_closed_trades_for_session_date
+
+        trade_id = uuid4()
+        signal_id = uuid4()
+        opened_at = datetime(2026, 5, 16, 14, 0, tzinfo=UTC)
+        closed_at = datetime(2026, 5, 16, 20, 30, tzinfo=UTC)
+        row = MagicMock()
+        row.trade_id = trade_id
+        row.entry_signal_id = signal_id
+        row.direction = "long"
+        row.total_quantity = 1
+        row.avg_entry_price = Decimal("85.50")
+        row.avg_exit_price = Decimal("86.25")
+        row.realized_pnl_usd = Decimal("0.75")
+        row.realized_commission = Decimal("0.05")
+        row.opened_at_utc = opened_at
+        row.closed_at_utc = closed_at
+        row.expected_entry_price = Decimal("85.40")
+        row.expected_slippage_bps = Decimal("1.2")
+        row.expected_at_utc = opened_at
+
+        @asynccontextmanager
+        async def _session_cm() -> Any:
+            sess = MagicMock()
+            res = MagicMock()
+            res.fetchall = MagicMock(return_value=[row])
+            sess.execute = AsyncMock(return_value=res)
+            yield sess
+
+        factory = MagicMock(side_effect=lambda: _session_cm())
+        result = await fetch_closed_trades_for_session_date(
+            factory,
+            account_id=uuid4(),
+            env="paper",
+            session_date_et=date(2026, 5, 16),
+        )
+        assert len(result) == 1
+        trade = result[0]
+        assert trade.trade_id == trade_id
+        assert trade.entry_signal_id == signal_id
+        assert trade.direction == "long"
+        assert trade.total_quantity == 1
+        assert trade.avg_entry_price == Decimal("85.50")
+        assert trade.realized_pnl_usd == Decimal("0.75")
+        assert trade.expected_entry_price == Decimal("85.40")
+
+    @pytest.mark.asyncio
+    async def test_incomplete_trade_skipped_silently(self) -> None:
+        """Defensive: a trade in state='closed' with null avg_exit_price
+        is a data-quality concern (shouldn't be possible per PR-G+
+        contract); skip rather than crash."""
+        from datetime import date
+
+        from services.reconciliation.eod_cycle import fetch_closed_trades_for_session_date
+
+        row = MagicMock()
+        row.trade_id = uuid4()
+        row.entry_signal_id = uuid4()
+        row.direction = "long"
+        row.total_quantity = 1
+        row.avg_entry_price = Decimal("85.50")
+        row.avg_exit_price = None  # incomplete
+        row.realized_pnl_usd = Decimal("0.50")
+        row.realized_commission = Decimal("0.05")
+        row.opened_at_utc = datetime(2026, 5, 16, 14, 0, tzinfo=UTC)
+        row.closed_at_utc = datetime(2026, 5, 16, 20, 30, tzinfo=UTC)
+        row.expected_entry_price = Decimal("85.40")
+        row.expected_slippage_bps = Decimal("1.2")
+        row.expected_at_utc = datetime(2026, 5, 16, 14, 0, tzinfo=UTC)
+
+        @asynccontextmanager
+        async def _session_cm() -> Any:
+            sess = MagicMock()
+            res = MagicMock()
+            res.fetchall = MagicMock(return_value=[row])
+            sess.execute = AsyncMock(return_value=res)
+            yield sess
+
+        factory = MagicMock(side_effect=lambda: _session_cm())
+        result = await fetch_closed_trades_for_session_date(
+            factory,
+            account_id=uuid4(),
+            env="paper",
+            session_date_et=date(2026, 5, 16),
+        )
+        assert result == ()  # skipped
+
+
+class TestEmitDailyAttributionRollup:
+    """The PR-K helper that fires from inside run_eod_cycle."""
+
+    @pytest.mark.asyncio
+    async def test_empty_trades_writes_audit_returns_zero(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Today's reality: no closed trades → no attribution rows
+        INSERTed, but the audit ROLL-UP event still fires (Today page
+        breadcrumb)."""
+        from services.reconciliation import eod_cycle as mod
+
+        # Stub the SELECT to return empty
+        async def _stub_fetch(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
+            return ()
+
+        monkeypatch.setattr(mod, "fetch_closed_trades_for_session_date", _stub_fetch)
+
+        # Stub append_audit_event
+        rec = MagicMock()
+        rec.event_uuid = uuid4()
+        rec.sequence_no = 30
+        append = AsyncMock(return_value=rec)
+        import services.risk.attribution as attr_mod
+
+        monkeypatch.setattr(attr_mod, "append_audit_event", append)
+
+        @asynccontextmanager
+        async def _session_cm() -> Any:
+            sess = MagicMock()
+            sess.execute = AsyncMock()
+            sess.begin = lambda: _asyncnull_cm()
+            yield sess
+
+        @asynccontextmanager
+        async def _asyncnull_cm() -> Any:
+            yield None
+
+        factory = MagicMock(side_effect=lambda: _session_cm())
+
+        count = await mod._emit_daily_attribution_rollup(
+            session_factory=factory,
+            account_id=uuid4(),
+            env="paper",
+            phase_at_emit=1,
+            snapshot_pulled_at_utc=datetime(2026, 5, 16, 22, 30, tzinfo=UTC),
+        )
+        # Zero rows inserted (no closed trades)
+        assert count == 0
+        # Audit event fired exactly once (the rollup breadcrumb)
+        append.assert_awaited_once()
+        from services.audit.event_types import AuditEventType
+
+        assert append.await_args.args[1] == AuditEventType.ATTRIBUTION_ROLLUP_RECORDED
+        # Payload carries the zero-aggregate
+        payload = append.await_args.args[2]
+        assert payload["trade_count"] == 0
+        assert payload["long_count"] == 0
+        assert payload["short_count"] == 0
+
+
+class TestRunEodCycleAttributionIntegration:
+    """Verify the attribution rollup is invoked at the end of run_eod_cycle."""
+
+    @pytest.mark.asyncio
+    async def test_attribution_helper_called_from_run_eod_cycle(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The new wiring must call _emit_daily_attribution_rollup from
+        inside run_eod_cycle after apply_reconciliation_plan succeeds."""
+        from services.reconciliation import eod_cycle as mod
+        from services.reconciliation.eod_cycle import EodCycleConfig
+
+        # Mock the recon stages so we focus on attribution wiring
+        snapshot_mock = MagicMock()
+        snapshot_mock.pulled_at_utc = datetime(2026, 5, 16, 22, 30, tzinfo=UTC)
+        snapshot_mock.positions = ()
+        snapshot_mock.cash_balances = ()
+        snapshot_mock.account_summary = MagicMock(
+            cash_usd=Decimal("0"),
+            net_liquidation_usd=Decimal("0"),
+            stock_market_value_usd=Decimal("0"),
+            bond_market_value_usd=Decimal("0"),
+            futures_pnl_usd=Decimal("0"),
+        )
+
+        flex_client_mock = MagicMock()
+        flex_client_mock.fetch_snapshot = AsyncMock(return_value=snapshot_mock)
+
+        def factory() -> Any:
+            return flex_client_mock
+
+        # The autouse fixture _patch_refresh already no-ops refresh_backend_from_broker_snapshot
+        # Stub build_backend_view + apply_reconciliation_plan since they need a real DB
+        from services.reconciliation.recon import BackendView
+
+        monkeypatch.setattr(
+            mod,
+            "build_backend_view",
+            AsyncMock(
+                return_value=BackendView(
+                    positions={}, cash_usd=Decimal("0"), equity_baseline=Decimal("0")
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            mod,
+            "fetch_prior_breaks_within_grace_window",
+            AsyncMock(return_value=()),
+        )
+        # Stub apply_reconciliation_plan to return a result
+        from services.reconciliation.apply import ReconciliationApplyResult
+
+        apply_result = ReconciliationApplyResult(
+            audit_event_uuids=(),
+            inserted_break_ids=(),
+            resolved_break_count=0,
+            kill_switch_invoked=False,
+            alerts_dispatched_count=0,
+        )
+        monkeypatch.setattr(
+            mod,
+            "apply_reconciliation_plan",
+            AsyncMock(return_value=apply_result),
+        )
+
+        # Spy on the attribution helper
+        emit_spy = AsyncMock(return_value=0)
+        monkeypatch.setattr(mod, "_emit_daily_attribution_rollup", emit_spy)
+
+        # Fake session factory
+        @asynccontextmanager
+        async def _session_cm() -> Any:
+            yield MagicMock()
+
+        session_factory = MagicMock(side_effect=lambda: _session_cm())
+
+        config = EodCycleConfig(
+            account_id=uuid4(),
+            env="paper",
+            flex_query_id=1,
+            flex_query_token="token",
+        )
+        await mod.run_eod_cycle(
+            config=config,
+            session_factory=session_factory,
+            flex_client_factory=factory,
+        )
+
+        # Attribution helper was called
+        emit_spy.assert_awaited_once()
+        kwargs = emit_spy.await_args.kwargs
+        assert kwargs["env"] == "paper"
+        # snapshot_pulled_at_utc was forwarded
+        assert kwargs["snapshot_pulled_at_utc"] == snapshot_mock.pulled_at_utc
+
+    @pytest.mark.asyncio
+    async def test_attribution_failure_does_not_fail_cycle(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If _emit_daily_attribution_rollup raises, run_eod_cycle still
+        returns the recon apply result. PR-K is best-effort."""
+        from services.reconciliation import eod_cycle as mod
+        from services.reconciliation.eod_cycle import EodCycleConfig
+
+        snapshot_mock = MagicMock()
+        snapshot_mock.pulled_at_utc = datetime(2026, 5, 16, 22, 30, tzinfo=UTC)
+        snapshot_mock.positions = ()
+        snapshot_mock.cash_balances = ()
+        snapshot_mock.account_summary = MagicMock(
+            cash_usd=Decimal("0"),
+            net_liquidation_usd=Decimal("0"),
+            stock_market_value_usd=Decimal("0"),
+            bond_market_value_usd=Decimal("0"),
+            futures_pnl_usd=Decimal("0"),
+        )
+
+        flex_client_mock = MagicMock()
+        flex_client_mock.fetch_snapshot = AsyncMock(return_value=snapshot_mock)
+
+        from services.reconciliation.recon import BackendView
+
+        monkeypatch.setattr(
+            mod,
+            "build_backend_view",
+            AsyncMock(
+                return_value=BackendView(
+                    positions={}, cash_usd=Decimal("0"), equity_baseline=Decimal("0")
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            mod,
+            "fetch_prior_breaks_within_grace_window",
+            AsyncMock(return_value=()),
+        )
+        from services.reconciliation.apply import ReconciliationApplyResult
+
+        apply_result = ReconciliationApplyResult(
+            audit_event_uuids=(),
+            inserted_break_ids=(),
+            resolved_break_count=0,
+            kill_switch_invoked=False,
+            alerts_dispatched_count=0,
+        )
+        monkeypatch.setattr(
+            mod,
+            "apply_reconciliation_plan",
+            AsyncMock(return_value=apply_result),
+        )
+
+        # Attribution helper raises
+        monkeypatch.setattr(
+            mod,
+            "_emit_daily_attribution_rollup",
+            AsyncMock(side_effect=RuntimeError("audit chain down")),
+        )
+
+        @asynccontextmanager
+        async def _session_cm() -> Any:
+            yield MagicMock()
+
+        session_factory = MagicMock(side_effect=lambda: _session_cm())
+
+        config = EodCycleConfig(
+            account_id=uuid4(),
+            env="paper",
+            flex_query_id=1,
+            flex_query_token="token",
+        )
+        # Cycle still returns successfully (apply_result)
+        result = await mod.run_eod_cycle(
+            config=config,
+            session_factory=session_factory,
+            flex_client_factory=lambda: flex_client_mock,
+        )
+        assert result is apply_result
