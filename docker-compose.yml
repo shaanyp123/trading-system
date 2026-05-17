@@ -98,6 +98,13 @@ services:
       API_LOG_LEVEL: ${API_LOG_LEVEL:-INFO}
       API_DB_HOST: postgres
       API_DB_NAME: trading
+      # TWS API clientId (1-7 per IBKR's docs). Default 1 matches the api's
+      # config.py + ibkr_adapter.py constants. Override to 2-7 via deploy/.env
+      # when clientId=1 is held by IBKR's server-side session table after an
+      # uncleanly-disconnected prior session (the post-pivot 2026-05-17
+      # "Error 326: client id is already in use" wedge that can persist 30+
+      # minutes past container restart). See decisions-log 2026-05-17 entry.
+      API_IBKR_CLIENT_ID: ${API_IBKR_CLIENT_ID:-1}
     # Bind-mount the host-decrypted secrets directory. `deploy/day5-bringup.sh`
     # runs `sops -d` on the host and writes /opt/trading/secrets-decrypted/
     # decrypted.yaml — the api entrypoint reads it at /run/secrets/decrypted.yaml.
