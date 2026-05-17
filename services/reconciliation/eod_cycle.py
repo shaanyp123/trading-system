@@ -899,7 +899,7 @@ async def fetch_closed_trades_for_session_date(
                     "  t.avg_entry_price, "
                     "  t.avg_exit_price, "
                     "  t.realized_pnl_usd, "
-                    "  t.realized_commission, "
+                    "  t.realized_commission_usd, "
                     "  t.opened_at_utc, "
                     "  t.closed_at_utc, "
                     "  s.expected_fill_price AS expected_entry_price, "
@@ -938,7 +938,7 @@ async def fetch_closed_trades_for_session_date(
                 avg_entry_price=Decimal(str(r.avg_entry_price)),
                 avg_exit_price=Decimal(str(r.avg_exit_price)),
                 realized_pnl_usd=Decimal(str(r.realized_pnl_usd)),
-                realized_commission_usd=Decimal(str(r.realized_commission or 0)),
+                realized_commission_usd=Decimal(str(r.realized_commission_usd or 0)),
                 opened_at_utc=r.opened_at_utc,
                 closed_at_utc=r.closed_at_utc,
                 expected_entry_price=Decimal(str(r.expected_entry_price))

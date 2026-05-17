@@ -1451,7 +1451,7 @@ class TestFetchClosedTradesForSessionDate:
         row.avg_entry_price = Decimal("85.50")
         row.avg_exit_price = Decimal("86.25")
         row.realized_pnl_usd = Decimal("0.75")
-        row.realized_commission = Decimal("0.05")
+        row.realized_commission_usd = Decimal("0.05")
         row.opened_at_utc = opened_at
         row.closed_at_utc = closed_at
         row.expected_entry_price = Decimal("85.40")
@@ -1500,7 +1500,7 @@ class TestFetchClosedTradesForSessionDate:
         row.avg_entry_price = Decimal("85.50")
         row.avg_exit_price = None  # incomplete
         row.realized_pnl_usd = Decimal("0.50")
-        row.realized_commission = Decimal("0.05")
+        row.realized_commission_usd = Decimal("0.05")
         row.opened_at_utc = datetime(2026, 5, 16, 14, 0, tzinfo=UTC)
         row.closed_at_utc = datetime(2026, 5, 16, 20, 30, tzinfo=UTC)
         row.expected_entry_price = Decimal("85.40")
