@@ -609,7 +609,203 @@ named volumes are persistent.
 | Futures `BentoWarning: reduced quality: <date> (degraded)` | DataBento marked a single trading day as degraded quality on the upstream venue | Informational; data still ingests. Cross-check the bar on that date against an independent source before approving signals derived from it |
 | LEAN boot crash `factor_files not found` (futures) | The strategy's explicit `data_normalization_mode=DataNormalizationMode.RAW` (added in this-PR) was reverted or the implicit BackwardsRatio default is back | Re-check `lean/v1_strategy.py` `add_future()` calls — each must include `data_normalization_mode=DataNormalizationMode.RAW` per QC forum discussion 17093 (the implicit default is BackwardsRatio, which DOES need factor_files we don't have) |
 | LEAN boot crash `Map file not found` (futures) | 2-row sentinel map_file insufficient for LEAN's continuous-contract construction | Consider escape-hatch: continuous-front-month via `add_equity` (Path C in 2026-05-12 futures-data memo; requires `risk-review-approved` PR) |
-| Cycle still shows `failed_markets=['/MES', ...]` after futures seed | Path filter — staging didn't merge into volume correctly | Re-run Step F3 with explicit volume path; verify via the post-Step-F3 cross-check loop |
+| Cycle still shows `failed_markets=['/MES', ...]` after futures seed | (a) Path filter — staging didn't merge into volume correctly, OR (b) Seed data stale relative to session_date — universe files end before today (see Cadence section below) | (a) Re-run Step F3 with explicit volume path; verify via the post-Step-F3 cross-check loop. (b) Re-seed per Cadence section below |
+| Cycle on a NEW DAY shows `failed_markets=['/MES','/MNQ','/MYM','/M2K','/MGC','/MCL','/MBT']` (all 7 micros) but ETFs unaffected | Seed data is stale — universe files end before `session_date`. LEAN's continuous-contract resolution can't pick the active expiry without a universe file for the session date. | Re-seed via the VPS-side ad-hoc procedure (Cadence section below) OR re-run Steps F1-F4 on operator workstation. **Reference incident: 2026-05-17** (5-day staleness → all 7 futures dropped; see `Docs/decisions-log.md` 2026-05-17 entry "7-micro `v1_history_unavailable` root cause"). |
+
+---
+
+## Seed data cadence + staleness detection
+
+The DataBento + yfinance seeds bake daily-bar data INTO the `trading_lean_data`
+Docker volume at seed time. There is no live ingestion pipeline that extends
+the volume forward as new trading days complete. Universe files for the
+7 micro futures are particularly load-bearing: LEAN's
+`add_future` + `DataMappingMode.OPEN_INTEREST` continuous-contract resolution
+requires a `universes/<lower>/<YYYYMMDD>.csv` for the current `session_date`
+to identify the active expiry. **Without a universe file for today's session
+date, `self.history(continuous_symbol, count, Resolution.DAILY)` returns
+empty** and the strategy logs `v1_history_unavailable` for that market.
+
+ETFs are NOT affected by this — `add_equity` uses `<lower>.zip` per ticker
+with no per-day universe dependency. The bond-ETF sub-universe stays healthy
+across staleness windows.
+
+### How to detect staleness
+
+Two signals fire when the seed has aged out:
+
+**Signal 1 — LEAN cycle log line:**
+
+```
+v1_history_unavailable session_date=<YYYY-MM-DD> failed_markets=['/MES','/MNQ','/MYM','/M2K','/MGC','/MCL','/MBT']
+```
+
+The full 7-element `failed_markets` list with the ETFs absent is the canonical
+fingerprint. (Partial lists — 1 or 2 markets — usually mean per-contract
+issues, not whole-seed staleness.)
+
+**Signal 2 — Universe file extent check:**
+
+```bash
+ssh root@<vps> "docker run --rm -v trading_lean_data:/data alpine sh -c \
+  'for t in mes mnq mym m2k mbt mgc mcl; do
+     d=/data/future/cme/universes/\$t
+     [ ! -d \"\$d\" ] && d=/data/future/comex/universes/\$t
+     [ ! -d \"\$d\" ] && d=/data/future/nymex/universes/\$t
+     last=\$(ls -1 \"\$d\" 2>/dev/null | tail -1)
+     echo \"\$t: last=\$last\"
+   done'"
+```
+
+Compare the `last=YYYYMMDD.csv` value to today. **A gap > 3 trading days
+means the next cycle will fail.** Schedule a re-seed before that cycle fires.
+
+### Recommended cadence
+
+* **Manual minimum:** re-seed once per week (Sunday evening before Monday's
+  21:30 UTC cycle).
+* **Recommended:** re-seed every weekday morning (~08:00 ET) so the cycle
+  at 21:30 UTC = 17:30 ET later that day has fresh universe data.
+* **Long-term:** automate via a daily cron OR a sidecar service that
+  re-runs the seed script + restarts `lean_local` on success. Tracked as
+  a Phase 1+ infrastructure follow-up (see `Docs/decisions-log.md`
+  2026-05-17 entry "7-micro `v1_history_unavailable` root cause" lessons-
+  learned section).
+
+### Ad-hoc re-seed on the VPS (no operator-workstation venv required)
+
+The canonical seed script `scripts/seed_lean_futures_databento.py` is
+operator-side ceremony — runs from a venv on the operator's local machine
+per Steps F1-F6. For interactive or emergency re-seeds when the operator
+isn't at their workstation, run the same script from inside a transient
+`python:3.11-slim` container on the VPS. This pattern was first executed
+on 2026-05-17 for the post-PR-#169 staleness incident.
+
+**Prerequisites:** sops-encrypted `secrets/paper.enc.yaml::databento.api_key`
+populated (single-time setup per Step F1's prerequisite list); `/opt/trading`
+checked out at the latest commit on `main`; ~75 minutes of wall-clock budget
+(70 minutes of DataBento `statistics` schema fetch dominates).
+
+```bash
+ssh root@<vps> 'bash -s' <<'OUTER_EOF'
+set -euo pipefail
+
+# Phase A: extract DataBento key from sops (file-only, never stdout)
+export SOPS_AGE_KEY_FILE=/etc/credstore.encrypted/age_key
+sops --decrypt /opt/trading/secrets/paper.enc.yaml > /dev/shm/paper.dec.yaml
+chmod 600 /dev/shm/paper.dec.yaml
+
+DATABENTO_KEY=$(python3 << 'PYEOF'
+import yaml
+d = yaml.safe_load(open("/dev/shm/paper.dec.yaml"))
+print(d.get("databento", {}).get("api_key", ""))
+PYEOF
+)
+shred -u /dev/shm/paper.dec.yaml
+[ -z "$DATABENTO_KEY" ] && { echo "ERROR: databento.api_key empty"; exit 1; }
+echo "DataBento key length: ${#DATABENTO_KEY} (expect 32)"
+
+# Phase B: clean staging
+rm -rf /tmp/lean_seed_futures /tmp/lean_seed_futures.tar.gz /tmp/lean_seed_futures_stage
+
+# Phase C: launch the seed container detached
+docker run -d --rm \
+  --name lean_seed_runner \
+  -v /opt/trading/scripts:/scripts:ro \
+  -v /tmp:/work \
+  -e DATABENTO_API_KEY="$DATABENTO_KEY" \
+  -e PYTHONUNBUFFERED=1 \
+  python:3.11-slim \
+  sh -c 'pip install --quiet --no-input "databento>=0.78" pyyaml && \
+         python /scripts/seed_lean_futures_databento.py --yes --out /work/lean_seed_futures' \
+  > /dev/null
+unset DATABENTO_KEY
+echo "Container started; poll via: docker logs lean_seed_runner 2>&1 | tail -20"
+OUTER_EOF
+```
+
+Poll progress periodically (every 5-10 min is fine — pip install + cost
+quote takes 30s; the DataBento fetch + write loop is mostly silent until
+each ticker completes):
+
+```bash
+ssh root@<vps> "docker logs lean_seed_runner 2>&1 | tail -20; \
+  docker ps --filter name=lean_seed_runner --format 'table {{.Names}}\t{{.Status}}'"
+```
+
+**Expected final lines (~75 minutes after start):**
+
+```
+Staged: 7 ticker(s) under /work/lean_seed_futures/future/
+Tarball: /work/lean_seed_futures.tar.gz  (XXXXX bytes)
+```
+
+The container exits 0 + auto-removes. The host has the tarball at
+`/tmp/lean_seed_futures.tar.gz` ready for Step F3.
+
+### After re-seed: extract into volume + restart `lean_local`
+
+Once the seed container exits cleanly (status 0; tarball file present):
+
+```bash
+ssh root@<vps> 'bash -s' <<'OUTER_EOF'
+set -euo pipefail
+
+# Verify the tarball landed
+ls -la /tmp/lean_seed_futures.tar.gz
+
+# Extract to staging (NOT directly into the volume — preserves the
+# "explicit cp -rv /seed/future/. /Lean/Data/future/" merge step that
+# the runbook documents for auditability)
+mkdir -p /tmp/lean_seed_futures_stage
+tar -xzf /tmp/lean_seed_futures.tar.gz -C /tmp/lean_seed_futures_stage
+
+# Merge into trading_lean_data volume (trailing /. is intentional — merges
+# without overwriting the existing tutorial bundle)
+docker run --rm \
+  -v trading_lean_data:/Lean/Data \
+  -v /tmp/lean_seed_futures_stage:/seed:ro \
+  alpine \
+  cp -rv /seed/future/. /Lean/Data/future/ | tail -10
+
+# Verify new universe extent (should be today or yesterday for all 7 micros)
+docker run --rm -v trading_lean_data:/data alpine sh -c '
+  for t in mes mnq mym m2k mbt; do
+    d=/data/future/cme/universes/$t
+    last=$(ls -1 "$d" 2>/dev/null | tail -1)
+    echo "$t (cme): last=$last"
+  done
+  echo "mgc (comex): last=$(ls -1 /data/future/comex/universes/mgc 2>/dev/null | tail -1)"
+  echo "mcl (nymex): last=$(ls -1 /data/future/nymex/universes/mcl 2>/dev/null | tail -1)"
+'
+
+# Restart lean_local to pick up the new data
+cd /opt/trading
+docker compose --env-file deploy/.env restart lean_local
+
+# Cleanup staging dirs (volume persists; the host /tmp dirs were transient)
+rm -rf /tmp/lean_seed_futures_stage /tmp/lean_seed_futures /tmp/lean_seed_futures.tar.gz
+OUTER_EOF
+```
+
+**Verification:** wait for the next 21:30 UTC cycle (or `restart lean_local`
+during the day — boot warmup is ~30-60 min before the first cycle fires).
+The expected log line transitions from:
+
+```
+v1_history_unavailable session_date=YYYY-MM-DD failed_markets=['/MES','/MNQ','/MYM','/M2K','/MGC','/MCL','/MBT']
+v1_signals_generated session_date=YYYY-MM-DD signals_emitted_count=0 rejections_count=4
+```
+
+to:
+
+```
+v1_signals_generated session_date=YYYY-MM-DD signals_emitted_count=<N> rejections_count=<11-N>
+```
+
+(no `v1_history_unavailable` log line; `rejections_count` should reach 11 minus
+whatever count of signals fire). Audit chain unchanged unless V1 organically
+emits — re-seed is read-only against audit_log.
 
 ---
 
