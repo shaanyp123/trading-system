@@ -30,24 +30,77 @@ from services.risk.order_placement_worker import (
 )
 
 
+def _sizing_trace(
+    *,
+    market: str = "/MES",
+    stop_price: str = "4220.50",
+) -> dict[str, Any]:
+    """Build a minimal sizing_trace matching V1's canonical position.
+
+    The bracket-order extension reads
+    ``stage_0_universe.strategy_inputs[market].stop_price``; tests must
+    populate this path or the planner raises.
+    """
+    return {
+        "stage_0_universe": {
+            "active_markets": [market],
+            "excluded": [],
+            "strategy_inputs": {
+                market: {
+                    "stop_price": stop_price,
+                    "atr": "10.50",
+                    "donchian_high": "4255.00",
+                    "donchian_low": "4100.00",
+                    "ma_fast": "4180.00",
+                    "ma_slow": "4150.00",
+                    "hurst": "0.62",
+                    "lookback_days_donchian": 60,
+                }
+            },
+        }
+    }
+
+
 def _signal(
     *,
     direction: str = "long",
     target_contracts: int = 1,
     strategy_hash: str = "a" * 40,
     parameter_set_hash: str = "b" * 64,
+    sizing_trace: dict[str, Any] | None = None,
+    market: str = "/MES",
+    decision_price: str = "4250.50",
 ) -> ApprovedSignalRow:
-    """Build a sample ApprovedSignalRow for tests."""
+    """Build a sample ApprovedSignalRow for tests.
+
+    Bracket-order extension 2026-05-17: sizing_trace defaults to a stop
+    that's correctly oriented vs the default decision_price + direction
+    (long → stop BELOW decision; short → stop ABOVE).
+    """
+    if sizing_trace is None:
+        # Default stop placed safely below for long, above for short.
+        # Derived from decision_price so the helper works for any market.
+        decision_d = Decimal(decision_price)
+        if direction == "long":
+            default_stop = str(decision_d * Decimal("0.97"))
+        elif direction == "short":
+            default_stop = str(decision_d * Decimal("1.03"))
+        else:
+            # 'flat' or unknown directions don't reach the stop validator
+            # because the planner raises on direction first.
+            default_stop = str(decision_d * Decimal("0.97"))
+        sizing_trace = _sizing_trace(market=market, stop_price=default_stop)
     return ApprovedSignalRow(
         signal_id=uuid4(),
         account_id=uuid4(),
         env="paper",
-        market="/MES",
+        market=market,
         direction=direction,  # type: ignore[arg-type]
         target_contracts=target_contracts,
-        decision_price=Decimal("4250.50"),
+        decision_price=Decimal(decision_price),
         strategy_hash=strategy_hash,
         parameter_set_hash=parameter_set_hash,
+        sizing_trace=sizing_trace,
     )
 
 
@@ -203,6 +256,511 @@ class TestPlanOrderPlacement:
         plan = plan_order_placement(_signal(), env="paper")
         with pytest.raises(AttributeError):
             plan.market = "/ES"  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# Bracket-order extension 2026-05-17 — stop_price derivation + dual placement
+# ---------------------------------------------------------------------------
+
+
+class TestExtractStopPriceFromSizingTrace:
+    """Verifies the V1 canonical lookup path + direction sanity checks."""
+
+    def test_long_extracts_stop_price_below_decision(self) -> None:
+        from services.risk.order_placement_worker import (
+            _extract_stop_price_from_sizing_trace,
+        )
+
+        trace = _sizing_trace(market="TLT", stop_price="82.50")
+        stop = _extract_stop_price_from_sizing_trace(
+            trace,
+            market="TLT",
+            direction="long",
+            decision_price=Decimal("85.00"),
+        )
+        assert stop == Decimal("82.50")
+
+    def test_short_extracts_stop_price_above_decision(self) -> None:
+        from services.risk.order_placement_worker import (
+            _extract_stop_price_from_sizing_trace,
+        )
+
+        trace = _sizing_trace(market="TLT", stop_price="87.50")
+        stop = _extract_stop_price_from_sizing_trace(
+            trace,
+            market="TLT",
+            direction="short",
+            decision_price=Decimal("85.00"),
+        )
+        assert stop == Decimal("87.50")
+
+    def test_missing_stage_0_universe_raises(self) -> None:
+        from services.risk.order_placement_worker import (
+            _extract_stop_price_from_sizing_trace,
+        )
+
+        with pytest.raises(OrderPlacementError, match="stop_price"):
+            _extract_stop_price_from_sizing_trace(
+                {},
+                market="TLT",
+                direction="long",
+                decision_price=Decimal("85.00"),
+            )
+
+    def test_missing_market_entry_raises(self) -> None:
+        from services.risk.order_placement_worker import (
+            _extract_stop_price_from_sizing_trace,
+        )
+
+        trace = {"stage_0_universe": {"strategy_inputs": {}}}  # market="TLT" missing
+        with pytest.raises(OrderPlacementError, match="stop_price"):
+            _extract_stop_price_from_sizing_trace(
+                trace,
+                market="TLT",
+                direction="long",
+                decision_price=Decimal("85.00"),
+            )
+
+    def test_long_stop_at_or_above_decision_raises(self) -> None:
+        from services.risk.order_placement_worker import (
+            _extract_stop_price_from_sizing_trace,
+        )
+
+        trace = _sizing_trace(market="TLT", stop_price="85.00")  # equal
+        with pytest.raises(OrderPlacementError, match="NOT strictly below"):
+            _extract_stop_price_from_sizing_trace(
+                trace,
+                market="TLT",
+                direction="long",
+                decision_price=Decimal("85.00"),
+            )
+        trace_above = _sizing_trace(market="TLT", stop_price="90.00")
+        with pytest.raises(OrderPlacementError, match="NOT strictly below"):
+            _extract_stop_price_from_sizing_trace(
+                trace_above,
+                market="TLT",
+                direction="long",
+                decision_price=Decimal("85.00"),
+            )
+
+    def test_short_stop_at_or_below_decision_raises(self) -> None:
+        from services.risk.order_placement_worker import (
+            _extract_stop_price_from_sizing_trace,
+        )
+
+        trace = _sizing_trace(market="TLT", stop_price="80.00")
+        with pytest.raises(OrderPlacementError, match="NOT strictly above"):
+            _extract_stop_price_from_sizing_trace(
+                trace,
+                market="TLT",
+                direction="short",
+                decision_price=Decimal("85.00"),
+            )
+
+    def test_zero_stop_price_raises(self) -> None:
+        from services.risk.order_placement_worker import (
+            _extract_stop_price_from_sizing_trace,
+        )
+
+        trace = _sizing_trace(market="TLT", stop_price="0")
+        with pytest.raises(OrderPlacementError, match="> 0"):
+            _extract_stop_price_from_sizing_trace(
+                trace,
+                market="TLT",
+                direction="long",
+                decision_price=Decimal("85.00"),
+            )
+
+    def test_unparseable_stop_price_raises(self) -> None:
+        from services.risk.order_placement_worker import (
+            _extract_stop_price_from_sizing_trace,
+        )
+
+        trace = _sizing_trace(market="TLT", stop_price="not_a_number")
+        with pytest.raises(OrderPlacementError, match="not Decimal-castable"):
+            _extract_stop_price_from_sizing_trace(
+                trace,
+                market="TLT",
+                direction="long",
+                decision_price=Decimal("85.00"),
+            )
+
+
+class TestPlanOrderPlacementBracket:
+    """Plan-level tests for the bracket-order extension."""
+
+    def test_long_entry_plan_includes_sell_stop(self) -> None:
+        plan = plan_order_placement(
+            _signal(direction="long", market="TLT", decision_price="85.00"),
+            env="paper",
+        )
+        assert plan.side == "buy"
+        assert plan.stop_side == "sell"
+        assert plan.stop_price < plan.limit_price
+
+    def test_short_entry_plan_includes_buy_stop(self) -> None:
+        plan = plan_order_placement(
+            _signal(direction="short", market="TLT", decision_price="85.00"),
+            env="paper",
+        )
+        assert plan.side == "sell"
+        assert plan.stop_side == "buy"
+        assert plan.stop_price > plan.limit_price
+
+    def test_stop_client_order_id_is_entry_cid_plus_suffix(self) -> None:
+        plan = plan_order_placement(_signal(direction="long"), env="paper")
+        assert plan.stop_client_order_id == f"{plan.client_order_id}-stop"
+
+    def test_missing_stop_price_in_sizing_trace_raises_pre_plan(self) -> None:
+        trace_no_stop = {"stage_0_universe": {"strategy_inputs": {"/MES": {}}}}
+        with pytest.raises(OrderPlacementError, match="stop_price"):
+            plan_order_placement(
+                _signal(direction="long", sizing_trace=trace_no_stop),
+                env="paper",
+            )
+
+    def test_stop_price_decimal_precision_preserved(self) -> None:
+        trace = _sizing_trace(market="TLT", stop_price="82.50123456")
+        plan = plan_order_placement(
+            _signal(
+                direction="long",
+                market="TLT",
+                decision_price="85.00",
+                sizing_trace=trace,
+            ),
+            env="paper",
+        )
+        assert plan.stop_price == Decimal("82.50123456")
+
+
+# ---------------------------------------------------------------------------
+# Bracket-order apply-step tests (mocked IBKR + session)
+# ---------------------------------------------------------------------------
+
+
+def _fake_ibkr_place_result(broker_order_id: int, status: str = "submitted") -> Any:
+    """Minimal stand-in for IbkrPlaceOrderResult — only fields the apply
+    step accesses."""
+    from services.execution.types import IbkrPlaceOrderResult
+
+    return IbkrPlaceOrderResult(
+        client_order_id=f"cid-{broker_order_id}",
+        broker_order_id=broker_order_id,
+        status=status,  # type: ignore[arg-type]
+        submitted_at_utc=datetime(2026, 5, 17, 14, 0, 0, tzinfo=UTC),
+    )
+
+
+def _build_apply_session_factory() -> Any:
+    """Build an async session_factory for apply_order_placement tests.
+
+    Returns a factory whose `session.execute()` returns a fake result
+    with `.fetchone()` yielding a row with `.id` set to a fresh UUID.
+    Each call to the factory yields a fresh session (so INSERTs +
+    UPDATEs each get their own).
+    """
+
+    @asynccontextmanager
+    async def factory() -> Any:
+        sess = MagicMock()
+
+        async def _exec(stmt: Any, params: Any = None) -> MagicMock:
+            result_mock = MagicMock()
+            result_mock.fetchone = MagicMock(return_value=MagicMock(id=uuid4()))
+            return result_mock
+
+        sess.execute = AsyncMock(side_effect=_exec)
+
+        @asynccontextmanager
+        async def _begin_cm() -> Any:
+            yield None
+
+        sess.begin = MagicMock(return_value=_begin_cm())
+        yield sess
+
+    return factory
+
+
+class TestApplyOrderPlacementBracket:
+    """Verifies the bracket-order apply step places TWO IBKR orders,
+    writes TWO audit rows, and INSERTs TWO orders rows."""
+
+    @pytest.mark.asyncio
+    async def test_long_entry_places_both_entry_and_stop(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from services.execution.types import IbkrContractRef
+        from services.risk.order_placement_worker import apply_order_placement
+
+        place_calls: list[Any] = []
+
+        async def fake_place(request: Any) -> Any:
+            place_calls.append(request)
+            return _fake_ibkr_place_result(broker_order_id=len(place_calls) * 10)
+
+        ibkr = MagicMock()
+        ibkr.place_order = AsyncMock(side_effect=fake_place)
+        ibkr.cancel_order = AsyncMock()
+
+        # Monkeypatch the audit writer so we don't need a real DB.
+        async def fake_append(*args: Any, **kwargs: Any) -> Any:
+            return MagicMock(event_uuid=uuid4(), sequence_no=1)
+
+        monkeypatch.setattr(
+            "services.risk.order_placement_worker.append_audit_event",
+            AsyncMock(side_effect=fake_append),
+        )
+
+        plan = plan_order_placement(
+            _signal(direction="long", market="TLT", decision_price="85.00"),
+            env="paper",
+        )
+        contract = IbkrContractRef(market="TLT", ibkr_local_symbol="TLT", exchange="SMART")
+        await apply_order_placement(
+            plan,
+            ibkr_client=ibkr,
+            contract=contract,
+            session_factory=_build_apply_session_factory(),
+        )
+        # TWO IBKR placement requests fired.
+        assert len(place_calls) == 2
+        entry, stop = place_calls
+        assert entry.client_order_id == plan.client_order_id
+        assert entry.side == "buy"
+        assert entry.order_type == "limit_marketable"
+        assert entry.limit_price == plan.limit_price
+        assert stop.client_order_id == plan.stop_client_order_id
+        assert stop.side == "sell"
+        assert stop.order_type == "stop_market"
+        assert stop.stop_price == plan.stop_price
+        assert stop.time_in_force == "GTC"
+        assert stop.parent_client_order_id == plan.client_order_id
+
+    @pytest.mark.asyncio
+    async def test_short_entry_places_opposite_side_stop(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from services.execution.types import IbkrContractRef
+        from services.risk.order_placement_worker import apply_order_placement
+
+        place_calls: list[Any] = []
+
+        async def fake_place(request: Any) -> Any:
+            place_calls.append(request)
+            return _fake_ibkr_place_result(broker_order_id=len(place_calls) * 10)
+
+        ibkr = MagicMock()
+        ibkr.place_order = AsyncMock(side_effect=fake_place)
+        ibkr.cancel_order = AsyncMock()
+
+        async def fake_append(*args: Any, **kwargs: Any) -> Any:
+            return MagicMock(event_uuid=uuid4(), sequence_no=1)
+
+        monkeypatch.setattr(
+            "services.risk.order_placement_worker.append_audit_event",
+            AsyncMock(side_effect=fake_append),
+        )
+
+        plan = plan_order_placement(
+            _signal(direction="short", market="TLT", decision_price="85.00"),
+            env="paper",
+        )
+        contract = IbkrContractRef(market="TLT", ibkr_local_symbol="TLT", exchange="SMART")
+        await apply_order_placement(
+            plan,
+            ibkr_client=ibkr,
+            contract=contract,
+            session_factory=_build_apply_session_factory(),
+        )
+        entry, stop = place_calls
+        assert entry.side == "sell"
+        assert stop.side == "buy"
+        assert stop.order_type == "stop_market"
+
+    @pytest.mark.asyncio
+    async def test_audit_event_count_is_two_on_success(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from services.execution.types import IbkrContractRef
+        from services.risk.order_placement_worker import apply_order_placement
+
+        ibkr = MagicMock()
+        ibkr.place_order = AsyncMock(
+            side_effect=[
+                _fake_ibkr_place_result(broker_order_id=10),
+                _fake_ibkr_place_result(broker_order_id=11),
+            ]
+        )
+        ibkr.cancel_order = AsyncMock()
+
+        audit_calls: list[Any] = []
+
+        async def fake_append(*args: Any, **kwargs: Any) -> Any:
+            audit_calls.append(kwargs.get("source_clock_ts"))
+            return MagicMock(event_uuid=uuid4(), sequence_no=len(audit_calls))
+
+        monkeypatch.setattr(
+            "services.risk.order_placement_worker.append_audit_event",
+            AsyncMock(side_effect=fake_append),
+        )
+
+        plan = plan_order_placement(
+            _signal(direction="long", market="TLT", decision_price="85.00"),
+            env="paper",
+        )
+        contract = IbkrContractRef(market="TLT", ibkr_local_symbol="TLT", exchange="SMART")
+        await apply_order_placement(
+            plan,
+            ibkr_client=ibkr,
+            contract=contract,
+            session_factory=_build_apply_session_factory(),
+        )
+        # 1 audit for entry + 1 audit for stop = 2.
+        assert len(audit_calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_entry_rejected_skips_stop_placement(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If IBKR rejects the entry, the stop should NOT be placed."""
+        from services.execution.types import IbkrContractRef
+        from services.risk.order_placement_worker import apply_order_placement
+
+        place_calls: list[Any] = []
+
+        async def fake_place(request: Any) -> Any:
+            place_calls.append(request)
+            return _fake_ibkr_place_result(broker_order_id=10, status="rejected")
+
+        ibkr = MagicMock()
+        ibkr.place_order = AsyncMock(side_effect=fake_place)
+        ibkr.cancel_order = AsyncMock()
+
+        async def fake_append(*args: Any, **kwargs: Any) -> Any:
+            return MagicMock(event_uuid=uuid4(), sequence_no=1)
+
+        monkeypatch.setattr(
+            "services.risk.order_placement_worker.append_audit_event",
+            AsyncMock(side_effect=fake_append),
+        )
+
+        plan = plan_order_placement(
+            _signal(direction="long", market="TLT", decision_price="85.00"),
+            env="paper",
+        )
+        contract = IbkrContractRef(market="TLT", ibkr_local_symbol="TLT", exchange="SMART")
+        await apply_order_placement(
+            plan,
+            ibkr_client=ibkr,
+            contract=contract,
+            session_factory=_build_apply_session_factory(),
+        )
+        # Only the entry was placed; stop was skipped because entry rejected.
+        assert len(place_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_stop_placement_failure_cancels_entry_and_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If stop placement raises, the worker must cancel the entry +
+        propagate OrderPlacementError."""
+        from services.execution.types import IbkrContractRef, IbkrPlacementError
+        from services.risk.order_placement_worker import apply_order_placement
+
+        call_count = {"n": 0}
+        cancel_called: list[str] = []
+
+        async def fake_place(request: Any) -> Any:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # Entry: succeeds.
+                return _fake_ibkr_place_result(broker_order_id=10)
+            # Stop: simulated transport failure.
+            raise IbkrPlacementError(
+                operation="placeOrder",
+                detail="broker disconnect",
+                underlying_exception_class="ConnectionError",
+                occurred_at_utc=datetime(2026, 5, 17, 14, 0, 0, tzinfo=UTC),
+            )
+
+        async def fake_cancel(client_order_id: str) -> Any:
+            cancel_called.append(client_order_id)
+            return MagicMock()
+
+        ibkr = MagicMock()
+        ibkr.place_order = AsyncMock(side_effect=fake_place)
+        ibkr.cancel_order = AsyncMock(side_effect=fake_cancel)
+
+        async def fake_append(*args: Any, **kwargs: Any) -> Any:
+            return MagicMock(event_uuid=uuid4(), sequence_no=1)
+
+        monkeypatch.setattr(
+            "services.risk.order_placement_worker.append_audit_event",
+            AsyncMock(side_effect=fake_append),
+        )
+
+        plan = plan_order_placement(
+            _signal(direction="long", market="TLT", decision_price="85.00"),
+            env="paper",
+        )
+        contract = IbkrContractRef(market="TLT", ibkr_local_symbol="TLT", exchange="SMART")
+        with pytest.raises(OrderPlacementError, match="STOP_PLACEMENT_FAILED"):
+            await apply_order_placement(
+                plan,
+                ibkr_client=ibkr,
+                contract=contract,
+                session_factory=_build_apply_session_factory(),
+            )
+        # Cancel was called against the entry's client_order_id.
+        assert cancel_called == [plan.client_order_id]
+
+    @pytest.mark.asyncio
+    async def test_stop_rejected_cancels_entry_and_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If IBKR rejects the stop at validation, entry is cancelled."""
+        from services.execution.types import IbkrContractRef
+        from services.risk.order_placement_worker import apply_order_placement
+
+        call_count = {"n": 0}
+        cancel_called: list[str] = []
+
+        async def fake_place(request: Any) -> Any:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return _fake_ibkr_place_result(broker_order_id=10)
+            # Stop: rejected by broker.
+            return _fake_ibkr_place_result(broker_order_id=11, status="rejected")
+
+        async def fake_cancel(client_order_id: str) -> Any:
+            cancel_called.append(client_order_id)
+            return MagicMock()
+
+        ibkr = MagicMock()
+        ibkr.place_order = AsyncMock(side_effect=fake_place)
+        ibkr.cancel_order = AsyncMock(side_effect=fake_cancel)
+
+        async def fake_append(*args: Any, **kwargs: Any) -> Any:
+            return MagicMock(event_uuid=uuid4(), sequence_no=1)
+
+        monkeypatch.setattr(
+            "services.risk.order_placement_worker.append_audit_event",
+            AsyncMock(side_effect=fake_append),
+        )
+
+        plan = plan_order_placement(
+            _signal(direction="long", market="TLT", decision_price="85.00"),
+            env="paper",
+        )
+        contract = IbkrContractRef(market="TLT", ibkr_local_symbol="TLT", exchange="SMART")
+        with pytest.raises(OrderPlacementError, match="STOP_PLACEMENT_FAILED"):
+            await apply_order_placement(
+                plan,
+                ibkr_client=ibkr,
+                contract=contract,
+                session_factory=_build_apply_session_factory(),
+            )
+        assert cancel_called == [plan.client_order_id]
 
 
 class TestBrokerStatusMapping:

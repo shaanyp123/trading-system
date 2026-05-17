@@ -7,6 +7,24 @@ planner, dispatches via :class:`services.execution.ibkr_client.IbkrClient`,
 writes an ``order_placed`` audit row, INSERTs the orders row, and updates
 the signals row's ``status`` to ``'working'``.
 
+**Bracket-order extension (2026-05-17).** When the planner can derive a
+stop price from the signal's ``sizing_trace`` (the V1 strategy populates
+``stage_0_universe.strategy_inputs[market].stop_price``), the worker
+places BOTH the entry order AND a stop-market exit order in the same
+apply step. Two audit ``ORDER_PLACED`` rows + two ``orders`` rows + one
+``signals.status='working'`` UPDATE land atomically. The stop order
+reuses the entry's ``signal_id`` per the bracket-order Option B contract
+documented in :mod:`services.risk.fill_processor` — when the stop fires,
+``fetch_fill_context`` resolves to the entry signal's direction +
+the EXIT_FULL_CLOSE branch handles the close.
+
+If stop placement fails after a successful entry placement, the worker
+attempts to cancel the entry via ``ibkr_client.cancel_order`` and raises
+:class:`OrderPlacementError`. **The cancel is best-effort** — for ETFs
+which paper-fill immediately, the entry may have already filled before
+the cancel reaches IBKR, leaving a naked position the operator must
+manually flatten via TWS + audit-event manual entry.
+
 **Audit-first ordering per backend-spec §2.10.1.** The placeOrder call to
 the broker happens BEFORE the audit write — IBKR's broker_order_id is
 load-bearing for the audit payload, and the broker call is the
@@ -22,10 +40,10 @@ than that catches manual-approve flows quickly without unnecessary DB
 pressure. Tunable via the ``poll_interval_seconds`` constructor arg.
 
 **Client order ID format** (backend-spec §2.5 LOCKED):
-``<strategy_short>-<paramset_short>-<signal_short>-<retry_n>`` — 33 chars
-total via the 8-char prefixes of strategy_hash + parameter_set_hash +
-signal UUID short form. Phase 1 retry_n=0 (no retry on rejection yet;
-Phase 2+ adds exponential backoff per spec §6.3).
+``<strategy_short>-<paramset_short>-<signal_short>-<retry_n>`` for the
+entry; the stop order appends a ``-stop`` suffix:
+``<strategy_short>-<paramset_short>-<signal_short>-<retry_n>-stop``.
+Phase 1 retry_n=0.
 
 **Anti-pattern enforcement:**
 
@@ -113,6 +131,11 @@ class ApprovedSignalRow:
     decision_price: Decimal
     strategy_hash: str
     parameter_set_hash: str
+    sizing_trace: dict[str, Any]
+    """Raw ``signals.sizing_trace`` JSONB column as a Python dict. Used to
+    derive the bracket stop_price via
+    ``sizing_trace["stage_0_universe"]["strategy_inputs"][market]["stop_price"]``
+    (V1 strategy's canonical position). Bracket-order extension 2026-05-17."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +149,13 @@ class OrderPlacementPlan:
     All ID derivation is deterministic — same signal row → same
     client_order_id always (necessary for retry idempotency at the
     broker boundary).
+
+    Bracket-order extension (2026-05-17): when the signal's sizing_trace
+    contains ``stage_0_universe.strategy_inputs[market].stop_price`` the
+    planner also populates ``stop_client_order_id`` + ``stop_price`` +
+    ``stop_side`` so the apply step places BOTH the entry order and
+    the protective stop-market exit order. When stop info is missing
+    the planner raises (no entry without a stop, per V1 design).
     """
 
     signal_id: UUID
@@ -141,6 +171,17 @@ class OrderPlacementPlan:
     strategy_hash: str
     parameter_set_hash: str
     decision_price: Decimal
+    # ----- Bracket stop-loss fields -----
+    stop_client_order_id: str
+    """Stop's client_order_id; entry's CID + ``-stop`` suffix."""
+    stop_price: Decimal
+    """Stop price computed from the strategy's pre-computed
+    sizing_trace.stop_price (V1: ATR-based exit stop). For longs,
+    stop_price < limit_price; for shorts, stop_price > limit_price.
+    Validated in plan_order_placement."""
+    stop_side: IbkrOrderSide
+    """Opposite of entry side — sell for long entries (close-long via
+    sell-stop), buy for short entries (close-short via buy-stop)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,12 +236,84 @@ def _build_client_order_id(
     return f"{strategy_hash[:8]}-{parameter_set_hash[:8]}-{signal_hex[:8]}-{retry_n}"
 
 
+def _extract_stop_price_from_sizing_trace(
+    sizing_trace: dict[str, Any],
+    *,
+    market: str,
+    direction: Literal["long", "short", "flat"],
+    decision_price: Decimal,
+) -> Decimal:
+    """Pull ``stop_price`` from the V1 sizing_trace canonical position.
+
+    Lookup path:
+    ``sizing_trace["stage_0_universe"]["strategy_inputs"][market]["stop_price"]``
+
+    The V1 strategy populates this in
+    :meth:`lean.v1_strategy.V1TrendFollowingAlgorithm._build_minimal_sizing_trace`
+    using ``decision_price ± ATR x STOP_DISTANCE_ATR_MULT``. Phase 2+
+    strategies that don't follow this convention need their own
+    extension to this function (or a strategy-keyed dispatch).
+
+    Sanity-check side direction: for ``direction='long'`` the stop must
+    be STRICTLY BELOW the decision price; for ``direction='short'`` the
+    stop must be STRICTLY ABOVE. Violations raise
+    :class:`OrderPlacementError` — better to refuse the entry than
+    submit a self-defeating stop (a sell-stop above the long entry would
+    fire immediately).
+
+    Raises :class:`OrderPlacementError` for any of: missing nested key,
+    unparseable value (negative, zero, non-Decimal-castable), direction
+    inversion.
+    """
+    try:
+        stage_0 = sizing_trace["stage_0_universe"]
+        strategy_inputs = stage_0["strategy_inputs"]
+        market_inputs = strategy_inputs[market]
+        raw_stop = market_inputs["stop_price"]
+    except (KeyError, TypeError) as exc:
+        raise OrderPlacementError(
+            f"sizing_trace missing canonical stop_price path "
+            f"(stage_0_universe.strategy_inputs.{market}.stop_price): {exc!r}"
+        ) from exc
+    if raw_stop is None or raw_stop == "":
+        raise OrderPlacementError(
+            f"sizing_trace stop_price for market {market!r} is empty/None; "
+            "V1 strategy must populate decision_price ± ATR x STOP_DISTANCE_ATR_MULT."
+        )
+    try:
+        # Strategy persists Decimal as string per A05; tolerate Decimal too.
+        stop_price = Decimal(str(raw_stop))
+    except (ArithmeticError, ValueError) as exc:
+        raise OrderPlacementError(
+            f"sizing_trace stop_price {raw_stop!r} not Decimal-castable: {exc!r}"
+        ) from exc
+    if stop_price <= 0:
+        raise OrderPlacementError(f"sizing_trace stop_price={stop_price} must be > 0.")
+    # Direction sanity check. Defensive — a self-defeating stop fires
+    # immediately, draining the operator's account via slippage.
+    if direction == "long" and stop_price >= decision_price:
+        raise OrderPlacementError(
+            f"Long entry decision_price={decision_price} but stop_price={stop_price} "
+            "is NOT strictly below; rejecting to avoid an immediate self-defeating fill."
+        )
+    if direction == "short" and stop_price <= decision_price:
+        raise OrderPlacementError(
+            f"Short entry decision_price={decision_price} but stop_price={stop_price} "
+            "is NOT strictly above; rejecting to avoid an immediate self-defeating fill."
+        )
+    return stop_price
+
+
 def plan_order_placement(signal: ApprovedSignalRow, *, env: Environment) -> OrderPlacementPlan:
     """Build the placement plan for one approved signal.
 
     Pure policy — no I/O, no clock, no random. Same inputs always
     produce the same plan, which means client_order_id is
     deterministic per signal (necessary for IBKR retry idempotency).
+
+    Bracket-order extension (2026-05-17): derives stop_price from
+    ``signal.sizing_trace`` and includes it in the plan. The apply step
+    places both entry + stop in one operation.
 
     Raises :class:`OrderPlacementError` for shape problems that should
     have been caught upstream — these are runtime sanity checks.
@@ -222,6 +335,18 @@ def plan_order_placement(signal: ApprovedSignalRow, *, env: Environment) -> Orde
         retry_n=RETRY_N_PHASE_1,
     )
 
+    # Bracket extension: derive stop fields from the strategy's
+    # canonical position in sizing_trace.
+    stop_price = _extract_stop_price_from_sizing_trace(
+        signal.sizing_trace,
+        market=signal.market,
+        direction=signal.direction,
+        decision_price=signal.decision_price,
+    )
+    # Opposite-side stop for the bracket.
+    stop_side: IbkrOrderSide = "sell" if side == "buy" else "buy"
+    stop_client_order_id = f"{client_order_id}-stop"
+
     return OrderPlacementPlan(
         signal_id=signal.signal_id,
         account_id=signal.account_id,
@@ -236,6 +361,9 @@ def plan_order_placement(signal: ApprovedSignalRow, *, env: Environment) -> Orde
         strategy_hash=signal.strategy_hash,
         parameter_set_hash=signal.parameter_set_hash,
         decision_price=signal.decision_price,
+        stop_client_order_id=stop_client_order_id,
+        stop_price=stop_price,
+        stop_side=stop_side,
     )
 
 
@@ -269,7 +397,8 @@ async def fetch_approved_signals(
                       s.target_contracts,
                       s.decision_price,
                       s.strategy_hash,
-                      s.parameter_set_hash
+                      s.parameter_set_hash,
+                      s.sizing_trace
                     FROM signals s
                     LEFT JOIN orders o ON o.signal_id = s.id
                     WHERE s.account_id = :acct
@@ -294,6 +423,8 @@ async def fetch_approved_signals(
             decision_price=r.decision_price,
             strategy_hash=r.strategy_hash,
             parameter_set_hash=r.parameter_set_hash,
+            # asyncpg returns JSONB as a Python dict already (no json.loads needed).
+            sizing_trace=dict(r.sizing_trace) if r.sizing_trace is not None else {},
         )
         for r in rows
     ]
@@ -307,30 +438,37 @@ async def apply_order_placement(
     session_factory: async_sessionmaker[Any],
     phase_at_emit: PhaseAtEmit = 1,
 ) -> OrderPlacementResult:
-    """Execute the placement plan: IBKR placeOrder → audit → INSERT orders.
+    """Execute the placement plan: IBKR placeOrder (entry + stop) → audit → INSERT orders.
 
-    Three sequential steps:
+    Sequential steps:
 
-    1. ``ibkr_client.place_order(...)`` — the broker-side side effect.
-       Failure raises :class:`IbkrPlacementError` (broker connectivity)
-       or returns an ``IbkrPlaceOrderResult`` with ``status='rejected'``
-       (broker validation rejection).
-    2. ``append_audit_event(AuditEventType.ORDER_PLACED, ...)`` — its
-       own SERIALIZABLE transaction. Payload includes the
-       client_order_id + broker_order_id (when present) for downstream
-       reconciliation traceability.
-    3. ``INSERT INTO orders ...`` carrying the audit_event_uuid as FK
-       linkage + UPDATE signals.status='working'. Single transaction so
-       both rows land or neither does.
+    1. ``ibkr_client.place_order(entry_request)`` — the broker-side
+       side effect for the entry leg. Failure raises
+       :class:`IbkrPlacementError` (broker connectivity) or returns an
+       ``IbkrPlaceOrderResult`` with ``status='rejected'`` (broker
+       validation rejection).
+    2. **Bracket extension (2026-05-17):** if entry placed successfully
+       (status not in rejected set), build + place the stop-market exit
+       order via ``ibkr_client.place_order(stop_request)``. On stop
+       failure → best-effort cancel the entry + raise
+       :class:`OrderPlacementError("STOP_PLACEMENT_FAILED")`.
+    3. Audit-first (per spec §2.10.1): write ``ORDER_PLACED`` x N
+       (1 if entry rejected, 2 if entry + stop both placed) — each in
+       its own SERIALIZABLE transaction. Payload includes the
+       client_order_id + broker_order_id.
+    4. INSERT ``orders`` x N + UPDATE ``signals.status`` in one
+       transaction. The stop's ``parent_order_id`` references the
+       entry's id (set via RETURNING from the first INSERT).
 
-    Returns an :class:`OrderPlacementResult` regardless of whether IBKR
-    accepted the order — rejection vs success is reflected in the
-    ``status`` + ``broker_order_id`` fields.
+    Returns an :class:`OrderPlacementResult` reflecting the ENTRY
+    order's status (the stop's status is logged + audited but not
+    surfaced in the worker's return value — Phase 2+ may add a
+    bracket-aware result wrapper).
     """
     placed_at = datetime.now(tz=UTC)
 
-    # Step 1: IBKR side effect.
-    request = IbkrPlaceOrderRequest(
+    # Step 1: IBKR side effect — entry order.
+    entry_request = IbkrPlaceOrderRequest(
         client_order_id=plan.client_order_id,
         contract=contract,
         side=plan.side,
@@ -340,7 +478,7 @@ async def apply_order_placement(
         time_in_force=plan.time_in_force,
     )
     try:
-        broker_result = await ibkr_client.place_order(request)
+        broker_result = await ibkr_client.place_order(entry_request)
     except IbkrPlacementError as exc:
         log.error(
             "order_placement_broker_error",
@@ -354,10 +492,66 @@ async def apply_order_placement(
     broker_status = broker_result.status
     rejection_category = getattr(broker_result, "rejection_category", None)
     rejection_detail = getattr(broker_result, "rejection_detail", None)
+    db_status = _broker_status_to_orders_status(broker_status)
 
-    # Step 2: audit (audit-first per spec §2.10.1; the broker side effect
+    # Step 2: IBKR side effect — stop-market exit order (bracket).
+    # Skip the stop placement if the entry was rejected at the broker;
+    # there's no position to protect.
+    place_stop = db_status != "rejected"
+    stop_broker_result = None
+    stop_db_status: str | None = None
+    if place_stop:
+        stop_request = IbkrPlaceOrderRequest(
+            client_order_id=plan.stop_client_order_id,
+            contract=contract,
+            side=plan.stop_side,
+            quantity=plan.quantity,
+            order_type="stop_market",
+            stop_price=plan.stop_price,
+            time_in_force="GTC",
+            parent_client_order_id=plan.client_order_id,
+        )
+        try:
+            stop_broker_result = await ibkr_client.place_order(stop_request)
+            stop_db_status = _broker_status_to_orders_status(stop_broker_result.status)
+            if stop_db_status == "rejected":
+                # Stop rejected; treat as failure of the bracket pair.
+                raise OrderPlacementError(
+                    f"Stop placement rejected by broker: {stop_broker_result.rejection_detail!r}"
+                )
+        except (IbkrPlacementError, OrderPlacementError) as stop_exc:
+            log.error(
+                "order_placement_stop_failed",
+                signal_id=str(plan.signal_id),
+                entry_client_order_id=plan.client_order_id,
+                stop_client_order_id=plan.stop_client_order_id,
+                entry_broker_order_id=str(broker_order_id),
+                error=str(stop_exc),
+            )
+            # Best-effort cancel of the entry. For ETFs that paper-fill
+            # immediately the cancel may race the fill and lose; the
+            # operator must reconcile via TWS + manual audit entry.
+            try:
+                await ibkr_client.cancel_order(plan.client_order_id)
+                log.warning(
+                    "order_placement_entry_cancel_submitted_after_stop_failure",
+                    entry_client_order_id=plan.client_order_id,
+                    entry_broker_order_id=str(broker_order_id),
+                )
+            except Exception:
+                log.exception(
+                    "order_placement_entry_cancel_failed_after_stop_failure",
+                    entry_client_order_id=plan.client_order_id,
+                    entry_broker_order_id=str(broker_order_id),
+                )
+            raise OrderPlacementError(
+                f"STOP_PLACEMENT_FAILED entry_cid={plan.client_order_id} "
+                f"stop_cid={plan.stop_client_order_id}: {stop_exc!r}"
+            ) from stop_exc
+
+    # Step 3: audit (audit-first per spec §2.10.1; the broker side effect
     # already happened so we record what actually was done).
-    audit_payload: dict[str, Any] = {
+    entry_audit_payload: dict[str, Any] = {
         "signal_id": str(plan.signal_id),
         "account_id": str(plan.account_id),
         "client_order_id": plan.client_order_id,
@@ -372,24 +566,59 @@ async def apply_order_placement(
         "rejection_category": rejection_category,
         "rejection_detail": rejection_detail,
         "placed_at_utc": placed_at.isoformat(),
+        "leg": "entry",
     }
     async with session_factory() as audit_session:
         audit_record = await append_audit_event(
             audit_session,
             AuditEventType.ORDER_PLACED,
-            audit_payload,
+            entry_audit_payload,
             account_id=plan.account_id,
             env=plan.env,
             phase_at_emit=phase_at_emit,
             source_clock_ts=placed_at,
         )
 
-    # Step 3: INSERT orders + UPDATE signal. Single transaction so the
-    # business-data view is consistent.
-    db_status = _broker_status_to_orders_status(broker_status)
+    stop_audit_record = None
+    if stop_broker_result is not None:
+        stop_audit_payload: dict[str, Any] = {
+            "signal_id": str(plan.signal_id),
+            "account_id": str(plan.account_id),
+            "client_order_id": plan.stop_client_order_id,
+            "broker_order_id": (
+                str(stop_broker_result.broker_order_id)
+                if stop_broker_result.broker_order_id is not None
+                else None
+            ),
+            "market": plan.market,
+            "side": plan.stop_side,
+            "quantity": str(plan.quantity),
+            "order_type": "stop_market",
+            "stop_price": str(plan.stop_price),
+            "time_in_force": "GTC",
+            "broker_status": stop_broker_result.status,
+            "rejection_category": getattr(stop_broker_result, "rejection_category", None),
+            "rejection_detail": getattr(stop_broker_result, "rejection_detail", None),
+            "placed_at_utc": placed_at.isoformat(),
+            "leg": "stop",
+            "parent_client_order_id": plan.client_order_id,
+        }
+        async with session_factory() as stop_audit_session:
+            stop_audit_record = await append_audit_event(
+                stop_audit_session,
+                AuditEventType.ORDER_PLACED,
+                stop_audit_payload,
+                account_id=plan.account_id,
+                env=plan.env,
+                phase_at_emit=phase_at_emit,
+                source_clock_ts=placed_at,
+            )
+
+    # Step 4: INSERT orders x {1, 2} + UPDATE signal. Single transaction
+    # so the business-data view is consistent.
     async with session_factory() as session:
         async with session.begin():
-            order_row = (
+            entry_order_row = (
                 await session.execute(
                     text(
                         """
@@ -427,8 +656,50 @@ async def apply_order_placement(
                     },
                 )
             ).fetchone()
-            assert order_row is not None
-            order_id: UUID = order_row.id
+            assert entry_order_row is not None
+            order_id: UUID = entry_order_row.id
+
+            if stop_broker_result is not None:
+                # INSERT stop row with parent_order_id pointing at entry.
+                await session.execute(
+                    text(
+                        """
+                        INSERT INTO orders (
+                            account_id, env, signal_id, client_order_id, broker_order_id,
+                            market, direction, order_type, quantity, stop_price,
+                            placed_at_utc, status, rejection_reason, retry_n,
+                            parent_order_id, strategy_hash, parameter_set_hash
+                        ) VALUES (
+                            :acct, :env, :sig, :cid, :bid,
+                            :market, :side, 'stop_market', :qty, :stop_px,
+                            :placed_at, :status, :rej_reason, :retry_n,
+                            :parent_id, :strat, :param
+                        )
+                        """
+                    ),
+                    {
+                        "acct": plan.account_id,
+                        "env": plan.env,
+                        "sig": plan.signal_id,
+                        "cid": plan.stop_client_order_id,
+                        "bid": (
+                            str(stop_broker_result.broker_order_id)
+                            if stop_broker_result.broker_order_id is not None
+                            else None
+                        ),
+                        "market": plan.market,
+                        "side": plan.stop_side,
+                        "qty": int(plan.quantity),
+                        "stop_px": plan.stop_price,
+                        "placed_at": placed_at,
+                        "status": stop_db_status,
+                        "rej_reason": getattr(stop_broker_result, "rejection_detail", None),
+                        "retry_n": RETRY_N_PHASE_1,
+                        "parent_id": order_id,
+                        "strat": plan.strategy_hash,
+                        "param": plan.parameter_set_hash,
+                    },
+                )
 
             # Flip the signals row status to reflect placement outcome.
             new_signal_status = "working" if db_status != "rejected" else "rejected"
@@ -446,6 +717,13 @@ async def apply_order_placement(
         broker_status=broker_status,
         db_status=db_status,
         audit_event_uuid=str(audit_record.event_uuid),
+        stop_placed=stop_broker_result is not None,
+        stop_client_order_id=plan.stop_client_order_id if stop_broker_result else None,
+        stop_broker_order_id=(
+            str(stop_broker_result.broker_order_id) if stop_broker_result else None
+        ),
+        stop_broker_status=(stop_broker_result.status if stop_broker_result else None),
+        stop_audit_event_uuid=(str(stop_audit_record.event_uuid) if stop_audit_record else None),
     )
 
     # Best-effort SSE fan-out so the webhook_pusher subscriber + web UI
@@ -477,6 +755,18 @@ async def apply_order_placement(
                 "placed_at_utc": placed_at.isoformat(),
                 "environment": plan.env,
                 "audit_event_uuid": str(audit_record.event_uuid),
+                # Bracket extension: stop info echoed for the consumer.
+                "stop_placed": stop_broker_result is not None,
+                "stop_client_order_id": (plan.stop_client_order_id if stop_broker_result else None),
+                "stop_price": str(plan.stop_price) if stop_broker_result else None,
+                "stop_broker_order_id": (
+                    str(stop_broker_result.broker_order_id)
+                    if stop_broker_result is not None
+                    else None
+                ),
+                "stop_audit_event_uuid": (
+                    str(stop_audit_record.event_uuid) if stop_audit_record else None
+                ),
             },
         )
     except Exception:
