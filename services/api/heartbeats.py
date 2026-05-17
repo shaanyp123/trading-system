@@ -94,9 +94,19 @@ class HeartbeatRegistry:
     :func:`get_heartbeat_registry`. The api's lifespan does not need to
     instantiate this — it is a passive store; the first
     :func:`record` call from the LEAN POST handler initializes its entry.
+
+    **Alert cooldown tracking (PR #154 follow-up 2026-05-16):** the
+    ``_alerted_at`` map tracks the last time each service tripped a
+    ``HEARTBEAT_STALE_DETECTED`` alert. The staleness probe (in
+    ``services/api/heartbeat_probe.py``) uses :meth:`should_alert` to
+    avoid flooding Discord with the same staleness once per 15-min probe
+    tick — re-alerts only after :data:`HEARTBEAT_ALERT_COOLDOWN_S` has
+    elapsed since the last alert AND the service is still stale. A
+    fresh heartbeat (via :meth:`record`) clears the cooldown immediately.
     """
 
     _records: dict[HeartbeatService, HeartbeatRecord] = field(default_factory=dict)
+    _alerted_at: dict[HeartbeatService, datetime] = field(default_factory=dict)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def record(
@@ -110,6 +120,11 @@ class HeartbeatRegistry:
 
         Raises :class:`ValueError` if either timestamp is naive (dev-guide
         §3 / A06: all in-process datetimes are tz-aware UTC).
+
+        Side-effect (PR #154 follow-up): clears any stale-alert cooldown
+        for the service. A fresh heartbeat means the service has
+        recovered; the next staleness event should fire a fresh alert
+        immediately rather than waiting for the 24h cooldown to expire.
         """
         if source_clock_utc.tzinfo is None:
             raise ValueError(
@@ -133,6 +148,9 @@ class HeartbeatRegistry:
                 count=new_count,
             )
             self._records[service] = record
+            # Recovery: a fresh heartbeat clears the alert cooldown so the
+            # NEXT staleness fires an alert immediately.
+            self._alerted_at.pop(service, None)
             return record
 
     def snapshot(self) -> dict[HeartbeatService, HeartbeatRecord]:
@@ -144,9 +162,40 @@ class HeartbeatRegistry:
         """
         return dict(self._records)
 
+    def should_alert(self, service: HeartbeatService, *, now_utc: datetime) -> bool:
+        """Return True if a stale-alert for ``service`` is not in cooldown.
+
+        Used by the staleness probe to dedupe: only fire one alert per
+        :data:`HEARTBEAT_ALERT_COOLDOWN_S` window. Caller is expected to
+        have already verified the service is stale.
+        """
+        if now_utc.tzinfo is None:
+            raise ValueError("now_utc must be tz-aware (dev-guide §3 / A06); got naive")
+        last_alerted = self._alerted_at.get(service)
+        if last_alerted is None:
+            return True
+        age_s = (now_utc - last_alerted).total_seconds()
+        return age_s >= float(HEARTBEAT_ALERT_COOLDOWN_S)
+
+    def mark_alerted(self, service: HeartbeatService, *, now_utc: datetime) -> None:
+        """Stamp the last-alerted time for ``service``.
+
+        Called by the staleness probe AFTER a successful audit + alert
+        dispatch so subsequent probe ticks within the cooldown window
+        suppress further re-alerts.
+        """
+        if now_utc.tzinfo is None:
+            raise ValueError("now_utc must be tz-aware (dev-guide §3 / A06); got naive")
+        self._alerted_at[service] = now_utc
+
+    def last_alerted_at(self, service: HeartbeatService) -> datetime | None:
+        """Read the per-service last-alerted timestamp; None if never alerted."""
+        return self._alerted_at.get(service)
+
     def reset(self) -> None:
-        """Drop all records. Test-only; production has no reset path."""
+        """Drop all records + alert state. Test-only; production has no reset path."""
         self._records.clear()
+        self._alerted_at.clear()
 
 
 #: Module-level singleton. The convention mirrors the SSE multiplexer:
@@ -164,10 +213,26 @@ def get_heartbeat_registry() -> HeartbeatRegistry:
 #:
 #: ``lean_cycle`` = 26h: one daily cycle (24h) + a 2h soft cushion for
 #: weekend boundaries / DST flips / a single missed cycle. Above this,
-#: the operator should investigate; the follow-up alert PR fires a P2.
+#: the operator should investigate; the staleness probe fires a P2 alert.
 HEARTBEAT_STALE_THRESHOLDS_S: dict[HeartbeatService, int] = {
     "lean_cycle": 26 * 3600,
 }
+
+
+#: Cooldown between consecutive ``HEARTBEAT_STALE_DETECTED`` alerts for
+#: the same service. The staleness probe ticks every 15 min; without a
+#: cooldown the operator would get an alert per tick (~96/day) for the
+#: same stuck cron. 24h means at most one alert per day per stuck
+#: service; a fresh heartbeat (``HeartbeatRegistry.record(...)``)
+#: clears the cooldown immediately so a recovery + re-failure pattern
+#: still alerts on the second failure.
+HEARTBEAT_ALERT_COOLDOWN_S: int = 24 * 3600
+
+
+#: Interval between staleness-probe ticks. 15 min is the right cadence:
+#: fine-grained enough to catch a stuck cron within an hour of going
+#: stale, coarse enough to keep the api-side load negligible.
+HEARTBEAT_PROBE_INTERVAL_S: int = 15 * 60
 
 
 HeartbeatFreshness = Literal["fresh", "stale", "unknown"]
@@ -198,6 +263,8 @@ def classify_freshness(
 
 
 __all__ = [
+    "HEARTBEAT_ALERT_COOLDOWN_S",
+    "HEARTBEAT_PROBE_INTERVAL_S",
     "HEARTBEAT_STALE_THRESHOLDS_S",
     "HeartbeatFreshness",
     "HeartbeatRecord",
