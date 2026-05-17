@@ -54,6 +54,7 @@ from services.risk.fill_processor import (
     PriorTradeRow,
     TradeMutation,
     UnsupportedFillScenarioError,
+    _classify_fill_scenario,
     _quantize_avg_cost,
     _recompute_avg_cost,
     apply_fill_plan,
@@ -282,6 +283,7 @@ class TestPlanFillApplicationUpdatePath:
             trade_created_at=_ORDER_CREATED,
             total_quantity=2,
             avg_entry_price=Decimal("100"),
+            realized_commission_usd=Decimal("0"),
         )
         prior_pos = PriorPositionRow(position_id=uuid4(), quantity=2, avg_cost=Decimal("100"))
         plan = plan_fill_application(
@@ -303,6 +305,7 @@ class TestPlanFillApplicationUpdatePath:
             trade_created_at=_ORDER_CREATED,
             total_quantity=2,
             avg_entry_price=Decimal("100"),
+            realized_commission_usd=Decimal("0"),
         )
         prior_pos = PriorPositionRow(position_id=uuid4(), quantity=2, avg_cost=Decimal("100"))
         plan = plan_fill_application(
@@ -822,12 +825,14 @@ class TestFetchHelpers:
             created_at=_ORDER_CREATED,
             total_quantity=2,
             avg_entry_price=Decimal("100"),
+            realized_commission_usd=Decimal("0.50"),
         )
         sf = _build_mock_session_factory_with_row(row)
         prior = await fetch_prior_trade(sf, entry_signal_id=_SIGNAL_ID)
         assert prior is not None
         assert prior.trade_id == trade_id
         assert prior.total_quantity == 2
+        assert prior.realized_commission_usd == Decimal("0.50")
 
     @pytest.mark.asyncio
     async def test_fetch_prior_trade_none(self) -> None:
@@ -874,6 +879,697 @@ class TestProcessFillEventFacade:
 
 
 # ---------------------------------------------------------------------------
+# Pure-policy: _classify_fill_scenario
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyFillScenario:
+    """Exercises the public dispatch table for the classifier directly.
+    Test class added 2026-05-17 for the PR-G exit-path extension."""
+
+    def test_first_fill_long_buy_is_entry(self) -> None:
+        assert (
+            _classify_fill_scenario(
+                signal_direction="long",
+                order_direction="buy",
+                prior_position_quantity=0,
+                fill_quantity=1,
+            )
+            == "ENTRY"
+        )
+
+    def test_first_fill_short_sell_is_entry(self) -> None:
+        assert (
+            _classify_fill_scenario(
+                signal_direction="short",
+                order_direction="sell",
+                prior_position_quantity=0,
+                fill_quantity=1,
+            )
+            == "ENTRY"
+        )
+
+    def test_same_direction_long_add_is_entry(self) -> None:
+        assert (
+            _classify_fill_scenario(
+                signal_direction="long",
+                order_direction="buy",
+                prior_position_quantity=2,
+                fill_quantity=3,
+            )
+            == "ENTRY"
+        )
+
+    def test_same_direction_short_add_is_entry(self) -> None:
+        assert (
+            _classify_fill_scenario(
+                signal_direction="short",
+                order_direction="sell",
+                prior_position_quantity=-2,
+                fill_quantity=3,
+            )
+            == "ENTRY"
+        )
+
+    def test_full_close_long_via_sell_is_exit_full_close(self) -> None:
+        """+5 long, sell 5 → EXIT_FULL_CLOSE."""
+        assert (
+            _classify_fill_scenario(
+                signal_direction="long",  # entry's direction (stop reuses signal_id)
+                order_direction="sell",
+                prior_position_quantity=5,
+                fill_quantity=5,
+            )
+            == "EXIT_FULL_CLOSE"
+        )
+
+    def test_full_close_short_via_buy_is_exit_full_close(self) -> None:
+        """-3 short, buy 3 → EXIT_FULL_CLOSE."""
+        assert (
+            _classify_fill_scenario(
+                signal_direction="short",
+                order_direction="buy",
+                prior_position_quantity=-3,
+                fill_quantity=3,
+            )
+            == "EXIT_FULL_CLOSE"
+        )
+
+    def test_partial_close_long_raises_exit_partial(self) -> None:
+        """+5 long, sell 3 → EXIT_PARTIAL (deferred)."""
+        with pytest.raises(UnsupportedFillScenarioError) as exc_info:
+            _classify_fill_scenario(
+                signal_direction="long",
+                order_direction="sell",
+                prior_position_quantity=5,
+                fill_quantity=3,
+            )
+        assert "Partial exit" in exc_info.value.message
+
+    def test_partial_close_short_raises_exit_partial(self) -> None:
+        """-5 short, buy 2 → EXIT_PARTIAL (deferred)."""
+        with pytest.raises(UnsupportedFillScenarioError) as exc_info:
+            _classify_fill_scenario(
+                signal_direction="short",
+                order_direction="buy",
+                prior_position_quantity=-5,
+                fill_quantity=2,
+            )
+        assert "Partial exit" in exc_info.value.message
+
+    def test_exit_reversal_long_raises(self) -> None:
+        """+5 long, sell 8 → EXIT_REVERSAL (deferred)."""
+        with pytest.raises(UnsupportedFillScenarioError) as exc_info:
+            _classify_fill_scenario(
+                signal_direction="long",
+                order_direction="sell",
+                prior_position_quantity=5,
+                fill_quantity=8,
+            )
+        assert "reversal" in exc_info.value.message
+
+    def test_exit_reversal_short_raises(self) -> None:
+        """-3 short, buy 5 → EXIT_REVERSAL (deferred)."""
+        with pytest.raises(UnsupportedFillScenarioError) as exc_info:
+            _classify_fill_scenario(
+                signal_direction="short",
+                order_direction="buy",
+                prior_position_quantity=-3,
+                fill_quantity=5,
+            )
+        assert "reversal" in exc_info.value.message
+
+    def test_entry_signal_direction_mismatch_raises(self) -> None:
+        """First-fill, signal=long, order=sell → raises (cross-direction)."""
+        with pytest.raises(UnsupportedFillScenarioError):
+            _classify_fill_scenario(
+                signal_direction="long",
+                order_direction="sell",
+                prior_position_quantity=0,
+                fill_quantity=1,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Pure-policy: exit-close path planner
+# ---------------------------------------------------------------------------
+
+
+def _open_trade_row(
+    *,
+    total_quantity: int = 1,
+    avg_entry_price: str = "85.00",
+    realized_commission_usd: str = "0.50",
+) -> PriorTradeRow:
+    """Helper — construct a PriorTradeRow for the exit-close tests."""
+    return PriorTradeRow(
+        trade_id=UUID("eeeeeeee-eeee-7eee-eeee-eeeeeeeeeeee"),
+        trade_created_at=_ORDER_CREATED,
+        total_quantity=total_quantity,
+        avg_entry_price=Decimal(avg_entry_price),
+        realized_commission_usd=Decimal(realized_commission_usd),
+    )
+
+
+class TestPlanFillApplicationExitClosePath:
+    """Exit-close path tests added 2026-05-17 (PR-G exit-path extension)."""
+
+    def test_long_close_emits_four_audit_events_in_order(self) -> None:
+        prior_pos = PriorPositionRow(position_id=uuid4(), quantity=1, avg_cost=Decimal("85.00"))
+        plan = plan_fill_application(
+            context=_ctx(
+                signal_direction="long",
+                order_direction="sell",
+                target_contracts=1,
+                market="TLT",
+            ),
+            payload=_payload(fill_quantity=1, fill_price="86.50", commission_usd="0.50"),
+            prior_position=prior_pos,
+            prior_trade=_open_trade_row(),
+            prior_balance=_zero_balance(),
+        )
+        types = [e.event_type for e in plan.audit_events]
+        assert types == [
+            AuditEventType.ORDER_FILLED,
+            AuditEventType.POSITION_CLOSED,
+            AuditEventType.BALANCE_SNAPSHOT_RECORDED,
+            AuditEventType.TRADE_CLOSED,
+        ]
+
+    def test_short_close_emits_four_audit_events(self) -> None:
+        prior_pos = PriorPositionRow(position_id=uuid4(), quantity=-1, avg_cost=Decimal("85.00"))
+        plan = plan_fill_application(
+            context=_ctx(
+                signal_direction="short",
+                order_direction="buy",
+                target_contracts=1,
+                market="TLT",
+            ),
+            payload=_payload(fill_quantity=1, fill_price="83.50", commission_usd="0.50"),
+            prior_position=prior_pos,
+            prior_trade=_open_trade_row(),
+            prior_balance=_zero_balance(),
+        )
+        types = [e.event_type for e in plan.audit_events]
+        assert types == [
+            AuditEventType.ORDER_FILLED,
+            AuditEventType.POSITION_CLOSED,
+            AuditEventType.BALANCE_SNAPSHOT_RECORDED,
+            AuditEventType.TRADE_CLOSED,
+        ]
+
+    def test_long_close_realized_pnl_positive_when_exit_above_entry(self) -> None:
+        """1 TLT long, entry 85.00, exit 86.50 → +1.50 gross - 0.50 entry comm
+        - 0.50 exit comm = 0.50 net (signed positive)."""
+        prior_pos = PriorPositionRow(position_id=uuid4(), quantity=1, avg_cost=Decimal("85.00"))
+        plan = plan_fill_application(
+            context=_ctx(
+                signal_direction="long",
+                order_direction="sell",
+                target_contracts=1,
+                market="TLT",
+            ),
+            payload=_payload(fill_quantity=1, fill_price="86.50", commission_usd="0.50"),
+            prior_position=prior_pos,
+            prior_trade=_open_trade_row(
+                total_quantity=1,
+                avg_entry_price="85.00",
+                realized_commission_usd="0.50",
+            ),
+            prior_balance=_zero_balance(),
+        )
+        # gross = (86.50 - 85.00) * 1 = 1.50
+        # total_commission = 0.50 (entry) + 0.50 (exit) = 1.00
+        # pnl = 1.50 - 1.00 = 0.50
+        assert plan.trade_mutation.realized_pnl_usd == Decimal("0.5000")
+        # Audit event mirrors the same number.
+        trade_event = plan.audit_events[3]
+        assert trade_event.payload["realized_pnl_usd"] == "0.5000"
+        assert trade_event.payload["gross_pnl_usd"] == "1.5000"
+
+    def test_long_close_realized_pnl_negative_when_exit_below_entry(self) -> None:
+        """1 TLT long, entry 85.00, exit 82.00 → -3.00 gross - 1.00 commission
+        = -4.00 net."""
+        prior_pos = PriorPositionRow(position_id=uuid4(), quantity=1, avg_cost=Decimal("85.00"))
+        plan = plan_fill_application(
+            context=_ctx(
+                signal_direction="long",
+                order_direction="sell",
+                target_contracts=1,
+                market="TLT",
+            ),
+            payload=_payload(fill_quantity=1, fill_price="82.00", commission_usd="0.50"),
+            prior_position=prior_pos,
+            prior_trade=_open_trade_row(
+                total_quantity=1,
+                avg_entry_price="85.00",
+                realized_commission_usd="0.50",
+            ),
+            prior_balance=_zero_balance(),
+        )
+        assert plan.trade_mutation.realized_pnl_usd == Decimal("-4.0000")
+
+    def test_short_close_realized_pnl_positive_when_exit_below_entry(self) -> None:
+        """1 TLT short, entry 85.00, exit 82.00 → +3.00 gross - 1.00 commission
+        = +2.00 net."""
+        prior_pos = PriorPositionRow(position_id=uuid4(), quantity=-1, avg_cost=Decimal("85.00"))
+        plan = plan_fill_application(
+            context=_ctx(
+                signal_direction="short",
+                order_direction="buy",
+                target_contracts=1,
+                market="TLT",
+            ),
+            payload=_payload(fill_quantity=1, fill_price="82.00", commission_usd="0.50"),
+            prior_position=prior_pos,
+            prior_trade=_open_trade_row(
+                total_quantity=1,
+                avg_entry_price="85.00",
+                realized_commission_usd="0.50",
+            ),
+            prior_balance=_zero_balance(),
+        )
+        assert plan.trade_mutation.realized_pnl_usd == Decimal("2.0000")
+
+    def test_short_close_realized_pnl_negative_when_exit_above_entry(self) -> None:
+        """1 TLT short, entry 85.00, exit 87.00 → -2.00 gross - 1.00 commission
+        = -3.00 net."""
+        prior_pos = PriorPositionRow(position_id=uuid4(), quantity=-1, avg_cost=Decimal("85.00"))
+        plan = plan_fill_application(
+            context=_ctx(
+                signal_direction="short",
+                order_direction="buy",
+                target_contracts=1,
+                market="TLT",
+            ),
+            payload=_payload(fill_quantity=1, fill_price="87.00", commission_usd="0.50"),
+            prior_position=prior_pos,
+            prior_trade=_open_trade_row(
+                total_quantity=1,
+                avg_entry_price="85.00",
+                realized_commission_usd="0.50",
+            ),
+            prior_balance=_zero_balance(),
+        )
+        assert plan.trade_mutation.realized_pnl_usd == Decimal("-3.0000")
+
+    def test_position_mutation_close_carries_prior_position_id(self) -> None:
+        pid = uuid4()
+        prior_pos = PriorPositionRow(position_id=pid, quantity=1, avg_cost=Decimal("85.00"))
+        plan = plan_fill_application(
+            context=_ctx(
+                signal_direction="long",
+                order_direction="sell",
+                target_contracts=1,
+                market="TLT",
+            ),
+            payload=_payload(fill_quantity=1, fill_price="86.50"),
+            prior_position=prior_pos,
+            prior_trade=_open_trade_row(),
+            prior_balance=_zero_balance(),
+        )
+        assert plan.position_mutation.action == "close"
+        assert plan.position_mutation.position_id == pid
+
+    def test_trade_mutation_close_carries_exit_fields(self) -> None:
+        prior_pos = PriorPositionRow(position_id=uuid4(), quantity=1, avg_cost=Decimal("85.00"))
+        prior_trade = _open_trade_row()
+        plan = plan_fill_application(
+            context=_ctx(
+                signal_direction="long",
+                order_direction="sell",
+                target_contracts=1,
+                market="TLT",
+            ),
+            payload=_payload(fill_quantity=1, fill_price="86.50", commission_usd="0.50"),
+            prior_position=prior_pos,
+            prior_trade=prior_trade,
+            prior_balance=_zero_balance(),
+        )
+        tm = plan.trade_mutation
+        assert tm.action == "close"
+        assert tm.trade_id == prior_trade.trade_id
+        assert tm.trade_created_at == prior_trade.trade_created_at
+        assert tm.closed_at_utc == datetime(2026, 5, 13, 12, 30, 0, tzinfo=UTC)
+        assert tm.exit_order_id == _ORDER_ID
+        assert tm.avg_exit_price == Decimal("86.50")
+        assert tm.realized_pnl_usd is not None
+
+    def test_long_close_cash_increases_by_notional_minus_commission(self) -> None:
+        """Sell 1 TLT @ 86.50, commission 0.50 → cash += 86.50 - 0.50 = 86.00."""
+        prior_pos = PriorPositionRow(position_id=uuid4(), quantity=1, avg_cost=Decimal("85.00"))
+        prior_balance = PriorBalanceSnapshot(
+            cash_usd=Decimal("100000"), net_liquidation=Decimal("100085")
+        )
+        plan = plan_fill_application(
+            context=_ctx(
+                signal_direction="long",
+                order_direction="sell",
+                target_contracts=1,
+                market="TLT",
+            ),
+            payload=_payload(fill_quantity=1, fill_price="86.50", commission_usd="0.50"),
+            prior_position=prior_pos,
+            prior_trade=_open_trade_row(),
+            prior_balance=prior_balance,
+        )
+        assert plan.balance_insert.cash_usd == Decimal("100086.0000")
+        # Post-close NLV equals cash (position MTM is 0).
+        assert plan.balance_insert.net_liquidation == Decimal("100086.0000")
+
+    def test_short_close_cash_decreases_by_notional_plus_commission(self) -> None:
+        """Buy back 1 TLT @ 83.50, commission 0.50 → cash -= 83.50 + 0.50 = 84.00."""
+        prior_pos = PriorPositionRow(position_id=uuid4(), quantity=-1, avg_cost=Decimal("85.00"))
+        prior_balance = PriorBalanceSnapshot(
+            cash_usd=Decimal("100085"), net_liquidation=Decimal("100000")
+        )
+        plan = plan_fill_application(
+            context=_ctx(
+                signal_direction="short",
+                order_direction="buy",
+                target_contracts=1,
+                market="TLT",
+            ),
+            payload=_payload(fill_quantity=1, fill_price="83.50", commission_usd="0.50"),
+            prior_position=prior_pos,
+            prior_trade=_open_trade_row(),
+            prior_balance=prior_balance,
+        )
+        assert plan.balance_insert.cash_usd == Decimal("100001.0000")
+
+    def test_close_balance_audit_post_fill_mtm_is_zero(self) -> None:
+        prior_pos = PriorPositionRow(position_id=uuid4(), quantity=1, avg_cost=Decimal("85.00"))
+        plan = plan_fill_application(
+            context=_ctx(
+                signal_direction="long",
+                order_direction="sell",
+                target_contracts=1,
+                market="TLT",
+            ),
+            payload=_payload(fill_quantity=1, fill_price="86.50"),
+            prior_position=prior_pos,
+            prior_trade=_open_trade_row(),
+            prior_balance=_zero_balance(),
+        )
+        bal_event = plan.audit_events[2]
+        assert bal_event.payload["post_fill_position_mtm_usd"] == "0"
+
+    def test_position_closed_audit_payload_shape(self) -> None:
+        prior_pos = PriorPositionRow(position_id=uuid4(), quantity=1, avg_cost=Decimal("85.00"))
+        prior_trade = _open_trade_row()
+        plan = plan_fill_application(
+            context=_ctx(
+                signal_direction="long",
+                order_direction="sell",
+                target_contracts=1,
+                market="TLT",
+            ),
+            payload=_payload(fill_quantity=1, fill_price="86.50"),
+            prior_position=prior_pos,
+            prior_trade=prior_trade,
+            prior_balance=_zero_balance(),
+        )
+        pos_event = plan.audit_events[1]
+        assert pos_event.event_type == AuditEventType.POSITION_CLOSED
+        assert pos_event.payload["prior_quantity"] == 1
+        assert pos_event.payload["fill_quantity_signed"] == -1
+        assert pos_event.payload["new_quantity"] == 0
+        assert pos_event.payload["trade_id"] == str(prior_trade.trade_id)
+        assert pos_event.payload["market"] == "TLT"
+
+    def test_trade_closed_audit_payload_shape(self) -> None:
+        prior_pos = PriorPositionRow(position_id=uuid4(), quantity=1, avg_cost=Decimal("85.00"))
+        prior_trade = _open_trade_row(
+            total_quantity=1,
+            avg_entry_price="85.00",
+            realized_commission_usd="0.50",
+        )
+        plan = plan_fill_application(
+            context=_ctx(
+                signal_direction="long",
+                order_direction="sell",
+                target_contracts=1,
+                market="TLT",
+            ),
+            payload=_payload(fill_quantity=1, fill_price="86.50", commission_usd="0.50"),
+            prior_position=prior_pos,
+            prior_trade=prior_trade,
+            prior_balance=_zero_balance(),
+        )
+        trade_event = plan.audit_events[3]
+        assert trade_event.event_type == AuditEventType.TRADE_CLOSED
+        assert trade_event.payload["trade_id"] == str(prior_trade.trade_id)
+        assert trade_event.payload["exit_order_id"] == str(_ORDER_ID)
+        assert trade_event.payload["direction"] == "long"
+        assert trade_event.payload["total_quantity"] == 1
+        assert trade_event.payload["avg_entry_price"] == "85.00"
+        assert trade_event.payload["avg_exit_price"] == "86.50"
+        # gross_pnl = 1.50; total_commission = 1.00; realized_pnl = 0.50
+        assert trade_event.payload["realized_commission_usd"] == "1.0000"
+        assert trade_event.payload["realized_pnl_usd"] == "0.5000"
+        # All money fields are Decimal-as-string [A05].
+        assert all(
+            isinstance(trade_event.payload[k], str)
+            for k in (
+                "avg_entry_price",
+                "avg_exit_price",
+                "gross_pnl_usd",
+                "realized_commission_usd",
+                "realized_pnl_usd",
+            )
+        )
+
+    def test_order_filled_audit_payload_carries_scenario_tag(self) -> None:
+        prior_pos = PriorPositionRow(position_id=uuid4(), quantity=1, avg_cost=Decimal("85.00"))
+        plan = plan_fill_application(
+            context=_ctx(
+                signal_direction="long",
+                order_direction="sell",
+                target_contracts=1,
+                market="TLT",
+            ),
+            payload=_payload(fill_quantity=1, fill_price="86.50"),
+            prior_position=prior_pos,
+            prior_trade=_open_trade_row(),
+            prior_balance=_zero_balance(),
+        )
+        order_event = plan.audit_events[0]
+        assert order_event.payload["scenario"] == "EXIT_FULL_CLOSE"
+
+    def test_exit_with_no_prior_trade_raises_invariant(self) -> None:
+        """The classifier returns EXIT_FULL_CLOSE but the trade lookup
+        returned None — should raise EXIT_NO_PRIOR_TRADE."""
+        prior_pos = PriorPositionRow(position_id=uuid4(), quantity=1, avg_cost=Decimal("85.00"))
+        with pytest.raises(FillProcessingError) as exc_info:
+            plan_fill_application(
+                context=_ctx(
+                    signal_direction="long",
+                    order_direction="sell",
+                    target_contracts=1,
+                    market="TLT",
+                ),
+                payload=_payload(fill_quantity=1, fill_price="86.50"),
+                prior_position=prior_pos,
+                prior_trade=None,
+                prior_balance=_zero_balance(),
+            )
+        assert exc_info.value.error_code == "EXIT_NO_PRIOR_TRADE"
+
+    def test_trade_qty_mismatch_raises(self) -> None:
+        """Trade total_quantity != position quantity → defensive raise."""
+        prior_pos = PriorPositionRow(position_id=uuid4(), quantity=1, avg_cost=Decimal("85.00"))
+        prior_trade = _open_trade_row(total_quantity=3, avg_entry_price="85.00")
+        with pytest.raises(FillProcessingError) as exc_info:
+            plan_fill_application(
+                context=_ctx(
+                    signal_direction="long",
+                    order_direction="sell",
+                    target_contracts=1,
+                    market="TLT",
+                ),
+                payload=_payload(fill_quantity=1, fill_price="86.50"),
+                prior_position=prior_pos,
+                prior_trade=prior_trade,
+                prior_balance=_zero_balance(),
+            )
+        assert exc_info.value.error_code == "EXIT_CLOSE_TRADE_QTY_MISMATCH"
+
+    def test_realized_pnl_quantized_to_four_decimals(self) -> None:
+        """1/3 of a cent precision rounds half-even."""
+        prior_pos = PriorPositionRow(position_id=uuid4(), quantity=3, avg_cost=Decimal("100.00"))
+        prior_trade = _open_trade_row(
+            total_quantity=3,
+            avg_entry_price="100.00",
+            realized_commission_usd="0",
+        )
+        plan = plan_fill_application(
+            context=_ctx(
+                signal_direction="long",
+                order_direction="sell",
+                target_contracts=3,
+                market="TLT",
+            ),
+            payload=_payload(
+                fill_quantity=3,
+                cumulative_filled_quantity=3,
+                fill_price="100.00033333",
+                commission_usd="0",
+            ),
+            prior_position=prior_pos,
+            prior_trade=prior_trade,
+            prior_balance=_zero_balance(),
+        )
+        # (100.00033333 - 100.00) * 3 = 0.00099999
+        # Quantize to 4dp half-even: 0.0010 (since 99999 → ...9... rounds up)
+        assert plan.trade_mutation.realized_pnl_usd == Decimal("0.0010")
+
+
+# ---------------------------------------------------------------------------
+# Mocked I/O: apply close action
+# ---------------------------------------------------------------------------
+
+
+def _build_close_plan() -> FillApplyPlan:
+    """Build a minimal valid FillApplyPlan for the close action."""
+    trade_id = uuid4()
+    audit_events = (
+        PendingAuditEvent(event_type=AuditEventType.ORDER_FILLED, payload={"k": "v"}),
+        PendingAuditEvent(event_type=AuditEventType.POSITION_CLOSED, payload={"k": "v"}),
+        PendingAuditEvent(event_type=AuditEventType.BALANCE_SNAPSHOT_RECORDED, payload={"k": "v"}),
+        PendingAuditEvent(event_type=AuditEventType.TRADE_CLOSED, payload={"k": "v"}),
+    )
+    return FillApplyPlan(
+        audit_events=audit_events,
+        order_change=OrderStatusChange(
+            order_id=_ORDER_ID,
+            order_created_at=_ORDER_CREATED,
+            new_status="filled",
+        ),
+        fill_insert=FillInsert_for_test(),
+        position_mutation=PositionMutation(
+            action="close",
+            position_id=uuid4(),
+            account_id=_ACCOUNT_ID,
+            market="TLT",
+            contract_id=None,
+            new_quantity=0,
+            new_avg_cost=Decimal("85.00000000"),
+            last_mark_ts=datetime(2026, 5, 13, 12, 30, 0, tzinfo=UTC),
+            managed_by_version="a" * 40,
+        ),
+        balance_insert=BalanceInsert(
+            account_id=_ACCOUNT_ID,
+            snapshot_ts=datetime(2026, 5, 13, 12, 30, 0, tzinfo=UTC),
+            net_liquidation=Decimal("100086.0000"),
+            cash_usd=Decimal("100086.0000"),
+            excess_liquidity=Decimal("100086.0000"),
+            used_margin_pct=Decimal("0"),
+            source=BALANCE_SOURCE_FROM_FILL,
+        ),
+        trade_mutation=TradeMutation(
+            action="close",
+            trade_id=trade_id,
+            trade_created_at=_ORDER_CREATED,
+            account_id=_ACCOUNT_ID,
+            env="paper",
+            market="TLT",
+            contract_id=None,
+            entry_signal_id=_SIGNAL_ID,
+            entry_order_id=_ORDER_ID,
+            direction="long",
+            opened_at_utc=_ORDER_CREATED,
+            new_total_quantity=1,
+            new_avg_entry_price=Decimal("85.00000000"),
+            realized_commission_usd=Decimal("0.50"),
+            managed_by_version="a" * 40,
+            strategy_hash="a" * 40,
+            parameter_set_hash="b" * 64,
+            slippage_calibration_version_id=_SLIP_ID,
+            closed_at_utc=datetime(2026, 5, 13, 12, 30, 0, tzinfo=UTC),
+            exit_order_id=_ORDER_ID,
+            avg_exit_price=Decimal("86.50"),
+            realized_pnl_usd=Decimal("0.5000"),
+        ),
+    )
+
+
+class TestApplyFillPlanCloseAction:
+    """Mocked-I/O tests for the close-action apply path."""
+
+    @pytest.mark.asyncio
+    async def test_close_apply_returns_trade_and_position_ids(self) -> None:
+        plan = _build_close_plan()
+        session_factory = _build_mock_session_factory()
+        with patch(
+            "services.risk.fill_processor.append_audit_event",
+            new=AsyncMock(side_effect=lambda *a, **k: _audit_record_mock()),
+        ):
+            result = await apply_fill_plan(
+                plan,
+                session_factory=session_factory,
+                account_id=_ACCOUNT_ID,
+                env="paper",
+            )
+        assert isinstance(result, FillApplyResult)
+        assert result.position_id == plan.position_mutation.position_id
+        assert result.trade_id == plan.trade_mutation.trade_id
+        assert result.signal_id == _SIGNAL_ID
+        assert len(result.audit_event_uuids) == 4
+
+    @pytest.mark.asyncio
+    async def test_close_apply_issues_delete_position_sql(self) -> None:
+        """Capture session.execute calls and verify a DELETE FROM
+        positions_current statement was issued."""
+        plan = _build_close_plan()
+        captured_sql: list[str] = []
+
+        session_factory = MagicMock()
+
+        def _make_session() -> MagicMock:
+            sess = MagicMock()
+
+            async def _exec(stmt: Any, params: Any = None) -> MagicMock:
+                captured_sql.append(str(stmt))
+                result_mock = MagicMock()
+                result_mock.fetchone = MagicMock(return_value=MagicMock(id=uuid4()))
+                return result_mock
+
+            sess.execute = AsyncMock(side_effect=_exec)
+
+            @asynccontextmanager
+            async def _begin_cm() -> Any:
+                yield None
+
+            sess.begin = MagicMock(return_value=_begin_cm())
+            return sess
+
+        @asynccontextmanager
+        async def _factory_cm() -> Any:
+            yield _make_session()
+
+        session_factory.side_effect = lambda: _factory_cm()
+
+        with patch(
+            "services.risk.fill_processor.append_audit_event",
+            new=AsyncMock(side_effect=lambda *a, **k: _audit_record_mock()),
+        ):
+            await apply_fill_plan(
+                plan,
+                session_factory=session_factory,
+                account_id=_ACCOUNT_ID,
+                env="paper",
+            )
+        # The position close branch issues DELETE FROM positions_current.
+        joined = " | ".join(captured_sql)
+        assert "DELETE FROM positions_current" in joined
+        # The trade close branch issues UPDATE trades SET state = 'closed'.
+        assert "UPDATE trades" in joined
+        assert "state = 'closed'" in joined
+        # realized_pnl_usd UPDATE is part of the trade UPDATE.
+        assert "realized_pnl_usd" in joined
+
+
+# ---------------------------------------------------------------------------
 # Module contract
 # ---------------------------------------------------------------------------
 
@@ -892,6 +1588,7 @@ class TestModuleContract:
             "FillIngestPayload",
             "FillInsert",
             "FillProcessingError",
+            "FillScenario",
             "OrderStatusChange",
             "PendingAuditEvent",
             "PositionAction",
