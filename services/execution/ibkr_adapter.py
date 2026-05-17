@@ -289,9 +289,97 @@ class IbAsyncIbkrClient:
         submitted_at = _ts_utc()
         try:
             # Translate request → ib_async Contract + Order
-            from ib_async import LimitOrder, MarketOrder, StopOrder
+            from ib_async import Future, LimitOrder, MarketOrder, StopOrder
 
             ib_contract = self._build_ib_contract(request.contract)
+
+            # Qualify the contract BEFORE placeOrder. For futures, this
+            # resolves the continuous-month symbol (ContFuture) to a
+            # concrete Future with `lastTradeDateOrContractMonth` +
+            # `conId` populated. IBKR rejects continuous futures with
+            # error 321 ("Please enter a local symbol or an expiry");
+            # we resolve to the front month here so the broker-side
+            # validator sees a specific contract.
+            #
+            # For Stock (ETFs), qualify is a no-op aside from populating
+            # `conId` — Stock contracts route fine without qualify in
+            # practice, but the call costs ~1 round-trip and ensures
+            # `conId` is set on the contract we hand to placeOrder.
+            try:
+                qualified = await ib.qualifyContractsAsync(ib_contract)
+            except Exception as exc:
+                raise IbkrPlacementError(
+                    operation="qualifyContractsAsync",
+                    detail=(
+                        f"contract qualification failed for {request.contract.market!r}: {exc!r}"
+                    ),
+                    underlying_exception_class=type(exc).__name__,
+                    occurred_at_utc=submitted_at,
+                ) from exc
+            if not qualified:
+                raise IbkrPlacementError(
+                    operation="qualifyContractsAsync",
+                    detail=(
+                        f"contract qualification returned no matches for "
+                        f"{request.contract.market!r}; check that the symbol "
+                        "is in the Phase 1 universe + IBKR exchange access "
+                        "is configured for the account"
+                    ),
+                    underlying_exception_class="EmptyQualificationResult",
+                    occurred_at_utc=submitted_at,
+                )
+
+            # For ContFuture, ib_async returns the front-month Future on
+            # qualify (secType=FUT, with lastTradeDateOrContractMonth +
+            # conId populated). The qualified[0] object is the
+            # tradeable Future contract — use it directly for placeOrder.
+            # For Stock, qualified[0] is the same Stock object with
+            # `conId` filled in.
+            #
+            # Defense-in-depth: if the qualified contract is still a
+            # ContFuture (some ib_async versions return ContFuture
+            # unchanged with metadata populated), explicitly construct a
+            # new Future. IBKR's placeOrder rejects secType='CONTFUT'.
+            #
+            # mypy: ib_async's qualifyContractsAsync return type is
+            # `Contract | list[Contract | None] | None`. We've already
+            # verified the list is non-empty above. Use Any-typing on
+            # the local binding to avoid attribute-access errors on the
+            # union types; the runtime contract is "first element is a
+            # qualified Contract subclass with all metadata populated."
+            qualified_contract: Any = qualified[0]
+            if qualified_contract is None:
+                raise IbkrPlacementError(
+                    operation="qualifyContractsAsync",
+                    detail=(
+                        f"qualifyContractsAsync returned [None] for "
+                        f"{request.contract.market!r}; ib_async signals an "
+                        "un-resolvable contract this way (usually missing "
+                        "exchange access on the account)"
+                    ),
+                    underlying_exception_class="NoneQualificationElement",
+                    occurred_at_utc=submitted_at,
+                )
+            if qualified_contract.__class__.__name__ == "ContFuture":
+                ib_contract = Future(
+                    symbol=qualified_contract.symbol,
+                    lastTradeDateOrContractMonth=qualified_contract.lastTradeDateOrContractMonth,
+                    exchange=qualified_contract.exchange,
+                    currency=qualified_contract.currency,
+                    conId=qualified_contract.conId,
+                )
+            else:
+                ib_contract = qualified_contract
+
+            log.info(
+                "ibkr_contract_qualified",
+                market=request.contract.market,
+                resolved_local_symbol=getattr(ib_contract, "localSymbol", None),
+                resolved_expiry=getattr(ib_contract, "lastTradeDateOrContractMonth", None),
+                resolved_conid=getattr(ib_contract, "conId", None),
+                sec_type=getattr(ib_contract, "secType", None),
+            )
+
             ib_order: Any
             if request.order_type == "limit_marketable":
                 if request.limit_price is None:
@@ -345,7 +433,6 @@ class IbAsyncIbkrClient:
             # Note: a fully-async dispatcher (Pivot-PR-D) subscribes to the
             # Trade.statusEvent for ongoing updates; this method's contract
             # is "submit + report initial status".
-            await ib.qualifyContractsAsync(ib_contract)  # ensures conId
             broker_order_id = trade.order.orderId
             status_raw = getattr(trade.orderStatus, "status", "PendingSubmit")
             status = _IBKR_STATUS_MAP.get(status_raw, "pending_submit")
@@ -721,16 +808,36 @@ class IbAsyncIbkrClient:
     def _build_ib_contract(self, ref: IbkrContractRef) -> Any:
         """Build an ib_async Contract from our typed IbkrContractRef.
 
-        Lazy-imports ib_async.Future + ib_async.Stock so the module can be
-        imported without the library installed. Returns ``Any`` because the
-        ib_async type stubs aren't published (see pyproject.toml mypy
-        override).
+        Lazy-imports ib_async.{ContFuture, Stock} so the module can be
+        imported without the library installed. Returns ``Any`` because
+        the ib_async type stubs aren't published (see pyproject.toml
+        mypy override).
+
+        **Futures: ContFuture, not Future** — pre-2026-05-16 this
+        function returned a naked ``Future(symbol='MNQ', exchange='CME',
+        currency='USD')`` with no ``lastTradeDateOrContractMonth``.
+        IBKR rejected those orders at submit time with error 321
+        ("Please enter a local symbol or an expiry") because every
+        futures order must specify a specific contract month and the
+        Phase 1 universe symbols (``/MES``, ``/MNQ``, etc.) are
+        continuous-month references.
+
+        ``ContFuture`` is ib_async's continuous-front-month wrapper.
+        :meth:`IB.qualifyContractsAsync` resolves it to a concrete
+        :class:`Future` with the front-month ``lastTradeDateOrContractMonth``
+        + ``conId`` populated. ``place_order`` then converts the
+        qualified ContFuture into a fresh Future (ib_async sometimes
+        returns ContFuture with secType still set to ``CONTFUT``, which
+        IBKR's ``placeOrder`` rejects; the explicit Future conversion
+        side-steps that edge case).
+
+        ETFs unchanged — ``Stock(symbol=..., exchange='SMART',
+        currency='USD')`` routes correctly without expiry resolution.
         """
-        from ib_async import Future, Stock
+        from ib_async import ContFuture, Stock
 
         if ref.market.startswith("/"):
-            # Futures: use the front-month continuous contract
-            return Future(
+            return ContFuture(
                 symbol=ref.market.lstrip("/"),
                 exchange=ref.exchange,
                 currency="USD",
