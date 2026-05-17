@@ -135,6 +135,11 @@ class AlertCategory(StrEnum):
     INCIDENT_REVIEW_REQUIRED = "incident_review_required"
     PHASE_CUTOVER_STARTED = "phase_cutover_started"
     MAINTENANCE_WINDOW = "maintenance_window"
+    # PR #154 follow-up (2026-05-16): heartbeat-staleness alerts from
+    # ``services.api.heartbeat_probe``. P2-only routing today
+    # (#alerts channel only); P0/P1 escalation tied to specific stuck
+    # services is a future enhancement.
+    HEARTBEAT_STALE = "heartbeat_stale"
 
 
 class ChannelName(StrEnum):

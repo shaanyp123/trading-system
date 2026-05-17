@@ -898,8 +898,9 @@ class TestAlertCategoryEnumMirror:
     """
 
     def test_alert_category_count_matches_spec(self) -> None:
-        # alembic 0004:311-341 lists 29 values; spec §3.27 lists the same.
-        assert len(list(AlertCategory)) == 29
+        # alembic 0004:311-341 lists 29 values; 2026-05-17_heartbeat_stale_category
+        # migration adds 1 more (`heartbeat_stale` for the staleness probe).
+        assert len(list(AlertCategory)) == 30
 
     def test_canonical_values_present(self) -> None:
         # Sentinel check; full set in alembic 0004 + spec §3.27.

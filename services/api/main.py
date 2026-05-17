@@ -683,6 +683,79 @@ async def _stop_order_placement_worker(state: tuple[object, object] | None) -> N
             log.exception("order_placement_worker_ibkr_disconnect_failed")
 
 
+async def _start_heartbeat_probe(
+    settings: APISettings,
+) -> tuple[object, object] | None:
+    """Spawn the heartbeat staleness probe; return (probe, task) or None.
+
+    PR #154 follow-up (2026-05-16). Ticks every 15 min, snapshots the
+    in-memory ``HeartbeatRegistry``, and emits
+    ``HEARTBEAT_STALE_DETECTED`` audit rows + P2 Discord alerts for each
+    cron-like service past its locked threshold.
+
+    Best-effort: requires an active accounts row (so the audit row has a
+    valid account_id FK). When the row is missing — typical Phase 0
+    pre-setup state — the probe doesn't start + a structured warning is
+    logged. The api continues without it.
+
+    Shares the same ``alert_dispatch_hook`` closure the reconciliation
+    scheduler uses — when sops Discord URLs aren't populated, the hook
+    is None and the probe still writes audit rows but skips the alert
+    dispatch (the audit chain is the durable breadcrumb).
+    """
+    from services.api.heartbeat_probe import HeartbeatProbe
+
+    async with session_scope() as repo_session:
+        repo = PostgresPhase1QueryRepo(repo_session)
+        account_id = await repo.fetch_active_account_id()
+    if account_id is None:
+        log.warning(
+            "heartbeat_probe_no_active_account",
+            note="run /setup before the staleness probe can resolve an account_id",
+        )
+        return None
+
+    alert_dispatch_hook = _build_alert_dispatch_hook(settings)
+    probe = HeartbeatProbe(
+        session_factory=api_db.get_session_factory(),
+        account_id=account_id,
+        env=_audit_env_from_settings(settings),
+        alert_dispatch_hook=alert_dispatch_hook,  # type: ignore[arg-type]
+    )
+    task = asyncio.create_task(probe.run_forever(), name="heartbeat_probe.run_forever")
+    log.info(
+        "heartbeat_probe_spawned",
+        account_id=str(account_id),
+        env=_audit_env_from_settings(settings),
+        alert_dispatch_hook_wired=alert_dispatch_hook is not None,
+    )
+    return probe, task
+
+
+async def _stop_heartbeat_probe(state: tuple[object, object] | None) -> None:
+    """Request stop + await the probe task. Best-effort."""
+    if state is None:
+        return
+    probe, task = state
+    try:
+        probe.request_stop()  # type: ignore[attr-defined]
+    except Exception:
+        log.exception("heartbeat_probe_request_stop_failed")
+    try:
+        await asyncio.wait_for(task, timeout=15.0)  # type: ignore[arg-type]
+    except TimeoutError:
+        log.warning("heartbeat_probe_shutdown_timeout")
+        task.cancel()  # type: ignore[attr-defined]
+        try:
+            await task  # type: ignore[misc]
+        except asyncio.CancelledError:
+            log.info("heartbeat_probe_shutdown_cancelled")
+        except Exception:
+            log.exception("heartbeat_probe_shutdown_unclean")
+    except Exception:
+        log.exception("heartbeat_probe_task_join_failed")
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     settings = get_settings()
@@ -697,6 +770,7 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     sse_multiplexer.start_heartbeat()
     worker_state: tuple[object, object] | None = None
     recon_state: tuple[object, object] | None = None
+    heartbeat_probe_state: tuple[object, object] | None = None
     try:
         try:
             await _bootstrap_owner_token()
@@ -721,10 +795,18 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             # sops fields, no active account) which we already log at
             # WARNING from inside _start_reconciliation_scheduler.
             log.exception("reconciliation_scheduler_startup_failed")
+        try:
+            heartbeat_probe_state = await _start_heartbeat_probe(settings)
+        except Exception:
+            # Probe startup is best-effort; same rationale as the recon
+            # scheduler. The /api/system/heartbeats endpoint still works
+            # without the probe running.
+            log.exception("heartbeat_probe_startup_failed")
         log.info("api_ready")
         yield
     finally:
         log.info("api_stopping")
+        await _stop_heartbeat_probe(heartbeat_probe_state)
         await _stop_reconciliation_scheduler(recon_state)
         await _stop_order_placement_worker(worker_state)
         await sse_multiplexer.stop_heartbeat()

@@ -173,6 +173,13 @@ class AuditEventType(StrEnum):
     INCIDENT_REVIEW_LOGGED = "incident_review_logged"
     AUDIT_CHAIN_INTEGRITY_VERIFIED = "audit_chain_integrity_verified"
     AUDIT_REPAIR_APPLIED = "audit_repair_applied"
+    # PR #154 follow-up (2026-05-16): emitted by the heartbeat staleness
+    # probe (services/api/heartbeat_probe.py) when a tracked cron-like
+    # service hasn't recorded a heartbeat within its locked threshold
+    # (HEARTBEAT_STALE_THRESHOLDS_S in services/api/heartbeats.py).
+    # Single durable breadcrumb per stale-detection cycle; dedup +
+    # cooldown live on the probe side.
+    HEARTBEAT_STALE_DETECTED = "heartbeat_stale_detected"
 
 
 __all__ = ["AuditEventType"]
