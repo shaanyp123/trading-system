@@ -756,6 +756,67 @@ async def _stop_heartbeat_probe(state: tuple[object, object] | None) -> None:
         log.exception("heartbeat_probe_task_join_failed")
 
 
+async def _start_async_task_monitor(
+    settings: APISettings,
+    *,
+    order_placement: tuple[object, object] | None,
+    reconciliation: tuple[object, object] | None,
+    heartbeat_probe: tuple[object, object] | None,
+) -> tuple[object, object] | None:
+    """Construct + start the AsyncTaskMonitor; return (monitor, task) or None.
+
+    2026-05-17 follow-up to the silent-worker-death pattern. The 3
+    lifespan background tasks (worker, scheduler, probe) silently die
+    when they hit an uncaught BaseException OR hang indefinitely on an
+    unresponsive IBKR await. Without an observer, dead tasks are
+    invisible. The monitor ticks every
+    ``async_task_monitor_interval_seconds`` and logs
+    ``async_task_died`` events when a tracked task transitions to
+    ``.done()`` unexpectedly.
+
+    Best-effort: the monitor is a debugging aid, not load-bearing. If
+    construction fails the api still serves traffic.
+    """
+    if not settings.async_task_monitor_enabled:
+        log.info("async_task_monitor_disabled_via_setting")
+        return None
+    from services.api.async_task_monitor import (
+        AsyncTaskMonitor,
+        collect_tracked_tasks,
+    )
+
+    tracked = collect_tracked_tasks(
+        order_placement=order_placement,
+        reconciliation=reconciliation,
+        heartbeat_probe=heartbeat_probe,
+    )
+    monitor = AsyncTaskMonitor(
+        tracked,
+        interval_seconds=settings.async_task_monitor_interval_seconds,
+    )
+    task = asyncio.create_task(
+        monitor.run_forever(),
+        name="async_task_monitor.run_forever",
+    )
+    log.info(
+        "async_task_monitor_spawned",
+        interval_seconds=settings.async_task_monitor_interval_seconds,
+        tracked_count=len(tracked),
+    )
+    return monitor, task
+
+
+async def _stop_async_task_monitor(state: tuple[object, object] | None) -> None:
+    """Request stop + await the monitor task; best-effort."""
+    if state is None:
+        return
+    from services.api.async_task_monitor import stop_async_task_monitor
+
+    # The state tuple is (monitor, task); pass through via the typed
+    # helper which handles cancel/timeout/exception swallow.
+    await stop_async_task_monitor(state)  # type: ignore[arg-type]
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     settings = get_settings()
@@ -771,6 +832,7 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     worker_state: tuple[object, object] | None = None
     recon_state: tuple[object, object] | None = None
     heartbeat_probe_state: tuple[object, object] | None = None
+    async_task_monitor_state: tuple[object, object] | None = None
     try:
         try:
             await _bootstrap_owner_token()
@@ -802,10 +864,26 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             # scheduler. The /api/system/heartbeats endpoint still works
             # without the probe running.
             log.exception("heartbeat_probe_startup_failed")
+        try:
+            # The monitor MUST start AFTER the other 3 so it can
+            # capture their final `(worker, task)` tuples (or `None`
+            # for ones that failed to spawn). The monitor itself is
+            # a 4th task and is NOT in its own tracked set.
+            async_task_monitor_state = await _start_async_task_monitor(
+                settings,
+                order_placement=worker_state,
+                reconciliation=recon_state,
+                heartbeat_probe=heartbeat_probe_state,
+            )
+        except Exception:
+            # Monitor startup is best-effort; the api functions without
+            # it (just with less observability into silent task death).
+            log.exception("async_task_monitor_startup_failed")
         log.info("api_ready")
         yield
     finally:
         log.info("api_stopping")
+        await _stop_async_task_monitor(async_task_monitor_state)
         await _stop_heartbeat_probe(heartbeat_probe_state)
         await _stop_reconciliation_scheduler(recon_state)
         await _stop_order_placement_worker(worker_state)

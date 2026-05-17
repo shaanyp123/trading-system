@@ -1,0 +1,476 @@
+"""Unit tests for ``services.api.async_task_monitor``.
+
+The monitor is a lifespan observability surface added 2026-05-17 to
+catch silent worker-task death (an asyncio task that completes
+unexpectedly without anything ``await``ing it, leaving the
+operator with no log line). Pure Python; no testcontainers; A22 N/A.
+
+Test surface:
+
+* ``TestTrackedTask`` — frozen dataclass shape
+* ``TestCollectTrackedTasks`` — builds the canonical tuple from
+  lifespan state, handling None state tuples
+* ``TestAsyncTaskMonitor`` — construction validation +
+  ``probe_once`` correctness across alive / dead / exception /
+  cancelled scenarios
+* ``TestProbeIdempotency`` — repeat probes of the same dead task
+  don't re-log
+* ``TestRunForever`` — main loop ticks at interval; ``request_stop``
+  exits cleanly
+* ``TestStopAsyncTaskMonitor`` — shutdown helper handles timeout +
+  exception paths
+* ``TestModuleContract`` — public ``__all__`` surface
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+
+import pytest
+import structlog
+from structlog.testing import capture_logs
+
+from services.api.async_task_monitor import (
+    DEFAULT_MONITOR_INTERVAL_SECONDS,
+    AsyncTaskMonitor,
+    TrackedTask,
+    collect_tracked_tasks,
+    stop_async_task_monitor,
+)
+
+
+class TestTrackedTask:
+    """Frozen dataclass; name + task + expected_alive."""
+
+    def test_construct_with_task(self) -> None:
+        async def _noop() -> None:
+            return None
+
+        async def _runner() -> tuple[TrackedTask, asyncio.Task[None]]:
+            task = asyncio.create_task(_noop())
+            await task  # complete cleanly so we don't leak
+            tracked = TrackedTask(name="foo", task=task, expected_alive=True)
+            return tracked, task
+
+        tracked, task = asyncio.run(_runner())
+        assert tracked.name == "foo"
+        assert tracked.task is task
+        assert tracked.expected_alive is True
+
+    def test_construct_with_none_task(self) -> None:
+        tracked = TrackedTask(name="bar", task=None, expected_alive=False)
+        assert tracked.name == "bar"
+        assert tracked.task is None
+        assert tracked.expected_alive is False
+
+    def test_frozen(self) -> None:
+        tracked = TrackedTask(name="x", task=None, expected_alive=False)
+        with pytest.raises(Exception):  # FrozenInstanceError is dataclass-internal
+            tracked.name = "y"  # type: ignore[misc]
+
+
+class TestCollectTrackedTasks:
+    """The lifespan-state → TrackedTask shape conversion."""
+
+    def test_all_none(self) -> None:
+        result = collect_tracked_tasks(
+            order_placement=None,
+            reconciliation=None,
+            heartbeat_probe=None,
+        )
+        assert len(result) == 3
+        assert [t.name for t in result] == [
+            "order_placement_worker.run_forever",
+            "reconciliation_scheduler.run_forever",
+            "heartbeat_probe.run_forever",
+        ]
+        assert all(t.task is None for t in result)
+        assert all(t.expected_alive is False for t in result)
+
+    def test_extracts_task_from_tuple(self) -> None:
+        async def _runner() -> tuple[asyncio.Task[None], tuple[TrackedTask, ...]]:
+            async def _noop() -> None:
+                pass
+
+            task = asyncio.create_task(_noop())
+            try:
+                tuples = collect_tracked_tasks(
+                    order_placement=(object(), task),
+                    reconciliation=None,
+                    heartbeat_probe=None,
+                )
+            finally:
+                await task
+            return task, tuples
+
+        task, result = asyncio.run(_runner())
+        assert result[0].task is task
+        assert result[0].expected_alive is True
+        assert result[1].task is None
+        assert result[1].expected_alive is False
+        assert result[2].task is None
+        assert result[2].expected_alive is False
+
+    def test_non_task_second_element_treated_as_none(self) -> None:
+        result = collect_tracked_tasks(
+            order_placement=(object(), object()),  # task slot isn't a Task
+            reconciliation=None,
+            heartbeat_probe=None,
+        )
+        # The tuple is not-None (so expected_alive should be True), but
+        # the extracted task is None because the slot wasn't an
+        # asyncio.Task. This is a defensive branch — the lifespan
+        # shouldn't actually do this, but we handle it cleanly.
+        assert result[0].task is None
+        assert result[0].expected_alive is True
+
+
+class TestAsyncTaskMonitor:
+    """Construction validation + per-state probe behavior."""
+
+    def test_interval_must_be_positive(self) -> None:
+        with pytest.raises(ValueError, match="interval_seconds must be > 0"):
+            AsyncTaskMonitor([], interval_seconds=0)
+        with pytest.raises(ValueError, match="interval_seconds must be > 0"):
+            AsyncTaskMonitor([], interval_seconds=-1.0)
+
+    def test_default_interval_constant_matches(self) -> None:
+        assert DEFAULT_MONITOR_INTERVAL_SECONDS == 30.0
+
+    def test_probe_once_with_no_tasks_returns_zero(self) -> None:
+        monitor = AsyncTaskMonitor([], interval_seconds=30.0)
+        assert monitor.probe_once() == 0
+
+    def test_probe_once_skips_alive_task(self) -> None:
+        async def _runner() -> int:
+            async def _long_running() -> None:
+                await asyncio.sleep(60)
+
+            task = asyncio.create_task(_long_running())
+            try:
+                monitor = AsyncTaskMonitor(
+                    [TrackedTask(name="alive", task=task, expected_alive=True)],
+                    interval_seconds=30.0,
+                )
+                with capture_logs() as logs:
+                    newly_dead = monitor.probe_once()
+                assert newly_dead == 0
+                # Alive tasks shouldn't emit any log per cycle (would be
+                # spammy at 30s cadence over a long-lived api).
+                assert not any(log.get("event") == "async_task_died" for log in logs)
+            finally:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            return newly_dead
+
+        assert asyncio.run(_runner()) == 0
+
+    def test_probe_once_detects_dead_task_with_exception(self) -> None:
+        async def _runner() -> tuple[int, list[Any]]:
+            async def _raises() -> None:
+                raise RuntimeError("boom")
+
+            task = asyncio.create_task(_raises())
+            try:
+                await task
+            except RuntimeError:
+                pass
+            # Task is now .done() with the exception set.
+            monitor = AsyncTaskMonitor(
+                [TrackedTask(name="dead", task=task, expected_alive=True)],
+                interval_seconds=30.0,
+            )
+            with capture_logs() as logs:
+                newly_dead = monitor.probe_once()
+            return newly_dead, logs
+
+        newly_dead, logs = asyncio.run(_runner())
+        assert newly_dead == 1
+        died = [log for log in logs if log.get("event") == "async_task_died"]
+        assert len(died) == 1
+        assert died[0]["task_name"] == "dead"
+        assert died[0]["exit_reason"] == "exception"
+        assert died[0]["exception_type"] == "RuntimeError"
+        assert "boom" in died[0]["exception_repr"]
+
+    def test_probe_once_detects_dead_task_without_exception(self) -> None:
+        async def _runner() -> tuple[int, list[Any]]:
+            async def _exits_cleanly() -> None:
+                return None
+
+            task = asyncio.create_task(_exits_cleanly())
+            await task  # complete cleanly
+            monitor = AsyncTaskMonitor(
+                [TrackedTask(name="clean_exit", task=task, expected_alive=True)],
+                interval_seconds=30.0,
+            )
+            with capture_logs() as logs:
+                newly_dead = monitor.probe_once()
+            return newly_dead, logs
+
+        newly_dead, logs = asyncio.run(_runner())
+        assert newly_dead == 1
+        died = [log for log in logs if log.get("event") == "async_task_died"]
+        assert len(died) == 1
+        assert died[0]["task_name"] == "clean_exit"
+        assert died[0]["exit_reason"] == "done_without_exception"
+        assert "exception_type" not in died[0]
+
+    def test_probe_once_detects_cancelled_task(self) -> None:
+        async def _runner() -> tuple[int, list[Any]]:
+            async def _long_running() -> None:
+                await asyncio.sleep(60)
+
+            task = asyncio.create_task(_long_running())
+            await asyncio.sleep(0)  # let it start
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            monitor = AsyncTaskMonitor(
+                [TrackedTask(name="cancelled", task=task, expected_alive=True)],
+                interval_seconds=30.0,
+            )
+            with capture_logs() as logs:
+                newly_dead = monitor.probe_once()
+            return newly_dead, logs
+
+        newly_dead, logs = asyncio.run(_runner())
+        assert newly_dead == 1
+        died = [log for log in logs if log.get("event") == "async_task_died"]
+        assert len(died) == 1
+        assert died[0]["task_name"] == "cancelled"
+        assert died[0]["exit_reason"] == "exception"
+        assert died[0]["exception_type"] == "CancelledError"
+
+    def test_probe_once_skips_none_tasks(self) -> None:
+        monitor = AsyncTaskMonitor(
+            [TrackedTask(name="not_spawned", task=None, expected_alive=True)],
+            interval_seconds=30.0,
+        )
+        with capture_logs() as logs:
+            newly_dead = monitor.probe_once()
+        assert newly_dead == 0
+        # No async_task_died log; None tasks are reported separately in
+        # probe_initial() not per-cycle.
+        assert not any(log.get("event") == "async_task_died" for log in logs)
+
+
+class TestProbeIdempotency:
+    """Same dead task across multiple probes only logs once."""
+
+    def test_repeat_probe_no_repeat_log(self) -> None:
+        async def _runner() -> tuple[int, int, list[Any], list[Any]]:
+            async def _raises() -> None:
+                raise ValueError("once")
+
+            task = asyncio.create_task(_raises())
+            try:
+                await task
+            except ValueError:
+                pass
+            monitor = AsyncTaskMonitor(
+                [TrackedTask(name="dead", task=task, expected_alive=True)],
+                interval_seconds=30.0,
+            )
+            with capture_logs() as logs1:
+                first = monitor.probe_once()
+            with capture_logs() as logs2:
+                second = monitor.probe_once()
+            return first, second, logs1, logs2
+
+        first, second, logs1, logs2 = asyncio.run(_runner())
+        assert first == 1
+        assert second == 0
+        died1 = [log for log in logs1 if log.get("event") == "async_task_died"]
+        died2 = [log for log in logs2 if log.get("event") == "async_task_died"]
+        assert len(died1) == 1
+        assert len(died2) == 0
+
+
+class TestProbeInitial:
+    """The one-shot startup log + un-spawned WARNING."""
+
+    def test_probe_initial_emits_summary(self) -> None:
+        async def _runner() -> list[Any]:
+            async def _alive() -> None:
+                await asyncio.sleep(60)
+
+            alive_task = asyncio.create_task(_alive())
+            try:
+                monitor = AsyncTaskMonitor(
+                    [
+                        TrackedTask(name="alive", task=alive_task, expected_alive=True),
+                        TrackedTask(name="not_spawned", task=None, expected_alive=True),
+                        TrackedTask(name="not_expected", task=None, expected_alive=False),
+                    ],
+                    interval_seconds=30.0,
+                )
+                with capture_logs() as logs:
+                    monitor.probe_initial()
+            finally:
+                alive_task.cancel()
+                try:
+                    await alive_task
+                except asyncio.CancelledError:
+                    pass
+            return logs
+
+        logs = asyncio.run(_runner())
+        started = [log for log in logs if log.get("event") == "async_task_monitor_started"]
+        assert len(started) == 1
+        assert started[0]["spawned_count"] == 1
+        assert started[0]["not_spawned_count"] == 1  # expected_alive=True only
+        assert started[0]["total_tracked"] == 3
+        not_spawned = [log for log in logs if log.get("event") == "async_task_not_spawned"]
+        assert len(not_spawned) == 1
+        assert not_spawned[0]["task_name"] == "not_spawned"
+
+
+class TestRunForever:
+    """Main loop ticks at interval; request_stop exits cleanly."""
+
+    def test_run_forever_stops_on_request_stop(self) -> None:
+        async def _runner() -> None:
+            monitor = AsyncTaskMonitor([], interval_seconds=30.0)
+            task = asyncio.create_task(monitor.run_forever())
+            # Let the monitor enter run_forever + probe_initial.
+            await asyncio.sleep(0.05)
+            monitor.request_stop()
+            await asyncio.wait_for(task, timeout=1.0)
+
+        asyncio.run(_runner())
+
+    def test_run_forever_calls_probe_initial_once(self) -> None:
+        async def _runner() -> list[Any]:
+            monitor = AsyncTaskMonitor([], interval_seconds=0.05)
+            with capture_logs() as logs:
+                task = asyncio.create_task(monitor.run_forever())
+                await asyncio.sleep(0.15)  # let a few probes happen
+                monitor.request_stop()
+                await asyncio.wait_for(task, timeout=1.0)
+            return logs
+
+        logs = asyncio.run(_runner())
+        started_count = sum(1 for log in logs if log.get("event") == "async_task_monitor_started")
+        # probe_initial fires exactly once at run_forever entry.
+        assert started_count == 1
+        stopped_count = sum(1 for log in logs if log.get("event") == "async_task_monitor_stopped")
+        assert stopped_count == 1
+
+    def test_run_forever_catches_probe_exception(self) -> None:
+        # Inject a broken tracked task entry — the monitor's probe loop
+        # should catch + log the exception + keep going.
+        class _BrokenTask:
+            """A task-shaped object that raises from .done()."""
+
+            def done(self) -> bool:
+                raise RuntimeError("probe-time-error")
+
+            def exception(self) -> BaseException | None:
+                return None  # pragma: no cover
+
+        async def _runner() -> list[Any]:
+            # Inject a TrackedTask whose .task is our broken stub.
+            broken = TrackedTask(
+                name="broken",
+                task=_BrokenTask(),  # type: ignore[arg-type]
+                expected_alive=True,
+            )
+            monitor = AsyncTaskMonitor([broken], interval_seconds=0.05)
+            with capture_logs() as logs:
+                task = asyncio.create_task(monitor.run_forever())
+                await asyncio.sleep(0.20)  # at least 2 probe iterations
+                monitor.request_stop()
+                await asyncio.wait_for(task, timeout=1.0)
+            return logs
+
+        logs = asyncio.run(_runner())
+        # The probe should have logged async_task_monitor_probe_failed
+        # at least once (we slept 4x the interval; expect 2-4 probes).
+        probe_failed = [
+            log for log in logs if log.get("event") == "async_task_monitor_probe_failed"
+        ]
+        assert len(probe_failed) >= 1
+        # AND the monitor still exited cleanly via request_stop, not
+        # via an unhandled exception.
+        stopped = [log for log in logs if log.get("event") == "async_task_monitor_stopped"]
+        assert len(stopped) == 1
+
+
+class TestStopAsyncTaskMonitor:
+    """Lifespan shutdown helper handles timeout + exception paths."""
+
+    def test_stop_none_state_returns_immediately(self) -> None:
+        asyncio.run(stop_async_task_monitor(None))
+
+    def test_stop_happy_path(self) -> None:
+        async def _runner() -> None:
+            monitor = AsyncTaskMonitor([], interval_seconds=30.0)
+            task = asyncio.create_task(monitor.run_forever())
+            await asyncio.sleep(0.05)
+            await stop_async_task_monitor((monitor, task))
+            assert task.done()
+
+        asyncio.run(_runner())
+
+    def test_stop_timeout_cancels_task(self) -> None:
+        async def _runner() -> None:
+            # Make a hung task that doesn't respond to request_stop.
+            class _HungMonitor:
+                def request_stop(self) -> None:
+                    return None  # never actually stops
+
+            async def _never_returns() -> None:
+                await asyncio.sleep(60)
+
+            task = asyncio.create_task(_never_returns())
+            # Use a small wait_for in the stop helper by monkeypatching
+            # the timeout. The helper has a 5.0s wait_for which is
+            # too long for a unit test. Instead we patch asyncio.wait_for
+            # locally... but the test should still complete in <1s
+            # because we cancel after timeout.
+            #
+            # Approach: skip the helper's 5s wait by passing a custom
+            # stop_event-less monitor. The helper still calls
+            # request_stop (noop on _HungMonitor) then asyncio.wait_for.
+            # We'll observe the task.cancel() being called after wait_for
+            # TimeoutError fires. To keep the test fast, we patch the
+            # timeout via a side-channel: subclass + override.
+            #
+            # Simpler: just use the helper as-is and assert the task is
+            # eventually cancelled. asyncio.wait_for raises TimeoutError
+            # after 5s. We'll accept the 5s wait for this test.
+            #
+            # Pragmatic: assert task.cancelled() after the stop helper.
+            await stop_async_task_monitor((_HungMonitor(), task))  # type: ignore[arg-type]
+            assert task.done()
+
+        # This test takes ~5s due to the wait_for inside stop helper.
+        # Mark it as slow if needed; left simple for now.
+        asyncio.run(_runner())
+
+
+class TestModuleContract:
+    """Public ``__all__`` surface."""
+
+    def test_all_exports(self) -> None:
+        from services.api import async_task_monitor as mod
+
+        assert set(mod.__all__) == {
+            "AsyncTaskMonitor",
+            "DEFAULT_MONITOR_INTERVAL_SECONDS",
+            "TrackedTask",
+            "collect_tracked_tasks",
+            "stop_async_task_monitor",
+        }
+
+
+# structlog is consumed via capture_logs above; silence unused-import in
+# tools that don't recognize the indirection.
+_ = structlog
