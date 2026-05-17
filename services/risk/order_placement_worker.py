@@ -696,12 +696,26 @@ class OrderPlacementWorker:
           * Any other exception — logged at EXCEPTION; SSE NOT emitted
             because we don't have an audit linkage to stamp.
 
-        Other transitions (Submitted, PartiallyFilled, Cancelled,
-        Rejected) are observed-only for now; the placeOrder path's
-        ``order_placed`` audit + SSE emit already covers Submitted, and
-        terminal cancel/reject paths land alongside the reconciliation
-        + retry follow-ups.
+        **Non-fill terminal statuses (Defect #2 fix, 2026-05-16):**
+
+        ``cancelled`` / ``inactive`` (IBKR's name for various reject
+        modes including validation errors) propagate through
+        :func:`services.risk.order_terminal_status_processor.process_terminal_status_event`
+        which writes an ``order_cancelled`` or ``order_rejected`` audit
+        row + UPDATEs ``orders.status`` + ``orders.rejection_reason``.
+        Same dedupe set guards against IBKR re-firing on reconnect.
+
+        ``PartiallyFilled`` is observed-only for now; the bookkeeping
+        for partial fills (multiple fills rows per order, position
+        running sum, trade lifecycle) is a Phase 1+ follow-up.
+
+        ``Submitted`` / ``pending_submit`` are observed-only because
+        the placeOrder path already wrote the ``order_placed`` audit
+        row + emitted the SSE event.
         """
+        if update.status in ("cancelled", "rejected", "inactive"):
+            await self._process_terminal_status(update)
+            return
         if update.status != "filled":
             return
         if update.broker_order_id in self._emitted_fill_order_ids:
@@ -847,6 +861,134 @@ class OrderPlacementWorker:
             fill_price=str(fill_price),
             commission_usd=str(commission_usd),
             audit_event_uuid=order_filled_audit_uuid,
+        )
+
+    async def _process_terminal_status(self, update: OrderStatusUpdate) -> None:
+        """Handle cancelled / rejected / inactive orderStatus events.
+
+        Defect #2 fix (2026-05-16). Pre-this-method, the worker dropped
+        these events silently and ``orders.status`` stayed at
+        ``pending`` forever even after IBKR had terminally rejected the
+        order at validation time.
+
+        Delegates to
+        :func:`services.risk.order_terminal_status_processor.process_terminal_status_event`
+        which:
+          1. Looks up the orders row by client_order_id
+          2. If already terminal, no-ops (idempotent vs IBKR re-fires)
+          3. Appends an ``order_cancelled`` / ``order_rejected`` audit row
+          4. UPDATEs orders.status + rejection_reason
+          5. Returns the audit linkage for SSE stamping
+
+        Dedupes via the same ``_emitted_fill_order_ids`` set as the fill
+        path. An order can only have ONE terminal state in practice
+        (fill OR cancel OR reject); the unified set is the simplest
+        correctness guarantee.
+
+        SSE emit fires the canonical ``order`` envelope with
+        ``action=cancelled`` or ``action=rejected`` so the web /signals
+        page + the Discord webhook pusher can subscribe. Best-effort —
+        an SSE failure does NOT roll back the durable writes.
+        """
+        if update.broker_order_id in self._emitted_fill_order_ids:
+            self._log.info(
+                "order_placement_terminal_already_processed",
+                broker_order_id=update.broker_order_id,
+                client_order_id=update.client_order_id,
+                status=update.status,
+            )
+            return
+
+        # Lazy import to avoid the same module-load cycle as fill_processor.
+        from services.risk.order_terminal_status_processor import (
+            OrderTerminalStatusError,
+            TerminalStatusPayload,
+            process_terminal_status_event,
+        )
+
+        # The OrderStatusKind Literal ("cancelled", "rejected", "inactive",
+        # "filled", "submitted", "partially_filled") is the same shape as
+        # the terminal processor's TerminalOrderStatus Literal for these
+        # three values. Narrow defensively.
+        if update.status not in ("cancelled", "rejected", "inactive"):
+            # Unreachable in production (_on_order_status gates this);
+            # defensive for direct-call test paths.
+            return
+
+        payload = TerminalStatusPayload(
+            broker_order_id=update.broker_order_id,
+            status_kind=update.status,
+            rejection_reason=update.rejection_reason,
+            observed_at_utc=update.observed_at_utc,
+        )
+
+        try:
+            result = await process_terminal_status_event(
+                session_factory=self._session_factory,
+                client_order_id=update.client_order_id,
+                payload=payload,
+                env=self._env,
+            )
+        except OrderTerminalStatusError as exc:
+            self._log.error(
+                "order_placement_terminal_processing_failed",
+                client_order_id=update.client_order_id,
+                broker_order_id=update.broker_order_id,
+                error_code=exc.error_code,
+                error=str(exc),
+                details=exc.details,
+            )
+            return
+        except Exception:
+            self._log.exception(
+                "order_placement_terminal_unexpected_error",
+                client_order_id=update.client_order_id,
+                broker_order_id=update.broker_order_id,
+            )
+            return
+
+        if result is None:
+            # Either order_not_found or already_terminal — both logged
+            # at INFO by process_terminal_status_event. Mark the
+            # dedupe set since we don't need to act on it again.
+            self._emitted_fill_order_ids.add(update.broker_order_id)
+            return
+
+        # SSE emit
+        try:
+            from services.api.sse import emit_sse
+
+            await emit_sse(
+                "order",
+                {
+                    "action": result.new_status,  # "cancelled" | "rejected"
+                    "order_id": str(result.order_id),
+                    "client_order_id": update.client_order_id,
+                    "signal_id": str(result.signal_id) if result.signal_id is not None else None,
+                    "market": result.market,
+                    "broker_order_id": str(update.broker_order_id),
+                    "rejection_reason": update.rejection_reason,
+                    "environment": self._env,
+                    "new_status": result.new_status,
+                    "audit_event_uuid": str(result.audit_event_uuid),
+                    "audit_sequence_no": result.audit_sequence_no,
+                },
+            )
+        except Exception:
+            self._log.exception(
+                "order_placement_terminal_sse_emit_failed",
+                client_order_id=update.client_order_id,
+                broker_order_id=update.broker_order_id,
+            )
+
+        self._emitted_fill_order_ids.add(update.broker_order_id)
+        self._log.info(
+            "order_placement_terminal_propagated",
+            client_order_id=update.client_order_id,
+            broker_order_id=update.broker_order_id,
+            order_id=str(result.order_id),
+            new_status=result.new_status,
+            audit_event_uuid=str(result.audit_event_uuid),
         )
 
 

@@ -252,6 +252,7 @@ def _build_status_update(
     fill_price: str | None = "5234.75",
     commission: str = "1.25",
     last_fill_at: datetime | None = None,
+    rejection_reason: str | None = None,
 ) -> OrderStatusUpdate:
     return OrderStatusUpdate(
         client_order_id=client_order_id,
@@ -265,6 +266,7 @@ def _build_status_update(
         total_commission_usd=Decimal(commission),
         last_fill_at_utc=last_fill_at or datetime(2026, 5, 12, 21, 32, 15, tzinfo=UTC),
         observed_at_utc=datetime(2026, 5, 12, 21, 32, 15, tzinfo=UTC),
+        rejection_reason=rejection_reason,
     )
 
 
@@ -463,6 +465,178 @@ class TestOnOrderStatusEmit:
         assert worker._emitted_fill_order_ids == {
             _build_status_update(status="filled").broker_order_id
         }
+
+
+# ---------------------------------------------------------------------------
+# Defect #2 (2026-05-16): terminal-status propagation
+# ---------------------------------------------------------------------------
+
+
+def _stub_terminal_status_event_returning(
+    *,
+    market: str = "/MNQ",
+    new_status: str = "rejected",
+) -> AsyncMock:
+    """Stand-in for process_terminal_status_event returning a populated result."""
+    from services.risk.order_terminal_status_processor import TerminalStatusResult
+
+    result = TerminalStatusResult(
+        order_id=uuid4(),
+        signal_id=uuid4(),
+        market=market,
+        new_status=new_status,
+        audit_event_uuid=uuid4(),
+        audit_sequence_no=10,
+    )
+    return AsyncMock(return_value=result)
+
+
+class TestOnOrderStatusTerminal:
+    """Defect #2 fix (2026-05-16): the worker propagates cancelled /
+    rejected / inactive orderStatus events to backend tables + audit
+    chain + SSE. Pre-fix, the worker dropped these silently and
+    ``orders.status`` stayed at ``pending`` indefinitely.
+    """
+
+    async def test_rejected_propagates_via_terminal_processor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worker, _ = _build_worker_with_signal_lookup(signal_id=uuid4())
+        emit = AsyncMock(return_value=11)
+        monkeypatch.setattr("services.api.sse.emit_sse", emit)
+        stub = _stub_terminal_status_event_returning(new_status="rejected")
+        monkeypatch.setattr(
+            "services.risk.order_terminal_status_processor.process_terminal_status_event",
+            stub,
+        )
+
+        await worker._on_order_status(
+            _build_status_update(
+                status="rejected",
+                broker_order_id=3,
+                market="/MNQ",
+                rejection_reason="321 - Please enter a local symbol or an expiry",
+            )
+        )
+
+        stub.assert_awaited_once()
+        kwargs = stub.await_args.kwargs
+        assert kwargs["env"] == "paper"
+        payload_arg = kwargs["payload"]
+        assert payload_arg.status_kind == "rejected"
+        assert payload_arg.rejection_reason == "321 - Please enter a local symbol or an expiry"
+
+        # SSE fired with action=rejected
+        emit.assert_awaited_once()
+        event_type, body = emit.await_args.args
+        assert event_type == "order"
+        assert body["action"] == "rejected"
+        assert body["new_status"] == "rejected"
+        assert body["broker_order_id"] == "3"
+        assert body["rejection_reason"] == "321 - Please enter a local symbol or an expiry"
+        # Dedupe set marked
+        assert 3 in worker._emitted_fill_order_ids
+
+    async def test_cancelled_propagates_with_action_cancelled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worker, _ = _build_worker_with_signal_lookup(signal_id=uuid4())
+        emit = AsyncMock(return_value=12)
+        monkeypatch.setattr("services.api.sse.emit_sse", emit)
+        stub = _stub_terminal_status_event_returning(new_status="cancelled")
+        monkeypatch.setattr(
+            "services.risk.order_terminal_status_processor.process_terminal_status_event",
+            stub,
+        )
+        await worker._on_order_status(_build_status_update(status="cancelled", broker_order_id=5))
+        stub.assert_awaited_once()
+        # The status_kind passed to the processor matches the inbound update
+        assert stub.await_args.kwargs["payload"].status_kind == "cancelled"
+        emit.assert_awaited_once()
+        body = emit.await_args.args[1]
+        assert body["action"] == "cancelled"
+        assert body["new_status"] == "cancelled"
+
+    async def test_inactive_propagates_as_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # IBKR's Inactive surfaces validation errors; the processor maps
+        # to "rejected" wire value. The worker's job is just to forward
+        # the inbound status_kind faithfully.
+        worker, _ = _build_worker_with_signal_lookup(signal_id=uuid4())
+        emit = AsyncMock(return_value=13)
+        monkeypatch.setattr("services.api.sse.emit_sse", emit)
+        stub = _stub_terminal_status_event_returning(new_status="rejected")
+        monkeypatch.setattr(
+            "services.risk.order_terminal_status_processor.process_terminal_status_event",
+            stub,
+        )
+        await worker._on_order_status(_build_status_update(status="inactive", broker_order_id=7))
+        # Worker forwards "inactive" — processor handles the mapping
+        assert stub.await_args.kwargs["payload"].status_kind == "inactive"
+        # Output reflects processor's resolution
+        body = emit.await_args.args[1]
+        assert body["new_status"] == "rejected"
+        assert body["action"] == "rejected"
+
+    async def test_terminal_already_in_dedupe_set_skipped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worker, _ = _build_worker_with_signal_lookup(signal_id=uuid4())
+        worker._emitted_fill_order_ids.add(99)
+        emit = AsyncMock()
+        monkeypatch.setattr("services.api.sse.emit_sse", emit)
+        stub = AsyncMock()
+        monkeypatch.setattr(
+            "services.risk.order_terminal_status_processor.process_terminal_status_event",
+            stub,
+        )
+        await worker._on_order_status(_build_status_update(status="rejected", broker_order_id=99))
+        stub.assert_not_awaited()
+        emit.assert_not_called()
+
+    async def test_processor_returns_none_marks_dedupe_no_sse(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Order not found in DB (orphan / already terminal) — processor
+        # returns None. Worker must mark dedupe to avoid retrying + must
+        # NOT emit SSE (no audit linkage to stamp).
+        worker, _ = _build_worker_with_signal_lookup(signal_id=uuid4())
+        emit = AsyncMock()
+        monkeypatch.setattr("services.api.sse.emit_sse", emit)
+        stub = AsyncMock(return_value=None)
+        monkeypatch.setattr(
+            "services.risk.order_terminal_status_processor.process_terminal_status_event",
+            stub,
+        )
+        await worker._on_order_status(_build_status_update(status="rejected", broker_order_id=200))
+        stub.assert_awaited_once()
+        emit.assert_not_called()
+        assert 200 in worker._emitted_fill_order_ids
+
+    async def test_filled_path_unaffected_by_terminal_branch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Regression: the new terminal branch must NOT intercept filled.
+        signal_id = uuid4()
+        worker, _ = _build_worker_with_signal_lookup(signal_id=signal_id)
+        emit = AsyncMock(return_value=14)
+        monkeypatch.setattr("services.api.sse.emit_sse", emit)
+        monkeypatch.setattr(
+            "services.risk.fill_processor.process_fill_event",
+            _stub_process_fill_event_returning(signal_id=signal_id),
+        )
+        # The terminal stub must NOT be called for a filled event
+        term_stub = AsyncMock()
+        monkeypatch.setattr(
+            "services.risk.order_terminal_status_processor.process_terminal_status_event",
+            term_stub,
+        )
+        await worker._on_order_status(_build_status_update(status="filled"))
+        term_stub.assert_not_awaited()
+        emit.assert_awaited_once()
+        body = emit.await_args.args[1]
+        # The fill envelope (NOT the order envelope) is emitted
+        assert emit.await_args.args[0] == "fill"
+        assert body.get("market") == "/MES"
 
 
 # ---------------------------------------------------------------------------

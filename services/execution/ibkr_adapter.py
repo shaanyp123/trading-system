@@ -787,6 +787,26 @@ class IbAsyncIbkrClient:
 
         broker_order_id = int(getattr(order, "orderId", 0) or 0)
 
+        # Defect #2 fix (2026-05-16): extract the rejection reason from
+        # trade.log for terminal-reject statuses so the worker can
+        # populate orders.rejection_reason + the order_rejected audit
+        # payload. The IBKR API surfaces error code + message via
+        # TradeLogEntry; we take the LAST log entry (most recent) and
+        # format it as "<errorCode> - <message>" when both are present.
+        rejection_reason: str | None = None
+        if status in ("cancelled", "rejected", "inactive"):
+            logs = getattr(trade, "log", []) or []
+            if logs:
+                last_log = logs[-1]
+                message = getattr(last_log, "message", None)
+                code = getattr(last_log, "errorCode", None)
+                if message and code:
+                    rejection_reason = f"{code} - {message}"
+                elif message:
+                    rejection_reason = str(message)
+                elif code:
+                    rejection_reason = f"IBKR error {code}"
+
         return OrderStatusUpdate(
             client_order_id=client_order_id,
             broker_order_id=broker_order_id,
@@ -799,6 +819,7 @@ class IbAsyncIbkrClient:
             total_commission_usd=total_commission,
             last_fill_at_utc=last_fill_at,
             observed_at_utc=_ts_utc(),
+            rejection_reason=rejection_reason,
         )
 
     # ------------------------------------------------------------------
