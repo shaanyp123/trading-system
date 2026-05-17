@@ -198,6 +198,7 @@ async def _start_order_placement_worker(settings: APISettings) -> tuple[object, 
         account_id=account_id,
         env=_audit_env_from_settings(settings),
         poll_interval_seconds=settings.order_placement_poll_interval_seconds,
+        ibkr_call_timeout_seconds=settings.ibkr_call_timeout_seconds,
     )
     task = asyncio.create_task(worker.run_forever(), name="order_placement_worker.run_forever")
     log.info(
@@ -208,6 +209,7 @@ async def _start_order_placement_worker(settings: APISettings) -> tuple[object, 
         ibkr_port=settings.ibkr_port,
         ibkr_account=ibkr_account,
         poll_interval=settings.order_placement_poll_interval_seconds,
+        ibkr_call_timeout_seconds=settings.ibkr_call_timeout_seconds,
     )
     return worker, task
 

@@ -292,6 +292,25 @@ class APISettings(BaseSettings):
             "of marginal DB pressure."
         ),
     )
+    # 2026-05-17 follow-up to the silent-worker pattern (see
+    # ``DEFAULT_IBKR_CALL_TIMEOUT_SECONDS`` in
+    # ``services/risk/order_placement_worker.py`` for the full diagnosis).
+    # Hard wall-clock deadline applied via ``asyncio.wait_for`` around
+    # every IBKR adapter await (``resolve_contract``, ``place_order``
+    # entry + stop, ``cancel_order``, ``subscribe_order_status``).
+    # Expiry translates to ``IbkrPlacementError`` so the existing
+    # transient-broker error path handles it.
+    ibkr_call_timeout_seconds: float = Field(
+        default=30.0,
+        gt=0.0,
+        le=600.0,
+        description=(
+            "Hard per-call timeout (seconds) on every "
+            "OrderPlacementWorker IBKR adapter await. 30s default "
+            "balances IBKR round-trip latency under load against "
+            "silent-worker recovery time."
+        ),
+    )
     # -- Async task liveness monitor ----------------------------------------
     #
     # 2026-05-17 follow-up to the silent-worker-death pattern observed

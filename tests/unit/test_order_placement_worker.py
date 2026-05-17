@@ -1345,3 +1345,404 @@ class TestHaltGuard:
         )
         await worker.run_once()
         assert len(fetch_signals_calls) == 1
+
+
+# =====================================================================
+# Timeout + payload-observability tests (2026-05-17 follow-up to silent-
+# worker pattern). The first batch verifies _await_ibkr_with_timeout
+# translates hangs into IbkrPlacementError so the existing except paths
+# handle them cleanly. The second batch verifies the pre-append payload
+# log carries the audit-leg metadata that would have caught the
+# 2026-05-17 drill 1 "missing leg field" mystery had it been present.
+# =====================================================================
+
+
+class TestAwaitIbkrWithTimeout:
+    """The helper that bounds every IBKR adapter await.
+
+    Verifies:
+      * Happy path: a quick-completing coroutine returns its value.
+      * Hung path: a coroutine that exceeds the timeout raises
+        IbkrPlacementError with the right operation + detail fields.
+      * Exception passthrough: a coroutine that raises something else
+        propagates that exception unchanged (we only translate the
+        timeout, NOT every exception).
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_value_on_quick_completion(self) -> None:
+        from services.risk.order_placement_worker import _await_ibkr_with_timeout
+
+        async def _quick() -> str:
+            return "done"
+
+        result = await _await_ibkr_with_timeout(
+            _quick(),
+            operation="testOp",
+            timeout_seconds=30.0,
+        )
+        assert result == "done"
+
+    @pytest.mark.asyncio
+    async def test_hung_coroutine_raises_ibkr_placement_error(self) -> None:
+        import asyncio
+
+        from services.execution.types import IbkrPlacementError
+        from services.risk.order_placement_worker import _await_ibkr_with_timeout
+
+        async def _hung() -> None:
+            await asyncio.sleep(60)
+
+        with pytest.raises(IbkrPlacementError) as excinfo:
+            await _await_ibkr_with_timeout(
+                _hung(),
+                operation="placeOrder.entry",
+                timeout_seconds=0.05,
+            )
+        err = excinfo.value
+        assert err.operation == "placeOrder.entry"
+        assert "timed out after 0.05s" in err.detail
+        assert err.underlying_exception_class == "TimeoutError"
+        assert err.occurred_at_utc.tzinfo is not None
+
+    @pytest.mark.asyncio
+    async def test_propagates_non_timeout_exception_unchanged(self) -> None:
+        from services.risk.order_placement_worker import _await_ibkr_with_timeout
+
+        async def _raises_value_error() -> None:
+            raise ValueError("boom")
+
+        with pytest.raises(ValueError, match="boom"):
+            await _await_ibkr_with_timeout(
+                _raises_value_error(),
+                operation="testOp",
+                timeout_seconds=30.0,
+            )
+
+    @pytest.mark.asyncio
+    async def test_propagates_ibkr_placement_error_unchanged(self) -> None:
+        from services.execution.types import IbkrPlacementError
+        from services.risk.order_placement_worker import _await_ibkr_with_timeout
+
+        original = IbkrPlacementError(
+            operation="connect",
+            detail="ib_gateway down",
+            underlying_exception_class="ConnectionError",
+            occurred_at_utc=datetime(2026, 5, 17, 14, 0, 0, tzinfo=UTC),
+        )
+
+        async def _raises_existing_ibkr_err() -> None:
+            raise original
+
+        with pytest.raises(IbkrPlacementError) as excinfo:
+            await _await_ibkr_with_timeout(
+                _raises_existing_ibkr_err(),
+                operation="placeOrder.entry",
+                timeout_seconds=30.0,
+            )
+        # Same instance — NOT re-wrapped into a timeout error.
+        assert excinfo.value.operation == "connect"
+        assert excinfo.value.detail == "ib_gateway down"
+
+
+class TestWorkerConstructorTimeoutDefault:
+    """The worker carries _ibkr_call_timeout_seconds through constructor."""
+
+    def test_default_timeout_matches_constant(self) -> None:
+        from services.risk.order_placement_worker import (
+            DEFAULT_IBKR_CALL_TIMEOUT_SECONDS,
+        )
+
+        @asynccontextmanager
+        async def factory() -> Any:
+            yield MagicMock()
+
+        worker = OrderPlacementWorker(
+            session_factory=factory,  # type: ignore[arg-type]
+            ibkr_client=MagicMock(),
+            account_id=uuid4(),
+            env="paper",
+        )
+        assert worker._ibkr_call_timeout_seconds == DEFAULT_IBKR_CALL_TIMEOUT_SECONDS
+        assert DEFAULT_IBKR_CALL_TIMEOUT_SECONDS == 30.0
+
+    def test_explicit_timeout_overrides_default(self) -> None:
+        @asynccontextmanager
+        async def factory() -> Any:
+            yield MagicMock()
+
+        worker = OrderPlacementWorker(
+            session_factory=factory,  # type: ignore[arg-type]
+            ibkr_client=MagicMock(),
+            account_id=uuid4(),
+            env="paper",
+            ibkr_call_timeout_seconds=5.0,
+        )
+        assert worker._ibkr_call_timeout_seconds == 5.0
+
+
+class TestApplyOrderPlacementTimeout:
+    """Verifies a hung place_order call inside apply_order_placement
+    raises IbkrPlacementError via _await_ibkr_with_timeout."""
+
+    @pytest.mark.asyncio
+    async def test_entry_hangs_raises_ibkr_placement_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio
+
+        from services.execution.types import IbkrContractRef, IbkrPlacementError
+        from services.risk.order_placement_worker import apply_order_placement
+
+        async def _hung_place(_req: Any) -> Any:
+            await asyncio.sleep(60)
+            raise AssertionError("should never reach here")
+
+        ibkr = MagicMock()
+        ibkr.place_order = AsyncMock(side_effect=_hung_place)
+        ibkr.cancel_order = AsyncMock()
+
+        async def fake_append(*args: Any, **kwargs: Any) -> Any:
+            return MagicMock(event_uuid=uuid4(), sequence_no=1)
+
+        monkeypatch.setattr(
+            "services.risk.order_placement_worker.append_audit_event",
+            AsyncMock(side_effect=fake_append),
+        )
+
+        plan = plan_order_placement(
+            _signal(direction="long", market="TLT", decision_price="85.00"),
+            env="paper",
+        )
+        contract = IbkrContractRef(market="TLT", ibkr_local_symbol="TLT", exchange="SMART")
+
+        with pytest.raises(IbkrPlacementError) as excinfo:
+            await apply_order_placement(
+                plan,
+                ibkr_client=ibkr,
+                contract=contract,
+                session_factory=_build_apply_session_factory(),
+                ibkr_call_timeout_seconds=0.05,
+            )
+        assert excinfo.value.operation == "placeOrder.entry"
+        assert "timed out" in excinfo.value.detail
+
+    @pytest.mark.asyncio
+    async def test_stop_hangs_cancels_entry_and_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio
+
+        from services.execution.types import IbkrContractRef
+        from services.risk.order_placement_worker import (
+            OrderPlacementError,
+            apply_order_placement,
+        )
+
+        call_no = 0
+
+        async def _maybe_hang(_req: Any) -> Any:
+            nonlocal call_no
+            call_no += 1
+            if call_no == 1:
+                # Entry succeeds quickly.
+                return _fake_ibkr_place_result(broker_order_id=42, status="pending_submit")
+            # Stop hangs.
+            await asyncio.sleep(60)
+            raise AssertionError("should never reach here")
+
+        ibkr = MagicMock()
+        ibkr.place_order = AsyncMock(side_effect=_maybe_hang)
+        ibkr.cancel_order = AsyncMock()
+
+        async def fake_append(*args: Any, **kwargs: Any) -> Any:
+            return MagicMock(event_uuid=uuid4(), sequence_no=1)
+
+        monkeypatch.setattr(
+            "services.risk.order_placement_worker.append_audit_event",
+            AsyncMock(side_effect=fake_append),
+        )
+
+        plan = plan_order_placement(
+            _signal(direction="long", market="TLT", decision_price="85.00"),
+            env="paper",
+        )
+        contract = IbkrContractRef(market="TLT", ibkr_local_symbol="TLT", exchange="SMART")
+
+        with pytest.raises(OrderPlacementError, match="STOP_PLACEMENT_FAILED"):
+            await apply_order_placement(
+                plan,
+                ibkr_client=ibkr,
+                contract=contract,
+                session_factory=_build_apply_session_factory(),
+                ibkr_call_timeout_seconds=0.05,
+            )
+        # Cancel should have been called on the entry — best-effort
+        # cleanup after the stop-side hang.
+        assert ibkr.cancel_order.await_count == 1
+
+
+class TestAuditPayloadObservabilityLog:
+    """The pre-append observability log fires once per leg with the
+    payload key set. This is the diagnostic for the 2026-05-17 drill 1
+    'leg field missing' mystery (audit row seq=45 written without the
+    leg field even though deployed code unambiguously sets it).
+    """
+
+    @pytest.mark.asyncio
+    async def test_entry_audit_pre_append_logs_payload_keys(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from structlog.testing import capture_logs
+
+        from services.execution.types import IbkrContractRef
+        from services.risk.order_placement_worker import apply_order_placement
+
+        async def fake_place(request: Any) -> Any:
+            return _fake_ibkr_place_result(broker_order_id=99, status="pending_submit")
+
+        ibkr = MagicMock()
+        ibkr.place_order = AsyncMock(side_effect=fake_place)
+        ibkr.cancel_order = AsyncMock()
+
+        async def fake_append(*args: Any, **kwargs: Any) -> Any:
+            return MagicMock(event_uuid=uuid4(), sequence_no=1)
+
+        monkeypatch.setattr(
+            "services.risk.order_placement_worker.append_audit_event",
+            AsyncMock(side_effect=fake_append),
+        )
+
+        plan = plan_order_placement(
+            _signal(direction="long", market="TLT", decision_price="85.00"),
+            env="paper",
+        )
+        contract = IbkrContractRef(market="TLT", ibkr_local_symbol="TLT", exchange="SMART")
+        with capture_logs() as logs:
+            await apply_order_placement(
+                plan,
+                ibkr_client=ibkr,
+                contract=contract,
+                session_factory=_build_apply_session_factory(),
+            )
+        pre_appends = [
+            entry
+            for entry in logs
+            if entry.get("event") == "order_placement_audit_payload_pre_append"
+        ]
+        # Two pre-append logs: one for entry, one for stop.
+        assert len(pre_appends) == 2
+        entry_pre = next(e for e in pre_appends if e["leg"] == "entry")
+        # The audit-leg breadcrumb the drill 1 mystery needed.
+        assert entry_pre["has_leg_field"] is True
+        assert "leg" in entry_pre["payload_keys"]
+        assert entry_pre["payload_key_count"] == len(entry_pre["payload_keys"])
+        # All 15 canonical entry-leg keys present.
+        assert entry_pre["payload_key_count"] == 15
+        # Sorted for log-grep stability.
+        assert entry_pre["payload_keys"] == sorted(entry_pre["payload_keys"])
+
+    @pytest.mark.asyncio
+    async def test_stop_audit_pre_append_logs_payload_keys(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from structlog.testing import capture_logs
+
+        from services.execution.types import IbkrContractRef
+        from services.risk.order_placement_worker import apply_order_placement
+
+        place_call_no = 0
+
+        async def fake_place(request: Any) -> Any:
+            nonlocal place_call_no
+            place_call_no += 1
+            return _fake_ibkr_place_result(
+                broker_order_id=place_call_no * 10, status="pending_submit"
+            )
+
+        ibkr = MagicMock()
+        ibkr.place_order = AsyncMock(side_effect=fake_place)
+        ibkr.cancel_order = AsyncMock()
+
+        async def fake_append(*args: Any, **kwargs: Any) -> Any:
+            return MagicMock(event_uuid=uuid4(), sequence_no=1)
+
+        monkeypatch.setattr(
+            "services.risk.order_placement_worker.append_audit_event",
+            AsyncMock(side_effect=fake_append),
+        )
+
+        plan = plan_order_placement(
+            _signal(direction="long", market="TLT", decision_price="85.00"),
+            env="paper",
+        )
+        contract = IbkrContractRef(market="TLT", ibkr_local_symbol="TLT", exchange="SMART")
+        with capture_logs() as logs:
+            await apply_order_placement(
+                plan,
+                ibkr_client=ibkr,
+                contract=contract,
+                session_factory=_build_apply_session_factory(),
+            )
+        pre_appends = [
+            entry
+            for entry in logs
+            if entry.get("event") == "order_placement_audit_payload_pre_append"
+        ]
+        stop_pre = next(e for e in pre_appends if e["leg"] == "stop")
+        assert stop_pre["has_leg_field"] is True
+        # 16 canonical stop-leg keys (15 entry keys + parent_client_order_id
+        # + stop_price; no limit_price on stop_market orders).
+        assert stop_pre["payload_key_count"] == 16
+        assert "leg" in stop_pre["payload_keys"]
+        assert "parent_client_order_id" in stop_pre["payload_keys"]
+        assert "stop_price" in stop_pre["payload_keys"]
+        assert "limit_price" not in stop_pre["payload_keys"]
+
+    @pytest.mark.asyncio
+    async def test_rejected_entry_skips_stop_pre_append_log(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from structlog.testing import capture_logs
+
+        from services.execution.types import IbkrContractRef
+        from services.risk.order_placement_worker import apply_order_placement
+
+        async def fake_place(request: Any) -> Any:
+            # Entry rejected → no stop placement → no stop audit → no
+            # stop pre-append log.
+            return _fake_ibkr_place_result(broker_order_id=11, status="rejected")
+
+        ibkr = MagicMock()
+        ibkr.place_order = AsyncMock(side_effect=fake_place)
+        ibkr.cancel_order = AsyncMock()
+
+        async def fake_append(*args: Any, **kwargs: Any) -> Any:
+            return MagicMock(event_uuid=uuid4(), sequence_no=1)
+
+        monkeypatch.setattr(
+            "services.risk.order_placement_worker.append_audit_event",
+            AsyncMock(side_effect=fake_append),
+        )
+
+        plan = plan_order_placement(
+            _signal(direction="long", market="TLT", decision_price="85.00"),
+            env="paper",
+        )
+        contract = IbkrContractRef(market="TLT", ibkr_local_symbol="TLT", exchange="SMART")
+        with capture_logs() as logs:
+            await apply_order_placement(
+                plan,
+                ibkr_client=ibkr,
+                contract=contract,
+                session_factory=_build_apply_session_factory(),
+            )
+        pre_appends = [
+            entry
+            for entry in logs
+            if entry.get("event") == "order_placement_audit_payload_pre_append"
+        ]
+        # Only ONE pre-append log: the entry. No stop because entry was
+        # rejected (db_status='rejected' → place_stop=False).
+        assert len(pre_appends) == 1
+        assert pre_appends[0]["leg"] == "entry"
