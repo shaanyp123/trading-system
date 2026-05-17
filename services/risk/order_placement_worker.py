@@ -99,6 +99,21 @@ log = structlog.get_logger()
 #: manual-approve flow without taxing the DB.
 DEFAULT_POLL_INTERVAL_SECONDS: Final[float] = 5.0
 
+#: Default hard timeout for every IBKR adapter call this worker makes
+#: (``resolve_contract``, ``place_order`` entry + stop, ``cancel_order``,
+#: ``subscribe_order_status``). Added 2026-05-17 after three production
+#: drills surfaced a silent-worker pattern: IBKR's paper API can leave
+#: ``ib-async`` awaits hung indefinitely (no internal timeout fires) when
+#: the broker side is sluggish or unresponsive. Without an outer
+#: ``asyncio.wait_for`` the worker task never raises, never logs, and
+#: never re-polls — the entire pipeline goes silent.
+#:
+#: 30s is a deliberate trade-off: long enough for a healthy IBKR round-
+#: trip even under transient latency, short enough that the worker
+#: recovers within one poll cycle's worth of patience. Tunable via
+#: ``API_IBKR_CALL_TIMEOUT_SECONDS``.
+DEFAULT_IBKR_CALL_TIMEOUT_SECONDS: Final[float] = 30.0
+
 #: Phase 1 retry count for the client_order_id suffix. retry_n=0 always
 #: in Worker-PR-1. Retry semantics land in a future iteration.
 RETRY_N_PHASE_1: Final[int] = 0
@@ -430,6 +445,50 @@ async def fetch_approved_signals(
     ]
 
 
+async def _await_ibkr_with_timeout(
+    coro: Any,
+    *,
+    operation: str,
+    timeout_seconds: float,
+) -> Any:
+    """Wrap an IBKR adapter ``await`` with a hard timeout.
+
+    The IBKR TWS API (and the ``ib-async`` adapter layered over it) does
+    not always honor its own internal timeouts when the broker side
+    becomes sluggish or unresponsive. Concretely: ``qualifyContractsAsync``,
+    ``placeOrder``, and ``reqExecutions`` can each hang indefinitely with
+    no ``asyncio.TimeoutError`` being raised. When that happens the
+    worker's ``run_once`` await-blocks forever — no exception, no log
+    line, and the asyncio task is still ``not .done()`` so the
+    :class:`services.api.async_task_monitor.AsyncTaskMonitor` doesn't
+    flag it as dead. This is the silent-worker pattern observed in the
+    2026-05-17 drill 2 ceremony.
+
+    This helper enforces a hard wall-clock deadline. On expiry:
+
+    * The underlying coroutine is cancelled (asyncio.wait_for contract).
+    * :class:`services.execution.types.IbkrPlacementError` is raised
+      with ``operation`` + a structured ``"timed out after Xs"`` detail.
+      The existing ``except IbkrPlacementError`` blocks in the worker's
+      ``run_once`` / ``apply_order_placement`` then take their normal
+      "broker unavailable" recovery path — log, fail this iteration,
+      continue polling.
+
+    Defense in depth alongside ``AsyncTaskMonitor``: that monitor catches
+    tasks that have already died; this helper prevents the tasks from
+    ever silently hanging in the first place.
+    """
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout_seconds)
+    except TimeoutError as exc:
+        raise IbkrPlacementError(
+            operation=operation,
+            detail=f"{operation} timed out after {timeout_seconds}s",
+            underlying_exception_class="TimeoutError",
+            occurred_at_utc=datetime.now(tz=UTC),
+        ) from exc
+
+
 async def apply_order_placement(
     plan: OrderPlacementPlan,
     *,
@@ -437,6 +496,7 @@ async def apply_order_placement(
     contract: IbkrContractRef,
     session_factory: async_sessionmaker[Any],
     phase_at_emit: PhaseAtEmit = 1,
+    ibkr_call_timeout_seconds: float = DEFAULT_IBKR_CALL_TIMEOUT_SECONDS,
 ) -> OrderPlacementResult:
     """Execute the placement plan: IBKR placeOrder (entry + stop) → audit → INSERT orders.
 
@@ -446,12 +506,17 @@ async def apply_order_placement(
        side effect for the entry leg. Failure raises
        :class:`IbkrPlacementError` (broker connectivity) or returns an
        ``IbkrPlaceOrderResult`` with ``status='rejected'`` (broker
-       validation rejection).
+       validation rejection). The await is bounded by
+       ``ibkr_call_timeout_seconds`` (default 30s); expiry raises
+       :class:`IbkrPlacementError` so the existing except path handles
+       it cleanly.
     2. **Bracket extension (2026-05-17):** if entry placed successfully
        (status not in rejected set), build + place the stop-market exit
        order via ``ibkr_client.place_order(stop_request)``. On stop
        failure → best-effort cancel the entry + raise
-       :class:`OrderPlacementError("STOP_PLACEMENT_FAILED")`.
+       :class:`OrderPlacementError("STOP_PLACEMENT_FAILED")`. The
+       cancel itself is also wrapped in the timeout so a hanging cancel
+       doesn't trap the worker after the original stop failure.
     3. Audit-first (per spec §2.10.1): write ``ORDER_PLACED`` x N
        (1 if entry rejected, 2 if entry + stop both placed) — each in
        its own SERIALIZABLE transaction. Payload includes the
@@ -478,7 +543,11 @@ async def apply_order_placement(
         time_in_force=plan.time_in_force,
     )
     try:
-        broker_result = await ibkr_client.place_order(entry_request)
+        broker_result = await _await_ibkr_with_timeout(
+            ibkr_client.place_order(entry_request),
+            operation="placeOrder.entry",
+            timeout_seconds=ibkr_call_timeout_seconds,
+        )
     except IbkrPlacementError as exc:
         log.error(
             "order_placement_broker_error",
@@ -512,7 +581,11 @@ async def apply_order_placement(
             parent_client_order_id=plan.client_order_id,
         )
         try:
-            stop_broker_result = await ibkr_client.place_order(stop_request)
+            stop_broker_result = await _await_ibkr_with_timeout(
+                ibkr_client.place_order(stop_request),
+                operation="placeOrder.stop",
+                timeout_seconds=ibkr_call_timeout_seconds,
+            )
             stop_db_status = _broker_status_to_orders_status(stop_broker_result.status)
             if stop_db_status == "rejected":
                 # Stop rejected; treat as failure of the bracket pair.
@@ -531,8 +604,15 @@ async def apply_order_placement(
             # Best-effort cancel of the entry. For ETFs that paper-fill
             # immediately the cancel may race the fill and lose; the
             # operator must reconcile via TWS + manual audit entry.
+            # The cancel itself is bounded by ibkr_call_timeout_seconds
+            # so a hung cancel doesn't trap the worker after the
+            # original stop failure already raised.
             try:
-                await ibkr_client.cancel_order(plan.client_order_id)
+                await _await_ibkr_with_timeout(
+                    ibkr_client.cancel_order(plan.client_order_id),
+                    operation="cancelOrder.entry_after_stop_failure",
+                    timeout_seconds=ibkr_call_timeout_seconds,
+                )
                 log.warning(
                     "order_placement_entry_cancel_submitted_after_stop_failure",
                     entry_client_order_id=plan.client_order_id,
@@ -568,6 +648,22 @@ async def apply_order_placement(
         "placed_at_utc": placed_at.isoformat(),
         "leg": "entry",
     }
+    # Pre-append payload observability: log the audit payload key set so
+    # future invocations of the silent-"leg field missing" defect (2026-05-17
+    # drill 1, audit row seq=45 written WITHOUT the leg field even though
+    # the deployed code unambiguously sets it here) leave a breadcrumb
+    # showing exactly what was passed in to append_audit_event. The
+    # mystery there is unresolved; this log is the diagnostic for the
+    # next occurrence. Logging keys-only (not the full payload) keeps
+    # the log line small + avoids leaking signal-specific data.
+    log.info(
+        "order_placement_audit_payload_pre_append",
+        signal_id=str(plan.signal_id),
+        leg="entry",
+        payload_keys=sorted(entry_audit_payload.keys()),
+        payload_key_count=len(entry_audit_payload),
+        has_leg_field="leg" in entry_audit_payload,
+    )
     async with session_factory() as audit_session:
         audit_record = await append_audit_event(
             audit_session,
@@ -603,6 +699,18 @@ async def apply_order_placement(
             "leg": "stop",
             "parent_client_order_id": plan.client_order_id,
         }
+        # Pre-append payload observability — same diagnostic as the
+        # entry leg above. Logs the stop leg's payload keys so the
+        # "missing leg field" mystery from drill 1 has a breadcrumb
+        # on every future occurrence.
+        log.info(
+            "order_placement_audit_payload_pre_append",
+            signal_id=str(plan.signal_id),
+            leg="stop",
+            payload_keys=sorted(stop_audit_payload.keys()),
+            payload_key_count=len(stop_audit_payload),
+            has_leg_field="leg" in stop_audit_payload,
+        )
         async with session_factory() as stop_audit_session:
             stop_audit_record = await append_audit_event(
                 stop_audit_session,
@@ -827,12 +935,20 @@ class OrderPlacementWorker:
         account_id: UUID,
         env: Environment,
         poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
+        ibkr_call_timeout_seconds: float = DEFAULT_IBKR_CALL_TIMEOUT_SECONDS,
     ) -> None:
         self._session_factory = session_factory
         self._ibkr_client = ibkr_client
         self._account_id = account_id
         self._env: Environment = env
         self._poll_interval = poll_interval_seconds
+        # Per-call hard timeout on every IBKR adapter await (resolve,
+        # place_order, cancel_order, subscribe_order_status). Translates
+        # to IbkrPlacementError on expiry so the existing except paths
+        # handle it as a transient broker-unavailable event. See the
+        # DEFAULT_IBKR_CALL_TIMEOUT_SECONDS constant docstring above for
+        # the silent-worker context this protects against.
+        self._ibkr_call_timeout_seconds = ibkr_call_timeout_seconds
         self._stop_event = asyncio.Event()
         self._order_status_subscribed = False
         # Tracks broker_order_ids we've already emitted a "fill" SSE for
@@ -896,12 +1012,22 @@ class OrderPlacementWorker:
         for signal in signals:
             try:
                 plan = plan_order_placement(signal, env=self._env)
-                contract = await self._ibkr_client.resolve_contract(plan.market)
+                # Bound the IBKR contract-qualification call. ib-async's
+                # qualifyContractsAsync can hang indefinitely under
+                # broker-side sluggishness (silent-worker pattern from
+                # the 2026-05-17 drill 2). 30s default is the same
+                # ceiling apply_order_placement uses for placeOrder.
+                contract = await _await_ibkr_with_timeout(
+                    self._ibkr_client.resolve_contract(plan.market),
+                    operation="resolveContract",
+                    timeout_seconds=self._ibkr_call_timeout_seconds,
+                )
                 await apply_order_placement(
                     plan,
                     ibkr_client=self._ibkr_client,
                     contract=contract,
                     session_factory=self._session_factory,
+                    ibkr_call_timeout_seconds=self._ibkr_call_timeout_seconds,
                 )
                 placed += 1
             except OrderPlacementError as exc:
@@ -914,7 +1040,9 @@ class OrderPlacementWorker:
                 )
             except IbkrPlacementError as exc:
                 # Broker connectivity error — log, leave the signal in
-                # 'approved' for the next poll cycle to retry.
+                # 'approved' for the next poll cycle to retry. This also
+                # catches the _await_ibkr_with_timeout-translated
+                # TimeoutError from resolveContract / placeOrder above.
                 self._log.error(
                     "order_placement_broker_unavailable",
                     signal_id=str(signal.signal_id),
@@ -935,7 +1063,18 @@ class OrderPlacementWorker:
                 # connection at startup eventually wires the listener.
                 if not self._order_status_subscribed:
                     try:
-                        await self._ibkr_client.subscribe_order_status(self._on_order_status)
+                        # Bound the subscription call. ib-async's
+                        # reqOpenOrdersAsync (used internally by
+                        # subscribe_order_status to attach the event
+                        # handler) can hang under the same broker-
+                        # sluggishness pattern as place_order. A
+                        # bounded retry on the next poll iteration
+                        # eventually subscribes once broker is healthy.
+                        await _await_ibkr_with_timeout(
+                            self._ibkr_client.subscribe_order_status(self._on_order_status),
+                            operation="subscribeOrderStatus",
+                            timeout_seconds=self._ibkr_call_timeout_seconds,
+                        )
                         self._order_status_subscribed = True
                         self._log.info("order_placement_orderstatus_subscribed")
                     except Exception as exc:
@@ -1283,6 +1422,7 @@ class OrderPlacementWorker:
 
 
 __all__ = [
+    "DEFAULT_IBKR_CALL_TIMEOUT_SECONDS",
     "DEFAULT_POLL_INTERVAL_SECONDS",
     "RETRY_N_PHASE_1",
     "ApprovedSignalRow",
