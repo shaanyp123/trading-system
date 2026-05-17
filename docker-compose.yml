@@ -438,10 +438,32 @@ services:
 
   # lean_local — LEAN algorithm engine (Pivot-PR-A; post-pivot 2026-05-12).
   #
-  # Runs `quantconnect/lean:latest` on the operator's Hetzner VPS. Mounts
-  # `./lean/` as the algorithm directory + `./strategies/` for shared
-  # Python. POSTs signal events to `http://api:8000/api/internal/lean/signals`
-  # using the shared bearer from sops `lean.api_bearer_token`.
+  # Runs LEAN on the operator's Hetzner VPS. Mounts `./lean/` as the
+  # algorithm directory + `./strategies/` for shared Python. POSTs signal
+  # events to `http://api:8000/api/internal/lean/signals` using the shared
+  # bearer from sops `lean.api_bearer_token`.
+  #
+  # **Image tag rationale (2026-05-16 fix):** prior to today the `image:`
+  # field was `quantconnect/lean:latest` — the same tag as the upstream
+  # public LEAN image. Our `infrastructure/lean_local/Dockerfile` extends
+  # the upstream image (custom entrypoint that resolves sops bundle +
+  # deep-merges lean.json onto upstream config.json). When the local
+  # image gets re-tagged via our build, it overwrites the upstream tag in
+  # the local docker registry. But `docker compose up -d` without a
+  # preceding `docker compose build lean_local` will re-pull the pristine
+  # upstream image + clobber our custom layer. Discovered during the
+  # 2026-05-16 deploy: lean_local silently ran upstream's
+  # `BasicTemplateFrameworkAlgorithm` for hours instead of our
+  # `V1TrendFollowingAlgorithm` because the operator had `up -d`'d after
+  # `git pull` without rebuilding.
+  #
+  # Fix: image tag is now GHCR-namespaced (`ghcr.io/${GHCR_OWNER}/
+  # trading-lean-local:${RELEASE_SHA:-latest}`) matching the convention
+  # used by api/nextjs/discord_bot/webhook_pusher. `docker compose pull`
+  # won't ever collide with the upstream tag. The operator must
+  # `docker compose build lean_local` after upgrading the LEAN base
+  # image OR pushing strategy code changes (Phase 1+ CI publishes the
+  # built image to GHCR; today it's built locally on the VPS).
   #
   # Networks: `internal` only (no egress; QC bundled data is mounted as a
   # volume; live market data flows via `ib_gateway` on the internal net
@@ -454,7 +476,7 @@ services:
   #
   # See `deploy/lean_local/README.md` for the operator runbook.
   lean_local:
-    image: quantconnect/lean:latest
+    image: ghcr.io/${GHCR_OWNER:?set GHCR_OWNER in deploy/.env}/trading-lean-local:${RELEASE_SHA:-latest}
     build:
       context: .
       dockerfile: infrastructure/lean_local/Dockerfile
