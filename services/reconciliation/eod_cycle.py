@@ -73,6 +73,7 @@ from datetime import UTC, date, datetime
 from decimal import ROUND_HALF_EVEN, Decimal
 from typing import Any, Final
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import structlog
 from sqlalchemy import text
@@ -751,6 +752,38 @@ async def run_eod_cycle(
         alert_dispatch_hook=alert_dispatch_hook,
         state_transition_hook=state_transition_hook,
     )
+
+    # PR-K wiring (2026-05-16): roll up today's closed-trade attribution.
+    # Fires AFTER recon so cash + position state has already been
+    # refreshed + diffed. Emits one ATTRIBUTION_ROLLUP_RECORDED audit
+    # event per cycle (even on zero-closed-trade days — the audit gives
+    # the Today page a daily breadcrumb to render "$0 P&L" instead of
+    # "unknown").
+    #
+    # Phase 1 reality: trades.state='closed' is only populated by the
+    # PR-G exit-fill path which is NOT yet shipped — so this wiring
+    # writes the daily breadcrumb today + auto-fires the per-row INSERTs
+    # the day exit fills start landing. Zero impact on the recon
+    # convergence semantics.
+    try:
+        attribution_count = await _emit_daily_attribution_rollup(
+            session_factory=session_factory,
+            account_id=config.account_id,
+            env=config.env,
+            phase_at_emit=config.phase_at_emit,
+            snapshot_pulled_at_utc=snapshot.pulled_at_utc,
+        )
+    except Exception:
+        # PR-K is best-effort: a failure here MUST NOT take down the recon
+        # scheduler. The recon path already succeeded by this point + the
+        # operator's daily breadcrumb just stays missing for today.
+        log.exception(
+            "reconciliation_eod_cycle_attribution_failed",
+            account_id=str(config.account_id),
+            env=config.env,
+        )
+        attribution_count = 0
+
     duration_s = (datetime.now(tz=UTC) - started_at).total_seconds()
     log.info(
         "reconciliation_eod_cycle_completed",
@@ -760,9 +793,166 @@ async def run_eod_cycle(
         breaks_resolved=len(plan.breaks_resolved),
         actionable_break_count=plan.actionable_break_count,
         kill_switch_invoked=result.kill_switch_invoked,
+        attribution_rows_inserted=attribution_count,
         duration_seconds=round(duration_s, 2),
     )
     return result
+
+
+async def _emit_daily_attribution_rollup(
+    *,
+    session_factory: async_sessionmaker[Any],
+    account_id: UUID,
+    env: Environment,
+    phase_at_emit: PhaseAtEmit,
+    snapshot_pulled_at_utc: datetime,
+) -> int:
+    """Roll up today's closed trades into the attribution table.
+
+    Returns the number of attribution rows INSERTed. Today (pre-exit-
+    fill-path) this is always 0 + the audit row still fires.
+
+    Anchors session_date on America/New_York wall clock per dev-guide
+    §3.7 — the recon cycle's snapshot_pulled_at_utc is the natural
+    "as-of" timestamp for today's rollup.
+    """
+    from services.risk.attribution import (
+        apply_attribution_plan,
+        plan_daily_attribution,
+    )
+
+    et = ZoneInfo("America/New_York")
+    session_date_et = snapshot_pulled_at_utc.astimezone(et).date()
+
+    closed_trades = await fetch_closed_trades_for_session_date(
+        session_factory,
+        account_id=account_id,
+        env=env,
+        session_date_et=session_date_et,
+    )
+    plan = plan_daily_attribution(
+        account_id=account_id,
+        env=env,
+        session_date_et=session_date_et,
+        closed_trades_today=closed_trades,
+        rollup_at_utc=snapshot_pulled_at_utc,
+    )
+    result = await apply_attribution_plan(
+        plan,
+        session_factory=session_factory,
+        env=env,
+        phase_at_emit=phase_at_emit,
+        rollup_at_utc=snapshot_pulled_at_utc,
+    )
+    log.info(
+        "reconciliation_eod_cycle_attribution_emitted",
+        account_id=str(account_id),
+        env=env,
+        session_date_et=session_date_et.isoformat(),
+        closed_trade_count=len(closed_trades),
+        rows_inserted=result.inserted_row_count,
+        audit_event_uuid=str(result.audit_event_uuid),
+    )
+    return result.inserted_row_count
+
+
+async def fetch_closed_trades_for_session_date(
+    session_factory: async_sessionmaker[Any],
+    *,
+    account_id: UUID,
+    env: Environment,
+    session_date_et: date,
+) -> tuple[Any, ...]:
+    """Materialize the closed-trade rows for one session date.
+
+    Returns a tuple of :class:`services.risk.attribution.ClosedTradeForAttribution`
+    instances. Today (pre-exit-fill-path) this query always returns
+    empty — no trades have ``state='closed'`` because the exit path
+    raises ``UnsupportedFillScenarioError`` in
+    ``services/risk/fill_processor.py``. Returns ``()`` cleanly.
+
+    The JOIN with ``signals`` is necessary because expected_entry_price
+    + expected_slippage_bps live on the signal row (the planner needs
+    them to compute the realized-vs-expected delta).
+
+    Phase 1+ when the exit path lands:
+      * `trades.state = 'closed'` AND `trades.closed_at_utc::date = :session_date`
+      * JOIN signals ON signals.id = trades.entry_signal_id
+      * Optional LEFT JOIN signals AS exit_sig ON signals.id =
+        trades.exit_signal_id (Phase 1+ may carry the exit signal id;
+        today the column is nullable + the planner accepts None)
+
+    A05 enforced: Decimal(str(...)) round-trip on numeric columns.
+    A06 enforced: every datetime tz-aware UTC.
+    """
+    from services.risk.attribution import ClosedTradeForAttribution
+
+    async with session_factory() as session:
+        rows = (
+            await session.execute(
+                text(
+                    "SELECT "
+                    "  t.id AS trade_id, "
+                    "  t.entry_signal_id, "
+                    "  t.direction, "
+                    "  t.total_quantity, "
+                    "  t.avg_entry_price, "
+                    "  t.avg_exit_price, "
+                    "  t.realized_pnl_usd, "
+                    "  t.realized_commission, "
+                    "  t.opened_at_utc, "
+                    "  t.closed_at_utc, "
+                    "  s.expected_fill_price AS expected_entry_price, "
+                    "  s.expected_slippage_bps AS expected_slippage_bps, "
+                    "  s.emitted_at_utc AS expected_at_utc "
+                    "FROM trades t "
+                    "JOIN signals s ON s.id = t.entry_signal_id "
+                    "WHERE t.account_id = :acct "
+                    "  AND t.env = :env "
+                    "  AND t.state = 'closed' "
+                    "  AND t.closed_at_utc IS NOT NULL "
+                    "  AND (t.closed_at_utc AT TIME ZONE 'America/New_York')::date = :session "
+                ),
+                {"acct": account_id, "env": env, "session": session_date_et},
+            )
+        ).fetchall()
+
+    closed: list[Any] = []
+    for r in rows:
+        if r.avg_exit_price is None or r.realized_pnl_usd is None:
+            # Defensive: trades.state='closed' SHOULD imply both columns
+            # populated. Skip with a warning rather than crash.
+            log.warning(
+                "attribution_fetch_skipped_incomplete_trade",
+                trade_id=str(r.trade_id),
+                avg_exit_price_is_none=r.avg_exit_price is None,
+                realized_pnl_is_none=r.realized_pnl_usd is None,
+            )
+            continue
+        closed.append(
+            ClosedTradeForAttribution(
+                trade_id=UUID(str(r.trade_id)),
+                entry_signal_id=UUID(str(r.entry_signal_id)),
+                direction=r.direction,
+                total_quantity=int(r.total_quantity),
+                avg_entry_price=Decimal(str(r.avg_entry_price)),
+                avg_exit_price=Decimal(str(r.avg_exit_price)),
+                realized_pnl_usd=Decimal(str(r.realized_pnl_usd)),
+                realized_commission_usd=Decimal(str(r.realized_commission or 0)),
+                opened_at_utc=r.opened_at_utc,
+                closed_at_utc=r.closed_at_utc,
+                expected_entry_price=Decimal(str(r.expected_entry_price))
+                if r.expected_entry_price is not None
+                else Decimal("0"),
+                expected_exit_price=None,  # Phase 1+ exit-signal carries this
+                expected_slippage_bps=Decimal(str(r.expected_slippage_bps))
+                if r.expected_slippage_bps is not None
+                else Decimal("0"),
+                expected_holding_days=0,  # Phase 1+ derived from strategy params
+                expected_at_utc=r.expected_at_utc,
+            )
+        )
+    return tuple(closed)
 
 
 def make_cycle_callback(
