@@ -292,6 +292,45 @@ class APISettings(BaseSettings):
             "of marginal DB pressure."
         ),
     )
+    # -- Async task liveness monitor ----------------------------------------
+    #
+    # 2026-05-17 follow-up to the silent-worker-death pattern observed
+    # across three production drills. The lifespan spawns 3+ long-lived
+    # asyncio tasks (OrderPlacementWorker, ReconciliationScheduler,
+    # HeartbeatProbe). When a task dies via an uncaught exception, asyncio
+    # marks it `.done()` but the exception is only surfaced if something
+    # `await`s the task or calls `.exception()`. Without an explicit
+    # observer, dead tasks are invisible until the operator notices a
+    # secondary symptom (no fills, no recon, etc.).
+    #
+    # The monitor is a 4th lifespan task that ticks every
+    # ``async_task_monitor_interval_seconds`` and inspects each tracked
+    # task's `.done()` / `.exception()`. On unexpected completion it logs
+    # a `async_task_died` event at ERROR with the task name + exception
+    # repr (or "done without exception" if the task exited cleanly). The
+    # monitor does NOT attempt to restart dead tasks — restart semantics
+    # depend on the task (worker is restart-safe via api restart; the
+    # heartbeat probe is too) but a blind restart could mask real bugs.
+    # Phase 1+ may add per-task restart policies behind opt-in flags.
+    async_task_monitor_enabled: bool = Field(
+        default=True,
+        description=(
+            "When False, the api lifespan skips the async-task liveness "
+            "monitor. Tests inject False to avoid spawning the monitor "
+            "in unit-test contexts; production should leave True."
+        ),
+    )
+    async_task_monitor_interval_seconds: float = Field(
+        default=30.0,
+        gt=0.0,
+        le=600.0,
+        description=(
+            "Seconds between async-task liveness probes. Default 30s "
+            "balances log noise against detection latency for silent "
+            "task death (the operator sees the next health-check + "
+            "log scan within ~1 minute of failure)."
+        ),
+    )
     # -- EOD reconciliation scheduler ---------------------------------------
     #
     # Worker-PR-3b follow-up (post-pivot 2026-05-12). Wires the
