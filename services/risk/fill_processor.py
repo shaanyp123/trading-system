@@ -24,14 +24,30 @@ The split mirrors the plan-then-apply convention used by
     with the minted audit_event_uuids + ids of the new rows for downstream
     SSE emission.
 
-**PR-G scope: entry case only.** Per the spec, Phase 1 signals are all
-entry signals (LEAN never emits close signals; exits come via separate
-exit logic deferred to Phase 1+). This module asserts that constraint:
-fills whose side opposes the existing position direction (i.e., would
-reduce the position toward zero) are logged at WARNING + an
-:class:`UnsupportedFillScenarioError` is raised, with the audit /
-fills / orders writes preserved up to the point of failure. The
-operator manually reconciles via the Audit page + psql.
+**Scenario classification** (since 2026-05-17 exit-path extension):
+
+  * ``ENTRY`` — prior position is zero OR same-direction; fill grows
+    the position. Emits ORDER_FILLED → POSITION_OPENED/POSITION_UPDATED
+    → BALANCE_SNAPSHOT_RECORDED → optional TRADE_OPENED.
+  * ``EXIT_FULL_CLOSE`` — opposite-direction fill that takes ``|prior|``
+    to exactly zero (the bracket-order stop fires, or LEAN emits an
+    explicit close signal). Emits ORDER_FILLED → POSITION_CLOSED →
+    BALANCE_SNAPSHOT_RECORDED → TRADE_CLOSED. The position row is
+    DELETEd; the trade row is UPDATEd with state='closed' +
+    realized_pnl_usd + avg_exit_price + closed_at_utc + exit_order_id.
+  * ``EXIT_PARTIAL`` (deferred Phase 2+) — opposite fill that reduces
+    but doesn't reach zero. Raises :class:`UnsupportedFillScenarioError`.
+  * ``EXIT_REVERSAL`` (deferred Phase 2+) — opposite fill that crosses
+    zero into a new opposite-direction position. Raises.
+
+For the EXIT_FULL_CLOSE path, the lookup convention is **same-signal-id**
+— the bracket-order stop placed by
+:mod:`services.risk.order_placement_worker.apply_order_placement` carries
+``signal_id = entry_signal.id`` (Option B per the 2026-05-17 session brief).
+The entry + stop orders both point at the same signal row; differentiation
+is via ``orders.direction`` + ``orders.order_type``. That means
+:func:`fetch_prior_trade(entry_signal_id=context.signal_id)` resolves the
+open trade for both entry-add and stop-fill paths without extra plumbing.
 
 **Audit event taxonomy** (`services/audit/event_types.py`):
 
@@ -40,14 +56,17 @@ operator manually reconciles via the Audit page + psql.
   * ``POSITION_OPENED`` — first non-zero quantity for an
     (account, market, contract_id) tuple.
   * ``POSITION_UPDATED`` — quantity change without reaching zero
-    (same-direction adds in PR-G scope).
+    (same-direction adds).
+  * ``POSITION_CLOSED`` — quantity reaches zero (exit-close path).
   * ``BALANCE_SNAPSHOT_RECORDED`` — new ``balances`` row with the cash +
     NAV deltas from the fill.
   * ``TRADE_OPENED`` — first fill against a signal (state=open_position).
+  * ``TRADE_CLOSED`` — exit fill brings position to zero; realized P&L
+    + state='closed' stamped.
 
 Subsequent fills against the same signal (e.g., a 3-of-5 partial + a
 2-of-5 completion when the IBKR adapter re-fires Filled with cumulative
-totals — note: PR-G's contract per the worker is that we act ONCE per
+totals — note: the worker's contract is that we act ONCE per
 broker_order_id) only emit ORDER_FILLED + POSITION_UPDATED +
 BALANCE_SNAPSHOT_RECORDED; the trade row is UPDATEd in place without an
 event because TRADE_REALIZED (Phase 1+) is the lifecycle-final marker
@@ -206,9 +225,10 @@ class PriorTradeRow:
     """Snapshot of an existing OPEN trade row for the same signal.
 
     Returned by the lookup helper as ``None`` when no trade row exists
-    yet (first fill on this signal). PR-G entry-only: when a prior row
-    exists, this fill is adding to it; quantity grows + avg_entry_price
-    is recomputed.
+    yet (first fill on this signal). For the entry-add path: this fill
+    grows the trade; quantity + avg_entry_price recomputed. For the
+    exit-close path: this snapshot supplies the entry-side cost basis
+    + accumulated commission used to compute realized P&L.
     """
 
     trade_id: UUID
@@ -218,6 +238,11 @@ class PriorTradeRow:
 
     total_quantity: int
     avg_entry_price: Decimal
+    realized_commission_usd: Decimal
+    """Cumulative commission across all fills on this trade so far. For
+    the exit-close path the planner adds the exit fill's commission to
+    this value to compute the trade's total commission against gross
+    P&L. NUMERIC(20,4) per the trades schema."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -331,9 +356,14 @@ TradeAction = Literal["open", "update", "close"]
 class TradeMutation:
     """The ``trades`` mutation the plan prescribes.
 
-    PR-G scope: ``action='open'`` (first fill on signal) or
-    ``action='update'`` (subsequent fill grows the trade). The 'close'
-    action is reserved for Phase 1+ when exit fills land.
+    Actions:
+
+    * ``action='open'`` — first fill on signal; INSERT trades row.
+    * ``action='update'`` — subsequent same-direction fill; UPDATE
+      ``total_quantity`` + ``avg_entry_price`` + accumulate commission.
+    * ``action='close'`` — exit fill brings position to zero; UPDATE
+      ``state='closed'`` + stamp ``closed_at_utc`` + ``exit_order_id``
+      + ``avg_exit_price`` + ``realized_pnl_usd`` + accumulate commission.
     """
 
     action: TradeAction
@@ -352,18 +382,42 @@ class TradeMutation:
     entry_order_id: UUID
     direction: Literal["long", "short"]
     opened_at_utc: datetime
-    """Set to filled_at_utc on action='open'; preserved on 'update'."""
+    """Set to filled_at_utc on action='open'; preserved on 'update'/'close'."""
 
     new_total_quantity: int
     new_avg_entry_price: Decimal
     realized_commission_usd: Decimal
-    """Cumulative commission across all fills on this trade. PR-G
-    adds the new fill's commission to the prior trade's cumulative."""
+    """For 'open': total commission on this trade (= entry fill's commission).
+    For 'update' / 'close': the FILL's commission DELTA; the apply step's
+    UPDATE SQL accumulates via ``realized_commission_usd +
+    :comm`` so the prior trade's running total is preserved."""
 
     managed_by_version: str
     strategy_hash: str
     parameter_set_hash: str
     slippage_calibration_version_id: UUID
+
+    # ----- Close-action only fields (None on 'open'/'update') -----
+
+    closed_at_utc: datetime | None = None
+    """Tz-aware UTC when the trade closed. Set on action='close';
+    typically equal to the exit fill's ``filled_at_utc``."""
+
+    exit_order_id: UUID | None = None
+    """The orders.id of the exit-side order (the stop-loss order whose
+    fill triggered the close, or the explicit exit order). Set on
+    action='close'."""
+
+    avg_exit_price: Decimal | None = None
+    """Volume-weighted average exit price; NUMERIC(20,8). Set on
+    action='close'. PR-G full-close path: equals the exit fill's
+    fill_price (single exit fill assumption)."""
+
+    realized_pnl_usd: Decimal | None = None
+    """Quantized to NUMERIC(20,4). Computed as
+    ``(avg_exit - avg_entry) * qty - total_commission`` for longs,
+    ``(avg_entry - avg_exit) * qty - total_commission`` for shorts.
+    Set on action='close'."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -484,60 +538,122 @@ def _recompute_avg_cost(
     return _quantize_avg_cost(weighted / Decimal(new_total_qty))
 
 
-def _validate_entry_direction_match(
+#: Scenario classification for one fill event. The planner branches on
+#: this value to choose the entry-path vs. exit-close-path mutation set.
+#: Partial exits + direction reversals raise
+#: :class:`UnsupportedFillScenarioError` (Phase 2+ scope).
+FillScenario = Literal["ENTRY", "EXIT_FULL_CLOSE"]
+
+
+def _classify_fill_scenario(
     *,
     signal_direction: Literal["long", "short"],
     order_direction: Literal["buy", "sell"],
     prior_position_quantity: int,
-) -> None:
-    """Assert the fill is an entry case (no opposition with prior position).
+    fill_quantity: int,
+) -> FillScenario:
+    """Classify a fill into ENTRY or EXIT_FULL_CLOSE.
 
-    The PR-G entry-only contract:
+    Branches:
 
-    * Signal direction matches order direction (long→buy, short→sell).
-    * Prior position direction matches signal direction (or no prior
-      position). Specifically:
-        - signal=long → prior_quantity ≥ 0 (no short open)
-        - signal=short → prior_quantity ≤ 0 (no long open)
+    * **ENTRY** — prior position is zero OR the fill is same-direction
+      (buy adding to a long, sell adding to a short). The signal must
+      align with the order side (``long→buy`` / ``short→sell``) and the
+      signal direction must match the prior position direction.
+    * **EXIT_FULL_CLOSE** — opposite-direction fill that takes
+      ``|prior_position_quantity|`` to **exactly zero** (the bracket
+      stop-loss fires, or LEAN emits an explicit close signal). The
+      signal_direction is the ORIGINAL entry direction because the
+      stop order reuses the entry signal_id per the bracket-order
+      placement contract.
 
-    Violations raise :class:`UnsupportedFillScenarioError`. The worker
-    catches + logs; the operator manually reconciles.
+    Raises :class:`UnsupportedFillScenarioError` for:
+
+    * **EXIT_PARTIAL** — ``fill_quantity < |prior|`` (close part of
+      the position). Deferred to Phase 2+ when partial-close signals
+      land.
+    * **EXIT_REVERSAL** — ``fill_quantity > |prior|`` (close + open
+      opposite direction in a single fill). Deferred to Phase 2+.
+    * Entry direction mismatches (signal_direction vs order_direction;
+      signal_direction vs prior position direction) — these are
+      almost-certainly programmer-error paths preserved from the
+      pre-2026-05-17 ``_validate_entry_direction_match`` guard.
     """
-    expected_order_side = "buy" if signal_direction == "long" else "sell"
-    if order_direction != expected_order_side:
+    # Same-direction (or first-fill) → ENTRY
+    same_direction_add = (
+        prior_position_quantity == 0
+        or (prior_position_quantity > 0 and order_direction == "buy")
+        or (prior_position_quantity < 0 and order_direction == "sell")
+    )
+    if same_direction_add:
+        expected_order_side = "buy" if signal_direction == "long" else "sell"
+        if order_direction != expected_order_side:
+            raise UnsupportedFillScenarioError(
+                (
+                    f"Order direction {order_direction!r} does not match signal "
+                    f"direction {signal_direction!r}; entry case requires "
+                    f"(long→buy, short→sell)."
+                ),
+                details={
+                    "signal_direction": signal_direction,
+                    "order_direction": order_direction,
+                    "prior_position_quantity": prior_position_quantity,
+                },
+            )
+        if prior_position_quantity > 0 and signal_direction == "short":
+            raise UnsupportedFillScenarioError(
+                (
+                    "Short signal with prior long position is a cross-direction "
+                    "overlap; not a clean entry add nor an exit close."
+                ),
+                details={
+                    "signal_direction": signal_direction,
+                    "prior_position_quantity": prior_position_quantity,
+                },
+            )
+        if prior_position_quantity < 0 and signal_direction == "long":
+            raise UnsupportedFillScenarioError(
+                (
+                    "Long signal with prior short position is a cross-direction "
+                    "overlap; not a clean entry add nor an exit close."
+                ),
+                details={
+                    "signal_direction": signal_direction,
+                    "prior_position_quantity": prior_position_quantity,
+                },
+            )
+        return "ENTRY"
+
+    # Opposite-direction → exit-class. Branch on magnitude.
+    abs_prior = abs(prior_position_quantity)
+    if fill_quantity == abs_prior:
+        return "EXIT_FULL_CLOSE"
+    if fill_quantity < abs_prior:
         raise UnsupportedFillScenarioError(
             (
-                f"Order direction {order_direction!r} does not match signal "
-                f"direction {signal_direction!r}; PR-G handles entry case only "
-                f"(long→buy, short→sell). Exit / hedging flows are Phase 1+."
+                f"Partial exit fill (fill_quantity={fill_quantity} < "
+                f"|prior_position_quantity|={abs_prior}); deferred to Phase 2+."
             ),
             details={
-                "signal_direction": signal_direction,
+                "fill_quantity": fill_quantity,
+                "prior_position_quantity": prior_position_quantity,
                 "order_direction": order_direction,
             },
         )
-    if signal_direction == "long" and prior_position_quantity < 0:
-        raise UnsupportedFillScenarioError(
-            (
-                "Long entry signal would reduce an existing short position "
-                "toward zero; PR-G handles entry case only."
-            ),
-            details={
-                "signal_direction": signal_direction,
-                "prior_position_quantity": prior_position_quantity,
-            },
-        )
-    if signal_direction == "short" and prior_position_quantity > 0:
-        raise UnsupportedFillScenarioError(
-            (
-                "Short entry signal would reduce an existing long position "
-                "toward zero; PR-G handles entry case only."
-            ),
-            details={
-                "signal_direction": signal_direction,
-                "prior_position_quantity": prior_position_quantity,
-            },
-        )
+    # fill_quantity > abs_prior → reversal
+    raise UnsupportedFillScenarioError(
+        (
+            f"Exit reversal fill (fill_quantity={fill_quantity} > "
+            f"|prior_position_quantity|={abs_prior}); deferred to Phase 2+. "
+            "The fill would cross zero into a new opposite-direction "
+            "position which Phase 1 does not support."
+        ),
+        details={
+            "fill_quantity": fill_quantity,
+            "prior_position_quantity": prior_position_quantity,
+            "order_direction": order_direction,
+        },
+    )
 
 
 def plan_fill_application(
@@ -554,20 +670,18 @@ def plan_fill_application(
     Pure policy — no I/O, no clock, no random. Same inputs always
     produce the same plan.
 
-    Audit-event order in the resulting plan:
+    Dispatches to one of two scenario-specific planners after classifying
+    via :func:`_classify_fill_scenario`:
 
-      1. ``ORDER_FILLED`` — broker-side confirmation, always first.
-      2. ``POSITION_OPENED`` or ``POSITION_UPDATED`` — depending on
-         whether a prior position row existed.
-      3. ``BALANCE_SNAPSHOT_RECORDED`` — the new cash + NAV snapshot.
-      4. ``TRADE_OPENED`` — only when no prior trade row existed for
-         this signal. Subsequent fills against the same signal do
-         NOT emit a new trade audit event; the trade row is UPDATEd
-         in place + ORDER_FILLED + POSITION_UPDATED capture the state.
+    * **ENTRY** → :func:`_plan_entry_fill_application`. Audit events:
+      ``ORDER_FILLED`` → ``POSITION_OPENED|UPDATED`` →
+      ``BALANCE_SNAPSHOT_RECORDED`` → optional ``TRADE_OPENED``.
+    * **EXIT_FULL_CLOSE** → :func:`_plan_exit_close_fill_application`.
+      Audit events: ``ORDER_FILLED`` → ``POSITION_CLOSED`` →
+      ``BALANCE_SNAPSHOT_RECORDED`` → ``TRADE_CLOSED``.
 
-    Raises :class:`UnsupportedFillScenarioError` for exit / hedging
-    cases (signal direction opposite the prior position) — see
-    :func:`_validate_entry_direction_match`.
+    Raises :class:`UnsupportedFillScenarioError` for partial exits +
+    direction reversals (Phase 2+ scope).
     """
     if timestamp_utc is None:
         timestamp_utc = payload.filled_at_utc
@@ -596,31 +710,97 @@ def plan_fill_application(
         )
 
     prior_qty_signed = prior_position.quantity if prior_position is not None else 0
-    _validate_entry_direction_match(
+    scenario = _classify_fill_scenario(
         signal_direction=context.signal_direction,
         order_direction=context.order_direction,
         prior_position_quantity=prior_qty_signed,
+        fill_quantity=payload.fill_quantity,
     )
 
+    if scenario == "ENTRY":
+        return _plan_entry_fill_application(
+            context=context,
+            payload=payload,
+            prior_position=prior_position,
+            prior_trade=prior_trade,
+            prior_balance=prior_balance,
+        )
+    # EXIT_FULL_CLOSE
+    if prior_position is None:
+        # Classifier guarantees prior_position is not None on this branch
+        # (you can't exit a position that doesn't exist). Defensive raise
+        # surfaces the contract violation.
+        raise FillProcessingError(
+            error_code="EXIT_NO_PRIOR_POSITION",
+            message=(
+                "EXIT_FULL_CLOSE scenario reached with no prior position row; "
+                "fill_processor invariant violated."
+            ),
+        )
+    if prior_trade is None:
+        raise FillProcessingError(
+            error_code="EXIT_NO_PRIOR_TRADE",
+            message=(
+                "EXIT_FULL_CLOSE scenario reached but no open trade row was "
+                "found for the entry signal_id. Either the bracket-order stop "
+                "is not reusing the entry signal_id (Option B contract violated) "
+                "or the trade row was prematurely closed. Operator must "
+                "reconcile manually."
+            ),
+            details={
+                "signal_id": str(context.signal_id),
+                "market": context.market,
+            },
+        )
+    return _plan_exit_close_fill_application(
+        context=context,
+        payload=payload,
+        prior_position=prior_position,
+        prior_trade=prior_trade,
+        prior_balance=prior_balance,
+    )
+
+
+def _plan_entry_fill_application(
+    *,
+    context: FillContext,
+    payload: FillIngestPayload,
+    prior_position: PriorPositionRow | None,
+    prior_trade: PriorTradeRow | None,
+    prior_balance: PriorBalanceSnapshot,
+) -> FillApplyPlan:
+    """Build the apply-plan for an ENTRY-class fill.
+
+    Audit-event order:
+
+      1. ``ORDER_FILLED`` — broker-side confirmation, always first.
+      2. ``POSITION_OPENED`` or ``POSITION_UPDATED`` — depending on
+         whether a prior position row existed.
+      3. ``BALANCE_SNAPSHOT_RECORDED`` — the new cash + NAV snapshot.
+      4. ``TRADE_OPENED`` — only when no prior trade row existed for
+         this signal. Subsequent fills against the same signal do
+         NOT emit a new trade audit event; the trade row is UPDATEd
+         in place + ORDER_FILLED + POSITION_UPDATED capture the state.
+    """
+    prior_qty_signed = prior_position.quantity if prior_position is not None else 0
+
     # Signed delta to apply to positions_current.quantity. Buys are
-    # positive, sells are negative. PR-G entry contract: signal long →
+    # positive, sells are negative. Entry contract: signal long →
     # buy → positive delta; signal short → sell → negative delta.
     signed_fill_delta = (
         payload.fill_quantity if context.order_direction == "buy" else -payload.fill_quantity
     )
     new_quantity_signed = prior_qty_signed + signed_fill_delta
     if new_quantity_signed == 0:
-        # PR-G doesn't handle the close case (qty → 0). The entry-match
-        # check above would have caught a sign-opposite flip; reaching
-        # here means the prior position was already 0 AND the order
-        # delta is 0, which contradicts the fill_quantity > 0 guard.
-        # Defensive raise to surface the bug instead of producing a
-        # 0-qty positions_current row.
+        # Entry branch reaching 0 quantity means the prior position was
+        # already 0 AND the order delta is 0 (which contradicts the
+        # fill_quantity > 0 guard upstream). Defensive raise to surface
+        # the invariant violation.
         raise FillProcessingError(
             error_code="POSITION_DELTA_ZERO",
             message=(
-                "Computed new_quantity is 0 despite non-zero fill_quantity; "
-                "fill processor invariant violated."
+                "Computed new_quantity is 0 despite non-zero fill_quantity on "
+                "entry branch; fill_processor invariant violated."
             ),
             details={
                 "prior_quantity": prior_qty_signed,
@@ -681,7 +861,7 @@ def plan_fill_application(
         trade_opened_at_utc = prior_trade.trade_created_at
 
     # Balance snapshot: cash decreases by notional + commission on buy,
-    # increases on sell. PR-G entry contract: buy = long entry (cash
+    # increases on sell. Entry contract: buy = long entry (cash
     # out); sell = short entry (cash IN per short-sale proceeds — IBKR
     # paper account credits the notional + holds margin). Use the
     # signed-delta convention: buy notional reduces cash, sell notional
@@ -691,7 +871,7 @@ def plan_fill_application(
         cash_delta = -(notional_decimal + payload.commission_usd)
     else:
         # Short entry: cash credit minus commission. Margin held is a
-        # separate column we don't update in PR-G (positions_current
+        # separate column we don't update here (positions_current
         # tracks margin_held; the recon path keeps it in sync).
         cash_delta = notional_decimal - payload.commission_usd
     new_cash = prior_balance.cash_usd + cash_delta
@@ -727,6 +907,7 @@ def plan_fill_application(
                 "commission_usd": str(payload.commission_usd),
                 "new_order_status": new_order_status,
                 "filled_at_utc": payload.filled_at_utc.isoformat(),
+                "scenario": "ENTRY",
             },
         )
     )
@@ -864,6 +1045,286 @@ def plan_fill_application(
     )
 
 
+def _plan_exit_close_fill_application(
+    *,
+    context: FillContext,
+    payload: FillIngestPayload,
+    prior_position: PriorPositionRow,
+    prior_trade: PriorTradeRow,
+    prior_balance: PriorBalanceSnapshot,
+) -> FillApplyPlan:
+    """Build the apply-plan for an EXIT_FULL_CLOSE-class fill.
+
+    The bracket stop-loss fired (or LEAN emitted an explicit close
+    signal). The fill takes ``|prior_position.quantity|`` to zero
+    EXACTLY — partial closes + reversals raise upstream in
+    :func:`_classify_fill_scenario`.
+
+    Audit-event order:
+
+      1. ``ORDER_FILLED`` — broker-side confirmation of the exit fill.
+      2. ``POSITION_CLOSED`` — position row will be DELETEd by apply.
+      3. ``BALANCE_SNAPSHOT_RECORDED`` — post-close cash + NAV (NAV
+         equals cash since position quantity is now zero).
+      4. ``TRADE_CLOSED`` — trade row will be UPDATEd to state='closed'
+         with realized_pnl_usd + closed_at_utc + exit_order_id +
+         avg_exit_price stamped.
+
+    Realized P&L convention (per backend-spec §3.6):
+
+    * Long close: ``(avg_exit - avg_entry) * qty - total_commission``
+    * Short close: ``(avg_entry - avg_exit) * qty - total_commission``
+
+    where ``total_commission`` is the trade's accumulated commission
+    across all entry fills + this exit fill. Quantized to NUMERIC(20,4).
+    """
+    # Defensive invariants — should never trigger because the classifier
+    # already gated on these. Raising here surfaces the contract violation
+    # rather than producing a silent invalid plan.
+    abs_prior_qty = abs(prior_position.quantity)
+    if payload.fill_quantity != abs_prior_qty:
+        raise FillProcessingError(
+            error_code="EXIT_CLOSE_QTY_MISMATCH",
+            message=(
+                f"EXIT_FULL_CLOSE fill_quantity={payload.fill_quantity} != "
+                f"|prior_position|={abs_prior_qty}; classifier invariant violated."
+            ),
+            details={
+                "fill_quantity": payload.fill_quantity,
+                "prior_position_quantity": prior_position.quantity,
+            },
+        )
+    # The trade's quantity must align with the position being closed.
+    # If they diverge, the operator has manually edited one but not the
+    # other; bail and require manual reconcile.
+    if prior_trade.total_quantity != abs_prior_qty:
+        raise FillProcessingError(
+            error_code="EXIT_CLOSE_TRADE_QTY_MISMATCH",
+            message=(
+                f"Trade total_quantity={prior_trade.total_quantity} does not match "
+                f"|position|={abs_prior_qty}; row drift between trades + "
+                "positions_current. Operator must reconcile manually before the "
+                "exit fill can apply."
+            ),
+            details={
+                "trade_id": str(prior_trade.trade_id),
+                "trade_total_quantity": prior_trade.total_quantity,
+                "prior_position_quantity": prior_position.quantity,
+            },
+        )
+
+    # Trade direction is the sign of the (now-closing) position.
+    trade_direction: Literal["long", "short"] = "long" if prior_position.quantity > 0 else "short"
+
+    # Realized P&L computation.
+    avg_exit = payload.fill_price
+    avg_entry = prior_trade.avg_entry_price
+    qty = Decimal(abs_prior_qty)
+    if trade_direction == "long":
+        gross_pnl = (avg_exit - avg_entry) * qty
+    else:
+        gross_pnl = (avg_entry - avg_exit) * qty
+    total_commission_usd = prior_trade.realized_commission_usd + payload.commission_usd
+    realized_pnl_raw = gross_pnl - total_commission_usd
+    # trades.realized_pnl_usd is NUMERIC(20,4).
+    realized_pnl_usd = realized_pnl_raw.quantize(Decimal("0.0001"), rounding=ROUND_HALF_EVEN)
+    # Quantize total_commission so the audit payload matches the
+    # NUMERIC(20,4) schema for trades.realized_commission_usd.
+    total_commission_q = total_commission_usd.quantize(Decimal("0.0001"), rounding=ROUND_HALF_EVEN)
+    gross_pnl_q = gross_pnl.quantize(Decimal("0.0001"), rounding=ROUND_HALF_EVEN)
+
+    # Order status: filled if cumulative reached target, else partially_filled.
+    # Exit orders are typically full-fill (the stop fires once); but we
+    # mirror the entry path's logic for safety.
+    if payload.cumulative_filled_quantity >= context.target_contracts:
+        new_order_status: Literal["filled", "partially_filled"] = "filled"
+    else:
+        new_order_status = "partially_filled"
+
+    # Cash + NAV deltas.
+    # Long close (sell): cash IN (proceeds) - commission
+    # Short close (buy): cash OUT (cost) + commission
+    notional_decimal = payload.fill_price * Decimal(payload.fill_quantity)
+    if context.order_direction == "buy":
+        # Closing a short by buying back. Cash decreases by notional + commission.
+        cash_delta = -(notional_decimal + payload.commission_usd)
+    else:
+        # Closing a long by selling. Cash increases by notional - commission.
+        cash_delta = notional_decimal - payload.commission_usd
+    new_cash = prior_balance.cash_usd + cash_delta
+    # Post-close: position quantity is 0, so MTM contribution is 0 and
+    # NAV equals cash.
+    nav_q = new_cash.quantize(Decimal("0.0001"), rounding=ROUND_HALF_EVEN)
+    cash_q = new_cash.quantize(Decimal("0.0001"), rounding=ROUND_HALF_EVEN)
+
+    closed_at_utc = payload.filled_at_utc
+
+    # ----- Audit events (audit-first) -----
+    audit_events: list[PendingAuditEvent] = [
+        PendingAuditEvent(
+            event_type=AuditEventType.ORDER_FILLED,
+            payload={
+                "signal_id": str(context.signal_id),
+                "order_id": str(context.order_id),
+                "account_id": str(context.account_id),
+                "broker_fill_id": payload.broker_fill_id,
+                "market": context.market,
+                "order_direction": context.order_direction,
+                "fill_quantity": payload.fill_quantity,
+                "cumulative_filled_quantity": payload.cumulative_filled_quantity,
+                "target_contracts": context.target_contracts,
+                "fill_price": str(payload.fill_price),
+                "commission_usd": str(payload.commission_usd),
+                "new_order_status": new_order_status,
+                "filled_at_utc": payload.filled_at_utc.isoformat(),
+                "scenario": "EXIT_FULL_CLOSE",
+            },
+        ),
+        PendingAuditEvent(
+            event_type=AuditEventType.POSITION_CLOSED,
+            payload={
+                "signal_id": str(context.signal_id),
+                "order_id": str(context.order_id),
+                "account_id": str(context.account_id),
+                "market": context.market,
+                "contract_id": str(context.contract_id) if context.contract_id else None,
+                "prior_quantity": prior_position.quantity,
+                "fill_quantity_signed": (
+                    payload.fill_quantity
+                    if context.order_direction == "buy"
+                    else -payload.fill_quantity
+                ),
+                "new_quantity": 0,
+                "prior_avg_cost": str(prior_position.avg_cost),
+                "closed_at_utc": closed_at_utc.isoformat(),
+                "trade_id": str(prior_trade.trade_id),
+            },
+        ),
+        PendingAuditEvent(
+            event_type=AuditEventType.BALANCE_SNAPSHOT_RECORDED,
+            payload={
+                "account_id": str(context.account_id),
+                "snapshot_ts": payload.filled_at_utc.isoformat(),
+                "trigger": "fill_propagation",
+                "source": BALANCE_SOURCE_FROM_FILL,
+                "prior_cash_usd": str(prior_balance.cash_usd),
+                "cash_delta_usd": str(cash_delta),
+                "new_cash_usd": str(cash_q),
+                "new_net_liquidation_usd": str(nav_q),
+                "post_fill_position_mtm_usd": "0",
+            },
+        ),
+        PendingAuditEvent(
+            event_type=AuditEventType.TRADE_CLOSED,
+            payload={
+                "signal_id": str(context.signal_id),
+                "trade_id": str(prior_trade.trade_id),
+                "entry_order_id": None,  # echoed by audit; not load-bearing
+                "exit_order_id": str(context.order_id),
+                "account_id": str(context.account_id),
+                "market": context.market,
+                "direction": trade_direction,
+                "total_quantity": abs_prior_qty,
+                "avg_entry_price": str(avg_entry),
+                "avg_exit_price": str(avg_exit),
+                "gross_pnl_usd": str(gross_pnl_q),
+                "realized_commission_usd": str(total_commission_q),
+                "realized_pnl_usd": str(realized_pnl_usd),
+                "closed_at_utc": closed_at_utc.isoformat(),
+                "managed_by_version": context.managed_by_version,
+            },
+        ),
+    ]
+
+    # ----- Table mutations -----
+    order_change = OrderStatusChange(
+        order_id=context.order_id,
+        order_created_at=context.order_created_at,
+        new_status=new_order_status,
+    )
+
+    fill_insert = FillInsert(
+        account_id=context.account_id,
+        env=context.env,
+        order_id=context.order_id,
+        broker_fill_id=payload.broker_fill_id,
+        filled_at_utc=payload.filled_at_utc,
+        fill_price=payload.fill_price,
+        fill_quantity=payload.fill_quantity,
+        commission_usd=payload.commission_usd,
+        exchange_fee_usd=Decimal("0"),
+    )
+
+    position_mutation = PositionMutation(
+        action="close",
+        position_id=prior_position.position_id,
+        account_id=context.account_id,
+        market=context.market,
+        contract_id=context.contract_id,
+        # new_quantity / new_avg_cost are unused on the close branch (the
+        # apply step DELETEs the row) but the dataclass requires values.
+        # Echo the post-close zero + the prior avg_cost as documentation.
+        new_quantity=0,
+        new_avg_cost=prior_position.avg_cost,
+        last_mark_ts=payload.filled_at_utc,
+        managed_by_version=context.managed_by_version,
+    )
+
+    balance_insert = BalanceInsert(
+        account_id=context.account_id,
+        snapshot_ts=payload.filled_at_utc,
+        net_liquidation=nav_q,
+        cash_usd=cash_q,
+        excess_liquidity=cash_q,
+        used_margin_pct=Decimal("0"),
+        source=BALANCE_SOURCE_FROM_FILL,
+    )
+
+    trade_mutation = TradeMutation(
+        action="close",
+        trade_id=prior_trade.trade_id,
+        trade_created_at=prior_trade.trade_created_at,
+        account_id=context.account_id,
+        env=context.env,
+        market=context.market,
+        contract_id=context.contract_id,
+        # entry_signal_id and entry_order_id are preserved on the trade;
+        # the apply UPDATE only touches the close-side fields. We echo
+        # the entry_signal_id (== context.signal_id under the shared-
+        # signal contract) here for dataclass completeness; entry_order_id
+        # is NOT available in FillContext for the close path (the context
+        # holds the EXIT order id), so we use the same context.order_id
+        # as a placeholder — the apply UPDATE doesn't reference it.
+        entry_signal_id=context.signal_id,
+        entry_order_id=context.order_id,
+        direction=trade_direction,
+        opened_at_utc=prior_trade.trade_created_at,
+        # new_total_quantity unchanged on close (the trade's total qty is
+        # what was opened; close doesn't reduce it conceptually — the
+        # POSITION goes to 0, not the trade's recorded size).
+        new_total_quantity=prior_trade.total_quantity,
+        new_avg_entry_price=avg_entry,
+        realized_commission_usd=payload.commission_usd,  # DELTA; apply accumulates
+        managed_by_version=context.managed_by_version,
+        strategy_hash=context.strategy_hash,
+        parameter_set_hash=context.parameter_set_hash,
+        slippage_calibration_version_id=context.slippage_calibration_version_id,
+        closed_at_utc=closed_at_utc,
+        exit_order_id=context.order_id,
+        avg_exit_price=avg_exit,
+        realized_pnl_usd=realized_pnl_usd,
+    )
+
+    return FillApplyPlan(
+        audit_events=tuple(audit_events),
+        order_change=order_change,
+        fill_insert=fill_insert,
+        position_mutation=position_mutation,
+        balance_insert=balance_insert,
+        trade_mutation=trade_mutation,
+    )
+
+
 # ---------------------------------------------------------------------------
 # I/O lookup helpers
 # ---------------------------------------------------------------------------
@@ -978,13 +1439,18 @@ async def fetch_prior_trade(
     """Read the existing open trade row for ``entry_signal_id`` if any.
 
     There is at most one trade per (entry_signal_id, state='open_position')
-    in PR-G's model. Returns None when no row exists (first fill).
+    in the current model. Returns None when no row exists (first fill).
+
+    The bracket-order contract (Phase B): the stop-loss order reuses the
+    entry signal_id, so when the stop fires the same lookup returns the
+    open trade row — no separate exit-side query needed.
     """
     async with session_factory() as session:
         row = (
             await session.execute(
                 text(
-                    "SELECT id, created_at, total_quantity, avg_entry_price "
+                    "SELECT id, created_at, total_quantity, avg_entry_price, "
+                    "       realized_commission_usd "
                     "FROM trades "
                     "WHERE entry_signal_id = :sid AND state = 'open_position' "
                     "ORDER BY created_at DESC LIMIT 1"
@@ -999,6 +1465,7 @@ async def fetch_prior_trade(
         trade_created_at=row.created_at,
         total_quantity=int(row.total_quantity),
         avg_entry_price=Decimal(str(row.avg_entry_price)),
+        realized_commission_usd=Decimal(str(row.realized_commission_usd)),
     )
 
 
@@ -1172,9 +1639,14 @@ async def _apply_position_mutation(
     *,
     session_factory: async_sessionmaker[Any],
 ) -> UUID:
-    """INSERT a new positions_current row (action='open') or UPDATE the
-    existing one (action='update'). DELETE (action='close') is reserved
-    for the exit case and not exercised by PR-G."""
+    """Apply a ``positions_current`` mutation.
+
+    * ``action='open'`` → INSERT new row + RETURNING id.
+    * ``action='update'`` → UPDATE existing row's quantity / avg_cost /
+      last_mark_ts. Returns the prior position_id.
+    * ``action='close'`` → DELETE the positions_current row by id.
+      Returns the now-deleted position_id (for SSE / result linkage).
+    """
     async with session_factory() as session:
         async with session.begin():
             if mutation.action == "open":
@@ -1219,11 +1691,13 @@ async def _apply_position_mutation(
                     },
                 )
                 return mutation.position_id
-            # action == "close" — reserved for the exit case (Phase 1+).
-            raise FillProcessingError(
-                error_code="POSITION_CLOSE_DEFERRED",
-                message="position 'close' action is reserved for the exit-fill path (Phase 1+).",
+            # action == "close" — exit-fill path. DELETE the row.
+            assert mutation.position_id is not None
+            await session.execute(
+                text("DELETE FROM positions_current WHERE id = :pid"),
+                {"pid": mutation.position_id},
             )
+            return mutation.position_id
 
 
 async def _insert_balance(
@@ -1264,11 +1738,14 @@ async def _apply_trade_mutation(
     *,
     session_factory: async_sessionmaker[Any],
 ) -> UUID:
-    """INSERT new trade row (action='open') or UPDATE existing (action='update').
+    """Apply a ``trades`` mutation.
 
-    The 'close' action transitions state to 'closed' + stamps
-    exit_order_id + closed_at_utc + realized_pnl_usd; PR-G doesn't exercise
-    it (no exit signals).
+    * ``action='open'`` → INSERT new trade row + RETURNING id.
+    * ``action='update'`` → UPDATE total_quantity / avg_entry_price +
+      accumulate commission. Returns the trade_id.
+    * ``action='close'`` → UPDATE state='closed' + stamp closed_at_utc +
+      exit_order_id + avg_exit_price + realized_pnl_usd + accumulate
+      commission. Returns the trade_id.
     """
     async with session_factory() as session:
         async with session.begin():
@@ -1335,11 +1812,35 @@ async def _apply_trade_mutation(
                     },
                 )
                 return mutation.trade_id
-            # action == "close" reserved for exit fills (Phase 1+).
-            raise FillProcessingError(
-                error_code="TRADE_CLOSE_DEFERRED",
-                message="trade 'close' action is reserved for the exit-fill path (Phase 1+).",
+            # action == "close" — exit-fill path.
+            assert mutation.trade_id is not None
+            assert mutation.trade_created_at is not None
+            assert mutation.closed_at_utc is not None
+            assert mutation.exit_order_id is not None
+            assert mutation.avg_exit_price is not None
+            assert mutation.realized_pnl_usd is not None
+            await session.execute(
+                text(
+                    "UPDATE trades SET "
+                    "    state = 'closed', "
+                    "    closed_at_utc = :closed_at, "
+                    "    exit_order_id = :exit_oid, "
+                    "    avg_exit_price = :avg_exit, "
+                    "    realized_pnl_usd = :pnl, "
+                    "    realized_commission_usd = realized_commission_usd + :comm "
+                    "WHERE id = :tid AND created_at = :tcreated"
+                ),
+                {
+                    "closed_at": mutation.closed_at_utc,
+                    "exit_oid": mutation.exit_order_id,
+                    "avg_exit": mutation.avg_exit_price,
+                    "pnl": mutation.realized_pnl_usd,
+                    "comm": mutation.realized_commission_usd,
+                    "tid": mutation.trade_id,
+                    "tcreated": mutation.trade_created_at,
+                },
             )
+            return mutation.trade_id
 
 
 # ---------------------------------------------------------------------------
@@ -1410,6 +1911,7 @@ __all__ = [
     "FillIngestPayload",
     "FillInsert",
     "FillProcessingError",
+    "FillScenario",
     "OrderStatusChange",
     "PendingAuditEvent",
     "PositionAction",
