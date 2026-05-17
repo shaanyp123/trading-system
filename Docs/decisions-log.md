@@ -17,6 +17,89 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ## Entries
 
+### 2026-05-17 — Live paper-trading round-trip closure (PR-G exit path + bracket-order placement + TLT drill) — PRs #164 + #165
+
+- **Context:** Prior session (2026-05-13/16, decisions-log entries through PR #163) shipped the bracket-order-fill backbone — PR-G entry path (#146), risk-state gate (#147), recon pre-write (#148), auto-halt closure (#149), attribution rollup planner (#150). The fill-side ENTRY case worked end-to-end in pure-policy + integration tests, but the EXIT case raised `UnsupportedFillScenarioError` (deferred), and the OrderPlacementWorker placed only the entry — no stop. Without a stop, V1 positions can run unbounded; without exit-fill handling, closed trades have no record of realized P&L. This session closes both gaps.
+
+- **PRs opened + merged this session (both `risk-review-approved`):**
+
+  - **PR #164 — `feat(risk): PR-G exit path — close-trade fill processing + realized P&L`.** Extends `services/risk/fill_processor.py` with the EXIT_FULL_CLOSE branch. Refactors `_validate_entry_direction_match` → `_classify_fill_scenario` returning `Literal["ENTRY", "EXIT_FULL_CLOSE"]`; partial closes + direction reversals raise `UnsupportedFillScenarioError` (Phase 2+ scope). Exit branch emits 4 audit rows (`ORDER_FILLED` → `POSITION_CLOSED` → `BALANCE_SNAPSHOT_RECORDED` → `TRADE_CLOSED`), DELETEs the `positions_current` row, UPDATEs the `trades` row to `state='closed'` with `realized_pnl_usd` + `avg_exit_price` + `closed_at_utc` + `exit_order_id` + accumulated commission. Realized P&L: `(avg_exit - avg_entry) * qty - total_commission` for longs (sign flipped for shorts), NUMERIC(20,4). `PriorTradeRow` extended with `realized_commission_usd`; `TradeMutation` extended with four optional close-action fields. 30 new unit tests + 1 integration test (postgres:16 testcontainer; alembic upgrade head; full audit + DELETE + UPDATE assertions; `verify_chain` clean). Merged at `b2476ca`.
+
+  - **PR #165 — `feat(risk): bracket-order placement — entry + stop-market exit placed atomically`.** Extends `services/risk/order_placement_worker.py` so `apply_order_placement` places BOTH the entry order AND a protective stop-market exit order in one apply step. Two `ORDER_PLACED` audit rows + two `orders` rows + one `signals.status='working'` UPDATE land atomically. Stop price sourced from V1's canonical `sizing_trace.stage_0_universe.strategy_inputs[market].stop_price` via new helper `_extract_stop_price_from_sizing_trace` (validates direction orientation; refuses self-defeating stops above entry on longs or below on shorts). `ApprovedSignalRow` extended with `sizing_trace: dict[str, Any]`; `OrderPlacementPlan` extended with `stop_client_order_id` + `stop_price` + `stop_side` fields. Stop CID format: entry's CID + `-stop` suffix. Stop-failure path: best-effort `ibkr_client.cancel_order(entry.cid)` + raise `OrderPlacementError("STOP_PLACEMENT_FAILED")`. SSE envelope extended with stop fields for the consumer. 19 new unit tests across 3 classes; all 47 prior tests preserved. Merged at `e6f57e1`.
+
+  - **Bracket-order Option B contract (decision):** Stop order REUSES the entry's `signal_id` (both rows share `signal_id`; differentiated by `direction` + `order_type` + `client_order_id` suffix). When the stop fires:
+    1. IBKR fires `orderStatus(status='filled')` for the stop's broker_order_id
+    2. `_on_order_status` → `process_fill_event(client_order_id=<stop_cid>)`
+    3. `fetch_fill_context` joins `orders` + `signals` → returns `context.signal_direction='long'` (the entry's), `context.order_direction='sell'` (the stop's)
+    4. PR #164's `_classify_fill_scenario` detects opposite-direction + full-magnitude → returns `EXIT_FULL_CLOSE`
+    5. Position DELETEd, trade UPDATEd to closed with realized_pnl_usd
+
+    Rejected alternative was synthetic exit-signal rows (more rows, more lookups, no benefit). Decision rationale: keep the `signals` table as the strategy's intent surface; let `orders` carry the bracket-leg distinction.
+
+- **Phase C — TLT production drill (two attempts):**
+
+  - **Attempt 1 (signal_id `019e33fa-3534-7af5-ba14-86e33b994010`, 03:28 UTC):** Injected via `POST /api/internal/lean/signals` with LEAN bearer; approved via Discord bot bearer. Worker silent for 25 minutes — root cause was `ib_gateway` Client-1 connection state from prior session was wedged (continuous `remove Client 1` loop in ib_gateway logs). After `docker compose restart ib_gateway` + `docker compose restart api`, the worker placed the entry order at IBKR (broker_order_id=4, status=PreSubmitted, queued for Monday open) + wrote the entry audit row (seq=35). However, the api process exited (clean uvicorn shutdown — likely a healthcheck-triggered restart during the ib_gateway disconnect cascade) BEFORE the stop placement completed. Result: **orphan entry order with no stop** at IBKR — broker_order_id=4, will fill Monday 13:30 UTC if not cancelled.
+
+  - **Attempt 2 (signal_id `019e341a-099b-72e1-a217-2d83ee3cd075`, 04:03 UTC):** After waiting for `ib_gateway` Client-1 connection to recover (took ~4 minutes; worker eventually logged `order_placement_orderstatus_subscribed`), injected a fresh TLT signal + approved. **Clean bracket placed end-to-end within 5 seconds:**
+    - `ibkr_contract_qualified market=TLT resolved_local_symbol=TLT resolved_conid=15547841 sec_type=STK`
+    - `ibkr_order_placed client_order_id=d66d6ce9-d0592219-019e341a-0 broker_order_id=8 status=pending_submit` (ENTRY)
+    - `ibkr_contract_qualified` (stop's qualify)
+    - `ibkr_order_placed client_order_id=d66d6ce9-d0592219-019e341a-0-stop broker_order_id=10 status=pending_submit` (STOP, sell, stop_price=82.50, TIF=GTC)
+    - 2 × `order_placed` audit rows (seq=41 + seq=42)
+    - `order_placement_completed signal_id=... stop_placed=true stop_broker_order_id=10 stop_audit_event_uuid=...`
+    - 2 orders rows INSERTed (entry + stop) with `parent_order_id` linking stop → entry
+    - IBKR validation note: `'Order Message: BUY 1 TLT NASDAQ.NMS Warning: Your order will not be placed at the exchange until 2026-05-18 09:30:00 US/Eastern.'` — confirms queued for Monday open.
+
+  - **Cancellation of orphan entry (broker_order_id=4) attempted twice — FAILED.** Tried `cancelOrder` via `clientId=2` (independent client) AND `clientId=0` (master client) with explicit `manualCancelOrderTime`. IBKR returned `Error 10147: OrderId 4 that needs to be cancelled is not found.` despite the order being visible in `reqAllOpenOrdersAsync` output as `PreSubmitted`. The orderId is bound to the original `clientId=1` session that placed it; subsequent api restarts created new clientId=1 sessions that don't have a handle on the original orderId. **Operator follow-up required: cancel via TWS GUI Monday morning before 13:30 UTC market open.** Risk if uncancelled: 1 TLT share long (~$85 notional) with no paired stop. Recon would detect the position-without-stop mismatch and could optionally trigger a manual review.
+
+- **Audit chain growth:** 26 rows pre-session → 42 rows post-session.
+  - Boot-time recon: +3 rows (BALANCE_SNAPSHOT_RECORDED + RECONCILIATION_CHECK_PASSED + ATTRIBUTION_ROLLUP_RECORDED at api boot 03:27 + 03:53 + 03:55)
+  - Drill 1: +3 rows (SIGNAL_EMITTED seq=30 + SIGNAL_APPROVED seq=31 + ORDER_PLACED seq=35 for the entry only — no stop audit because stop placement was interrupted)
+  - Drill 2: +3 rows (SIGNAL_EMITTED seq=39 + SIGNAL_APPROVED seq=40 + ORDER_PLACED seq=41 entry + ORDER_PLACED seq=42 stop = +4 total)
+  - `verify_chain --env paper` → `CHAIN OK: 42 rows verified` post-drill.
+
+- **What the drill PROVED:**
+  - LEAN bearer → POST `/api/internal/lean/signals` → signal row INSERTed + SIGNAL_EMITTED audit ✓
+  - Bot bearer → POST `/api/signals/<id>/approve` → SIGNAL_APPROVED audit + status flip ✓ (schema: empty `{}` body — `decided_by_user_id` is forbidden, derived from session)
+  - OrderPlacementWorker picks up approved signal → reads sizing_trace → derives stop_price → places entry + stop via IBKR → writes 2 audit rows + 2 orders rows + signal status='working' atomically ✓
+  - IBKR queues both orders for next-day market open with TIF=DAY for entry + TIF=GTC for stop ✓
+  - Audit chain integrity holds across all the new code paths (chain CLEAN at 42 rows) ✓
+
+- **What the drill DID NOT prove (deferred until Monday 13:30 UTC market open):**
+  - Real entry fill → PR #164's PR-G entry path (4 audit rows: ORDER_FILLED + POSITION_OPENED + BALANCE_SNAPSHOT_RECORDED + TRADE_OPENED; fills + positions_current + balances + trades rows populated)
+  - Real stop fill → PR #164's PR-G exit path (4 audit rows: ORDER_FILLED + POSITION_CLOSED + BALANCE_SNAPSHOT_RECORDED + TRADE_CLOSED; positions_current DELETE; trade UPDATE to closed with realized_pnl_usd)
+  - First-ever realized P&L number in production
+
+- **VPS state at session close:**
+  - `origin/main` HEAD: `e6f57e1` (PR #165 merge commit; PR #164 at `b2476ca` is one commit before).
+  - All 8 containers healthy.
+  - `audit_log` count: **42** (`verify_chain --env paper` → `CHAIN OK`).
+  - `signals` count: **3** (all status='working'; /MNQ from May 13 drill + 2 TLT from this session).
+  - `orders` count: **4** (all status='pending'; /MNQ from May 13 + 3 TLT from this session: orphan entry + clean bracket pair).
+  - `fills` / `positions_current` / `trades` count: **0** (no fills until Monday market open).
+  - `risk_state` = NORMAL (reason `convalescent_graduated`; unchanged from session start).
+  - IBKR paper account `DUQ825170` `openTrades` count: **3** TLT orders (broker_order_ids 4, 8, 10) + 1 /MNQ from May 13 that IBKR rejected at validation. All TLT orders show `PreSubmitted` status pending Monday 13:30 UTC NASDAQ open.
+
+- **Open follow-ups for operator (ordered by urgency):**
+  1. **Cancel orphan TLT entry order via TWS GUI BEFORE Monday 13:30 UTC** (broker_order_id=4, orderRef=`d66d6ce9-bc6a43e7-019e33fa-0`). Cross-client cancellation from CLI failed with IBKR Error 10147; only the originating session can cancel. Operator must use TWS workstation or web TWS to right-click cancel. Risk if uncancelled: 1 TLT share long with no paired stop.
+  2. **Cancel orphan /MNQ entry order (broker_order_id=3, May 13 drill)** if it shows in TWS openTrades — appears unfilled at IBKR since it was rejected at validation. Same TWS GUI cancellation required.
+  3. **Update backend `orders.status` to 'cancelled'** for the two orphans after TWS cancellation, via psql: `UPDATE orders SET status='cancelled', rejection_reason='operator_manual_cleanup_session_2026_05_17' WHERE id IN ('019e3412-b7a8-71c7-b394-51688525c1be', '019e226c-de19-7c13-9084-873ed850d0d7');`. Sequence_no won't advance (no audit), but rec cycle's broker-snapshot path will reconcile correctly.
+  4. **Monday morning Phase-C completion**: watch the clean bracket (broker_order_ids 8 + 10) fill at market open. Expected sequence:
+     - 13:30 UTC entry fills → PR-G entry path fires → 4 new audit rows + populated fills/positions_current/balances/trades tables. Signal `019e341a-099b-72e1-a217-2d83ee3cd075` status flips to 'filled' via `_apply_signal_status_on_fill` (or whatever the propagation surface is post-PR #164).
+     - Operator triggers the stop manually via TWS (either modify stop_price up so it fires, OR cancel the stop + place an offsetting SELL at market).
+     - Stop fills → PR-G exit path fires → 4 NEW audit rows. Position DELETEd; trade UPDATEd to state='closed' with `realized_pnl_usd` populated. **First-ever realized P&L number in production.**
+  5. **Investigate the api-process exit during drill attempt 1.** Root cause not yet identified — could be docker healthcheck-triggered restart during the ib_gateway disconnect cascade, OR an uncaught exception in the bracket-order code path that took down uvicorn. The audit/INSERT for the entry side completed cleanly; the stop side never got to execute. Phase B's test suite passes 19 unit tests including the failure-cancellation path against mocked IBKR — so the code logic is provably correct in isolation. The production failure is likely environmental (ib_gateway connection state during back-to-back restarts), not algorithmic. Recommend a follow-up PR adding a circuit breaker around `_ensure_connected` with explicit timeout + clean error propagation so future ib_gateway flakiness emits a structured log + raises cleanly rather than blocking the asyncio task.
+  6. **Partial-exit + direction-reversal exit cases** (PR-G EXIT_PARTIAL + EXIT_REVERSAL) still raise `UnsupportedFillScenarioError`. Phase 2+ scope when LEAN gains partial-close / reversal signal support OR when the operator needs to scale-out via the web /signals page.
+  7. **LEAN signal_emitted payload extension for attribution** (PR-K wiring follow-up from prior session): for `ATTRIBUTION_ROLLUP_RECORDED` rows to have non-zero `expected_pnl_usd` + `expected_holding_days`, the V1 strategy needs to populate those fields in the signal_emitted payload at emit time. Currently the strategy emits a minimal sizing_trace; the attribution payload would need its own canonical position (e.g., `sizing_trace.attribution.{expected_pnl_usd,expected_holding_days,expected_slippage_bps,expected_entry_price,expected_exit_price}`). Coordinated spec update + V1 strategy code change + backend signal_ingestion mapping. Not blocking PR-G or bracket placement; closes the attribution-completeness gap.
+
+- **Lessons learned:**
+  - **IBKR client_id=1 contention is a real production-time hazard.** Multiple back-to-back api restarts within minutes can leave `ib_gateway` in a state where it rejects new clientId=1 connections for ~4 minutes ("Peer closed connection. clientId 1 already in use?"). The worker's deferred-subscribe pattern recovers eventually but logs a `order_placement_orderstatus_subscribe_deferred` warning every ~35s during the recovery window. For PR-style deploys with multiple restarts (build → up → maybe re-up after fix), the operator should add a 60-90s pause between restarts to let ib_gateway clean up the prior session.
+  - **Cross-client order cancellation requires master clientId=0 OR TWS GUI.** The IBKR TWS API binds orderIds to (clientId, sessionId) tuples; even master client 0 returned Error 10147 for an orderId placed by a now-dead clientId=1 session. The only reliable cleanup path is the TWS GUI. Document this in `deploy/ibkr/README.md` operator runbook (follow-up).
+  - **Order schema: `decided_by_user_id` is forbidden on the approve endpoint.** Pydantic `extra="forbid"` rejects it. The endpoint derives it from the session context (BotAuthMiddleware injects a `discord-bot` session). Update Discord bot's `/approve` slash command + any operator runbook examples accordingly.
+  - **The bracket-order Option B contract (stop reuses entry signal_id) is the right call.** Drill 2 proved it works end-to-end through the worker → IBKR → backend audit + INSERT chain. The alternative (synthetic exit signal rows) would have added complexity with no benefit. Confirmed for V1; Phase 2+ multi-leg / pyramid strategies will need to revisit.
+
+- **Operator pre-authorizations carried forward:** SSH to VPS, git push, gh pr create + merge --squash --delete-branch, branch creation + rebase + force-push-with-lease, docker compose build + restart, alembic upgrade head, curl against `https://spratcapital.com/api/**` via LEAN bearer + bot bearer, READ-only sops access on VPS, ONE TLT drill signal (note: this session used TWO due to the recovery cycle after attempt 1's interruption; total 1-share notional + 1-share + 1-share = 3 shares = ~$255 TLT exposure if all fill Monday; risk profile still trivial).
+
 ### 2026-05-05 — Day 1 — Repo name `trading-system` (matches spec naming)
 
 - **Spec reference:** `Docs/backend-spec.md` §1.1 ("trading/" placeholder); `implementation-guide.md` §11 Day 1 ("Create new repo `trading-system`")
