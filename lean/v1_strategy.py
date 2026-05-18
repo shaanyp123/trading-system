@@ -702,144 +702,93 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
     # Universe freshness defensive check (2026-05-17 evening followup)
     # ------------------------------------------------------------------
 
-    # Default market paths for the V1 futures sub-universe. Matches the
-    # layout produced by ``scripts/seed_lean_futures_databento.py`` per
-    # ``deploy/lean_local/seed-data.md`` Step F1. Keys are the canonical
-    # market symbols; values are the relative path under ``/Lean/Data/future``.
-    _V1_FUTURES_MARKET_PATHS = {
-        "/MES": "cme/universes/mes",
-        "/MNQ": "cme/universes/mnq",
-        "/MYM": "cme/universes/mym",
-        "/M2K": "cme/universes/m2k",
-        "/MBT": "cme/universes/mbt",
-        "/MGC": "comex/universes/mgc",
-        "/MCL": "nymex/universes/mcl",
-    }
-
-    # Threshold calibrated against the 2026-05-17 incident (6-day staleness
-    # caused all 7 markets to fail). Warn at > 5 calendar days to give the
-    # operator 1-2 days of headroom before the cycle actually fails. Past
-    # experience: 0-day staleness (same-day seed) always works; 6+ day
-    # staleness always fails. The 1-5 day band is empirically unknown — the
-    # threshold is the conservative end.
-    _UNIVERSE_STALENESS_THRESHOLD_DAYS = 5
-
     def _log_universe_freshness(self) -> None:
         """Emit structured log lines about futures universe staleness.
 
-        Inline filesystem scan + date comparison. Runs once at
-        initialize() (post-subscription setup) and emits one of three
-        structured log lines per category found:
+        Thin LEAN-runtime wrapper around the pure-Python evaluator at
+        ``strategies.v1_trend_following.universe_freshness``. The
+        wrapper wires ``self.time.date()`` + ``self.log(...)`` to the
+        evaluator's filesystem scan + classification logic; the
+        evaluator owns the data shape and the threshold calibration
+        + has full unit-test coverage in
+        ``tests/unit/test_universe_freshness.py`` (27 tests).
+
+        Three structured log lines per category found:
 
         * ``v1_universe_data_fresh markets_checked=7 threshold_days=5
-          fresh_count=7`` — happy path; all 7 markets within threshold.
+          fresh_count=7`` — happy path; emitted always (even when no
+          warning fires) so operators can confirm the check ran.
         * ``v1_universe_data_stale threshold_days=5 stale_count=<N>
-          stale_markets=[<symbol>(<days>d/<file>),...]`` — one or more
-          markets past threshold. **Canonical fingerprint** for the
-          staleness pattern; an operator alert (Phase 1+ extension to
-          AsyncTaskMonitor per ``Docs/decisions-log.md`` 2026-05-17
-          evening entry follow-up #3) can grep for this.
-        * ``v1_universe_data_missing missing_markets=[...]`` — universe
+          stale_markets=[<symbol>(<days>d/<file>),...]`` — canonical
+          fingerprint for the staleness pattern. The Phase 1+
+          AsyncTaskMonitor extension (per ``Docs/decisions-log.md``
+          2026-05-17 evening entry follow-up #3) will alert on this.
+        * ``v1_universe_data_missing missing_markets=[...]`` —
           directory not found, no ``YYYYMMDD.csv`` entries, or
           unparseable filename. Distinct severity (volume-mount issue
           or seed-never-ran).
 
-        Defensive: catches every exception path. The algorithm boot
-        should NEVER fail because this check raised — it's pure
-        observability.
+        Defensive: catches every exception from the import + the
+        evaluator. The algorithm boot should NEVER fail because this
+        check raised — it's pure observability.
 
-        **Context (2026-05-17 evening incident).** The 7 micro futures
-        sub-universe failed ``v1_history_unavailable`` for 5+ days
-        running because the seed data had aged out — universe files
-        ended ``20260511.csv`` while ``session_date`` was
-        ``2026-05-17``. The per-cycle heartbeat stayed clean and the
-        audit chain stayed clean throughout, so the staleness was
-        invisible until the operator inspected the LEAN cycle log
-        directly. This check is the defensive layer that catches the
-        next occurrence at boot time.
+        **Context.** The 2026-05-17 evening incident found the 7 micro
+        futures sub-universe failing ``v1_history_unavailable`` for 5+
+        days because the seed data had aged out. The per-cycle
+        heartbeat stayed clean and the audit chain stayed clean
+        throughout, so the staleness was invisible until the operator
+        inspected the LEAN cycle log directly. This check is the
+        defensive layer that catches the next occurrence at boot.
 
         See ``Docs/decisions-log.md`` 2026-05-17 evening entry
         "7-micro v1_history_unavailable root cause" for the full
-        investigation. The inline implementation here (vs the
-        extraction pattern of PR #129/#130's ``lean_history_adapter``)
-        was chosen because the CI ``python_backend`` path filter
-        triggers pytest on ``strategies/**`` touches; this PR's window
-        is gated by an unrelated pre-existing pytest failure on
-        ``main`` (see Docs/decisions-log.md follow-up for that test).
-        Keep this method short + inline; the future extraction can
-        happen once the pre-existing test is unblocked.
+        investigation. PR #172 shipped the inline implementation
+        because a pre-existing pytest time-bomb blocked the
+        extraction; PR #173 fixed the time-bomb; this PR repays the
+        technical debt with the extraction + full test coverage.
         """
         try:
-            today = self.time.date()
+            from strategies.v1_trend_following.universe_freshness import (  # type: ignore[import-not-found]
+                DEFAULT_STALENESS_THRESHOLD_DAYS,
+                V1_FUTURES_MARKET_PATHS,
+                evaluate_universe_freshness,
+            )
         except Exception as exc:  # noqa: BLE001 -- log + skip; check is observability-only
-            self.log(f"v1_universe_freshness_check_failed exc={exc!r}")
+            self.log(f"v1_universe_freshness_import_failed exc={exc!r}")
             return
 
-        fresh_markets: list[str] = []
-        stale_markets: list[tuple[str, str, int]] = []  # (market, last_file, days_stale)
-        missing_markets: list[str] = []
-        data_root = "/Lean/Data/future"
-
-        for market, subdir in self._V1_FUTURES_MARKET_PATHS.items():
-            try:
-                path = os.path.join(data_root, subdir)
-                entries = os.listdir(path)
-            except (FileNotFoundError, NotADirectoryError, PermissionError, OSError):
-                missing_markets.append(market)
-                continue
-            except Exception:  # noqa: BLE001 -- defensive: any other I/O error
-                missing_markets.append(market)
-                continue
-
-            # Universe filenames are exactly ``YYYYMMDD.csv`` (8 digits +
-            # 4 for ``.csv`` = 12 chars total). Anything else is filtered
-            # defensively to avoid date-parse crashes.
-            date_files = [e for e in entries if len(e) == 12 and e.endswith(".csv")]
-            if not date_files:
-                missing_markets.append(market)
-                continue
-
-            # ``max()`` over ``YYYYMMDD.csv`` strings sorts lex-correctly
-            # because the format is zero-padded fixed-width.
-            last_file = max(date_files)
-            try:
-                last_date = _date(
-                    int(last_file[0:4]),
-                    int(last_file[4:6]),
-                    int(last_file[6:8]),
-                )
-            except (ValueError, IndexError):
-                missing_markets.append(market)
-                continue
-
-            days_stale = (today - last_date).days
-            if days_stale > self._UNIVERSE_STALENESS_THRESHOLD_DAYS:
-                stale_markets.append((market, last_file, days_stale))
-            else:
-                fresh_markets.append(market)
+        try:
+            result = evaluate_universe_freshness(
+                today=self.time.date(),
+                data_root="/Lean/Data/future",
+                markets=V1_FUTURES_MARKET_PATHS,
+            )
+        except Exception as exc:  # noqa: BLE001 -- log + skip
+            self.log(f"v1_universe_freshness_check_failed exc={exc!r}")
+            return
 
         # Emit structured log lines per category found. Each category is
         # an independent line so log analyzers can grep for one without
         # parsing the others.
-        if missing_markets:
+        if result.missing_markets:
             self.log(
-                f"v1_universe_data_missing missing_markets={missing_markets}"
+                f"v1_universe_data_missing missing_markets={list(result.missing_markets)}"
             )
-        if stale_markets:
+        if result.stale_markets:
             summary = ",".join(
-                f"{m}({d}d/{f})" for m, f, d in stale_markets
+                f"{s.market}({s.days_stale}d/{s.last_file})" for s in result.stale_markets
             )
             self.log(
                 f"v1_universe_data_stale "
-                f"threshold_days={self._UNIVERSE_STALENESS_THRESHOLD_DAYS} "
-                f"stale_count={len(stale_markets)} stale_markets=[{summary}]"
+                f"threshold_days={DEFAULT_STALENESS_THRESHOLD_DAYS} "
+                f"stale_count={len(result.stale_markets)} stale_markets=[{summary}]"
             )
-        if not missing_markets and not stale_markets:
+        if not result.missing_markets and not result.stale_markets:
             self.log(
                 f"v1_universe_data_fresh "
-                f"markets_checked={len(self._V1_FUTURES_MARKET_PATHS)} "
-                f"threshold_days={self._UNIVERSE_STALENESS_THRESHOLD_DAYS} "
-                f"fresh_count={len(fresh_markets)}"
+                f"markets_checked={len(V1_FUTURES_MARKET_PATHS)} "
+                f"threshold_days={DEFAULT_STALENESS_THRESHOLD_DAYS} "
+                f"fresh_count={len(result.fresh_markets)}"
             )
 
     # ------------------------------------------------------------------
