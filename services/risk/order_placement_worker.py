@@ -745,13 +745,26 @@ async def apply_order_placement(
             stop_price=plan.stop_price,
             time_in_force="GTC",
             parent_client_order_id=plan.client_order_id,
-            # PR-gamma: thread the entry's IBKR-side broker_order_id into the
-            # stop request so the adapter sets Order.parentId, registering
-            # the OCO bracket with IBKR. Without this the stop is placed
-            # as a standalone sell-stop (drill 6 defect #3): if the entry
-            # is cancelled (operator action, reconciliation, hung fill),
-            # the stop survives and can short the account on a price spike.
-            parent_broker_order_id=broker_order_id,
+            # PR-gamma was reverted here on 2026-05-18 (drill 9 retrospective).
+            # Setting parent_broker_order_id=<entry_broker_order_id> caused
+            # IBKR to reject the stop with "Parent order is being cancelled"
+            # because the marketable-limit entry filled BEFORE the stop's
+            # parentId linkage could register. Drill 9 placement at
+            # 23:16:58 UTC reproduced this: entry filled at 7434.25
+            # within ~7ms (paper Smart routing), stop placed 134ms later
+            # got Error 201 from IBKR. The stop went to status=rejected,
+            # leaving the entry filled and the position naked.
+            # Proper fix requires IBKR's transmit=False/True bracket
+            # protocol (entry.transmit=False + stop.parentId + stop.transmit=True
+            # to atomically register both) or an OCA-group fallback —
+            # tracked as PR-eta in the next-session brief. Until that
+            # lands the stop reverts to the pre-PR-gamma standalone form
+            # (drill 6 defect #3 returns: cancelled entry leaves stop
+            # alive, but this is recoverable via reqGlobalCancel; the
+            # PR-gamma path BROKE entries entirely which is worse).
+            # The dataclass field on IbkrPlaceOrderRequest + the adapter
+            # wiring stay so the proper fix can re-enable without re-
+            # plumbing.
         )
         try:
             stop_broker_result = await _await_ibkr_with_timeout(
