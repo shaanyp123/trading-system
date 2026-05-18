@@ -206,6 +206,7 @@ def round_to_tick(price: Decimal, *, market: str) -> Decimal:
     multiplier = (price / tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
     return multiplier * tick
 
+
 #: Map from ib_async order-status strings to our locked
 #: ``IbkrOrderStatus`` enum. The library may emit additional statuses
 #: (Inactive, ApiPending) which we collapse to the nearest fit.
