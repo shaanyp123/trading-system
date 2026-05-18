@@ -67,6 +67,7 @@ from services.webhook_pusher.event_pushes import (
     EventPushPlan,
     OrderFilledEvent,
     OrderPlacedEvent,
+    OrderTerminalEvent,
     SignalDecisionEvent,
     SignalEmittedEvent,
     plan_event_push,
@@ -234,6 +235,8 @@ def route_event(frame: SSEFrame) -> list[tuple[EventChannel, EventPushPlan]]:
         return _route_signal_event(data, frame.sequence_no)
     if et == "fill":
         return _route_fill_event(data, frame.sequence_no)
+    if et == "order":
+        return _route_order_event(data, frame.sequence_no)
     # All other types ignored.
     return []
 
@@ -398,6 +401,63 @@ def _route_fill_event(
             error=str(exc),
         )
         return []
+    plan = plan_event_push(channel=EventChannel.FILLS, event=event)
+    return [(EventChannel.FILLS, plan)]
+
+
+def _route_order_event(
+    data: dict[str, Any], sequence_no: int
+) -> list[tuple[EventChannel, EventPushPlan]]:
+    """Route an ``order`` SSE envelope (cancellation / rejection) to ``#fills``.
+
+    PR-epsilon / drill 6 defect #5. The worker emits
+    ``emit_sse('order', {action: cancelled|rejected, ...})`` from
+    ``services.risk.order_placement_worker._process_terminal_status``.
+    Before PR-epsilon the ``'order'`` event_type wasn't in
+    ``services.api.sse._CANONICAL_EVENT_TYPES`` so the emit raised
+    ValueError and cancellations never reached Discord. After PR-epsilon the
+    type is canonical and this subscriber routes it to ``#fills``.
+    """
+    action = str(data.get("action", "")).lower()
+    order_id = str(data.get("order_id", ""))
+    client_order_id = str(data.get("client_order_id", ""))
+    broker_order_id = str(data.get("broker_order_id", ""))
+    market = str(data.get("market", ""))
+    environment = str(data.get("environment", "paper"))
+    signal_id_raw = data.get("signal_id")
+    signal_id: str | None = str(signal_id_raw) if signal_id_raw else None
+    rejection_reason_raw = data.get("rejection_reason")
+    rejection_reason: str | None = str(rejection_reason_raw) if rejection_reason_raw else None
+
+    if action not in ("cancelled", "rejected"):
+        log.warning(
+            "sse_order_unknown_action",
+            sequence_no=sequence_no,
+            action=action,
+        )
+        return []
+    if not order_id or not client_order_id or not broker_order_id or not market:
+        log.warning(
+            "sse_order_missing_required_fields",
+            sequence_no=sequence_no,
+            action=action,
+            order_id=order_id,
+            client_order_id=client_order_id,
+            broker_order_id=broker_order_id,
+            market=market,
+        )
+        return []
+
+    event = OrderTerminalEvent(
+        action=action,
+        order_id=order_id,
+        client_order_id=client_order_id,
+        signal_id=signal_id,
+        market=market,
+        broker_order_id=broker_order_id,
+        environment=environment,
+        rejection_reason=rejection_reason,
+    )
     plan = plan_event_push(channel=EventChannel.FILLS, event=event)
     return [(EventChannel.FILLS, plan)]
 

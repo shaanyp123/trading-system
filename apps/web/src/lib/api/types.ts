@@ -315,6 +315,7 @@ export interface TradesQueryFilters {
 export type SSEEventType =
   | 'signal'
   | 'fill'
+  | 'order'
   | 'position'
   | 'pnl'
   | 'risk_state'

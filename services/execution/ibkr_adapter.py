@@ -672,6 +672,14 @@ class IbAsyncIbkrClient:
                 # but the type narrows here defensively.
                 raise ValueError(f"unsupported order_type: {request.order_type!r}")
 
+            # PR-gamma: IBKR-side bracket parentId. When set on the stop leg,
+            # IBKR treats it as an OCO child of the entry order — entry
+            # cancellation auto-cancels the stop and we cannot get a naked
+            # sell-stop firing after an aborted entry. Drill 6 defect #3
+            # fix (the stop was placed with parentId=0 = standalone).
+            if request.parent_broker_order_id is not None:
+                ib_order.parentId = request.parent_broker_order_id
+
             trade = ib.placeOrder(ib_contract, ib_order)
             # ib_async returns immediately with a Trade object; the actual
             # order-status events arrive async. We wait briefly for the

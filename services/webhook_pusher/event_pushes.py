@@ -51,6 +51,7 @@ COLOR_SIGNAL_DEFERRED = 0xF39C12  # amber — operator deferred
 COLOR_ORDER_PLACED = 0x3498DB  # blue — broker accepted; awaiting fill
 COLOR_ORDER_FILLED = 0x2ECC71  # green — broker confirmed fill
 COLOR_ORDER_REJECTED = 0xE74C3C  # red — broker rejected order
+COLOR_ORDER_CANCELLED = 0x95A5A6  # gray — order terminated without fill (cancel)
 
 
 _ET = ZoneInfo("America/New_York")
@@ -134,6 +135,34 @@ class OrderFilledEvent:
     commission_usd: Decimal
     filled_at_utc: datetime
     environment: str
+
+
+@dataclass(frozen=True, slots=True)
+class OrderTerminalEvent:
+    """Payload subset for an ``order`` SSE envelope (cancellation / rejection).
+
+    PR-epsilon / drill 6 defect #5. Emitted by
+    ``services.risk.order_placement_worker._process_terminal_status`` when
+    IBKR routes a Cancelled / Inactive / ApiCancelled / Rejected
+    ``orderStatus`` event into the worker. Before PR-epsilon the worker's emit
+    used a non-canonical ``event_type='order'`` that raised ValueError
+    at the multiplexer; the cancel audit row landed but the operator
+    never saw the cancellation in Discord ``#fills``.
+
+    ``action`` is one of ``cancelled`` / ``rejected`` (matches the
+    worker's ``result.new_status`` which mirrors ``orders.status``).
+    ``rejection_reason`` is populated only on rejections (free-text from
+    IBKR's error stream).
+    """
+
+    action: str  # "cancelled" | "rejected"
+    order_id: str  # internal orders.id UUID
+    client_order_id: str
+    signal_id: str | None  # null when worker couldn't resolve the signal
+    market: str
+    broker_order_id: str
+    environment: str
+    rejection_reason: str | None = None  # populated on rejection only
 
 
 @dataclass(frozen=True, slots=True)
@@ -351,10 +380,52 @@ def build_order_filled_embed(event: OrderFilledEvent) -> dict[str, Any]:
     }
 
 
+def build_order_terminal_embed(event: OrderTerminalEvent) -> dict[str, Any]:
+    """Build the Discord embed for an order cancellation / rejection.
+
+    PR-epsilon / drill 6 defect #5. Companion to ``build_order_placed_embed``
+    and ``build_order_filled_embed`` for the terminal-without-fill path.
+    """
+    action_lc = event.action.lower()
+    if action_lc == "cancelled":
+        color = COLOR_ORDER_CANCELLED
+        title = f"✗ CANCELLED: {event.market} (order {event.broker_order_id})"
+    elif action_lc == "rejected":
+        color = COLOR_ORDER_REJECTED
+        title = f"✗ REJECTED: {event.market} (order {event.broker_order_id})"
+    else:
+        raise ValueError(f"unsupported terminal action: {event.action!r}")
+
+    fields: list[dict[str, Any]] = [
+        {"name": "Action", "value": action_lc, "inline": True},
+        {"name": "Order ID", "value": event.broker_order_id, "inline": True},
+        {"name": "Env", "value": event.environment, "inline": True},
+    ]
+    if event.signal_id:
+        fields.append({"name": "Signal", "value": event.signal_id, "inline": False})
+    if event.rejection_reason:
+        # Truncate to 1020 (Discord field-value max is 1024).
+        reason = event.rejection_reason[:1020] + ("…" if len(event.rejection_reason) > 1020 else "")
+        fields.append({"name": "Reason", "value": reason, "inline": False})
+
+    return {
+        "title": title,
+        "color": color,
+        "fields": fields,
+        "footer": {"text": f"client_order_id: {event.client_order_id}"},
+    }
+
+
 def plan_event_push(
     *,
     channel: EventChannel,
-    event: SignalEmittedEvent | SignalDecisionEvent | OrderPlacedEvent | OrderFilledEvent,
+    event: (
+        SignalEmittedEvent
+        | SignalDecisionEvent
+        | OrderPlacedEvent
+        | OrderFilledEvent
+        | OrderTerminalEvent
+    ),
 ) -> EventPushPlan:
     """Build the dispatch plan for a single event push.
 
@@ -362,6 +433,7 @@ def plan_event_push(
         SignalEmittedEvent or SignalDecisionEvent → EventChannel.SIGNALS
         OrderPlacedEvent                          → EventChannel.FILLS
         OrderFilledEvent                          → EventChannel.FILLS
+        OrderTerminalEvent                        → EventChannel.FILLS
 
     The caller passes the channel explicitly so the routing logic stays
     obvious; this function validates the (channel, event) pair is sane.
@@ -386,6 +458,16 @@ def plan_event_push(
             raise ValueError("OrderFilledEvent must route to EventChannel.FILLS")
         embed = build_order_filled_embed(event)
         dedupe_key = f"order_filled:{event.order_id}"
+    elif isinstance(event, OrderTerminalEvent):
+        if channel != EventChannel.FILLS:
+            raise ValueError("OrderTerminalEvent must route to EventChannel.FILLS")
+        embed = build_order_terminal_embed(event)
+        # Dedupe by (action, broker_order_id) so a cancel and a rejection
+        # for the same broker_order_id can both deliver (rare but possible
+        # ordering: rejection might be re-fired after a cancel in some
+        # IBKR edge cases). action.lower() so a producer-side casing
+        # change doesn't break dedupe.
+        dedupe_key = f"order_{event.action.lower()}:{event.broker_order_id}"
     else:
         raise TypeError(f"unsupported event type: {type(event).__name__}")
 
@@ -393,6 +475,7 @@ def plan_event_push(
 
 
 __all__ = [
+    "COLOR_ORDER_CANCELLED",
     "COLOR_ORDER_FILLED",
     "COLOR_ORDER_REJECTED",
     "COLOR_SIGNAL_APPROVED",
@@ -402,9 +485,11 @@ __all__ = [
     "EventChannel",
     "EventPushPlan",
     "OrderFilledEvent",
+    "OrderTerminalEvent",
     "SignalDecisionEvent",
     "SignalEmittedEvent",
     "build_order_filled_embed",
+    "build_order_terminal_embed",
     "build_signal_decision_embed",
     "build_signal_emitted_embed",
     "plan_event_push",
