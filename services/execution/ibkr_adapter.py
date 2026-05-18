@@ -43,7 +43,7 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import TYPE_CHECKING, Any, Final
 
 import structlog
@@ -150,6 +150,61 @@ IbkrErrorStateProvider = Callable[[], "IbkrErrorState | None"]
 #: future expansion (multi-strategy / multi-account). Configurable via
 #: ``IbAsyncIbkrClient.__init__(client_id=...)``.
 DEFAULT_CLIENT_ID: Final[int] = 1
+
+
+#: Per-market minimum price variation (tick size) for the Phase 1 universe.
+#:
+#: IBKR rejects orders whose ``lmtPrice`` or ``auxPrice`` is not aligned to
+#: the contract's tick size with ``Error 110: "The price does not conform to
+#: the minimum price variation for this contract."`` (drill 6, 2026-05-18).
+#: The order placement worker tick-rounds limit + stop prices through
+#: :func:`round_to_tick` before calling :meth:`IbkrClient.place_order`.
+#:
+#: Phase 1 universe locked at backend-spec §11.1 — 7 micro futures + 4 ETFs.
+#: Tick sizes sourced from CME/CBOE contract specs (futures) + SEC sub-penny
+#: rule (ETFs trading > $1).
+PHASE1_TICK_SIZES: Final[dict[str, Decimal]] = {
+    # Micro futures (CME / COMEX / NYMEX).
+    "/MES": Decimal("0.25"),  # Micro E-mini S&P 500
+    "/MNQ": Decimal("0.25"),  # Micro E-mini Nasdaq-100
+    "/MYM": Decimal("1.0"),  # Micro E-mini Dow
+    "/M2K": Decimal("0.10"),  # Micro E-mini Russell 2000
+    "/MGC": Decimal("0.10"),  # Micro Gold
+    "/MCL": Decimal("0.01"),  # Micro WTI Crude Oil
+    "/MBT": Decimal("5.0"),  # Micro Bitcoin (5 USD/BTC)
+    # ETFs (SMART-routed; SEC sub-penny rule → 0.01 for prices ≥ $1).
+    "TLT": Decimal("0.01"),
+    "IEF": Decimal("0.01"),
+    "SHY": Decimal("0.01"),
+    "TIP": Decimal("0.01"),
+}
+
+
+def round_to_tick(price: Decimal, *, market: str) -> Decimal:
+    """Round ``price`` to the market's minimum price variation (tick).
+
+    Uses ``ROUND_HALF_UP`` for ties — symmetric, predictable, and slightly
+    biased toward the more-marketable side on a long-entry limit. For
+    /MES at tick=0.25: 7401.625 → 7401.75 (up); 7401.50 → 7401.50 (already
+    aligned); 7398.125 → 7398.25 (up); 7398.124 → 7398.00 (down).
+
+    :param price: raw Decimal price (may be off-tick from any source —
+        ``decision_price`` from the LEAN signal, ``stop_price`` from the
+        strategy's sizing_trace).
+    :param market: must be a key of :data:`PHASE1_TICK_SIZES`.
+    :raises KeyError: market not in the Phase 1 tick map (caller wraps
+        appropriately — :class:`services.risk.order_placement_worker.
+        OrderPlacementError` is the canonical wrap point at the planner
+        layer).
+    :returns: tick-aligned Decimal at the same scale as the tick size
+        (e.g., /MES tick=0.25 → returns values like ``Decimal("7401.75")``
+        with 2 decimal places; /MCL tick=0.01 → 2 decimal places).
+    """
+    tick = PHASE1_TICK_SIZES[market]
+    # Quantize the multiplier (price / tick) to an integer, then re-scale
+    # by tick. Equivalent to "round to nearest multiple of tick".
+    multiplier = (price / tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return multiplier * tick
 
 #: Map from ib_async order-status strings to our locked
 #: ``IbkrOrderStatus`` enum. The library may emit additional statuses
@@ -1083,7 +1138,9 @@ __all__ = [
     "DEFAULT_CLIENT_ID",
     "IBKR_CONNECTIVITY_ERROR_CODES",
     "IBKR_DATA_FARM_ERROR_CODES",
+    "PHASE1_TICK_SIZES",
     "IbAsyncIbkrClient",
     "IbkrErrorState",
     "IbkrErrorStateProvider",
+    "round_to_tick",
 ]

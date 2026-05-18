@@ -46,9 +46,11 @@ from services.execution.ibkr_adapter import (
     DEFAULT_CLIENT_ID,
     IBKR_CONNECTIVITY_ERROR_CODES,
     IBKR_DATA_FARM_ERROR_CODES,
+    PHASE1_TICK_SIZES,
     IbAsyncIbkrClient,
     IbkrErrorState,
     IbkrErrorStateProvider,
+    round_to_tick,
 )
 from services.execution.ibkr_client import IbkrClient
 from services.execution.types import (
@@ -71,6 +73,7 @@ __all__ = [
     "DEFAULT_CLIENT_ID",
     "IBKR_CONNECTIVITY_ERROR_CODES",
     "IBKR_DATA_FARM_ERROR_CODES",
+    "PHASE1_TICK_SIZES",
     "IbAsyncIbkrClient",
     "IbkrAccountSummary",
     "IbkrCancelOrderResult",
@@ -88,4 +91,5 @@ __all__ = [
     "IbkrPlacementError",
     "IbkrPosition",
     "IbkrRejectionCategory",
+    "round_to_tick",
 ]
