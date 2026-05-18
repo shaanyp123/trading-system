@@ -17,6 +17,121 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ## Entries
 
+### 2026-05-18 — Drill 9 — PR-ε validated LIVE end-to-end; PR-γ broke marketable-limit brackets at IBKR (Error 201) → reverted via PR #187; PR-η scope opened for the proper bracket fix
+
+- **Status:** MIXED. The pre-fill chain (AC1+AC2+AC3+AC4) ran cleanly through the LIVE PR-ζ path on first try — entry signal POSTed at 23:16:09 UTC, approved 46s later, worker fired the bracket placement 3s after that, entry filled at 7434.25 within ~7ms via paper Smart routing, and the canonical PR-G entry chain (order_filled + position_opened + balance_snapshot + trade_opened) landed WITHOUT a `fill_processor_unknown_order` race. **PR-ε validated LIVE end-to-end** — the stop's IBKR rejection emit_sse'd cleanly through the multiplexer and the `order_rejected:32` embed delivered to Discord `#fills` at HTTP 204 (pre-PR-ε this emit raised ValueError + the cancel never reached Discord). **PR-γ FAILED LIVE** — the stop carrying `parentId=<entry_orderId>` was rejected by IBKR with Error 201 "Parent order is being cancelled" because the marketable-limit entry filled BEFORE the stop's parentId linkage could validate at IBKR. Result: entry filled, stop rejected, position NAKED until the operator placed an emergency standalone protective stop. PR-γ reverted at the worker layer via PR #187 (hot-fix; merged 23:33 UTC; deployed 23:35 UTC). The IbkrPlaceOrderRequest field + IbAsyncIbkrClient.place_order adapter wiring are intentionally retained for PR-η (the proper transmit=False/True bracket protocol). Drill 6 defect #3 (entry-cancel leaves naked stop) returns as the known residual risk; that's recoverable via reqGlobalCancel + monitoring, whereas the PR-γ path BROKE entries entirely.
+
+- **Acceptance criteria scorecard:**
+
+  | AC | Criterion | Status | Notes |
+  |---|---|---|---|
+  | 1 | Signal POST → 202 + signal_id | ✅ PASS | audit seq=124; signal_id `019e3d60-1b22-…` |
+  | 2 | Approval POST → 200 + intent_to_place_order=true | ✅ PASS | audit seq=126; bot bearer; required HALT_NEW → CONVALESCENT resume first (seq=125) because system inherited the HALT_NEW state from prior recon_mismatch |
+  | **3** | **Bracket placed atomically (tick-aligned, PR-ζ pre-INSERT, PR-γ IBKR-side parentId)** | ⚠ **PARTIAL** | Tick-aligned ✓ (PR-α); PR-ζ pre-INSERT logs fired for both legs ✓ (entry + stop orders rows committed BEFORE IBKR place_order returned); **PR-γ IBKR-side parentId BROKE the stop** — see defect detail below |
+  | **4** | **orderStatusEvent for entry fill (LIVE path)** | ✅ **PASS** | audit seq=129 `order_filled` fired via `_on_order_status` → `process_fill_event` → audit chain — NO `fill_processor_unknown_order` warning; NO replay required. PR-ζ closes the drill 6 → drill 7 race definitively for the entry path. |
+  | 5 | orderStatusEvent for stop fill (LIVE path) | ⚠ PARTIAL | Drill 9's stop was REJECTED before it could ever fire (PR-γ defect, not a market-timing issue). Emergency standalone protective stop was placed via clientId=82 to protect the position; manually flattened at 23:35:56 UTC via SELL MKT (operator action, not stop fire). Exit fill landed via REPLAY through `scripts/operator_tools/replay_executions.py` (same path drill 5 + drill 7 used). |
+  | 6 | Full PR-G entry + exit audit rows | ✅ PASS | Entry chain LIVE (seq 127-132: order_placed×2 + order_filled + position_opened + balance_snapshot + trade_opened); Exit chain REPLAY (seq 137-140: order_filled + position_closed + balance_snapshot + trade_closed). Plus seq 133 `order_rejected` for the PR-γ-failed stop. Total +13 audit rows for the drill 9 round-trip plus +1 for the kill-switch resume. |
+  | **7** | **Discord #fills via SSE multiplexer** | ✅ **PASS** | 5 webhook_pusher deliveries logged HTTP 204: `signal_emitted` → `#signals`; `signal_approved` → `#signals`; `order_placed:019e3d60-da7e` → `#fills`; `order_filled:30` → `#fills`; **`order_rejected:32` → `#fills` (THIS IS PR-ε'S LIVE END-TO-END VALIDATION** — pre-PR-ε this emit raised ValueError + the cancel was invisible in Discord). |
+  | 8 | `verify_chain --env paper` CLEAN | ✅ PASS | 139 rows walked; max_seq=140 (one SERIALIZABLE retry gap is benign per the hash-chain linkage walker design) |
+  | 9 | Trade row with realized_pnl computed | ✅ PASS | trade `019e3d60-db33-78a2-ac95-0c2644969490` closed at 23:36:10 UTC; avg_entry_price=7434.25, avg_exit_price=7433.00, realized_pnl_usd=-1.2500 (raw price diff; /MES multiplier is $5/pt so actual cash loss = -$6.25; minutes_held=18.96) |
+  | **10** | **IBKR-side stop parentId == entry's broker_order_id (PR-γ validation)** | ❌ **FAIL** | The wire-level intent of PR-γ was confirmed (the adapter DID send parentId=30 to IBKR; the order_rejected payload shows broker_order_id=32 with the orderRef '-stop' suffix), but IBKR's parent-state machine rejected the stop because the parent was already in post-fill terminal state. PR-γ as-implemented is **incompatible with marketable-limit entries** because the parent fills before the child's parentId validates. The proper fix requires IBKR's transmit=False/True bracket protocol (PR-η). |
+
+- **Drill 9 timeline (UTC, this session):**
+
+  | Time | Event |
+  |---|---|
+  | 22:38 | Pre-flight: 8/8 containers healthy, no orphan, audit chain CLEAN at 109 rows, 2 stale positions (drill 7 /MES + drill 8 /MNQ), 4 stale 'working' signals |
+  | 22:42-22:50 | Priority 1 cleanup: `reqGlobalCancel` drill 8 stop → SELL MKT 1 /MES + 1 /MNQ via clientId=70 with stop CIDs as orderRef → `replay_executions.py` landed exit chain for both (seq 112-119); 2 stale 'working' signals UPDATEd to 'cancelled' |
+  | 22:52-23:08 | PR-γ + PR-ε code + 12 new tests; local CI green (lint + mypy + 1813 pytest + frontend) |
+  | 23:08 | PR #186 opened with `risk-review-approved` label |
+  | 23:12 | PR #186 squash-merged (commit b65e44b) after all CI checks green |
+  | 23:14 | Deployed to VPS: 8/8 healthy, `'order' in _CANONICAL_EVENT_TYPES = True`, `IbkrPlaceOrderRequest` includes `parent_broker_order_id` field |
+  | 23:16:09 | Drill 9 signal POSTed; /MES; decision_price=7440.50 (ask+10 ticks); stop_price=7435.25 (bid-10 ticks); signal_id `019e3d60-1b22-…`; audit seq=124 |
+  | 23:16:20 | First approve attempt: 409 `SIGNAL_BLOCKED_BY_HALT` (system was in HALT_NEW from earlier recon_mismatch); resume HALT_NEW → CONVALESCENT at seq=125 |
+  | 23:16:55 | Re-approve: 200 OK; audit seq=126; `intent_to_place_order=true` |
+  | 23:16:58.111 | Worker fired: PR-ζ pre-INSERT entry orders row (`019e3d60-da7e-…`) BEFORE IBKR place |
+  | 23:16:58.138 | IBKR placeOrder ACK: broker_order_id=30 for entry (limit 7440.50) |
+  | 23:16:58.245 | IBKR placeOrder ACK: broker_order_id=32 for stop (parentId=30 per PR-γ) |
+  | 23:16:58.265 | LIVE `order_filled` audit (seq=129) — entry fill at 7434.25 via paper Smart routing |
+  | 23:16:58.268-274 | LIVE PR-G entry chain: position_opened (seq=130), balance_snapshot (seq=131), trade_opened (seq=132) |
+  | 23:16:58.284 | **IBKR Error 201: "Parent order is being cancelled" — STOP REJECTED.** Worker writes `order_rejected` audit (seq=133); worker's `emit_sse('order', ...)` succeeds via PR-ε; webhook_pusher delivers `order_rejected:32` to Discord #fills (HTTP 204) at 23:16:58.802 |
+  | 23:17 | Position NAKED. Operator inspection confirmed via `reqAllOpenOrders` from clientId=70 — `OPEN_ORDERS=0` (only the rejected stop). |
+  | 23:18 | Emergency standalone stop placed via clientId=82: SELL STP @ 7435.25 GTC, `parentId=0` (no PR-γ linkage), orderRef="drill9-emergency-stop-019e3d60" |
+  | 23:19 | `INSERT INTO orders` row for the emergency-stop CID so `replay_executions.py` can resolve signal_id later |
+  | 23:22-23:31 | PR-γ revert hot-fix authored on `claude/zen-rosalind-hotfix-pr-gamma-revert` (rewrites 3 tests in `TestBracketParentIdLinkage` to assert the post-revert contract; keeps adapter wiring + dataclass field for PR-η) |
+  | 23:31 | PR #187 opened with `risk-review-approved` |
+  | 23:33 | PR #187 merged (commit aad87a8) |
+  | 23:35 | Hot-fix deployed; verified `parent_broker_order_id=broker_order_id` no longer present in deployed source |
+  | 23:35:56 | Manually flattened: `cancelOrder(orderId=4)` then SELL MKT 1 /MES via clientId=82 (orderRef="drill9-emergency-stop-019e3d60"); fill at 7433.00 |
+  | 23:36:10 | `replay_executions.py` LIVE: ran process_fill_event → wrote exit chain seq 137-140 (`order_filled` + `position_closed` + `balance_snapshot_recorded` + `trade_closed`) |
+  | 23:36:28 | `verify_chain --env paper` → `CHAIN OK: 139 rows verified` |
+
+- **Defect: PR-γ-as-implemented is incompatible with marketable-limit entries (drill 9 lesson #1):**
+
+  - **Code path:** `services/execution/ibkr_adapter.py::place_order` set `ib_order.parentId = request.parent_broker_order_id` after the limit/stop order construction; `services/risk/order_placement_worker.py::apply_order_placement` threaded `parent_broker_order_id=broker_order_id` into the stop_request after the entry's place returned.
+
+  - **Failure mode:** Drill 9 measured the entry's broker_order_id assigned at T+0.138s after place_order_call_start, entry fill_price observed at T+0.265s (paper Smart routing assigns the fill instantly), and the stop's IBKR place_order ack at T+0.245s. By the time IBKR validates the stop's parentId=30 linkage, broker_order_id=30 (the entry) is in Filled state — IBKR's parent-state machine treats post-fill orders as terminal and rejects the stop with Error 201 "Parent order is being cancelled." Entry stays filled; stop is rejected; **bracket is broken — position is NAKED**.
+
+  - **Why drill 8 didn't surface this:** Drill 8's entry was a /MNQ limit at 29150 placed against an ask of 29113.5 (~37pts above ask), padding sufficient that even though the market moved 9pts up during placement, the fill happened AFTER the stop's `parentId=24` had already been registered at IBKR (drill 8 timing was different — the stop's IBKR place ACK came before the entry's Fill event). Drill 8's `parentId=24` on the stop also rendered with `parentId=0` per the open_orders query at the time, suggesting drill 8 may have also been broken but the stop never got far enough into IBKR's validation flow to fail.
+
+  - **Why drill 7 didn't surface this:** Drill 7's stop was placed with `parentId=0` (pre-PR-γ; drill 7 was on PR #183 + the soon-to-be-merged PR #184 only).
+
+  - **Proper fix (PR-η scope):** IBKR's `transmit=False/True` bracket protocol per ib-async docs + TWS API spec:
+    - `entry.transmit = False` — IBKR queues the entry without releasing to the exchange
+    - `entry_trade = ib.placeOrder(contract, entry)` — get back entry.orderId immediately (ib-async assigns the id synchronously)
+    - `stop.parentId = entry_trade.order.orderId`
+    - `stop.transmit = True` — IBKR releases both atomically + registers the OCA relationship in one wire-level operation; the parent will not fill until the bracket is fully validated
+    The current worker flow doesn't support this because the orders-table INSERT (PR-ζ) happens BEFORE the first place_order call. PR-η needs to restructure the bracket placement: build entry+stop Order objects up-front → place_order(entry, transmit=False) → INSERT both orders rows pre-place(stop) → place_order(stop, parentId=entry.orderId, transmit=True). The pre-INSERT pattern stays so the fill_processor race window stays at zero, but the timing of `broker_order_id` assignment + the INSERT relative to wire transmission needs careful sequencing.
+    Forbidden-whitelist BIND: `services/risk/**` + `services/execution/**` — `risk-review-approved` required.
+    Tests: round-trip with mock-IBKR asserting `entry.transmit=False` + `stop.transmit=True` + ib_async's Trade.orderStatus reflects "WaitParent" (the canonical pre-fire state for a bracket-child whose parent hasn't filled yet).
+
+  - **Mitigation while PR-η is unfixed:** the hot-fix in PR #187 leaves the stop's parentId at 0 (standalone sell-stop). Drill 6 defect #3 (cancelled entry leaves stop alive → naked-short risk on a price spike) returns as the residual risk. Mitigation: every operator-initiated entry cancel (via `/api/system/kill-switch/invoke` cascade OR direct TWS UI) must be followed by a `reqGlobalCancel` sweep to clean up orphan stops. This is the same operational discipline the system had pre-PR-γ.
+
+- **PR-ε validation (the win of the night):**
+
+  Pre-PR-ε, drill 6 + drill 8 measured 3 cancellation events each that hit the `non-canonical SSE event_type 'order'` ValueError at the multiplexer. The cancel audit rows landed (audit-first protects this), but the `emit_sse` call raised + the worker's try/except swallowed the exception + Discord `#fills` never saw the cancel. Post-PR-ε, drill 9's `order_rejected:32` event fired the full pipeline cleanly:
+
+  1. Worker: `_process_terminal_status` → `emit_sse('order', {action:'rejected', ...})` — multiplexer accepted the 'order' type (new canonical entry from PR #186)
+  2. Multiplexer: appended to replay buffer with sequence_no=10 (post-deploy fresh counter); fanned to subscribers including webhook_pusher
+  3. webhook_pusher: `_route_order_event` constructed `OrderTerminalEvent` + `plan_event_push(channel=EventChannel.FILLS)` → `build_order_terminal_embed` (gray COLOR_ORDER_CANCELLED + truncated reason field) → `dispatch_event_push` POSTed to `discord.webhook_urls.fills`
+  4. Discord: HTTP 204 No Content (delivery success); embed visible in `#fills`
+
+  Webhook_pusher logs at 23:16:58.802: `event_push_delivered channel=fills dedupe_key=order_rejected:32 http_status=204` — the canonical PR-ε contract.
+
+- **Final state at session end:**
+  - positions_current: 0
+  - active signals (status IN ('approved','working')): 0
+  - open trades (state != 'closed'): 0
+  - max audit sequence_no: 140
+  - audit chain: CLEAN (`CHAIN OK: 139 rows verified`)
+  - IBKR open orders: 0
+  - IBKR positions: 0 (MES, TLT, MNQ all flat)
+  - Drill 9 trade: state='closed', realized_pnl_usd=-1.2500 (raw price diff; ~$-6.25 in cash terms)
+
+- **PRs landed this session:**
+
+  | PR | Title | Merged | Status |
+  |---|---|---|---|
+  | #186 | feat(execution,api,web): PR-γ bracket parentId + PR-ε canonical 'order' SSE | 23:12 UTC | PR-ε ✓ LIVE-validated; PR-γ ✗ (reverted by #187) |
+  | #187 | hotfix(risk): revert PR-γ worker wiring (drill 9 surfaced IBKR Error 201) | 23:33 UTC | ✓ deployed; worker no longer threads parent_broker_order_id; adapter wiring + dataclass field retained for PR-η |
+  | this PR | docs(decisions-log): drill 9 retrospective | TBD | ✓ Closes drill 9 documentation |
+
+- **Recommended follow-up PRs (post-drill-9):**
+
+  Priority order:
+  1. **PR-η — proper IBKR bracket protocol (transmit=False/True).** Restructure `apply_order_placement` to use ib-async's bracket-order pattern. `services/risk/**` + `services/execution/**` forbidden-whitelist; `risk-review-approved` required. Drill 10 hard prerequisite to get AC3+AC5 fully LIVE-validated. Tests must include the WaitParent-status assertion + a mock-IBKR round-trip that asserts the atomic placement contract.
+  2. **PR-β — defense-in-depth atomic claim hardening (SELECT FOR UPDATE SKIP LOCKED in `fetch_approved_signals`).** Still useful for multi-replica scaling + orphan-container safety. Not urgent.
+  3. **PR-δ — composite key cancellation lookup `(client_order_id, broker_order_id)`.** Only manifests under defect #2 race; deprioritized.
+  4. **CME real-time data subscription (~$1.50/mo) on the paper account** for tight-stop-fill validation. Until this lands, AC5 LIVE-validation requires either a wide enough stop that the delayed feed catches it OR manual flatten.
+  5. **HALT_NEW state recovery procedure documentation.** Drill 9 inherited HALT_NEW from a prior recon_mismatch (operator was unaware). The bot-bearer resume path worked, but a status-check-before-signal-injection step should be added to drill runbooks.
+  6. **realized_pnl_usd multiplier-correctness audit.** The drill 9 trade row shows realized_pnl_usd=-1.25 for a /MES 1.25-pt loss; actual cash loss is -$6.25 (1.25 × $5/pt). Whether this is intentional (stored as raw price diff for downstream calc) or a bug (should be multiplier-adjusted) needs verification against backend-spec §3 trades schema. Pre-existing; not introduced by drill 9.
+
+- **References:**
+  - Adjacent 2026-05-18 entries: drill 8 retrospective (PR-ζ LIVE-validated), drill 7 retrospective (defect #6 surfaced + PR-ζ written), drill 6 retrospective (5 defects + PR-α).
+  - PR #186 (this PR's parent): https://github.com/shaanyp123/trading-system/pull/186
+  - PR #187 (hot-fix revert): https://github.com/shaanyp123/trading-system/pull/187
+  - `scripts/operator_tools/replay_executions.py` — used for the drill 9 cleanup-via-CID re-routing + the exit chain landing post-manual-flatten
+
 ### 2026-05-18 — Drill 8 — PR-ζ validated LIVE; AC4+AC6(entry)+AC7 all via the fixed live SSE path; defect #5 re-confirmed; AC5 pending market movement
 
 - **Status:** SUCCESS for the AC4+AC6(entry)+AC7 contract. Drill 8 (retry-2, after 2 cancel-and-retry rounds for non-marketable limit prices on a volatile /MNQ) put the canonical full-entry PR-G path through the LIVE `orderStatusEvent` callback path WITHOUT a `fill_processor_unknown_order` race. Defect #5 (non-canonical SSE `event_type='order'` on terminal cancellations) re-confirmed — three cancellations across the two pre-fill drill 8 retries hit the same ValueError, but cancel-path audit + DB updates still landed cleanly (audit-first protects this case).
