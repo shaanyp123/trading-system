@@ -42,7 +42,14 @@ on /MES paper) is a pre-deploy gate.
 
 from __future__ import annotations
 
-from services.execution.ibkr_adapter import DEFAULT_CLIENT_ID, IbAsyncIbkrClient
+from services.execution.ibkr_adapter import (
+    DEFAULT_CLIENT_ID,
+    IBKR_CONNECTIVITY_ERROR_CODES,
+    IBKR_DATA_FARM_ERROR_CODES,
+    IbAsyncIbkrClient,
+    IbkrErrorState,
+    IbkrErrorStateProvider,
+)
 from services.execution.ibkr_client import IbkrClient
 from services.execution.types import (
     IbkrAccountSummary,
@@ -62,12 +69,16 @@ from services.execution.types import (
 
 __all__ = [
     "DEFAULT_CLIENT_ID",
+    "IBKR_CONNECTIVITY_ERROR_CODES",
+    "IBKR_DATA_FARM_ERROR_CODES",
     "IbAsyncIbkrClient",
     "IbkrAccountSummary",
     "IbkrCancelOrderResult",
     "IbkrClient",
     "IbkrConnectionState",
     "IbkrContractRef",
+    "IbkrErrorState",
+    "IbkrErrorStateProvider",
     "IbkrFill",
     "IbkrOrderSide",
     "IbkrOrderStatus",

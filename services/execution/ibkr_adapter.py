@@ -40,6 +40,8 @@ against the real broker; we treat the smoke as a pre-deploy gate.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Final
@@ -68,6 +70,79 @@ if TYPE_CHECKING:
     from ib_async import IB
 
 log = structlog.get_logger()
+
+
+@dataclass(frozen=True, slots=True)
+class IbkrErrorState:
+    """Typed snapshot of the most recent IBKR error event received.
+
+    Captured by ``IbAsyncIbkrClient._on_ibkr_error`` and surfaced via
+    ``IbAsyncIbkrClient.last_ibkr_error`` so the api lifespan's
+    ``AsyncTaskMonitor`` can probe for connectivity errors that the
+    OrderPlacementWorker would otherwise miss — the canonical
+    silent-absence pattern from the 2026-05-18 drill 5 incident
+    (IBKR fires Error 1100 to ib-async but the worker's outbound
+    socket stays connected, so ``_ib.isConnected()`` returns True
+    even while inbound orderStatus events have stopped propagating).
+
+    All timestamps are tz-aware UTC per [A06]. ``req_id`` is ib-async's
+    ``reqId`` field; -1 for connection-level errors (1100/1102), the
+    actual request ID for order-specific errors.
+    ``contract_local_symbol`` is None for connection-level errors
+    that don't carry a contract reference.
+    """
+
+    error_code: int
+    error_string: str
+    last_seen_at_utc: datetime
+    req_id: int
+    contract_local_symbol: str | None
+
+
+#: IBKR error codes for broker connectivity loss/restoration. Source:
+#: https://interactivebrokers.github.io/tws-api/message_codes.html
+#:
+#: 1100 — "Connectivity between IB and Trader Workstation has been lost"
+#: 1101 — "Connectivity between IB and Trader Workstation has been
+#:        restored - data lost." (re-subscribe to market data)
+#: 1102 — "Connectivity between IB and Trader Workstation has been
+#:        restored - data maintained." (no re-subscribe needed)
+#:
+#: These are the canonical "broker upstream is sick" signals. The
+#: AsyncTaskMonitor warns when one fires within the freshness window
+#: so the operator sees the upstream sickness even if the api's
+#: TWS API socket to the local gateway sidecar stays alive.
+IBKR_CONNECTIVITY_ERROR_CODES: Final[frozenset[int]] = frozenset({1100, 1101, 1102})
+
+
+#: IBKR error codes for data-farm connection state changes. These are
+#: informational under normal operation (the gateway connects to
+#: dozens of data farms and emits these as it cycles connections)
+#: but a sudden burst can correlate with a real upstream incident.
+#: Logged at WARNING for visibility; not surfaced via the monitor
+#: probe (would generate too much noise).
+#:
+#: 2103 — "A market data farm is disconnected."
+#: 2104 — "Market data farm connection is OK."
+#: 2106 — "HMDS data farm connection is OK."
+#: 2107 — "HMDS data farm connection is inactive but should be available
+#:        upon demand."
+#: 2108 — "Market data farm connection is inactive but should be
+#:        available upon demand."
+#: 2110 — "Connectivity between Trader Workstation and server is broken.
+#:        It will be restored automatically."
+#: 2150 — "Invalid position trade derived value."
+IBKR_DATA_FARM_ERROR_CODES: Final[frozenset[int]] = frozenset(
+    {2103, 2104, 2106, 2107, 2108, 2110, 2150}
+)
+
+
+#: Provider callable signature surfaced via ``last_ibkr_error`` so the
+#: ``AsyncTaskMonitor`` can read the adapter's most-recent error state
+#: without importing the adapter class itself (keeps the dependency
+#: direction api → execution single-headed and the monitor test
+#: surface fake-able).
+IbkrErrorStateProvider = Callable[[], "IbkrErrorState | None"]
 
 
 #: Default TWS API client ID for the execution service. IBKR allows up to
@@ -220,6 +295,15 @@ class IbAsyncIbkrClient:
         # Tracks whether we've already wired the IB event handler so
         # subscribe_order_status is idempotent across reconnects.
         self._order_status_wired: bool = False
+        # Most-recent IBKR error event captured by ``_on_ibkr_error``.
+        # Surfaced via ``last_ibkr_error`` so the AsyncTaskMonitor can
+        # probe for connectivity errors. None until the first error
+        # event fires; overwritten on each subsequent event.
+        self._last_ibkr_error: IbkrErrorState | None = None
+        # Idempotency guard for ``errorEvent`` subscription — same
+        # pattern as ``_order_status_wired``; re-subscribing on
+        # reconnect doesn't double-attach the handler.
+        self._ibkr_error_wired: bool = False
 
     async def connect(self) -> IbkrConnectionState:
         if self._ib is None:
@@ -252,7 +336,116 @@ class IbAsyncIbkrClient:
                     underlying_exception_class=type(exc).__name__,
                     occurred_at_utc=_ts_utc(),
                 ) from exc
+        # Wire ib-async's ``errorEvent`` so 2026-05-18 drill 5's
+        # silent-absence pattern surfaces structured logs (and feeds
+        # the AsyncTaskMonitor's connectivity probe). Idempotent across
+        # reconnects via ``_ibkr_error_wired`` mirror of the
+        # ``_order_status_wired`` pattern.
+        self._wire_error_event()
         return await self.connection_state()
+
+    def _wire_error_event(self) -> None:
+        """Subscribe ``_on_ibkr_error`` to ``self._ib.errorEvent``; idempotent.
+
+        Pre-2026-05-18: IBKR errors landed in api stdout as plain text
+        (e.g., ``Error 1100, reqId -1: Connectivity between IBKR and
+        Trader Workstation has been lost``) but were NOT structured-
+        logged, NOT surfaced via the AsyncTaskMonitor (PR #168), and
+        NOT pushed to Discord #alerts. This handler captures each
+        error event into ``_last_ibkr_error`` + emits a structured log
+        sized by code severity (WARNING for connectivity / data farm
+        codes; ERROR for order-rejection codes ≥ 10000; INFO for other
+        codes).
+
+        Wrapping in try/except is critical — a malformed error event
+        must NOT kill the broker connection (same mirror as
+        ``_on_order_status`` line 692-707). Idempotent re-subscribe
+        via ``_ibkr_error_wired`` flag.
+        """
+        if self._ib is None:
+            return
+        if self._ibkr_error_wired:
+            return
+        try:
+            self._ib.errorEvent += self._on_ibkr_error
+        except Exception as exc:  # pragma: no cover — ib_async should always expose this
+            log.error("ibkr_error_event_subscribe_failed", error=str(exc))
+            return
+        self._ibkr_error_wired = True
+        log.info("ibkr_error_event_subscribed", client_id=self._client_id)
+
+    def _on_ibkr_error(
+        self,
+        reqId: int,
+        errorCode: int,
+        errorString: str,
+        contract: Any,
+    ) -> None:
+        """Sync handler attached to ``ib_async.IB.errorEvent``.
+
+        ib_async invokes this with the 4-arg signature documented in
+        the upstream wrapper's ``self.ib.errorEvent.emit(reqId,
+        errorCode, errorString, contract)`` call. ``contract`` may be
+        ``None`` for connection-level errors (1100/1101/1102) or an
+        ``ib_async.Contract`` for order-specific errors.
+
+        Updates ``_last_ibkr_error`` snapshot + emits a structured log
+        at a severity sized by the error code's category. Swallows
+        any exception during construction so a malformed event
+        cannot kill the broker connection.
+        """
+        try:
+            now = _ts_utc()
+            local_symbol: str | None = None
+            if contract is not None:
+                raw = getattr(contract, "localSymbol", None)
+                if raw:
+                    local_symbol = str(raw)
+            self._last_ibkr_error = IbkrErrorState(
+                error_code=int(errorCode),
+                error_string=str(errorString),
+                last_seen_at_utc=now,
+                req_id=int(reqId),
+                contract_local_symbol=local_symbol,
+            )
+            log_fields = {
+                "error_code": int(errorCode),
+                "error_string": str(errorString),
+                "req_id": int(reqId),
+                "contract_local_symbol": local_symbol,
+                "client_id": self._client_id,
+            }
+            if int(errorCode) in IBKR_CONNECTIVITY_ERROR_CODES:
+                log_fields["category"] = "connectivity"
+                log.warning("ibkr_error_received", **log_fields)
+            elif int(errorCode) in IBKR_DATA_FARM_ERROR_CODES:
+                log_fields["category"] = "data_farm"
+                log.warning("ibkr_error_received", **log_fields)
+            elif int(errorCode) >= 10000:
+                log_fields["category"] = "order_rejection"
+                log.error("ibkr_error_received", **log_fields)
+            else:
+                log_fields["category"] = "other"
+                log.info("ibkr_error_received", **log_fields)
+        except Exception as exc:
+            # The handler MUST NOT raise into ib-async's reader thread —
+            # an exception here would propagate up the eventkit emit
+            # path and could terminate the broker connection. Log + swallow.
+            log.warning(
+                "ibkr_error_event_handler_failed",
+                error=str(exc),
+                raw_error_code=errorCode,
+            )
+
+    @property
+    def last_ibkr_error(self) -> IbkrErrorState | None:
+        """Read-only snapshot of the most-recent IBKR error event.
+
+        Surfaced for the api lifespan's ``AsyncTaskMonitor`` to probe
+        for fresh connectivity errors. Returns ``None`` if no error
+        event has fired since the adapter was constructed.
+        """
+        return self._last_ibkr_error
 
     async def disconnect(self) -> None:
         if self._ib is not None and self._ib.isConnected():
@@ -886,4 +1079,11 @@ class IbAsyncIbkrClient:
         )
 
 
-__all__ = ["DEFAULT_CLIENT_ID", "IbAsyncIbkrClient"]
+__all__ = [
+    "DEFAULT_CLIENT_ID",
+    "IBKR_CONNECTIVITY_ERROR_CODES",
+    "IBKR_DATA_FARM_ERROR_CODES",
+    "IbAsyncIbkrClient",
+    "IbkrErrorState",
+    "IbkrErrorStateProvider",
+]

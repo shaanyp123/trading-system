@@ -807,6 +807,290 @@ class TestBuildOrderStatusUpdate:
 
 
 # ---------------------------------------------------------------------------
+# TestErrorEventSubscription (2026-05-18 drill 5 follow-up #2)
+#
+# Mirrors the TestSubscribeOrderStatus pattern: `_OrderErrorEvent`
+# stand-in for ib_async's `IB.errorEvent` (eventkit.Event surface that
+# supports `+= handler` + `.emit(*args)`). The fake fires the
+# 4-arg signature documented in the upstream
+# `wrapper.py::self.ib.errorEvent.emit(reqId, errorCode, errorString, contract)`.
+# ---------------------------------------------------------------------------
+
+
+class _ErrorEvent:
+    """Minimal stand-in for ib_async's IB.errorEvent (`+=` Sigil)."""
+
+    def __init__(self) -> None:
+        self._handlers: list[Any] = []
+
+    def __iadd__(self, handler: Any) -> _ErrorEvent:
+        self._handlers.append(handler)
+        return self
+
+    def fire(self, reqId: int, errorCode: int, errorString: str, contract: Any) -> None:
+        for handler in self._handlers:
+            handler(reqId, errorCode, errorString, contract)
+
+    @property
+    def handler_count(self) -> int:
+        return len(self._handlers)
+
+
+def _fake_ib_with_error_event_class() -> type:
+    """A fake IB whose instance carries a real `errorEvent` attr."""
+
+    class _FakeIBWithErrorEvent:
+        def __init__(self) -> None:
+            self.serverVersion = 176
+            self._connected = False
+            self.errorEvent = _ErrorEvent()
+            self.connectAsync = AsyncMock(side_effect=self._mark_connected)
+            self.qualifyContractsAsync = AsyncMock()
+            self.accountSummaryAsync = AsyncMock(return_value=[])
+            self.placeOrder = MagicMock(return_value=_default_trade())
+            self.cancelOrder = MagicMock()
+            self.openTrades = MagicMock(return_value=[])
+            self.positions = MagicMock(return_value=[])
+
+        async def _mark_connected(self, **_kw: Any) -> None:
+            self._connected = True
+
+        def isConnected(self) -> bool:
+            return self._connected
+
+        def disconnect(self) -> None:
+            self._connected = False
+
+    return _FakeIBWithErrorEvent
+
+
+def _make_contract_mock(local_symbol: str | None) -> Any:
+    """Build a MagicMock that quacks like an ib_async Contract.
+
+    Use ``None`` for connection-level errors that don't carry a
+    contract; the adapter handles both branches.
+    """
+    if local_symbol is None:
+        return None
+    contract = MagicMock()
+    contract.localSymbol = local_symbol
+    return contract
+
+
+class TestErrorEventSubscription:
+    """``connect()`` wires the IBKR errorEvent + captures last error state."""
+
+    async def test_connect_wires_error_event_once(self) -> None:
+        """Idempotent across reconnects — handler attaches exactly once."""
+        ib_cls = _fake_ib_with_error_event_class()
+        client = IbAsyncIbkrClient(ib_factory=ib_cls)
+        await client.connect()
+        ib_instance = client._ib  # type: ignore[attr-defined]
+        assert ib_instance is not None
+        assert ib_instance.errorEvent.handler_count == 1
+        # Force a disconnect + reconnect — handler stays at 1.
+        ib_instance._connected = False
+        await client.connect()
+        assert ib_instance.errorEvent.handler_count == 1
+
+    async def test_connect_emits_subscribed_log(self) -> None:
+        from structlog.testing import capture_logs
+
+        ib_cls = _fake_ib_with_error_event_class()
+        client = IbAsyncIbkrClient(ib_factory=ib_cls)
+        with capture_logs() as logs:
+            await client.connect()
+        events = [log.get("event") for log in logs]
+        assert "ibkr_error_event_subscribed" in events
+
+    async def test_error_event_with_1100_stores_last_error(self) -> None:
+        """Connection-level Error 1100 captured into ``last_ibkr_error``."""
+        from services.execution.ibkr_adapter import IbkrErrorState
+
+        ib_cls = _fake_ib_with_error_event_class()
+        client = IbAsyncIbkrClient(ib_factory=ib_cls)
+        await client.connect()
+        # Pre-condition: no error captured yet.
+        assert client.last_ibkr_error is None
+        ib_instance = client._ib  # type: ignore[attr-defined]
+        assert ib_instance is not None
+        ib_instance.errorEvent.fire(
+            -1,
+            1100,
+            "Connectivity between IBKR and Trader Workstation has been lost.",
+            None,
+        )
+        state = client.last_ibkr_error
+        assert isinstance(state, IbkrErrorState)
+        assert state.error_code == 1100
+        assert state.error_string.startswith("Connectivity between IBKR")
+        assert state.req_id == -1
+        assert state.contract_local_symbol is None
+        assert state.last_seen_at_utc.tzinfo is UTC
+
+    async def test_error_event_warning_for_connectivity_codes(self) -> None:
+        from structlog.testing import capture_logs
+
+        ib_cls = _fake_ib_with_error_event_class()
+        client = IbAsyncIbkrClient(ib_factory=ib_cls)
+        await client.connect()
+        ib_instance = client._ib  # type: ignore[attr-defined]
+        assert ib_instance is not None
+        with capture_logs() as logs:
+            ib_instance.errorEvent.fire(-1, 1102, "Connectivity restored.", None)
+        received = [log for log in logs if log.get("event") == "ibkr_error_received"]
+        assert len(received) == 1
+        assert received[0]["log_level"] == "warning"
+        assert received[0]["category"] == "connectivity"
+        assert received[0]["error_code"] == 1102
+
+    async def test_error_event_warning_for_data_farm_codes(self) -> None:
+        from structlog.testing import capture_logs
+
+        ib_cls = _fake_ib_with_error_event_class()
+        client = IbAsyncIbkrClient(ib_factory=ib_cls)
+        await client.connect()
+        ib_instance = client._ib  # type: ignore[attr-defined]
+        assert ib_instance is not None
+        with capture_logs() as logs:
+            ib_instance.errorEvent.fire(-1, 2104, "Market data farm connection is OK.", None)
+        received = [log for log in logs if log.get("event") == "ibkr_error_received"]
+        assert len(received) == 1
+        assert received[0]["log_level"] == "warning"
+        assert received[0]["category"] == "data_farm"
+
+    async def test_error_event_error_for_order_rejection_codes(self) -> None:
+        """Codes >= 10000 are order rejections; log at ERROR."""
+        from structlog.testing import capture_logs
+
+        ib_cls = _fake_ib_with_error_event_class()
+        client = IbAsyncIbkrClient(ib_factory=ib_cls)
+        await client.connect()
+        ib_instance = client._ib  # type: ignore[attr-defined]
+        assert ib_instance is not None
+        contract = _make_contract_mock("TLT")
+        with capture_logs() as logs:
+            ib_instance.errorEvent.fire(
+                42,
+                10147,
+                "OrderId 42 that needs to be cancelled is not found.",
+                contract,
+            )
+        received = [log for log in logs if log.get("event") == "ibkr_error_received"]
+        assert len(received) == 1
+        assert received[0]["log_level"] == "error"
+        assert received[0]["category"] == "order_rejection"
+        assert received[0]["req_id"] == 42
+        assert received[0]["contract_local_symbol"] == "TLT"
+
+    async def test_error_event_info_for_unknown_codes(self) -> None:
+        from structlog.testing import capture_logs
+
+        ib_cls = _fake_ib_with_error_event_class()
+        client = IbAsyncIbkrClient(ib_factory=ib_cls)
+        await client.connect()
+        ib_instance = client._ib  # type: ignore[attr-defined]
+        assert ib_instance is not None
+        with capture_logs() as logs:
+            ib_instance.errorEvent.fire(-1, 321, "Please enter a local symbol.", None)
+        received = [log for log in logs if log.get("event") == "ibkr_error_received"]
+        assert len(received) == 1
+        assert received[0]["log_level"] == "info"
+        assert received[0]["category"] == "other"
+
+    async def test_handler_swallows_exceptions(self) -> None:
+        """A malformed event must not crash the broker connection."""
+        from unittest.mock import PropertyMock
+
+        from structlog.testing import capture_logs
+
+        ib_cls = _fake_ib_with_error_event_class()
+        client = IbAsyncIbkrClient(ib_factory=ib_cls)
+        await client.connect()
+        ib_instance = client._ib  # type: ignore[attr-defined]
+        assert ib_instance is not None
+        # Build a contract whose .localSymbol raises on access.
+        bad_contract = MagicMock()
+        type(bad_contract).localSymbol = PropertyMock(side_effect=RuntimeError("bad attr"))
+        with capture_logs() as logs:
+            # Must not raise.
+            ib_instance.errorEvent.fire(-1, 1100, "Connectivity lost.", bad_contract)
+        failed = [log for log in logs if log.get("event") == "ibkr_error_event_handler_failed"]
+        assert len(failed) == 1
+        assert failed[0]["raw_error_code"] == 1100
+        # last_ibkr_error should remain None — the snapshot construction
+        # raised before assignment.
+        assert client.last_ibkr_error is None
+
+    async def test_last_ibkr_error_overwritten_on_new_event(self) -> None:
+        ib_cls = _fake_ib_with_error_event_class()
+        client = IbAsyncIbkrClient(ib_factory=ib_cls)
+        await client.connect()
+        ib_instance = client._ib  # type: ignore[attr-defined]
+        assert ib_instance is not None
+        ib_instance.errorEvent.fire(-1, 1100, "lost", None)
+        first = client.last_ibkr_error
+        assert first is not None
+        assert first.error_code == 1100
+        # New event overwrites.
+        ib_instance.errorEvent.fire(-1, 1102, "restored", None)
+        second = client.last_ibkr_error
+        assert second is not None
+        assert second.error_code == 1102
+
+    async def test_contract_local_symbol_captured_when_present(self) -> None:
+        ib_cls = _fake_ib_with_error_event_class()
+        client = IbAsyncIbkrClient(ib_factory=ib_cls)
+        await client.connect()
+        ib_instance = client._ib  # type: ignore[attr-defined]
+        assert ib_instance is not None
+        contract = _make_contract_mock("MESH26")
+        ib_instance.errorEvent.fire(99, 10147, "not found", contract)
+        state = client.last_ibkr_error
+        assert state is not None
+        assert state.contract_local_symbol == "MESH26"
+
+    async def test_contract_none_yields_none_local_symbol(self) -> None:
+        ib_cls = _fake_ib_with_error_event_class()
+        client = IbAsyncIbkrClient(ib_factory=ib_cls)
+        await client.connect()
+        ib_instance = client._ib  # type: ignore[attr-defined]
+        assert ib_instance is not None
+        ib_instance.errorEvent.fire(-1, 1100, "lost", None)
+        state = client.last_ibkr_error
+        assert state is not None
+        assert state.contract_local_symbol is None
+
+    async def test_constants_match_canonical_sets(self) -> None:
+        """``IBKR_CONNECTIVITY_ERROR_CODES`` + ``IBKR_DATA_FARM_ERROR_CODES`` are frozen."""
+        from services.execution.ibkr_adapter import (
+            IBKR_CONNECTIVITY_ERROR_CODES,
+            IBKR_DATA_FARM_ERROR_CODES,
+        )
+
+        assert IBKR_CONNECTIVITY_ERROR_CODES == frozenset({1100, 1101, 1102})
+        assert IBKR_DATA_FARM_ERROR_CODES == frozenset({2103, 2104, 2106, 2107, 2108, 2110, 2150})
+        # These sets are disjoint (1100-1102 vs. 2103+).
+        assert IBKR_CONNECTIVITY_ERROR_CODES.isdisjoint(IBKR_DATA_FARM_ERROR_CODES)
+
+    async def test_ibkr_error_state_frozen(self) -> None:
+        """``IbkrErrorState`` is a frozen dataclass (cannot mutate after construction)."""
+        from datetime import datetime
+
+        from services.execution.ibkr_adapter import IbkrErrorState
+
+        state = IbkrErrorState(
+            error_code=1100,
+            error_string="lost",
+            last_seen_at_utc=datetime.now(tz=UTC),
+            req_id=-1,
+            contract_local_symbol=None,
+        )
+        with pytest.raises(Exception):  # FrozenInstanceError or dataclasses.FrozenInstanceError
+            state.error_code = 1102  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
 # TestModuleContract
 # ---------------------------------------------------------------------------
 
@@ -825,6 +1109,10 @@ class TestModuleContract:
             "IbkrPosition",
             "IbkrAccountSummary",
             "DEFAULT_CLIENT_ID",
+            "IbkrErrorState",
+            "IbkrErrorStateProvider",
+            "IBKR_CONNECTIVITY_ERROR_CODES",
+            "IBKR_DATA_FARM_ERROR_CODES",
         ):
             assert hasattr(execution, name), f"missing public export: {name}"
 

@@ -30,6 +30,29 @@ and cancelled at api shutdown. It tolerates its own failures: any
 exception inside the probe loop is caught + logged at ERROR; the
 monitor keeps running.
 
+2026-05-18 drill 5 extension — IBKR connectivity probe
+------------------------------------------------------
+
+The monitor now also probes an optional ``TrackedIbkrErrorState``
+provider callable each cycle. When IBKR fires Error 1100/1101/1102
+("Connectivity between IBKR and Trader Workstation has been lost") the
+``ibkr_adapter`` captures the event via its ``errorEvent`` subscription
+and surfaces it via its ``last_ibkr_error`` property. The monitor reads
+the snapshot each tick — when an error is in the connectivity-codes set
+AND the event is fresher than the freshness window, the monitor emits a
+``async_task_monitor_ibkr_connectivity_warn`` WARNING (once per distinct
+``(error_code, last_seen_at_utc)`` pair, so the log doesn't flood while
+the connection stays sick).
+
+This catches the silent-absence pattern from the 2026-05-18 drill 5
+incident: ib_gateway↔IBKR upstream broke at the 23:59 ET overnight
+maintenance restart; the api's clientId=N socket to the local gateway
+sidecar stayed alive (``_ib.isConnected()`` returned True), but inbound
+orderStatus events for fills stopped propagating. Without this probe,
+the operator only notices when checking on drill state mid-day. The
+WARNING log + (in a follow-up PR) a Discord ``#alerts`` P1 dispatch
+closes the gap.
+
 This module is hot-fix scope (services/api/**) per dev-guide §2.3.
 """
 
@@ -38,10 +61,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
-from typing import Final
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Final
 
 import structlog
+
+if TYPE_CHECKING:
+    from services.execution.ibkr_adapter import IbkrErrorStateProvider
 
 log = structlog.get_logger(__name__)
 
@@ -65,6 +92,52 @@ class TrackedTask:
 DEFAULT_MONITOR_INTERVAL_SECONDS: Final[float] = 30.0
 
 
+#: Connectivity-error codes that trigger an
+#: ``async_task_monitor_ibkr_connectivity_warn`` WARNING. Default set
+#: lifted from ``services.execution.ibkr_adapter.IBKR_CONNECTIVITY_ERROR_CODES``
+#: but kept here as a module-level frozenset so the monitor doesn't have
+#: to import the adapter (single-headed dependency direction).
+DEFAULT_IBKR_CONNECTIVITY_CODES: Final[frozenset[int]] = frozenset({1100, 1101, 1102})
+
+#: Default freshness window for IBKR error probes. Errors older than
+#: this window are treated as stale and won't re-trigger a WARNING
+#: (the original event already fired its WARNING when it was fresh;
+#: re-warning every probe cycle would be noisy). 5 min matches the
+#: typical IBKR overnight-maintenance window so a single connectivity
+#: blip produces 1-2 WARNING lines, not 10+.
+DEFAULT_IBKR_FRESHNESS_SECONDS: Final[float] = 300.0
+
+
+@dataclass(frozen=True, slots=True)
+class TrackedIbkrErrorState:
+    """Probe descriptor for the ibkr_adapter's most-recent error state.
+
+    Wraps the ``last_ibkr_error`` provider callable so the monitor
+    can read the adapter's latest error each tick without importing
+    the adapter class itself. ``provider`` returns ``None`` when no
+    error has fired since adapter boot OR raises if the adapter is
+    in an inconsistent state — the monitor handles both cleanly.
+
+    ``connectivity_codes`` is the set of IBKR error codes that
+    trigger a WARNING. Defaults to the canonical {1100, 1101, 1102}
+    upstream-connectivity set; the caller can pass a wider/narrower
+    set for testing or for environments where the desired alert
+    threshold differs.
+
+    ``freshness_window_seconds`` caps how old an error event can be
+    before the monitor treats it as resolved (no log). Defaults to
+    300s (5 min); errors older than this don't re-warn even if
+    they're still the latest stored state.
+    """
+
+    name: str
+    provider: IbkrErrorStateProvider
+    connectivity_codes: frozenset[int] = field(
+        default_factory=lambda: DEFAULT_IBKR_CONNECTIVITY_CODES,
+    )
+    freshness_window_seconds: float = DEFAULT_IBKR_FRESHNESS_SECONDS
+
+
 class AsyncTaskMonitor:
     """Periodic liveness probe over a fixed set of lifespan asyncio tasks.
 
@@ -80,6 +153,7 @@ class AsyncTaskMonitor:
         tracked: Sequence[TrackedTask],
         *,
         interval_seconds: float = DEFAULT_MONITOR_INTERVAL_SECONDS,
+        ibkr_error_state: TrackedIbkrErrorState | None = None,
     ) -> None:
         self._tracked: tuple[TrackedTask, ...] = tuple(tracked)
         self._interval: float = float(interval_seconds)
@@ -93,6 +167,17 @@ class AsyncTaskMonitor:
         # silent (the dead task remains dead and we don't want a noisy
         # repeating ERROR log).
         self._reported_dead: set[str] = set()
+        # Optional IBKR error-state probe (2026-05-18 drill 5 follow-up).
+        # None when the adapter isn't wired into the lifespan yet (Phase
+        # 0 stub envs / Phase 1 dev with no broker connection); the
+        # probe simply skips.
+        self._ibkr_error_state: TrackedIbkrErrorState | None = ibkr_error_state
+        # Idempotency guard for IBKR connectivity warnings: keyed on
+        # ``(error_code, last_seen_at_utc)`` so a single error event
+        # only generates one WARNING even though the probe runs every
+        # 30s. A new error event (different timestamp OR different code)
+        # produces a fresh WARNING.
+        self._reported_ibkr_errors: set[tuple[int, datetime]] = set()
         self._log = log.bind(component="async_task_monitor")
 
     def request_stop(self) -> None:
@@ -105,7 +190,28 @@ class AsyncTaskMonitor:
         Synchronous (no awaits). Returns the number of NEWLY-detected
         dead tasks this probe — the per-task report fires only once
         per task lifetime to avoid repeating-error log spam.
+
+        Also probes the optional ``TrackedIbkrErrorState`` for IBKR
+        connectivity errors (2026-05-18 drill 5 follow-up). The IBKR
+        probe runs independently of task-death detection — both fire
+        each cycle if conditions are met.
         """
+        newly_dead = self._probe_tracked_tasks()
+        # IBKR probe runs after the task probe; failures are logged
+        # but don't inhibit the next probe cycle.
+        try:
+            self._probe_ibkr_error_state()
+        except Exception:
+            # Defensive: a bug in the probe MUST NOT kill the monitor
+            # loop. ``run_forever`` already wraps probe_once in a
+            # broader try/except, but we wrap here too so the IBKR
+            # probe's failure mode is structurally distinct from the
+            # task probe's.
+            self._log.exception("async_task_monitor_ibkr_probe_failed")
+        return newly_dead
+
+    def _probe_tracked_tasks(self) -> int:
+        """Pre-2026-05-18 ``probe_once`` body — task liveness only."""
         newly_dead = 0
         for tracked in self._tracked:
             if tracked.task is None:
@@ -155,6 +261,91 @@ class AsyncTaskMonitor:
             self._reported_dead.add(tracked.name)
             newly_dead += 1
         return newly_dead
+
+    def _probe_ibkr_error_state(self) -> None:
+        """Read the IBKR adapter's last-error snapshot; warn if connectivity loss is fresh.
+
+        Three skip paths:
+
+        * No ``TrackedIbkrErrorState`` configured (Phase 0 / dev envs
+          without a broker connection) — silent no-op.
+        * Provider raises — log at WARNING (don't crash the monitor)
+          and skip; the next probe will retry.
+        * Provider returns ``None`` (no error event has fired since
+          adapter boot) — silent no-op.
+
+        When the provider returns a fresh connectivity-code error
+        that we haven't already reported, emit
+        ``async_task_monitor_ibkr_connectivity_warn`` at WARNING and
+        add the ``(code, last_seen_at_utc)`` key to the idempotency
+        set so subsequent probes of the same event are silent.
+
+        "Fresh" means ``last_seen_at_utc`` is within
+        ``freshness_window_seconds`` of ``datetime.now(tz=UTC)`` —
+        older errors are treated as already-resolved.
+        """
+        if self._ibkr_error_state is None:
+            return
+        tracker = self._ibkr_error_state
+        try:
+            state = tracker.provider()
+        except Exception as exc:
+            self._log.warning(
+                "async_task_monitor_ibkr_provider_failed",
+                error=str(exc),
+                exception_type=type(exc).__name__,
+            )
+            return
+        if state is None:
+            return
+        if state.error_code not in tracker.connectivity_codes:
+            # Non-connectivity error (e.g., order rejection 10147, data
+            # farm 2103). The adapter already structured-logged it at
+            # the appropriate level; the monitor doesn't need to add
+            # another log line.
+            return
+        # Freshness check — stale errors don't re-warn.
+        now = datetime.now(tz=UTC)
+        # Guard against naive timestamps (would raise TypeError on
+        # subtract). The adapter writes tz-aware UTC per [A06]; this
+        # is defensive against a future regression.
+        if state.last_seen_at_utc.tzinfo is None:
+            self._log.warning(
+                "async_task_monitor_ibkr_naive_timestamp",
+                error_code=state.error_code,
+                note="IbkrErrorState.last_seen_at_utc was tz-naive; expected tz-aware UTC ([A06])",
+            )
+            return
+        age_seconds = (now - state.last_seen_at_utc).total_seconds()
+        if age_seconds > tracker.freshness_window_seconds:
+            return
+        # Idempotency — same (code, timestamp) only warns once.
+        key = (state.error_code, state.last_seen_at_utc)
+        if key in self._reported_ibkr_errors:
+            return
+        self._reported_ibkr_errors.add(key)
+        self._log.warning(
+            "async_task_monitor_ibkr_connectivity_warn",
+            error_code=state.error_code,
+            error_string=state.error_string,
+            req_id=state.req_id,
+            contract_local_symbol=state.contract_local_symbol,
+            last_seen_at_utc=state.last_seen_at_utc.isoformat(),
+            age_seconds=round(age_seconds, 2),
+            freshness_window_seconds=tracker.freshness_window_seconds,
+            tracker_name=tracker.name,
+            note=(
+                "IBKR fired a connectivity-loss/restoration error "
+                "(see https://interactivebrokers.github.io/tws-api/"
+                "message_codes.html for the canonical list). The api's "
+                "TWS API socket to the local ib_gateway sidecar may "
+                "still report connected even while inbound orderStatus "
+                "events have stopped propagating. Verify by checking "
+                "the ibkr_adapter logs around `last_seen_at_utc` and "
+                "the gateway↔IBKR upstream state via `docker compose "
+                "logs ib_gateway`."
+            ),
+        )
 
     def probe_initial(self) -> None:
         """Log a one-shot startup summary; mark un-spawned tasks reported.
@@ -297,8 +488,11 @@ def _extract_task(
 
 
 __all__: Final = (
+    "DEFAULT_IBKR_CONNECTIVITY_CODES",
+    "DEFAULT_IBKR_FRESHNESS_SECONDS",
     "DEFAULT_MONITOR_INTERVAL_SECONDS",
     "AsyncTaskMonitor",
+    "TrackedIbkrErrorState",
     "TrackedTask",
     "collect_tracked_tasks",
     "stop_async_task_monitor",
