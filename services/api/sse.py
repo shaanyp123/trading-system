@@ -147,6 +147,18 @@ _CANONICAL_EVENT_TYPES: Final[frozenset[str]] = frozenset(
         "job",
         "version",
         "session_evicted",
+        # Order-lifecycle (PR-epsilon / drill 6 defect #5). Emitted by
+        # services.risk.order_placement_worker._process_terminal_status
+        # with ``action`` ∈ ``{cancelled, rejected}``. Symmetric with
+        # ``signal`` (signal-lifecycle) and ``fill`` (fill-lifecycle):
+        # an order can be placed (currently surfaced as a ``signal``
+        # ``action=placed`` envelope from the route layer), filled
+        # (surfaced as a ``fill`` envelope), or terminate without a
+        # fill (cancelled by operator/recon/broker, or rejected at
+        # submit by IBKR validation) — the last category needs its
+        # own type so consumers can route to the right Discord
+        # channel + invalidate the right TanStack Query keys.
+        "order",
         # Heartbeat (multiplexer-internal):
         "ping",
     }

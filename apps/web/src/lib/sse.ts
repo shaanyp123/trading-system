@@ -72,6 +72,12 @@ export interface UseSSEResult {
 const INVALIDATE_KEYS: Readonly<Record<SSEEventType, readonly (readonly string[])[]>> = {
   signal: [['signals'], ['today-digest']],
   fill: [['fills'], ['positions'], ['today-digest']],
+  // 'order' is the terminal-without-fill path (cancellation, rejection) per
+  // PR-epsilon / drill 6 defect #5. Invalidates orders + trades + today-digest;
+  // 'signals' too because an entry-cancel can transition the signal status
+  // back to a non-pending state. PR-G full-close path emits 'fill' so we
+  // don't need positions here.
+  order: [['orders'], ['trades'], ['signals'], ['today-digest']],
   position: [['positions'], ['today-digest']],
   pnl: [['today-digest']],
   risk_state: [['system-status'], ['today-digest']],

@@ -138,6 +138,28 @@ class TestCanonicalEventTypeGate:
         await multiplexer.emit_sse("ping", {"server_now": "..."})
         assert multiplexer._test_current_sequence_no() == 1
 
+    @pytest.mark.asyncio
+    async def test_order_event_type_accepted_for_terminal_status(self) -> None:
+        """PR-epsilon / drill 6 defect #5 regression contract.
+
+        Pre-fix the worker's emit_sse('order', ...) for cancellations raised
+        ValueError because 'order' wasn't in _CANONICAL_EVENT_TYPES. Post-fix
+        the emit lands and the multiplexer fans out to subscribers.
+        """
+        await multiplexer.emit_sse(
+            "order",
+            {
+                "action": "cancelled",
+                "order_id": "abc",
+                "client_order_id": "cid-1",
+                "signal_id": "sig-1",
+                "market": "/MES",
+                "broker_order_id": "42",
+                "environment": "paper",
+            },
+        )
+        assert multiplexer._test_current_sequence_no() == 1
+
 
 class TestReplayBuffer:
     @pytest.mark.asyncio
