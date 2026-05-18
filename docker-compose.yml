@@ -428,6 +428,23 @@ services:
       # required for placeOrder/cancelOrder; empty defaults to read-only.
       TWS_ACCEPT_INCOMING: 'accept'
       READ_ONLY_API: 'no'
+      # EXISTING_SESSION_DETECTED_ACTION populates IBC's config.ini
+      # `ExistingSessionDetectedAction` setting (same image template as
+      # TWS_ACCEPT_INCOMING). Without this, IBC defaults to `manual` and
+      # pops a headless "Existing session detected — keep this session or
+      # exit?" dialog whenever a second client logs into the same account
+      # (e.g., operator's TWS Desktop is open against DUQ825170 paper while
+      # the gateway tries to reconnect after IBKR's overnight maintenance
+      # window restart). The dialog hangs until clicked; meanwhile IBKR
+      # emits Error 1100 ("connectivity lost") and orderStatus events stop
+      # propagating to the api even though the API socket stays open.
+      # Discovered 2026-05-18 drill 5; see `Docs/decisions-log.md` entry.
+      #
+      # `primary` = this gateway session WINS, kicks the other client.
+      # The backend is authoritative; operator must reconnect TWS Desktop
+      # manually after each gateway restart. Documented tradeoff in
+      # `deploy/ibkr/README.md` "Existing session collisions" section.
+      EXISTING_SESSION_DETECTED_ACTION: 'primary'
     healthcheck:
       # Probe the externally-published socat port (4004 paper / 4003 live)
       # rather than the internal gateway port (4002/4001). Inside the
