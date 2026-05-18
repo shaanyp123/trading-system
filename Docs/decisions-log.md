@@ -17,6 +17,108 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ## Entries
 
+### 2026-05-18 — Drill 7 retrospective — PR-α validated; defect #2 ROOT-CAUSED + RESOLVED (orphan container); defect #6 newly surfaced (fill_processor race)
+
+- **Status:** PARTIAL SUCCESS. Drill 7 ran in the same session as drill 6 (~1.5h after drill 6 aborted) to validate PR-α tick-rounding fix + confirm defect #2 (duplicate placement race) was resolved by stopping the orphan container surfaced during drill 6 investigation. PR-α validated end-to-end ✓ (no IBKR Error 110, clean bracket). Defect #2 confirmed resolved ✓ (single entry order, no clientId=1 duplicate). **NEW defect #6 surfaced** — `fill_processor_unknown_order` race condition where IBKR's orderStatus event arrives ~7ms BEFORE the orders row is committed to DB, causing the live fill propagation to be dropped. Entry fill RECOVERED via `scripts/operator_tools/replay_executions.py` (same path drill 5 used). AC4 partial (orderStatusEvent fired but raced); AC5+AC7 pending CME re-open at 22:00 UTC (drill 7 hit the CME 21:00-22:00 UTC daily maintenance break mid-execution).
+
+- **Drill 6 → Drill 7 bridge investigation (the orphan-container smoking gun):**
+
+  During drill 6 retrospective writing, audit chain logs revealed that audit seq 71 + 76 were written to the `audit_log` table but the api container's structured logs (`audit_event_appended`) had NO entries for those sequence numbers. Only an external process could have written those rows. Investigation via `docker ps --filter name=api` revealed TWO api containers running:
+  - `trading-api-1` — the "official" container (Up 4 hours; clientId=2 per `API_IBKR_CLIENT_ID=2` env override in deploy/.env)
+  - `trading-api-run-99cd0b962f91` — **ORPHAN container (Up 42 hours)**. Created 2026-05-17T02:16:49 UTC via `docker compose run api alembic -c alembic.ini upgrade head` for a one-off migration task. `--rm` was NOT specified, so the container persisted with the full api entrypoint running (the runtime cmd was the alembic invocation, but the container's `entrypoint` is the api's `tini → python -m services.api.entrypoint`, so the full FastAPI + worker stack initialized). `docker compose run` does NOT pass through the parent's env vars by default — so `API_IBKR_CLIENT_ID=2` from deploy/.env did NOT apply; the orphan defaulted to `services.execution.ibkr_adapter.DEFAULT_CLIENT_ID = 1`. The orphan polled the same Postgres for approved signals on a parallel poll cycle to the live api, racing on every approved signal for 42 hours.
+
+  Orphan container logs (queried via `docker logs trading-api-run-...`) confirmed the smoking-gun chain — it wrote audit seq 71 (drill 6 retry's first order_placed event) AND seq 76 (one of the dup cancellation routings). Its `_process_terminal_status` ALSO failed with the same `non-canonical SSE event_type 'order'` ValueError (defect #5), but from an OLDER code build — `line 961` in the orphan vs `line 1390` in the live api, because the orphan was built from the git SHA at 2026-05-17 02:16 UTC.
+
+  **Resolution: `docker stop trading-api-run-99cd0b962f91`** — orphan stopped at 20:50 UTC. Container state went from "Up 42 hours (healthy)" → "dead". Drill 7 ran in a single-api-container environment for the first time today.
+
+  **Defect #2 (drill 6) root cause therefore is NOT a missing `SELECT FOR UPDATE` in `fetch_approved_signals` per se — it's the existence of a second api process polling the same DB.** PR-β (atomic claim hardening) is still a valuable defense-in-depth measure (would prevent future orphan-container-style races OR multi-replica scaling), but isn't strictly required to make drill 7 work. Operator should also add a docker compose post-deploy hygiene check: `docker ps --filter name=api | wc -l == 1`. Recommended Phase 1+ follow-up: an api lifespan startup self-check that queries Postgres + ib_gateway for active connections with our identity (account_id + clientId) and refuses to start if it sees another live api session, preventing this class of orphan-container race entirely.
+
+- **PR #183 — drill 6 fix bundle (this PR's code surface):**
+
+  Merged 20:57 UTC; commit `5dab3b3` on `main`. Pre-deploy local: `make ci` clean (1700/1700 unit tests; ruff + mypy --strict; 26 new tests across `TestRoundToTick` (10) + `TestPlanOrderPlacementTickRounding` (11) + `TestPlanOrderPlacementBracket` extension (1) + module-contract additions (2 ETF coverage in `TestRoundToTick.test_etf_cent_tick`). Deploy: `git pull --ff-only` + `docker compose build api` (3.8s — Python-only change leveraged the deps layer cache) + `docker compose up -d api`. Boot verification: `from services.execution.ibkr_adapter import round_to_tick, PHASE1_TICK_SIZES; round_to_tick(Decimal("7401.625"), market="/MES") == Decimal("7401.75")` — the canonical drill 6 case validated on the running container.
+
+- **Drill 7 timeline (Drill 7 ran 20:59:33 → 21:01:44 UTC; one minute before + during the CME 21:00-22:00 UTC maintenance break):**
+
+  - **20:58:29 UTC** — api restarted with PR #183 code. Worker spawned, IBKR connected clientId=2, orderStatus subscribed, AsyncTaskMonitor running.
+  - **20:59:00 UTC** — `/MES` delayed quote refresh: bid=7423.50, ask=7423.75.
+  - **20:59:33 UTC** — Signal POST to `/api/internal/lean/signals` with `decision_price="7423.75000000"` (at ask, tick-aligned) + `stop_price="7420.00"` (~0.05% below; tick-aligned). Response 202; signal_id `019e3ce3-0d2a-7249-a73f-2f49c7dfee17`; audit seq=77.
+  - **20:59:33 UTC** — Approval via bot bearer. Response 200; audit seq=78.
+  - **20:59:35.122 UTC** — Worker (clientId=2) placed entry on IBKR: broker_order_id=10, limit_marketable BUY 1 @ 7423.75. **Tick-aligned ✓ (PR-α validated).**
+  - **20:59:35.255 UTC** — Worker began writing entry order_placed audit row.
+  - **20:59:35.262 UTC** — IBKR `orderStatusEvent` fired for entry (presumably the "Submitted" → "Filled" lifecycle). Worker's `_on_order_status` callback ran, called `fill_processor.process_fill_event(client_order_id="6614a6b5-fa2810a9-019e3ce3-0", ...)`. The fill_processor's SELECT lookup on the `orders` table by `client_order_id` returned NO rows because the entry order_placed audit + orders INSERT had NOT YET COMMITTED. Logged `fill_processor_unknown_order` at WARNING; the worker logged `order_placement_fill_unknown_order` at WARNING; fill event DROPPED. **DEFECT #6 surfaced.**
+  - **20:59:35.287 UTC** — Worker began writing stop order_placed audit row.
+  - **20:59:35.305 UTC** — Worker logged `order_placement_completed` — entry + stop orders rows committed to DB at this point. ~43ms AFTER the orderStatusEvent that the fill_processor missed.
+  - **20:59:35 UTC** — Audit chain: signal_emitted=77, signal_approved=78, order_placed entry=79, order_placed stop=80. Bracket placed CLEAN with NO dup entry (defect #2 resolved). Backend `parent_order_id` on stop correctly references entry's UUID. **IBKR-side bracket parentId STILL 0 (defect #3 not addressed in this PR).**
+  - **21:01:00 UTC** — IBKR-side check via `reqAllOpenOrders` from clientId=90: 1 open order (the stop at orderId=12, PreSubmitted). Entry order=10 NOT in open list — meaning either filled or rejected.
+  - **21:01:00 UTC** — `reqExecutionsAsync` via clientId=89: 1 execution for orderId=10, BOT 1 @ 7420.75 at 20:59:35 UTC. **Entry FILLED at 7420.75 (NOT at the limit 7423.75 — IBKR paper Smart-routed to a better price).**
+  - **21:01:36 UTC** — Initial `replay_executions.py` invocation FAILED with `DATABASE_URL is not set` (the script reads `$DATABASE_URL` for the engine; the api container doesn't have DATABASE_URL in its base env — it builds its connection from individual `API_DB_*` vars via Pydantic settings).
+  - **21:01:43 UTC** — Re-ran `replay_executions.py` with `-e DATABASE_URL=postgresql+asyncpg://...` exported into the exec environment. **SUCCESS.** Replayed the missed entry fill through `services.risk.fill_processor.process_fill_event` end-to-end:
+    - audit seq=81 — order_filled (entry, broker_order_id=10, fill_price=7420.75, vwap)
+    - audit seq=82 — position_opened (/MES qty=1 avg_cost=7420.75)
+    - audit seq=83 — balance_snapshot_recorded
+    - audit seq=84 — trade_opened (trade_id=019e3ce5-0dc2-…, state='open_position')
+  - **21:01:44 UTC** — `replay_executions_completed exit_code=0 outcomes=[{kind:success, audit_event_uuid:019e3ce5-0d9e-…}]`. Same recovery semantics as drill 5 — backend now reflects reality.
+  - **21:02:38 UTC** — `verify_chain --env paper` → `CHAIN OK: 84 rows verified` (84 rows = 76 pre-drill + 8 from drill 7).
+  - **21:00-22:00 UTC** — CME daily maintenance break in effect. /MES not actively trading. The stop at 7420.00 remains pending; will only fill if /MES drops 0.75pts after the 22:00 UTC re-open. Stop is "DAY" tif but IBKR's stops typically persist through the maintenance break and into the next session for futures contracts.
+
+- **NEW DEFECT #6 — fill_processor_unknown_order race (the drill 7 finding):**
+
+  - **Code path:** `services/risk/fill_processor.py::process_fill_event` (invoked from `services/risk/order_placement_worker.py::_on_order_status` callback at line ~1148). The function looks up the orders row by `client_order_id` to identify which signal + market context the fill belongs to.
+
+  - **Failure mode:** IBKR's first `orderStatusEvent` for an order can fire IMMEDIATELY after `placeOrder` returns — drill 7 measured 7ms between place ack (`ibkr_order_placed` log at 20:59:35.122) and the orderStatus event arrival (20:59:35.262, where `fill_processor_unknown_order` warning fired). Meanwhile, the worker writes the orders row + entry audit row INSIDE a `with session.begin():` block that commits at ~20:59:35.305 (43ms LATER). During the 43ms window: the orderStatus event fires → fill_processor looks up orders row by CID → no row exists → logs `fill_processor_unknown_order` → drops the event silently.
+
+  - **Why this didn't manifest in drill 5:** Drill 5's TLT entry was a different order_type / different IBKR Smart routing behavior — the orderStatus event for TLT didn't fire within the 43ms window (or it did fire and we never noticed because the drill 5 retrospective focused on the gateway dialog hang). Drill 7's /MES with paper Smart routing fired the orderStatus near-instantly because the paper account's matching engine immediately accepts at the IBKR-internal mid.
+
+  - **Proper fix:** restructure the placement sequence so the orders row is INSERT'd BEFORE the IBKR place_order call returns. Options:
+    - **(a)** INSERT orders row with `broker_order_id=NULL` BEFORE the IBKR call, then UPDATE to set broker_order_id after. The fill_processor's lookup by client_order_id will then find the row immediately (`client_order_id` is deterministic from the signal). Order: INSERT (CID, NULL) → place_order → orderStatus event arrives → fill_processor finds row → UPDATE broker_order_id. Race-free.
+    - **(b)** Use SELECT FOR UPDATE in fill_processor's lookup with a configurable backoff (retry up to ~100ms in 10ms increments) — but this is bandaging the symptom, not the cause.
+    - **(c)** Suspend fill_processor.process_fill_event until orderStatus's broker_order_id has a backing audit row (poll until visible). Most fragile.
+    - **(a) is recommended.** Forbidden-whitelist BIND: `services/risk/order_placement_worker.py` + `services/risk/fill_processor.py`; `risk-review-approved` required.
+
+  - **Mitigation while #6 is unfixed:** every entry-fill drill MUST be followed by `python -m scripts.operator_tools.replay_executions --client-order-ids <CID> --env <env>` to recover the missed fill into the audit chain + tables. (Same mitigation drill 5 used for the gateway-hang scenario; this is now a known recurring need post-drill-6.) The orderStatusEvent for the STOP fill is unaffected because the stop's orders row IS already committed when the stop eventually fires (could be hours after placement).
+
+- **Acceptance criteria scorecard:**
+
+  | AC | Criterion | Status | Notes |
+  |---|---|---|---|
+  | 1 | Signal POST → 202 + signal_id | ✅ PASS | audit seq=77 |
+  | 2 | Approval POST → 200 + intent_to_place_order=true | ✅ PASS | audit seq=78 |
+  | 3 | Bracket placed atomically with `has_leg_field=true` on both | ✅ PASS | Entry seq=79 + stop seq=80; clean single-pair (defect #2 resolved); tick-aligned (PR-α validated) |
+  | 4 | orderStatusEvent fires for entry fill (real-time) | ⚠ PARTIAL | Event FIRED at 20:59:35.262 → routed to `_on_order_status` → fill_processor → logged `fill_processor_unknown_order` (defect #6 race) → DROPPED. Recovered via `replay_executions.py` at 21:01:44 UTC (same as drill 5). |
+  | 5 | orderStatusEvent fires for stop fill | ❓ PENDING | Stop active at IBKR (orderId=12, status=PreSubmitted, aux=7420.00). CME maintenance break 21:00-22:00 UTC. Awaiting natural fill or manual close post-break. |
+  | 6 | Full PR-G entry + exit audit rows | ⚠ PARTIAL | Entry path COMPLETE via replay (seq 81=order_filled, 82=position_opened, 83=balance_snapshot, 84=trade_opened). Exit path pending stop fill. |
+  | 7 | Discord #fills via SSE multiplexer | ⚠ PARTIAL | Replay path runs in a separate Python process (same as drill 5), so SSE multiplexer didn't see the entry fill. Discord `#fills` would have rendered the fill ONLY if the live orderStatusEvent path had succeeded — defect #6 broke it. Stop fill (if it lands via live path) should propagate cleanly through SSE. |
+  | 8 | `verify_chain --env paper` CLEAN | ✅ PASS | 84 rows verified post-replay |
+  | 9 | Trade row with realized_pnl computed | ❓ PENDING | trade_id=019e3ce5-0dc2 is open (state='open_position'); realized_pnl will land when stop fills (or manual close). |
+
+- **Total drill 7 audit chain growth:** 76 → 84 (+8 rows: signal_emitted, signal_approved, order_placed×2, order_filled, position_opened, balance_snapshot, trade_opened). Expected +13 total if stop fills cleanly: add order_filled stop, position_closed, balance_snapshot, trade_closed = 84 → 88. (Drill 5 ran the same +12 expected vs +8 baseline.)
+
+- **Recommended follow-up PRs (defect #6 + leftover drill 6 defects):**
+
+  Priority order updated after drill 7:
+  1. **NEW PR-ζ (defect #6 fix)** — restructure orders INSERT to land BEFORE IBKR place_order returns (option (a) above). Drill 8 hard prerequisite to get AC4 fully cleanly. ~50 LOC + ~10 tests including concurrent-place-and-fill race test. `risk-review-approved`.
+  2. **PR-γ (defect #3)** — IBKR-side bracket parentId on stop_market. Stop on /MES still has parentId=0 today; if entry rejected or operator-cancelled mid-flight, the stop would stand alone and could short the account. Required before any LIVE-money drill (paper is forgiving but this is a critical safety gap for live).
+  3. **PR-β (defect #2 hardening)** — `SELECT FOR UPDATE SKIP LOCKED` in `fetch_approved_signals` as defense-in-depth. NOT strictly required after orphan removal but valuable for Phase 2+ multi-replica scaling (and for any future `docker compose run` accidents).
+  4. **PR-δ (defect #4)** — cancellation-by-CID + broker_order_id composite lookup. Only manifests when defect #2 fires; deprioritized.
+  5. **PR-ε (defect #5)** — SSE non-canonical `'order'` event_type → swap to `'signal'` action='cancelled' (path b). Affects cancel propagation only; fill propagation is unaffected.
+
+- **Open positions / unfinished state at drill 7 documentation time:**
+  - `positions_current`: 1 row, /MES qty=1 avg_cost=7420.75.
+  - `trades`: trade `019e3ce5-0dc2-75e5-b5a8-e0b4edcfecab` at state='open_position'.
+  - `orders`: entry `019e3ce3-1401-…` still status='pending' in the DB (the live worker never observed the entry fill via the orderStatus path — it was recorded via replay's direct fill_processor path which writes the fills/positions/balances/trades rows but does NOT update the orders status to 'filled'). The replay tool's docstring notes this is by design — the orders row update is a separate concern best handled by the live worker.
+  - IBKR: 1 open order (stop at orderId=12) + 1 position (MESM6 qty=1).
+  - Awaiting CME re-open at 22:00 UTC to see if the stop fills naturally; if not, operator should manually close via TWS or via a sell market order at session open.
+
+- **Cost / scope impact:**
+  - PR-α (this PR) — drill 6 retrospective + tick-rounding code + 26 unit tests. Merged. Drill 6's defect #1 closed.
+  - Drill 7 surfaced 1 new defect (#6 fill_processor race). Defect count net stays at 5 because defect #2 was reclassified as orphan-container-induced (resolved by `docker stop`, not by code).
+  - **Drill 8 prereq:** PR-ζ (defect #6 fix). Without it, every drill needs a manual replay_executions follow-up to recover the entry fill, which is unsustainable + masks AC4/AC7's true status.
+
+- **References:**
+  - Adjacent 2026-05-18 entry "Drill 6 retrospective" (this same session, ~1.5h earlier) — context for why drill 7 was attempted.
+  - PR #183 (this PR's merge) — bundles drill 6 retrospective + PR-α tick-rounding fix.
+  - `scripts/operator_tools/replay_executions.py` + `scripts/operator_tools/README.md` (drill 5 follow-up #4) — used to recover the missed entry fill at 21:01:44 UTC.
+
 ### 2026-05-18 — Drill 6 retrospective — SAFETY ABORT via reqGlobalCancel; 5 defects surfaced
 
 - **Status:** ABORTED via operator-authorized `reqGlobalCancel` at 20:14:11 UTC after the worker's bracket placement landed in an unsafe state on IBKR (2 entry orders for 1 signal across two clientIds + standalone stop with `parentId=0`). Audit chain stayed CLEAN throughout (`verify_chain --env paper` → 76 rows verified post-cleanup). AC1+AC2+AC8 passed; AC3 partial; AC4/AC5/AC6/AC7/AC9 BLOCKED — no fills ever landed because the drill was halted on safety grounds before any fill propagation.
