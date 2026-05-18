@@ -17,6 +17,144 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ## Entries
 
+### 2026-05-18 — Drill 6 retrospective — SAFETY ABORT via reqGlobalCancel; 5 defects surfaced
+
+- **Status:** ABORTED via operator-authorized `reqGlobalCancel` at 20:14:11 UTC after the worker's bracket placement landed in an unsafe state on IBKR (2 entry orders for 1 signal across two clientIds + standalone stop with `parentId=0`). Audit chain stayed CLEAN throughout (`verify_chain --env paper` → 76 rows verified post-cleanup). AC1+AC2+AC8 passed; AC3 partial; AC4/AC5/AC6/AC7/AC9 BLOCKED — no fills ever landed because the drill was halted on safety grounds before any fill propagation.
+
+- **Drill 6's intended value-add over drill 5** (per the runbook for this session): exercise the real-time `ib-async` `orderStatusEvent` callback path end-to-end on both entry + stop fills (AC4 + AC5), plus Discord `#fills` embeds posted VIA the api's SSE multiplexer (AC7). Drill 5 missed these because the gateway↔IBKR upstream was broken by the 23:59 ET overnight `Existing session detected` dialog hang — recovery required a one-shot `reqExecutions` replay via `/tmp/drill5_recovery.py` (later codified as `scripts/operator_tools/replay_executions.py` per drill 5 follow-up #4). Drill 6 was scheduled for a clean gateway state.
+
+- **Timeline:**
+  - **19:09:01 UTC** — Pre-flight: 8/8 containers healthy; audit chain CLEAN at 64 rows; positions=0, open_trades=0, but 1 active signal (drill 5's stale `019e3b08-…` stuck at `status='working'` because PR #181 (`UPDATE signals.status='closed' on trade close`) merged AFTER drill 5 and isn't retroactive). Operator elected to proceed with drill 6 leaving the stale signal as-is (worker only claims `status='approved'`, so no mechanical conflict).
+  - **19:09:25 UTC** — `verify_chain --env paper` → `CHAIN OK: 64 rows verified` baseline.
+  - **19:09:01 UTC** — Operator chose `/MES` micro futures (23/5 trading, no cash-close pressure) + tight stop ~0.05% below mid.
+  - **19:09:30 UTC** — /MES delayed quote: bid=7401.50 ask=7401.75 (CME data subscription absent on the paper account; fell back to `reqMarketDataType(3)` delayed-data); historical 1h close = 7401.25.
+  - **19:38:40.408 UTC** — **Attempt 1 signal injection.** POST /api/internal/lean/signals with `decision_price="7401.62500000"` (mid of 7401.50 + 7401.75) + `stop_price="7398.25"`. Response 202; signal_id `019e3c98-ffd5-…`; audit_event_uuid `019e3c98-ffc5-…` (audit seq=65).
+  - **19:39:10 UTC** — **Attempt 1 approval.** POST /api/signals/.../approve via bot bearer. Response 200; `new_status=approved`; audit_sequence_no=66; `intent_to_place_order=true`.
+  - **19:39:14.128 UTC** — Worker (clientId=2) placed entry order via ib-async at limit_marketable 7401.625. IBKR responded with **Error 110: "The price does not conform to the minimum price variation for this contract"** (/MES min tick = 0.25; 7401.625 is half a tick). Worker wrote `order_placed` audit (seq=67) + `order_cancelled` audit (seq=68) within 262ms. Stop order was NOT placed because entry rejected atomically. **DEFECT #1 surfaced (tick-rounding gap).**
+  - **19:39:14.390 UTC** — Attempt 1 ended; orders row `019e3c99-8441-…` at status='cancelled' with rejection_reason "110 - Error 110, reqId 4: The price does not conform to the minimum price variation for this contract." Signal `019e3c98-…` now stuck at status='working' (the workers' `apply_order_placement` flips signals.status='working' BEFORE the IBKR call returns; the rejection cascade doesn't roll back).
+  - **19:44:00 UTC** — Operator chose option 1 ("inject fresh signal with tick-aligned price"). /MES quote refresh: bid=7402.00 ask=7402.25 (drift +0.25 since last quote).
+  - **19:44:11.073 UTC** — **Retry signal injection** with `decision_price="7402.25000000"` (at ask, valid 0.25 tick) + `stop_price="7398.50"` (0.05% below, valid tick). Response 202; signal_id `019e3c9e-0b6f-…`; audit seq=69.
+  - **19:44:22.008 UTC** — **Retry approval.** Response 200; audit seq=70.
+  - **19:44:24.565 UTC** — **DEFECT #2 surfaces.** A FIRST `order_placed` audit row landed (seq=71) — broker_order_id=6, client_order_id="c3561a8b-5c415b65-019e3c9e-0", written **2ms before** the worker's logged `ibkr_contract_qualified` event at 19:44:24.615. Origin: a place call from **clientId=1** (NOT the api worker, which runs on clientId=2 per the PR #167 bypass). Source process unknown — see Open Question section below.
+  - **19:44:24.567 UTC** — Worker (clientId=2) placed entry (broker_order_id=4; audit seq=72 — "leg=entry" payload, `has_leg_field=true` per PR #169 observability log) + stop (broker_order_id=6; audit seq=73 — "leg=stop" payload, `has_leg_field=true`). Worker logged `order_placement_completed signal_id=…-019e3c9e-… order_id=…-40ca-… broker_order_id="4" stop_placed=true stop_broker_order_id="6"`. From the worker's perspective, this looked like a CLEAN bracket placement.
+  - **19:44:25–20:14:00 UTC** — 30 min observation period. No `orderStatusEvent` callback fired; no fills. /MES held between 7401.50–7402.50, neither hitting the limit-marketable buy at 7402.25 reliably (delayed-data context — the actual prevailing ask may have moved away) nor the stop at 7398.50.
+  - **20:14:00 UTC** — `reqAllOpenOrdersAsync` from clientId=96 revealed THREE open orders:
+    | OrderId | ClientID | Action | OrderRef | Status | parentId |
+    |---|---|---|---|---|---|
+    | 4 | **2** | BUY 1 @ 7402.25 LMT | `c3561a8b-…-019e3c9e-0` | Submitted | 0 |
+    | 6 | **2** | SELL 1 @ 7398.50 STP | `c3561a8b-…-019e3c9e-0-stop` | PreSubmitted | **0** (!) |
+    | 6 | **1** | BUY 1 @ 7402.25 LMT | `c3561a8b-…-019e3c9e-0` | Submitted | 0 |
+
+    **Two entries** (one per clientId, same orderRef) **+ standalone stop with parentId=0** (broken bracket linkage). If both entries fill: long 2 /MES with stop coverage for only 1; the standalone stop with `parentId=0` would trigger as a SELL at 7398.50 regardless of position state. Real safety hazard even on paper.
+  - **20:14:00 UTC** — Operator chose option 1 ("Cancel ALL 3 orders, document drill 6 outcome"). Surgical cross-clientId cancel from clientId=95 failed (IBKR Error 10147 "OrderId X not found" — TWS API requires same-clientId cancellation by default).
+  - **20:14:11.080 UTC** — `reqGlobalCancel()` from clientId=94 — succeeded. POST-cancel `reqAllOpenOrdersAsync` returned 0 open orders.
+  - **20:14:11.080–20:14:11.130 UTC** — Worker's `_on_order_status` callback fired for each of the 3 cancellations; wrote `order_cancelled` audit rows (seq=74, 75, 76). All three cancel attempts emitted SSE via `emit_sse("order", …)` which **failed with `ValueError: non-canonical SSE event_type 'order'`** — **DEFECT #5 surfaced.** Audit rows still landed (audit-first ordering per backend-spec §2.10.1; SSE failure is non-blocking by design).
+  - **20:14:58 UTC** — `verify_chain --env paper` → `CHAIN OK: 76 rows verified`. Audit chain integrity holds across 12 new rows (4 attempt 1 + 8 retry).
+
+- **5 defects surfaced** (in order of severity):
+
+  1. **DEFECT #1 — Tick-rounding missing in order placement pipeline.**
+     - Code path: `services/risk/signal_dispatch.py::plan_order_placement` translates a signal's `decision_price` directly into `OrderPlacementPlan.limit_price` with NO tick alignment. `services/risk/order_placement_worker.py::apply_order_placement` passes that raw `limit_price` to `IbkrClient.place_order` which sends it to IBKR. /MES min tick = 0.25; ETFs = 0.01; /MGC = 0.10; etc.
+     - Symptom: IBKR Error 110 at place time; entry rejected atomically; stop NOT placed (atomic bracket failure). Order goes pending_submit → cancelled in milliseconds.
+     - Reproduction: any LEAN-emitted signal whose `decision_price` doesn't align to the market's minimum price variation. /MES at mid 7401.625 (half-tick) is the canonical example; ETFs are usually safe because their tick is the same 0.01 granularity as Python `Decimal` typical usage.
+     - Operator-side workaround: ensure LEAN's signal emit rounds `decision_price` to the market's tick before POSTing. But this should be enforced at the backend boundary (defense in depth).
+     - Proper fix: per-market tick lookup at `plan_order_placement`-time. The tick map already exists for futures in `services/execution/ibkr_adapter.py::PHASE1_FUTURES_TICK_SIZES` (or similar) — needs to be exported + applied at planning time. ETFs need a 0.01 default. Tests: round-trip with each Phase 1 market.
+     - Forbidden-whitelist BIND: `services/risk/signal_dispatch.py` + `services/risk/order_placement_worker.py` — `risk-review-approved` required.
+
+  2. **DEFECT #2 — Duplicate placement race condition (no atomic claim).**
+     - Code path: `services/risk/order_placement_worker.py::fetch_approved_signals` (lines ~385-445) — SQL `SELECT … FROM signals s LEFT JOIN orders o ON o.signal_id = s.id WHERE s.account_id=:acct AND s.env=:env AND s.status='approved' AND o.id IS NULL`. **No `SELECT FOR UPDATE` / no atomic claim mechanism.**
+     - Symptom: clientId=1 (UNKNOWN source) + clientId=2 (the api worker) BOTH placed entry orders for the same approved signal within ~2ms of each other. Each pre-claim query returned the same approved-with-no-orders row.
+     - Hypothesis on the clientId=1 source: PR #167 (referenced in CLAUDE.md pre-state context but not in repo as a merged commit visible to me) switched the api from clientId=1 → clientId=2 to bypass operator-TWS-Desktop conflict. The clientId=1 placement during drill 6 retry suggests a stale ib-async session somewhere, or an orphan process, or an automated test/dev harness still wired to clientId=1. **Worth a separate investigation by the operator — see Open Question below.**
+     - Proper fix: atomic SELECT FOR UPDATE SKIP LOCKED on the signals row (claim semantics matching `services/audit/chain.py::append_audit_event`'s `pg_advisory_xact_lock` pattern). Alternative / additionally: write a pre-IBKR-call `intent_to_place` orders row so subsequent polls' LEFT JOIN excludes the in-flight signal (idempotent at the orders-PK level). Tests: spawn 10 concurrent run_once tasks against a single approved signal — exactly one should result in an orders row.
+     - Forbidden-whitelist BIND: `services/risk/**` — `risk-review-approved` required.
+
+  3. **DEFECT #3 — IBKR-side bracket parentId=0 on stop_market.**
+     - Code path: `services/execution/ibkr_adapter.py::place_order` for stop_market with `parent_broker_order_id` argument — the `ib_async.Order` constructed for the stop has `parentId` set to 0 (the default) instead of the entry's broker_order_id. The bracket relationship is therefore NOT registered with IBKR.
+     - Cross-validation: the BACKEND `orders.parent_order_id` (UUID-to-UUID linkage in our own table) IS correctly populated (40ce → 40ca). Only the IBKR-side OCO/bracket relationship is missing.
+     - Real-world impact: if entry fills, IBKR doesn't auto-link the stop. If the entry gets cancelled, the stop sits OPEN at 7398.50 and will trigger as a standalone SELL if /MES hits that level — putting us SHORT 1 contract with no entry-side position.
+     - Proper fix: at place-stop time, pass `Order.parentId = entry_broker_order_id` to ib-async; ib-async will set it correctly on the wire. Tests: place bracket, query IBKR with `reqAllOpenOrders`, assert stop's `parentId == entry.orderId`.
+     - Forbidden-whitelist BIND: `services/execution/**` — `risk-review-approved` required.
+
+  4. **DEFECT #4 — Cancellation-by-client_order_id ambiguous when CIDs are duplicated.**
+     - Code path: `services/risk/order_terminal_status_processor.py::process_terminal_status_event` (per the log line `event=order_terminal_status_propagated`) — looks up the orders row by `client_order_id` to identify which row to update on cancel/reject events. When duplicate-placement (defect #2) creates two orders rows sharing the same client_order_id, both cancel events route to the SAME (first-matched) orders row.
+     - Symptom: orders 4018 (broker_order_id=6, clientId=1) + 40ca (broker_order_id=4, clientId=2) share `client_order_id="c3561a8b-5c415b65-019e3c9e-0"`. When IBKR sent `Cancelled` orderStatus for both entry orders, the worker's terminal_status processor matched the lookup by CID, found 4018 first (older `created_at`), and updated 4018 TWICE. Audit seq=75 and seq=76 BOTH point at `order_id="019e3c9e-4018-…"` — but the underlying broker_order_id values in those payloads differ (4 vs 6). The 40ca row was never touched and remains `status='pending'` while IBKR shows 0 open orders.
+     - Downstream of defect #2: would not manifest if the race were prevented.
+     - Proper fix: terminal_status_processor should look up by `(client_order_id, broker_order_id)` composite OR by `(account_id, broker_order_id)` (since broker_order_id IS unique per `(account_id, clientId)` and clientId is implicitly tied to the api adapter — though defect #2 leaks orders into the same DB from foreign clientIds). Cleanest: composite key `(client_order_id, broker_order_id)` for the lookup.
+     - Forbidden-whitelist BIND: `services/risk/order_terminal_status_processor.py` — `risk-review-approved` required.
+     - Manual cleanup needed: `UPDATE orders SET status='cancelled' WHERE id='019e3c9e-40ca-7f03-8ecb-f3837c6d6260'` to reconcile DB with IBKR reality. **NOT done in this session** — deferred to drill 7 prep or a hot-fix follow-up.
+
+  5. **DEFECT #5 — `services/risk/order_placement_worker.py:1390` emits SSE with non-canonical event_type='order'.**
+     - Error: `ValueError: non-canonical SSE event_type 'order'; see services.api.sse._CANONICAL_EVENT_TYPES for the locked set`
+     - Code path: `services/risk/order_placement_worker.py::_process_terminal_status` calls `emit_sse("order", {…})` after writing the order_cancelled / order_rejected audit row. The `services/api/sse.py::emit_sse` function enforces a locked taxonomy (`_CANONICAL_EVENT_TYPES`) — `'order'` is not in the allowed set.
+     - Symptom: cancellation events are written to audit_log (audit-first ordering preserves the row) but DON'T propagate via SSE. Discord `#fills` never sees the cancellation. Web `/signals` + `/trades` pages can't observe the cancel transition without polling. The `signal action=placed` route-layer emit (PR #107) DOES work because it uses canonical type 'signal' — so cancel-via-worker is the broken path.
+     - Cross-validation: the failure is logged at ERROR (`event=order_placement_terminal_sse_emit_failed`); the worker correctly continues + emits the success-of-DB-state log (`event=order_placement_terminal_propagated`); SSE failure is non-blocking by design (audit chain is the source of truth).
+     - Proper fix: either (a) add `'order'` to `services/api/sse._CANONICAL_EVENT_TYPES` with frontend cache-invalidation map updates in `apps/web/src/lib/sse.ts`, OR (b) change the worker's emit to use `'signal'` event_type with `action='cancelled'` / `action='rejected'` (matching the existing `signal action=placed` pattern). Option (b) is lower-risk because it doesn't grow the canonical taxonomy.
+     - Hot-fix whitelist scope: `services/risk/order_placement_worker.py:1390` is the call site (single-line change); `services/api/sse.py` modification (if path (a)) touches the canonical taxonomy and requires regular review. **Recommended: path (b).**
+     - Forbidden-whitelist consideration: `services/risk/**` is on the forbidden list, so even a single-line emit_sse-call-site change requires `risk-review-approved`.
+
+- **Final state** (post-cleanup, ready for drill 7 planning):
+  - Audit chain: CLEAN at 76 rows (`verify_chain --env paper` → `CHAIN OK: 76 rows verified`).
+  - IBKR-side: 0 open orders (confirmed via clientId=93 `reqAllOpenOrdersAsync` after global cancel).
+  - Backend `signals` table: 2 drill-6 signals stuck at status='working':
+    - `019e3c98-ffd5-7678-85d8-18990ceaedbb` (attempt 1, /MES, approved 19:39:10) — stale because PR #181 closes signals when the trade closes, but attempt 1 never opened a trade (entry rejected).
+    - `019e3c9e-0b6f-7945-9df3-d8c9fea13885` (retry, /MES, approved 19:44:22) — stale because retry never reached fills; reqGlobalCancel terminated the path.
+  - Backend `orders` table: 4 drill-6 rows:
+    - `019e3c99-8441-71a1-857e-b2a311ccaf36` (attempt 1, broker_order_id=4, status='cancelled', rejection_reason "110 - …minimum price variation…").
+    - `019e3c9e-4018-75a4-8ffc-c0c078fa51a2` (retry dup entry on clientId=1, broker_order_id=6, status='cancelled' — audit seq=75 + 76 BOTH attributed here via defect #4).
+    - `019e3c9e-40ca-7f03-8ecb-f3837c6d6260` (retry real entry on clientId=2, broker_order_id=4, status='**pending**' — STALE: real-world cancelled but the cancel audit got mis-routed to 4018).
+    - `019e3c9e-40ce-7e94-b7c6-24ca98139c29` (retry stop on clientId=2, broker_order_id=6, status='cancelled', parent_order_id=40ca — backend linkage correct; IBKR linkage was broken per defect #3).
+  - Backend `trades` table: unchanged from pre-drill (1 closed trade from drill 5).
+
+- **Acceptance criteria scorecard:**
+
+  | AC | Criterion | Status | Notes |
+  |---|---|---|---|
+  | 1 | Signal POST → 202 + signal_id | ✅ PASS | Twice (attempt 1 + retry) |
+  | 2 | Approval POST → 200 + intent_to_place_order=true | ✅ PASS | Twice |
+  | 3 | Bracket placed atomically; `has_leg_field=true` on both legs | ⚠ PARTIAL | clientId=2 worker placed entry+stop with leg fields (PR #169 observability log confirmed both); but defect #2 introduced a DUP entry from clientId=1 that bypassed the worker entirely and wasn't bracket-aware |
+  | 4 | orderStatusEvent fires for entry fill (real-time path) | ❌ BLOCKED | No fill — drill aborted before fills landed |
+  | 5 | orderStatusEvent fires for stop fill | ❌ BLOCKED | Same |
+  | 6 | Full PR-G entry + exit audit rows (ORDER_FILLED + POSITION_OPENED + BALANCE_SNAPSHOT + TRADE_OPENED + …) | ❌ BLOCKED | Only order_placed + order_cancelled audit rows landed (12 of expected 14 if both fills had happened) |
+  | 7 | Discord #fills embeds posted VIA SSE multiplexer | ❌ BLOCKED | No fills; also defect #5 would have broken the cancel-propagation path |
+  | 8 | `verify_chain --env paper` CLEAN post-cycle | ✅ PASS | 76 rows verified |
+  | 9 | Trade row with realized_pnl_usd computed | ❌ BLOCKED | No fill, no trade |
+
+- **5 recommended follow-up PRs (drill 7 prerequisites + hardening):**
+
+  1. **PR-α (defect #1)** — `services/risk/signal_dispatch.py::plan_order_placement` applies per-market tick rounding to `limit_price` + `stop_price`. Tick map lookup from `services/execution/ibkr_adapter.py` (already has Phase 1 futures map; needs ETF default 0.01). ~50 LOC + ~10 unit tests covering /MES /MGC /MCL /MBT half-tick / quarter-tick edges + ETF 0.001 sub-cent rejection. `risk-review-approved`. **Drill 7 prerequisite.**
+
+  2. **PR-β (defect #2)** — `services/risk/order_placement_worker.py::fetch_approved_signals` adds `SELECT … FOR UPDATE SKIP LOCKED LIMIT 1` (or rewrites the loop to be per-signal-claim). Alternative / additionally: pre-IBKR-call writes an `intent_to_place` orders row inside the same transaction as the SELECT FOR UPDATE so the LEFT JOIN filter excludes the in-flight signal idempotently. ~30 LOC + ~5 tests (concurrent claim race; stale lock recovery). `risk-review-approved`. **Drill 7 prerequisite.**
+
+  3. **PR-γ (defect #3)** — `services/execution/ibkr_adapter.py::place_order` for stop_market threads `parent_broker_order_id` into the `ib_async.Order(parentId=…)` field. `services/risk/order_placement_worker.py::apply_order_placement` passes the entry's broker_order_id through. ~30 LOC + ~5 tests (mock IBKR, assert parentId on the Order object before send). `risk-review-approved`. Recommended for drill 7 (without it, bracket is cosmetic).
+
+  4. **PR-δ (defect #4)** — `services/risk/order_terminal_status_processor.py` looks up by `(account_id, broker_order_id)` composite (or `(client_order_id, broker_order_id)`) instead of just `client_order_id`. ~20 LOC + ~5 tests (dup-CID + per-broker_id disambiguation). `risk-review-approved`. Less urgent than #1-#3 because it only manifests when defect #2 fires; fixing #2 makes #4 harmless in practice.
+
+  5. **PR-ε (defect #5)** — `services/risk/order_placement_worker.py:1390` changes the SSE emit from `emit_sse("order", …)` to `emit_sse("signal", {"action": "cancelled", …})` (path b from defect #5 above — does NOT grow the canonical taxonomy). Alternatively (path a): add `'order'` to `services/api/sse._CANONICAL_EVENT_TYPES` + extend frontend cache-invalidation map. Path b recommended. ~10 LOC + ~3 tests. `risk-review-approved` (worker call site is in services/risk/**).
+
+  **Bonus follow-up (not a defect but operational):** clean up the 2 stale drill-6 signals at `status='working'` + the orphaned `019e3c9e-40ca` orders row at `status='pending'`. Either a one-off SQL backfill OR codified as `scripts/operator_tools/backfill_signal_status.py` per the "Option C — backfill script" path mentioned earlier in the session.
+
+- **Open question — origin of the clientId=1 placer:** UNKNOWN. The api runs on clientId=2 per PR #167 boot logs (`{"client_id": 2, "event": "ibkr_connected", …}`). The duplicate entry on clientId=1 with the same `orderRef="c3561a8b-5c415b65-019e3c9e-0"` (matches our drill 6 retry's client_order_id derivation) indicates a programmatic placement by SOMETHING that knows our CID derivation logic. Hypotheses:
+  - Stale ib-async session from a previous api boot (pre-PR-#167 era) still hung in ib_gateway.
+  - An operator-side dev harness / one-shot script accidentally left running with clientId=1.
+  - TWS Desktop on the operator's workstation with some auto-trade plugin (unlikely — would normally place via UI, not via `orderRef` matching our format).
+  - A scheduled/cron job we don't know about (no `scheduled-tasks` records would match).
+
+  **Operator should investigate independently**: `docker compose -f /opt/trading/docker-compose.yml ps | grep -i ibkr` + `docker compose logs ib_gateway | grep -E 'clientId=1|client 1' | head -50` + check the operator's workstation for stale TWS/IBKR Python connections.
+
+- **Cost / scope impact:**
+  - **5 follow-up PRs (PR-α through PR-ε)** with combined estimated diff ~170 LOC + ~33 tests. PR-α + PR-β are drill 7 hard prerequisites; the others are recommended hardening.
+  - **Audit chain is robust** — no audit-side defect surfaced; the 76 rows verified end-to-end. The audit-first ordering (backend-spec §2.10.1) caught a cascade of broker-side surprises without losing data.
+  - **No real-money loss** (paper account `DUQ825170`); but the bracket-parent-0 + duplicate-entry combination would have been catastrophic on live. Drill 6's value was exactly this — surfacing the defect cluster in the paper environment.
+  - **Drill 7 timeline:** depends on PR review cadence for 5 risk-review-approved PRs. Minimum 2-3 days assuming serial review; 1 day if PR-α + PR-β can land bundled with PR-γ as one big "drill 6 hardening" PR.
+
+- **References:**
+  - This session's drill 6 runbook (in the user prompt that opened this session).
+  - 2026-05-18 entry "Drill 5 / Week 7 verification gate close" (~6h earlier) — drill 5's retrospective with the silent-worker pattern + ib_gateway dialog hang context.
+  - PR #167 (referenced but not located in `git log` — operator should confirm: was this the api clientId=1→2 swap? Or was it included in another PR like #177?).
+  - PR #169 (audit payload observability log + IBKR-await timeouts) — the `order_placement_audit_payload_pre_append` log was the diagnostic that confirmed `has_leg_field=true` for the clientId=2 entry+stop placements (separately from the bracket parent-0 defect).
+  - PR #179 + #180 (AsyncTaskMonitor IBKR connectivity probe + Discord #alerts P1) — did NOT fire during this drill because the underlying connection stayed healthy; the surfaced defects were all upstream of connectivity.
+  - PR #181 (UPDATE signals.status='closed' on trade close) — not exercised; no trade ever closed.
+
 ### 2026-05-18 — Scope ticket: LEAN signal_emitted attribution payload extension (Phase 1+; brainstormed this session, no code)
 
 - **Status:** OPEN — scope ticket only, no code. Authored after operator chose option 4 ("brainstorm scope ticket only") for Priority 3 of the 2026-05-18 afternoon carryover session. Requires a dedicated session for code work because the strategy-logic questions inline below need operator alignment first.
