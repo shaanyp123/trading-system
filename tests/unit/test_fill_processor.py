@@ -1567,6 +1567,122 @@ class TestApplyFillPlanCloseAction:
         assert "state = 'closed'" in joined
         # realized_pnl_usd UPDATE is part of the trade UPDATE.
         assert "realized_pnl_usd" in joined
+        # Drill 5 follow-up #3 — the close branch also issues an
+        # UPDATE signals SET status = 'closed' for the entry signal_id.
+        assert "UPDATE signals SET status = 'closed'" in joined
+
+    @pytest.mark.asyncio
+    async def test_close_apply_passes_signal_id_to_signals_update(self) -> None:
+        """The signals UPDATE binds the entry_signal_id from TradeMutation.
+
+        Drill 5 follow-up #3 regression test — captures the params dict
+        passed to session.execute and asserts the ``sig`` param matches
+        ``plan.trade_mutation.entry_signal_id`` (the signal whose trade
+        just closed).
+        """
+        plan = _build_close_plan()
+        captured: list[tuple[str, Any]] = []
+
+        session_factory = MagicMock()
+
+        def _make_session() -> MagicMock:
+            sess = MagicMock()
+
+            async def _exec(stmt: Any, params: Any = None) -> MagicMock:
+                captured.append((str(stmt), params))
+                result_mock = MagicMock()
+                result_mock.fetchone = MagicMock(return_value=MagicMock(id=uuid4()))
+                return result_mock
+
+            sess.execute = AsyncMock(side_effect=_exec)
+
+            @asynccontextmanager
+            async def _begin_cm() -> Any:
+                yield None
+
+            sess.begin = MagicMock(return_value=_begin_cm())
+            return sess
+
+        @asynccontextmanager
+        async def _factory_cm() -> Any:
+            yield _make_session()
+
+        session_factory.side_effect = lambda: _factory_cm()
+
+        with patch(
+            "services.risk.fill_processor.append_audit_event",
+            new=AsyncMock(side_effect=lambda *a, **k: _audit_record_mock()),
+        ):
+            await apply_fill_plan(
+                plan,
+                session_factory=session_factory,
+                account_id=_ACCOUNT_ID,
+                env="paper",
+            )
+
+        # Locate the signals UPDATE in the captured execute calls.
+        signals_updates = [
+            (stmt, params)
+            for stmt, params in captured
+            if "UPDATE signals SET status = 'closed'" in stmt
+        ]
+        assert len(signals_updates) == 1
+        _, params = signals_updates[0]
+        # `sig` bound from plan.trade_mutation.entry_signal_id (= _SIGNAL_ID).
+        assert params == {"sig": _SIGNAL_ID}
+
+    @pytest.mark.asyncio
+    async def test_close_apply_does_not_update_signals_for_other_paths(self) -> None:
+        """ENTRY (action='open') path does NOT issue a signals UPDATE.
+
+        The open-path apply still INSERTs the trades row, but signals
+        stays at 'working' (the audit chain captures the lifecycle, the
+        cosmetic signals.status flip only fires on close).
+        """
+        plan = _build_plan(action="open")  # ENTRY path
+        captured_sql: list[str] = []
+
+        session_factory = MagicMock()
+
+        def _make_session() -> MagicMock:
+            sess = MagicMock()
+
+            async def _exec(stmt: Any, params: Any = None) -> MagicMock:
+                captured_sql.append(str(stmt))
+                result_mock = MagicMock()
+                result_mock.fetchone = MagicMock(return_value=MagicMock(id=uuid4()))
+                return result_mock
+
+            sess.execute = AsyncMock(side_effect=_exec)
+
+            @asynccontextmanager
+            async def _begin_cm() -> Any:
+                yield None
+
+            sess.begin = MagicMock(return_value=_begin_cm())
+            return sess
+
+        @asynccontextmanager
+        async def _factory_cm() -> Any:
+            yield _make_session()
+
+        session_factory.side_effect = lambda: _factory_cm()
+
+        with patch(
+            "services.risk.fill_processor.append_audit_event",
+            new=AsyncMock(side_effect=lambda *a, **k: _audit_record_mock()),
+        ):
+            await apply_fill_plan(
+                plan,
+                session_factory=session_factory,
+                account_id=_ACCOUNT_ID,
+                env="paper",
+            )
+
+        joined = " | ".join(captured_sql)
+        # ENTRY path issues INSERT INTO trades, not UPDATE signals.
+        assert "INSERT INTO trades" in joined
+        assert "UPDATE signals SET status = 'closed'" not in joined
 
 
 # ---------------------------------------------------------------------------

@@ -473,6 +473,19 @@ async def test_exit_full_close_end_to_end(
     assert exit_order.status == "filled"
     assert exit_order.acknowledged_at_utc is not None
 
+    # ----- signals.status flipped to 'closed' (drill 5 follow-up #3) -----
+    # The cosmetic cleanup that closes drill 5 follow-up #3 from PR #176.
+    # Pre-PR: the entry signal stayed at 'working' even after the trade
+    # lifecycle completed, leaving stale rows in /api/signals?status=working.
+    # The UPDATE happens inside the same _apply_trade_mutation session.begin()
+    # block as the UPDATE trades, so the two are atomic.
+    with sync_engine.connect() as conn:
+        signal_row = conn.execute(
+            text("SELECT status FROM signals WHERE id = :sig"),
+            {"sig": state["signal_id"]},
+        ).one()
+    assert signal_row.status == "closed"
+
     # ----- chain still verifies clean -----
     async with async_session_factory() as session:
         verify_result = await verify_chain(session)

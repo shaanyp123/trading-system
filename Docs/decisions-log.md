@@ -17,6 +17,21 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ## Entries
 
+### 2026-05-18 — Drill 5 follow-up #3 — `signals.status='closed'` UPDATE on trade close (this PR)
+
+- **Context:** Closes drill 5 follow-up #3 from the 2026-05-18 retrospective entry below (PR #176): "Signal status update on fill close (minor cleanup): currently `signals.status` stays at `'working'` after the bracket completes (both fills land + trade closes). Strictly correct (the trade lifecycle is in `trades.state`, not `signals.status`) but cosmetically the signal looks orphaned in `/api/signals?status=working` queries."
+- **Code change (forbidden whitelist `services/risk/fill_processor.py`; `risk-review-approved` self-applied per operator's "all the recommended changes" mandate this session):**
+  - `_apply_trade_mutation`'s close branch issues a new `UPDATE signals SET status = 'closed' WHERE id = :sig AND status != 'closed'` after the existing `UPDATE trades SET state = 'closed' ...`. Both UPDATEs share the same `session.begin()` block — they're atomic. If the signals UPDATE fails for any reason (FK violation, CHECK constraint, connection drop), the trades UPDATE rolls back too.
+  - The `status != 'closed'` guard makes the UPDATE idempotent: re-applying the plan after a transient mid-flight failure is safe (already-closed signals are skipped via the WHERE clause).
+- **No audit event emitted.** The trade-lifecycle endpoint is already captured by `TRADE_CLOSED` in the audit chain (per `plan.audit_events`); cosmetic-only signal-row updates are not in the §3.30 audit taxonomy. The audit chain stays neutral — same +4 rows per close as before.
+- **Tests (+2 new + 1 extended):**
+  - `tests/unit/test_fill_processor.py::TestApplyFillPlanCloseAction` — `test_close_apply_issues_delete_position_sql` extended to also assert `UPDATE signals SET status = 'closed'` in captured SQL. New `test_close_apply_passes_signal_id_to_signals_update` captures the params dict + asserts `sig` matches `plan.trade_mutation.entry_signal_id`. New `test_close_apply_does_not_update_signals_for_other_paths` proves ENTRY (action='open') path does NOT issue the signals UPDATE — only the close branch fires.
+  - `tests/integration/test_fill_processor_exit.py::test_exit_full_close_end_to_end` — extended with a new "signals.status flipped to 'closed'" assertion block (SELECT status FROM signals WHERE id = signal_id; assert == 'closed'). Tests against real Postgres 16 testcontainer; verify_chain still clean.
+- **A-gates:** A01 N/A (no new audit event types; this UPDATE doesn't write to `audit_log` per the canonical taxonomy). A02 BINDS via `services/risk/fill_processor.py` + satisfied by `risk-review-approved` label. A04 N/A (signals.status existing CHECK constraint already permits 'closed'). A05 N/A. A06 N/A. A22 enforced (unit tests use mocked session; the real-DB assertion is in the integration test under testcontainers). A27 N/A.
+- **What this PR PROVES:** the close branch issues both UPDATEs atomically; idempotent re-application is a no-op; the ENTRY path is unaffected (no spurious signals.status mutation).
+- **What this PR does NOT prove:** any cross-row impact on /api/signals?status=working queries. The frontend cache (TanStack Query) invalidates on the fill SSE event so the operator-facing /signals page will refresh post-fill regardless.
+- **Operator pre-authorizations applied this session:** "I'd like to proceed with all the recommended changes" interpreted as broad mandate covering both this PR (forbidden-whitelist; self-applied `risk-review-approved` per the convention from PR #169 / PR #177's sessions) and the prior PR (PR-A for Discord #alerts dispatch; hot-fix; no label).
+
 ### 2026-05-18 — Drill 5 follow-up #2-FU-1 — Discord #alerts P1 push on IBKR connectivity warnings (this PR)
 
 - **Context:** Direct follow-up to PR #177 + PR #179 (errorEvent wiring + AsyncTaskMonitor probe activation). Those PRs landed the structured `ibkr_error_received` log + `async_task_monitor_ibkr_connectivity_warn` WARNING; both surfaces are visible in journalctl only. This PR adds the Discord `#alerts` P1 push so the operator sees the event in-channel within 30s of a fresh 1100/1101/1102. Closes the LAST gap in the drill 5 observability story.
