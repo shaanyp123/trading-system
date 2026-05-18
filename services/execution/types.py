@@ -108,7 +108,12 @@ class IbkrPlaceOrderRequest:
     limit_price: Decimal | None = None  # required for limit_marketable / limit_at_target
     stop_price: Decimal | None = None  # required for stop_market
     time_in_force: Literal["DAY", "GTC"] = "DAY"
-    parent_client_order_id: str | None = None  # for stop attached to entry
+    parent_client_order_id: str | None = (
+        None  # informational: links stop to entry CID; not on the wire
+    )
+    parent_broker_order_id: int | None = (
+        None  # IBKR-side bracket parentId — when set on a stop, IBKR treats it as an OCO child of the entry (entry-cancel auto-cancels stop). PR-gamma / drill 6 defect #3 fix.
+    )
 
 
 @dataclass(frozen=True, slots=True)

@@ -427,6 +427,126 @@ class TestPlaceOrderQualifyFirst:
 
 
 # ---------------------------------------------------------------------------
+# TestPlaceOrderParentId — PR-gamma / drill 6 defect #3 fix
+# ---------------------------------------------------------------------------
+
+
+class TestPlaceOrderParentId:
+    """Validates ``IbkrPlaceOrderRequest.parent_broker_order_id`` is wired
+    into ``ib_async.Order.parentId`` on the placeOrder call.
+
+    Pre-fix (drill 6): the stop order was always placed with
+    ``Order.parentId = 0`` (the ib_async default), so IBKR treated it as
+    a STANDALONE sell-stop rather than an OCO child of the entry. Drill
+    6 surfaced this when reqGlobalCancel was needed mid-bracket — the
+    stop survived independently. Post-fix: when the worker threads the
+    entry's broker_order_id into ``parent_broker_order_id``, the adapter
+    sets ``Order.parentId`` so IBKR auto-cancels the stop on entry
+    cancellation.
+    """
+
+    @staticmethod
+    def _last_order_arg(client: IbAsyncIbkrClient) -> Any:
+        """Pull the ib_async Order from the most recent placeOrder call."""
+        call_args = client._ib.placeOrder.call_args  # type: ignore[union-attr]
+        return call_args.args[1]
+
+    async def test_default_parent_broker_order_id_is_none(self) -> None:
+        """Sanity-lock: the dataclass default is None."""
+        req = _basic_request()
+        assert req.parent_broker_order_id is None
+
+    async def test_no_parent_means_order_parentid_zero(self) -> None:
+        """When the request omits parent_broker_order_id, the Order
+        passed to placeOrder has the ib_async default parentId=0 — no
+        bracket linkage registered with IBKR."""
+        fake = _fake_ib_class(place_order_trade=_default_trade(status="Submitted"))
+        client = IbAsyncIbkrClient(ib_factory=fake)
+        await client.place_order(_basic_request())
+        order_arg = self._last_order_arg(client)
+        assert order_arg.parentId == 0
+
+    async def test_parent_broker_order_id_propagates_to_order_parentid(self) -> None:
+        """Setting parent_broker_order_id on the request → Order.parentId
+        gets the same value. This is the core PR-gamma contract."""
+        from dataclasses import replace
+
+        fake = _fake_ib_class(place_order_trade=_default_trade(status="Submitted"))
+        client = IbAsyncIbkrClient(ib_factory=fake)
+        # Stop-side request with parent_broker_order_id=42 (= entry broker_order_id)
+        req = replace(
+            _basic_request(),
+            order_type="stop_market",
+            side="sell",
+            limit_price=None,
+            stop_price=Decimal("3990"),
+            time_in_force="GTC",
+            parent_client_order_id="9d2f7a1c-b54e83a1-4d9e7c1b2f0a-1",
+            parent_broker_order_id=42,
+        )
+        await client.place_order(req)
+        order_arg = self._last_order_arg(client)
+        assert order_arg.parentId == 42
+        # Belt-and-suspenders: orderRef + orderType still correct
+        assert order_arg.orderRef == req.client_order_id
+        assert order_arg.orderType == "STP"
+
+    async def test_parent_broker_order_id_applies_to_any_order_type(self) -> None:
+        """The wiring is order-type agnostic; even an entry-side limit
+        order would carry parentId if the caller set it (defensive — in
+        practice only stops set it, but we don't gate by order_type)."""
+        from dataclasses import replace
+
+        fake = _fake_ib_class(place_order_trade=_default_trade(status="Submitted"))
+        client = IbAsyncIbkrClient(ib_factory=fake)
+        req = replace(_basic_request(), parent_broker_order_id=7)
+        await client.place_order(req)
+        order_arg = self._last_order_arg(client)
+        assert order_arg.parentId == 7
+
+    async def test_round_trip_entry_then_stop_with_parent_linkage(self) -> None:
+        """Simulates the worker's bracket-placement sequence:
+        place entry → capture broker_order_id → place stop with that
+        broker_order_id as parent → verify Order.parentId on the stop.
+
+        Mirrors the actual production sequence in
+        ``services.risk.order_placement_worker.apply_order_placement``.
+        """
+        from dataclasses import replace
+
+        entry_trade = _default_trade(order_id=99, status="Submitted")
+        stop_trade = _default_trade(order_id=100, status="PreSubmitted")
+        fake = _fake_ib_class(place_order_trade=entry_trade)
+        client = IbAsyncIbkrClient(ib_factory=fake)
+        await client.connect()
+        # First placeOrder → returns entry_trade; second → stop_trade
+        client._ib.placeOrder.side_effect = [entry_trade, stop_trade]  # type: ignore[union-attr]
+
+        # 1. Place entry (no parent_broker_order_id)
+        entry_result = await client.place_order(_basic_request())
+        assert entry_result.broker_order_id == 99
+        entry_order_arg = client._ib.placeOrder.call_args_list[0].args[1]  # type: ignore[union-attr]
+        assert entry_order_arg.parentId == 0
+
+        # 2. Place stop with entry's broker_order_id as parent
+        stop_req = replace(
+            _basic_request(),
+            client_order_id="9d2f7a1c-b54e83a1-4d9e7c1b2f0a-1-stop",
+            order_type="stop_market",
+            side="sell",
+            limit_price=None,
+            stop_price=Decimal("3990"),
+            time_in_force="GTC",
+            parent_client_order_id=_basic_request().client_order_id,
+            parent_broker_order_id=entry_result.broker_order_id,
+        )
+        stop_result = await client.place_order(stop_req)
+        assert stop_result.broker_order_id == 100
+        stop_order_arg = client._ib.placeOrder.call_args_list[1].args[1]  # type: ignore[union-attr]
+        assert stop_order_arg.parentId == 99  # matches entry_result.broker_order_id
+
+
+# ---------------------------------------------------------------------------
 # TestCancelOrder
 # ---------------------------------------------------------------------------
 

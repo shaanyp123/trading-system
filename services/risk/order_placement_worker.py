@@ -745,6 +745,13 @@ async def apply_order_placement(
             stop_price=plan.stop_price,
             time_in_force="GTC",
             parent_client_order_id=plan.client_order_id,
+            # PR-gamma: thread the entry's IBKR-side broker_order_id into the
+            # stop request so the adapter sets Order.parentId, registering
+            # the OCO bracket with IBKR. Without this the stop is placed
+            # as a standalone sell-stop (drill 6 defect #3): if the entry
+            # is cancelled (operator action, reconciliation, hung fill),
+            # the stop survives and can short the account on a price spike.
+            parent_broker_order_id=broker_order_id,
         )
         try:
             stop_broker_result = await _await_ibkr_with_timeout(

@@ -965,6 +965,164 @@ class TestApplyOrderPlacementBracket:
 
 
 # ---------------------------------------------------------------------------
+# TestBracketParentIdLinkage — PR-gamma / drill 6 defect #3 fix
+# ---------------------------------------------------------------------------
+
+
+class TestBracketParentIdLinkage:
+    """Verifies ``apply_order_placement`` threads the entry's
+    ``broker_order_id`` into the stop request's ``parent_broker_order_id``
+    so the adapter registers the stop as an IBKR-side OCO bracket child.
+
+    Pre-fix: stop_request was constructed with ``parent_broker_order_id``
+    unset (None default), the adapter then placed the stop with
+    ``Order.parentId=0`` (standalone). Drill 6 confirmed this leaves the
+    stop alive after an entry cancellation — a safety hazard that could
+    naked-short the account.
+
+    Post-fix: stop_request.parent_broker_order_id equals the entry's
+    broker_order_id returned by the first place_order call.
+    """
+
+    @pytest.mark.asyncio
+    async def test_stop_request_carries_entry_broker_order_id_as_parent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The core PR-gamma contract: entry broker_order_id=10 → stop request
+        has parent_broker_order_id=10 (the linkage IBKR uses for OCO)."""
+        from services.execution.types import IbkrContractRef
+        from services.risk.order_placement_worker import apply_order_placement
+
+        place_calls: list[Any] = []
+
+        async def fake_place(request: Any) -> Any:
+            place_calls.append(request)
+            # Entry returns broker_order_id=10; stop returns 11
+            return _fake_ibkr_place_result(broker_order_id=10 if len(place_calls) == 1 else 11)
+
+        ibkr = MagicMock()
+        ibkr.place_order = AsyncMock(side_effect=fake_place)
+        ibkr.cancel_order = AsyncMock()
+
+        async def fake_append(*args: Any, **kwargs: Any) -> Any:
+            return MagicMock(event_uuid=uuid4(), sequence_no=1)
+
+        monkeypatch.setattr(
+            "services.risk.order_placement_worker.append_audit_event",
+            AsyncMock(side_effect=fake_append),
+        )
+
+        plan = plan_order_placement(
+            _signal(direction="long", market="TLT", decision_price="85.00"),
+            env="paper",
+        )
+        contract = IbkrContractRef(market="TLT", ibkr_local_symbol="TLT", exchange="SMART")
+        await apply_order_placement(
+            plan,
+            ibkr_client=ibkr,
+            contract=contract,
+            session_factory=_build_apply_session_factory(),
+        )
+        assert len(place_calls) == 2
+        entry, stop = place_calls
+        # Entry never carries a parent (it IS the parent).
+        assert entry.parent_broker_order_id is None
+        # Stop carries the entry's broker_order_id.
+        assert stop.parent_broker_order_id == 10
+        # The informational CID linkage is unchanged.
+        assert stop.parent_client_order_id == plan.client_order_id
+
+    @pytest.mark.asyncio
+    async def test_stop_parent_matches_entry_broker_order_id_short_side(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same contract on a short bracket — entry sell, stop buy, but
+        the parent_broker_order_id linkage is direction-agnostic."""
+        from services.execution.types import IbkrContractRef
+        from services.risk.order_placement_worker import apply_order_placement
+
+        place_calls: list[Any] = []
+
+        async def fake_place(request: Any) -> Any:
+            place_calls.append(request)
+            return _fake_ibkr_place_result(broker_order_id=77 if len(place_calls) == 1 else 78)
+
+        ibkr = MagicMock()
+        ibkr.place_order = AsyncMock(side_effect=fake_place)
+        ibkr.cancel_order = AsyncMock()
+
+        async def fake_append(*args: Any, **kwargs: Any) -> Any:
+            return MagicMock(event_uuid=uuid4(), sequence_no=1)
+
+        monkeypatch.setattr(
+            "services.risk.order_placement_worker.append_audit_event",
+            AsyncMock(side_effect=fake_append),
+        )
+
+        plan = plan_order_placement(
+            _signal(direction="short", market="TLT", decision_price="85.00"),
+            env="paper",
+        )
+        contract = IbkrContractRef(market="TLT", ibkr_local_symbol="TLT", exchange="SMART")
+        await apply_order_placement(
+            plan,
+            ibkr_client=ibkr,
+            contract=contract,
+            session_factory=_build_apply_session_factory(),
+        )
+        entry, stop = place_calls
+        assert entry.side == "sell"
+        assert stop.side == "buy"
+        assert stop.parent_broker_order_id == 77
+
+    @pytest.mark.asyncio
+    async def test_entry_rejected_no_stop_placed_no_parent_linkage(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When the entry rejects, the stop is not placed — there is no
+        parent_broker_order_id to thread because the entry never produced
+        a broker_order_id we'd want IBKR to bracket against. Existing
+        behavior preserved; verified here so a future refactor doesn't
+        accidentally place a stop with parent_broker_order_id=0."""
+        from services.execution.types import IbkrContractRef
+        from services.risk.order_placement_worker import apply_order_placement
+
+        place_calls: list[Any] = []
+
+        async def fake_place(request: Any) -> Any:
+            place_calls.append(request)
+            return _fake_ibkr_place_result(broker_order_id=10, status="rejected")
+
+        ibkr = MagicMock()
+        ibkr.place_order = AsyncMock(side_effect=fake_place)
+        ibkr.cancel_order = AsyncMock()
+
+        async def fake_append(*args: Any, **kwargs: Any) -> Any:
+            return MagicMock(event_uuid=uuid4(), sequence_no=1)
+
+        monkeypatch.setattr(
+            "services.risk.order_placement_worker.append_audit_event",
+            AsyncMock(side_effect=fake_append),
+        )
+
+        plan = plan_order_placement(
+            _signal(direction="long", market="TLT", decision_price="85.00"),
+            env="paper",
+        )
+        contract = IbkrContractRef(market="TLT", ibkr_local_symbol="TLT", exchange="SMART")
+        await apply_order_placement(
+            plan,
+            ibkr_client=ibkr,
+            contract=contract,
+            session_factory=_build_apply_session_factory(),
+        )
+        # Only the entry attempted; no stop placement at all → no chance
+        # of a bracket linkage being mis-wired.
+        assert len(place_calls) == 1
+        assert place_calls[0].parent_broker_order_id is None
+
+
+# ---------------------------------------------------------------------------
 # PR-ζ — fill_processor race fix (drill 7 defect #6, 2026-05-18)
 # ---------------------------------------------------------------------------
 
@@ -1649,6 +1807,45 @@ class TestOnOrderStatusTerminal:
         stub.assert_awaited_once()
         emit.assert_not_called()
         assert 200 in worker._emitted_fill_order_ids
+
+    async def test_cancelled_emit_lands_through_real_multiplexer_pr_epsilon(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """PR-epsilon / drill 6 defect #5 regression contract.
+
+        Pre-fix the worker's ``emit_sse('order', ...)`` raised
+        ``ValueError`` at the multiplexer's canonical-type gate. The
+        worker's except branch logged + swallowed (audit-first per
+        backend-spec §2.10.1) so the cancel audit row landed but the
+        SSE envelope never fanned out. This test exercises the call
+        site against the REAL ``services.api.sse.emit_sse`` (NOT
+        monkeypatched) and asserts no exception escapes — proving the
+        'order' event_type is now in ``_CANONICAL_EVENT_TYPES``.
+        """
+        from services.api import sse as sse_mod
+
+        worker, _ = _build_worker_with_signal_lookup(signal_id=uuid4())
+        stub = _stub_terminal_status_event_returning(new_status="cancelled")
+        monkeypatch.setattr(
+            "services.risk.order_terminal_status_processor.process_terminal_status_event",
+            stub,
+        )
+        # Reset multiplexer module state so this test is independent of
+        # other tests' emit calls. Matches the autouse fixture pattern
+        # in test_api_sse.py.
+        sse_mod.reset_state()
+        baseline_seq = sse_mod._test_current_sequence_no()
+        baseline_buffer = sse_mod._test_replay_buffer_size()
+
+        # No monkeypatch of emit_sse — we want the REAL one to run.
+        await worker._on_order_status(_build_status_update(status="cancelled", broker_order_id=314))
+
+        # If emit_sse raised, the worker's try/except would have logged
+        # 'order_placement_terminal_sse_emit_failed' but still completed.
+        # The unambiguous proof of fix: a real envelope landed in the
+        # replay buffer (sequence_no advanced + buffer grew).
+        assert sse_mod._test_current_sequence_no() > baseline_seq
+        assert sse_mod._test_replay_buffer_size() > baseline_buffer
 
     async def test_filled_path_unaffected_by_terminal_branch(
         self, monkeypatch: pytest.MonkeyPatch
