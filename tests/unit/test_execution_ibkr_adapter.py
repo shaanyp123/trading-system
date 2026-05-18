@@ -1113,6 +1113,8 @@ class TestModuleContract:
             "IbkrErrorStateProvider",
             "IBKR_CONNECTIVITY_ERROR_CODES",
             "IBKR_DATA_FARM_ERROR_CODES",
+            "PHASE1_TICK_SIZES",
+            "round_to_tick",
         ):
             assert hasattr(execution, name), f"missing public export: {name}"
 
@@ -1120,3 +1122,129 @@ class TestModuleContract:
         from services.execution import DEFAULT_CLIENT_ID
 
         assert DEFAULT_CLIENT_ID == 1
+
+
+class TestRoundToTick:
+    """Tick-rounding helper (drill 6 fix, 2026-05-18).
+
+    Locked behavior: ``round_to_tick(price, market=...)`` quantizes ``price``
+    to the market's :data:`PHASE1_TICK_SIZES` entry using
+    :data:`decimal.ROUND_HALF_UP`. Raises ``KeyError`` if market is not in
+    the Phase 1 universe map.
+    """
+
+    def test_phase1_tick_sizes_contains_universe(self) -> None:
+        from services.execution.ibkr_adapter import PHASE1_TICK_SIZES
+
+        # Locked Phase 1 universe per backend-spec §11.1.
+        for market in ("/MES", "/MNQ", "/MYM", "/M2K", "/MGC", "/MCL", "/MBT"):
+            assert market in PHASE1_TICK_SIZES, f"missing micro future {market!r}"
+        for market in ("TLT", "IEF", "SHY", "TIP"):
+            assert market in PHASE1_TICK_SIZES, f"missing ETF {market!r}"
+        # No surprise entries
+        assert len(PHASE1_TICK_SIZES) == 11
+
+    def test_phase1_tick_sizes_are_decimals(self) -> None:
+        """Tick values MUST be Decimal (not float) to avoid A05 violations
+        propagating into IBKR-bound order shapes."""
+        from decimal import Decimal as _Decimal
+
+        from services.execution.ibkr_adapter import PHASE1_TICK_SIZES
+
+        for market, tick in PHASE1_TICK_SIZES.items():
+            assert isinstance(tick, _Decimal), f"{market} tick is {type(tick)}, expected Decimal"
+            assert tick > 0, f"{market} tick={tick} must be > 0"
+
+    def test_mes_quarter_tick_half_up(self) -> None:
+        """/MES tick=0.25. Round-half-up at 0.125 → 0.25."""
+        from decimal import Decimal as _Decimal
+
+        from services.execution.ibkr_adapter import round_to_tick
+
+        assert round_to_tick(_Decimal("7401.625"), market="/MES") == _Decimal("7401.75")
+        # 7401.50 already aligned
+        assert round_to_tick(_Decimal("7401.50"), market="/MES") == _Decimal("7401.50")
+        # 7401.10 → 7401.00 (closer)
+        assert round_to_tick(_Decimal("7401.10"), market="/MES") == _Decimal("7401.00")
+        # 7401.20 → 7401.25 (closer; 0.05 vs 0.20)
+        assert round_to_tick(_Decimal("7401.20"), market="/MES") == _Decimal("7401.25")
+
+    def test_mgc_dime_tick(self) -> None:
+        """/MGC tick=0.10."""
+        from decimal import Decimal as _Decimal
+
+        from services.execution.ibkr_adapter import round_to_tick
+
+        assert round_to_tick(_Decimal("2345.67"), market="/MGC") == _Decimal("2345.70")
+        assert round_to_tick(_Decimal("2345.64"), market="/MGC") == _Decimal("2345.60")
+        # Half-up exactly on 0.05
+        assert round_to_tick(_Decimal("2345.65"), market="/MGC") == _Decimal("2345.70")
+
+    def test_mbt_5usd_tick(self) -> None:
+        """/MBT tick=5.0; tick larger than 1.0 still rounds correctly."""
+        from decimal import Decimal as _Decimal
+
+        from services.execution.ibkr_adapter import round_to_tick
+
+        # 102000.50 → multiplier 20400.10 → rounds to 20400 → 102000
+        assert round_to_tick(_Decimal("102000.50"), market="/MBT") == _Decimal("102000")
+        # 102003 → multiplier 20400.60 → rounds to 20401 → 102005
+        assert round_to_tick(_Decimal("102003"), market="/MBT") == _Decimal("102005")
+        # 102002.50 (half-tick) → multiplier 20400.50 → ROUND_HALF_UP → 20401 → 102005
+        assert round_to_tick(_Decimal("102002.50"), market="/MBT") == _Decimal("102005")
+
+    def test_mym_unit_tick(self) -> None:
+        """/MYM tick=1.0; sub-unit decimals round to nearest integer."""
+        from decimal import Decimal as _Decimal
+
+        from services.execution.ibkr_adapter import round_to_tick
+
+        assert round_to_tick(_Decimal("40123.40"), market="/MYM") == _Decimal("40123")
+        assert round_to_tick(_Decimal("40123.60"), market="/MYM") == _Decimal("40124")
+        # Half-up at .5
+        assert round_to_tick(_Decimal("40123.50"), market="/MYM") == _Decimal("40124")
+
+    def test_etf_cent_tick(self) -> None:
+        """ETFs tick=0.01; high-precision input rounds to the cent."""
+        from decimal import Decimal as _Decimal
+
+        from services.execution.ibkr_adapter import round_to_tick
+
+        for market in ("TLT", "IEF", "SHY", "TIP"):
+            assert round_to_tick(_Decimal("85.005"), market=market) == _Decimal("85.01")
+            assert round_to_tick(_Decimal("85.004"), market=market) == _Decimal("85.00")
+            assert round_to_tick(_Decimal("82.50123456"), market=market) == _Decimal("82.50")
+
+    def test_unknown_market_raises_key_error(self) -> None:
+        """KeyError is the raw failure mode; callers (e.g.,
+        ``plan_order_placement``) wrap into a domain-specific error."""
+        from decimal import Decimal as _Decimal
+
+        from services.execution.ibkr_adapter import round_to_tick
+
+        with pytest.raises(KeyError):
+            round_to_tick(_Decimal("100.00"), market="/XYZ")
+
+    def test_already_aligned_passes_through(self) -> None:
+        """A price that's already on a tick boundary returns the same value
+        (modulo Decimal scale)."""
+        from decimal import Decimal as _Decimal
+
+        from services.execution.ibkr_adapter import round_to_tick
+
+        result = round_to_tick(_Decimal("4250.50"), market="/MES")
+        assert result == _Decimal("4250.50")
+        # The result is the multiplier-times-tick — same Decimal value.
+        # Equality compares numerically (Decimal("4250.50") == Decimal("4250.5")
+        # is True), so we don't assert exact-scale matching here.
+
+    def test_extremely_small_prices(self) -> None:
+        """Edge: a price smaller than the tick rounds to 0 or one tick."""
+        from decimal import Decimal as _Decimal
+
+        from services.execution.ibkr_adapter import round_to_tick
+
+        # /MES tick=0.25; 0.10 → 0 (rounds DOWN; 0.10 < 0.125 cutoff)
+        assert round_to_tick(_Decimal("0.10"), market="/MES") == _Decimal("0.00")
+        # 0.20 → 0.25 (closer)
+        assert round_to_tick(_Decimal("0.20"), market="/MES") == _Decimal("0.25")

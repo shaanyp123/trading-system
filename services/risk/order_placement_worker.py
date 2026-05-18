@@ -83,6 +83,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from services.audit.event_types import AuditEventType
 from services.audit.writer import Environment, PhaseAtEmit, append_audit_event
+from services.execution.ibkr_adapter import PHASE1_TICK_SIZES, round_to_tick
 from services.execution.ibkr_client import IbkrClient
 from services.execution.types import (
     IbkrContractRef,
@@ -352,12 +353,51 @@ def plan_order_placement(signal: ApprovedSignalRow, *, env: Environment) -> Orde
 
     # Bracket extension: derive stop fields from the strategy's
     # canonical position in sizing_trace.
-    stop_price = _extract_stop_price_from_sizing_trace(
+    raw_stop_price = _extract_stop_price_from_sizing_trace(
         signal.sizing_trace,
         market=signal.market,
         direction=signal.direction,
         decision_price=signal.decision_price,
     )
+    # Tick-rounding (drill 6 fix, 2026-05-18): IBKR rejects orders whose
+    # lmtPrice / auxPrice is not aligned to the contract's tick size with
+    # Error 110 "The price does not conform to the minimum price variation
+    # for this contract." Round limit + stop to the market's tick BEFORE
+    # building the plan so the worker's downstream place_order call is
+    # always tick-aligned. Direction sanity (stop strictly below long /
+    # strictly above short) was already enforced on the raw values above;
+    # we re-validate after rounding because the rounding could flip the
+    # inequality on edges (e.g., long entry rounds DOWN past the stop that
+    # rounds UP). Both prices share the same tick map keyed by ``market``.
+    try:
+        limit_price = round_to_tick(signal.decision_price, market=signal.market)
+        stop_price = round_to_tick(raw_stop_price, market=signal.market)
+    except KeyError as exc:
+        raise OrderPlacementError(
+            f"market {signal.market!r} not in PHASE1_TICK_SIZES; "
+            "see services.execution.ibkr_adapter for the Phase 1 universe map."
+        ) from exc
+    # Post-rounding direction sanity — catches the edge case where the
+    # raw stop is < 1 tick from the entry (e.g., long entry 7402.20,
+    # stop 7402.10 with /MES tick=0.25 → both round to 7402.25, stop
+    # NO LONGER strictly below entry). Refuse the bracket rather than
+    # ship a self-defeating order.
+    if signal.direction == "long" and stop_price >= limit_price:
+        raise OrderPlacementError(
+            f"After tick-rounding: long entry limit_price={limit_price} but "
+            f"stop_price={stop_price} is NOT strictly below; "
+            f"raw decision_price={signal.decision_price}, raw stop={raw_stop_price}, "
+            f"tick={PHASE1_TICK_SIZES.get(signal.market)}. "
+            "Strategy needs a wider stop offset."
+        )
+    if signal.direction == "short" and stop_price <= limit_price:
+        raise OrderPlacementError(
+            f"After tick-rounding: short entry limit_price={limit_price} but "
+            f"stop_price={stop_price} is NOT strictly above; "
+            f"raw decision_price={signal.decision_price}, raw stop={raw_stop_price}, "
+            f"tick={PHASE1_TICK_SIZES.get(signal.market)}. "
+            "Strategy needs a wider stop offset."
+        )
     # Opposite-side stop for the bracket.
     stop_side: IbkrOrderSide = "sell" if side == "buy" else "buy"
     stop_client_order_id = f"{client_order_id}-stop"
@@ -370,7 +410,7 @@ def plan_order_placement(signal: ApprovedSignalRow, *, env: Environment) -> Orde
         side=side,
         quantity=Decimal(signal.target_contracts),
         order_type="limit_marketable",
-        limit_price=signal.decision_price,
+        limit_price=limit_price,
         time_in_force="DAY",
         client_order_id=client_order_id,
         strategy_hash=signal.strategy_hash,

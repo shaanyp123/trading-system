@@ -419,7 +419,13 @@ class TestPlanOrderPlacementBracket:
                 env="paper",
             )
 
-    def test_stop_price_decimal_precision_preserved(self) -> None:
+    def test_stop_price_tick_rounded_to_market_minimum(self) -> None:
+        """Drill 6 fix (2026-05-18): tick-round both limit and stop to the
+        market's minimum price variation. Pre-rounding precision (e.g.,
+        ``"82.50123456"``) gets quantized to the tick. For TLT (tick=0.01),
+        82.50123456 → 82.50. The raw value is no longer carried through;
+        IBKR Error 110 (the drill 6 surfacing) would have rejected the
+        non-tick-aligned price."""
         trace = _sizing_trace(market="TLT", stop_price="82.50123456")
         plan = plan_order_placement(
             _signal(
@@ -430,7 +436,202 @@ class TestPlanOrderPlacementBracket:
             ),
             env="paper",
         )
-        assert plan.stop_price == Decimal("82.50123456")
+        # Rounded to TLT tick=0.01
+        assert plan.stop_price == Decimal("82.50")
+
+
+# ---------------------------------------------------------------------------
+# Tick-rounding extension 2026-05-18 — drill 6 fix (defect #1)
+# ---------------------------------------------------------------------------
+
+
+class TestPlanOrderPlacementTickRounding:
+    """Tick-rounding regression contract for the drill 6 IBKR Error 110 fix.
+
+    The drill 6 retry signal had decision_price=7401.625 on /MES (tick=0.25).
+    IBKR rejected the order at place time with Error 110 because 7401.625
+    is half a tick. The fix tick-rounds limit + stop in
+    ``plan_order_placement`` before the IbkrPlaceOrderRequest is built.
+
+    See Docs/decisions-log.md 2026-05-18 "Drill 6 retrospective" for full
+    context.
+    """
+
+    def test_mes_half_tick_decision_price_rounds_up(self) -> None:
+        """/MES tick=0.25; decision_price=7401.625 is half-tick (the drill 6
+        canonical bug). ROUND_HALF_UP → 7401.75."""
+        trace = _sizing_trace(market="/MES", stop_price="7398.25")
+        plan = plan_order_placement(
+            _signal(
+                market="/MES",
+                direction="long",
+                decision_price="7401.625",
+                sizing_trace=trace,
+            ),
+            env="paper",
+        )
+        assert plan.limit_price == Decimal("7401.75")
+        assert plan.stop_price == Decimal("7398.25")
+        # decision_price field on the plan IS preserved (audit purposes)
+        assert plan.decision_price == Decimal("7401.625")
+
+    def test_mes_aligned_decision_price_unchanged(self) -> None:
+        """A tick-aligned input returns the same value (no spurious rounding
+        artifacts)."""
+        trace = _sizing_trace(market="/MES", stop_price="7398.25")
+        plan = plan_order_placement(
+            _signal(
+                market="/MES",
+                direction="long",
+                decision_price="7402.25",
+                sizing_trace=trace,
+            ),
+            env="paper",
+        )
+        assert plan.limit_price == Decimal("7402.25")
+        assert plan.stop_price == Decimal("7398.25")
+
+    def test_mes_quarter_below_rounds_down(self) -> None:
+        """7402.10 → tick 0.25 → 7402.00 (round DOWN; 0.10 is < 0.125)."""
+        trace = _sizing_trace(market="/MES", stop_price="7398.00")
+        plan = plan_order_placement(
+            _signal(
+                market="/MES",
+                direction="long",
+                decision_price="7402.10",
+                sizing_trace=trace,
+            ),
+            env="paper",
+        )
+        assert plan.limit_price == Decimal("7402.00")
+
+    def test_mcl_two_decimal_aligned(self) -> None:
+        """/MCL tick=0.01; ETF-style prices align exactly with no rounding."""
+        trace = _sizing_trace(market="/MCL", stop_price="71.50")
+        plan = plan_order_placement(
+            _signal(
+                market="/MCL",
+                direction="long",
+                decision_price="72.45",
+                sizing_trace=trace,
+            ),
+            env="paper",
+        )
+        assert plan.limit_price == Decimal("72.45")
+        assert plan.stop_price == Decimal("71.50")
+
+    def test_mgc_dime_rounding(self) -> None:
+        """/MGC tick=0.10; 2345.67 → 2345.70 (rounds nearest)."""
+        trace = _sizing_trace(market="/MGC", stop_price="2340.00")
+        plan = plan_order_placement(
+            _signal(
+                market="/MGC",
+                direction="long",
+                decision_price="2345.67",
+                sizing_trace=trace,
+            ),
+            env="paper",
+        )
+        assert plan.limit_price == Decimal("2345.70")
+
+    def test_tlt_etf_cent_rounding(self) -> None:
+        """TLT tick=0.01; high-precision input rounds to the cent."""
+        trace = _sizing_trace(market="TLT", stop_price="82.50")
+        plan = plan_order_placement(
+            _signal(
+                market="TLT",
+                direction="long",
+                decision_price="85.005",  # half a cent
+                sizing_trace=trace,
+            ),
+            env="paper",
+        )
+        # ROUND_HALF_UP: 85.005 → 85.01
+        assert plan.limit_price == Decimal("85.01")
+
+    def test_mbt_5usd_tick_rounding(self) -> None:
+        """/MBT tick=5.0 (USD per BTC); 102000.50 → 102000 (round down 1 tick)."""
+        trace = _sizing_trace(market="/MBT", stop_price="100000")
+        plan = plan_order_placement(
+            _signal(
+                market="/MBT",
+                direction="long",
+                decision_price="102000.50",
+                sizing_trace=trace,
+            ),
+            env="paper",
+        )
+        # /MBT tick=5.0: 102000.50 / 5.0 = 20400.10 → rounds to 20400 → 102000.0
+        assert plan.limit_price == Decimal("102000")
+
+    def test_myms_unit_tick(self) -> None:
+        """/MYM tick=1.0; 40123.40 → 40123 (rounds down)."""
+        trace = _sizing_trace(market="/MYM", stop_price="40100")
+        plan = plan_order_placement(
+            _signal(
+                market="/MYM",
+                direction="long",
+                decision_price="40123.40",
+                sizing_trace=trace,
+            ),
+            env="paper",
+        )
+        assert plan.limit_price == Decimal("40123")
+
+    def test_unknown_market_raises_order_placement_error(self) -> None:
+        """A market not in PHASE1_TICK_SIZES raises OrderPlacementError
+        (wrapped from KeyError) so the worker logs a clear diagnostic."""
+        trace = _sizing_trace(market="/XYZ", stop_price="50.00")
+        with pytest.raises(OrderPlacementError, match="PHASE1_TICK_SIZES"):
+            plan_order_placement(
+                _signal(
+                    market="/XYZ",
+                    direction="long",
+                    decision_price="51.00",
+                    sizing_trace=trace,
+                ),
+                env="paper",
+            )
+
+    def test_post_rounding_direction_inversion_raises_long(self) -> None:
+        """Edge case: long entry + stop within one tick of the entry. After
+        rounding, both could end up at the same tick → stop NOT strictly
+        below. Refuse the bracket rather than ship a self-defeating order."""
+        # /MES tick=0.25; entry 7402.20 rounds DOWN to 7402.25... wait,
+        # 7402.20 / 0.25 = 29608.80 → rounds to 29609 → 7402.25
+        # stop 7402.10 → 7402.10 / 0.25 = 29608.40 → rounds to 29608 → 7402.00
+        # So actually 7402.25 > 7402.00 (still strictly below). Test a
+        # tighter case.
+        # entry 7402.10, stop 7402.05 — both within one tick of each other.
+        # 7402.10 → 29608.40 → 29608 → 7402.00
+        # 7402.05 → 29608.20 → 29608 → 7402.00
+        # Both round to 7402.00 → equal → not strictly below → raises.
+        trace = _sizing_trace(market="/MES", stop_price="7402.05")
+        with pytest.raises(OrderPlacementError, match="NOT strictly below"):
+            plan_order_placement(
+                _signal(
+                    market="/MES",
+                    direction="long",
+                    decision_price="7402.10",
+                    sizing_trace=trace,
+                ),
+                env="paper",
+            )
+
+    def test_post_rounding_direction_inversion_raises_short(self) -> None:
+        """Symmetric test: short entry + stop close above entry rounds into
+        equality on the same tick → not strictly above → raises."""
+        trace = _sizing_trace(market="/MES", stop_price="7402.10")
+        with pytest.raises(OrderPlacementError, match="NOT strictly above"):
+            plan_order_placement(
+                _signal(
+                    market="/MES",
+                    direction="short",
+                    decision_price="7402.05",
+                    sizing_trace=trace,
+                ),
+                env="paper",
+            )
 
 
 # ---------------------------------------------------------------------------
