@@ -5,6 +5,11 @@ catch silent worker-task death (an asyncio task that completes
 unexpectedly without anything ``await``ing it, leaving the
 operator with no log line). Pure Python; no testcontainers; A22 N/A.
 
+2026-05-18 drill 5 follow-up extension — IBKR connectivity probe.
+The monitor now also probes an optional ``TrackedIbkrErrorState``
+provider each cycle and warns on fresh connectivity errors. See
+``TestIbkrConnectivityProbe`` below.
+
 Test surface:
 
 * ``TestTrackedTask`` — frozen dataclass shape
@@ -19,12 +24,15 @@ Test surface:
   exits cleanly
 * ``TestStopAsyncTaskMonitor`` — shutdown helper handles timeout +
   exception paths
+* ``TestIbkrConnectivityProbe`` — fresh 1100/1101/1102 errors warn;
+  stale errors silent; idempotent; defensive on provider failures
 * ``TestModuleContract`` — public ``__all__`` surface
 """
 
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -32,12 +40,16 @@ import structlog
 from structlog.testing import capture_logs
 
 from services.api.async_task_monitor import (
+    DEFAULT_IBKR_CONNECTIVITY_CODES,
+    DEFAULT_IBKR_FRESHNESS_SECONDS,
     DEFAULT_MONITOR_INTERVAL_SECONDS,
     AsyncTaskMonitor,
+    TrackedIbkrErrorState,
     TrackedTask,
     collect_tracked_tasks,
     stop_async_task_monitor,
 )
+from services.execution.ibkr_adapter import IbkrErrorState
 
 
 class TestTrackedTask:
@@ -456,6 +468,327 @@ class TestStopAsyncTaskMonitor:
         asyncio.run(_runner())
 
 
+class TestIbkrConnectivityProbe:
+    """2026-05-18 drill 5 follow-up — IBKR connectivity probe surface.
+
+    The monitor reads ``ibkr_adapter.last_ibkr_error`` via a provider
+    callable each tick. Fresh connectivity errors (codes 1100/1101/1102
+    within the freshness window) emit
+    ``async_task_monitor_ibkr_connectivity_warn`` at WARNING; same
+    error event idempotent across probes; non-connectivity codes
+    silent; provider failures swallowed.
+    """
+
+    @staticmethod
+    def _build_state(
+        *,
+        code: int = 1100,
+        message: str = "Connectivity between IBKR and Trader Workstation has been lost.",
+        age_seconds: float = 1.0,
+        req_id: int = -1,
+        contract_local_symbol: str | None = None,
+    ) -> IbkrErrorState:
+        return IbkrErrorState(
+            error_code=code,
+            error_string=message,
+            last_seen_at_utc=datetime.now(tz=UTC) - timedelta(seconds=age_seconds),
+            req_id=req_id,
+            contract_local_symbol=contract_local_symbol,
+        )
+
+    def test_default_constants_match_canonical_values(self) -> None:
+        assert DEFAULT_IBKR_CONNECTIVITY_CODES == frozenset({1100, 1101, 1102})
+        assert DEFAULT_IBKR_FRESHNESS_SECONDS == 300.0
+
+    def test_tracked_ibkr_state_frozen(self) -> None:
+        tracker = TrackedIbkrErrorState(
+            name="ibkr_adapter",
+            provider=lambda: None,
+        )
+        with pytest.raises(Exception):  # FrozenInstanceError
+            tracker.name = "other"  # type: ignore[misc]
+
+    def test_tracked_ibkr_state_defaults(self) -> None:
+        tracker = TrackedIbkrErrorState(
+            name="ibkr_adapter",
+            provider=lambda: None,
+        )
+        assert tracker.connectivity_codes == DEFAULT_IBKR_CONNECTIVITY_CODES
+        assert tracker.freshness_window_seconds == DEFAULT_IBKR_FRESHNESS_SECONDS
+
+    def test_no_tracker_silently_skips(self) -> None:
+        monitor = AsyncTaskMonitor([], interval_seconds=30.0)
+        with capture_logs() as logs:
+            monitor.probe_once()
+        assert not any(
+            log.get("event") == "async_task_monitor_ibkr_connectivity_warn" for log in logs
+        )
+
+    def test_provider_returns_none_silent(self) -> None:
+        tracker = TrackedIbkrErrorState(name="ibkr_adapter", provider=lambda: None)
+        monitor = AsyncTaskMonitor([], interval_seconds=30.0, ibkr_error_state=tracker)
+        with capture_logs() as logs:
+            monitor.probe_once()
+        assert not any(
+            log.get("event") == "async_task_monitor_ibkr_connectivity_warn" for log in logs
+        )
+
+    def test_fresh_1100_emits_warning(self) -> None:
+        state = self._build_state(code=1100, age_seconds=1.0)
+        tracker = TrackedIbkrErrorState(name="ibkr_adapter", provider=lambda: state)
+        monitor = AsyncTaskMonitor([], interval_seconds=30.0, ibkr_error_state=tracker)
+        with capture_logs() as logs:
+            monitor.probe_once()
+        warns = [
+            log for log in logs if log.get("event") == "async_task_monitor_ibkr_connectivity_warn"
+        ]
+        assert len(warns) == 1
+        assert warns[0]["error_code"] == 1100
+        assert warns[0]["log_level"] == "warning"
+        assert warns[0]["tracker_name"] == "ibkr_adapter"
+        # age_seconds is rounded; should be approximately 1.0.
+        assert 0.5 < warns[0]["age_seconds"] < 2.0
+        assert warns[0]["freshness_window_seconds"] == DEFAULT_IBKR_FRESHNESS_SECONDS
+
+    def test_fresh_1102_emits_warning(self) -> None:
+        state = self._build_state(code=1102, message="Connectivity restored.", age_seconds=2.0)
+        tracker = TrackedIbkrErrorState(name="ibkr_adapter", provider=lambda: state)
+        monitor = AsyncTaskMonitor([], interval_seconds=30.0, ibkr_error_state=tracker)
+        with capture_logs() as logs:
+            monitor.probe_once()
+        warns = [
+            log for log in logs if log.get("event") == "async_task_monitor_ibkr_connectivity_warn"
+        ]
+        assert len(warns) == 1
+        assert warns[0]["error_code"] == 1102
+
+    def test_stale_connectivity_error_does_not_warn(self) -> None:
+        """Errors older than the freshness window are treated as resolved."""
+        state = self._build_state(code=1100, age_seconds=400.0)  # > default 300s
+        tracker = TrackedIbkrErrorState(name="ibkr_adapter", provider=lambda: state)
+        monitor = AsyncTaskMonitor([], interval_seconds=30.0, ibkr_error_state=tracker)
+        with capture_logs() as logs:
+            monitor.probe_once()
+        assert not any(
+            log.get("event") == "async_task_monitor_ibkr_connectivity_warn" for log in logs
+        )
+
+    def test_non_connectivity_code_does_not_warn(self) -> None:
+        """Order rejection (>=10000) + data farm (2103-2150) skipped here."""
+        state = self._build_state(code=10147, message="not found", age_seconds=1.0)
+        tracker = TrackedIbkrErrorState(name="ibkr_adapter", provider=lambda: state)
+        monitor = AsyncTaskMonitor([], interval_seconds=30.0, ibkr_error_state=tracker)
+        with capture_logs() as logs:
+            monitor.probe_once()
+        assert not any(
+            log.get("event") == "async_task_monitor_ibkr_connectivity_warn" for log in logs
+        )
+
+    def test_idempotent_per_error_event(self) -> None:
+        """Same (code, last_seen_at_utc) only warns once across probes."""
+        state = self._build_state(code=1100, age_seconds=1.0)
+        tracker = TrackedIbkrErrorState(name="ibkr_adapter", provider=lambda: state)
+        monitor = AsyncTaskMonitor([], interval_seconds=30.0, ibkr_error_state=tracker)
+        with capture_logs() as logs1:
+            monitor.probe_once()
+        with capture_logs() as logs2:
+            monitor.probe_once()
+        warns1 = [
+            log for log in logs1 if log.get("event") == "async_task_monitor_ibkr_connectivity_warn"
+        ]
+        warns2 = [
+            log for log in logs2 if log.get("event") == "async_task_monitor_ibkr_connectivity_warn"
+        ]
+        assert len(warns1) == 1
+        assert len(warns2) == 0
+
+    def test_new_event_after_idempotent_skip_warns_again(self) -> None:
+        """Different last_seen_at_utc → fresh key → new WARNING."""
+        state_first = self._build_state(code=1100, age_seconds=10.0)
+        state_second = self._build_state(code=1100, age_seconds=1.0)
+        states = [state_first, state_second]
+
+        def _provider() -> IbkrErrorState | None:
+            return states.pop(0) if states else None
+
+        tracker = TrackedIbkrErrorState(name="ibkr_adapter", provider=_provider)
+        monitor = AsyncTaskMonitor([], interval_seconds=30.0, ibkr_error_state=tracker)
+        with capture_logs() as logs1:
+            monitor.probe_once()
+        with capture_logs() as logs2:
+            monitor.probe_once()
+        warns1 = [
+            log for log in logs1 if log.get("event") == "async_task_monitor_ibkr_connectivity_warn"
+        ]
+        warns2 = [
+            log for log in logs2 if log.get("event") == "async_task_monitor_ibkr_connectivity_warn"
+        ]
+        assert len(warns1) == 1
+        assert len(warns2) == 1
+        # Distinct timestamps in the two warnings.
+        assert warns1[0]["last_seen_at_utc"] != warns2[0]["last_seen_at_utc"]
+
+    def test_provider_raises_swallowed(self) -> None:
+        def _provider() -> IbkrErrorState | None:
+            raise RuntimeError("adapter probe failed")
+
+        tracker = TrackedIbkrErrorState(name="ibkr_adapter", provider=_provider)
+        monitor = AsyncTaskMonitor([], interval_seconds=30.0, ibkr_error_state=tracker)
+        with capture_logs() as logs:
+            # Must not raise.
+            monitor.probe_once()
+        provider_failed = [
+            log for log in logs if log.get("event") == "async_task_monitor_ibkr_provider_failed"
+        ]
+        assert len(provider_failed) == 1
+        assert provider_failed[0]["exception_type"] == "RuntimeError"
+        # And no connectivity warning fires from the same probe.
+        assert not any(
+            log.get("event") == "async_task_monitor_ibkr_connectivity_warn" for log in logs
+        )
+
+    def test_naive_timestamp_swallowed_with_warning(self) -> None:
+        """Defensive: naive last_seen_at_utc logs a warning and doesn't crash."""
+        # Build a state manually with naive timestamp (the adapter
+        # would never produce this per A06, but defensive).
+        bad_state = IbkrErrorState(
+            error_code=1100,
+            error_string="lost",
+            last_seen_at_utc=datetime.now(),
+            req_id=-1,
+            contract_local_symbol=None,
+        )
+        tracker = TrackedIbkrErrorState(name="ibkr_adapter", provider=lambda: bad_state)
+        monitor = AsyncTaskMonitor([], interval_seconds=30.0, ibkr_error_state=tracker)
+        with capture_logs() as logs:
+            monitor.probe_once()
+        naive_warns = [
+            log for log in logs if log.get("event") == "async_task_monitor_ibkr_naive_timestamp"
+        ]
+        assert len(naive_warns) == 1
+        # And no connectivity warning fires for the malformed state.
+        assert not any(
+            log.get("event") == "async_task_monitor_ibkr_connectivity_warn" for log in logs
+        )
+
+    def test_custom_codes_set_overrides_default(self) -> None:
+        """Caller can narrow the connectivity-codes set for testing."""
+        state = self._build_state(code=1102, age_seconds=1.0)
+        # Configure tracker to ONLY warn on 1100; 1102 should skip.
+        tracker = TrackedIbkrErrorState(
+            name="ibkr_adapter",
+            provider=lambda: state,
+            connectivity_codes=frozenset({1100}),
+        )
+        monitor = AsyncTaskMonitor([], interval_seconds=30.0, ibkr_error_state=tracker)
+        with capture_logs() as logs:
+            monitor.probe_once()
+        assert not any(
+            log.get("event") == "async_task_monitor_ibkr_connectivity_warn" for log in logs
+        )
+
+    def test_custom_freshness_window_overrides_default(self) -> None:
+        """Caller can widen the freshness window for short-cycle environments."""
+        state = self._build_state(code=1100, age_seconds=400.0)
+        # 400s old should normally be stale (> 300s default), but here
+        # we explicitly widen to 600s so it still counts as fresh.
+        tracker = TrackedIbkrErrorState(
+            name="ibkr_adapter",
+            provider=lambda: state,
+            freshness_window_seconds=600.0,
+        )
+        monitor = AsyncTaskMonitor([], interval_seconds=30.0, ibkr_error_state=tracker)
+        with capture_logs() as logs:
+            monitor.probe_once()
+        warns = [
+            log for log in logs if log.get("event") == "async_task_monitor_ibkr_connectivity_warn"
+        ]
+        assert len(warns) == 1
+        assert warns[0]["freshness_window_seconds"] == 600.0
+
+    def test_contract_local_symbol_propagates_to_log(self) -> None:
+        state = self._build_state(
+            code=1100,
+            age_seconds=1.0,
+            req_id=42,
+            contract_local_symbol="TLT",
+        )
+        tracker = TrackedIbkrErrorState(name="ibkr_adapter", provider=lambda: state)
+        monitor = AsyncTaskMonitor([], interval_seconds=30.0, ibkr_error_state=tracker)
+        with capture_logs() as logs:
+            monitor.probe_once()
+        warns = [
+            log for log in logs if log.get("event") == "async_task_monitor_ibkr_connectivity_warn"
+        ]
+        assert len(warns) == 1
+        assert warns[0]["req_id"] == 42
+        assert warns[0]["contract_local_symbol"] == "TLT"
+
+    def test_task_probe_and_ibkr_probe_independent(self) -> None:
+        """A dead task probe fires alongside an IBKR connectivity warn."""
+
+        async def _runner() -> list[Any]:
+            async def _raises() -> None:
+                raise RuntimeError("dead worker")
+
+            task = asyncio.create_task(_raises())
+            try:
+                await task
+            except RuntimeError:
+                pass
+            state = TestIbkrConnectivityProbe._build_state(code=1100, age_seconds=1.0)
+            tracker = TrackedIbkrErrorState(name="ibkr_adapter", provider=lambda: state)
+            monitor = AsyncTaskMonitor(
+                [TrackedTask(name="dead", task=task, expected_alive=True)],
+                interval_seconds=30.0,
+                ibkr_error_state=tracker,
+            )
+            with capture_logs() as logs:
+                monitor.probe_once()
+            return logs
+
+        logs = asyncio.run(_runner())
+        died = [log for log in logs if log.get("event") == "async_task_died"]
+        warns = [
+            log for log in logs if log.get("event") == "async_task_monitor_ibkr_connectivity_warn"
+        ]
+        # Both events fire from a single probe_once invocation.
+        assert len(died) == 1
+        assert len(warns) == 1
+
+    def test_ibkr_probe_outer_exception_caught(self) -> None:
+        """A bug OUTSIDE the provider call doesn't crash probe_once.
+
+        Inner try/except only covers ``tracker.provider()``;
+        ``tracker.connectivity_codes`` access happens outside that
+        guard. A bug there bubbles up to the outer try in
+        ``probe_once`` and logs ``async_task_monitor_ibkr_probe_failed``.
+        """
+        state = self._build_state(code=1100, age_seconds=1.0)
+
+        class _BadTracker:
+            name = "ibkr_adapter"
+            provider = staticmethod(lambda: state)  # OK — returns fine
+            freshness_window_seconds = 300.0
+
+            @property
+            def connectivity_codes(self) -> Any:
+                raise RuntimeError("attribute-access-time error AFTER provider")
+
+        monitor = AsyncTaskMonitor(
+            [],
+            interval_seconds=30.0,
+            ibkr_error_state=_BadTracker(),  # type: ignore[arg-type]
+        )
+        with capture_logs() as logs:
+            # Must not raise; probe_once must return cleanly.
+            assert monitor.probe_once() == 0
+        probe_failed = [
+            log for log in logs if log.get("event") == "async_task_monitor_ibkr_probe_failed"
+        ]
+        assert len(probe_failed) == 1
+
+
 class TestModuleContract:
     """Public ``__all__`` surface."""
 
@@ -464,7 +797,10 @@ class TestModuleContract:
 
         assert set(mod.__all__) == {
             "AsyncTaskMonitor",
+            "DEFAULT_IBKR_CONNECTIVITY_CODES",
+            "DEFAULT_IBKR_FRESHNESS_SECONDS",
             "DEFAULT_MONITOR_INTERVAL_SECONDS",
+            "TrackedIbkrErrorState",
             "TrackedTask",
             "collect_tracked_tasks",
             "stop_async_task_monitor",

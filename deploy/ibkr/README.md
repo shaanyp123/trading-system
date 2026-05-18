@@ -373,6 +373,117 @@ the collision. The above manual smoke is the A27 satisfier.
 
 ---
 
+## IBKR error event observability (2026-05-18 drill 5 follow-up #2)
+
+The 2026-05-18 drill 5 incident surfaced a silent-absence defect:
+ib_gateway↔IBKR servers connection broke at the 23:59 ET overnight
+maintenance restart (IBC "Existing session detected" dialog hung 4h
+before the `primary` env-var fix above landed). The api's clientId=N
+socket to the gateway sidecar stayed alive throughout —
+`_ib.isConnected()` returned True — but IBKR orderStatus events for
+fills never propagated. IBKR fired Error 1100 ("Connectivity between
+IBKR and Trader Workstation has been lost") to the api's ib-async
+client. The error landed in api stdout logs as plain text (`api-1 |
+Error 1100, reqId -1: ...`) but was NOT structured-logged, NOT surfaced
+via the AsyncTaskMonitor (PR #168), and NOT pushed to Discord #alerts.
+Operator only noticed when checking on drill state mid-day.
+
+**The follow-up PR (2026-05-18)** wires ib-async's `IB.errorEvent`
+into the api's observability stack. Two new log lines + one new
+WARNING are surfaced.
+
+### `ibkr_error_received` (new — emitted by `services/execution/ibkr_adapter.py`)
+
+Every IBKR error event captured by the adapter's `errorEvent`
+subscription emits one of these. Fields: `error_code`, `error_string`,
+`req_id`, `contract_local_symbol`, `client_id`, `category`. Severity
+follows the IBKR canonical taxonomy:
+
+| Category | Codes | Log level | Meaning |
+|---|---|---|---|
+| `connectivity` | 1100, 1101, 1102 | WARNING | Connection between IBKR and TWS lost / restored. 1100 = lost; 1101 = restored, data lost (re-subscribe needed); 1102 = restored, data maintained. |
+| `data_farm` | 2103, 2104, 2106, 2107, 2108, 2110, 2150 | WARNING | Market data farm connection state. Informational under normal operation; bursts can correlate with broker incidents. |
+| `order_rejection` | ≥ 10000 | ERROR | Order-side rejection (e.g., 10147 "OrderId X not found"). |
+| `other` | < 1000 | INFO | Validation warnings, contract messages, etc. (e.g., 321 "Please enter a local symbol"). |
+
+Full IBKR error code reference:
+https://interactivebrokers.github.io/tws-api/message_codes.html
+
+### `ibkr_error_event_subscribed` (new — emitted at `connect()` time)
+
+One-shot INFO confirming the `errorEvent` handler attached. Should
+appear once per api boot (idempotent across reconnects via
+`_ibkr_error_wired` flag). If absent from boot logs, the api's
+adapter is NOT capturing IBKR errors — investigate.
+
+### `async_task_monitor_ibkr_connectivity_warn` (new — emitted by `services/api/async_task_monitor.py`)
+
+Every 30s, the AsyncTaskMonitor probes the adapter's most-recent
+error state. When it sees a fresh (< 5 min old) error in the
+connectivity codes set (1100/1101/1102), the monitor emits this
+WARNING. Idempotent per `(error_code, last_seen_at_utc)` pair —
+the same error event only generates one WARNING even though the
+probe runs every 30s.
+
+Fields: `error_code`, `error_string`, `req_id`,
+`contract_local_symbol`, `last_seen_at_utc`, `age_seconds`,
+`freshness_window_seconds`, `tracker_name`.
+
+**Operator response:**
+
+1. **Verify the gateway state first:**
+   ```
+   docker compose logs ib_gateway --since 10m | tail -50
+   ```
+   Look for `Existing session detected` (race with TWS Desktop —
+   see section above), `Login succeeded` (recent restart), or
+   IBKR-side messages about the upstream broker.
+
+2. **Check the api's view of the connection:**
+   ```
+   docker compose logs api --since 10m | grep -E 'ibkr_(connected|disconnected|error_received)' | tail -20
+   ```
+   If `ibkr_connected` is recent and no `ibkr_disconnected` followed,
+   the api's local socket is still up — confirming the silent-absence
+   pattern (local socket alive, upstream broker sick).
+
+3. **Typical recovery:** wait 5-10 min for IBKR's upstream to
+   recover on its own. Most 1100 events are transient and IBKR
+   fires 1102 ("restored") shortly after. If 1100 persists > 15 min
+   without a 1102, restart the gateway:
+   ```
+   docker compose restart ib_gateway
+   ```
+   Wait for `Login succeeded` + `ibkr_connected` in the api logs.
+
+4. **Future Discord #alerts dispatch (follow-up PR):** the current
+   PR surfaces the structured log + monitor WARNING only. A
+   follow-up PR will wire `async_task_monitor_ibkr_connectivity_warn`
+   into `services/webhook_pusher`'s alert pipeline so the same
+   event also fires a P1 Discord embed in `#alerts`.
+
+### `async_task_monitor_ibkr_provider_failed` (new — error path)
+
+If the adapter's `last_ibkr_error` property raises (e.g., bug in
+the adapter), the monitor logs this WARNING and continues. The
+probe will retry next cycle. Should never fire in normal
+operation; a recurring instance indicates a real bug.
+
+### Sanity check (after deploy)
+
+After PR #N deploys, verify the new wiring in a single SSH session:
+
+```
+docker compose logs api --since 5m | grep -E 'ibkr_error_event_subscribed|async_task_monitor_started'
+```
+
+Expected: one of each per api boot. If `ibkr_error_event_subscribed`
+is missing but `async_task_monitor_started` is present, the adapter
+never wired the handler — check `ib-async` version (must be ≥ 2.0)
+and the adapter's `_wire_error_event` call inside `connect()`.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
@@ -387,6 +498,9 @@ the collision. The above manual smoke is the A27 satisfier.
 | Healthcheck `Up (unhealthy)` after 5 min | IBC login looped or hung | `docker compose restart ib_gateway`; if persistent, VNC in via `vncviewer <vps-ip>:5900` (password from `IB_GATEWAY_VNC_PASSWORD`) + debug manually |
 | `Existing session detected ... User must choose` in logs + IBC hangs + Error 1100 to api | `EXISTING_SESSION_DETECTED_ACTION` env var not propagating to IBC config | See "Existing session collisions with TWS Desktop" section above; verify `docker compose exec ib_gateway grep ExistingSessionDetectedAction /home/ibgateway/ibc/config.ini` prints `primary`; recreate container if not |
 | Orders placed but no fills propagate after IBKR maintenance restart (~00:18 UTC) | IBC hit "Existing session detected" dialog because TWS Desktop was open against same account | Workaround: close TWS Desktop + `docker compose restart ib_gateway`. Canonical fix shipped 2026-05-18 (`EXISTING_SESSION_DETECTED_ACTION=primary`); if symptom recurs, verify env propagation per row above |
+| `async_task_monitor_ibkr_connectivity_warn error_code=1100` in api logs | IBKR upstream broker connection dropped (silent-absence pattern from 2026-05-18 drill 5) | See "IBKR error event observability" section above. Most 1100 events recover automatically (IBKR fires 1102 shortly after); persistent 1100 > 15min → `docker compose restart ib_gateway` |
+| `ibkr_error_event_subscribed` missing from boot logs even though api healthy | `ib-async` version too old OR `_wire_error_event` not reached due to adapter regression | Verify `pip show ib-async` ≥ 2.0 in api container; check `connect()` source at `services/execution/ibkr_adapter.py` for the `_wire_error_event()` call after `await self._ib.connectAsync(...)` |
+| `ibkr_error_event_handler_failed raw_error_code=1100` (or similar) | Malformed error event from ib-async (e.g., contract object with raising attributes) | Handler swallows the exception cleanly; broker connection unaffected. If recurring on same `raw_error_code`, escalate — the upstream `ib-async` may have a regression. The `last_ibkr_error` snapshot did NOT update for that event (no `_last_ibkr_error` assignment) |
 
 ---
 
