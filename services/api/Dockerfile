@@ -88,6 +88,14 @@ COPY infrastructure/ infrastructure/
 COPY strategies/ strategies/
 COPY alembic/ alembic/
 COPY alembic.ini ./
+# scripts/operator_tools/** ships in the image so operator recovery tooling
+# (e.g. replay_executions.py — drill 5 backend-blind-fills recovery) is
+# importable via `python -m scripts.operator_tools.<name>` from inside the api
+# container. The rest of scripts/ (seed_*, verify_*, check_dockerfile_*)
+# rides along; those are inert at import time (their entry points are
+# never invoked from the api process — operator runs from a workstation
+# venv with separate deps like yfinance / databento per their runbooks).
+COPY scripts/ scripts/
 
 # Sanity check: importable module + route surface intact. Stub env var for
 # the pydantic-settings load; real values come from sops at runtime.
@@ -122,6 +130,7 @@ COPY --from=builder /build/infrastructure /app/infrastructure
 COPY --from=builder /build/strategies /app/strategies
 COPY --from=builder /build/alembic /app/alembic
 COPY --from=builder /build/alembic.ini /app/alembic.ini
+COPY --from=builder /build/scripts /app/scripts
 
 USER trading
 
