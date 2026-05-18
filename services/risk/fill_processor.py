@@ -1840,6 +1840,29 @@ async def _apply_trade_mutation(
                     "tcreated": mutation.trade_created_at,
                 },
             )
+            # Drill 5 follow-up #3 — flip the entry signal's status to
+            # 'closed' so /api/signals?status=working doesn't leave a
+            # stale row visible after the trade lifecycle completes.
+            # The trade lifecycle authoritative state lives in
+            # ``trades.state`` (just UPDATEd to 'closed' above); the
+            # signal's status is now strictly cosmetic for the
+            # operator-facing /signals page.
+            #
+            # No audit event emitted — the trade-lifecycle endpoint is
+            # already captured by ``TRADE_CLOSED`` in the audit chain
+            # (per ``plan.audit_events``); cosmetic-only signal-row
+            # updates are not in the §3.30 audit taxonomy.
+            #
+            # Same transaction as the trades UPDATE so the two
+            # mutations are atomic — if signals UPDATE fails for any
+            # reason, trades UPDATE rolls back too. The
+            # ``status != 'closed'`` guard makes the UPDATE idempotent
+            # if the orchestrator re-applies the plan after a
+            # transient mid-flight failure.
+            await session.execute(
+                text("UPDATE signals SET status = 'closed' WHERE id = :sig AND status != 'closed'"),
+                {"sig": mutation.entry_signal_id},
+            )
             return mutation.trade_id
 
 
