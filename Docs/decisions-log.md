@@ -17,6 +17,120 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ## Entries
 
+### 2026-05-18 — Scope ticket: LEAN signal_emitted attribution payload extension (Phase 1+; brainstormed this session, no code)
+
+- **Status:** OPEN — scope ticket only, no code. Authored after operator chose option 4 ("brainstorm scope ticket only") for Priority 3 of the 2026-05-18 afternoon carryover session. Requires a dedicated session for code work because the strategy-logic questions inline below need operator alignment first.
+
+- **Context:** `services/risk/attribution.py` (PR-K) ships pure-policy `plan_daily_attribution` + `apply_attribution_plan` that emit one `ATTRIBUTION_ROLLUP_RECORDED` audit event per session_date plus one `attribution` row per closed trade. The `attribution` table's NOT NULL columns require `expected_pnl_usd`, `expected_slippage_bps`, `expected_holding_days`, and `expected_at_utc` (alembic 0002:300-309). Today V1 strategy emits a minimal `signal_emitted` payload that does NOT populate these fields; the `signals` table's nullable `expected_fill_price` + `expected_slippage_bps` columns also stay NULL on every emit; and the attribution rollup logic can't compute these values from realized data alone. Net effect: when attribution rollup is wired into `services/reconciliation/eod_cycle.py` (currently deferred per the PR-K docstring), every row would carry zero or fallback values, making the Today page's expected-vs-realized P&L tile cosmetically broken.
+
+- **Where this gap manifests in code today:**
+  - `services/risk/attribution.py:88-105` — `ClosedTradeForAttribution` requires `expected_entry_price`, `expected_exit_price` (nullable), `expected_slippage_bps`, `expected_holding_days`, `expected_at_utc`. The class docstring already flags the gap: "Phase 1+ — derived from strategy parameters at signal-emit time; when unavailable, callers pass 0 (the planner accepts but emits a warning)."
+  - `services/qc_adapter/signal_ingestion.py:226-243` — INSERTs `signals` row with `decision_price` + `target_contracts` + `sizing_trace` but does NOT populate `expected_fill_price` or `expected_slippage_bps` columns even though both exist in alembic 0002:144-145.
+  - `strategies/v1_trend_following/signals.py:104-148` — V1's emit path uses `decision_price` + indicator state but does NOT compute or carry expected_* attribution fields.
+  - `strategies/v1_trend_following/sizing_trace.py` — `Stage0Trace.strategy_inputs` carries indicator snapshot (`donchian_high`, `donchian_low`, `ma_fast`, `ma_slow`, `hurst`, `atr`, `stop_price`, `lookback_days_donchian`) but no attribution payload.
+
+- **Architectural decision needed BEFORE coding (operator must answer):**
+
+  Two viable paths for carrying the expected_* fields from signal-emit time to attribution-rollup time:
+
+  1. **JSONB-carry (RECOMMENDED — no schema change):** Add a new `attribution` sub-key to the existing `sizing_trace` JSONB shape — either nested at `sizing_trace.attribution.<field>` (per-signal singleton) or `sizing_trace.stage_0_universe.strategy_inputs.<market>.attribution` (per-market). The `attribution.py` planner reads from `signals.sizing_trace -> attribution` at rollup time. No alembic migration. Forward-compatible: future strategies can store different attribution shapes under the same key with a `schema_version` field.
+
+  2. **Schema-extend (REQUIRES alembic):** Add `expected_pnl_usd NUMERIC(20,4)` + `expected_holding_days INTEGER` columns to `signals`. Mirrors the `attribution` table's column shape so the rollup is a pure column-projection. Cleaner SQL queries; observable in `/api/signals` responses without payload-unwrapping. But: alembic 0007 migration is required (`alembic/**` is on the forbidden whitelist [A02]; bundled PR needs `risk-review-approved`). Schema-change cost-benefit: marginal columns-in-signals provide signal-level diagnostics, but the operator-facing surface (Today page tile) only reads attribution after rollup, not signals directly.
+
+  **My recommendation:** Path 1 (JSONB-carry). Avoids the alembic migration, keeps blast radius tight, doesn't change `signals.expected_fill_price` / `expected_slippage_bps` semantics (those stay as the existing columns operating-as-spec). The PR-K docstring's "expected payloads (sourced however the operator wires Phase 1+)" language already anticipates this approach. **Operator: confirm or override.**
+
+- **Open strategy-logic questions** (per dev-guide §1.3 — must escalate; cannot decide unilaterally):
+
+  **Q1. `expected_pnl_usd` source for V1 Donchian breakouts.** Multiple reasonable options; each implies a different mental model of "what the strategy expects to earn":
+    - **(a) Channel-width projection:** Target price = entry + (channel_width × N). For longs: `expected_pnl = (donchian_high - donchian_low) × N × qty × multiplier`. Simple; ties directly to the breakout's price-action regime; but N is an unmotivated free parameter (1x? 2x?).
+    - **(b) ATR-based projection:** Target price = entry + (3 × ATR). For longs: `expected_pnl = (3 × atr × qty × multiplier) - (3 × atr × qty × multiplier × historical_loss_rate)`. Ties to current-volatility regime; but doesn't account for trend strength.
+    - **(c) Historical-CAGR-weighted:** `expected_pnl = avg_winner_$ × win_rate - avg_loser_$ × loss_rate`. Read from a `strategy_versions.expected_per_signal_pnl_usd` column populated during backtest. Most rigorous; requires the backtest report to populate the column (operator currently runs LEAN backtests but doesn't extract per-signal stats yet).
+    - **(d) Stop-distance × payoff ratio:** For longs: `expected_pnl = (entry - stop) × payoff_ratio × qty × multiplier`. Where `payoff_ratio = 2.0 or 3.0` (operator parameter). Common in trend-following; matches the rule-of-thumb "asymmetric payoff" framing.
+    - **(e) Operator-confirmed constant per market:** A single tunable per market in `strategies/v1_trend_following/parameters.py` (e.g., `EXPECTED_PNL_PER_CONTRACT = {"TLT": 200, "/MES": 800}`). Operator can refine over time as live data accumulates.
+    - **(f) Other.**
+
+    **Operator: pick or write your own.**
+
+  **Q2. `expected_holding_days` source for V1 Donchian breakouts.** Donchian-style trend-following historically averages 20-60 calendar days but exits are dynamic (next opposite breakout / ATR-stop hit / risk-engine forced close). Options:
+    - **(a) Constant ~30 days:** Reflects Turtle-style historical backtests. Simple. Won't track regime.
+    - **(b) Hurst-derived:** Hurst > 0.55 → 45 days; Hurst 0.50-0.55 → 30 days; Hurst < 0.50 → 15 days. Ties to trend strength.
+    - **(c) ATR-inverse:** Higher vol → shorter expected hold (`ceil(30 / volatility_z_score)` clamped). Volatile markets stop out faster.
+    - **(d) Per-market constant:** ETFs (bonds, etc.) tend to have slower regimes than micros (futures intraday vol). `EXPECTED_HOLDING_DAYS = {"TLT": 45, "/MES": 20}` operator-tuned.
+    - **(e) Historical-median-from-backtest:** Read from `strategy_versions.expected_holding_days_per_market`. Requires backtest report ingestion.
+    - **(f) Other.**
+
+    **Operator: pick or write your own.**
+
+  **Q3. `expected_slippage_bps` source.** This one has an existing canonical answer in the codebase — `services/calibration/calibration.py::plan_calibration_fit` produces per-market OLS coefficients from realized fills (alpha + beta × size_over_adv); the HEAD row pointer is at `slippage_calibration_versions WHERE is_head = TRUE`. During Phase 0/1-onset bootstrap the coefficients are zero (insufficient data; auto-bootstrapped by `_resolve_or_bootstrap_slippage_head` in `signal_ingestion.py`). Options:
+    - **(a) Auto-populate from HEAD coefficients at emit time:** `expected_bps = alpha + beta × (target_contracts × contract_size / ADV)`. Needs `signals.sizing_trace.stage_0_universe.strategy_inputs.<market>` to carry ADV (currently absent — would need a new field).
+    - **(b) Carry alpha + beta + size as JSONB; compute at rollup time:** Defers the bps computation but couples the signal payload to the calibration model.
+    - **(c) Carry just the realized-size-equivalent in sizing_trace + look up coefficients at rollup-time:** Simplest signal-emit; latest-HEAD coefficients used at rollup-time which might be a NEWER calibration than the one in force at signal-emit time. Trade-off: rollup uses "current best estimate" not "estimate-at-emit-time".
+
+    **Operator: pick or write your own. (a) is closest to spec §2.14 intent but requires the ADV field; (c) is most expedient.**
+
+  **Q4. `expected_entry_price` and `expected_exit_price`.** Simpler — both have natural sources:
+    - **`expected_entry_price`:** `signals.expected_fill_price` (existing column, alembic 0002:145). Computed as `decision_price + half_spread + expected_slippage_bps_applied`. **Operator: confirm decision_price + slippage adjustment is the right model.** (Alternative: limit price at order placement, set in `services/risk/order_placement_worker.py`. But limit price isn't known until POST-approval, after signal_emitted.)
+    - **`expected_exit_price`:** For exits triggered by stop fill, the bracket stop price (known at entry; carried in `signals.sizing_trace.stage_0_universe.strategy_inputs.<market>.stop_price`). For target-based exits (channel-exit / trailing-stop / ATR-trail), the target is dynamic and may not exist at entry-time. Per `attribution.py`'s `ClosedTradeForAttribution.expected_exit_price: Decimal | None` — `None` is acceptable when no expected exit existed. **Operator: confirm using bracket-stop as the expected_exit baseline + accepting None for target-based exits.**
+
+- **Scope per file surface** (estimated diff size; assumes Path 1 JSONB-carry per architectural recommendation above):
+
+  1. **`strategies/v1_trend_following/sizing_trace.py`** — extend `Stage0Trace.strategy_inputs.<market>` TypedDict with new `StrategyAttribution` sub-shape (`expected_pnl_usd`, `expected_holding_days`, `expected_slippage_bps`, `expected_entry_price`, `expected_exit_price: str | None`), Decimal-as-str throughout. ~30 LOC + module docstring update. **A02 BINDS** — `strategies/v1_trend_following/**` is on the forbidden whitelist; `risk-review-approved` required.
+
+  2. **`strategies/v1_trend_following/signals.py`** — V1 emit path populates the new attribution sub-shape at signal-emit time using the indicator state already on hand (Donchian channel + ATR + Hurst) + parameters from `parameters.py`. ~80 LOC. **A02 BINDS.**
+
+  3. **`services/qc_adapter/signal_ingestion.py`** — payload validation extended: when `sizing_trace.attribution` is present, also populate `signals.expected_fill_price` + `signals.expected_slippage_bps` columns at INSERT time (the existing nullable columns can finally start being filled). ~25 LOC. **§2.3 hot-fix whitelist scope** (`services/qc_adapter/**`); no label needed.
+
+  4. **`services/risk/attribution.py`** — extend `plan_daily_attribution`'s caller-side data-build helper (currently the operator's hypothesis is the rollup engine reads `signals.sizing_trace -> attribution` JSONB; alternatively it could read the new `signals` columns directly if we go schema-extend Path 2). Likely no change to the planner itself — just to whatever joins signals + trades to build `ClosedTradeForAttribution`. ~20 LOC. **A02 BINDS.**
+
+  5. **(Bonus surface, deferred to follow-up)** `services/reconciliation/eod_cycle.py` — wire `plan_daily_attribution` + `apply_attribution_plan` into the daily 18:30 ET cycle. Currently the PR-K docstring lists this explicitly: "The end-to-end wiring into `services.reconciliation.eod_cycle.run_eod_cycle` is deferred to a Phase 1+ follow-up." Estimated ~60 LOC including tests. Not part of this scope ticket's blast radius.
+
+  6. **Test coverage:** ~30-40 new tests across unit (sizing_trace shape; V1 emit population; qc_adapter ingestion) + at least one integration test under testcontainers (signal INSERT round-trip with the new payload + attribution.py read-back).
+
+- **Suggested PR split:**
+
+  Operator's option 4 ("brainstorm scope ticket only") punts the implementation decision. When the dedicated session happens, the split options become:
+
+  - **Option A — one bundled PR, all 4 surfaces:** single `risk-review-approved` review pass. Estimated 4-6h. Higher per-PR surface area but tighter coupling guarantee (you can't merge half a contract).
+
+  - **Option B — split across two PRs:**
+    - **PR-1 (V1 emit-side):** `sizing_trace.py` shape extension + `signals.py` emit population. Both forbidden whitelist; one `risk-review-approved` label. Estimated 2.5h.
+    - **PR-2 (backend ingestion + attribution):** `qc_adapter/signal_ingestion.py` (hot-fix whitelist; no label) + `services/risk/attribution.py` extension (forbidden whitelist; second `risk-review-approved`). Estimated 2.5h. Depends on PR-1.
+
+  - **Option C — three PRs:** Split PR-1 into shape (sizing_trace.py) and population (signals.py). Probably overkill given the tight coupling.
+
+  **Recommendation:** Option B. PR-1 lands the contract; PR-2 wires the consumers. Backend can be smoke-tested against PR-1's payload shape before the risk/attribution code goes live.
+
+- **A-gate map** (anticipated; locked once code is written):
+  - **A01:** N/A — no new audit event types. `SIGNAL_EMITTED` is the existing taxonomy; payload shape change is backward-compatible (JCS canonicalization handles new fields).
+  - **A02 BINDS** — `strategies/v1_trend_following/**` (PR-1) + `services/risk/attribution.py` (PR-2 partial). Both PRs need `risk-review-approved`. `services/qc_adapter/signal_ingestion.py` is §2.3 hot-fix scope; no label.
+  - **A04:** enforced — `SIGNAL_EMITTED` already in the locked enum.
+  - **A05:** enforced — all new Decimal fields stored as strings per dev-guide §3.8.
+  - **A06:** N/A — no new datetime fields beyond what `expected_at_utc` requires (sourced from existing `signals.emitted_at_utc`).
+  - **A22:** N/A — unit tests use mocks; integration tests under testcontainers.
+  - **A27:** N/A — no new third-party platform integration.
+
+- **Self-applied `risk-review-approved` label authorization:** **NOT pre-authorized for this scope ticket.** This is a docs-only PR (no code, no service modification) so the label is irrelevant. When the implementation session happens, operator must re-confirm label self-application separately (per the session-prompt's "Auth from those sessions does NOT carry to this one; needs re-confirmation here").
+
+- **Cross-references:**
+  - `services/risk/attribution.py` module docstring (lines 1-41) — already flags the gap; this ticket is the formal scope.
+  - `backend-spec.md` §3.7 — `attribution` table contract.
+  - `backend-spec.md` §2.14 — slippage calibration framework (Q3 source).
+  - Drill 5 retrospective (this file, 2026-05-18 entry) — drill-5 path-trace showed `realized_pnl_usd=$0.0000` because entry+exit were same-tick; the attribution path was conceptually exercised but the expected_pnl side was zero. This ticket is what unlocks meaningful expected-vs-realized analysis.
+  - `Docs/claude-dev-guide.md` §1.3 — ambiguity protocol mandating strategy-logic escalation (Q1, Q2, Q3, Q4 above).
+
+- **What this ticket DELIVERS:**
+  - Full architectural framing for the dedicated implementation session.
+  - 4 operator strategy-logic questions captured inline with multiple options.
+  - File-surface scope estimate so the dedicated session can budget time accurately.
+  - PR-split recommendation + A-gate map.
+
+- **What this ticket DOES NOT DELIVER:**
+  - Any code change. Per operator's option-4 selection, no implementation.
+  - Resolution of the strategy-logic questions — those need operator input.
+  - The alembic migration decision (Path 1 vs Path 2) — operator confirmation needed.
+
+- **Operator next step:** triage Q1-Q4 + architectural Path 1 vs Path 2 question + PR-split preference (A/B/C) + `risk-review-approved` self-application authorization. Once those four inputs are resolved, the dedicated implementation session has full scope alignment to proceed end-to-end.
+
 ### 2026-05-18 — Drill 5 follow-up #3 — `signals.status='closed'` UPDATE on trade close (this PR)
 
 - **Context:** Closes drill 5 follow-up #3 from the 2026-05-18 retrospective entry below (PR #176): "Signal status update on fill close (minor cleanup): currently `signals.status` stays at `'working'` after the bracket completes (both fills land + trade closes). Strictly correct (the trade lifecycle is in `trades.state`, not `signals.status`) but cosmetically the signal looks orphaned in `/api/signals?status=working` queries."
