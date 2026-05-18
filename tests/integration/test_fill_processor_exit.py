@@ -294,13 +294,24 @@ def _seed_open_trade_state(
         ).scalar_one()
         # Seed a prior balances row representing post-entry state. cash =
         # 100000 - (85 * 1) - 0.50 = 99914.50
+        #
+        # snapshot_ts must be strictly BEFORE the exit fill's filled_at_utc
+        # (`2026-05-17 18:00 UTC` in test_exit_full_close_end_to_end) because
+        # production code AND the test's post-apply assertion both use
+        # `ORDER BY snapshot_ts DESC LIMIT 1` to fetch the latest balance.
+        # Using `now()` here is wall-clock-dependent: it produces a timestamp
+        # *later* than the hard-coded exit time whenever the test runs after
+        # 2026-05-17 18:00 UTC, which caused the latest-balance SELECT to
+        # return THIS seeded row instead of the new exit-fill row. Hard-coded
+        # 1 hour before the exit makes the relative ordering deterministic
+        # regardless of when the test runs.
         balance_id = conn.execute(
             text(
                 "INSERT INTO balances ("
                 "    account_id, snapshot_ts, net_liquidation,"
                 "    cash_usd, excess_liquidity, used_margin_pct, source"
                 ") VALUES ("
-                "    :acct, now(), 99999.50,"
+                "    :acct, '2026-05-17 17:00:00+00'::timestamptz, 99999.50,"
                 "    99914.50, 99914.50, 0, 'tws_api'"
                 ") RETURNING id"
             ),
