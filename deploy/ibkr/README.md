@@ -295,6 +295,84 @@ IBKR's paper-account credentials rotate manually via the IBKR portal
 
 ---
 
+## Existing session collisions with TWS Desktop
+
+IBKR allows only one logged-in client per account at a time. If the
+operator's TWS Desktop is open against the same paper account
+(`DUQ825170`) and the gateway tries to log in — typically after IBKR's
+overnight maintenance window restarts the gateway around 00:18 UTC —
+IBC pops a headless "Existing session detected" dialog that hangs
+indefinitely on the VNC display. While the dialog is open, IBKR
+emits Error 1100 ("connectivity lost") to the api and orderStatus
+events stop propagating, even though the api's TWS API socket stays
+open and `place_order` calls succeed at the protocol layer (the orders
+sit in the gateway but never roundtrip a fill event).
+
+**Canonical fix:** `docker-compose.yml` sets
+`EXISTING_SESSION_DETECTED_ACTION=primary` on the `ib_gateway` service.
+IBC writes this to its `config.ini` `ExistingSessionDetectedAction`
+setting at container start. With `primary`, the gateway WINS the
+collision — the other client (TWS Desktop) is kicked.
+
+**Documented tradeoff:** every gateway restart silently kicks the
+operator out of TWS Desktop. The operator must manually reconnect
+TWS Desktop after each restart. This is the expected behavior — the
+backend is authoritative for the trading account; TWS Desktop is for
+manual operator review only.
+
+**Manual smoke procedure** (do this after any `docker-compose.yml`
+edit that touches the IBC env block, or after a fresh VPS deploy):
+
+1. **Pre-state:** open TWS Desktop on the operator workstation and
+   log into `DUQ825170` paper. Confirm `Connected` in the TWS title
+   bar.
+
+2. **Trigger a gateway restart:** on the VPS:
+   ```
+   docker compose restart ib_gateway
+   ```
+
+3. **Watch the gateway logs for ~120s** (IBC's normal cold-boot
+   window):
+   ```
+   docker compose logs -f ib_gateway
+   ```
+
+4. **Expected log lines (success path):**
+   - `Got main window from future`
+   - `Login succeeded`
+   - `TWS API connection accepted` (when api reconnects)
+
+5. **Expected TWS Desktop behavior:** within ~10s of the gateway's
+   `Login succeeded`, the TWS Desktop session disconnects with a
+   dialog "You have been logged in from another location." This is
+   the expected `primary` behavior.
+
+6. **Anti-pattern to watch for:** if logs show
+   `Existing session detected ... User must choose` and IBC hangs,
+   the env var did not propagate. Verify with:
+   ```
+   docker compose exec ib_gateway grep ExistingSessionDetectedAction /home/ibgateway/ibc/config.ini
+   ```
+   Should print `ExistingSessionDetectedAction=primary`. If missing
+   or different, re-check `docker-compose.yml` env block + recreate
+   the container (`docker compose up -d --force-recreate ib_gateway`).
+
+7. **Post-state:** confirm the api reconnects within ~30s:
+   ```
+   docker compose logs api 2>&1 | grep -E 'ibkr_(connected|reconnected)' | tail -3
+   ```
+
+8. **Cleanup:** operator may reconnect TWS Desktop if they want
+   continued manual visibility into the paper account. The kick is
+   one-shot — TWS Desktop can rejoin without affecting the gateway.
+
+Integration-testing this end-to-end in CI is impractical because it
+requires a real IBKR auth round-trip + a second IBKR client to drive
+the collision. The above manual smoke is the A27 satisfier.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
@@ -307,6 +385,8 @@ IBKR's paper-account credentials rotate manually via the IBKR portal
 | `REJECTED category=duplicate_order` | Same client_order_id used twice | Smoke script uses a fixed ID (`smoke-001-abc-xyz-1`); cancel any existing order with that ID first |
 | `REJECTED category=limit_too_far_from_market` | Limit price (4000) below the realistic /MES range | The smoke deliberately picks a low limit; if /MES is trading much higher (e.g., 5500+), raise the limit_price to within a reasonable band |
 | Healthcheck `Up (unhealthy)` after 5 min | IBC login looped or hung | `docker compose restart ib_gateway`; if persistent, VNC in via `vncviewer <vps-ip>:5900` (password from `IB_GATEWAY_VNC_PASSWORD`) + debug manually |
+| `Existing session detected ... User must choose` in logs + IBC hangs + Error 1100 to api | `EXISTING_SESSION_DETECTED_ACTION` env var not propagating to IBC config | See "Existing session collisions with TWS Desktop" section above; verify `docker compose exec ib_gateway grep ExistingSessionDetectedAction /home/ibgateway/ibc/config.ini` prints `primary`; recreate container if not |
+| Orders placed but no fills propagate after IBKR maintenance restart (~00:18 UTC) | IBC hit "Existing session detected" dialog because TWS Desktop was open against same account | Workaround: close TWS Desktop + `docker compose restart ib_gateway`. Canonical fix shipped 2026-05-18 (`EXISTING_SESSION_DETECTED_ACTION=primary`); if symptom recurs, verify env propagation per row above |
 
 ---
 
