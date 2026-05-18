@@ -17,6 +17,79 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ## Entries
 
+### 2026-05-18 — Drill 8 — PR-ζ validated LIVE; AC4+AC6(entry)+AC7 all via the fixed live SSE path; defect #5 re-confirmed; AC5 pending market movement
+
+- **Status:** SUCCESS for the AC4+AC6(entry)+AC7 contract. Drill 8 (retry-2, after 2 cancel-and-retry rounds for non-marketable limit prices on a volatile /MNQ) put the canonical full-entry PR-G path through the LIVE `orderStatusEvent` callback path WITHOUT a `fill_processor_unknown_order` race. Defect #5 (non-canonical SSE `event_type='order'` on terminal cancellations) re-confirmed — three cancellations across the two pre-fill drill 8 retries hit the same ValueError, but cancel-path audit + DB updates still landed cleanly (audit-first protects this case).
+
+- **PR-ζ live-fire validation:**
+
+  Audit chain narrative for drill 8 retry-2 (signal `019e3d25-1336-76da-b668-fe55fc0b1c31`, all 8 events on the LIVE path with PR-ζ pre-INSERT — NO replay required):
+
+  | Seq | Event | Notes |
+  |---|---|---|
+  | 99 | `signal_emitted` | LEAN POST → 202 |
+  | 100 | `signal_approved` | Bot bearer approve → 200; `signal_decision_sse_emitted sse_sequence_no=92` (Discord #signals via webhook_pusher HTTP 204) |
+  | 101 | `order_placed` (entry) | PR-ζ pre-INSERT log fired: `order_placement_entry_row_pre_inserted`; then IBKR placeOrder; broker_order_id=24; `event_push_delivered channel=fills dedupe_key=order_placed:019e3d25-1a6c-…` |
+  | 102 | `order_placed` (stop) | PR-ζ pre-INSERT log fired: `order_placement_stop_row_pre_inserted`; broker_order_id=26 |
+  | **103** | **`order_filled`** | **fill_processor SAW the orders row (no race)** — fill at 29122.25, audit_event_uuid `019e3d25-1b2b-…`; `event_push_delivered channel=fills dedupe_key=order_filled:24 http_status=204` (Discord #fills delivered!) |
+  | 104 | `position_opened` | /MNQ qty=1 avg_cost=29122.25 |
+  | 105 | `balance_snapshot_recorded` | post-fill balance snapshot |
+  | 106 | `trade_opened` | trade_id `019e3d25-1b58-…`, state='open_position' |
+
+  `fill_processor_applied` log captured the contract: `audit_event_count=4, new_order_status=filled, position_action=open, trade_action=open`. **No `fill_processor_unknown_order` warning** anywhere in drill 8 retry-2's window — PR-ζ closes the drill 6 → drill 7 race definitively.
+
+- **AC scorecard (drill 8):**
+
+  | AC | Status | Notes |
+  |---|---|---|
+  | 1 Signal POST → 202 | ✅ PASS | audit seq=99 |
+  | 2 Approval → 200 | ✅ PASS | audit seq=100 |
+  | 3 Bracket placed atomically (tick-aligned, PR-ζ pre-INSERT) | ✅ PASS | Entry seq=101 + stop seq=102; PR-ζ pre-INSERT logs visible for both |
+  | **4 orderStatusEvent for entry fill (LIVE)** | ✅ **PASS** | seq=103; **NO replay** required (drill 7 needed replay; drill 8 fired the full canonical path on the live SSE callback) |
+  | 5 orderStatusEvent for stop fill | ❓ DEFERRED | Stop placed at 29110; /MNQ briefly touched 29100 on delayed feed but real-time didn't trigger fill (delayed-data feed lag); stop remains active GTC. AC5 will validate via natural market movement OR drill 9 with a tighter stop. |
+  | 6 Full PR-G entry+exit audit rows | ⚠ PARTIAL (entry done) | Entry path COMPLETE seq=103-106 (4 audit rows). Exit pending stop fill. |
+  | **7 Discord #fills via SSE multiplexer** | ✅ **PASS** | webhook_pusher logs show `event_push_delivered channel=fills dedupe_key=order_filled:24 http_status=204` — fill SSE → webhook_pusher → Discord round-trip complete. |
+  | 8 `verify_chain --env paper` CLEAN | ✅ PASS | 105 rows verified (seq=90 + the SERIALIZABLE_retry gap from drill 8 retry's reqGlobalCancel; chain prev_hash linkage walks 105 valid rows; max sequence_no = 106) |
+  | 9 Trade with realized_pnl | ❓ DEFERRED | Trade `019e3d25-1b58-…` open at 29122.25; realized_pnl on close |
+
+- **Drill 7 → Drill 8 sequence (in-session):**
+
+  1. **Drill 7 (20:59 UTC):** /MES @ 7423.75; PR-α tick-rounding validated; entry filled at 7420.75 (paper Smart routing); fill MISSED by live path (defect #6 race); recovered via `replay_executions.py`. Drill 7 retrospective documented separately.
+  2. **PR-ζ written + tested + merged (21:08-21:28 UTC):** orders row INSERTed pre-IBKR-place; UPDATE post-place. 4 new race-fix tests in `TestApplyOrderPlacementRaceFix`; 1704/1704 unit tests; merged via PR #184 (after rebase on main post-#183-squash). Deployed at 21:29 UTC.
+  3. **CME maintenance break 21:00-22:00 UTC** — /MES + /MNQ paused; cleanup window.
+  4. **Drill 8 attempt 1 (22:00 UTC, CME re-open):** /MNQ @ 29078.75 limit — market moved up 5.5pts post-place, entry sat Submitted, no fill.
+  5. **Drill 8 retry-1 (22:08 UTC):** /MNQ moved to 29105.5; placed at 29107.50 (2 ticks above ask) — market moved up AGAIN before fill, sat Submitted.
+  6. **Drill 8 retry-2 (22:11 UTC):** /MNQ at 29113.50 ask; placed at 29150 (~37pts above ask, GUARANTEED marketable). Filled at 29122.25 in seconds. **This is the canonical drill 8 success — audit seq 99-106.**
+  7. Stop at 29110 still active; awaiting natural fill.
+
+  Total reqGlobalCancel rounds during drill 8: 2 (cleanup of drill 7's leftover stop + drill 8 retry 1's stale orders). Each cancel cycle exercised the worker's terminal_status path, reproducing defect #5 (`non-canonical SSE event_type 'order'` ValueError) on every cancellation. Cancel audit rows + orders.status UPDATEs landed correctly — the audit-first ordering means SSE failure is non-blocking.
+
+- **Lessons learned from drill 8:**
+
+  1. **`limit_marketable` order type assumes prices stay locked between operator-quote-fetch and worker-place-call.** For a fast-moving market like /MNQ near CME re-open, the strategy's `decision_price` can be stale by the time the worker reaches IBKR. Either pad the limit considerably (drill 8 retry-2 used limit=ask+37pts and filled at +9pts above ask) OR add a "modify limit price to current ask + N ticks" step in the worker right before `place_order`. The latter is non-trivial because plan_order_placement is pure-policy + the limit price is in the audit payload.
+  2. **Delayed data is unreliable for stop-fill timing.** Drill 8's stop at 29110 with /MNQ delayed quote at 29100.5 looked like it should have fired immediately. The real-time market likely never touched 29110 (delayed feed lags 10min for futures). Live drills that need stop-fill validation should use a market with subscribed real-time data (operator hasn't enabled CME real-time on the paper account; quarterly cost: ~$1.50).
+  3. **PR-ζ has no observable downside.** The pre-INSERT adds one short SQL round-trip per leg (~2-5ms locally) before each IBKR call. Drill 8 timing was: PR-ζ entry pre-INSERT log at T+0.000 → IBKR place at T+0.026 (delay = 26ms which is within the SQL+commit window we'd expect; well within the operator's tolerance for placement latency). The race window that defect #6 lived in is now ZERO because the orders row is durable BEFORE the IBKR call even starts.
+
+- **Open positions / unfinished state at drill 8 documentation:**
+  - Drill 7 trade `019e3ce5-0dc2-…` (long 1 /MES @ 7420.75): position OPEN; stop was cancelled by reqGlobalCancel during drill 8 cleanup. **Position is NAKED.** Operator should manually flatten via TWS or a fresh short-signal close at next opportunity.
+  - Drill 8 trade `019e3d25-1b58-…` (long 1 /MNQ @ 29122.25): position OPEN; stop active at 29110 (GTC). Awaiting natural stop fill OR manual flatten.
+  - audit chain CLEAN at 105 rows (max sequence_no=106; one SERIALIZABLE retry gap at seq=90 is benign — verify_chain walks the hash-chain linkage, not sequence_no contiguity).
+
+- **Follow-up PR priority (updated post-drill-8):**
+
+  1. ✅ ~~PR-α — tick rounding~~ (drill 6 fix; merged via #183).
+  2. ✅ ~~PR-ζ — fill_processor race~~ (drill 7 fix; merged via #184; LIVE-VALIDATED via drill 8).
+  3. **PR-γ — IBKR-side bracket parentId (still open).** Drill 8 retry-2's stop has IBKR-side parentId=0 (not OCO-linked); if the entry-fill had occurred while the stop was already "PreSubmitted active," IBKR wouldn't have auto-cancelled the stop on entry-cancel. Required for live-money safety.
+  4. **PR-ε — SSE non-canonical `'order'` event_type.** Re-confirmed 3 times during drill 8 cleanup cycles. Cancellations don't propagate to Discord #fills. Path b (swap worker emit to `'signal'` action='cancelled') is still the recommended fix.
+  5. **PR-β — atomic claim hardening (post-orphan).** Defense in depth; the actual race in drill 6 was orphan-induced, not code-induced. PR-β still useful for Phase 2 multi-replica + future `docker compose run` accidents.
+  6. **PR-δ — cancel-by-CID composite key.** Only manifests under defect #2 race; deprioritized.
+  7. **New backlog: drill 8 lesson #1 — limit price freshness.** Operator should decide: pad limit considerably (low-cost stop-gap) OR add worker-side limit-refresh step (higher complexity, more accurate). Likely Phase 1+ follow-up; defer.
+  8. **New backlog: CME real-time data subscription** for live-drill timing. Paper account currently delayed-only; AC5 deferred until real-time enables tight-stop-fill validation.
+
+- **References:**
+  - Adjacent 2026-05-18 entries: drill 6 retrospective (5 defects surfaced; PR-α delivered) + drill 7 retrospective (defect #6 surfaced + recovered via replay).
+  - PR #184 (this PR) — bundles drill 7 retrospective + drill 8 retrospective + PR-ζ code + 4 new race-fix tests.
+
 ### 2026-05-18 — Drill 7 retrospective — PR-α validated; defect #2 ROOT-CAUSED + RESOLVED (orphan container); defect #6 newly surfaced (fill_processor race)
 
 - **Status:** PARTIAL SUCCESS. Drill 7 ran in the same session as drill 6 (~1.5h after drill 6 aborted) to validate PR-α tick-rounding fix + confirm defect #2 (duplicate placement race) was resolved by stopping the orphan container surfaced during drill 6 investigation. PR-α validated end-to-end ✓ (no IBKR Error 110, clean bracket). Defect #2 confirmed resolved ✓ (single entry order, no clientId=1 duplicate). **NEW defect #6 surfaced** — `fill_processor_unknown_order` race condition where IBKR's orderStatus event arrives ~7ms BEFORE the orders row is committed to DB, causing the live fill propagation to be dropped. Entry fill RECOVERED via `scripts/operator_tools/replay_executions.py` (same path drill 5 used). AC4 partial (orderStatusEvent fired but raced); AC5+AC7 pending CME re-open at 22:00 UTC (drill 7 hit the CME 21:00-22:00 UTC daily maintenance break mid-execution).
