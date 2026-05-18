@@ -1457,3 +1457,131 @@ class TestEntrypointFloatSecretGuard:
         exit_code = entrypoint.main(["true"])
         # exit 2 from missing postgres password, NOT from the float guard.
         assert exit_code == 2
+
+
+class TestBuildIbkrErrorTracker:
+    """2026-05-18 drill 5 follow-up #2 — lifespan-wiring contract for
+    the IBKR error-state probe (pure-policy helper).
+
+    The PR #177 monitor extension shipped the `ibkr_error_state` kwarg
+    but lifespan wiring was deferred to this PR. These tests lock the
+    contract: ``_build_ibkr_error_tracker(order_placement)`` returns a
+    TrackedIbkrErrorState wired to the worker's ``_ibkr_client.last_ibkr_error``
+    property, or None when the worker is missing / has no client.
+
+    Pure-policy test target avoids spawning ``AsyncTaskMonitor`` —
+    the monitor's ``run_forever`` task would cache the
+    ``services.api.async_task_monitor`` module logger under
+    ``cache_logger_on_first_use=True`` (configured at api-app
+    construction time by the autouse ``_stub_api_env`` fixture),
+    breaking ``capture_logs()`` interception in downstream
+    ``test_async_task_monitor.py`` tests when the full unit suite runs.
+    """
+
+    def test_no_order_placement_returns_none(self) -> None:
+        """``order_placement=None`` → tracker None."""
+        from services.api import main as api_main
+
+        assert api_main._build_ibkr_error_tracker(None) is None
+
+    def test_worker_without_ibkr_client_attr_returns_none(self) -> None:
+        """Worker present but no `_ibkr_client` → tracker None."""
+        from services.api import main as api_main
+
+        class _WorkerWithoutClient:
+            pass
+
+        result = api_main._build_ibkr_error_tracker((_WorkerWithoutClient(), object()))
+        assert result is None
+
+    def test_worker_with_ibkr_client_builds_tracker(self) -> None:
+        """Happy path: worker._ibkr_client present → TrackedIbkrErrorState."""
+        from services.api import main as api_main
+        from services.api.async_task_monitor import TrackedIbkrErrorState
+
+        # Stand-in adapter exposing `last_ibkr_error` returning None.
+        class _FakeAdapter:
+            @property
+            def last_ibkr_error(self) -> Any:
+                return None
+
+        adapter = _FakeAdapter()
+
+        class _FakeWorker:
+            def __init__(self) -> None:
+                self._ibkr_client = adapter
+
+        tracker = api_main._build_ibkr_error_tracker((_FakeWorker(), object()))
+        assert isinstance(tracker, TrackedIbkrErrorState)
+        assert tracker.name == "ibkr_adapter"
+        assert tracker.provider() is None
+
+    def test_provider_reads_live_adapter_state(self) -> None:
+        """Provider closure resolves adapter's CURRENT last_ibkr_error.
+
+        Mutating the adapter's state after tracker construction must
+        reflect in subsequent provider() calls — proves the closure
+        captures the adapter instance, not the snapshot.
+        """
+        from datetime import UTC, datetime
+
+        from services.api import main as api_main
+        from services.execution.ibkr_adapter import IbkrErrorState
+
+        class _MutableAdapter:
+            def __init__(self) -> None:
+                self._error: IbkrErrorState | None = None
+
+            @property
+            def last_ibkr_error(self) -> IbkrErrorState | None:
+                return self._error
+
+            def set_error(self, error: IbkrErrorState | None) -> None:
+                self._error = error
+
+        adapter = _MutableAdapter()
+
+        class _FakeWorker:
+            def __init__(self) -> None:
+                self._ibkr_client = adapter
+
+        tracker = api_main._build_ibkr_error_tracker((_FakeWorker(), object()))
+        assert tracker is not None
+        # Pre-mutation: provider returns None.
+        assert tracker.provider() is None
+        # Mutate adapter's state; provider() reflects the new value.
+        fresh_error = IbkrErrorState(
+            error_code=1100,
+            error_string="Connectivity lost.",
+            last_seen_at_utc=datetime.now(tz=UTC),
+            req_id=-1,
+            contract_local_symbol=None,
+        )
+        adapter.set_error(fresh_error)
+        assert tracker.provider() is fresh_error
+
+
+class TestStartAsyncTaskMonitorDisabled:
+    """Bring-up of the AsyncTaskMonitor; minimal contract test.
+
+    Only the disabled-setting branch is unit-tested here. The
+    enabled-branch end-to-end is exercised at deploy time via the
+    ``async_task_monitor_started`` log line + the sanity-check
+    procedure in ``deploy/ibkr/README.md``. Spawning a real
+    ``AsyncTaskMonitor`` in unit tests would cache its module logger
+    and pollute downstream tests' ``capture_logs()`` interception
+    (see ``TestBuildIbkrErrorTracker`` docstring for the full
+    investigation).
+    """
+
+    @pytest.mark.asyncio
+    async def test_disabled_setting_returns_none(self) -> None:
+        from services.api import main as api_main
+
+        result = await api_main._start_async_task_monitor(
+            _settings(async_task_monitor_enabled=False),
+            order_placement=None,
+            reconciliation=None,
+            heartbeat_probe=None,
+        )
+        assert result is None

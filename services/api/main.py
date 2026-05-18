@@ -30,8 +30,11 @@ import logging
 import secrets
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from uuid import UUID
+
+if TYPE_CHECKING:
+    from services.api.async_task_monitor import TrackedIbkrErrorState
 
 import httpx
 import structlog
@@ -782,19 +785,50 @@ async def _start_async_task_monitor(
     if not settings.async_task_monitor_enabled:
         log.info("async_task_monitor_disabled_via_setting")
         return None
-    from services.api.async_task_monitor import (
-        AsyncTaskMonitor,
-        collect_tracked_tasks,
-    )
+    from services.api.async_task_monitor import AsyncTaskMonitor, collect_tracked_tasks
 
     tracked = collect_tracked_tasks(
         order_placement=order_placement,
         reconciliation=reconciliation,
         heartbeat_probe=heartbeat_probe,
     )
+
+    ibkr_error_tracker = _build_ibkr_error_tracker(order_placement)
+    if ibkr_error_tracker is not None:
+        log.info(
+            "async_task_monitor_ibkr_probe_wired",
+            tracker_name=ibkr_error_tracker.name,
+            note=(
+                "IBKR connectivity probe is live. Fresh "
+                "1100/1101/1102 errors will emit "
+                "async_task_monitor_ibkr_connectivity_warn WARNING."
+            ),
+        )
+    elif order_placement is None:
+        log.info(
+            "async_task_monitor_ibkr_probe_not_wired",
+            reason="order_placement_worker_not_spawned",
+            note=(
+                "OrderPlacementWorker is None (likely no active account "
+                "or worker disabled via setting). IBKR connectivity "
+                "probe will not run; structured-log path via adapter "
+                "is unaffected."
+            ),
+        )
+    else:
+        log.warning(
+            "async_task_monitor_ibkr_probe_not_wired",
+            reason="worker_has_no_ibkr_client_attr",
+            note=(
+                "OrderPlacementWorker exists but exposes no "
+                "_ibkr_client. IBKR connectivity probe will not run."
+            ),
+        )
+
     monitor = AsyncTaskMonitor(
         tracked,
         interval_seconds=settings.async_task_monitor_interval_seconds,
+        ibkr_error_state=ibkr_error_tracker,
     )
     task = asyncio.create_task(
         monitor.run_forever(),
@@ -804,8 +838,65 @@ async def _start_async_task_monitor(
         "async_task_monitor_spawned",
         interval_seconds=settings.async_task_monitor_interval_seconds,
         tracked_count=len(tracked),
+        ibkr_probe_wired=ibkr_error_tracker is not None,
     )
     return monitor, task
+
+
+def _build_ibkr_error_tracker(
+    order_placement: tuple[object, object] | None,
+) -> TrackedIbkrErrorState | None:
+    """Pure-policy: build a ``TrackedIbkrErrorState`` from lifespan state.
+
+    2026-05-18 drill 5 follow-up #2 — extracted from
+    ``_start_async_task_monitor`` so it can be unit-tested without
+    spawning a real ``AsyncTaskMonitor`` (whose ``run_forever`` task
+    would emit structlog log lines through the
+    ``services.api.async_task_monitor`` module logger, caching it
+    under ``cache_logger_on_first_use=True`` set by
+    ``_configure_structlog``, which then prevents downstream
+    ``test_async_task_monitor.py`` tests from intercepting via
+    ``capture_logs()``).
+
+    Resolves the IBKR adapter from the worker via
+    ``getattr(worker, "_ibkr_client", None)`` (same pattern as the
+    disconnect path in ``_stop_order_placement_worker``) and builds
+    a provider callable closing over the adapter instance. The
+    provider reads the adapter's ``last_ibkr_error`` property each
+    probe; the property returns ``None`` until the first errorEvent
+    fires.
+
+    Returns ``None`` when:
+    * ``order_placement`` is None (worker disabled / no active account).
+    * The worker exposes no ``_ibkr_client`` attribute (unexpected;
+      worker class shape changed).
+
+    Both branches leave the adapter's own ``ibkr_error_received``
+    structured-log path unaffected — only the monitor's per-cycle
+    WARNING surface is gated.
+    """
+    if order_placement is None:
+        return None
+    worker, _task = order_placement
+    ibkr_client = getattr(worker, "_ibkr_client", None)
+    if ibkr_client is None:
+        return None
+
+    # Lazy imports at function call time (mirror the pattern in
+    # _start_async_task_monitor). The TYPE_CHECKING-only quoted return
+    # type above keeps mypy happy without importing at module level.
+    from services.api.async_task_monitor import TrackedIbkrErrorState
+    from services.execution.ibkr_adapter import IbkrErrorState
+
+    captured_client = ibkr_client
+
+    def _ibkr_error_provider() -> IbkrErrorState | None:
+        return captured_client.last_ibkr_error  # type: ignore[no-any-return]
+
+    return TrackedIbkrErrorState(
+        name="ibkr_adapter",
+        provider=_ibkr_error_provider,
+    )
 
 
 async def _stop_async_task_monitor(state: tuple[object, object] | None) -> None:
