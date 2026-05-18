@@ -49,9 +49,17 @@ incident: ib_gateway↔IBKR upstream broke at the 23:59 ET overnight
 maintenance restart; the api's clientId=N socket to the local gateway
 sidecar stayed alive (``_ib.isConnected()`` returned True), but inbound
 orderStatus events for fills stopped propagating. Without this probe,
-the operator only notices when checking on drill state mid-day. The
-WARNING log + (in a follow-up PR) a Discord ``#alerts`` P1 dispatch
-closes the gap.
+the operator only notices when checking on drill state mid-day.
+
+Drill 5 follow-up #2-FU-1 — Discord ``#alerts`` P1 dispatch on the
+WARNING is wired via an optional ``alert_dispatch_hook`` on
+``TrackedIbkrErrorState``. The monitor invokes the hook (if provided)
+immediately after emitting the WARNING; the hook closure (built by
+``services.api.main._build_monitor_alert_dispatch_hook``) INSERTs an
+``alerts`` row with category=``broker_disconnect``, severity=``P1``,
+and calls ``services.webhook_pusher.dispatcher.dispatch_alert``.
+Hook failures are caught + logged at WARNING — the WARNING log itself
+is the load-bearing signal; the Discord push is enhancement.
 
 This module is hot-fix scope (services/api/**) per dev-guide §2.3.
 """
@@ -60,15 +68,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 import structlog
 
 if TYPE_CHECKING:
-    from services.execution.ibkr_adapter import IbkrErrorStateProvider
+    from services.execution.ibkr_adapter import IbkrErrorState, IbkrErrorStateProvider
 
 log = structlog.get_logger(__name__)
 
@@ -109,6 +117,44 @@ DEFAULT_IBKR_FRESHNESS_SECONDS: Final[float] = 300.0
 
 
 @dataclass(frozen=True, slots=True)
+class MonitorAlertDescriptor:
+    """Pure-policy alert descriptor for monitor-emitted alerts.
+
+    Mirrors the shape of ``services.reconciliation.recon.AlertDescriptor``
+    minus the recon-specific ``triggering_break_index`` (monitor alerts
+    have no triggering audit event — they're pure observability). The
+    fields land in the ``alerts`` table per backend-spec §3.27:
+
+    - ``severity`` → ``alerts.severity`` ('P0' | 'P1' | 'P2')
+    - ``category`` → ``alerts.category`` (must match the
+      ``alert_category`` Postgres enum from alembic 0004)
+    - ``title`` + ``body`` → composed into ``alerts.message``
+      (recon convention is ``f"{title}\\n\\n{body}"``)
+    - ``payload`` → ``alerts.detail`` (JSONB)
+
+    Used by the IBKR connectivity probe today; future monitor probes
+    (heartbeat staleness, EOD recon missing, etc.) can emit the same
+    shape.
+    """
+
+    severity: str
+    category: str
+    title: str
+    body: str
+    payload: dict[str, Any]
+
+
+#: Hook signature for monitor-emitted alert dispatch. The hook closure
+#: (built in ``services.api.main._build_monitor_alert_dispatch_hook``)
+#: INSERTs an ``alerts`` row + calls
+#: ``services.webhook_pusher.dispatcher.dispatch_alert``. Returns None
+#: on success; raises on infrastructure failure (caught + logged by
+#: the monitor — the hook's failure mode is "Discord didn't fire," not
+#: "monitor crashed").
+MonitorAlertHook = Callable[[MonitorAlertDescriptor], Awaitable[None]]
+
+
+@dataclass(frozen=True, slots=True)
 class TrackedIbkrErrorState:
     """Probe descriptor for the ibkr_adapter's most-recent error state.
 
@@ -128,6 +174,15 @@ class TrackedIbkrErrorState:
     before the monitor treats it as resolved (no log). Defaults to
     300s (5 min); errors older than this don't re-warn even if
     they're still the latest stored state.
+
+    ``alert_dispatch_hook`` (drill 5 follow-up #2-FU-1) — optional
+    Discord ``#alerts`` P1 dispatch hook. When set, the monitor
+    invokes the hook with a ``MonitorAlertDescriptor`` immediately
+    after emitting the WARNING (same idempotency key — one alert
+    per ``(error_code, last_seen_at_utc)``). Hook failures are
+    caught + logged at WARNING; the WARNING log is load-bearing,
+    the Discord push is enhancement. When None, the WARNING fires
+    but no Discord push is attempted.
     """
 
     name: str
@@ -136,6 +191,7 @@ class TrackedIbkrErrorState:
         default_factory=lambda: DEFAULT_IBKR_CONNECTIVITY_CODES,
     )
     freshness_window_seconds: float = DEFAULT_IBKR_FRESHNESS_SECONDS
+    alert_dispatch_hook: MonitorAlertHook | None = None
 
 
 class AsyncTaskMonitor:
@@ -346,6 +402,107 @@ class AsyncTaskMonitor:
                 "logs ib_gateway`."
             ),
         )
+        # Drill 5 follow-up #2-FU-1: fire the Discord #alerts dispatch
+        # hook if wired. Fire-and-forget via create_task so the probe
+        # stays sync + the next 30s cycle doesn't wait on httpx round-
+        # trips. Hook failures land in journalctl as a WARNING but the
+        # idempotency key is already in _reported_ibkr_errors so we
+        # don't retry on the next probe — the load-bearing observability
+        # is the structured log above; the Discord push is enhancement.
+        if tracker.alert_dispatch_hook is not None:
+            descriptor = self._build_ibkr_alert_descriptor(state, age_seconds, tracker)
+            self._schedule_alert_dispatch(tracker.alert_dispatch_hook, descriptor)
+
+    @staticmethod
+    def _build_ibkr_alert_descriptor(
+        state: IbkrErrorState,
+        age_seconds: float,
+        tracker: TrackedIbkrErrorState,
+    ) -> MonitorAlertDescriptor:
+        """Translate an IbkrErrorState snapshot into a MonitorAlertDescriptor.
+
+        Severity locked P1 (operator-actionable but not P0; the api still
+        functions for outbound calls). Category locked
+        ``broker_disconnect`` per the alembic 0004 enum + spec §3.27.
+
+        Title is a short operator-grep handle; body carries the human-
+        readable explanation + recovery hint. Payload is structured for
+        the Audit / Alerts page renderer.
+        """
+        title = f"IBKR connectivity error {state.error_code}"
+        body = (
+            f"{state.error_string}\n\n"
+            f"Seen at: {state.last_seen_at_utc.isoformat()} "
+            f"(age {round(age_seconds, 1)}s).\n"
+            f"req_id={state.req_id}; contract={state.contract_local_symbol or '—'}; "
+            f"tracker={tracker.name}.\n\n"
+            "The api's TWS API socket to the local ib_gateway sidecar may "
+            "still report connected even while inbound orderStatus events "
+            "have stopped propagating. If 1100 persists > 15 min without "
+            "1102 ('restored'), check ib_gateway logs + restart the "
+            "container per deploy/ibkr/README.md."
+        )
+        payload: dict[str, Any] = {
+            "error_code": state.error_code,
+            "error_string": state.error_string,
+            "req_id": state.req_id,
+            "contract_local_symbol": state.contract_local_symbol,
+            "last_seen_at_utc": state.last_seen_at_utc.isoformat(),
+            "age_seconds": round(age_seconds, 2),
+            "freshness_window_seconds": tracker.freshness_window_seconds,
+            "tracker_name": tracker.name,
+        }
+        return MonitorAlertDescriptor(
+            severity="P1",
+            category="broker_disconnect",
+            title=title,
+            body=body,
+            payload=payload,
+        )
+
+    def _schedule_alert_dispatch(
+        self,
+        hook: MonitorAlertHook,
+        descriptor: MonitorAlertDescriptor,
+    ) -> None:
+        """Fire-and-forget dispatch of the hook on the running loop.
+
+        Wraps the hook in an exception-swallowing coroutine so a Discord
+        5xx or alerts-INSERT failure doesn't crash the monitor's
+        run_forever loop. Hook failures emit
+        ``async_task_monitor_ibkr_alert_dispatch_failed`` at WARNING.
+
+        The probe runs inside the monitor's ``run_forever`` task (an
+        asyncio task on the lifespan event loop), so
+        ``asyncio.create_task`` always has a running loop. Defensive
+        fallback for tests that probe outside a loop: log + skip.
+        """
+
+        async def _invoke() -> None:
+            try:
+                await hook(descriptor)
+            except Exception as exc:
+                self._log.warning(
+                    "async_task_monitor_ibkr_alert_dispatch_failed",
+                    error=str(exc),
+                    exception_type=type(exc).__name__,
+                    error_code=descriptor.payload.get("error_code"),
+                )
+
+        coro = _invoke()
+        try:
+            asyncio.create_task(coro)  # noqa: RUF006 — fire-and-forget by design
+        except RuntimeError as exc:
+            # No running loop (test path). Close the un-awaited coro
+            # to suppress the RuntimeWarning + log so the operator
+            # knows the dispatch was skipped. The WARNING log already
+            # fired above; the Discord push is the only thing that's
+            # gated by the missing loop.
+            coro.close()
+            self._log.warning(
+                "async_task_monitor_ibkr_alert_dispatch_no_loop",
+                error=str(exc),
+            )
 
     def probe_initial(self) -> None:
         """Log a one-shot startup summary; mark un-spawned tasks reported.
@@ -492,6 +649,8 @@ __all__: Final = (
     "DEFAULT_IBKR_FRESHNESS_SECONDS",
     "DEFAULT_MONITOR_INTERVAL_SECONDS",
     "AsyncTaskMonitor",
+    "MonitorAlertDescriptor",
+    "MonitorAlertHook",
     "TrackedIbkrErrorState",
     "TrackedTask",
     "collect_tracked_tasks",
