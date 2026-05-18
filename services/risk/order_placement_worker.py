@@ -538,32 +538,50 @@ async def apply_order_placement(
     phase_at_emit: PhaseAtEmit = 1,
     ibkr_call_timeout_seconds: float = DEFAULT_IBKR_CALL_TIMEOUT_SECONDS,
 ) -> OrderPlacementResult:
-    """Execute the placement plan: IBKR placeOrder (entry + stop) → audit → INSERT orders.
+    """Execute the placement plan: INSERT orders → IBKR placeOrder → audit → UPDATE orders.
+
+    **PR-ζ restructure (2026-05-18, drill 7 defect #6 fix):** the orders
+    row is INSERTed BEFORE the IBKR ``place_order`` call returns, with
+    ``broker_order_id=NULL`` + ``status='pending'``. After IBKR responds,
+    the row is UPDATEd with the assigned broker_order_id + final status.
+    This closes the race where IBKR's first ``orderStatusEvent`` (which
+    fires ms after place_order acks) reaches the fill_processor BEFORE
+    the orders row would have been INSERTed in the prior post-place
+    order. Drill 7 measured the race window at ~43ms; fill_processor's
+    lookup by ``client_order_id`` raced and dropped the entry fill,
+    requiring a manual ``replay_executions.py`` recovery.
 
     Sequential steps:
 
-    1. ``ibkr_client.place_order(entry_request)`` — the broker-side
+    1. **PR-ζ INSERT entry orders row (pre-place)** — broker_order_id=NULL,
+       status='pending'. Committed before the IBKR side effect so the
+       fill_processor's lookup-by-CID finds the row no matter how fast
+       the orderStatusEvent fires.
+    2. ``ibkr_client.place_order(entry_request)`` — the broker-side
        side effect for the entry leg. Failure raises
        :class:`IbkrPlacementError` (broker connectivity) or returns an
        ``IbkrPlaceOrderResult`` with ``status='rejected'`` (broker
-       validation rejection). The await is bounded by
+       validation rejection). On failure the pre-placed orders row
+       remains in 'pending' — recoverable via reconciliation or
+       operator action. The await is bounded by
        ``ibkr_call_timeout_seconds`` (default 30s); expiry raises
        :class:`IbkrPlacementError` so the existing except path handles
        it cleanly.
-    2. **Bracket extension (2026-05-17):** if entry placed successfully
-       (status not in rejected set), build + place the stop-market exit
-       order via ``ibkr_client.place_order(stop_request)``. On stop
-       failure → best-effort cancel the entry + raise
+    3. **Bracket extension (2026-05-17):** if entry placed successfully
+       (status not in rejected set), INSERT the stop orders row
+       (PR-ζ) THEN place the stop-market exit order via
+       ``ibkr_client.place_order(stop_request)``. On stop failure
+       → best-effort cancel the entry + raise
        :class:`OrderPlacementError("STOP_PLACEMENT_FAILED")`. The
        cancel itself is also wrapped in the timeout so a hanging cancel
        doesn't trap the worker after the original stop failure.
-    3. Audit-first (per spec §2.10.1): write ``ORDER_PLACED`` x N
+    4. Audit-first (per spec §2.10.1): write ``ORDER_PLACED`` x N
        (1 if entry rejected, 2 if entry + stop both placed) — each in
        its own SERIALIZABLE transaction. Payload includes the
        client_order_id + broker_order_id.
-    4. INSERT ``orders`` x N + UPDATE ``signals.status`` in one
-       transaction. The stop's ``parent_order_id`` references the
-       entry's id (set via RETURNING from the first INSERT).
+    5. **PR-ζ UPDATE orders rows (post-place)** + UPDATE
+       ``signals.status`` in one transaction. The UPDATE sets
+       broker_order_id + final status + rejection_reason.
 
     Returns an :class:`OrderPlacementResult` reflecting the ENTRY
     order's status (the stop's status is logged + audited but not
@@ -571,6 +589,58 @@ async def apply_order_placement(
     bracket-aware result wrapper).
     """
     placed_at = datetime.now(tz=UTC)
+
+    # PR-ζ Step 0: INSERT entry orders row PRE-place (broker_order_id=NULL,
+    # status='pending'). The COMMIT happens on session-context exit, BEFORE
+    # the IBKR place_order call. This is the drill 7 defect #6 fix —
+    # closes the race where IBKR's first orderStatusEvent reached the
+    # fill_processor before the orders row was INSERTed.
+    async with session_factory() as session:
+        async with session.begin():
+            entry_order_row = (
+                await session.execute(
+                    text(
+                        """
+                        INSERT INTO orders (
+                            account_id, env, signal_id, client_order_id, broker_order_id,
+                            market, direction, order_type, quantity, limit_price,
+                            placed_at_utc, status, rejection_reason, retry_n,
+                            strategy_hash, parameter_set_hash
+                        ) VALUES (
+                            :acct, :env, :sig, :cid, NULL,
+                            :market, :side, :order_type, :qty, :lim,
+                            :placed_at, 'pending', NULL, :retry_n,
+                            :strat, :param
+                        )
+                        RETURNING id
+                        """
+                    ),
+                    {
+                        "acct": plan.account_id,
+                        "env": plan.env,
+                        "sig": plan.signal_id,
+                        "cid": plan.client_order_id,
+                        "market": plan.market,
+                        "side": plan.side,
+                        "order_type": plan.order_type,
+                        "qty": int(plan.quantity),
+                        "lim": plan.limit_price,
+                        "placed_at": placed_at,
+                        "retry_n": RETRY_N_PHASE_1,
+                        "strat": plan.strategy_hash,
+                        "param": plan.parameter_set_hash,
+                    },
+                )
+            ).fetchone()
+            assert entry_order_row is not None
+            order_id: UUID = entry_order_row.id
+    log.info(
+        "order_placement_entry_row_pre_inserted",
+        signal_id=str(plan.signal_id),
+        order_id=str(order_id),
+        client_order_id=plan.client_order_id,
+        note="PR-ζ: orders row INSERTed pre-IBKR-place to close fill_processor race (defect #6).",
+    )
 
     # Step 1: IBKR side effect — entry order.
     entry_request = IbkrPlaceOrderRequest(
@@ -593,8 +663,12 @@ async def apply_order_placement(
             "order_placement_broker_error",
             signal_id=str(plan.signal_id),
             client_order_id=plan.client_order_id,
+            order_id=str(order_id),
             error=str(exc),
         )
+        # The pre-placed orders row stays in 'pending' with broker_order_id=NULL.
+        # Operator reconciles via the IBKR-side audit (FlexQuery / TWS) — the
+        # row signals "we tried to place this but the broker call failed."
         raise
 
     broker_order_id = broker_result.broker_order_id
@@ -609,7 +683,59 @@ async def apply_order_placement(
     place_stop = db_status != "rejected"
     stop_broker_result = None
     stop_db_status: str | None = None
+    stop_order_id: UUID | None = None
     if place_stop:
+        # PR-ζ Step 0b: INSERT stop orders row PRE-place (broker_order_id=NULL,
+        # status='pending', parent_order_id=entry's id). Same race-fix
+        # reasoning as the entry pre-INSERT above.
+        async with session_factory() as session:
+            async with session.begin():
+                stop_order_row = (
+                    await session.execute(
+                        text(
+                            """
+                            INSERT INTO orders (
+                                account_id, env, signal_id, client_order_id, broker_order_id,
+                                market, direction, order_type, quantity, stop_price,
+                                placed_at_utc, status, rejection_reason, retry_n,
+                                parent_order_id, strategy_hash, parameter_set_hash
+                            ) VALUES (
+                                :acct, :env, :sig, :cid, NULL,
+                                :market, :side, 'stop_market', :qty, :stop_px,
+                                :placed_at, 'pending', NULL, :retry_n,
+                                :parent_id, :strat, :param
+                            )
+                            RETURNING id
+                            """
+                        ),
+                        {
+                            "acct": plan.account_id,
+                            "env": plan.env,
+                            "sig": plan.signal_id,
+                            "cid": plan.stop_client_order_id,
+                            "market": plan.market,
+                            "side": plan.stop_side,
+                            "qty": int(plan.quantity),
+                            "stop_px": plan.stop_price,
+                            "placed_at": placed_at,
+                            "retry_n": RETRY_N_PHASE_1,
+                            "parent_id": order_id,
+                            "strat": plan.strategy_hash,
+                            "param": plan.parameter_set_hash,
+                        },
+                    )
+                ).fetchone()
+                assert stop_order_row is not None
+                stop_order_id = stop_order_row.id
+        log.info(
+            "order_placement_stop_row_pre_inserted",
+            signal_id=str(plan.signal_id),
+            stop_order_id=str(stop_order_id),
+            stop_client_order_id=plan.stop_client_order_id,
+            entry_order_id=str(order_id),
+            note="PR-ζ: stop orders row INSERTed pre-IBKR-place (race fix).",
+        )
+
         stop_request = IbkrPlaceOrderRequest(
             client_order_id=plan.stop_client_order_id,
             contract=contract,
@@ -639,6 +765,7 @@ async def apply_order_placement(
                 entry_client_order_id=plan.client_order_id,
                 stop_client_order_id=plan.stop_client_order_id,
                 entry_broker_order_id=str(broker_order_id),
+                stop_order_id=str(stop_order_id),
                 error=str(stop_exc),
             )
             # Best-effort cancel of the entry. For ETFs that paper-fill
@@ -762,90 +889,52 @@ async def apply_order_placement(
                 source_clock_ts=placed_at,
             )
 
-    # Step 4: INSERT orders x {1, 2} + UPDATE signal. Single transaction
-    # so the business-data view is consistent.
+    # PR-ζ Step 4: UPDATE the pre-placed orders rows with broker_order_id +
+    # final status + rejection_reason. The rows were INSERTed in steps 0/0b
+    # BEFORE the IBKR call (drill 7 defect #6 fix). Single transaction so
+    # the business-data view is consistent + the signals UPDATE lands
+    # atomically with both orders UPDATEs.
     async with session_factory() as session:
         async with session.begin():
-            entry_order_row = (
-                await session.execute(
-                    text(
-                        """
-                        INSERT INTO orders (
-                            account_id, env, signal_id, client_order_id, broker_order_id,
-                            market, direction, order_type, quantity, limit_price,
-                            placed_at_utc, status, rejection_reason, retry_n,
-                            strategy_hash, parameter_set_hash
-                        ) VALUES (
-                            :acct, :env, :sig, :cid, :bid,
-                            :market, :side, :order_type, :qty, :lim,
-                            :placed_at, :status, :rej_reason, :retry_n,
-                            :strat, :param
-                        )
-                        RETURNING id
-                        """
-                    ),
-                    {
-                        "acct": plan.account_id,
-                        "env": plan.env,
-                        "sig": plan.signal_id,
-                        "cid": plan.client_order_id,
-                        "bid": str(broker_order_id) if broker_order_id is not None else None,
-                        "market": plan.market,
-                        "side": plan.side,
-                        "order_type": plan.order_type,
-                        "qty": int(plan.quantity),
-                        "lim": plan.limit_price,
-                        "placed_at": placed_at,
-                        "status": db_status,
-                        "rej_reason": rejection_detail,
-                        "retry_n": RETRY_N_PHASE_1,
-                        "strat": plan.strategy_hash,
-                        "param": plan.parameter_set_hash,
-                    },
-                )
-            ).fetchone()
-            assert entry_order_row is not None
-            order_id: UUID = entry_order_row.id
+            await session.execute(
+                text(
+                    """
+                    UPDATE orders
+                    SET broker_order_id = :bid,
+                        status = :status,
+                        rejection_reason = :rej_reason
+                    WHERE id = :oid
+                    """
+                ),
+                {
+                    "bid": str(broker_order_id) if broker_order_id is not None else None,
+                    "status": db_status,
+                    "rej_reason": rejection_detail,
+                    "oid": order_id,
+                },
+            )
 
             if stop_broker_result is not None:
-                # INSERT stop row with parent_order_id pointing at entry.
+                assert stop_order_id is not None
                 await session.execute(
                     text(
                         """
-                        INSERT INTO orders (
-                            account_id, env, signal_id, client_order_id, broker_order_id,
-                            market, direction, order_type, quantity, stop_price,
-                            placed_at_utc, status, rejection_reason, retry_n,
-                            parent_order_id, strategy_hash, parameter_set_hash
-                        ) VALUES (
-                            :acct, :env, :sig, :cid, :bid,
-                            :market, :side, 'stop_market', :qty, :stop_px,
-                            :placed_at, :status, :rej_reason, :retry_n,
-                            :parent_id, :strat, :param
-                        )
+                        UPDATE orders
+                        SET broker_order_id = :bid,
+                            status = :status,
+                            rejection_reason = :rej_reason
+                        WHERE id = :oid
                         """
                     ),
                     {
-                        "acct": plan.account_id,
-                        "env": plan.env,
-                        "sig": plan.signal_id,
-                        "cid": plan.stop_client_order_id,
                         "bid": (
                             str(stop_broker_result.broker_order_id)
                             if stop_broker_result.broker_order_id is not None
                             else None
                         ),
-                        "market": plan.market,
-                        "side": plan.stop_side,
-                        "qty": int(plan.quantity),
-                        "stop_px": plan.stop_price,
-                        "placed_at": placed_at,
                         "status": stop_db_status,
                         "rej_reason": getattr(stop_broker_result, "rejection_detail", None),
-                        "retry_n": RETRY_N_PHASE_1,
-                        "parent_id": order_id,
-                        "strat": plan.strategy_hash,
-                        "param": plan.parameter_set_hash,
+                        "oid": stop_order_id,
                     },
                 )
 

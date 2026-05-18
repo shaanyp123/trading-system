@@ -964,6 +964,285 @@ class TestApplyOrderPlacementBracket:
         assert cancel_called == [plan.client_order_id]
 
 
+# ---------------------------------------------------------------------------
+# PR-ζ — fill_processor race fix (drill 7 defect #6, 2026-05-18)
+# ---------------------------------------------------------------------------
+
+
+def _build_apply_session_factory_with_ordering_log(ops: list[str]) -> Any:
+    """Like ``_build_apply_session_factory`` but records every SQL statement
+    fragment into ``ops`` so tests can assert sequence-of-operations.
+
+    The session yields ``MagicMock`` rows for INSERT...RETURNING; UPDATEs
+    return without RETURNING. ``ops`` accumulates a short tag per statement
+    (e.g., ``"INSERT entry"``, ``"UPDATE orders entry"``).
+    """
+
+    @asynccontextmanager
+    async def factory() -> Any:
+        sess = MagicMock()
+
+        async def _exec(stmt: Any, params: Any = None) -> MagicMock:
+            sql = str(stmt).upper()
+            tag: str
+            if "INSERT INTO ORDERS" in sql:
+                if "STOP_PRICE" in sql:
+                    tag = "INSERT_STOP"
+                else:
+                    tag = "INSERT_ENTRY"
+            elif "UPDATE ORDERS" in sql:
+                # Distinguish entry vs stop by oid in params (both UPDATEs use :oid).
+                # The first UPDATE in apply_order_placement is for the entry.
+                tag = "UPDATE_ORDERS"
+            elif "UPDATE SIGNALS" in sql:
+                tag = "UPDATE_SIGNALS"
+            else:
+                tag = f"OTHER:{sql[:32]}"
+            ops.append(tag)
+            result_mock = MagicMock()
+            result_mock.fetchone = MagicMock(return_value=MagicMock(id=uuid4()))
+            return result_mock
+
+        sess.execute = AsyncMock(side_effect=_exec)
+
+        @asynccontextmanager
+        async def _begin_cm() -> Any:
+            yield None
+
+        sess.begin = MagicMock(return_value=_begin_cm())
+        yield sess
+
+    return factory
+
+
+class TestApplyOrderPlacementRaceFix:
+    """PR-ζ regression contract — orders row INSERTed BEFORE the IBKR
+    ``place_order`` call returns, so a fast orderStatusEvent from IBKR
+    finds the row when ``fill_processor`` looks up by client_order_id.
+
+    Drill 7 measured the pre-PR-ζ race window at ~43ms; fill_processor
+    dropped the entry fill because the orders row hadn't committed yet.
+    See Docs/decisions-log.md 2026-05-18 "Drill 7 retrospective" for
+    context.
+    """
+
+    @pytest.mark.asyncio
+    async def test_entry_row_inserted_before_ibkr_place_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The SQL sequence must place INSERT_ENTRY before any IBKR call.
+
+        We instrument both the SQL session and the IBKR adapter to record
+        every event in a single list, then assert the INSERT_ENTRY tag
+        appears before the first ``place_order`` call.
+        """
+        from services.execution.types import IbkrContractRef
+        from services.risk.order_placement_worker import apply_order_placement
+
+        ops: list[str] = []
+
+        async def fake_place(request: Any) -> Any:
+            ops.append("PLACE_ORDER")
+            return _fake_ibkr_place_result(broker_order_id=len(ops))
+
+        ibkr = MagicMock()
+        ibkr.place_order = AsyncMock(side_effect=fake_place)
+        ibkr.cancel_order = AsyncMock()
+
+        async def fake_append(*args: Any, **kwargs: Any) -> Any:
+            ops.append("AUDIT")
+            return MagicMock(event_uuid=uuid4(), sequence_no=1)
+
+        monkeypatch.setattr(
+            "services.risk.order_placement_worker.append_audit_event",
+            AsyncMock(side_effect=fake_append),
+        )
+
+        plan = plan_order_placement(
+            _signal(direction="long", market="TLT", decision_price="85.00"),
+            env="paper",
+        )
+        contract = IbkrContractRef(market="TLT", ibkr_local_symbol="TLT", exchange="SMART")
+        await apply_order_placement(
+            plan,
+            ibkr_client=ibkr,
+            contract=contract,
+            session_factory=_build_apply_session_factory_with_ordering_log(ops),
+        )
+
+        # INSERT_ENTRY must precede the first PLACE_ORDER. This is the
+        # canonical drill 7 defect #6 race fix.
+        first_insert_entry = ops.index("INSERT_ENTRY")
+        first_place_order = ops.index("PLACE_ORDER")
+        assert first_insert_entry < first_place_order, (
+            f"INSERT_ENTRY must precede PLACE_ORDER (defect #6 race fix); got ops={ops}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_stop_row_inserted_before_stop_place_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same race-fix contract for the stop leg — the stop's orders
+        row INSERT must precede the stop's place_order."""
+        from services.execution.types import IbkrContractRef
+        from services.risk.order_placement_worker import apply_order_placement
+
+        ops: list[str] = []
+
+        async def fake_place(request: Any) -> Any:
+            ops.append("PLACE_ORDER")
+            return _fake_ibkr_place_result(broker_order_id=len(ops))
+
+        ibkr = MagicMock()
+        ibkr.place_order = AsyncMock(side_effect=fake_place)
+        ibkr.cancel_order = AsyncMock()
+
+        async def fake_append(*args: Any, **kwargs: Any) -> Any:
+            ops.append("AUDIT")
+            return MagicMock(event_uuid=uuid4(), sequence_no=1)
+
+        monkeypatch.setattr(
+            "services.risk.order_placement_worker.append_audit_event",
+            AsyncMock(side_effect=fake_append),
+        )
+
+        plan = plan_order_placement(
+            _signal(direction="long", market="TLT", decision_price="85.00"),
+            env="paper",
+        )
+        contract = IbkrContractRef(market="TLT", ibkr_local_symbol="TLT", exchange="SMART")
+        await apply_order_placement(
+            plan,
+            ibkr_client=ibkr,
+            contract=contract,
+            session_factory=_build_apply_session_factory_with_ordering_log(ops),
+        )
+
+        # Expected canonical sequence (PR-ζ):
+        # INSERT_ENTRY → PLACE_ORDER (entry) → INSERT_STOP → PLACE_ORDER (stop)
+        # → AUDIT (entry) → AUDIT (stop) → UPDATE_ORDERS (entry) → UPDATE_ORDERS (stop)
+        # → UPDATE_SIGNALS
+        assert ops[0] == "INSERT_ENTRY", f"step 0 must be INSERT_ENTRY; got {ops}"
+        assert ops[1] == "PLACE_ORDER", f"step 1 must be PLACE_ORDER (entry); got {ops}"
+        assert ops[2] == "INSERT_STOP", f"step 2 must be INSERT_STOP; got {ops}"
+        assert ops[3] == "PLACE_ORDER", f"step 3 must be PLACE_ORDER (stop); got {ops}"
+
+    @pytest.mark.asyncio
+    async def test_no_top_level_orders_insert_after_place(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The post-place stage must use UPDATE, NOT INSERT. Verifies the
+        PR-ζ refactor didn't accidentally leave a leftover INSERT in the
+        post-place transaction (which would create duplicate orders
+        rows + violate the unique client_order_id constraint).
+        """
+        from services.execution.types import IbkrContractRef
+        from services.risk.order_placement_worker import apply_order_placement
+
+        ops: list[str] = []
+
+        async def fake_place(request: Any) -> Any:
+            ops.append("PLACE_ORDER")
+            return _fake_ibkr_place_result(broker_order_id=len(ops))
+
+        ibkr = MagicMock()
+        ibkr.place_order = AsyncMock(side_effect=fake_place)
+        ibkr.cancel_order = AsyncMock()
+
+        async def fake_append(*args: Any, **kwargs: Any) -> Any:
+            ops.append("AUDIT")
+            return MagicMock(event_uuid=uuid4(), sequence_no=1)
+
+        monkeypatch.setattr(
+            "services.risk.order_placement_worker.append_audit_event",
+            AsyncMock(side_effect=fake_append),
+        )
+
+        plan = plan_order_placement(
+            _signal(direction="long", market="TLT", decision_price="85.00"),
+            env="paper",
+        )
+        contract = IbkrContractRef(market="TLT", ibkr_local_symbol="TLT", exchange="SMART")
+        await apply_order_placement(
+            plan,
+            ibkr_client=ibkr,
+            contract=contract,
+            session_factory=_build_apply_session_factory_with_ordering_log(ops),
+        )
+
+        # Total INSERT_ENTRY count is exactly 1; same for INSERT_STOP.
+        assert ops.count("INSERT_ENTRY") == 1, f"exactly 1 INSERT_ENTRY expected; got ops={ops}"
+        assert ops.count("INSERT_STOP") == 1, f"exactly 1 INSERT_STOP expected; got ops={ops}"
+        # UPDATE_ORDERS appears TWICE (entry + stop) + UPDATE_SIGNALS once.
+        assert ops.count("UPDATE_ORDERS") == 2, (
+            f"exactly 2 UPDATE_ORDERS expected (entry + stop); got ops={ops}"
+        )
+        assert ops.count("UPDATE_SIGNALS") == 1, f"exactly 1 UPDATE_SIGNALS expected; got ops={ops}"
+
+    @pytest.mark.asyncio
+    async def test_ibkr_failure_after_pre_insert_preserves_orders_row(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When IBKR ``place_order`` raises after the pre-INSERT, the orders
+        row should remain in DB (in 'pending' status with broker_order_id=NULL).
+        This is the operator-recoverable state — the worker re-raises
+        IbkrPlacementError, the operator can reconcile via TWS or
+        replay_executions.py."""
+        from services.execution.types import IbkrContractRef, IbkrPlacementError
+        from services.risk.order_placement_worker import apply_order_placement
+
+        ops: list[str] = []
+
+        async def fake_place_fails(request: Any) -> Any:
+            ops.append("PLACE_ORDER_FAIL")
+            raise IbkrPlacementError(
+                operation="placeOrder.entry",
+                detail="simulated broker down",
+                underlying_exception_class="ConnectionError",
+                occurred_at_utc=datetime(2026, 5, 18, 21, 0, 0, tzinfo=UTC),
+            )
+
+        ibkr = MagicMock()
+        ibkr.place_order = AsyncMock(side_effect=fake_place_fails)
+        ibkr.cancel_order = AsyncMock()
+
+        async def fake_append(*args: Any, **kwargs: Any) -> Any:
+            ops.append("AUDIT")
+            return MagicMock(event_uuid=uuid4(), sequence_no=1)
+
+        monkeypatch.setattr(
+            "services.risk.order_placement_worker.append_audit_event",
+            AsyncMock(side_effect=fake_append),
+        )
+
+        plan = plan_order_placement(
+            _signal(direction="long", market="TLT", decision_price="85.00"),
+            env="paper",
+        )
+        contract = IbkrContractRef(market="TLT", ibkr_local_symbol="TLT", exchange="SMART")
+        with pytest.raises(IbkrPlacementError):
+            await apply_order_placement(
+                plan,
+                ibkr_client=ibkr,
+                contract=contract,
+                session_factory=_build_apply_session_factory_with_ordering_log(ops),
+            )
+
+        # INSERT_ENTRY happened BEFORE the IBKR call failed.
+        assert "INSERT_ENTRY" in ops, f"orders row must be pre-INSERTed; got {ops}"
+        assert ops.index("INSERT_ENTRY") < ops.index("PLACE_ORDER_FAIL"), (
+            f"INSERT_ENTRY must precede the failed place; got ops={ops}"
+        )
+        # No audit row was written (place failed before audit step).
+        assert "AUDIT" not in ops, (
+            f"audit row should NOT be written after broker failure; got {ops}"
+        )
+        # No UPDATE_ORDERS / UPDATE_SIGNALS — broker call failed before
+        # the post-place commit stage. Row stays in 'pending' as INSERTed.
+        assert "UPDATE_ORDERS" not in ops, f"got {ops}"
+        assert "UPDATE_SIGNALS" not in ops, f"got {ops}"
+
+
 class TestBrokerStatusMapping:
     """Verify _broker_status_to_orders_status collapses correctly."""
 
