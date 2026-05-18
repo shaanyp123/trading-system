@@ -789,6 +789,232 @@ class TestIbkrConnectivityProbe:
         assert len(probe_failed) == 1
 
 
+class TestMonitorAlertDispatchHook:
+    """Drill 5 follow-up #2-FU-1 — Discord #alerts dispatch on probe WARNING.
+
+    These tests lock the hook-firing contract: when an alert dispatch
+    hook is wired into ``TrackedIbkrErrorState`` AND a fresh connectivity
+    error fires, the monitor invokes the hook with a
+    ``MonitorAlertDescriptor`` carrying severity=P1, category=
+    broker_disconnect, and the IBKR error metadata. Hook failures are
+    caught + logged at WARNING; the WARNING log itself is load-bearing.
+    """
+
+    @staticmethod
+    def _build_state(
+        *,
+        code: int = 1100,
+        message: str = "Connectivity between IBKR and Trader Workstation has been lost.",
+        age_seconds: float = 1.0,
+        req_id: int = -1,
+        contract_local_symbol: str | None = None,
+    ) -> IbkrErrorState:
+        return IbkrErrorState(
+            error_code=code,
+            error_string=message,
+            last_seen_at_utc=datetime.now(tz=UTC) - timedelta(seconds=age_seconds),
+            req_id=req_id,
+            contract_local_symbol=contract_local_symbol,
+        )
+
+    def test_descriptor_shape(self) -> None:
+        """MonitorAlertDescriptor is a frozen dataclass with the 5 expected fields."""
+        from services.api.async_task_monitor import MonitorAlertDescriptor
+
+        d = MonitorAlertDescriptor(
+            severity="P1",
+            category="broker_disconnect",
+            title="t",
+            body="b",
+            payload={"k": "v"},
+        )
+        assert d.severity == "P1"
+        assert d.category == "broker_disconnect"
+        assert d.title == "t"
+        assert d.body == "b"
+        assert d.payload == {"k": "v"}
+        with pytest.raises(Exception):  # FrozenInstanceError
+            d.severity = "P0"  # type: ignore[misc]
+
+    def test_build_ibkr_alert_descriptor_shape(self) -> None:
+        """``_build_ibkr_alert_descriptor`` produces the canonical P1 broker_disconnect."""
+        state = self._build_state(
+            code=1100, age_seconds=42.0, req_id=99, contract_local_symbol="TLT"
+        )
+        tracker = TrackedIbkrErrorState(name="ibkr_adapter", provider=lambda: state)
+        d = AsyncTaskMonitor._build_ibkr_alert_descriptor(state, 42.0, tracker)
+        assert d.severity == "P1"
+        assert d.category == "broker_disconnect"
+        assert "1100" in d.title
+        assert state.error_string in d.body
+        assert "req_id=99" in d.body
+        assert "contract=TLT" in d.body
+        assert d.payload["error_code"] == 1100
+        assert d.payload["req_id"] == 99
+        assert d.payload["contract_local_symbol"] == "TLT"
+        assert d.payload["age_seconds"] == 42.0
+        assert d.payload["tracker_name"] == "ibkr_adapter"
+
+    def test_build_ibkr_alert_descriptor_contract_none(self) -> None:
+        """When contract is None, body renders '—' fallback."""
+        state = self._build_state(contract_local_symbol=None)
+        tracker = TrackedIbkrErrorState(name="ibkr_adapter", provider=lambda: state)
+        d = AsyncTaskMonitor._build_ibkr_alert_descriptor(state, 1.0, tracker)
+        assert "contract=—" in d.body
+        assert d.payload["contract_local_symbol"] is None
+
+    @pytest.mark.asyncio
+    async def test_fresh_1100_fires_hook(self) -> None:
+        """Fresh 1100 + wired hook → hook invoked with the descriptor."""
+        from services.api.async_task_monitor import MonitorAlertDescriptor
+
+        captured: list[MonitorAlertDescriptor] = []
+
+        async def _hook(d: MonitorAlertDescriptor) -> None:
+            captured.append(d)
+
+        state = self._build_state(code=1100, age_seconds=1.0)
+        tracker = TrackedIbkrErrorState(
+            name="ibkr_adapter",
+            provider=lambda: state,
+            alert_dispatch_hook=_hook,
+        )
+        monitor = AsyncTaskMonitor([], interval_seconds=30.0, ibkr_error_state=tracker)
+        # Run probe inside a running loop so create_task is valid.
+        monitor.probe_once()
+        # Yield to let the scheduled task run.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert len(captured) == 1
+        d = captured[0]
+        assert d.severity == "P1"
+        assert d.category == "broker_disconnect"
+        assert d.payload["error_code"] == 1100
+
+    @pytest.mark.asyncio
+    async def test_hook_idempotent_across_probes(self) -> None:
+        """Same (code, last_seen) only fires hook once."""
+        from services.api.async_task_monitor import MonitorAlertDescriptor
+
+        captured: list[MonitorAlertDescriptor] = []
+
+        async def _hook(d: MonitorAlertDescriptor) -> None:
+            captured.append(d)
+
+        state = self._build_state(code=1100, age_seconds=1.0)
+        tracker = TrackedIbkrErrorState(
+            name="ibkr_adapter",
+            provider=lambda: state,
+            alert_dispatch_hook=_hook,
+        )
+        monitor = AsyncTaskMonitor([], interval_seconds=30.0, ibkr_error_state=tracker)
+        monitor.probe_once()
+        monitor.probe_once()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert len(captured) == 1
+
+    @pytest.mark.asyncio
+    async def test_no_hook_silent_on_warning(self) -> None:
+        """When alert_dispatch_hook=None, the WARNING fires but no hook attempt."""
+        state = self._build_state(code=1100, age_seconds=1.0)
+        tracker = TrackedIbkrErrorState(
+            name="ibkr_adapter",
+            provider=lambda: state,
+            # No alert_dispatch_hook.
+        )
+        monitor = AsyncTaskMonitor([], interval_seconds=30.0, ibkr_error_state=tracker)
+        with capture_logs() as logs:
+            monitor.probe_once()
+        await asyncio.sleep(0)
+        warns = [
+            log for log in logs if log.get("event") == "async_task_monitor_ibkr_connectivity_warn"
+        ]
+        assert len(warns) == 1
+        # No dispatch-no-loop, no dispatch-failed.
+        assert not any(
+            log.get("event") == "async_task_monitor_ibkr_alert_dispatch_no_loop" for log in logs
+        )
+        assert not any(
+            log.get("event") == "async_task_monitor_ibkr_alert_dispatch_failed" for log in logs
+        )
+
+    @pytest.mark.asyncio
+    async def test_hook_exception_swallowed(self) -> None:
+        """A failing hook logs WARNING but doesn't crash the probe loop."""
+        from services.api.async_task_monitor import MonitorAlertDescriptor
+
+        async def _hook(d: MonitorAlertDescriptor) -> None:
+            raise RuntimeError("Discord 503")
+
+        state = self._build_state(code=1100, age_seconds=1.0)
+        tracker = TrackedIbkrErrorState(
+            name="ibkr_adapter",
+            provider=lambda: state,
+            alert_dispatch_hook=_hook,
+        )
+        monitor = AsyncTaskMonitor([], interval_seconds=30.0, ibkr_error_state=tracker)
+        with capture_logs() as logs:
+            # Must not raise.
+            monitor.probe_once()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+        failed = [
+            log
+            for log in logs
+            if log.get("event") == "async_task_monitor_ibkr_alert_dispatch_failed"
+        ]
+        assert len(failed) == 1
+        assert failed[0]["exception_type"] == "RuntimeError"
+        assert failed[0]["error_code"] == 1100
+
+    def test_no_loop_fallback_logs_warning(self) -> None:
+        """probe_once called outside a running loop logs no-loop warning."""
+        from services.api.async_task_monitor import MonitorAlertDescriptor
+
+        async def _hook(d: MonitorAlertDescriptor) -> None:
+            return None
+
+        state = self._build_state(code=1100, age_seconds=1.0)
+        tracker = TrackedIbkrErrorState(
+            name="ibkr_adapter",
+            provider=lambda: state,
+            alert_dispatch_hook=_hook,
+        )
+        monitor = AsyncTaskMonitor([], interval_seconds=30.0, ibkr_error_state=tracker)
+        # No running loop; create_task raises RuntimeError → caught + logged.
+        with capture_logs() as logs:
+            monitor.probe_once()
+        no_loop = [
+            log
+            for log in logs
+            if log.get("event") == "async_task_monitor_ibkr_alert_dispatch_no_loop"
+        ]
+        assert len(no_loop) == 1
+
+    @pytest.mark.asyncio
+    async def test_stale_error_does_not_fire_hook(self) -> None:
+        """Stale connectivity error: no WARNING + no hook fire."""
+        from services.api.async_task_monitor import MonitorAlertDescriptor
+
+        captured: list[MonitorAlertDescriptor] = []
+
+        async def _hook(d: MonitorAlertDescriptor) -> None:
+            captured.append(d)
+
+        state = self._build_state(code=1100, age_seconds=400.0)  # > 300s default
+        tracker = TrackedIbkrErrorState(
+            name="ibkr_adapter",
+            provider=lambda: state,
+            alert_dispatch_hook=_hook,
+        )
+        monitor = AsyncTaskMonitor([], interval_seconds=30.0, ibkr_error_state=tracker)
+        monitor.probe_once()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert captured == []
+
+
 class TestModuleContract:
     """Public ``__all__`` surface."""
 
@@ -800,6 +1026,8 @@ class TestModuleContract:
             "DEFAULT_IBKR_CONNECTIVITY_CODES",
             "DEFAULT_IBKR_FRESHNESS_SECONDS",
             "DEFAULT_MONITOR_INTERVAL_SECONDS",
+            "MonitorAlertDescriptor",
+            "MonitorAlertHook",
             "TrackedIbkrErrorState",
             "TrackedTask",
             "collect_tracked_tasks",

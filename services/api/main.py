@@ -383,6 +383,185 @@ def _build_alert_dispatch_hook(
     return _hook
 
 
+def _build_monitor_alert_dispatch_hook(
+    settings: APISettings,
+) -> object | None:
+    """Construct the AsyncTaskMonitor's alert dispatch hook or return None.
+
+    Drill 5 follow-up #2-FU-1 (PR after #177 + #179). The
+    AsyncTaskMonitor's IBKR connectivity probe emits an
+    ``async_task_monitor_ibkr_connectivity_warn`` WARNING on fresh
+    1100/1101/1102 errors; this hook adds the Discord ``#alerts``
+    P1 push so the operator sees the event in-channel within 30s of
+    its first probe-tick observation.
+
+    Returns ``None`` (cleanly skipping the hook installation) when
+    sops ``discord.webhook_urls.alerts`` isn't populated. The probe's
+    WARNING log still fires unconditionally; only the Discord side
+    degrades.
+
+    Pattern mirror of ``_build_alert_dispatch_hook`` for the recon
+    surface, but the hook signature is the monitor's
+    ``MonitorAlertHook`` taking a ``MonitorAlertDescriptor`` (no
+    triggering_audit_event_uuid — monitor alerts have no audit row
+    upstream; ``alerts.triggering_audit_event_uuid`` is nullable per
+    alembic 0004 schema).
+
+    Resolves account_id at hook-FIRE time (not construction time) so
+    the closure is cheap to build at lifespan startup; the
+    fetch-at-fire pattern means the hook still works after operator
+    runs /setup post-boot.
+
+    Returns ``object | None`` to dodge a circular import — the actual
+    return type is ``services.api.async_task_monitor.MonitorAlertHook``
+    but importing that at module-load forces a transitive load of the
+    monitor module which itself imports api_db. Lazy-import below.
+    """
+    # Lazy imports keep module-load fast + avoid the circular-import surface.
+    from services.api.async_task_monitor import MonitorAlertDescriptor
+    from services.webhook_pusher.dispatcher import dispatch_alert
+    from services.webhook_pusher.payloads import (
+        AlertCategory,
+        AlertSeverity,
+        ChannelName,
+        EmailIdentity,
+    )
+
+    if settings.discord_webhook_url_alerts is None:
+        log.warning(
+            "monitor_alert_dispatch_hook_skipped_no_webhook_url",
+            note=(
+                "discord.webhook_urls.alerts not in sops; the monitor's "
+                "IBKR connectivity probe will still emit the structured "
+                "WARNING log on 1100/1101/1102 events but no Discord "
+                "#alerts push will fire. Wire the sops field + restart "
+                "api to enable."
+            ),
+        )
+        return None
+
+    webhook_urls: dict[ChannelName, str] = {
+        ChannelName.DISCORD_ALERTS: settings.discord_webhook_url_alerts.get_secret_value(),
+    }
+    if settings.discord_webhook_url_critical is not None:
+        webhook_urls[ChannelName.DISCORD_CRITICAL] = (
+            settings.discord_webhook_url_critical.get_secret_value()
+        )
+
+    email_identity: EmailIdentity | None = None
+    if (
+        settings.resend_api_key is not None
+        and settings.resend_from_address is not None
+        and settings.resend_to_address is not None
+    ):
+        email_identity = EmailIdentity(
+            from_address=settings.resend_from_address,
+            to_address=settings.resend_to_address,
+            resend_api_key=settings.resend_api_key.get_secret_value(),
+        )
+
+    log.info(
+        "monitor_alert_dispatch_hook_constructed",
+        channels=[c.value for c in webhook_urls],
+        email_wired=email_identity is not None,
+    )
+
+    audit_env = _audit_env_from_settings(settings)
+
+    async def _hook(descriptor: MonitorAlertDescriptor) -> None:
+        """Per-alert: INSERT alerts row + dispatch via webhook_pusher.
+
+        Resolves account_id at fire time so a missing-account-at-boot
+        path (operator hasn't run /setup yet) doesn't break hook
+        construction. If account_id is still unresolved at fire time,
+        log + skip the dispatch — the monitor WARNING already fired.
+
+        Two separate sessions per call mirror the recon hook pattern:
+
+        1. INSERT into alerts using a fresh session_factory()-opened
+           session.
+        2. Open a fresh httpx.AsyncClient + session for the dispatch.
+
+        Hook failures propagate; the monitor's ``_schedule_alert_dispatch``
+        catches them + logs at WARNING so a Discord 5xx doesn't crash
+        the run_forever loop.
+        """
+        session_factory = api_db.get_session_factory()
+        async with session_factory() as repo_session:
+            repo = PostgresPhase1QueryRepo(repo_session)
+            account_id = await repo.fetch_active_account_id()
+        if account_id is None:
+            log.warning(
+                "monitor_alert_dispatch_skipped_no_account",
+                note=(
+                    "Monitor fired the IBKR connectivity WARNING but "
+                    "no active account is provisioned; alerts row INSERT "
+                    "would violate the NOT NULL FK to accounts. Run "
+                    "/setup to create the account row + restart api."
+                ),
+                severity=descriptor.severity,
+                category=descriptor.category,
+            )
+            return
+
+        # Defense-in-depth: validate severity + category map to the
+        # locked enums before attempting the INSERT (matches the
+        # recon hook's enum cross-check at line 361-362).
+        AlertSeverity(descriptor.severity)
+        AlertCategory(descriptor.category)
+
+        message_text = f"{descriptor.title}\n\n{descriptor.body}"
+        async with session_factory() as ins_session:
+            row = (
+                await ins_session.execute(
+                    text(
+                        "INSERT INTO alerts ("
+                        "    account_id, severity, category, message, detail"
+                        ") VALUES ("
+                        "    :acct, :sev, :cat, :msg, CAST(:detail AS JSONB)"
+                        ") RETURNING id"
+                    ),
+                    {
+                        "acct": account_id,
+                        "sev": descriptor.severity,
+                        "cat": descriptor.category,
+                        "msg": message_text,
+                        "detail": json.dumps(descriptor.payload),
+                    },
+                )
+            ).fetchone()
+            assert row is not None
+            alert_id = UUID(str(row.id))
+            await ins_session.commit()
+
+        log.info(
+            "monitor_alert_inserted",
+            alert_id=str(alert_id),
+            severity=descriptor.severity,
+            category=descriptor.category,
+            account_id=str(account_id),
+            env=audit_env,
+        )
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as http_client:
+            async with session_factory() as disp_session:
+                report = await dispatch_alert(
+                    session=disp_session,
+                    alert_id=alert_id,
+                    http_client=http_client,
+                    webhook_urls=webhook_urls,
+                    email_identity=email_identity,
+                )
+        log.info(
+            "monitor_alert_dispatched",
+            alert_id=str(alert_id),
+            short_circuited=report.short_circuited,
+            delivery_status=dict(report.delivery_status),
+        )
+
+    return _hook
+
+
 def _build_state_transition_hook(
     settings: APISettings,
 ) -> object | None:
@@ -767,6 +946,7 @@ async def _start_async_task_monitor(
     order_placement: tuple[object, object] | None,
     reconciliation: tuple[object, object] | None,
     heartbeat_probe: tuple[object, object] | None,
+    monitor_alert_hook: object | None = None,
 ) -> tuple[object, object] | None:
     """Construct + start the AsyncTaskMonitor; return (monitor, task) or None.
 
@@ -793,7 +973,7 @@ async def _start_async_task_monitor(
         heartbeat_probe=heartbeat_probe,
     )
 
-    ibkr_error_tracker = _build_ibkr_error_tracker(order_placement)
+    ibkr_error_tracker = _build_ibkr_error_tracker(order_placement, monitor_alert_hook)
     if ibkr_error_tracker is not None:
         log.info(
             "async_task_monitor_ibkr_probe_wired",
@@ -845,6 +1025,7 @@ async def _start_async_task_monitor(
 
 def _build_ibkr_error_tracker(
     order_placement: tuple[object, object] | None,
+    monitor_alert_hook: object | None = None,
 ) -> TrackedIbkrErrorState | None:
     """Pure-policy: build a ``TrackedIbkrErrorState`` from lifespan state.
 
@@ -866,6 +1047,13 @@ def _build_ibkr_error_tracker(
     probe; the property returns ``None`` until the first errorEvent
     fires.
 
+    Drill 5 follow-up #2-FU-1: optional ``monitor_alert_hook`` is the
+    Discord ``#alerts`` dispatch closure built by
+    ``_build_monitor_alert_dispatch_hook``. When wired, the monitor
+    fires the hook with a ``MonitorAlertDescriptor`` immediately
+    after emitting ``async_task_monitor_ibkr_connectivity_warn``. When
+    None, the WARNING fires but no Discord push is attempted.
+
     Returns ``None`` when:
     * ``order_placement`` is None (worker disabled / no active account).
     * The worker exposes no ``_ibkr_client`` attribute (unexpected;
@@ -885,7 +1073,7 @@ def _build_ibkr_error_tracker(
     # Lazy imports at function call time (mirror the pattern in
     # _start_async_task_monitor). The TYPE_CHECKING-only quoted return
     # type above keeps mypy happy without importing at module level.
-    from services.api.async_task_monitor import TrackedIbkrErrorState
+    from services.api.async_task_monitor import MonitorAlertHook, TrackedIbkrErrorState
     from services.execution.ibkr_adapter import IbkrErrorState
 
     captured_client = ibkr_client
@@ -893,9 +1081,17 @@ def _build_ibkr_error_tracker(
     def _ibkr_error_provider() -> IbkrErrorState | None:
         return captured_client.last_ibkr_error  # type: ignore[no-any-return]
 
+    # The hook arg is `object | None` at this function's API boundary
+    # (dodges import-time circularity at module-load); narrow to the
+    # concrete callable type here for the dataclass field.
+    typed_hook: MonitorAlertHook | None = (
+        None if monitor_alert_hook is None else monitor_alert_hook  # type: ignore[assignment]
+    )
+
     return TrackedIbkrErrorState(
         name="ibkr_adapter",
         provider=_ibkr_error_provider,
+        alert_dispatch_hook=typed_hook,
     )
 
 
@@ -962,11 +1158,20 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             # capture their final `(worker, task)` tuples (or `None`
             # for ones that failed to spawn). The monitor itself is
             # a 4th task and is NOT in its own tracked set.
+            #
+            # Drill 5 follow-up #2-FU-1: build the monitor's alert
+            # dispatch hook BEFORE starting the monitor so a fresh
+            # 1100 surfaces in Discord #alerts. Hook returns None if
+            # sops `discord.webhook_urls.alerts` is unpopulated;
+            # monitor degrades gracefully (WARNING log fires, no
+            # Discord push).
+            monitor_alert_hook = _build_monitor_alert_dispatch_hook(settings)
             async_task_monitor_state = await _start_async_task_monitor(
                 settings,
                 order_placement=worker_state,
                 reconciliation=recon_state,
                 heartbeat_probe=heartbeat_probe_state,
+                monitor_alert_hook=monitor_alert_hook,
             )
         except Exception:
             # Monitor startup is best-effort; the api functions without

@@ -1585,3 +1585,107 @@ class TestStartAsyncTaskMonitorDisabled:
             heartbeat_probe=None,
         )
         assert result is None
+
+
+class TestBuildMonitorAlertDispatchHook:
+    """Drill 5 follow-up #2-FU-1 — Discord #alerts hook for the monitor.
+
+    Mirrors ``TestBuildAlertDispatchHook`` for the recon dispatch hook.
+    None when sops Discord URL isn't populated; callable closure when
+    it is. Closure invocation is exercised end-to-end at deploy time
+    via the monitor's IBKR connectivity probe + a real Discord push;
+    the unit tests here just lock the construction contract.
+    """
+
+    def test_no_discord_alerts_url_returns_none(self) -> None:
+        from services.api import main as api_main
+
+        hook = api_main._build_monitor_alert_dispatch_hook(_settings())
+        assert hook is None
+
+    def test_with_alerts_url_returns_callable(self) -> None:
+        from services.api import main as api_main
+
+        hook = api_main._build_monitor_alert_dispatch_hook(
+            _settings(discord_webhook_url_alerts=_SecretStub("https://discord.test/a"))
+        )
+        assert hook is not None
+        assert callable(hook)
+
+    def test_with_critical_url_constructs_closure(self) -> None:
+        from services.api import main as api_main
+
+        hook = api_main._build_monitor_alert_dispatch_hook(
+            _settings(
+                discord_webhook_url_alerts=_SecretStub("https://discord.test/a"),
+                discord_webhook_url_critical=_SecretStub("https://discord.test/c"),
+            )
+        )
+        assert hook is not None
+
+    def test_full_resend_config_constructs_closure(self) -> None:
+        from services.api import main as api_main
+
+        hook = api_main._build_monitor_alert_dispatch_hook(
+            _settings(
+                discord_webhook_url_alerts=_SecretStub("https://discord.test/a"),
+                discord_webhook_url_critical=_SecretStub("https://discord.test/c"),
+                resend_api_key=_SecretStub("re_test"),
+                resend_from_address="from@test",
+                resend_to_address="to@test",
+            )
+        )
+        assert hook is not None
+
+
+class TestBuildIbkrErrorTrackerWithHook:
+    """Drill 5 follow-up #2-FU-1 — `_build_ibkr_error_tracker` threads the hook.
+
+    Pure-policy: when ``monitor_alert_hook`` is passed,
+    ``TrackedIbkrErrorState.alert_dispatch_hook`` carries it through to
+    the monitor. When None (the dormant path), the tracker is still
+    built but the hook field stays None.
+    """
+
+    def test_no_hook_arg_yields_none_field(self) -> None:
+        from services.api import main as api_main
+
+        class _FakeAdapter:
+            @property
+            def last_ibkr_error(self) -> Any:
+                return None
+
+        class _FakeWorker:
+            def __init__(self) -> None:
+                self._ibkr_client = _FakeAdapter()
+
+        tracker = api_main._build_ibkr_error_tracker((_FakeWorker(), object()))
+        assert tracker is not None
+        assert tracker.alert_dispatch_hook is None
+
+    def test_hook_arg_threaded_through(self) -> None:
+        from services.api import main as api_main
+
+        class _FakeAdapter:
+            @property
+            def last_ibkr_error(self) -> Any:
+                return None
+
+        class _FakeWorker:
+            def __init__(self) -> None:
+                self._ibkr_client = _FakeAdapter()
+
+        async def _hook(descriptor: Any) -> None:
+            return None
+
+        tracker = api_main._build_ibkr_error_tracker((_FakeWorker(), object()), _hook)
+        assert tracker is not None
+        assert tracker.alert_dispatch_hook is _hook
+
+    def test_no_worker_returns_none_regardless_of_hook(self) -> None:
+        from services.api import main as api_main
+
+        async def _hook(descriptor: Any) -> None:
+            return None
+
+        assert api_main._build_ibkr_error_tracker(None, _hook) is None

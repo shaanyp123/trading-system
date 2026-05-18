@@ -456,11 +456,29 @@ Fields: `error_code`, `error_string`, `req_id`,
    ```
    Wait for `Login succeeded` + `ibkr_connected` in the api logs.
 
-4. **Future Discord #alerts dispatch (follow-up PR):** the current
-   PR surfaces the structured log + monitor WARNING only. A
-   follow-up PR will wire `async_task_monitor_ibkr_connectivity_warn`
-   into `services/webhook_pusher`'s alert pipeline so the same
-   event also fires a P1 Discord embed in `#alerts`.
+4. **Discord #alerts P1 push** (shipped drill 5 follow-up #2-FU-1):
+   the same WARNING also triggers an `alerts` row INSERT (severity=P1,
+   category=`broker_disconnect`) + a Discord push to the `#alerts`
+   channel via `services/webhook_pusher`. Operator should see the
+   embed within 30s of the first probe-tick observation. Idempotent
+   per `(error_code, last_seen_at_utc)` — one Discord ping per
+   distinct error event, not one per probe cycle.
+
+   Expected log sequence on a fresh 1100:
+   ```
+   ibkr_error_received error_code=1100 category=connectivity log_level=warning
+   async_task_monitor_ibkr_connectivity_warn error_code=1100 age_seconds=N
+   monitor_alert_inserted alert_id=<uuid> severity=P1 category=broker_disconnect
+   monitor_alert_dispatched alert_id=<uuid> short_circuited=False
+   ```
+
+   The `monitor_alert_*` log lines fire from the lifespan-owned hook
+   closure built by `_build_monitor_alert_dispatch_hook` in
+   `services/api/main.py`. The closure does the INSERT + dispatch on
+   an asyncio task spawned by the monitor's probe; if either step
+   fails (e.g., Discord 5xx), an
+   `async_task_monitor_ibkr_alert_dispatch_failed` WARNING fires but
+   the WARNING log + journalctl visibility are unaffected.
 
 ### `async_task_monitor_ibkr_provider_failed` (new — error path)
 
@@ -474,8 +492,14 @@ operation; a recurring instance indicates a real bug.
 After PR #N deploys, verify the new wiring in a single SSH session:
 
 ```
-docker compose logs api --since 5m | grep -E 'ibkr_error_event_subscribed|async_task_monitor_started'
+docker compose logs api --since 5m | grep -E 'ibkr_error_event_subscribed|async_task_monitor_started|monitor_alert_dispatch_hook_(constructed|skipped)'
 ```
+
+Expected: one of each per api boot. `monitor_alert_dispatch_hook_constructed`
+indicates the Discord push is wired (drill 5 follow-up #2-FU-1);
+`monitor_alert_dispatch_hook_skipped_no_webhook_url` indicates sops
+`discord.webhook_urls.alerts` is unpopulated (the WARNING log still
+fires; only Discord side degrades).
 
 Expected: one of each per api boot. If `ibkr_error_event_subscribed`
 is missing but `async_task_monitor_started` is present, the adapter
