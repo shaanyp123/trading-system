@@ -93,17 +93,20 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import math
 import shutil
 import sys
 import tarfile
 import zipfile
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime, timedelta
 from datetime import date as _date
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, TypeVar
+
+_T = TypeVar("_T")
 
 # Phase 1 universe (from CLAUDE.md PHASE1_FUTURES + V1_CANDIDATE_UNIVERSE).
 # Each entry: ticker → (databento_parent_symbol, lean_market_dir, lean_market_code).
@@ -139,6 +142,74 @@ STAT_TYPE_OPEN_INTEREST = 9
 PREQUOTED_TOTAL_USD = Decimal("0.96")
 COST_TRIPWIRE_USD = PREQUOTED_TOTAL_USD * 5  # $4.80
 
+# Per-API-call timeout defaults (2026-05-19 — drill-10-day re-seed hung
+# at the CME→COMEX dataset boundary for ~80 min without firing any
+# timeout; the DataBento ``client.timeseries.get_range`` + ``metadata.
+# get_cost`` calls are blocking sync I/O with no built-in deadline).
+# These defaults wrap every DataBento call in a thread + impose a wall-
+# clock deadline. On timeout: cost-quote calls abort the whole script
+# (we can't proceed without a quote); per-ticker fetch calls log + skip
+# that ticker + proceed to the next. Tuneable via ``--per-call-timeout``
+# + ``--cost-quote-timeout``.
+DEFAULT_PER_CALL_TIMEOUT_SECONDS = 600.0  # 10 min — generous for single-ticker fetch
+DEFAULT_COST_QUOTE_TIMEOUT_SECONDS = 120.0  # 2 min — quotes are sub-second normally
+
+
+class SeedCallTimeoutError(Exception):
+    """Raised when a DataBento API call exceeds its configured deadline.
+
+    Carries the operation name (e.g., ``"ohlcv-1d MES"``) + the
+    timeout that fired so the caller's log line is operator-readable.
+    """
+
+    def __init__(self, operation: str, timeout_seconds: float) -> None:
+        self.operation = operation
+        self.timeout_seconds = timeout_seconds
+        super().__init__(f"DataBento call {operation!r} exceeded {timeout_seconds:.0f}s deadline")
+
+
+def _call_with_timeout(
+    func: Callable[..., _T],
+    *args: Any,
+    timeout_seconds: float,
+    operation: str,
+    **kwargs: Any,
+) -> _T:
+    """Run a blocking sync call in a worker thread with a wall-clock deadline.
+
+    The DataBento Python SDK exposes only synchronous methods that
+    block on httpx I/O without honoring any per-call deadline (verified
+    2026-05-19 — a 504 cost-quote attempt blocked indefinitely until
+    SIGKILL). ``concurrent.futures.ThreadPoolExecutor`` lets us
+    interrupt the *waiter* on timeout while the worker thread keeps
+    running in the background — clean enough for a one-shot CLI script
+    since the process exits after main returns and orphan threads die
+    with it.
+
+    Raises :class:`SeedCallTimeoutError` on deadline. Propagates any
+    other exception the wrapped call raises (transport errors, 5xx
+    BentoServerError, schema mismatches) so the caller's existing
+    ``except Exception`` paths still see the underlying cause.
+    """
+    if timeout_seconds <= 0:
+        # Defensive — argparse already type-checks float positivity, but
+        # belt + suspenders so the executor doesn't immediately raise.
+        raise ValueError(
+            f"timeout_seconds must be > 0 for operation {operation!r}; got {timeout_seconds}"
+        )
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix=f"seed-{operation}"
+    ) as ex:
+        future = ex.submit(func, *args, **kwargs)
+        try:
+            return future.result(timeout=timeout_seconds)
+        except concurrent.futures.TimeoutError as exc:
+            # Note: future keeps running on its worker thread. Cancel
+            # is best-effort (only works pre-execution); the executor
+            # will get GC'd when this function returns.
+            future.cancel()
+            raise SeedCallTimeoutError(operation, timeout_seconds) from exc
+
 
 class TickerSeedResult(NamedTuple):
     ticker: str
@@ -157,7 +228,13 @@ class TickerSeedResult(NamedTuple):
 
 
 def cost_quote_combined(
-    client: Any, parent_symbols: list[str], start: str, end: str, dataset: str
+    client: Any,
+    parent_symbols: list[str],
+    start: str,
+    end: str,
+    dataset: str,
+    *,
+    timeout_seconds: float = DEFAULT_COST_QUOTE_TIMEOUT_SECONDS,
 ) -> tuple[Decimal, Decimal, Decimal, Decimal]:
     """Re-quote cost for ohlcv-1d + statistics + definition before fetch.
 
@@ -166,40 +243,54 @@ def cost_quote_combined(
 
     Costs come back from DataBento as floats; we convert via ``Decimal(str)``
     immediately so downstream arithmetic stays Decimal-only.
+
+    Each of the 3 ``metadata.get_cost`` calls is bounded by
+    ``timeout_seconds`` via :func:`_call_with_timeout` — a timeout
+    raises :class:`SeedCallTimeoutError` which the caller
+    (:func:`main`) translates into exit code 5.
     """
     ohlcv = Decimal(
         str(
-            client.metadata.get_cost(
+            _call_with_timeout(
+                client.metadata.get_cost,
                 dataset=dataset,
                 start=start,
                 end=end,
                 symbols=parent_symbols,
                 schema="ohlcv-1d",
                 stype_in="parent",
+                timeout_seconds=timeout_seconds,
+                operation="cost-quote ohlcv-1d",
             )
         )
     )
     stats = Decimal(
         str(
-            client.metadata.get_cost(
+            _call_with_timeout(
+                client.metadata.get_cost,
                 dataset=dataset,
                 start=start,
                 end=end,
                 symbols=parent_symbols,
                 schema="statistics",
                 stype_in="parent",
+                timeout_seconds=timeout_seconds,
+                operation="cost-quote statistics",
             )
         )
     )
     defs = Decimal(
         str(
-            client.metadata.get_cost(
+            _call_with_timeout(
+                client.metadata.get_cost,
                 dataset=dataset,
                 start=start,
                 end=end,
                 symbols=parent_symbols,
                 schema="definition",
                 stype_in="parent",
+                timeout_seconds=timeout_seconds,
+                operation="cost-quote definition",
             )
         )
     )
@@ -211,20 +302,35 @@ def cost_quote_combined(
 # ---------------------------------------------------------------------------
 
 
-def fetch_definition(client: Any, parent_symbol: str, start: str, end: str, dataset: str) -> Any:
+def fetch_definition(
+    client: Any,
+    parent_symbol: str,
+    start: str,
+    end: str,
+    dataset: str,
+    *,
+    timeout_seconds: float = DEFAULT_PER_CALL_TIMEOUT_SECONDS,
+) -> Any:
     """Fetch contract definitions; return pandas DataFrame.
 
     Filters: keep only single contracts (no spreads — raw_symbol must NOT
     contain ``-``). Returned columns of interest: ``raw_symbol``,
     ``instrument_id``, ``expiration`` (timestamp).
+
+    Bounded by ``timeout_seconds`` via :func:`_call_with_timeout`; on
+    timeout :class:`SeedCallTimeoutError` propagates to the caller which
+    skips the ticker per the runbook's "per-call timeout" semantic.
     """
-    data = client.timeseries.get_range(
+    data = _call_with_timeout(
+        client.timeseries.get_range,
         dataset=dataset,
         start=start,
         end=end,
         symbols=[parent_symbol],
         schema="definition",
         stype_in="parent",
+        timeout_seconds=timeout_seconds,
+        operation=f"definition {parent_symbol}",
     )
     df = data.to_df()
     if df.empty:
@@ -234,20 +340,33 @@ def fetch_definition(client: Any, parent_symbol: str, start: str, end: str, data
     return df[mask].copy()
 
 
-def fetch_ohlcv(client: Any, parent_symbol: str, start: str, end: str, dataset: str) -> Any:
+def fetch_ohlcv(
+    client: Any,
+    parent_symbol: str,
+    start: str,
+    end: str,
+    dataset: str,
+    *,
+    timeout_seconds: float = DEFAULT_PER_CALL_TIMEOUT_SECONDS,
+) -> Any:
     """Fetch daily OHLCV; return pandas DataFrame.
 
     Filters: keep only single contracts (no spreads). Columns of interest:
     ``open``, ``high``, ``low``, ``close``, ``volume``, ``symbol``,
     ``instrument_id``. Index is ``ts_event`` (UTC).
+
+    Bounded by ``timeout_seconds`` via :func:`_call_with_timeout`.
     """
-    data = client.timeseries.get_range(
+    data = _call_with_timeout(
+        client.timeseries.get_range,
         dataset=dataset,
         start=start,
         end=end,
         symbols=[parent_symbol],
         schema="ohlcv-1d",
         stype_in="parent",
+        timeout_seconds=timeout_seconds,
+        operation=f"ohlcv-1d {parent_symbol}",
     )
     df = data.to_df()
     if df.empty:
@@ -256,21 +375,36 @@ def fetch_ohlcv(client: Any, parent_symbol: str, start: str, end: str, dataset: 
     return df[mask].copy()
 
 
-def fetch_open_interest(client: Any, parent_symbol: str, start: str, end: str, dataset: str) -> Any:
+def fetch_open_interest(
+    client: Any,
+    parent_symbol: str,
+    start: str,
+    end: str,
+    dataset: str,
+    *,
+    timeout_seconds: float = DEFAULT_PER_CALL_TIMEOUT_SECONDS,
+) -> Any:
     """Fetch statistics schema + filter to ``stat_type == OPEN_INTEREST``.
 
     Publishes ~20 stat types intraday; we only want OI. Returns the
     end-of-day OI per (contract, session_date) — DataBento publishes
     multiple OI updates throughout the day; we keep the LAST one per
     (symbol, date) pair via groupby + last().
+
+    Bounded by ``timeout_seconds`` via :func:`_call_with_timeout`. This
+    is the slowest of the 3 schemas (~8.1M records pre-filter on the
+    23-month default window).
     """
-    data = client.timeseries.get_range(
+    data = _call_with_timeout(
+        client.timeseries.get_range,
         dataset=dataset,
         start=start,
         end=end,
         symbols=[parent_symbol],
         schema="statistics",
         stype_in="parent",
+        timeout_seconds=timeout_seconds,
+        operation=f"statistics {parent_symbol}",
     )
     df = data.to_df()
     if df.empty:
@@ -546,10 +680,20 @@ def seed_one_ticker(
     dataset: str,
     out: Path,
     min_bars: int,
+    per_call_timeout: float = DEFAULT_PER_CALL_TIMEOUT_SECONDS,
 ) -> TickerSeedResult | None:
-    """Fetch + convert + write a single ticker. Returns None on failure."""
+    """Fetch + convert + write a single ticker. Returns None on failure.
+
+    Each of the 3 DataBento ``get_range`` calls is bounded by
+    ``per_call_timeout`` via :func:`_call_with_timeout`. On timeout
+    the ticker is skipped (return None) and the caller continues
+    to the next ticker per the 2026-05-19 runbook "per-call timeout"
+    semantic.
+    """
     # 1. Definition — gives us the raw_symbol → YYYYMM mapping
-    definition_df = fetch_definition(client, parent_symbol, start, end, dataset)
+    definition_df = fetch_definition(
+        client, parent_symbol, start, end, dataset, timeout_seconds=per_call_timeout
+    )
     if definition_df.empty:
         print(
             f"  {ticker}: FAIL — definition schema returned no rows (check parent symbol)",
@@ -565,7 +709,9 @@ def seed_one_ticker(
         return None
 
     # 2. OHLCV — daily bars per contract
-    ohlcv_df = fetch_ohlcv(client, parent_symbol, start, end, dataset)
+    ohlcv_df = fetch_ohlcv(
+        client, parent_symbol, start, end, dataset, timeout_seconds=per_call_timeout
+    )
     if ohlcv_df.empty:
         print(f"  {ticker}: FAIL — ohlcv-1d returned no rows", file=sys.stderr)
         return None
@@ -577,7 +723,9 @@ def seed_one_ticker(
         return None
 
     # 3. Open interest (filtered from statistics)
-    oi_df = fetch_open_interest(client, parent_symbol, start, end, dataset)
+    oi_df = fetch_open_interest(
+        client, parent_symbol, start, end, dataset, timeout_seconds=per_call_timeout
+    )
 
     # 4. Write the LEAN-format files
     trade_zip_bytes, trade_rows = write_trade_zip(out, ticker, market, ohlcv_df, expiry_map)
@@ -665,6 +813,31 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Skip the tarball step (default: emit <out>.tar.gz beside <out>/)",
     )
+    p.add_argument(
+        "--per-call-timeout",
+        type=float,
+        default=DEFAULT_PER_CALL_TIMEOUT_SECONDS,
+        help=(
+            f"Per-API-call timeout for DataBento timeseries.get_range "
+            f"(seconds; default: {DEFAULT_PER_CALL_TIMEOUT_SECONDS:.0f}). "
+            "On timeout the ticker is logged + skipped + script proceeds "
+            "to the next ticker. Tune up for very large windows or down "
+            "for fail-fast retry loops."
+        ),
+    )
+    p.add_argument(
+        "--cost-quote-timeout",
+        type=float,
+        default=DEFAULT_COST_QUOTE_TIMEOUT_SECONDS,
+        help=(
+            f"Timeout for each metadata.get_cost call (seconds; default: "
+            f"{DEFAULT_COST_QUOTE_TIMEOUT_SECONDS:.0f}). Cost quotes are "
+            "sub-second normally; this guards against the 504-timeout "
+            "pattern observed 2026-05-19 during a re-seed attempt. On "
+            "timeout the script aborts with exit code 5 (cannot proceed "
+            "without a cost quote)."
+        ),
+    )
     return p.parse_args(list(argv) if argv is not None else None)
 
 
@@ -739,7 +912,23 @@ def main(argv: Iterable[str] | None = None) -> int:
             start=start_date.isoformat(),
             end=end_date.isoformat(),
             dataset=args.dataset,
+            timeout_seconds=args.cost_quote_timeout,
         )
+    except SeedCallTimeoutError as exc:
+        # Cost-quote timeout is fatal — the script can't proceed
+        # without a cost re-quote (the tripwire check is what
+        # prevents an unbounded $$$ surprise on a misconfigured
+        # symbology). Surface as exit 5 (fetch-time exception) so
+        # the operator's runbook stays uniform across transient
+        # 504s + auth fails + everything else cost-quote-related.
+        print(
+            f"ERROR: cost quote timed out — {exc} "
+            f"(tune --cost-quote-timeout if DataBento is slow today, OR "
+            "retry after a few minutes — the 2026-05-19 504 pattern "
+            "cleared up within an hour). Aborting.",
+            file=sys.stderr,
+        )
+        return 5
     except Exception as exc:
         print(f"ERROR: cost quote failed — {type(exc).__name__}: {exc}", file=sys.stderr)
         return 5
@@ -776,6 +965,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     print("---")
     results: list[TickerSeedResult] = []
     fail_count = 0
+    timeout_count = 0
     for ticker, (parent, market, market_code) in universe.items():
         try:
             result = seed_one_ticker(
@@ -789,7 +979,19 @@ def main(argv: Iterable[str] | None = None) -> int:
                 dataset=args.dataset,
                 out=out,
                 min_bars=args.min_bars,
+                per_call_timeout=args.per_call_timeout,
             )
+        except SeedCallTimeoutError as exc:
+            # Per-ticker fetch timed out — log + skip + continue (the
+            # 2026-05-19 runbook contract). Other tickers may still
+            # succeed; only count this as one ticker failure.
+            print(
+                f"  {ticker}: TIMEOUT — {exc} (skipping; remaining tickers proceed)",
+                file=sys.stderr,
+            )
+            fail_count += 1
+            timeout_count += 1
+            continue
         except Exception as exc:
             print(
                 f"  {ticker}: EXCEPTION {type(exc).__name__}: {exc}",
@@ -812,7 +1014,18 @@ def main(argv: Iterable[str] | None = None) -> int:
         )
 
     if fail_count > 0 or not results:
-        print(f"\nFAILED: {fail_count} ticker(s) did not seed cleanly.", file=sys.stderr)
+        if timeout_count > 0:
+            print(
+                f"\nFAILED: {fail_count} ticker(s) did not seed cleanly "
+                f"({timeout_count} via per-call timeout — re-run with a "
+                "higher --per-call-timeout or retry later).",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"\nFAILED: {fail_count} ticker(s) did not seed cleanly.",
+                file=sys.stderr,
+            )
         return 2
 
     print("---")
