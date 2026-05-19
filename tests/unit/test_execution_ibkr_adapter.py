@@ -547,6 +547,112 @@ class TestPlaceOrderParentId:
 
 
 # ---------------------------------------------------------------------------
+# TestPlaceOrderTransmit — PR-eta / drill 9 fix
+# ---------------------------------------------------------------------------
+
+
+class TestPlaceOrderTransmit:
+    """Validates ``IbkrPlaceOrderRequest.transmit`` is wired into
+    ``ib_async.Order.transmit`` on the placeOrder call.
+
+    PR-eta (2026-05-19). The atomic-bracket protocol per IBKR docs:
+
+      * parent (entry) placed with transmit=False → IBKR queues it in
+        PendingSubmit but does NOT release to the exchange
+      * child (stop) placed with transmit=True + parentId=<entry_id> →
+        IBKR atomically releases both and registers the OCA relationship
+
+    This prevents the drill 9 race where a marketable-limit entry
+    filled within ~7ms before the stop's parentId linkage could
+    validate (Error 201 "Parent order is being cancelled"). With
+    transmit=False on the parent, the parent CANNOT fill until the
+    full bracket is registered at IBKR.
+
+    Default ``request.transmit=True`` preserves existing single-order
+    behavior for non-bracket callers (cancel paths, recon-driven manual
+    closes, the place_order surface in general).
+    """
+
+    @staticmethod
+    def _last_order_arg(client: IbAsyncIbkrClient) -> Any:
+        call_args = client._ib.placeOrder.call_args  # type: ignore[union-attr]
+        return call_args.args[1]
+
+    async def test_default_transmit_is_true(self) -> None:
+        """Sanity-lock: the dataclass default for transmit is True."""
+        req = _basic_request()
+        assert req.transmit is True
+
+    async def test_transmit_true_default_propagates_to_order(self) -> None:
+        """A request with the default transmit=True produces an Order
+        whose transmit=True (matches ib_async default + preserves the
+        pre-PR-eta single-order behavior)."""
+        fake = _fake_ib_class(place_order_trade=_default_trade(status="Submitted"))
+        client = IbAsyncIbkrClient(ib_factory=fake)
+        await client.place_order(_basic_request())
+        order_arg = self._last_order_arg(client)
+        assert order_arg.transmit is True
+
+    async def test_transmit_false_propagates_to_order(self) -> None:
+        """A request with transmit=False produces an Order whose
+        transmit=False (the parent-leg of an atomic bracket)."""
+        from dataclasses import replace
+
+        fake = _fake_ib_class(place_order_trade=_default_trade(status="PreSubmitted"))
+        client = IbAsyncIbkrClient(ib_factory=fake)
+        req = replace(_basic_request(), transmit=False)
+        await client.place_order(req)
+        order_arg = self._last_order_arg(client)
+        assert order_arg.transmit is False
+
+    async def test_atomic_bracket_pair_round_trip(self) -> None:
+        """Simulates the worker's PR-eta atomic-bracket sequence:
+
+          1. place entry with transmit=False, parent_broker_order_id=None
+          2. capture entry's broker_order_id from the result
+          3. place stop with transmit=True, parent_broker_order_id=entry_id
+
+        Asserts on the Order objects passed to ib.placeOrder for both
+        legs that the canonical atomic-bracket contract holds.
+        """
+        from dataclasses import replace
+
+        entry_trade = _default_trade(order_id=99, status="PreSubmitted")
+        stop_trade = _default_trade(order_id=100, status="PreSubmitted")
+        fake = _fake_ib_class(place_order_trade=entry_trade)
+        client = IbAsyncIbkrClient(ib_factory=fake)
+        await client.connect()
+        client._ib.placeOrder.side_effect = [entry_trade, stop_trade]  # type: ignore[union-attr]
+
+        # 1. Entry: transmit=False, no parent
+        entry_req = replace(_basic_request(), transmit=False)
+        entry_result = await client.place_order(entry_req)
+        assert entry_result.broker_order_id == 99
+        entry_order_arg = client._ib.placeOrder.call_args_list[0].args[1]  # type: ignore[union-attr]
+        assert entry_order_arg.transmit is False
+        assert entry_order_arg.parentId == 0
+
+        # 2. Stop: transmit=True + parent_broker_order_id=entry's broker_order_id
+        stop_req = replace(
+            _basic_request(),
+            client_order_id="9d2f7a1c-b54e83a1-4d9e7c1b2f0a-1-stop",
+            order_type="stop_market",
+            side="sell",
+            limit_price=None,
+            stop_price=Decimal("3990"),
+            time_in_force="GTC",
+            parent_client_order_id=_basic_request().client_order_id,
+            parent_broker_order_id=entry_result.broker_order_id,
+            transmit=True,
+        )
+        stop_result = await client.place_order(stop_req)
+        assert stop_result.broker_order_id == 100
+        stop_order_arg = client._ib.placeOrder.call_args_list[1].args[1]  # type: ignore[union-attr]
+        assert stop_order_arg.transmit is True
+        assert stop_order_arg.parentId == 99  # matches entry_result.broker_order_id
+
+
+# ---------------------------------------------------------------------------
 # TestCancelOrder
 # ---------------------------------------------------------------------------
 

@@ -680,6 +680,18 @@ class IbAsyncIbkrClient:
             if request.parent_broker_order_id is not None:
                 ib_order.parentId = request.parent_broker_order_id
 
+            # PR-eta: IBKR-side transmit flag. On the parent leg of an atomic
+            # bracket we set transmit=False so IBKR queues the entry in
+            # PendingSubmit without releasing to the exchange. When the child
+            # (stop) arrives with transmit=True + parentId=entry_id, IBKR
+            # atomically releases both — the parent cannot fill before the
+            # bracket is fully registered, so the parentId validation race
+            # that drill 9 surfaced (IBKR Error 201 "Parent order is being
+            # cancelled" when the parent had already filled) cannot recur.
+            # Default request.transmit=True preserves existing single-order
+            # behavior for non-bracket callers (cancel, recon, manual orders).
+            ib_order.transmit = request.transmit
+
             trade = ib.placeOrder(ib_contract, ib_order)
             # ib_async returns immediately with a Trade object; the actual
             # order-status events arrive async. We wait briefly for the
