@@ -17,6 +17,116 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ## Entries
 
+### 2026-05-19 — Drill 10 — PR-η validated LIVE end-to-end; AC1-AC10 all GREEN; drill 6 → 10 defect series CLOSED
+
+- **Status:** FULL SUCCESS. Drill 10 (retry, after attempt 1's limit drifted out of marketable per drill 8 lesson #1) put the canonical entry + exit pipeline through the LIVE path with **PR-η's atomic `transmit=False/True` bracket protocol** registering the OCO linkage at IBKR — entry filled cleanly (PR-ζ no race), stop fired naturally on a 6.5pt /MES drift (~3.81 min hold), exit chain landed via LIVE (no replay), Discord `#fills` delivered both fills, audit chain CLEAN throughout. **No Error 201** (drill 9 defect closed). **No fill_processor race** (PR-ζ continues to hold). **No non-canonical SSE failures** (PR-ε continues to hold). The drill 6 → drill 10 defect series is now fully closed — every recommended-PR scope from the drill 6 retrospective has either shipped + LIVE-validated (PR-α/PR-ε/PR-ζ/PR-η) or is documented as deprioritized (PR-β/PR-δ).
+
+- **Acceptance criteria scorecard — ALL GREEN (first drill since drill 5 with a full clean AC sweep):**
+
+  | AC | Criterion | Status | Notes |
+  |---|---|---|---|
+  | 1 | Signal POST → 202 + signal_id | ✅ PASS | audit seq=162 (retry); signal_id `019e40ef-8da8-…` |
+  | 2 | Approval POST → 200 + intent_to_place_order=true | ✅ PASS | audit seq=163; bot bearer |
+  | **3** | **Bracket placed atomically (PR-η transmit=False/True + parentId)** | ✅ **PASS** | Entry seq=164 (broker_order_id=44, transmit=False); Stop seq=165 (broker_order_id=46, transmit=True, parentId=44 at IBKR confirmed via `reqAllOpenOrders`). **NO Error 201** — the drill 9 race is structurally eliminated. |
+  | **4** | **orderStatusEvent for entry fill (LIVE path)** | ✅ **PASS** | audit seq=166; entry filled at 7375.00 via paper Smart routing; `fill_processor_applied` fired through `_on_order_status` → `process_fill_event` → audit chain — NO `fill_processor_unknown_order` warning. PR-ζ continues to hold. |
+  | **5** | **orderStatusEvent for stop fill (LIVE path)** | ✅ **PASS** | audit seq=170; stop fired at 7368.50 on /MES drift from 7375 → 7368.50 over 3.81 min; **no replay required**. The end-to-end PR-G exit path validated LIVE for the first time since drill 5 (drill 7 + drill 8 needed replay for the entry; drill 9 needed manual flatten + replay for the exit). |
+  | **6** | **Full PR-G entry + exit audit rows** | ✅ **PASS** | Entry chain LIVE (seq 164-169: order_placed×2 + order_filled + position_opened + balance_snapshot + trade_opened); Exit chain LIVE (seq 170-173: order_filled + position_closed + balance_snapshot + trade_closed). Total +12 audit rows for the round-trip, all via the live SSE callback path. |
+  | **7** | **Discord #fills via SSE multiplexer** | ✅ **PASS** | 4 webhook_pusher deliveries logged HTTP 204: `signal_emitted` → `#signals`; `signal_approved` → `#signals`; `order_filled:44` (entry) → `#fills` at 15:51:44 UTC; `order_filled:46` (stop) → `#fills` at 15:55:33 UTC. **Both fills visible in Discord LIVE** — drill 9's exit-not-in-Discord gap (replay-path bypass) does not recur because the LIVE path emits SSE which webhook_pusher routes via `_route_fill_event`. |
+  | 8 | `verify_chain --env paper` CLEAN | ✅ PASS | 172 rows walked; max_seq=173 (one SERIALIZABLE-retry gap is benign per the hash-chain linkage walker design) |
+  | **9** | **Trade row with realized_pnl computed** | ✅ PASS | trade `019e40ef-9742-…` closed at 15:55:33 UTC; avg_entry_price=7375.00, avg_exit_price=7368.50, realized_pnl_usd=-6.5000 (raw price diff; /MES multiplier is $5/pt so actual cash loss = **-$32.50**); minutes_held=3.81. The realized_pnl_usd column-name vs stored-value mismatch is the same pre-existing defect drill 9 flagged; tracked as the multiplier-correctness audit follow-up. |
+  | **10** | **IBKR-side stop parentId == entry's broker_order_id (PR-η validation)** | ✅ **PASS** | `reqAllOpenOrders` from clientId=95 immediately post-place returned `orderId=46 SELL STP status=PreSubmitted aux=7368.5 parentId=44 transmit=True` — the canonical OCA bracket linkage. The pre-PR-η drill 9 placement returned `parentId=0` (broken). The PR-η transmit=False/True protocol made the bracket atomic at IBKR. |
+
+- **Drill 10 timeline (UTC, 2026-05-19):**
+
+  | Time | Event |
+  |---|---|
+  | 14:55 | Operator-force CONVALESCENT → NORMAL via `apply_state_transition` (audit seq=155, reason `operator_force_graduation` for honesty). Stale recon break from the 23:33 UTC PR #187 hot-fix deploy marked resolved (`resolution_path='manual'`). |
+  | 15:08 | PR-η deployed to VPS (PR #189 squash commit 89b05a9); api healthy in 12s; `parent_broker_order_id=broker_order_id` re-enabled in `apply_order_placement`; `transmit=False` on entry; `transmit=True` (default) on stop |
+  | 15:10:59 | **Drill 10 mini** signal POST (`019e40ca-4a21-…`); decision_price 7374.25, stop 7366.50 |
+  | 15:11:00 | Approve → 200; audit seq=143 |
+  | 15:11:02 | Worker fired: bracket placed clean at IBKR — orderId=36 BUY LMT 7374.25 + orderId=38 SELL STP 7366.50 **parentId=36** ✓ |
+  | 15:11:21 | Entry filled LIVE; audit seq 144-149 (4-event PR-G entry chain); Discord `order_placed` + `order_filled` delivered |
+  | 15:13:22 | Manually flattened + replay to close; mini scope success — AC1-2-3-4-6-7-8-9-10 validated, AC5 deferred |
+  | 15:47:33 | **Drill 10 full attempt 1** signal POST (`019e40eb-c5a6-…`); decision_price 7369.25, stop 7365.50 |
+  | 15:47:34 | Approve → 200; audit seq=157 |
+  | 15:47:38 | Worker placed: bracket atomic; entry orderId=40 + stop orderId=42 parentId=40 ✓ |
+  | 15:48-15:50 | /MES drifted UP from 7367.25 → 7371.75; entry's limit at 7369.25 dropped below ask → order resting (NOT filling). Drill 8 lesson #1 (limit price freshness) reconfirmed — even +2pt above ask wasn't enough padding on a fast-moving session morning. |
+  | 15:51:13 | `reqGlobalCancel` to clear attempt 1; audit seq 160-161 (2 order_cancelled rows); attempt 1 abandoned cleanly |
+  | 15:51:38 | **Drill 10 full RETRY** signal POST (`019e40ef-8da8-…`); decision_price 7378.00 (+25 ticks padding above last bid), stop 7368.50 |
+  | 15:51:38 | Approve → 200; audit seq=163 |
+  | 15:51:38.7 | Worker fired: entry orderId=44 BUY LMT 7378.00 + stop orderId=46 SELL STP 7368.50 parentId=44 ✓ |
+  | 15:51:44 | **Entry filled LIVE at 7375.00** (paper Smart routed below limit); audit seq=166; PR-G entry chain through seq=169; `event_push_delivered channel=fills dedupe_key=order_filled:44 http_status=204` |
+  | 15:51-15:55 | /MES drifted from 7377 → 7372.5 → 7373.0 → 7374.5 → 7368.5 in ~4 min |
+  | 15:55:33 | **Stop fired LIVE at 7368.50** (the exact stop price); audit seq=170; PR-G exit chain through seq=173; `event_push_delivered channel=fills dedupe_key=order_filled:46 http_status=204` |
+  | 15:56:32 | `verify_chain --env paper` → `CHAIN OK: 172 rows verified`; final state 0 positions / 0 open trades / 1 cancelled-signal-cleanup-pending |
+  | 15:56:50 | Stuck `019e40eb-c5a6-…` (drill 10 attempt 1 entry signal, never reached fill) UPDATEd from `working` → `cancelled` (operator cleanup; PR #181 logic only flips on trade close, not on order cancel). Final state fully clean. |
+
+- **PR-η LIVE validation — the structural fix:**
+
+  Pre-PR-η (PR-γ as-implemented + reverted by PR #187): the stop's `parentId=<entry_broker_order_id>` arrived at IBKR after the parent had already filled (~7ms via paper Smart routing) → IBKR rejected with Error 201 "Parent order is being cancelled" → naked position.
+
+  Post-PR-η: the entry leg carries `transmit=False` so IBKR queues the parent in PendingSubmit without releasing it to the exchange. The stop leg arrives with `parentId=44 + transmit=True`. IBKR validates the parent/child pair, registers the OCA relationship, then atomically releases both. The parent never reaches a fillable state until the bracket is fully wired — Error 201 is **structurally impossible**.
+
+  Drill 10 mini at 15:11 + drill 10 full retry at 15:51 both validated this. The second validation (with a natural-fire stop 3.81 min later) closed the AC5 gap that drill 9 left open.
+
+- **Drill 8 lesson #1 (limit price freshness) RECONFIRMED:**
+
+  Drill 10 attempt 1 placed entry limit at 7369.25 (+2pt above the moment-of-decision ask 7367.25). The market drifted to 7371.75 ask during the ~5s worker placement window, leaving the limit below the new ask. Order rested without filling for ~3 min before I cancelled + re-issued with much wider padding (+25 ticks above current bid).
+
+  Same lesson as drill 8 retry-1 + retry-2 (which also needed wider padding on /MNQ). **This is now a confirmed recurring pattern** for marketable-limit entries on fast-moving sessions. Recommended follow-up: add a worker-side "modify limit to current ask + N ticks" step before placement, OR pad sizing_trace's `decision_price` field much more generously at the LEAN emit layer. Tracked as drill 8 lesson #1 in the next-session brief; deprioritized but real.
+
+- **Force CONVALESCENT → NORMAL — operator override documented:**
+
+  At session start the system was in HALT_NEW from the 23:33 UTC PR #187 deploy-time race. Resume yielded CONVALESCENT (HALT_NEW → CONVALESCENT works via `/api/system/kill-switch/resume`). To reach NORMAL the state machine requires 5 clean CME session closes (`CONVALESCENT_SESSIONS_TO_NORMAL = 5` per `services/risk/state_machine.py:147`). The operator authorized a manual force.
+
+  Implementation: hand-built `StateTransitionPlan` with `reason='operator_force_graduation'` + the canonical `state_transition_convalescent_to_normal` audit event, fed through the existing `apply_state_transition` orchestrator. Audit row at seq=155; no schema or state machine modifications. **Note for posterity:** `RISK_STATES_PERMITTING_DISPATCH = frozenset({"NORMAL", "CONVALESCENT"})` per `services/risk/signal_dispatch.py:64`, so CONVALESCENT does not actually restrict signal flow — the force was cosmetic. Documented so future operators don't misinterpret CONVALESCENT as a signal-flow constraint.
+
+- **Final state at session end (2026-05-19 15:57 UTC):**
+  - positions_current: 0
+  - active signals: 0 (drill 10 attempt 1 cleanup UPDATEd to 'cancelled')
+  - open trades: 0
+  - max audit sequence_no: 173
+  - audit chain: CLEAN (`CHAIN OK: 172 rows verified`)
+  - IBKR open orders: 0
+  - IBKR positions: 0
+  - Drill 10 trade: state='closed', realized_pnl_usd=-6.5000 (raw; -$32.50 in cash terms)
+  - Risk state: NORMAL (operator_force_graduation; no operational impact since CONVALESCENT and NORMAL are equivalent for dispatch)
+
+- **Defect closure scorecard — drill 6 → drill 10 series CLOSED:**
+
+  | Defect | Originated | Fix PR | Status as of 2026-05-19 |
+  |---|---|---|---|
+  | #1 tick-rounding | drill 6 | PR-α (#183) | ✅ Merged + LIVE-validated by drills 7-10 |
+  | #2 dup-placement race | drill 6 | orphan container removed | ✅ Resolved by `docker stop`; PR-β defense-in-depth deprioritized |
+  | #3 IBKR-side bracket parentId | drill 6 | PR-γ (#186) → reverted by PR #187 → **PR-η (#189) LIVE-validated** | ✅ Drill 10 confirmed atomic bracket places + holds parentId=44 |
+  | #4 cancel-by-CID composite | drill 6 | deferred | ⚪ Only manifests under defect #2 race; deprioritized |
+  | #5 non-canonical 'order' SSE | drill 6 | PR-ε (#186) | ✅ LIVE-validated by drill 9 cancel + drill 10 no-cancel paths |
+  | #6 fill_processor race | drill 7 | PR-ζ (#184) | ✅ Drill 10 entry filled LIVE with no race |
+
+  **No open defects in the drill 6 → drill 10 series.** The system is end-to-end LIVE-validated for paper trading.
+
+- **PRs landed this session (2026-05-19):**
+
+  | PR | Title | Merged | Status |
+  |---|---|---|---|
+  | #189 | feat(execution,risk): PR-η — atomic IBKR bracket via transmit=False/True | 15:07 UTC | ✅ LIVE-validated end-to-end by drill 10 mini + drill 10 full retry |
+  | this PR | docs(decisions-log): drill 10 retrospective | TBD | ✅ Closes the drill 6 → 10 defect series + documents force-NORMAL |
+
+- **Recommended follow-up PRs (post-drill-10, lower priority):**
+
+  1. **realized_pnl_usd multiplier-correctness audit.** Drill 9 + drill 10 trade rows both show `realized_pnl_usd` equal to the raw price diff (drill 10: -6.5 for /MES, actual cash -$32.50). Either the column name is misleading or the value should be multiplier-adjusted. Spec check + (likely) a fix PR.
+  2. **Limit price freshness defense.** Drill 8 lesson #1 confirmed by drill 10 attempt 1 — a 2-3 second worker placement window can drift through the limit on fast-moving sessions. Options: worker-side limit refresh, much wider sizing_trace.decision_price padding, OR a "modify if not filled within Ns" auto-resubmit. Phase 1+ followup.
+  3. **PR-θ: Discord visibility for replay-path closes.** The replay_executions path writes audit rows but bypasses the SSE multiplexer; Discord #fills doesn't see manual-flatten closures. Drill 10 didn't surface this (stop fired LIVE so the exit went through the live path) but drill 9 + drill 10 mini did. Either route replay POST directly to webhook_pusher OR emit SSE from replay's side channel.
+  4. **CME real-time data subscription (~$1.50/mo).** Considered + deferred per the morning discussion — narrow value for paper trading; will re-evaluate when (a) live-money cutover approaches OR (b) V1 intraday signals begin to depend on real-time quotes.
+  5. **Automated daily DataBento futures re-seed cron.** Currently manual (75 min wall-clock); operator runs every few days. Could be a scheduled task per dev-guide §scheduler patterns. Captured as Phase 1+ follow-up in `Docs/decisions-log.md` 2026-05-17 entry.
+  6. **PR-β / PR-δ.** Defense-in-depth items from drill 6; not blocking any drill outcome since they only manifest under the orphan-container or duplicate-CID conditions that have other safeguards now.
+
+- **References:**
+  - PR #189 — PR-η LIVE-validation in this drill
+  - PR #186 — PR-γ original + PR-ε (LIVE)
+  - PR #187 — PR-γ revert hot-fix (now superseded by PR-η)
+  - Adjacent 2026-05-18 entries: drill 9 retro (PR-η scope opened), drill 8 retro (PR-ζ LIVE-validated), drill 7 retro (PR-ζ written), drill 6 retro (5 defects + PR-α).
+
 ### 2026-05-18 — Drill 9 — PR-ε validated LIVE end-to-end; PR-γ broke marketable-limit brackets at IBKR (Error 201) → reverted via PR #187; PR-η scope opened for the proper bracket fix
 
 - **Status:** MIXED. The pre-fill chain (AC1+AC2+AC3+AC4) ran cleanly through the LIVE PR-ζ path on first try — entry signal POSTed at 23:16:09 UTC, approved 46s later, worker fired the bracket placement 3s after that, entry filled at 7434.25 within ~7ms via paper Smart routing, and the canonical PR-G entry chain (order_filled + position_opened + balance_snapshot + trade_opened) landed WITHOUT a `fill_processor_unknown_order` race. **PR-ε validated LIVE end-to-end** — the stop's IBKR rejection emit_sse'd cleanly through the multiplexer and the `order_rejected:32` embed delivered to Discord `#fills` at HTTP 204 (pre-PR-ε this emit raised ValueError + the cancel never reached Discord). **PR-γ FAILED LIVE** — the stop carrying `parentId=<entry_orderId>` was rejected by IBKR with Error 201 "Parent order is being cancelled" because the marketable-limit entry filled BEFORE the stop's parentId linkage could validate at IBKR. Result: entry filled, stop rejected, position NAKED until the operator placed an emergency standalone protective stop. PR-γ reverted at the worker layer via PR #187 (hot-fix; merged 23:33 UTC; deployed 23:35 UTC). The IbkrPlaceOrderRequest field + IbAsyncIbkrClient.place_order adapter wiring are intentionally retained for PR-η (the proper transmit=False/True bracket protocol). Drill 6 defect #3 (entry-cancel leaves naked stop) returns as the known residual risk; that's recoverable via reqGlobalCancel + monitoring, whereas the PR-γ path BROKE entries entirely.
