@@ -162,6 +162,37 @@ class FillContext:
     """CHAR(40) — same value as strategy_hash today; the slot is reserved
     for a future strategy-version registry (backend-spec §3.13)."""
 
+    multiplier: Decimal = Decimal(1)
+    """Contract multiplier (points → USD scaling). Sourced from
+    ``contracts.multiplier`` per backend-spec §3.29. ``Decimal(1)`` for
+    ETFs (where ``contract_id is None``); ``Decimal(5)`` for /MES,
+    ``Decimal(2)`` for /MNQ, ``Decimal(10)`` for /MGC, etc.
+
+    Threaded through the planner so:
+
+      * ``realized_pnl_usd = (exit - entry) * qty * multiplier`` —
+        without this scaling, futures trades record only the raw price
+        delta as P&L (e.g., /MES 7375→7368.5 = -6.5 instead of the
+        actual -$32.50 cash loss). The column name ``trades.realized_pnl_usd``
+        carries the canonical ``_usd`` suffix per spec §3.6 + the
+        consistent ``_usd``-means-cash convention elsewhere in the
+        schema (``cash_usd``, ``dividend_pnl_usd``, etc.).
+      * ``cash_delta`` semantics — futures only cross cash via realized
+        P&L + commission (initial margin is held in a separate column);
+        ETFs flow the full notional. ``context.contract_id is not None``
+        is the canonical futures discriminator (alembic 0002 leaves
+        ``orders.contract_id`` nullable; futures populate it via the
+        contracts table FK).
+      * ``post_fill_position_mtm_usd`` — ``quantity * fill_price *
+        multiplier`` so NAV math composes correctly across mixed
+        ETF+futures portfolios.
+
+    Defaults to ``Decimal(1)`` so test fixtures + any historical caller
+    that doesn't supply it preserves the ETF-shaped semantics. The
+    real-world producer is :func:`fetch_fill_context` which LEFT JOINs
+    ``contracts`` + COALESCEs to 1.
+    """
+
 
 @dataclass(frozen=True, slots=True)
 class FillIngestPayload:
@@ -860,28 +891,45 @@ def _plan_entry_fill_application(
         # crutch — the apply step's UPDATE SQL doesn't reference it.
         trade_opened_at_utc = prior_trade.trade_created_at
 
-    # Balance snapshot: cash decreases by notional + commission on buy,
-    # increases on sell. Entry contract: buy = long entry (cash
-    # out); sell = short entry (cash IN per short-sale proceeds — IBKR
-    # paper account credits the notional + holds margin). Use the
-    # signed-delta convention: buy notional reduces cash, sell notional
-    # increases cash.
+    # Balance snapshot: cash semantics differ for ETFs vs futures.
+    #
+    # ETFs (``context.contract_id is None``): buy = long entry (cash
+    # out by full notional); sell = short entry (cash IN per short-sale
+    # proceeds). The full notional crosses cash because the underlying
+    # is a cash equity.
+    #
+    # Futures (``context.contract_id is not None``): only commission
+    # crosses cash on entry. The full notional does NOT flow — futures
+    # are margined, and IBKR holds initial margin in a separate slot
+    # (``positions_current.margin_held``, kept in sync by the recon
+    # path against IBKR's reqAccountSummary). Pre-2026-05-19, this
+    # branch used the same notional-flow formula as ETFs, producing
+    # wildly wrong balance rows (e.g., 2026-05-18 22:11:42 backend
+    # cash=$-16,545 vs IBKR FlexQuery cash=$19,997.51 from drill 7+8
+    # naked positions). The audit log in production already shows the
+    # divergence; the fix here is forward-only — the EOD recon path
+    # restores authoritative cash on the next flexquery_eod snapshot.
     notional_decimal = payload.fill_price * Decimal(payload.fill_quantity)
-    if context.order_direction == "buy":
+    is_futures = context.contract_id is not None
+    if is_futures:
+        # Futures entry: only commission crosses cash. Margin is held
+        # separately and reconciled against IBKR; not modeled here.
+        cash_delta = -payload.commission_usd
+    elif context.order_direction == "buy":
         cash_delta = -(notional_decimal + payload.commission_usd)
     else:
-        # Short entry: cash credit minus commission. Margin held is a
-        # separate column we don't update here (positions_current
-        # tracks margin_held; the recon path keeps it in sync).
+        # ETF short entry: cash credit minus commission.
         cash_delta = notional_decimal - payload.commission_usd
     new_cash = prior_balance.cash_usd + cash_delta
     # NLV recompute: cash + sum(qty * mark for all open positions). We
     # don't have all positions here; use the simplification NLV = cash +
-    # (new_quantity * fill_price). This treats the fill price as the
-    # mark for the just-filled position — close enough for the post-
-    # fill snapshot until PR-I's broker-mark refresh runs. For multi-
-    # position accounts (Phase 2+), the recon snapshot is authoritative.
-    new_position_mtm = Decimal(new_quantity_signed) * payload.fill_price
+    # (new_quantity * fill_price * multiplier). The multiplier scales
+    # the position's notional value into USD so a /MES 1-contract long
+    # at $7375 contributes $36,875 of MTM (not $7,375). Close enough
+    # for the post-fill snapshot until PR-I's broker-mark refresh runs;
+    # for multi-position accounts (Phase 2+), the recon snapshot is
+    # authoritative.
+    new_position_mtm = Decimal(new_quantity_signed) * payload.fill_price * context.multiplier
     new_nav = new_cash + new_position_mtm
     # Quantize to NUMERIC(20,4) for the balances row.
     nav_q = new_nav.quantize(Decimal("0.0001"), rounding=ROUND_HALF_EVEN)
@@ -1117,13 +1165,26 @@ def _plan_exit_close_fill_application(
     trade_direction: Literal["long", "short"] = "long" if prior_position.quantity > 0 else "short"
 
     # Realized P&L computation.
+    #
+    # The contract multiplier scales raw price delta into USD per spec
+    # §3.6 (``trades.realized_pnl_usd`` carries the canonical ``_usd``
+    # suffix consistent with ``cash_usd``, ``dividend_pnl_usd``, etc.
+    # — all of which are cash USD throughout the schema). For ETFs the
+    # multiplier is 1 and the formula reduces to the prior behavior;
+    # for futures it produces the actual cash P&L (e.g., /MES with
+    # multiplier=5: a 6.5pt loss = -$32.50, not the raw -6.5).
+    #
+    # Pre-2026-05-19 this branch omitted the multiplier — drill 9 +
+    # drill 10 retrospectives flagged the resulting trade row values
+    # (drill 10 /MES exit showed realized_pnl_usd=-6.5 instead of the
+    # canonical -32.5).
     avg_exit = payload.fill_price
     avg_entry = prior_trade.avg_entry_price
     qty = Decimal(abs_prior_qty)
     if trade_direction == "long":
-        gross_pnl = (avg_exit - avg_entry) * qty
+        gross_pnl = (avg_exit - avg_entry) * qty * context.multiplier
     else:
-        gross_pnl = (avg_entry - avg_exit) * qty
+        gross_pnl = (avg_entry - avg_exit) * qty * context.multiplier
     total_commission_usd = prior_trade.realized_commission_usd + payload.commission_usd
     realized_pnl_raw = gross_pnl - total_commission_usd
     # trades.realized_pnl_usd is NUMERIC(20,4).
@@ -1141,15 +1202,30 @@ def _plan_exit_close_fill_application(
     else:
         new_order_status = "partially_filled"
 
-    # Cash + NAV deltas.
-    # Long close (sell): cash IN (proceeds) - commission
-    # Short close (buy): cash OUT (cost) + commission
+    # Cash + NAV deltas. ETFs vs futures (matching the entry path):
+    #
+    # ETFs (``context.contract_id is None``):
+    #   * Long close (sell): cash IN (full notional) - commission.
+    #   * Short close (buy): cash OUT (full notional) + commission.
+    #
+    # Futures (``context.contract_id is not None``):
+    #   * Cash crosses for realized P&L + commission only — initial
+    #     margin releases into a separate slot reconciled against
+    #     IBKR. The realized P&L is already multiplier-adjusted in
+    #     ``gross_pnl`` above, so the cash delta is simply the
+    #     gross_pnl minus the fill's commission (the prior trade's
+    #     accumulated entry commission already crossed cash on the
+    #     entry fill's ``-payload.commission_usd`` delta, so we don't
+    #     re-debit it here).
     notional_decimal = payload.fill_price * Decimal(payload.fill_quantity)
-    if context.order_direction == "buy":
-        # Closing a short by buying back. Cash decreases by notional + commission.
+    is_futures = context.contract_id is not None
+    if is_futures:
+        cash_delta = gross_pnl - payload.commission_usd
+    elif context.order_direction == "buy":
+        # ETF closing a short by buying back.
         cash_delta = -(notional_decimal + payload.commission_usd)
     else:
-        # Closing a long by selling. Cash increases by notional - commission.
+        # ETF closing a long by selling.
         cash_delta = notional_decimal - payload.commission_usd
     new_cash = prior_balance.cash_usd + cash_delta
     # Post-close: position quantity is 0, so MTM contribution is 0 and
@@ -1370,9 +1446,11 @@ async def fetch_fill_context(
                       s.strategy_hash,
                       s.parameter_set_hash,
                       s.slippage_calibration_version_id,
-                      s.decision_price
+                      s.decision_price,
+                      COALESCE(c.multiplier, 1) AS multiplier
                     FROM orders o
                     JOIN signals s ON s.id = o.signal_id
+                    LEFT JOIN contracts c ON c.id = o.contract_id
                     WHERE o.client_order_id = :cid
                     ORDER BY o.created_at DESC
                     LIMIT 1
@@ -1399,6 +1477,7 @@ async def fetch_fill_context(
         slippage_calibration_version_id=row.slippage_calibration_version_id,
         decision_price=Decimal(str(row.decision_price)),
         managed_by_version=row.strategy_hash,
+        multiplier=Decimal(str(row.multiplier)),
     )
 
 

@@ -85,6 +85,7 @@ def _ctx(
     target_contracts: int = 1,
     market: str = "/MES",
     contract_id: UUID | None = None,
+    multiplier: Decimal = Decimal(1),
 ) -> FillContext:
     return FillContext(
         order_id=_ORDER_ID,
@@ -102,6 +103,28 @@ def _ctx(
         slippage_calibration_version_id=_SLIP_ID,
         decision_price=Decimal("4250.50"),
         managed_by_version="a" * 40,
+        multiplier=multiplier,
+    )
+
+
+def _futures_ctx(
+    *,
+    signal_direction: str = "long",
+    order_direction: str = "buy",
+    target_contracts: int = 1,
+    market: str = "/MES",
+    multiplier: Decimal = Decimal(5),
+) -> FillContext:
+    """Helper for the futures-path tests — populates ``contract_id`` so
+    the planner takes the futures branch, with ``multiplier`` defaulting
+    to /MES's $5/pt."""
+    return _ctx(
+        signal_direction=signal_direction,
+        order_direction=order_direction,
+        target_contracts=target_contracts,
+        market=market,
+        contract_id=UUID("99999999-9999-7999-9999-999999999999"),
+        multiplier=multiplier,
     )
 
 
@@ -783,6 +806,7 @@ class TestFetchHelpers:
             parameter_set_hash="b" * 64,
             slippage_calibration_version_id=_SLIP_ID,
             decision_price=Decimal("4250.50"),
+            multiplier=Decimal("1"),
         )
         sf = _build_mock_session_factory_with_row(row)
         ctx = await fetch_fill_context(sf, client_order_id="abc-123-0")
@@ -791,6 +815,35 @@ class TestFetchHelpers:
         assert ctx.signal_direction == "long"
         assert ctx.target_contracts == 1
         assert ctx.decision_price == Decimal("4250.50")
+        # ETF row: multiplier COALESCEd to 1 by the LEFT JOIN contracts.
+        assert ctx.multiplier == Decimal("1")
+
+    @pytest.mark.asyncio
+    async def test_fetch_fill_context_futures_carries_multiplier(self) -> None:
+        """For futures (orders.contract_id non-NULL), the LEFT JOIN
+        contracts produces the contract's multiplier (e.g., /MES=5)."""
+        row = MagicMock(
+            order_id=_ORDER_ID,
+            order_created_at=_ORDER_CREATED,
+            signal_id=_SIGNAL_ID,
+            account_id=_ACCOUNT_ID,
+            env="paper",
+            market="/MES",
+            contract_id=UUID("99999999-9999-7999-9999-999999999999"),
+            order_direction="buy",
+            signal_direction="long",
+            target_contracts=1,
+            strategy_hash="a" * 40,
+            parameter_set_hash="b" * 64,
+            slippage_calibration_version_id=_SLIP_ID,
+            decision_price=Decimal("4250.50"),
+            multiplier=Decimal("5"),
+        )
+        sf = _build_mock_session_factory_with_row(row)
+        ctx = await fetch_fill_context(sf, client_order_id="abc-123-0")
+        assert ctx is not None
+        assert ctx.multiplier == Decimal("5")
+        assert ctx.contract_id is not None
 
     @pytest.mark.asyncio
     async def test_fetch_fill_context_none_when_no_row(self) -> None:
@@ -1683,6 +1736,336 @@ class TestApplyFillPlanCloseAction:
         # ENTRY path issues INSERT INTO trades, not UPDATE signals.
         assert "INSERT INTO trades" in joined
         assert "UPDATE signals SET status = 'closed'" not in joined
+
+
+# ---------------------------------------------------------------------------
+# Pure-policy: futures contract-multiplier path (2026-05-19 Item 2 fix)
+# ---------------------------------------------------------------------------
+
+
+class TestFuturesPathMultiplier:
+    """Coverage for the futures branches added 2026-05-19.
+
+    Pre-fix the planner treated every market as a multiplier=1 cash
+    equity. For /MES (multiplier=5) the drill 10 trade row recorded
+    ``realized_pnl_usd=-6.5000`` for a 6.5pt loss when the actual cash
+    P&L was -$32.50; the ``balances.cash_usd`` snapshot also booked the
+    full notional flow ($7,375 cash debit on entry) which produced
+    impossible balance rows like the 2026-05-18 22:11 ``cash_usd=
+    -16,545.49`` snapshot from drill 7+8 naked positions. The fix
+    routes futures fills through a separate cash-semantics branch that
+    only moves commission on entry + (gross P&L - commission) on exit.
+    """
+
+    # ----- realized_pnl_usd multiplier-adjustment -----
+
+    def test_mes_long_close_realized_pnl_multiplier_adjusted(self) -> None:
+        """/MES long: entry 7375.00 → exit 7368.50; qty 1; mult 5.
+
+        gross_pnl = (7368.50 - 7375.00) * 1 * 5 = -32.50
+        realized_pnl_usd = -32.50 - 0.00 commission_delta = -32.5000
+        """
+        ctx = _futures_ctx(
+            signal_direction="long",
+            order_direction="sell",
+            multiplier=Decimal("5"),
+        )
+        plan = plan_fill_application(
+            context=ctx,
+            payload=_payload(
+                fill_quantity=1,
+                cumulative_filled_quantity=1,
+                fill_price="7368.50",
+                commission_usd="0.00",
+            ),
+            prior_position=PriorPositionRow(
+                position_id=uuid4(),
+                quantity=1,
+                avg_cost=Decimal("7375.00"),
+            ),
+            prior_trade=PriorTradeRow(
+                trade_id=uuid4(),
+                trade_created_at=_ORDER_CREATED,
+                total_quantity=1,
+                avg_entry_price=Decimal("7375.00"),
+                realized_commission_usd=Decimal("0"),
+            ),
+            prior_balance=_zero_balance(),
+        )
+        assert plan.trade_mutation.realized_pnl_usd == Decimal("-32.5000")
+        trade_event = next(
+            e for e in plan.audit_events if e.event_type == AuditEventType.TRADE_CLOSED
+        )
+        assert trade_event.payload["realized_pnl_usd"] == "-32.5000"
+
+    def test_mes_short_close_realized_pnl_multiplier_adjusted(self) -> None:
+        """/MES short: entry 7375.00 (sell) → exit 7368.50 (buy);
+        qty 1; mult 5.
+
+        gross_pnl = (7375.00 - 7368.50) * 1 * 5 = +32.50
+        """
+        ctx = _futures_ctx(
+            signal_direction="short",
+            order_direction="buy",
+            multiplier=Decimal("5"),
+        )
+        plan = plan_fill_application(
+            context=ctx,
+            payload=_payload(
+                fill_quantity=1,
+                cumulative_filled_quantity=1,
+                fill_price="7368.50",
+                commission_usd="0.00",
+            ),
+            prior_position=PriorPositionRow(
+                position_id=uuid4(),
+                quantity=-1,
+                avg_cost=Decimal("7375.00"),
+            ),
+            prior_trade=PriorTradeRow(
+                trade_id=uuid4(),
+                trade_created_at=_ORDER_CREATED,
+                total_quantity=1,
+                avg_entry_price=Decimal("7375.00"),
+                realized_commission_usd=Decimal("0"),
+            ),
+            prior_balance=_zero_balance(),
+        )
+        assert plan.trade_mutation.realized_pnl_usd == Decimal("32.5000")
+
+    def test_mnq_long_close_uses_mnq_multiplier(self) -> None:
+        """/MNQ (multiplier=2): entry 29150 → exit 29122.25; qty 1.
+
+        gross_pnl = (29122.25 - 29150) * 1 * 2 = -55.50
+        """
+        ctx = _futures_ctx(
+            signal_direction="long",
+            order_direction="sell",
+            market="/MNQ",
+            multiplier=Decimal("2"),
+        )
+        plan = plan_fill_application(
+            context=ctx,
+            payload=_payload(
+                fill_quantity=1,
+                cumulative_filled_quantity=1,
+                fill_price="29122.25",
+                commission_usd="0.00",
+            ),
+            prior_position=PriorPositionRow(
+                position_id=uuid4(),
+                quantity=1,
+                avg_cost=Decimal("29150.00"),
+            ),
+            prior_trade=PriorTradeRow(
+                trade_id=uuid4(),
+                trade_created_at=_ORDER_CREATED,
+                total_quantity=1,
+                avg_entry_price=Decimal("29150.00"),
+                realized_commission_usd=Decimal("0"),
+            ),
+            prior_balance=_zero_balance(),
+        )
+        assert plan.trade_mutation.realized_pnl_usd == Decimal("-55.5000")
+
+    def test_mgc_uses_mgc_multiplier_10(self) -> None:
+        """/MGC (multiplier=10): 1pt loss = $10."""
+        ctx = _futures_ctx(
+            signal_direction="long",
+            order_direction="sell",
+            market="/MGC",
+            multiplier=Decimal("10"),
+        )
+        plan = plan_fill_application(
+            context=ctx,
+            payload=_payload(
+                fill_quantity=1,
+                cumulative_filled_quantity=1,
+                fill_price="2350.00",
+                commission_usd="0.00",
+            ),
+            prior_position=PriorPositionRow(
+                position_id=uuid4(),
+                quantity=1,
+                avg_cost=Decimal("2351.00"),
+            ),
+            prior_trade=PriorTradeRow(
+                trade_id=uuid4(),
+                trade_created_at=_ORDER_CREATED,
+                total_quantity=1,
+                avg_entry_price=Decimal("2351.00"),
+                realized_commission_usd=Decimal("0"),
+            ),
+            prior_balance=_zero_balance(),
+        )
+        assert plan.trade_mutation.realized_pnl_usd == Decimal("-10.0000")
+
+    # ----- cash_delta semantics: futures move ONLY commission/P&L, never notional -----
+
+    def test_futures_long_entry_cash_delta_excludes_notional(self) -> None:
+        """/MES long entry @ 7375 with $1.30 commission.
+
+        Pre-fix: cash_delta = -(7375 + 1.30) = -$7376.30 (wildly wrong).
+        Post-fix: cash_delta = -1.30 (commission only; margin is held
+        in a separate slot reconciled against IBKR).
+        """
+        ctx = _futures_ctx(multiplier=Decimal("5"))
+        plan = plan_fill_application(
+            context=ctx,
+            payload=_payload(fill_quantity=1, fill_price="7375.00", commission_usd="1.30"),
+            prior_position=None,
+            prior_trade=None,
+            prior_balance=PriorBalanceSnapshot(
+                cash_usd=Decimal("20000"), net_liquidation=Decimal("20000")
+            ),
+        )
+        # cash_delta = -1.30; new_cash = 20000 - 1.30 = 19998.70.
+        assert plan.balance_insert.cash_usd == Decimal("19998.7000")
+        bal_event = next(
+            e for e in plan.audit_events if e.event_type == AuditEventType.BALANCE_SNAPSHOT_RECORDED
+        )
+        assert bal_event.payload["cash_delta_usd"] == "-1.30"
+
+    def test_futures_short_entry_cash_delta_excludes_notional(self) -> None:
+        """Short futures entry — same semantics; only commission moves
+        cash. Pre-fix it incorrectly credited the full notional."""
+        ctx = _futures_ctx(
+            signal_direction="short",
+            order_direction="sell",
+            multiplier=Decimal("5"),
+        )
+        plan = plan_fill_application(
+            context=ctx,
+            payload=_payload(fill_quantity=1, fill_price="7375.00", commission_usd="1.30"),
+            prior_position=None,
+            prior_trade=None,
+            prior_balance=PriorBalanceSnapshot(
+                cash_usd=Decimal("20000"), net_liquidation=Decimal("20000")
+            ),
+        )
+        assert plan.balance_insert.cash_usd == Decimal("19998.7000")
+
+    def test_futures_long_close_cash_delta_is_pnl_minus_commission(self) -> None:
+        """/MES long close @ 7368.50 from entry 7375.00.
+
+        gross_pnl = -32.50; commission_delta = $1.30.
+        cash_delta = -32.50 - 1.30 = -33.80.
+        """
+        ctx = _futures_ctx(
+            signal_direction="long",
+            order_direction="sell",
+            multiplier=Decimal("5"),
+        )
+        plan = plan_fill_application(
+            context=ctx,
+            payload=_payload(
+                fill_quantity=1,
+                cumulative_filled_quantity=1,
+                fill_price="7368.50",
+                commission_usd="1.30",
+            ),
+            prior_position=PriorPositionRow(
+                position_id=uuid4(),
+                quantity=1,
+                avg_cost=Decimal("7375.00"),
+            ),
+            prior_trade=PriorTradeRow(
+                trade_id=uuid4(),
+                trade_created_at=_ORDER_CREATED,
+                total_quantity=1,
+                avg_entry_price=Decimal("7375.00"),
+                realized_commission_usd=Decimal("1.30"),  # entry commission already accumulated
+            ),
+            prior_balance=PriorBalanceSnapshot(
+                cash_usd=Decimal("19998.70"),  # post-entry from prior test scenario
+                net_liquidation=Decimal("19998.70"),
+            ),
+        )
+        # cash_delta = -32.50 - 1.30 = -33.80; new_cash = 19998.70 - 33.80 = 19964.90.
+        assert plan.balance_insert.cash_usd == Decimal("19964.9000")
+
+    def test_futures_short_close_cash_delta_is_pnl_minus_commission(self) -> None:
+        """Short close: short entry → buy back below entry = +pnl."""
+        ctx = _futures_ctx(
+            signal_direction="short",
+            order_direction="buy",
+            multiplier=Decimal("5"),
+        )
+        plan = plan_fill_application(
+            context=ctx,
+            payload=_payload(
+                fill_quantity=1,
+                cumulative_filled_quantity=1,
+                fill_price="7368.50",
+                commission_usd="1.30",
+            ),
+            prior_position=PriorPositionRow(
+                position_id=uuid4(),
+                quantity=-1,
+                avg_cost=Decimal("7375.00"),
+            ),
+            prior_trade=PriorTradeRow(
+                trade_id=uuid4(),
+                trade_created_at=_ORDER_CREATED,
+                total_quantity=1,
+                avg_entry_price=Decimal("7375.00"),
+                realized_commission_usd=Decimal("1.30"),
+            ),
+            prior_balance=PriorBalanceSnapshot(
+                cash_usd=Decimal("19998.70"),
+                net_liquidation=Decimal("19998.70"),
+            ),
+        )
+        # gross_pnl = +32.50; cash_delta = +32.50 - 1.30 = +31.20.
+        # new_cash = 19998.70 + 31.20 = 20029.90.
+        assert plan.balance_insert.cash_usd == Decimal("20029.9000")
+
+    # ----- position MTM uses multiplier -----
+
+    def test_futures_post_fill_position_mtm_uses_multiplier(self) -> None:
+        """/MES 1 long @ 7375 → MTM = 1 * 7375 * 5 = $36,875 (NOT the
+        pre-fix bare 7375 which under-counted NAV by ~$29,500)."""
+        ctx = _futures_ctx(multiplier=Decimal("5"))
+        plan = plan_fill_application(
+            context=ctx,
+            payload=_payload(fill_quantity=1, fill_price="7375.00", commission_usd="0"),
+            prior_position=None,
+            prior_trade=None,
+            prior_balance=PriorBalanceSnapshot(
+                cash_usd=Decimal("20000"), net_liquidation=Decimal("20000")
+            ),
+        )
+        bal_event = next(
+            e for e in plan.audit_events if e.event_type == AuditEventType.BALANCE_SNAPSHOT_RECORDED
+        )
+        # MTM = 1 * 7375 * 5 = 36875.00. The exact serialized value is
+        # the raw Decimal multiplication then quantized to 4 decimals.
+        assert bal_event.payload["post_fill_position_mtm_usd"] == "36875.0000"
+        # NAV = cash + MTM = 20000 (commission=0) + 36875 = 56875.
+        assert plan.balance_insert.net_liquidation == Decimal("56875.0000")
+
+    # ----- ETF path unchanged (regression guard) -----
+
+    def test_etf_path_unchanged_when_contract_id_none(self) -> None:
+        """Existing ETF behavior preserved: contract_id=None →
+        multiplier=1 by default → notional flow + raw P&L."""
+        ctx = _ctx()  # contract_id=None, multiplier=Decimal(1)
+        plan = plan_fill_application(
+            context=ctx,
+            payload=_payload(fill_quantity=1, fill_price="85.42", commission_usd="0.50"),
+            prior_position=None,
+            prior_trade=None,
+            prior_balance=PriorBalanceSnapshot(
+                cash_usd=Decimal("100000"), net_liquidation=Decimal("100000")
+            ),
+        )
+        # ETF: cash_delta = -(85.42 + 0.50) = -85.92; new_cash = 99914.08.
+        assert plan.balance_insert.cash_usd == Decimal("99914.0800")
+        # MTM = 1 * 85.42 * 1 = 85.42 (multiplier=1 default).
+        bal_event = next(
+            e for e in plan.audit_events if e.event_type == AuditEventType.BALANCE_SNAPSHOT_RECORDED
+        )
+        assert bal_event.payload["post_fill_position_mtm_usd"] == "85.4200"
 
 
 # ---------------------------------------------------------------------------
