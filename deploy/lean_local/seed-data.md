@@ -672,6 +672,31 @@ means the next cycle will fail.** Schedule a re-seed before that cycle fires.
   2026-05-17 entry "7-micro `v1_history_unavailable` root cause" lessons-
   learned section).
 
+### Per-call timeouts (2026-05-19)
+
+The seed script wraps every DataBento API call in a per-call wall-clock
+deadline so a hung call no longer blocks the whole bundle. Defaults:
+
+* `--cost-quote-timeout 120` (seconds) — for each of the 3 `metadata.
+  get_cost` calls in the up-front cost re-quote. On timeout: script
+  aborts with exit code 5 (cost-quote is a hard prerequisite). The
+  2026-05-19 incident sized this default — a 504 cost-quote attempt
+  blocked indefinitely until SIGKILL until this default was added.
+* `--per-call-timeout 600` (seconds) — for each of the 3 `timeseries.
+  get_range` calls per ticker (definition + ohlcv-1d + statistics). On
+  timeout: the ticker is logged + skipped + the script proceeds to the
+  next ticker. The aggregate "FAILED" message at script end calls out
+  how many tickers timed out + reminds the operator to tune the flag
+  or retry.
+
+Tune up if DataBento is having a slow day (`--per-call-timeout 1200`
+gives 20 min per call); tune down for fail-fast retry loops
+(`--cost-quote-timeout 30` gets you a quick 30s pre-flight check
+before committing to a full ~75-min fetch).
+
+For ad-hoc retry after a 504-pattern abort, just re-run the same
+container — DataBento's gateway typically clears within ~60 min.
+
 ### Ad-hoc re-seed on the VPS (no operator-workstation venv required)
 
 The canonical seed script `scripts/seed_lean_futures_databento.py` is
