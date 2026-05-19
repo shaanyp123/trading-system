@@ -17,6 +17,111 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ## Entries
 
+### 2026-05-19 — Calendar page (Week 7 Fri) scope ticket — data-source decision pending
+
+- **Status:** SCOPE-ONLY. No code in this entry. The Calendar page is on the Phase 1 nav per `frontend-spec.md` line 82 (`/calendar`) + line 156 (TopBar `Calendar` link) + `routes.config.ts:111` (`{ path: "/calendar", available_from: 1, hidden_in_nav: false }`). Backend-spec already defines the storage model (§3.28 `macro_events`), the API surface (§2.7.3 + `/api/calendar/events` + `/api/calendar/ratify`), and a primary ingestion source choice (§2.1.2 "Forex Factory primary, Trading Economics secondary"). Frontend-spec §2.7 has the full page layout + filter + ratification UX. **What's missing is operator confirmation that the 2024-vintage spec choice (Forex Factory scrape) is still the right call in 2026** given (a) the legal posture has tightened, (b) Trading Economics' individual tier pricing has shifted, and (c) we now have ~$0.96/mo ongoing DataBento spend as a precedent for paid-data-vendor cost normalization.
+
+- **Operator decision required (1 of 4 options):**
+
+  | Option | Source | Cost | Freshness | Legal posture | API stability | Effort to Phase 1 ship |
+  |---|---|---|---|---|---|---|
+  | **A** | **Forex Factory** scrape (spec default) | $0/mo | ~24h stale (their public calendar refreshes nightly) | Gray area — their ToS forbids scraping but it's widely done; no enforcement history we've seen on small individual scrapers | Their JSON endpoint at `nfs.faireconomy.media/ff_calendar_thisweek.json` (and `nextweek` / `lastweek` variants) has been stable since ~2017 per public reverse-engineering write-ups | ~2-3 days build (HTTP fetcher + parser + cron + tests + Discord `/ratify` + web page) |
+  | **B** | **Trading Economics API** | ~$0/mo (free tier) to ~$50/mo (individual real-time tier; pricing as of 2026-05) | Real-time on paid tier; 1-day stale on free tier | Clean — official API, attribution-required | OAS-spec'd; SLA on paid tier; rate-limit 100 req/hr free tier | ~2-3 days build (similar surface to Option A but with API-key auth + 429-handling) |
+  | **C** | **Investing.com economic calendar** scrape | $0/mo | Real-time | Gray-but-actively-defended — Investing.com has historically pursued scrapers via DMCA + JS-based rate-limiting + Cloudflare blocks | Their internal API rotates URLs every few months; brittle | NOT recommended — too high maintenance burden for a solo operator |
+  | **D** | **FRED + manual operator entry** | $0/mo | Real-time on FRED's release calendar; depends on operator for ratification | Clean — official FRED API | OAS-spec'd; rate-limit generous | ~1-2 days build (smaller — FRED only covers ~30% of relevant events; rest is operator-entered via Discord `/calendar add` command) |
+
+  **Recommendation: B (Trading Economics paid tier ~$50/mo).** Reasoning:
+    1. **Legal cleanness matters more at the live-money cutover** than at paper-trading time. Forex Factory is OK now but accumulating scrape risk into the eventual prop-firm allocation audit doesn't sit well — they'll want to see a defensible data lineage and a free unauthorized scrape is the opposite.
+    2. **Real-time matters** for `/ratify` flow + the 23:00 ET cutoff. A 24h-stale Forex Factory feed means by the time we ingest at 22:00 ET on Monday we're already missing whatever was announced Tuesday morning. The next 22:00 ET ingestion catches up but at the cost of one missed-event window.
+    3. **$50/mo is small** relative to the ongoing infrastructure spend (~$13/mo VPS + ~$1/mo DataBento + ~$5/mo various). Aggregate trading-system OpEx is < $25/mo today; $50/mo for legal+freshness on a load-bearing component is a justified ~3x bump.
+    4. **API stability matters** for unattended weekend operation. The script-based scrape needs to handle Cloudflare challenges + ToS pivots + JSON-shape drift; an API contract is supported.
+    5. Spec §2.1.2 lists Trading Economics as the secondary anyway — option B just promotes secondary to primary.
+
+  **Counter-argument (where A wins):** Solo-operator budget discipline. Total OpEx is < $25/mo today; doubling it for a Phase 1 feature that the operator interacts with maybe 3 times a week (ratification ceremony) is not obviously the right call. A 24h-stale calendar is acceptable for tier-2 + tier-3 events; the operator already knows when FOMC / CPI / NFP are dropping because they're newsworthy. The ratification UI is just a safety check.
+
+  **Smaller pre-decision:** operator should also confirm whether Phase 1 ships with the web `/calendar` page **read-only** (per spec §2.7 + frontend-spec §1.3 = `available_from: 1` already), with ratification staying Discord-only per spec §2.7.4 + spec §6.1, OR whether we promote the spec's "Phase 2 web ratification" forward into Phase 1. Recommendation: **defer web ratification to Phase 2 as specced**; operator interaction at this point is via Discord which is mobile-friendly. Web page is just for "did I remember to ratify?" visibility.
+
+- **Storage model (locked; no decision needed):**
+
+  Use the existing `macro_events` table per alembic 0004 `0004_ops_tables.py:368-394` + backend-spec §3.28. Schema is:
+
+  ```sql
+  CREATE TABLE macro_events (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
+    imported_at_utc TIMESTAMPTZ NOT NULL,
+    source TEXT NOT NULL CHECK (source IN ('forex_factory','trading_economics','manual')),
+    event_name TEXT NOT NULL,
+    tier1_classification TEXT,                        -- 'FOMC','CPI','NFP', ...
+    scheduled_at_utc TIMESTAMPTZ NOT NULL,
+    region TEXT,                                      -- 'US','EU','UK','JP'
+    currency CHAR(3),
+    importance TEXT CHECK (importance IN ('high','medium','low')),
+    ratified_at_utc TIMESTAMPTZ,
+    ratified_by TEXT,                                 -- 'operator_discord','operator_web'
+    audit_event_uuid_import UUID NOT NULL,
+    audit_event_uuid_ratify UUID
+  );
+  ```
+
+  Note: the source CHECK already includes both `forex_factory` and `trading_economics` so the table can ingest from either without migration.
+
+- **Ingestion cadence proposal:**
+
+  Per spec §2.9 schedule list: nightly cron at **22:00 ET** (= 02:00 UTC during EST; 03:00 UTC during EDT — APScheduler handles via the wall-clock-anchored ET pattern locked at spec §2.9). Trading Economics' free tier allows 100 req/hr so a single 22:00 ET cron with a 30-day forward window is well within. Forex Factory's nightly refresh aligns with 21:00-22:00 UTC so 22:00 ET (= 03:00 UTC EDT) catches the freshest feed.
+
+  **Failure modes (locked at spec §2.1.2):**
+  - Last successful import > 48h → HALT_NEW (routine, `reason=calendar_service_outage`)
+  - 23:00 ET cutoff with no ratification → HALT_NEW (routine, `reason=calendar_unratified`)
+  - VACATION mode suspends both gates
+
+- **Discord `/calendar` command spec:**
+
+  Per spec §6.1 the Phase 1 Discord bot surface includes `/calendar` (read-only feed) + `/ratify` (mark tomorrow's events as reviewed). Phase 1 minimum:
+  - `/calendar` — shows next 7 days of tier-1 + tier-2 events as an embed (date / time ET / event name / region). Default window 7 days; `--days N` argument for custom.
+  - `/ratify` — shows tomorrow's events with a "Ratify all" button + per-event checkbox view; on confirm, POST `/api/calendar/ratify` with `{ratify_all: true}`; emits `macro_event_ratified` audit row per event.
+  - `/calendar add` — operator-entered event (e.g., earnings windows for ETF holdings); fields: event_name + scheduled_at_utc + tier1_classification + importance; POST to a new `/api/calendar/manual-add` endpoint.
+
+- **Web `/calendar` page spec (per frontend-spec §2.7):**
+
+  Spec is already complete — 30-day forward view + per-event tier color (red/amber/sky) + 3 filter dropdowns (range / type / tier) + Phase 1 read-only ratification panel ("Ratify via Discord `/ratify` (web ratification arrives in Phase 2)"). Frontend-spec §2.7.4 has the empty + hard-halt-banner states.
+
+  No spec changes needed; the implementation just instantiates spec §2.7 verbatim.
+
+- **Test approach:**
+
+  Standard 4-layer:
+  1. **Unit (`tests/unit/test_macro_events_ingestion.py`)** — pure-policy parser for the chosen source's response shape; classification rules (e.g., `r"(?i)^FOMC|federal funds|rate decision"` → `tier1_event=FOMC` per spec §2.1.2 implementation note); de-duplication across imports.
+  2. **Integration (`tests/integration/test_macro_events_db.py`)** — testcontainers Postgres; INSERT round-trip; UNIQUE constraint guard for re-imports; audit-event linkage.
+  3. **API contract (`tests/unit/test_api_calendar.py`)** — `GET /api/calendar/events?from=&to=` shape; `POST /api/calendar/ratify` audit chain ordering.
+  4. **A22 + A27 enforcement:** integration test for the actual source-vendor HTTP shape (respx-mocked for unit, manual-runbook for live confirmation). HTTPS endpoint shape is a third-party contract that A27 binds to — operator-runbook check at deploy time per dev-guide §6.8 alternative (b).
+
+- **Estimated effort:**
+
+  | Option | Build | Tests | Runbook | Total (~) |
+  |---|---|---|---|---|
+  | A (Forex Factory) | 1.5 day | 0.5 day | 0.5 day | 2.5 days |
+  | B (Trading Economics) | 1.5 day | 0.5 day | 0.5 day | 2.5 days |
+  | D (FRED + manual) | 1 day | 0.5 day | 0.5 day | 2 days |
+
+  A + B are similar effort because the HTTP fetcher + parser layer is the same shape; only the underlying URL + auth differs. Option C deliberately omitted (not recommended).
+
+  **Recommend: 2.5-day budget split across two Claude Code sessions** — session 1 (this opens, operator picks A/B/D, the ingestion pipeline + macro_events writes + Discord `/calendar` ships); session 2 (web `/calendar` page + `/ratify` Discord + integration tests + smoke).
+
+- **What needs operator input before next session can start work:**
+
+  1. **Data source: A, B, or D?** (Recommend B; counter-argument is solo-operator budget discipline favors A.)
+  2. **Confirm Phase 1 ratification stays Discord-only per spec?** (Recommend yes; web ratification = Phase 2 per spec.)
+  3. **Manual-event entry surface — Discord-only via `/calendar add`, OR also a web form on `/calendar`?** (Recommend Discord-only Phase 1 for parity with `/ratify`.)
+
+  All 3 questions go to the operator at next session start. The build cannot start until decision 1 lands because it determines the secret-management + cost-tracking + cron-cadence shape.
+
+- **References:**
+  - `Docs/backend-spec.md` §2.1.2 (Calendar Ingestion CRITICAL) + §2.9 (Scheduler) + §3.28 (`macro_events` schema)
+  - `Docs/frontend-spec.md` §2.7 (`/calendar` page layout + sections + data + states)
+  - `alembic/versions/0004_ops_tables.py:368-394` (existing `macro_events` table + index)
+  - `apps/web/src/lib/routes.config.ts:111` (`/calendar` route registered)
+  - Adjacent: today's drill 10 retrospective (above) closes the LIVE-validated paper-trading milestone; Calendar is the next Phase 1 page that needs build attention per the implementation guide.
+
 ### 2026-05-19 — Drill 10 — PR-η validated LIVE end-to-end; AC1-AC10 all GREEN; drill 6 → 10 defect series CLOSED
 
 - **Status:** FULL SUCCESS. Drill 10 (retry, after attempt 1's limit drifted out of marketable per drill 8 lesson #1) put the canonical entry + exit pipeline through the LIVE path with **PR-η's atomic `transmit=False/True` bracket protocol** registering the OCO linkage at IBKR — entry filled cleanly (PR-ζ no race), stop fired naturally on a 6.5pt /MES drift (~3.81 min hold), exit chain landed via LIVE (no replay), Discord `#fills` delivered both fills, audit chain CLEAN throughout. **No Error 201** (drill 9 defect closed). **No fill_processor race** (PR-ζ continues to hold). **No non-canonical SSE failures** (PR-ε continues to hold). The drill 6 → drill 10 defect series is now fully closed — every recommended-PR scope from the drill 6 retrospective has either shipped + LIVE-validated (PR-α/PR-ε/PR-ζ/PR-η) or is documented as deprioritized (PR-β/PR-δ).
