@@ -114,6 +114,7 @@ class IbkrPlaceOrderRequest:
     parent_broker_order_id: int | None = (
         None  # IBKR-side bracket parentId — when set on a stop, IBKR treats it as an OCO child of the entry (entry-cancel auto-cancels stop). PR-gamma / drill 6 defect #3 fix.
     )
+    transmit: bool = True  # IBKR-side transmit flag. PR-eta / drill 9 fix: set False on the entry leg of an atomic bracket so IBKR queues it in PendingSubmit until the child (stop, transmit=True + parentId=entry_id) arrives + releases both atomically. Default True preserves single-order behavior for non-bracket callers (cancel, recon, manual orders).
 
 
 @dataclass(frozen=True, slots=True)

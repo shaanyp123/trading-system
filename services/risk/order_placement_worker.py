@@ -643,6 +643,12 @@ async def apply_order_placement(
     )
 
     # Step 1: IBKR side effect — entry order.
+    # PR-eta: transmit=False holds the entry in PendingSubmit at IBKR until
+    # the stop arrives with transmit=True + parentId=<entry_broker_order_id>.
+    # IBKR then releases both atomically. This is the proper fix for
+    # drill 9's Error 201 race (entry filled before parentId could register).
+    # Single-order callers (operator-flatten via the manual close path,
+    # recon-driven cancels) keep the default transmit=True.
     entry_request = IbkrPlaceOrderRequest(
         client_order_id=plan.client_order_id,
         contract=contract,
@@ -651,6 +657,7 @@ async def apply_order_placement(
         order_type=plan.order_type,
         limit_price=plan.limit_price,
         time_in_force=plan.time_in_force,
+        transmit=False,
     )
     try:
         broker_result = await _await_ibkr_with_timeout(
@@ -745,26 +752,18 @@ async def apply_order_placement(
             stop_price=plan.stop_price,
             time_in_force="GTC",
             parent_client_order_id=plan.client_order_id,
-            # PR-gamma was reverted here on 2026-05-18 (drill 9 retrospective).
-            # Setting parent_broker_order_id=<entry_broker_order_id> caused
-            # IBKR to reject the stop with "Parent order is being cancelled"
-            # because the marketable-limit entry filled BEFORE the stop's
-            # parentId linkage could register. Drill 9 placement at
-            # 23:16:58 UTC reproduced this: entry filled at 7434.25
-            # within ~7ms (paper Smart routing), stop placed 134ms later
-            # got Error 201 from IBKR. The stop went to status=rejected,
-            # leaving the entry filled and the position naked.
-            # Proper fix requires IBKR's transmit=False/True bracket
-            # protocol (entry.transmit=False + stop.parentId + stop.transmit=True
-            # to atomically register both) or an OCA-group fallback —
-            # tracked as PR-eta in the next-session brief. Until that
-            # lands the stop reverts to the pre-PR-gamma standalone form
-            # (drill 6 defect #3 returns: cancelled entry leaves stop
-            # alive, but this is recoverable via reqGlobalCancel; the
-            # PR-gamma path BROKE entries entirely which is worse).
-            # The dataclass field on IbkrPlaceOrderRequest + the adapter
-            # wiring stay so the proper fix can re-enable without re-
-            # plumbing.
+            # PR-eta (2026-05-19): re-enable PR-gamma's IBKR-side parentId
+            # wiring now that the entry leg above carries transmit=False.
+            # IBKR holds the parent in PendingSubmit until this stop arrives
+            # with transmit=True + parentId=<entry_broker_order_id>, then
+            # releases both atomically. The drill 9 race (entry filled
+            # before parentId could validate) cannot recur because the
+            # parent is gated on the bracket being fully wired.
+            parent_broker_order_id=broker_order_id,
+            # transmit=True is the dataclass default; explicit here for
+            # readability — this is the leg that releases the entire bracket
+            # to the exchange when IBKR validates the parent/child pair.
+            transmit=True,
         )
         try:
             stop_broker_result = await _await_ibkr_with_timeout(

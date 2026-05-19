@@ -965,53 +965,53 @@ class TestApplyOrderPlacementBracket:
 
 
 # ---------------------------------------------------------------------------
-# TestBracketParentIdLinkage — PR-gamma REVERTED at the worker layer (2026-05-18)
+# TestBracketParentIdLinkage — PR-eta atomic bracket (2026-05-19)
 # ---------------------------------------------------------------------------
 
 
 class TestBracketParentIdLinkage:
-    """Locks the **post-revert** contract for the worker's bracket placement.
+    """Locks the PR-eta atomic-bracket contract for the worker.
 
-    PR-gamma originally threaded the entry's broker_order_id into
-    stop_request.parent_broker_order_id so the adapter would set
-    ``Order.parentId`` on the IBKR side. Drill 9 (2026-05-18 ~23:17 UTC)
-    proved this is incompatible with marketable-limit entries: the entry
-    filled within ~7ms (paper Smart routing at 7434.25 vs decision_price
-    7440.50); by the time the stop arrived 134ms later carrying
-    parentId=<entry_orderId>, IBKR's parent state machine considered the
-    parent "cancelled" (post-fill terminal) and rejected the stop with
-    Error 201 "Parent order is being cancelled". The position was left
-    NAKED until the operator manually placed a standalone protective stop.
+    Drill 9 (2026-05-18 23:16 UTC) proved that wiring
+    ``stop.parent_broker_order_id=<entry_id>`` alone (PR-gamma's
+    approach) is incompatible with marketable-limit entries — the
+    entry fills within ~7ms (paper Smart routing) and IBKR rejects
+    the late-arriving stop with Error 201 "Parent order is being
+    cancelled". PR-#187 reverted PR-gamma at the worker layer to
+    restore single-leg placement (standalone sell-stop, drill 6
+    defect #3 residual).
 
-    The proper fix requires IBKR's transmit=False/True bracket protocol
-    (entry.transmit=False + stop.parentId + stop.transmit=True so IBKR
-    holds the entry until the stop registers + then atomically transmits
-    both). That's a non-trivial refactor; tracked as PR-eta in the
-    drill 9 retrospective follow-ups.
+    PR-eta (2026-05-19) restores the bracket linkage CORRECTLY by
+    pairing PR-gamma's ``parent_broker_order_id`` with IBKR's
+    ``transmit=False/True`` bracket protocol:
 
-    Until PR-eta lands, the worker leaves
-    stop_request.parent_broker_order_id=None and the stop is placed as a
-    standalone sell-stop. Drill 6 defect #3 (cancelled entry leaves
-    naked stop) returns as the residual risk; that's recoverable via
-    reqGlobalCancel + monitoring, whereas the PR-gamma path BREAKS
-    entries entirely which is worse.
+      * entry leg: ``transmit=False`` so IBKR queues the parent in
+        PendingSubmit without releasing it to the exchange
+      * stop leg: ``transmit=True`` + ``parent_broker_order_id=<entry_id>``
+        so IBKR atomically releases both members of the bracket and
+        registers the OCA relationship at the same moment the parent
+        becomes eligible to fill
 
-    The dataclass field on IbkrPlaceOrderRequest + the adapter wiring in
-    IbAsyncIbkrClient.place_order are intentionally retained so PR-eta
-    can re-enable the linkage without re-plumbing the types or adapter.
+    With the parent gated on the bracket being fully wired, the drill 9
+    race (parent in post-fill terminal state when child's parentId
+    arrives) is structurally impossible. Operator-initiated entry-
+    cancel still cleans both legs because IBKR auto-cancels children
+    of a cancelled parent.
+
+    The PR-zeta pre-INSERT pattern is preserved — orders rows for both
+    legs are committed to the DB before the IBKR placeOrder calls fire,
+    so the fill_processor race window stays at zero.
     """
 
     @pytest.mark.asyncio
-    async def test_stop_request_does_not_carry_parent_broker_order_id_until_pr_eta(
+    async def test_entry_transmit_false_stop_transmit_true_with_parent_linkage(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Post-revert contract: stop_request.parent_broker_order_id is None.
-
-        Without this revert, drill 9's stop got rejected at IBKR with
-        Error 201 because the marketable-limit entry filled before the
-        parentId linkage could register. The dataclass default for
-        parent_broker_order_id is None (services/execution/types.py).
-        """
+        """The core PR-eta contract: entry leg carries transmit=False,
+        stop leg carries transmit=True + parent_broker_order_id pointing
+        at the entry's broker_order_id returned by the first place_order
+        call. This is the canonical IBKR atomic-bracket protocol per
+        TWS API docs + ib_async's BracketOrder helper."""
         from services.execution.types import IbkrContractRef
         from services.risk.order_placement_worker import apply_order_placement
 
@@ -1019,6 +1019,7 @@ class TestBracketParentIdLinkage:
 
         async def fake_place(request: Any) -> Any:
             place_calls.append(request)
+            # Entry returns broker_order_id=10; stop returns 11
             return _fake_ibkr_place_result(broker_order_id=10 if len(place_calls) == 1 else 11)
 
         ibkr = MagicMock()
@@ -1046,22 +1047,32 @@ class TestBracketParentIdLinkage:
         )
         assert len(place_calls) == 2
         entry, stop = place_calls
-        # Entry never carries a parent (it IS the parent if the bracket
-        # protocol were active; here both fields default to None).
+
+        # ---- Entry leg (parent) ----
+        # transmit=False: IBKR queues this in PendingSubmit and DOES NOT
+        # release to the exchange until a child arrives with transmit=True.
+        assert entry.transmit is False
+        # Entry never carries a parentId (it IS the parent).
         assert entry.parent_broker_order_id is None
-        # Stop also carries None until PR-eta wires the
-        # transmit=False/True protocol per IBKR's bracket spec.
-        assert stop.parent_broker_order_id is None
-        # The informational CID linkage is unchanged (it's not on the
-        # IBKR wire; it's persisted in the orders table for observability).
+
+        # ---- Stop leg (child) ----
+        # transmit=True: this is the leg that fires IBKR's atomic
+        # release of both members of the bracket.
+        assert stop.transmit is True
+        # parent_broker_order_id points at the entry's broker_order_id
+        # returned by the first place_order call (10).
+        assert stop.parent_broker_order_id == 10
+        # The informational CID linkage is preserved (not on the wire;
+        # persisted in the orders table for observability).
         assert stop.parent_client_order_id == plan.client_order_id
 
     @pytest.mark.asyncio
-    async def test_short_bracket_also_skips_parent_broker_order_id(
+    async def test_short_bracket_also_uses_transmit_protocol(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The revert is direction-agnostic — short brackets also skip
-        the parent_broker_order_id linkage until PR-eta."""
+        """The atomic-bracket contract is direction-agnostic: short
+        brackets (sell entry + buy stop above) also use transmit=False
+        on the entry + transmit=True + parent_broker_order_id on the stop."""
         from services.execution.types import IbkrContractRef
         from services.risk.order_placement_worker import apply_order_placement
 
@@ -1096,17 +1107,68 @@ class TestBracketParentIdLinkage:
         )
         entry, stop = place_calls
         assert entry.side == "sell"
+        assert entry.transmit is False
+        assert entry.parent_broker_order_id is None
         assert stop.side == "buy"
-        assert stop.parent_broker_order_id is None
+        assert stop.transmit is True
+        assert stop.parent_broker_order_id == 77
 
     @pytest.mark.asyncio
-    async def test_dataclass_default_for_parent_broker_order_id_is_none(self) -> None:
+    async def test_entry_rejected_skips_stop_placement(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If IBKR rejects the entry at submit (rare with transmit=False
+        but still possible — e.g., contract validation fails), the worker
+        must NOT proceed to place the stop. There's no parent to bracket
+        against; placing the stop alone would be a naked sell-stop on
+        no-position. Existing pre-PR-eta behavior preserved."""
+        from services.execution.types import IbkrContractRef
+        from services.risk.order_placement_worker import apply_order_placement
+
+        place_calls: list[Any] = []
+
+        async def fake_place(request: Any) -> Any:
+            place_calls.append(request)
+            return _fake_ibkr_place_result(broker_order_id=10, status="rejected")
+
+        ibkr = MagicMock()
+        ibkr.place_order = AsyncMock(side_effect=fake_place)
+        ibkr.cancel_order = AsyncMock()
+
+        async def fake_append(*args: Any, **kwargs: Any) -> Any:
+            return MagicMock(event_uuid=uuid4(), sequence_no=1)
+
+        monkeypatch.setattr(
+            "services.risk.order_placement_worker.append_audit_event",
+            AsyncMock(side_effect=fake_append),
+        )
+
+        plan = plan_order_placement(
+            _signal(direction="long", market="TLT", decision_price="85.00"),
+            env="paper",
+        )
+        contract = IbkrContractRef(market="TLT", ibkr_local_symbol="TLT", exchange="SMART")
+        await apply_order_placement(
+            plan,
+            ibkr_client=ibkr,
+            contract=contract,
+            session_factory=_build_apply_session_factory(),
+        )
+        # Only the entry attempted; no stop placement when entry rejects.
+        assert len(place_calls) == 1
+        # The (rejected) entry still carried transmit=False — that's what
+        # IBKR validated against; the rejection is on contract/price/etc.,
+        # not on the transmit flag.
+        assert place_calls[0].transmit is False
+
+    @pytest.mark.asyncio
+    async def test_dataclass_default_for_transmit_is_true(self) -> None:
         """Sanity-lock: the IbkrPlaceOrderRequest dataclass default for
-        parent_broker_order_id stays None even after the revert. The
-        adapter wiring honors this — if a future caller (PR-eta) sets
-        the field explicitly, the adapter will propagate to Order.parentId
-        (the TestPlaceOrderParentId class in test_execution_ibkr_adapter.py
-        locks that adapter-side contract independently)."""
+        ``transmit`` is True — preserves single-order behavior for callers
+        that aren't placing brackets (cancel paths, recon-driven manual
+        closes, operator-flatten via the manual close path). The adapter
+        propagates this to ib_async.Order.transmit (locked by
+        TestPlaceOrderTransmit in test_execution_ibkr_adapter.py)."""
         from decimal import Decimal
 
         from services.execution.types import (
@@ -1122,6 +1184,7 @@ class TestBracketParentIdLinkage:
             order_type="limit_marketable",
             limit_price=Decimal("85"),
         )
+        assert req.transmit is True
         assert req.parent_broker_order_id is None
 
 
