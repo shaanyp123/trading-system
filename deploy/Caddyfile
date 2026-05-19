@@ -103,7 +103,21 @@
 	# Default → Next.js frontend (lands Phase 0 Week 4+). Until the upstream
 	# exists, /` falls through to handle_errors. /api/* routes above are
 	# served independently and are not affected.
+	#
+	# Temporary "simple auth" gate (operator request 2026-05-19): HTTP Basic
+	# Auth on the frontend only. /api/* paths above are NOT gated so the
+	# watchdog poll, SSE multiplexer, and bot bearer-auth path keep working.
+	# This is a stopgap until the spec'd WebAuthn + TOTP flow at /login is
+	# wired end-to-end (backend-spec §8.5; routes already shipped Day 21 but
+	# operator wants entry gated NOW).
+	#
+	# Password hash generated via:
+	#   docker run --rm caddy:2-alpine caddy hash-password --plaintext '<pw>'
+	# To rotate: regenerate the hash and replace the second token below.
 	handle {
+		basic_auth {
+			spratcapital2026! $2a$14$.tOJT3KwonivfSDdTeoZEe2bvYmFvxDg8uCv6SA.v9iQRt4lmdFTO
+		}
 		reverse_proxy nextjs:3000
 	}
 }
