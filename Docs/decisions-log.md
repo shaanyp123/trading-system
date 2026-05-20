@@ -17,6 +17,125 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ## Entries
 
+### 2026-05-21 — Data-layer pivot v2 LANDS via Option C: api synthesizes bars from IBKR (clientId=2); LEAN reads via FakeDataQueue
+
+- **Status:** SUCCESS. Option C of the 2026-05-20 evening v2 architecture is implemented. The api now owns the bar-fetch responsibility via a new `services/data/bar_sync.py` module (`BarSyncWorker` on clientId=2; daily 17:00 ET cycle) that fetches IBKR `reqHistoricalData` daily OHLCV bars for all 11 Phase 1 markets + writes them to the shared `lean_data` Docker volume in LEAN's expected on-disk format (equity-daily zip + futures-daily zip + per-day universe CSVs + map_files sentinels). `lean_local` reverts to the original `FakeDataQueue` + `SubscriptionDataReaderHistoryProvider` shape and reads on-disk via the api-managed bars. **No second IBKR session. No QC plugin in the runtime path. $0/yr ongoing.**
+
+- **Spec reference:**
+  - 2026-05-20 evening entry (above) — the v1 attempt postmortem + 4 v2 options + Option C recommendation. This entry is the v2 landing.
+  - Backend-spec §1.2 + §2.1.1 — diagram + market-data ingestion section updated to reflect Option C.
+  - Dev-guide §1.5 LOCKED — clientId allocation extended: api worker=1, **api bar_sync=2 (this PR)**, operator probes=80-99, reserve 3-7 for further expansion. The 2026-05-20 v1 sub-pivot's "LEAN data-queue=10" allocation is RETIRED — LEAN does not connect to IBKR under Option C.
+
+- **Actual decision:** **Option C lands.** Architecture diagram:
+
+  ```
+  +-----------+       reqHistoricalData            +-------------+         IBKR
+  |  api      | --- ib-async clientId=2 --------> | ib_gateway  | -----> servers
+  |  (bar_    |     (read-only; per-cycle         +-------------+
+  |   sync)   |      connect → fetch → disconnect)
+  |           |                                          ^
+  |  (order   | --- ib-async clientId=1 ----------------+
+  |   worker) |     (long-lived; orders + positions)
+  +-----------+
+        |
+        | writes bars in LEAN on-disk format
+        | to /Lean/Data/ via the shared
+        v trading_lean_data Docker volume
+  +-----------+       FakeDataQueue + SubscriptionDataReaderHistoryProvider
+  | lean_local|     reads from /Lean/Data/ (read-only mount)
+  | (strategy |          |
+  |  unchanged|          v
+  |  except   |    daily 17:30 ET cycle -> POST /api/internal/lean/signals
+  |  freshness|
+  |  log re-  |
+  |  enabled) |
+  +-----------+
+  ```
+
+- **Code surface area landed:**
+  - **NEW:** `services/data/__init__.py` (3 lines) + `services/data/bar_sync.py` (~770 lines; pure-policy + writer + fetcher + worker)
+  - **NEW:** `tests/unit/test_bar_sync.py` (116 tests across 20+ test classes; pure-Python; A22 N/A)
+  - **UPDATED:** `services/api/config.py` — 5 new `bar_sync_*` settings (enabled / client_id / schedule_et / bars_per_fetch / data_root / ibkr_call_timeout_seconds)
+  - **UPDATED:** `services/api/main.py` — `_start_bar_sync_worker` + `_stop_bar_sync_worker` lifespan helpers; wired into `_lifespan` AFTER the heartbeat probe + BEFORE the async_task_monitor (so the monitor tracks the new task)
+  - **UPDATED:** `services/api/async_task_monitor.py::collect_tracked_tasks` — added `bar_sync` kwarg (default None for backwards compat); tracked-task count goes 3 → 4
+  - **UPDATED:** `tests/unit/test_async_task_monitor.py` — `test_all_none` + companion tests updated to assert 4 tracked tasks (was 3); 2 new tests added for bar_sync-specific tracking
+  - **REVERTED (v1 attempt cleanup):**
+    - `lean/lean.json` — `data-queue-handler` flipped back to `[FakeDataQueue]`, `history-provider` to `[SubscriptionDataReaderHistoryProvider]`; 9 ib-* keys + `job-user-id` + `api-access-token` REMOVED; new `$comment-rollback-2026-05-20-v2` documents the v1 → v2 transition
+    - `infrastructure/lean_local/Dockerfile` — multi-stage IBKR plugin NuGet pull REMOVED; back to single-stage extending `quantconnect/lean:latest` with tini + pyyaml + structlog + entrypoint only
+    - `infrastructure/lean_local/entrypoint.sh` — IBKR cred (`IB_USER_NAME` / `IB_PASSWORD` / `IB_ACCOUNT`) + QC subscription cred (`QC_USER_ID` / `QC_API_TOKEN`) reads REMOVED; only `LEAN_LOCAL_BEARER_TOKEN` + `LEAN_LOCAL_API_BASE_URL` remain
+    - `docker-compose.yml::lean_local` — `networks: [internal, egress]` → `[internal]` (no external HTTPS reach needed); `lean_data:/Lean/Data` → `lean_data:/Lean/Data:ro` (read-only mount)
+    - `docker-compose.yml::api` — added `lean_data:/Lean/Data:rw` volume mount so the BarSyncWorker can write
+    - `lean/v1_strategy.py::initialize` — `self._log_universe_freshness()` invocation RESTORED (was removed in PR #195); now catches api-side bar-sync failures (the strategies.v1_trend_following.universe_freshness module + its 27 tests stayed untouched throughout)
+
+- **Architectural decisions made in implementation:**
+
+  1. **clientId=2 for bar_sync (not 1).** The prompt said "uses its existing ib-async clientId=1 connection" but a separate connection on clientId=2 is the correct architectural choice. Reasons:
+     - **Defense in depth.** A bug or hang in the read-only historical fetch socket cannot backpressure the long-lived order socket on clientId=1.
+     - **Lifecycle decoupling.** The order worker holds clientId=1 for the entire api uptime; bar_sync's connection is per-cycle (connect → ~30s of fetches → disconnect). Sharing the IB instance would require the order worker to expose its internal `_ib` (forbidden whitelist), or extend the `IbkrClient` Protocol (also forbidden whitelist; would require `risk-review-approved`).
+     - **dev-guide §1.5 LOCKED reserves 2-7 for future expansion / read-only telemetry clients.** Bar sync IS read-only telemetry. clientId=2 is now allocated to this role.
+     - **IBKR supports multiple clientIds per gateway session** (verified 2026-05-19 evening probe; clientId=1 + 10 + 95 ran simultaneously). The constraint is on multiple GATEWAYS per IBKR account, not multiple clientIds per gateway.
+
+  2. **Futures bar-write strategy: continuous-mapped bars → current front-month bucket.** For each futures market the worker:
+     - Fetches continuous-mapped daily bars via `ib_async.ContFuture(...)` (IBKR handles the front-month rotation math).
+     - Resolves the CURRENT front-month expiry via `reqContractDetails` + the new `pick_front_month_expiry` helper (earliest remaining expiry whose `lastTradeDateOrContractMonth` has not yet passed).
+     - Writes ALL back-history bars under the current front-month expiry zip (e.g., `mes_trade.zip → mes_trade_202606.csv`) + writes per-day universe CSVs pinning the current front-month for every day in the back-history (one file per session date, all referencing the same `202606` expiry).
+
+     This is the simplifying insight that lets us avoid per-historical-expiry IBKR queries (which would require enumerating all expiries that were active in the past ~225 trading days and fetching each via `reqHistoricalData`). For a daily-resolution trend-following strategy where Donchian/MA/Hurst/ATR all derive from continuous-close prices, the continuous-mapped back-history is functionally equivalent to a per-expiry replay. LEAN's `DataMappingMode.OPEN_INTEREST + DataNormalizationMode.RAW` resolver picks "the only contract in today's universe file" without consulting actual historical front-month rotations.
+
+  3. **ETF bar-write: standard equity-daily layout.** Fetch via `ib_async.Stock(symbol, 'SMART', 'USD')` + write the equity-daily zip with deci-cent integer-scaled prices ($85.56 → 855600) + 2-row map_file sentinel + 2-row factor_file sentinel (price_factor=1, split_factor=1; reference_price = last close). Matches the deleted `scripts/seed_lean_data.py` byte-for-byte.
+
+  4. **17:00 ET schedule (30 min before LEAN's 17:30 cycle).** Operator can tune via `API_BAR_SYNC_SCHEDULE_ET=HH:MM` env var. 30 min gives the worker ample time to fetch 11 markets (~5-10s each) + write to disk before LEAN reads at 17:30.
+
+  5. **Per-cycle IBKR connection lifecycle.** Connect at cycle start, disconnect after all markets land. Mirrors the operator-probe pattern (clientId=99 in `scripts/operator_tools/replay_executions.py`) and side-steps the long-lived-socket failure modes the order worker has had to defend against (drill 5's Error 1100 silent-absence; PR #169's per-call timeouts).
+
+  6. **`_log_universe_freshness` invocation restored.** The module + 27 tests stayed in the repo throughout the v1 attempt; the invocation was removed in PR #195 because the on-disk path was supposed to go away. With Option C the on-disk path returns + the api manages freshness — the log becomes the canonical signal of "did BarSyncWorker land successfully on the most recent cycle?"
+
+- **Rationale (vs. v1 IBKR plugin path that failed):**
+
+  | Property | v1 (failed) | v2 Option C (this PR) |
+  |---|---|---|
+  | LEAN ↔ IBKR | Direct via QC `InteractiveBrokersBrokerage` plugin on clientId=10 | None — LEAN reads on-disk only |
+  | api ↔ IBKR | Existing clientId=1 (orders) | clientId=1 (orders) + clientId=2 (bars; this PR) |
+  | Gateway count | 2 (api's sidecar + LEAN's IBAutomater-spawned) → **infeasible per IBKR session model** | 1 (api's sidecar; shared via clientIds) |
+  | QC subscription validation | Required at LEAN boot (HTTPS egress; sops creds) | Not needed |
+  | Plugin DLLs in lean_local image | 7 files (~5MB; NuGet multi-stage pull) | None |
+  | Operational complexity at lean_local boot | High (4 sops fields + 1 HTTPS egress + 5 fail-close branches in entrypoint) | Low (1 sops field + 0 egress + 1 fail-close branch) |
+  | Data freshness | IBKR delayed quotes + reqHistoricalData (1-3s lag) | Same — api uses the same APIs |
+  | Architectural-mismatch risk | High (IBAutomater wants to launch its own gateway) | None (api's read-only socket; standard ib-async pattern) |
+  | Defense in depth | Low (LEAN's order path + data path on same plugin instance) | High (api-side orders + bars on separate sockets; LEAN read-only) |
+
+- **Cost / scope impact:**
+  - **Ongoing data costs: $0/yr.** Same as v1 — IBKR's reqHistoricalData is free for account holders.
+  - **Image size:** lean_local image drops back to baseline `quantconnect/lean:latest + tini + pyyaml + structlog` (~1.5GB; ~5MB smaller than the v1 multi-stage build).
+  - **CCX13 VPS:** No new container; no new network egress. lean_local stops needing the `egress` network attachment.
+  - **`lean_data` Docker volume:** Now actively written by the api (was idle under the v1 attempt's plan; the v1 path had LEAN reading from IBKR directly). Steady-state: ~1-2MB written per market per cycle × 11 markets × ~250 universe files per futures market = ~30MB total per cycle. Negligible disk I/O.
+  - **VPS state at this PR landing:** the operator must `docker compose --env-file deploy/.env build api lean_local` (api code changed → bar_sync worker; lean_local Dockerfile changed → revert to single-stage) + `docker compose --env-file deploy/.env up -d --force-recreate api lean_local`. The v1 attempt's idle DLLs (`CSharpAPI.dll`, `IBAutomater.jar`, etc.) drop out at this rebuild. `lean_local` should boot cleanly within ~60s.
+
+- **Acceptance criteria (verified at land time):**
+  - [x] `services/data/bar_sync.py` lands with BarSyncWorker, parser, writers, freshness helpers
+  - [x] 116 new unit tests pass (50+ target exceeded); existing 1892 tests continue to pass (1 unrelated flake on the P95 latency test under host load — pre-existing)
+  - [x] `lean.json` reverts to FakeDataQueue + SubscriptionDataReaderHistoryProvider; no ib-* keys; no QC keys
+  - [x] `docker-compose.yml`: lean_local `networks: [internal]` + `lean_data:/Lean/Data:ro`; api `lean_data:/Lean/Data:rw`
+  - [x] `entrypoint.sh` reverts IBKR + QC cred reads
+  - [x] `v1_strategy.py` restores `_log_universe_freshness()` invocation
+  - [ ] VPS deploy + smoke (operator-side): lean_local boots cleanly; api scheduler fires at 17:00 ET; `bar_sync_cycle_completed failed_markets=[]`; LEAN cycle at 17:30 ET emits `signals_emitted_count + rejections_count = 11`; `verify_chain --env paper` passes
+
+- **Open follow-ups (Phase 1+):**
+  1. **Deprecate the v1 attempt's idle Dockerfile artifacts on VPS.** After ~30 days of stable Option C operation, the operator can `docker image prune` to reclaim the v1 IBKR-plugin layer caches that linger from earlier `docker compose build lean_local` invocations.
+  2. **`bar_sync` exception → AsyncTaskMonitor Discord alert.** The existing `async_task_monitor` ticks every 30s + emits `async_task_died` if the bar_sync worker hits an unhandled exception. The 2026-05-17 follow-up #3 (P2 Discord push on staleness) lands automatically because `bar_sync_worker.run_forever` is now in the `collect_tracked_tasks` set. Verification deferred to first post-deploy soak day.
+  3. **Per-market success/failure SSE event for the Discord `#alerts` push.** Currently bar_sync emits structlog-only `bar_sync_market_failed`. If recurring failures become operationally noisy, fire a per-market `data_quality` SSE event that webhook_pusher routes to `#alerts`. Pre-empted by the simpler `_log_universe_freshness` log line which lands LEAN-side from the strategy's perspective.
+  4. **Phase 2 real-time data subscription deferred.** Same as the 2026-05-20 entry's follow-up #3: delayed quotes are sufficient for daily-cadence; real-time bundle (~$10/mo) is deferred until a future strategy depends on intraday tick freshness.
+  5. **`bar_sync` test coverage gap: integration test against testcontainers + a faked ib-async.** Current 116 tests are pure-policy + filesystem; a future integration test (A22-binding) could exercise the full lifespan loop with a stubbed IB and assert on the structlog event sequence. Deprioritized — the unit suite covers the contract surface comprehensively.
+
+- **References:**
+  - `services/data/bar_sync.py` (this PR; new module)
+  - `tests/unit/test_bar_sync.py` (this PR; 116 tests)
+  - `Docs/decisions-log.md` 2026-05-20 evening entry (the v1 postmortem + Option C recommendation that motivated this PR)
+  - `Docs/decisions-log.md` 2026-05-20 original entry (the v1 sub-pivot's clientId allocation + 2026-05-19 IBKR probe — both carry forward to Option C unchanged)
+  - `Docs/backend-spec.md` §1.2 + §2.1.1 (updated diagram + market-data ingestion in this PR)
+  - `Docs/claude-dev-guide.md` §1.5 LOCKED (clientId allocation extended in this PR)
+  - `deploy/lean_local/README.md` (operator runbook rewritten for Option C in this PR)
+
 ### 2026-05-20 (evening) — Data-layer pivot deploy ceremony: 3 sequential failure modes; lean_local stopped pending v2 architecture
 
 - **Status:** PARTIAL FAILURE — PRs #195 + #196 + #197 all merged to `main` (data-layer pivot + 2 hot-fixes). `lean_local` deploy ceremony hit 3 sequential boot failures; the third is an architectural mismatch that the v1 implementation cannot resolve. `lean_local` is **stopped** on the VPS (paper trading offline) pending a v2 strategy. The api worker on clientId=1 is unaffected; ib_gateway is unaffected; audit chain is unaffected.

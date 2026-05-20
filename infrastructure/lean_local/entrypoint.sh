@@ -25,6 +25,15 @@
 # config and writes the result back to its canonical location, with
 # absolute paths for algorithm-location + data-folder and the active
 # environment selected from LEAN_LIVE_MODE.
+#
+# DATA-LAYER PIVOT v2 (Option C; 2026-05-20 evening): the v1 attempt's
+# `IB_USER_NAME` / `IB_PASSWORD` / `IB_ACCOUNT` / `QC_USER_ID` /
+# `QC_API_TOKEN` sops reads were dropped — LEAN no longer talks to
+# IBKR or QC's subscription validator. Bar data is now api-managed
+# (services/data/bar_sync.py reads via ib-async on clientId=2 and
+# writes to the shared lean_data Docker volume); LEAN reads on-disk
+# via FakeDataQueue + SubscriptionDataReaderHistoryProvider. See
+# Docs/decisions-log.md 2026-05-20 evening entry + the v2 landing entry.
 
 set -eu
 
@@ -80,112 +89,6 @@ esac
 # Docker network. Operator can override at the compose layer.
 : "${LEAN_LOCAL_API_BASE_URL:=http://api:8000}"
 export LEAN_LOCAL_API_BASE_URL
-
-# DATA-LAYER SUB-PIVOT 2026-05-20: LEAN reads market data from IBKR via
-# the `InteractiveBrokersBrokerage` data-queue-handler + history-provider
-# (delayed quotes 1-3s actual lag + reqHistoricalData) on a distinct
-# client-id from the api's order-placement worker (api=1, LEAN=10 per
-# dev-guide §1.5 LOCKED). The IBKR plugin DLL is baked into the image
-# via Dockerfile multi-stage NuGet pull; the credentials below land
-# substituted into lean.json's `${IB_USER_NAME}` / `${IB_PASSWORD}` /
-# `${IB_ACCOUNT}` placeholders at the deep-merge step further down.
-#
-# Source fields in sops (same fields the ib_gateway sidecar uses to
-# authenticate the gateway login — the api process never reads
-# username/password, just the account_number for the FlexQuery flow
-# via services/api/entrypoint.py):
-#   ibkr.paper_username → IB_USER_NAME
-#   ibkr.paper_password → IB_PASSWORD
-#   ibkr.paper_account  → IB_ACCOUNT
-#
-# Fail-closed if any are missing or carry the sops template's
-# `<TODO_...>` placeholder. We do NOT fall back silently to a default
-# account — that would attach LEAN's data-queue at clientId=10 to the
-# WRONG paper account and silently emit signals against bars from a
-# different sub-universe than the api's order-placement state.
-#
-# These reads were ORIGINALLY present in this script pre-2026-05-12;
-# PR #120 dropped them when LEAN was swapped to PaperBrokerage for data
-# AND fills. The 2026-05-20 data-layer sub-pivot restores them for the
-# data path only (live-mode-brokerage stays PaperBrokerage so LEAN
-# never places orders).
-if [ -z "${IB_USER_NAME:-}" ]; then
-    IB_USER_NAME="$(read_secret 'ibkr.paper_username')"
-    export IB_USER_NAME
-fi
-if [ -z "${IB_PASSWORD:-}" ]; then
-    IB_PASSWORD="$(read_secret 'ibkr.paper_password')"
-    export IB_PASSWORD
-fi
-if [ -z "${IB_ACCOUNT:-}" ]; then
-    IB_ACCOUNT="$(read_secret 'ibkr.paper_account')"
-    export IB_ACCOUNT
-fi
-
-for var_name in IB_USER_NAME IB_PASSWORD IB_ACCOUNT; do
-    eval "val=\${$var_name}"
-    if [ -z "${val}" ]; then
-        echo "[lean_local_entrypoint] FATAL: ${var_name} is empty (sops field ibkr.paper_username / .paper_password / .paper_account missing in $SECRETS_PATH)" >&2
-        echo "[lean_local_entrypoint] LEAN's InteractiveBrokersBrokerage data-queue-handler requires all three (2026-05-20 data-layer sub-pivot)." >&2
-        echo "[lean_local_entrypoint] Fix: sops secrets/<env>.enc.yaml; populate ibkr.paper_username / ibkr.paper_password / ibkr.paper_account; commit + redeploy." >&2
-        echo "[lean_local_entrypoint] See deploy/lean_local/README.md Step 1 + Docs/decisions-log.md 2026-05-20 entry." >&2
-        exit 2
-    fi
-    case "${val}" in
-        "<TODO"*|"null")
-            echo "[lean_local_entrypoint] FATAL: ${var_name} still has placeholder value '${val}'" >&2
-            echo "[lean_local_entrypoint] Replace with the real IBKR paper-account credential via sops." >&2
-            exit 2
-            ;;
-    esac
-done
-
-# DATA-LAYER SUB-PIVOT 2026-05-20 (boot-attempt-2 follow-up): the
-# QuantConnect.Brokerages.InteractiveBrokers v2.5.17699 NuGet plugin enforces
-# a ValidateSubscription() check at instantiation — calls
-# https://www.quantconnect.com/api/v2/authenticate with `job-user-id` +
-# `api-access-token` from lean.json (the values below substitute into
-# ${QC_USER_ID} / ${QC_API_TOKEN} placeholders at the deep-merge step).
-# Without these the plugin shuts LEAN down with "Invalid api user id or
-# token, cannot authenticate subscription" and lean_local restart-loops.
-#
-# Source fields in sops:
-#   quantconnect.user_id  (int — operator's QC numeric user_id) → QC_USER_ID
-#   quantconnect.api_token (64-char string)                     → QC_API_TOKEN
-#
-# Also requires lean_local to have `egress` network access (added in
-# docker-compose.yml) so the validation HTTPS call can reach
-# www.quantconnect.com:443.
-#
-# Fail-closed on missing or placeholder values — the plugin won't initialize
-# without them and the container would restart-loop anyway; better to fail
-# loudly here with a clear error than silently inside LEAN's startup.
-if [ -z "${QC_USER_ID:-}" ]; then
-    QC_USER_ID="$(read_secret 'quantconnect.user_id')"
-    export QC_USER_ID
-fi
-if [ -z "${QC_API_TOKEN:-}" ]; then
-    QC_API_TOKEN="$(read_secret 'quantconnect.api_token')"
-    export QC_API_TOKEN
-fi
-
-for var_name in QC_USER_ID QC_API_TOKEN; do
-    eval "val=\${$var_name}"
-    if [ -z "${val}" ]; then
-        echo "[lean_local_entrypoint] FATAL: ${var_name} is empty (sops field quantconnect.user_id / .api_token missing in $SECRETS_PATH)" >&2
-        echo "[lean_local_entrypoint] The QuantConnect IBKR brokerage plugin requires these for its ValidateSubscription() check at startup." >&2
-        echo "[lean_local_entrypoint] Fix: sops secrets/<env>.enc.yaml; populate quantconnect.user_id (int) + quantconnect.api_token (64-char string); commit + redeploy." >&2
-        echo "[lean_local_entrypoint] See Docs/decisions-log.md 2026-05-20 entry." >&2
-        exit 2
-    fi
-    case "${val}" in
-        "<TODO"*|"null")
-            echo "[lean_local_entrypoint] FATAL: ${var_name} still has placeholder value '${val}'" >&2
-            echo "[lean_local_entrypoint] Replace with the operator's real QC credential via sops." >&2
-            exit 2
-            ;;
-    esac
-done
 
 # Deep-merge our template on top of upstream config.json. The upstream
 # config at /Lean/Launcher/bin/Debug/config.json is a full framework

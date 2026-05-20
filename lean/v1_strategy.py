@@ -297,24 +297,22 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
             f"params_keys={sorted(params.keys())}"
         )
 
-        # DATA-LAYER SUB-PIVOT 2026-05-20: the on-disk universe-freshness
-        # check is now moot. LEAN reads market data from IBKR via the
-        # `InteractiveBrokersBrokerage` data-queue-handler + history-provider
-        # (delayed quotes + reqHistoricalData on clientId=10) — there is no
-        # `/Lean/Data/future/<ticker>/universes/*.csv` to walk anymore. The
-        # 2026-05-17 staleness incident that motivated PR #172 + PR #174
-        # can no longer recur because IBKR's reqHistoricalData always
-        # returns up-to-the-current-trading-day bars for the active
-        # contract chain. The `strategies.v1_trend_following.universe_freshness`
-        # module + its 27 unit tests stay in the repo (broker-agnostic
-        # filesystem logic; reusable if a future on-disk universe pattern
-        # returns); the `_log_universe_freshness` method below stays too
-        # (it's pure observability + swallows all exceptions). The
-        # invocation is removed because calling it against an empty
-        # `/Lean/Data/future` would log `v1_universe_data_missing` for
-        # all 7 micros every boot — noise the operator would learn to
-        # ignore, defeating the canonical-fingerprint design.
-        # See Docs/decisions-log.md 2026-05-20 entry.
+        # DATA-LAYER PIVOT v2 RESTORATION (Option C; 2026-05-20 evening):
+        # the v1 attempt (PR #195) removed the `_log_universe_freshness`
+        # invocation because LEAN was supposed to read market data directly
+        # from IBKR via the `InteractiveBrokersBrokerage` data-queue-handler
+        # — no on-disk universe files to walk. The v1 path was blocked at
+        # deploy (IBAutomater gateway-launch conflict); Option C revives
+        # the on-disk path with api-managed freshness via
+        # `services/data/bar_sync.py` (BarSyncWorker on clientId=2; daily
+        # 17:00 ET). The freshness check resumes its original purpose:
+        # catching api-side bar-sync failures (if BarSyncWorker fails for
+        # 5+ calendar days the operator sees `v1_universe_data_stale` in
+        # the LEAN log + the AsyncTaskMonitor's pending P2 alert hook
+        # fires per the 2026-05-17 evening incident's follow-up #3).
+        # See Docs/decisions-log.md 2026-05-20 evening + the v2 landing
+        # entry for the full chain.
+        self._log_universe_freshness()
 
         # Emit a startup heartbeat so the operator can confirm the algorithm
         # successfully reached this point + can authenticate against the

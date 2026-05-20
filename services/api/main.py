@@ -940,12 +940,105 @@ async def _stop_heartbeat_probe(state: tuple[object, object] | None) -> None:
         log.exception("heartbeat_probe_task_join_failed")
 
 
+async def _start_bar_sync_worker(
+    settings: APISettings,
+) -> tuple[object, object] | None:
+    """Construct + start the BarSyncWorker; return (worker, task) or None.
+
+    Option C of the 2026-05-20 data-layer pivot v2 (see
+    ``Docs/decisions-log.md`` 2026-05-20 evening entry). Fetches daily
+    OHLCV bars for the Phase 1 universe from IBKR via a dedicated
+    ib-async connection on ``clientId=2`` (distinct from the
+    OrderPlacementWorker's ``clientId=1``) and writes them to the
+    shared ``lean_data`` Docker volume in LEAN's expected on-disk
+    format. LEAN reads via FakeDataQueue +
+    SubscriptionDataReaderHistoryProvider on its 17:30 ET signal cycle.
+
+    Best-effort: when ``bar_sync_enabled=False`` returns None + logs a
+    structured warning. Other failure modes (ib-async dep missing, etc.)
+    log + return None without crashing the api boot.
+
+    Connection lifecycle is per-cycle (connect → fetch → disconnect)
+    inside ``BarSyncWorker.run_cycle``, not held across ticks. The
+    short-lived socket is intentional defense-in-depth: a bug or hang
+    in the read-only historical path cannot backpressure the long-lived
+    ``clientId=1`` order socket.
+    """
+    if not settings.bar_sync_enabled:
+        log.warning("bar_sync_worker_disabled_via_setting")
+        return None
+
+    # Lazy imports — keeps the rest of the api importable even if the
+    # services.data subpackage churns + avoids loading ib-async at
+    # module-load (the worker only needs it at first-cycle).
+    from datetime import time as _time
+    from pathlib import Path as _Path
+
+    from services.data.bar_sync import BarSyncConfig, BarSyncWorker
+
+    # Parse the HH:MM schedule string. The Pydantic field's regex
+    # constraint guarantees the shape; the split is safe.
+    hh_str, mm_str = settings.bar_sync_schedule_et.split(":", 1)
+    sync_time = _time(hour=int(hh_str), minute=int(mm_str))
+
+    config = BarSyncConfig(
+        data_root=_Path(settings.bar_sync_data_root),
+        bars_per_fetch=settings.bar_sync_bars_per_fetch,
+        sync_time_et=sync_time,
+        ibkr_host=settings.ibkr_host,
+        ibkr_port=settings.ibkr_port,
+        ibkr_client_id=settings.bar_sync_client_id,
+        ibkr_account=settings.ibkr_account,
+        ibkr_call_timeout_seconds=settings.bar_sync_ibkr_call_timeout_seconds,
+    )
+    worker = BarSyncWorker(config=config)
+    task = asyncio.create_task(worker.run_forever(), name="bar_sync_worker.run_forever")
+    log.info(
+        "bar_sync_worker_spawned",
+        env=_audit_env_from_settings(settings),
+        ibkr_host=settings.ibkr_host,
+        ibkr_port=settings.ibkr_port,
+        ibkr_client_id=settings.bar_sync_client_id,
+        bars_per_fetch=settings.bar_sync_bars_per_fetch,
+        sync_time_et=settings.bar_sync_schedule_et,
+        data_root=settings.bar_sync_data_root,
+        ibkr_call_timeout_seconds=settings.bar_sync_ibkr_call_timeout_seconds,
+        universe_size=len(config.markets),
+    )
+    return worker, task
+
+
+async def _stop_bar_sync_worker(state: tuple[object, object] | None) -> None:
+    """Request stop + await the worker task. Best-effort."""
+    if state is None:
+        return
+    worker, task = state
+    try:
+        worker.request_stop()  # type: ignore[attr-defined]
+    except Exception:
+        log.exception("bar_sync_worker_request_stop_failed")
+    try:
+        await asyncio.wait_for(task, timeout=15.0)  # type: ignore[arg-type]
+    except TimeoutError:
+        log.warning("bar_sync_worker_shutdown_timeout")
+        task.cancel()  # type: ignore[attr-defined]
+        try:
+            await task  # type: ignore[misc]
+        except asyncio.CancelledError:
+            log.info("bar_sync_worker_shutdown_cancelled")
+        except Exception:
+            log.exception("bar_sync_worker_shutdown_unclean")
+    except Exception:
+        log.exception("bar_sync_worker_task_join_failed")
+
+
 async def _start_async_task_monitor(
     settings: APISettings,
     *,
     order_placement: tuple[object, object] | None,
     reconciliation: tuple[object, object] | None,
     heartbeat_probe: tuple[object, object] | None,
+    bar_sync: tuple[object, object] | None = None,
     monitor_alert_hook: object | None = None,
 ) -> tuple[object, object] | None:
     """Construct + start the AsyncTaskMonitor; return (monitor, task) or None.
@@ -971,6 +1064,7 @@ async def _start_async_task_monitor(
         order_placement=order_placement,
         reconciliation=reconciliation,
         heartbeat_probe=heartbeat_probe,
+        bar_sync=bar_sync,
     )
 
     ibkr_error_tracker = _build_ibkr_error_tracker(order_placement, monitor_alert_hook)
@@ -1121,6 +1215,7 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     worker_state: tuple[object, object] | None = None
     recon_state: tuple[object, object] | None = None
     heartbeat_probe_state: tuple[object, object] | None = None
+    bar_sync_state: tuple[object, object] | None = None
     async_task_monitor_state: tuple[object, object] | None = None
     try:
         try:
@@ -1154,10 +1249,21 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             # without the probe running.
             log.exception("heartbeat_probe_startup_failed")
         try:
-            # The monitor MUST start AFTER the other 3 so it can
+            # Bar-sync worker (Option C of the 2026-05-20 data-layer
+            # pivot v2). Reads from IBKR on clientId=2, writes to the
+            # lean_data Docker volume that lean_local mounts. Cycle
+            # fires at 17:00 ET daily.
+            bar_sync_state = await _start_bar_sync_worker(settings)
+        except Exception:
+            # Bar-sync startup is best-effort; without it LEAN reads stale
+            # bars on the next cycle. The api still serves the rest of
+            # its surface and the operator can restart to recover.
+            log.exception("bar_sync_worker_startup_failed")
+        try:
+            # The monitor MUST start AFTER the other 4 so it can
             # capture their final `(worker, task)` tuples (or `None`
             # for ones that failed to spawn). The monitor itself is
-            # a 4th task and is NOT in its own tracked set.
+            # a 5th task and is NOT in its own tracked set.
             #
             # Drill 5 follow-up #2-FU-1: build the monitor's alert
             # dispatch hook BEFORE starting the monitor so a fresh
@@ -1171,6 +1277,7 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 order_placement=worker_state,
                 reconciliation=recon_state,
                 heartbeat_probe=heartbeat_probe_state,
+                bar_sync=bar_sync_state,
                 monitor_alert_hook=monitor_alert_hook,
             )
         except Exception:
@@ -1182,6 +1289,7 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     finally:
         log.info("api_stopping")
         await _stop_async_task_monitor(async_task_monitor_state)
+        await _stop_bar_sync_worker(bar_sync_state)
         await _stop_heartbeat_probe(heartbeat_probe_state)
         await _stop_reconciliation_scheduler(recon_state)
         await _stop_order_placement_worker(worker_state)
