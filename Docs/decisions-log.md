@@ -61,6 +61,71 @@ Canonical log of decisions made and deviations from the specs as the build progr
   - 2026-05-19 Drill 10 retrospective — the LIVE-validated end-to-end milestone for the order path
   - 2026-05-12 pivot block — the original architecture pivot that retired QC ObjectStore polling
 
+### 2026-05-20 — Live-money cutover plan v1.0 drafted (operator-ratified decision set; doc-only PR)
+
+- **Status:** PLANNING. Same-day follow-up to the Operational Day 1 milestone. With paper now formally live, the operator opened a brainstorm session to lock the decision set around the eventual `live-small` cutover. The output is a single planning doc at `Docs/live-money-cutover-plan.md` (~560 lines) that the operator (or a future build session) can execute against without re-deriving the policy questions. Live cutover itself remains a future Phase milestone — earliest plausible date Operational Day 30 of paper (≈ 2026-06-30) per readiness gate G1.
+
+- **Decisions ratified this session (16 locked constants in §1 of the new doc):**
+
+  1. **Starting deposit:** $25,000 USD (mid-tier; 50%-rule admits the full futures candidate universe with margin).
+  2. **Vol target at cutover:** 15% annual = paper default. Calendar-trigger revisit at Operational Day 30 of live with a paper-vs-live realized-vol comparison; no automated tightening.
+  3. **Kill-switch tolerances:** zero env-tier differentiation. Live runs paper's existing trigger × severity matrix; tightening earned post-Day-30 if data supports it.
+  4. **VPS topology:** same Hetzner Ashburn box, parallel docker-compose stacks via env-file override (`-p trading-live --env-file deploy/.env.live`). CCX13 → CCX23 upgrade is part of cutover ceremony step 0 (RAM headroom for two stacks).
+  5. **Readiness gate:** 30 paper sessions + 10 round-trips + 0 unresolved P0/P1/recon-breaks. Audit chain CLEAN every day. Operator self-attests on subjective items.
+  6. **Capital events wired Day 1:** all four — deposits, withdrawals, dividends, interest accrual. Requires (a) Discord `/capital-deposit` + `/capital-withdraw` commands shipped + (b) FlexQuery CashTransaction section enabled.
+  7. **Panic-flatten Day 1:** web `/system` INVOKE + manual TWS flatten. Discord `/flatten-all` lands as fast-follow PR (NOT cutover-blocking).
+  8. **P&L multiplier-correctness defect (Drill 9/10 follow-up #1):** must fix BEFORE cutover. Gates cutover.
+  9. **Discord channels:** shared with paper; embeds tagged `env=PAPER` / `env=LIVE`.
+  10. **First-live-signal ceremony:** none — operator trusts the 30-day paper soak as adequate validation.
+
+- **Open decisions (Appendix B of the new doc) — 9 items still TBD pre-cutover:**
+
+  | # | Open question | Default if unlocked at cutover |
+  |---|---|---|
+  | O1 | Apex routing post-cutover (paper @ apex vs live @ apex) | Live takes `live.spratcapital.com`; paper stays at apex |
+  | O2 | CME real-time data subscription (~$1.50/mo) | Enable at cutover |
+  | O3 | Live FlexQuery template | Operator creates pre-cutover in IBKR portal |
+  | O4 | Live WebAuthn re-enrollment | Re-enroll (rp_id distinct) |
+  | O5 | Live env-tag in lean.json | Reuse `paper-internal` (LEAN doesn't connect to IBKR under Option C) |
+  | O6 | CCX13 → CCX23 upgrade timing | Pre-cutover |
+  | O7 | Live `parameter_sets` head row provenance | Copy paper's current head |
+  | O8 | Watchdog poll targets | Poll both paper + live |
+  | O9 | Live S3 backup partition | Same bucket; new prefix `live-small/` |
+
+- **Build PRs surfaced (Appendix A — 13 follow-up sessions enumerated):**
+
+  Cutover-blocking subset (~4-5 dev sessions):
+  - A1: Fix `realized_pnl_usd` futures multiplier (Drill 10 follow-up #1)
+  - A2: Live env-tag handling (operator-script INSERT of `accounts` + `risk_state` + `parameter_sets` head row; no schema migration)
+  - A3: `deploy/.env.live` + `docker-compose.live.yml` overlay
+  - A4: Caddy config: paper + live site blocks per O1
+  - A5: Discord `/capital-deposit` + `/capital-withdraw` slash commands
+  - A10: Dual-IBKR-gateway session model validation (cheap pre-cutover smoke)
+  - A12: sops live template hygiene (backport post-Day-21/23 fields; remove vendor-cancelled sections)
+
+  Fast-follow (non-blocking):
+  - A6: `/flatten-all` Discord command
+  - A7: env=PAPER/LIVE tag in Discord embeds
+  - A8: FlexQuery CashTransaction parser (dividends + interest)
+  - A9: Annual-loss + extended-drawdown soft-trigger
+  - A11: Phase 1+ failure-mode re-tightening (Operational Day 30 of live)
+  - A13: Day-30 paper-vs-live realized-vol analysis script
+
+- **Why a doc and not a build prompt (outcome 1 vs outcome 2 from the prompt):**
+
+  The brainstorm surfaced ~5-7 cutover-blocking PRs + a handful of fast-follows, but each is a discrete session with a clear scope. No fundamentally new alembic schema is needed (live just INSERTs an accounts row; no new tables); no sops schema additions (the live template just needs the post-Day-21/23 fields backported); no live-specific signal-engine behavior (env-tag handling already exists in `services/api/entrypoint.py`). The doc lists the build PRs as enumerated follow-ups so the operator runs them serially (or in parallel) without losing the policy context. Build sessions read the doc + execute one PR each.
+
+- **Cost / scope impact:** $0 code changes (planning doc only). Estimated cutover-blocking build effort: ~4-5 dev sessions. Estimated operator-side cutover ceremony: ~2-4 hours at cutover day + 1-3 business days ACH settlement for the initial deposit. Recurring cost delta at live cutover: +$13/mo for CCX13 → CCX23 upgrade + ~$1.50/mo for CME real-time data (if O2 = enable).
+
+- **References:**
+  - `Docs/live-money-cutover-plan.md` (this PR; new file)
+  - `Docs/decisions-log.md` 2026-05-20 "Operational Day 1" entry (above) — paper-is-now-canonical milestone that motivates this plan
+  - `Docs/decisions-log.md` 2026-05-19 Drill 10 retrospective — the LIVE-validated end-to-end milestone the readiness gate G2 implicitly leverages
+  - `Docs/backend-spec.md` §2.4 (Risk Engine) — vol-target composition + kill-switch matrix the doc layers on top of
+  - `Docs/claude-dev-guide.md` §1.5 LOCKED — clientId allocation + Phase 1 architecture the cutover doc inherits
+  - `secrets/live.enc.yaml` + `deploy/sops/secret_schemas/live.template.yaml` — sops fields audited in §8 of the new doc
+  - `strategies/v1_trend_following/parameters.py` — V1_DEFAULTS + V1_CANDIDATE_UNIVERSE the doc references for tier sizing
+
 ### 2026-05-21 — Data-layer pivot v2 LANDS via Option C: api synthesizes bars from IBKR (clientId=2); LEAN reads via FakeDataQueue
 
 - **Status:** SUCCESS. Option C of the 2026-05-20 evening v2 architecture is implemented. The api now owns the bar-fetch responsibility via a new `services/data/bar_sync.py` module (`BarSyncWorker` on clientId=2; daily 17:00 ET cycle) that fetches IBKR `reqHistoricalData` daily OHLCV bars for all 11 Phase 1 markets + writes them to the shared `lean_data` Docker volume in LEAN's expected on-disk format (equity-daily zip + futures-daily zip + per-day universe CSVs + map_files sentinels). `lean_local` reverts to the original `FakeDataQueue` + `SubscriptionDataReaderHistoryProvider` shape and reads on-disk via the api-managed bars. **No second IBKR session. No QC plugin in the runtime path. $0/yr ongoing.**
