@@ -77,16 +77,47 @@ Save + exit. sops re-encrypts on save.
 
 ---
 
-## Step 2 — Verify IBKR paper-account credentials in sops (NEW 2026-05-20)
+## Step 2 — Verify IBKR clientId allocation in deploy/.env (NEW 2026-05-21 Option C)
 
-**NEW in the 2026-05-20 data-layer sub-pivot.** LEAN now connects to
-IBKR via the `InteractiveBrokersBrokerage` data-queue-handler and needs
-the paper-account credentials at boot. These are the SAME credentials
-the `ib_gateway` sidecar uses for its own gateway login (Pivot-PR-B);
-if `ib_gateway` is currently healthy + authenticated, the fields are
-already populated.
+**NEW in the 2026-05-21 data-layer pivot v2 (Option C).** Under Option C
+the api spawns TWO ib-async workers: the order-placement worker on
+`API_IBKR_CLIENT_ID` (default 1) AND the new bar_sync worker on
+`API_BAR_SYNC_CLIENT_ID` (default 2). These MUST be distinct. IBKR's
+"Error 326: client id is already in use" fires when two clients race
+the same clientId + wedges the colliding client for ~30 min.
 
-Verify by inspecting the sops bundle:
+**If the operator's `deploy/.env` ALREADY overrides `API_IBKR_CLIENT_ID`
+into the 2-7 range** (typically from the 2026-05-17 prior-session-wedge
+workaround), the operator MUST also set `API_BAR_SYNC_CLIENT_ID` to a
+non-overlapping value. The 2026-05-20 Option C deploy ceremony hit this
+exact collision: the operator's `API_IBKR_CLIENT_ID=2` left bar_sync
+also defaulting to 2 → first cycle would have collided. Fix:
+
+```bash
+ssh root@<vps-host>
+cd /opt/trading
+grep -E 'API_IBKR_CLIENT_ID|API_BAR_SYNC' deploy/.env
+# If API_IBKR_CLIENT_ID=2 is set:
+sed -i.bak '/^API_IBKR_CLIENT_ID=/a API_BAR_SYNC_CLIENT_ID=3' deploy/.env
+# Verify:
+grep -E 'API_IBKR_CLIENT_ID|API_BAR_SYNC' deploy/.env
+```
+
+After the api container restarts, the boot log should show:
+- `order_placement_worker_spawned ibkr_host=ib_gateway ...` (uses `API_IBKR_CLIENT_ID`)
+- `bar_sync_worker_spawned ibkr_client_id=3 universe_size=11 ...` (uses `API_BAR_SYNC_CLIENT_ID`)
+
+LEAN no longer connects to IBKR under Option C — there are no LEAN-side
+clientId concerns.
+
+## Step 2b — Verify IBKR paper-account credentials still in sops (unchanged from Pivot-PR-B)
+
+LEAN no longer reads IBKR credentials directly (the 2026-05-20 v1
+attempt's `IB_USER_NAME` / `IB_PASSWORD` / `IB_ACCOUNT` reads in
+`infrastructure/lean_local/entrypoint.sh` were reverted under Option C).
+But the `ib_gateway` sidecar still needs them for its own gateway login.
+Verify the sops bundle has them populated (the same 2026-05-12 Pivot-PR-B
+fields):
 
 ```bash
 sops -d --extract '["ibkr"]' secrets/paper.enc.yaml
@@ -101,18 +132,7 @@ paper_password: <your-paper-account-password>
 paper_account: DUQ<your-paper-account-id>
 ```
 
-If any are still `<TODO_...>`, edit `secrets/paper.enc.yaml` via `sops`
-and populate them. These came from the operator's IBKR portal at
-2026-05-12 Pivot-PR-B bring-up.
-
-Commit + push the sops updates from Step 1 (+ Step 2 if you had to
-populate any TODO):
-
-```bash
-git add secrets/paper.enc.yaml
-git commit -m "ops: paper env adds lean.api_bearer_token (Pivot-PR-A) + verify ibkr.paper_* (2026-05-20 data sub-pivot)"
-git push
-```
+If any are still `<TODO_...>`, edit via `sops` + commit + push.
 
 ---
 
@@ -180,31 +200,49 @@ similar).
 
 ---
 
-## Step 5 — Build + start the lean_local container
+## Step 5 — One-time `lean_data` volume ownership fix (NEW 2026-05-21 Option C)
 
-**2026-05-20 sub-pivot note:** the `docker compose build lean_local`
-step now runs a multi-stage build that pulls the
-`QuantConnect.Brokerages.InteractiveBrokers` v2.5.17699 NuGet package
-during the builder stage. This requires the VPS to reach
-`api.nuget.org`. First build typically takes 3-5 min; subsequent
-builds use Docker's layer cache + finish in < 30s unless
-`IBKR_PLUGIN_VERSION` is bumped.
+**REQUIRED ON FIRST DEPLOY of Option C** (or any time the volume gets
+recreated). Files on the `trading_lean_data` Docker volume are owned
+by whichever container's user wrote them first. Pre-Option-C the
+`lean_local` container ran as root + the operator's manual re-seed
+scripts ran as root inside that container → files were 0:0 (root).
+Under Option C the api container's `BarSyncWorker` (`trading` uid=1000
+per `services/api/Dockerfile`) needs WRITE access to those same paths.
+
+Without this one-time chown, every bar_sync cycle logs
+`PermissionError: [Errno 13] Permission denied` on every market and
+LEAN reads stale data forever.
+
+**One-time fix** (operator-side; volume is at rest while api is on
+`lean_data:rw` + lean_local is on `lean_data:ro`, so no race):
+
+```bash
+docker run --rm -v trading_lean_data:/Lean/Data busybox \
+    chown -R 1000:1000 /Lean/Data
+# Verify:
+docker run --rm -v trading_lean_data:/Lean/Data busybox \
+    stat -c "%u:%g %n" /Lean/Data /Lean/Data/equity/usa/daily/tlt.zip
+# Should print: 1000:1000 /Lean/Data
+#               1000:1000 /Lean/Data/equity/usa/daily/tlt.zip
+```
+
+Files written by `BarSyncWorker` going forward inherit uid=1000 from
+the api container's user, so this chown is one-shot — no recurring
+maintenance needed unless the volume is destroyed + recreated.
+
+## Step 5b — Build + start the lean_local container
+
+**2026-05-21 Option C note:** the Dockerfile reverts to single-stage
+(no NuGet pull; no IBKR plugin DLLs). First build typically takes
+30-60s; subsequent builds use Docker's layer cache + finish in
+seconds unless the `quantconnect/lean:latest` base shifts.
 
 ```bash
 docker compose --env-file deploy/.env build lean_local
 docker compose --env-file deploy/.env up -d lean_local
 docker compose --env-file deploy/.env logs lean_local 2>&1 | tail -80
 ```
-
-Verify the IBKR plugin DLL landed in the final image (one-time sanity check):
-
-```bash
-docker compose exec lean_local ls -la /Lean/Launcher/bin/Debug/QuantConnect.Brokerages.InteractiveBrokers.dll
-docker compose exec lean_local ls -la /Lean/Launcher/bin/Debug/QuantConnect.IBAutomater.dll
-```
-
-Both should exist (~few MB each). If either is missing, the builder
-stage failed — see Troubleshooting.
 
 Expected boot sequence in the logs (from `infrastructure/lean_local/entrypoint.sh`
 + LEAN's own logs):
