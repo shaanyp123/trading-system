@@ -17,6 +17,50 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ## Entries
 
+### 2026-05-20 — 🚀 OPERATIONAL DAY 1: paper trading formally live; vendor subscriptions reduced to IBKR + Hetzner only
+
+- **Status:** OPERATIONAL. Today is the canonical "Day 1" of the trading system being formally operational under the post-Option-C v2 architecture. Subsequent days count forward from here (Day 2 = 2026-05-21, etc.). This entry is the institutional marker of that transition. Drill 10 (2026-05-19) was the LIVE-validated end-to-end milestone for the order path; today's milestone is "v2 data path lands + paper trading is the canonical operational state going forward." Live-money cutover (`live-small` env tag) remains a future Phase milestone — today is paper-only.
+
+- **System state at Day 1 declaration (2026-05-20 16:31 UTC = 12:31 ET):**
+  - 8/8 containers healthy (api / lean_local / caddy / postgres / nextjs / ib_gateway / webhook_pusher / discord_bot); api + lean_local uptime ~12h since the Option C deploy.
+  - `risk_state`: NORMAL, severity=null, reason=`operator_force_normal_development` (HALT_NEW → CONVALESCENT via /api/system/kill-switch/resume → CONVALESCENT → NORMAL via the Drill 10 force pattern; 2 audit rows landed at sequence_no=178+179).
+  - Audit chain CLEAN: `CHAIN OK: 178 rows verified`.
+  - Clean baseline for first cycle: 0 pending signals, 0 approved signals, 0 open orders, 0 open positions, 0 open trades, vacation_active=false.
+  - bar_sync worker armed for 17:00 ET fire on `clientId=3`; order placement worker on `clientId=2`; lean_local on internal-only network reading `/Lean/Data` read-only.
+  - AsyncTaskMonitor tracking 4 tasks; IBKR connectivity probe live; 0 dead-task events since deploy.
+
+- **Vendor subscription audit (post-Option-C; code paths verified):**
+
+  | Vendor | Pre-Option-C role | Post-Option-C status | Action |
+  |---|---|---|---|
+  | **DataBento** | Futures seed via `scripts/seed_lean_futures_databento.py` ($0.96/run) | DELETED 2026-05-20; 0 code refs in runtime path | **Cancel** |
+  | **Tiingo** | ETF cross-check via `scripts/verify_seed_data.py` | DELETED 2026-05-20; 0 code refs | **Cancel** |
+  | **yfinance** | ETF seed via `scripts/seed_lean_data.py` (free; never paid) | DELETED 2026-05-20; 0 code refs | n/a |
+  | **QuantConnect Researcher ($60/mo)** | (a) QC Cloud ObjectStore polling pre-2026-05-12; (b) QC `InteractiveBrokersBrokerage` plugin subscription validation in the v1 2026-05-20 attempt | Both paths retired. The `quantconnect/lean:latest` Docker image is publicly available from Docker Hub (no QC account required to pull). The dormant `services/qc_adapter/**` code under the `qc_adapter_backfill` profile still references `quantconnect.user_id`/`api_token` sops fields BUT only fires if operator explicitly invokes `docker compose --profile qc_adapter_backfill up qc_adapter` for ad-hoc historical replay (not currently used). Only ongoing loss from cancelling: QC web IDE for ad-hoc backtests, replaced by `lean_local` running locally via the `backtesting` env. | **Cancel — saves $720/yr** |
+  | **IBKR Pro** | Orders + market data | Active; clientId=1 (orders) + clientId=2 (bar_sync) + clientId=3-7 reserved + clientId=80-99 probes | Keep |
+  | **Hetzner Ashburn CCX13** | Hosts the 8-container stack | Active | Keep (~$13/mo) |
+  | **Hetzner Nuremberg CX23 (watchdog)** | External `GET /api/health` poll every 5 min | Active | Keep (~$5/mo) |
+  | **Resend** | Operator email (P0 alerts via `_build_alert_dispatch_hook`) | Active on free tier (3k emails/mo) | Keep |
+  | **Cloudflare apex DNS for spratcapital.com** | DNS routing | Active on free tier | Keep |
+  | **GitHub (private repo + Actions)** | Code + CI + GHCR image hosting | Active on solo free tier | Keep |
+  | **Discord** | Bot guild + 7 channels | Active free | Keep |
+
+  **Recurring infra after cancellations:** ~$18/mo (Hetzner only). The Resend free tier covers the alert volume comfortably; Cloudflare/GitHub/Discord are all sustainably free for solo-operator scale.
+
+- **What does "Operational Day 1" mean operationally:**
+  1. Paper trading is the canonical operating state. Signals emit from LEAN at 17:30 ET daily; operator approves via web `/signals` page or Discord `/approve`; order worker dispatches approved signals to IBKR; fills land via IBKR `orderStatusEvent`; audit chain grows; EOD recon at 18:30 ET reconciles.
+  2. Cycle-count conventions reset. The CONVALESCENT counter is at 0 (we forced NORMAL, didn't graduate via 5 sessions); for future state-machine accounting, Day 1 = 2026-05-20. The 5-session counter resumes counting if/when the system ever re-enters CONVALESCENT.
+  3. Performance tracking starts today. P&L from 2026-05-20 onward is the canonical "system live" return series. Backtests pre-2026-05-20 stay as historical / development artifacts.
+  4. The operator's daily routine: watch Discord channels around 17:00-18:00 ET (bar_sync + signal cycle + EOD recon); approve any signals if entry conditions match operator judgment; review fills + state via `/system` web page.
+
+- **Cost/scope impact:** $0 code changes (this is a docs-only entry marking the milestone). Annual cost reduction from vendor cancellations: ~$720 (QC) + DataBento usage volatility eliminated.
+
+- **References:**
+  - `CLAUDE.md` top of file — "🚀 OPERATIONAL DAY 1" header
+  - 2026-05-20 evening (this PR's predecessor) "Data-layer pivot v2 LANDS via Option C" entry below
+  - 2026-05-19 Drill 10 retrospective — the LIVE-validated end-to-end milestone for the order path
+  - 2026-05-12 pivot block — the original architecture pivot that retired QC ObjectStore polling
+
 ### 2026-05-21 — Data-layer pivot v2 LANDS via Option C: api synthesizes bars from IBKR (clientId=2); LEAN reads via FakeDataQueue
 
 - **Status:** SUCCESS. Option C of the 2026-05-20 evening v2 architecture is implemented. The api now owns the bar-fetch responsibility via a new `services/data/bar_sync.py` module (`BarSyncWorker` on clientId=2; daily 17:00 ET cycle) that fetches IBKR `reqHistoricalData` daily OHLCV bars for all 11 Phase 1 markets + writes them to the shared `lean_data` Docker volume in LEAN's expected on-disk format (equity-daily zip + futures-daily zip + per-day universe CSVs + map_files sentinels). `lean_local` reverts to the original `FakeDataQueue` + `SubscriptionDataReaderHistoryProvider` shape and reads on-disk via the api-managed bars. **No second IBKR session. No QC plugin in the runtime path. $0/yr ongoing.**
