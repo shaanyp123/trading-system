@@ -2,6 +2,8 @@
 
 You are working on a solo-operator algorithmic trading system. The operator is non-coding (finance background, no programming) and relies on you for all implementation.
 
+> **🚀 OPERATIONAL DAY 1 — 2026-05-20.** Paper trading goes formally operational on this date with the data-layer pivot v2 (Option C) landing + the risk-state forced from HALT_NEW → NORMAL after recovering from the 2026-05-19 recon break. Subsequent operational days count from here (Day 2 = 2026-05-21, etc.). The Drill 10 retrospective from 2026-05-19 was the LIVE-validated end-to-end milestone; today's milestone is "v2 architecture lands + paper trading is the canonical operational state going forward." Live-money cutover (`live-small` env tag) remains a future Phase milestone — today is paper-only. See `Docs/decisions-log.md` 2026-05-20 entries for the full chain.
+
 > **🔄 ARCHITECTURE PIVOT 2026-05-12 — read this BEFORE consulting any other foundation doc.**
 >
 > The original Phase 1 architecture (QC-Cloud-mediated; backend polls QC ObjectStore for events; defensive trims via `/instructions/<n>.json`; cutover to direct-IBKR in Phase 2 ~Month 5) was retired on 2026-05-12 when DP-025 surfaced at Day 28 deploy: QC's `/object/get` REST endpoint is gated behind the Institutional subscription tier ($500+/mo), which is not viable on a solo-operator budget.
