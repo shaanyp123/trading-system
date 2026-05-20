@@ -232,22 +232,28 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
 
         # Subscribe to micro futures (continuous contract via QC's `Future` API).
         for ticker in PHASE1_FUTURES:
-            # data_normalization_mode=Raw — required for the Path 4 futures-seed
-            # strategy. add_future()'s default normalization mode is
-            # BackwardsRatio (per QC docs forum 17093 staff response: "if you
-            # use a data normalization mode that's not in the list, LEAN
-            # automatically converts it to DataNormalizationMode.BackwardsRatio").
-            # BackwardsRatio requires factor_files/<ticker>.csv with the
-            # continuous-contract scale math (BackwardsRatioScale, etc.) which
-            # is QC-internal and cannot be synthesized in a seed converter.
-            # Raw mode operates on un-adjusted per-expiry contract prices —
-            # exactly what the seed at scripts/seed_lean_futures_databento.py
-            # produces. Donchian/MA/Hurst/ATR all derive from each contract's
-            # own price levels; LEAN's job is to deliver the right contract's
-            # bars per session date (universe + OI files handle that under
-            # data_mapping_mode=OPEN_INTEREST). See Docs/decisions-log.md
-            # 2026-05-12 entry "Phase 1 futures seed via DataBento direct SDK
-            # + minimal LEAN converter (Path 4)".
+            # data_normalization_mode=Raw — explicitly Raw for the V1 strategy
+            # under any data source (post-2026-05-20 data-layer sub-pivot:
+            # LEAN reads bars from IBKR via the InteractiveBrokersBrokerage
+            # data-queue-handler + history-provider on clientId=10, no longer
+            # from on-disk seed files). add_future()'s default normalization
+            # mode resolves to BackwardsRatio per QC docs forum 17093 staff
+            # response: "if you use a data normalization mode that's not in
+            # the list, LEAN automatically converts it to
+            # DataNormalizationMode.BackwardsRatio". BackwardsRatio requires
+            # factor_files/<ticker>.csv with the continuous-contract scale
+            # math (BackwardsRatioScale, etc.) which is QC-internal — under
+            # the seed-file architecture we couldn't synthesize them, and
+            # under the IBKR data path we don't need them. Raw mode operates
+            # on un-adjusted per-expiry contract prices — LEAN's continuous-
+            # contract resolver picks the active contract per session date
+            # (via DataMappingMode.OPEN_INTEREST + IBKR's reqContractDetails
+            # under the sub-pivot), and the strategy's Donchian/MA/Hurst/ATR
+            # all derive from each active contract's own price levels.
+            # See Docs/decisions-log.md 2026-05-20 entry "Phase 1 data-layer
+            # pivot" + 2026-05-12 entry "Phase 1 futures seed via DataBento
+            # direct SDK + minimal LEAN converter (Path 4)" for the original
+            # rationale that motivated the explicit-Raw choice.
             future = self.add_future(
                 f"/{ticker}",
                 resolution=Resolution.DAILY,  # noqa: F405
@@ -291,15 +297,24 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
             f"params_keys={sorted(params.keys())}"
         )
 
-        # Defensive: scan the futures universe data for staleness. The
-        # 2026-05-17 evening incident found all 7 micros silently failing
-        # `v1_history_unavailable` for 5+ days because the seed had aged
-        # out — the per-cycle heartbeat stayed clean throughout, so the
-        # only fingerprint was the cycle log line. This boot-time check
-        # logs structured warnings the operator (or a Phase 1+ alerting
-        # extension to AsyncTaskMonitor) can grep for. Pure observability;
-        # zero behavior change; swallows all exceptions.
-        self._log_universe_freshness()
+        # DATA-LAYER SUB-PIVOT 2026-05-20: the on-disk universe-freshness
+        # check is now moot. LEAN reads market data from IBKR via the
+        # `InteractiveBrokersBrokerage` data-queue-handler + history-provider
+        # (delayed quotes + reqHistoricalData on clientId=10) — there is no
+        # `/Lean/Data/future/<ticker>/universes/*.csv` to walk anymore. The
+        # 2026-05-17 staleness incident that motivated PR #172 + PR #174
+        # can no longer recur because IBKR's reqHistoricalData always
+        # returns up-to-the-current-trading-day bars for the active
+        # contract chain. The `strategies.v1_trend_following.universe_freshness`
+        # module + its 27 unit tests stay in the repo (broker-agnostic
+        # filesystem logic; reusable if a future on-disk universe pattern
+        # returns); the `_log_universe_freshness` method below stays too
+        # (it's pure observability + swallows all exceptions). The
+        # invocation is removed because calling it against an empty
+        # `/Lean/Data/future` would log `v1_universe_data_missing` for
+        # all 7 micros every boot — noise the operator would learn to
+        # ignore, defeating the canonical-fingerprint design.
+        # See Docs/decisions-log.md 2026-05-20 entry.
 
         # Emit a startup heartbeat so the operator can confirm the algorithm
         # successfully reached this point + can authenticate against the

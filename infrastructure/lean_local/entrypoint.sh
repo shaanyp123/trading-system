@@ -81,20 +81,64 @@ esac
 : "${LEAN_LOCAL_API_BASE_URL:=http://api:8000}"
 export LEAN_LOCAL_API_BASE_URL
 
-# Post-ceremony 2026-05-12: LEAN no longer needs IBKR credentials.
-# The bare `quantconnect/lean:latest` image does NOT ship the IBKR
-# brokerage assembly, so live-mode boot with `InteractiveBrokersBrokerage`
-# crash-looped on `Sequence contains no matching element` from LEAN's
-# Composer broker-factory lookup. The post-ceremony swap binds LEAN to
-# the built-in `PaperBrokerage` (zero IBKR dependency). The api owns
-# the real IBKR contract via `services/execution/ibkr_adapter.py` —
-# LEAN only generates signals + POSTs them. The `LEAN_IBKR_USERNAME` /
-# `LEAN_IBKR_PASSWORD` / `LEAN_IBKR_ACCOUNT` env-var reads that used to
-# live here are gone; the sops fields `ibkr.paper_username` /
-# `.paper_password` / `.account_number` are still read elsewhere
-# (`services/api/entrypoint.py` for the FlexQuery flow + `ib_gateway`
-# for the gateway login) — they stay in the encrypted bundle.
-# See Docs/decisions-log.md 2026-05-12 'Post-ceremony session' entry.
+# DATA-LAYER SUB-PIVOT 2026-05-20: LEAN reads market data from IBKR via
+# the `InteractiveBrokersBrokerage` data-queue-handler + history-provider
+# (delayed quotes 1-3s actual lag + reqHistoricalData) on a distinct
+# client-id from the api's order-placement worker (api=1, LEAN=10 per
+# dev-guide §1.5 LOCKED). The IBKR plugin DLL is baked into the image
+# via Dockerfile multi-stage NuGet pull; the credentials below land
+# substituted into lean.json's `${IB_USER_NAME}` / `${IB_PASSWORD}` /
+# `${IB_ACCOUNT}` placeholders at the deep-merge step further down.
+#
+# Source fields in sops (same fields the ib_gateway sidecar uses to
+# authenticate the gateway login — the api process never reads
+# username/password, just the account_number for the FlexQuery flow
+# via services/api/entrypoint.py):
+#   ibkr.paper_username → IB_USER_NAME
+#   ibkr.paper_password → IB_PASSWORD
+#   ibkr.paper_account  → IB_ACCOUNT
+#
+# Fail-closed if any are missing or carry the sops template's
+# `<TODO_...>` placeholder. We do NOT fall back silently to a default
+# account — that would attach LEAN's data-queue at clientId=10 to the
+# WRONG paper account and silently emit signals against bars from a
+# different sub-universe than the api's order-placement state.
+#
+# These reads were ORIGINALLY present in this script pre-2026-05-12;
+# PR #120 dropped them when LEAN was swapped to PaperBrokerage for data
+# AND fills. The 2026-05-20 data-layer sub-pivot restores them for the
+# data path only (live-mode-brokerage stays PaperBrokerage so LEAN
+# never places orders).
+if [ -z "${IB_USER_NAME:-}" ]; then
+    IB_USER_NAME="$(read_secret 'ibkr.paper_username')"
+    export IB_USER_NAME
+fi
+if [ -z "${IB_PASSWORD:-}" ]; then
+    IB_PASSWORD="$(read_secret 'ibkr.paper_password')"
+    export IB_PASSWORD
+fi
+if [ -z "${IB_ACCOUNT:-}" ]; then
+    IB_ACCOUNT="$(read_secret 'ibkr.paper_account')"
+    export IB_ACCOUNT
+fi
+
+for var_name in IB_USER_NAME IB_PASSWORD IB_ACCOUNT; do
+    eval "val=\${$var_name}"
+    if [ -z "${val}" ]; then
+        echo "[lean_local_entrypoint] FATAL: ${var_name} is empty (sops field ibkr.paper_username / .paper_password / .paper_account missing in $SECRETS_PATH)" >&2
+        echo "[lean_local_entrypoint] LEAN's InteractiveBrokersBrokerage data-queue-handler requires all three (2026-05-20 data-layer sub-pivot)." >&2
+        echo "[lean_local_entrypoint] Fix: sops secrets/<env>.enc.yaml; populate ibkr.paper_username / ibkr.paper_password / ibkr.paper_account; commit + redeploy." >&2
+        echo "[lean_local_entrypoint] See deploy/lean_local/README.md Step 1 + Docs/decisions-log.md 2026-05-20 entry." >&2
+        exit 2
+    fi
+    case "${val}" in
+        "<TODO"*|"null")
+            echo "[lean_local_entrypoint] FATAL: ${var_name} still has placeholder value '${val}'" >&2
+            echo "[lean_local_entrypoint] Replace with the real IBKR paper-account credential via sops." >&2
+            exit 2
+            ;;
+    esac
+done
 
 # Deep-merge our template on top of upstream config.json. The upstream
 # config at /Lean/Launcher/bin/Debug/config.json is a full framework
