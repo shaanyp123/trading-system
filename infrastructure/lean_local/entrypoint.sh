@@ -140,6 +140,53 @@ for var_name in IB_USER_NAME IB_PASSWORD IB_ACCOUNT; do
     esac
 done
 
+# DATA-LAYER SUB-PIVOT 2026-05-20 (boot-attempt-2 follow-up): the
+# QuantConnect.Brokerages.InteractiveBrokers v2.5.17699 NuGet plugin enforces
+# a ValidateSubscription() check at instantiation — calls
+# https://www.quantconnect.com/api/v2/authenticate with `job-user-id` +
+# `api-access-token` from lean.json (the values below substitute into
+# ${QC_USER_ID} / ${QC_API_TOKEN} placeholders at the deep-merge step).
+# Without these the plugin shuts LEAN down with "Invalid api user id or
+# token, cannot authenticate subscription" and lean_local restart-loops.
+#
+# Source fields in sops:
+#   quantconnect.user_id  (int — operator's QC numeric user_id) → QC_USER_ID
+#   quantconnect.api_token (64-char string)                     → QC_API_TOKEN
+#
+# Also requires lean_local to have `egress` network access (added in
+# docker-compose.yml) so the validation HTTPS call can reach
+# www.quantconnect.com:443.
+#
+# Fail-closed on missing or placeholder values — the plugin won't initialize
+# without them and the container would restart-loop anyway; better to fail
+# loudly here with a clear error than silently inside LEAN's startup.
+if [ -z "${QC_USER_ID:-}" ]; then
+    QC_USER_ID="$(read_secret 'quantconnect.user_id')"
+    export QC_USER_ID
+fi
+if [ -z "${QC_API_TOKEN:-}" ]; then
+    QC_API_TOKEN="$(read_secret 'quantconnect.api_token')"
+    export QC_API_TOKEN
+fi
+
+for var_name in QC_USER_ID QC_API_TOKEN; do
+    eval "val=\${$var_name}"
+    if [ -z "${val}" ]; then
+        echo "[lean_local_entrypoint] FATAL: ${var_name} is empty (sops field quantconnect.user_id / .api_token missing in $SECRETS_PATH)" >&2
+        echo "[lean_local_entrypoint] The QuantConnect IBKR brokerage plugin requires these for its ValidateSubscription() check at startup." >&2
+        echo "[lean_local_entrypoint] Fix: sops secrets/<env>.enc.yaml; populate quantconnect.user_id (int) + quantconnect.api_token (64-char string); commit + redeploy." >&2
+        echo "[lean_local_entrypoint] See Docs/decisions-log.md 2026-05-20 entry." >&2
+        exit 2
+    fi
+    case "${val}" in
+        "<TODO"*|"null")
+            echo "[lean_local_entrypoint] FATAL: ${var_name} still has placeholder value '${val}'" >&2
+            echo "[lean_local_entrypoint] Replace with the operator's real QC credential via sops." >&2
+            exit 2
+            ;;
+    esac
+done
+
 # Deep-merge our template on top of upstream config.json. The upstream
 # config at /Lean/Launcher/bin/Debug/config.json is a full framework
 # config (handler bindings + limits + paths + 30+ env stubs); our
