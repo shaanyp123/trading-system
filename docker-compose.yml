@@ -505,7 +505,14 @@ services:
       context: .
       dockerfile: infrastructure/lean_local/Dockerfile
     restart: unless-stopped
-    networks: [internal]
+    # 2026-05-20 data-layer sub-pivot follow-up: `egress` added so LEAN's IBKR
+    # plugin can reach www.quantconnect.com:443 for its ValidateSubscription()
+    # call at startup. The plugin (from QC's NuGet feed) enforces a paid-
+    # subscription check before instantiating — calls /api/v2/authenticate
+    # with `job-user-id` + `api-access-token` from lean.json (sourced from
+    # sops `quantconnect.user_id` + `.api_token`). Without egress, lean_local
+    # restart-loops with `Resource temporarily unavailable (www.quantconnect.com:443)`.
+    networks: [internal, egress]
     environment:
       ENVIRONMENT: ${ENVIRONMENT:-paper}
       LEAN_LIVE_MODE: ${LEAN_LIVE_MODE:-false}
