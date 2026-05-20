@@ -17,6 +17,237 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ## Entries
 
+### 2026-05-20 (evening) — Data-layer pivot deploy ceremony: 3 sequential failure modes; lean_local stopped pending v2 architecture
+
+- **Status:** PARTIAL FAILURE — PRs #195 + #196 + #197 all merged to `main` (data-layer pivot + 2 hot-fixes). `lean_local` deploy ceremony hit 3 sequential boot failures; the third is an architectural mismatch that the v1 implementation cannot resolve. `lean_local` is **stopped** on the VPS (paper trading offline) pending a v2 strategy. The api worker on clientId=1 is unaffected; ib_gateway is unaffected; audit chain is unaffected.
+
+- **Failure mode 1 (resolved by PR #196):** `Composer.LoadPartsSafely(.../QuantConnect.Brokerages.InteractiveBrokers.dll)` → `FileNotFoundException: Could not load file or assembly 'CSharpAPI'`. Root cause: PR #195's Dockerfile only copied `QuantConnect.Brokerages.InteractiveBrokers.dll` + `QuantConnect.IBAutomater.dll` across the multi-stage boundary, missing 5 other IBKR-side runtime files (`CSharpAPI.dll`, `CSharpAPI.deps.json`, `IBAutomater.jar`, `IBAutomater.sh`, `ICSharpCode.SharpZipLib.dll`) that the NuGet `dotnet publish` step emits to `/publish/`. Probed via a fresh `mcr.microsoft.com/dotnet/sdk:10.0` container that ran `dotnet publish` on the same stub csproj — `/publish/` listed all 5 missing files. PR #196 added explicit COPY lines + sanity-print extensions. Verified resolved by boot-attempt-2's logs (Composer now loads `InteractiveBrokersBrokerage` cleanly).
+
+- **Failure mode 2 (resolved by PR #197):** `ApiConnection.TryRequest(https://www.quantconnect.com/api/v2/authenticate): Error: Resource temporarily unavailable (www.quantconnect.com:443)` → `ValidateSubscription(): Failed during validation, shutting down. Error : Invalid api user id or token, cannot authenticate subscription.` Root cause: the QC plugin (NuGet `QuantConnect.Brokerages.InteractiveBrokers` v2.5.17699) enforces a `ValidateSubscription()` check at instantiation — calls QC's `/api/v2/authenticate` with `job-user-id` + `api-access-token` from the top-level `lean.json` config. Two compounding problems: (a) `lean_local` was on Docker's `internal`-only network with no external internet egress, so the HTTPS call returned ECONNREFUSED-equivalent; (b) the credentials weren't wired in. Both fixed by PR #197 — `docker-compose.yml lean_local networks: [internal, egress]`, added `job-user-id` + `api-access-token` keys to `lean.json` with `${QC_USER_ID}` + `${QC_API_TOKEN}` substitution, added sops reads of `quantconnect.user_id` + `.api_token` to `entrypoint.sh`. Verified resolved by boot-attempt-3's logs (no more `Invalid api user id or token`; the plugin reached its constructor).
+
+- **Failure mode 3 (BLOCKING — architectural mismatch):**
+
+  ```
+  InteractiveBrokersBrokerage.InteractiveBrokersBrokerage(): Starting IB Automater...
+  InteractiveBrokersBrokerage.OnIbAutomaterOutputDataReceived(): Updating IBGateway configuration file: C:\ibgateway/ibgateway1.vmoptions
+  ERROR:: System.IO.FileNotFoundException: Could not find file C:\ibgateway/ibgateway1
+  ERROR:: Algorithm.Initialize() Error: Could not find file '/Lean/C:\ibgateway/ibgateway'
+  ```
+
+  Root cause: **the QC plugin's design assumption is that LEAN itself owns the IBKR gateway connection.** The plugin's constructor invokes the bundled `QuantConnect.IBAutomater` to LAUNCH a fresh IB Gateway process inside the `lean_local` container (writing to `C:\ibgateway/ibgateway1.vmoptions` — a Windows-style path that leaked through the IBAutomater port from Windows to Linux). The plugin does NOT have a "connect to an existing gateway" mode; the `ib-host` + `ib-port` config keys describe where IBAutomater's spawned gateway should LISTEN, not where to connect for an existing one.
+
+  This conflicts with the post-2026-05-12 architecture where the `ib_gateway` sidecar is already authenticated + owned by the api worker on `clientId=1`. We cannot have LEAN spawn its own competing gateway against the same IBKR paper account because IBKR's session model enforces single-IP-per-account for active TWS sessions (this is the same constraint that caused the 2026-05-19 evening probe's Error 162 with browser tabs). Two gateways from the same VPS to the same paper account = perpetual session conflict.
+
+  **The v1 implementation (PR #195 + #196 + #197) cannot resolve this within its scope.** It needs an architectural decision about how to handle the gateway-ownership conflict.
+
+- **Boot ceremony timeline (UTC, 2026-05-20):**
+
+  | Time | Event |
+  |---|---|
+  | 02:24 | PR #195 merged (`2f8b1bb`); operator-delegated SSH-to-VPS deploy initiated |
+  | 02:46 | First `docker compose up -d --force-recreate lean_local` — restart-loop with `Sequence contains no matching element` / "Unable to locate any exports matching the requested typeName: InteractiveBrokersBrokerage" |
+  | 02:48 | Probed `/publish/` contents in a fresh `dotnet/sdk:10.0` container; discovered 5 missing files |
+  | 02:55 | PR #196 merged (`b54cdc4`); rebuild + recreate → boot-attempt-2 |
+  | 02:56 | Restart-loop with `ApiConnection.TryRequest(www.quantconnect.com:443)` / `Resource temporarily unavailable` / `Invalid api user id or token, cannot authenticate subscription` |
+  | 02:58 | Diagnosed: (a) `lean_local` not on `egress` network, (b) `job-user-id` + `api-access-token` not wired |
+  | 03:00 | PR #197 written + merged (`9c0bffb`); rebuild + recreate → boot-attempt-3 |
+  | 03:04 | Restart-loop with `InteractiveBrokersBrokerage.OnIbAutomaterOutputDataReceived(): Updating IBGateway configuration file: C:\ibgateway/ibgateway1.vmoptions` / `FileNotFoundException` — plugin trying to spawn its own gateway |
+  | 03:06 | Operator-delegated `docker compose stop lean_local`; ceremony paused; v2 strategy planning begins |
+
+- **v2 options (decision required next session):**
+
+  | Option | Path | Effort | Pros | Cons |
+  |---|---|---|---|---|
+  | **A** | **Spin up a second `ib_gateway_lean` sidecar** — separate container on a separate clientId, owned by LEAN's IBAutomater | ~1-2 hrs | Reuses existing IBKR plugin; minimal code changes | **Likely infeasible:** IBKR paper account enforces single-session-per-account; 2 gateways → Error 162 forever. Would also double the IBKR-side resource usage. |
+  | **B** | **Compile QC plugin from source + disable IBAutomater** — clone `https://github.com/QuantConnect/Lean.Brokerages.InteractiveBrokers`, patch the `InteractiveBrokersBrokerage` ctor to skip the IBAutomater.Start() call when an `ib-existing-gateway: true` config flag is set, build the .dll in the Dockerfile builder stage | ~3-4 hrs | Plugin code is open-source (Apache 2.0); proper "connect to existing gateway" mode | Custom .dll diverges from upstream; future plugin upgrades need re-patching; IBAutomater's gateway-monitoring features become unavailable to LEAN; **may still fail QC's ValidateSubscription if the patched .dll is detected** |
+  | **C** ⭐ | **API synthesizes bars from IBKR + LEAN reads from disk via FakeDataQueue** — extend api's existing ib-async clientId=1 connection with a daily `reqHistoricalData` fetch for all 11 Phase 1 markets; api writes bars to the shared `lean_data` volume in LEAN's on-disk format (same format the deleted `seed_lean_data.py` + `seed_lean_futures_databento.py` produced); `lean.json` reverts to `FakeDataQueue` + `SubscriptionDataReaderHistoryProvider`; lean_local stays on the seed-file path but the data is always fresh | ~1 day | **No second gateway**; reuses existing api ↔ IBKR connection; preserves audit-chain isolation (LEAN's read-only path doesn't introduce a second IBKR-side state); $0/yr; works with operator's current QC tier; same daily-resolution data as Option B; staleness becomes impossible because api refreshes on schedule | Largest code surface area (new api service module + scheduler integration + bar-format writers); the seed-file architecture isn't fully retired — just its operator-side population path |
+  | **D** | **Roll back PRs #195 + #196 + #197 + re-seed via the old DataBento + yfinance scripts** | ~30 min | Quickest path to restored paper trading | Reintroduces the 2026-05-17 staleness foot-gun + ~$0.96/run DataBento spend; loses the institutional memory of what we learned |
+
+  ⭐ **Recommendation: Option C.** It's the only option that:
+  1. Sidesteps the gateway-ownership conflict (no second IBKR session)
+  2. Eliminates staleness (api refresh cadence is fully controllable)
+  3. Costs $0 ongoing (IBKR data is free for account holders)
+  4. Doesn't require patching closed-ish QC source code
+  5. Works regardless of operator's QC subscription tier
+  6. Reuses existing infrastructure (api's ib-async connection, lean_data volume, FakeDataQueue path)
+  7. Preserves the strategy code unchanged
+  8. The api can be the source of truth for "what data was LEAN looking at" — auditable
+
+  Estimated session for Option C: 1 focused day, see the prompt at the end of this entry.
+
+- **Cost / scope impact of the failed deploy attempt:**
+  - **Code surface area landed (kept in tree, idle):** `infrastructure/lean_local/Dockerfile` multi-stage NuGet pull (idle DLLs; ~5MB image overhead), `infrastructure/lean_local/entrypoint.sh` IBKR + QC cred sops reads (idle env vars), `lean/lean.json` ib-* + job-user-id + api-access-token keys + InteractiveBrokersBrokerage handlers (currently triggering boot crashes), `docker-compose.yml lean_local networks: [internal, egress]` (live; idle without `lean_local` running).
+  - **Operator-side impact:** `lean_local` stopped → no 17:30 ET LEAN signal cycle until v2 lands. The api + ib_gateway + audit chain + Discord bot all continue running. The operator can still place manual orders via the IBKR Client Portal or TWS Desktop if needed.
+  - **VPS state at session close (2026-05-20 03:06 UTC):** `origin/main` HEAD `9c0bffb`; 7 of 8 containers healthy (lean_local STOPPED); `verify_chain --env paper` unchanged at the pre-deploy count; `risk_state` NORMAL (operator_force_graduation from 2026-05-19 still active); 0 open positions; 0 open orders.
+
+- **What this session PROVED (institutional memory):**
+  1. **QC's `QuantConnect.Brokerages.InteractiveBrokers` NuGet plugin v2.5.17699 is NOT a drop-in for "LEAN reads data from existing gateway".** Its design assumes LEAN owns the IBKR session via IBAutomater.
+  2. The Windows-style path `C:\ibgateway/` in IBAutomater's Linux-container error messages confirms the IBAutomater code was ported from a Windows-first design; there's no clean "Linux + existing-gateway" mode.
+  3. The plugin's `ValidateSubscription()` call requires QC paid subscription credentials. The operator's Researcher tier ($60/mo) apparently DOES validate (we got past it), so the gating isn't tier-specific — it's just "paid user".
+  4. `dotnet publish` of a stub csproj referencing the IBKR plugin emits 7 IBKR-side files to `/publish/` (verified): the 2 QC-named DLLs + `CSharpAPI.dll` + `CSharpAPI.deps.json` + `IBAutomater.jar` + `IBAutomater.sh` + `ICSharpCode.SharpZipLib.dll`.
+  5. The 2026-05-19 evening IBKR probe (clientId=95) succeeded because it was a **single read-only connection** to the existing gateway. A second long-lived session conflicts; the probe pattern doesn't generalize.
+
+- **Open follow-ups (Phase 1+):**
+  1. **v2 implementation session** — execute Option C per the prompt below. ~1 day.
+  2. **VPS cleanup post-v2** — once Option C lands + lean_local is running cleanly on the new arch, remove the idle IBKR plugin Dockerfile multi-stage + the entrypoint's QC cred reads + the ib-* keys from lean.json + the egress network from lean_local. ~1 hour cleanup PR.
+  3. **Decision-log "fail forward, no rollback" lesson** — the operator's "don't roll back" call preserved the docs + Dockerfile + sops template work + lets v2 build on the v1 attempt's findings. Pattern to remember.
+  4. **CSharpAPI license review (Phase 1+):** the CSharpAPI.dll baked into the image via NuGet is bundled by QC under their NuGet license. If the operator ever ships a self-built variant via Option B (compile from source), they need to comply with IBKR's TWS API license terms (typically non-redistribution; in-image use should be fine for self-hosted operator use).
+  5. **`scripts/operator_tools/synthesize_today_universe.sh` revival**: the 2026-05-19 evening synthesis stopgap (in worktree only, never on main) was the seed-of-the-idea for Option C — instead of yfinance + DataBento as the source, use api's ib-async to IBKR. The shell-script approach is too brittle for production but the architectural pattern (api fetches → writes to disk → LEAN reads) is exactly Option C.
+
+- **References:**
+  - PR #195 — `feat(lean): pivot data layer from seed files to IBKR delayed quotes (clientId=10)` — the v1 attempt
+  - PR #196 — `hotfix(lean): bake CSharpAPI.dll + IBAutomater runtime files into lean_local image` — fix failure-mode-1
+  - PR #197 — `hotfix(lean): wire QC subscription validation (job-user-id + api-access-token + egress network)` — fix failure-mode-2
+  - This entry — failure-mode-3 + v2 options + Option C recommendation
+  - 2026-05-12 entries — original architecture pivot (DP-025 → Option 4) + the post-ceremony IBKR DLL gap (PR #120's PaperBrokerage swap) — context for why CSharpAPI was missing in the first place
+  - 2026-05-17 evening entry — the 7-micro staleness incident that motivated this pivot
+
+---
+
+#### Detailed session prompt for v2 (Option C: API synthesizes bars from IBKR)
+
+The operator should feed the prompt below into a fresh Claude Code session to execute Option C. The prompt is intentionally comprehensive (the v1 attempt suffered from under-specified requirements; the v2 prompt corrects that).
+
+> ## Task: implement Option C of the 2026-05-20 data-layer pivot v2 — api synthesizes bars from IBKR; LEAN reads from disk via FakeDataQueue
+>
+> Picking up the failed v1 attempt at the LEAN data-layer pivot (PRs #195 + #196 + #197 are merged but `lean_local` is stopped because the v1 path is incompatible with QC's IBKR plugin design — see `Docs/decisions-log.md` 2026-05-20 evening entry "Data-layer pivot deploy ceremony: 3 sequential failure modes"). This session implements **Option C**: the api uses its existing `ib-async` clientId=1 connection to IBKR to fetch historical bars on a daily schedule, writes them to the shared `lean_data` Docker volume in LEAN's expected on-disk format, and LEAN reads them via the original `FakeDataQueue` + `SubscriptionDataReaderHistoryProvider` path. No second IBKR session. No QC plugin in the runtime path. $0/yr ongoing. Same delayed-quote / `reqHistoricalData` data freshness as the v1 attempt would have provided.
+>
+> ## What you must read FIRST, in order
+>
+> 1. `CLAUDE.md` (root) — orientation + the 2026-05-12 pivot block + the 2026-05-20 sub-pivot block at top.
+> 2. `Docs/decisions-log.md` — the 2026-05-20 evening entry "Data-layer pivot deploy ceremony: 3 sequential failure modes" — REQUIRED reading; explains why v1 failed + why Option C is the chosen v2.
+> 3. `Docs/decisions-log.md` — the 2026-05-20 (original) entry "Phase 1 data-layer pivot: IBKR delayed quotes replace seed-file architecture" — covers the 2026-05-19 IBKR probe results which still apply (delayed quotes confirmed working; clientId allocation locked).
+> 4. `Docs/decisions-log.md` — the 2026-05-17 evening entry — the staleness incident that motivated the pivot.
+> 5. `Docs/backend-spec.md` §1.2 (current architecture diagram) + §2.1.1 (Market Data Ingestion).
+> 6. `Docs/claude-dev-guide.md` §1.5 LOCKED — clientId allocation + forbidden-paths whitelist.
+> 7. `services/execution/ibkr_adapter.py` — the existing ib-async wrapper; understand how `reqHistoricalData` would be called.
+> 8. `services/reconciliation/scheduler.py` + `services/reconciliation/eod_cycle.py` — pattern for adding a new scheduled task to the api's lifespan.
+> 9. `services/api/main.py` — see how `OrderPlacementWorker` + `ReconciliationScheduler` + `HeartbeatProbe` get registered in `_lifespan`; the new bar-sync scheduler follows the same shape.
+> 10. `lean/lean.json` — current (broken) state; understand what needs to revert.
+> 11. `infrastructure/lean_local/entrypoint.sh` — current state with idle IBKR + QC cred reads.
+> 12. `git log --oneline /scripts/seed_lean_data.py /scripts/seed_lean_futures_databento.py` — find the deleted seed scripts in git history; their bar-format-writing code is the canonical reference for LEAN's on-disk layout (equity-daily zip + futures-daily zip + per-day universe csv + map_files sentinels for Path 4 Raw-mode).
+>
+> ## Target architecture (Option C)
+>
+> ```
+> +-----------+       reqHistoricalData            +-------------+         IBKR
+> |  api      | --- ib-async clientId=1 --------> | ib_gateway  | -----> servers
+> |           |                                    +-------------+
+> | new       |
+> | scheduler | writes bars in LEAN on-disk
+> | task:     | format to /Lean/Data/ via the
+> | bar_sync  | trading_lean_data shared volume
+> +-----------+                |
+>                              v
+> +-----------+       FakeDataQueue + SubscriptionDataReaderHistoryProvider
+> | lean_local| reads from /Lean/Data/ (mounted from trading_lean_data)
+> | (unchanged|                |
+> |  strategy)|                v
+> +-----------+         daily 17:30 ET cycle -> POST /api/internal/lean/signals
+> ```
+>
+> ## Scope of changes
+>
+> ### NEW code (api side)
+>
+> - **`services/signal/bar_sync.py`** (new module; `services/signal/**` is FORBIDDEN per dev-guide §2.2 — requires `risk-review-approved` label. Actually wait — looking more carefully, the bar-sync is a DATA pipeline, not a signal-generation step. It should live at `services/data/bar_sync.py` or `services/scheduler/bar_sync.py`. Confirm scope with operator at session start; if `services/data/**` doesn't exist, create it.) The module exports:
+>   - `BarSyncConfig` frozen dataclass — universe list (re-use `strategies.v1_trend_following.parameters.V1_CANDIDATE_UNIVERSE`), data root (`/Lean/Data`), bars-per-fetch (e.g., 250 daily = ~1 year), refresh cadence.
+>   - `BarSyncResult` frozen dataclass — per-market success/failure, row counts, last-bar-session-date, errors.
+>   - `BarSyncWorker` class — `async def run_forever(): wait for next 17:00 ET → fetch + write → sleep`.
+>   - `async fetch_market_bars(client, market_key, count) -> list[Bar]` — calls `client.reqHistoricalData(...)` for either an equity (TLT/IEF/SHY/TIP) or a continuous-future (/MES /MNQ etc.), parses the response into Bar objects.
+>   - `write_bars_to_lean_layout(bars, market_key, data_root)` — writes the appropriate on-disk format (the deleted `scripts/seed_lean_*` files in git history have the canonical reference).
+>     - ETFs: `/Lean/Data/equity/usa/daily/<lower>.zip` with rows `YYYYMMDD 00:00,O,H,L,C,V`. `<lower>.csv` map_file with the bare ticker → exchange code (P for NYSE). Optional factor_file empty sentinel.
+>     - Futures: per-expiry `/Lean/Data/future/<market>/<lower>_<YYYYMMDD>_trade.zip` + `<lower>_<YYYYMMDD>_openinterest.zip` (raw float prices, NOT deci-cent scaled). Per-day universe CSV at `/Lean/Data/future/<market>/universes/<lower>/<YYYYMMDD>.csv` with header `#expiry,open,high,low,close,volume,open_interest`. 2-row sentinel `map_files/future/<market>/<lower>.csv` for Path 4 / Raw-mode.
+>   - `evaluate_freshness(data_root, markets, today) -> FreshnessReport` — same logic as `strategies.v1_trend_following.universe_freshness` (we kept that module; reuse). Returns whether each market is fresh / stale / missing.
+>
+> - **Tests:** `tests/unit/test_bar_sync.py` (50+ tests covering the parser + writer + freshness + the worker scheduler stub).
+>
+> - **`services/api/main.py`** — add `_start_bar_sync_worker` + `_stop_bar_sync_worker` to `_lifespan`, parallel to the existing `OrderPlacementWorker` + `ReconciliationScheduler` patterns.
+>
+> - **`services/api/config.py`** — add `bar_sync_enabled: bool = True` + `bar_sync_schedule_et: str = "17:00"` settings.
+>
+> - **`services/api/async_task_monitor.py`** — add `BarSyncWorker` to the 4-task tracked list (was 3: OrderPlacementWorker + ReconciliationScheduler + HeartbeatProbe → now 4).
+>
+> ### Revert / cleanup code (LEAN side)
+>
+> - **`lean/lean.json`** — revert `data-queue-handler` to `["QuantConnect.Lean.Engine.DataFeeds.Queues.FakeDataQueue"]` + `history-provider` to `["QuantConnect.Lean.Engine.HistoricalData.SubscriptionDataReaderHistoryProvider"]`. Remove the 9 ib-* keys + `job-user-id` + `api-access-token`. Re-add the `$comment-rollback-2026-05-20` documenting the v1 → v2 transition.
+>
+> - **`docker-compose.yml`** — revert `lean_local networks: [internal, egress]` to `[internal]` (no external egress needed once the IBKR plugin isn't running). Add an explicit volume mount: `- ./lean:/Lean/Algorithm:ro` already present + `lean_data:/Lean/Data` already present. The api needs the SAME `lean_data` volume mounted so it can write — add `lean_data:/Lean/Data` to the api service's volumes block (with `:rw` permission).
+>
+> - **`infrastructure/lean_local/Dockerfile`** — OPTIONAL: revert the multi-stage NuGet pull. The IBKR plugin DLLs become dead weight if LEAN doesn't use them. Cleaner image. BUT — if you want to leave the door open for Option B in the future, keep them. Recommendation: revert to the pre-PR-#195 single-stage Dockerfile for cleanliness.
+>
+> - **`infrastructure/lean_local/entrypoint.sh`** — revert the `IB_USER_NAME` / `IB_PASSWORD` / `IB_ACCOUNT` / `QC_USER_ID` / `QC_API_TOKEN` reads. They're no longer needed.
+>
+> - **`lean/v1_strategy.py`** — restore the `self._log_universe_freshness()` call in `initialize()` (removed in PR #195). The api-managed bar sync should keep `/Lean/Data/future/<market>/universes/` populated, so the freshness check resumes its original purpose: catching api-side bar-sync failures.
+>
+> ### Docs
+>
+> - `Docs/decisions-log.md` — new "2026-05-21 (or whatever-the-date) — v2 data-layer pivot lands: api-synthesizes-bars + LEAN reads via FakeDataQueue" entry.
+> - `CLAUDE.md` — update the 2026-05-20 sub-pivot block at top: change the "DATA-LAYER SUB-PIVOT 2026-05-20" content to reflect that Option C landed, the v1 IBKR plugin attempt is retired (referencing the postmortem entry for institutional memory).
+> - `Docs/backend-spec.md` §1.2 + §2.1.1 — update the diagram + market-data ingestion section to reflect Option C.
+> - `Docs/claude-dev-guide.md` §1.5 LOCKED — update the "LEAN data source" entry to "IBKR via api bar_sync on clientId=1; LEAN reads from disk via FakeDataQueue + SubscriptionDataReaderHistoryProvider".
+> - `deploy/lean_local/README.md` — rewrite for the Option C operational model (no IBKR creds on LEAN side; api owns the bar refresh; troubleshooting matrix updated).
+>
+> ## Implementation order
+>
+> 1. Read all listed files; confirm understanding of git-history seed scripts' bar-writing logic.
+> 2. **Operator decision at session start:** `services/data/**` vs `services/scheduler/**` for the new module path. Recommend `services/data/bar_sync.py` (the path is new + matches the data-pipeline nature). If operator agrees + the path is approved, no `risk-review-approved` label needed (new path, not on the forbidden whitelist).
+> 3. Write `services/data/bar_sync.py` (or wherever) with the dataclass + worker + parser + writer. Pure-Python until the IBKR ib-async call.
+> 4. Write `tests/unit/test_bar_sync.py` with 50+ tests — mock ib-async, test the parser + writer + freshness logic. Use the deleted seed scripts' tests in git history as a reference for golden-output examples.
+> 5. Wire into api lifespan via `services/api/main.py::_lifespan`. Add to async_task_monitor.
+> 6. Revert lean.json + docker-compose.yml + entrypoint.sh + v1_strategy.py per the cleanup list above.
+> 7. Update `Docs/**` per the docs list above.
+> 8. Run `make ci` locally — must pass.
+> 9. Run `pnpm typecheck && pnpm lint && pnpm build` in `apps/web/` — must pass (no frontend changes expected).
+> 10. Operator-side deploy: merge PR → SSH to VPS → git pull → `docker compose --env-file deploy/.env build api` (api code changed) + `lean_local` (revert Dockerfile if you did that) → `docker compose --env-file deploy/.env up -d --force-recreate api lean_local` → watch for the first bar-sync log line (api at 17:00 ET) → wait for the first LEAN cycle at 17:30 ET → verify `failed_markets=[]`.
+>
+> ## Acceptance criteria
+>
+> - [ ] `services/data/bar_sync.py` (or equivalent path) lands with `BarSyncWorker`, parser, writer, freshness logic.
+> - [ ] 50+ new unit tests pass; existing 1777 tests still pass.
+> - [ ] `lean.json` reverts to FakeDataQueue + SubscriptionDataReaderHistoryProvider; no ib-* keys; no QC subscription keys.
+> - [ ] `docker-compose.yml`: `lean_local networks: [internal]`; api has `lean_data:/Lean/Data:rw` mount.
+> - [ ] `entrypoint.sh` reverts IBKR + QC cred reads.
+> - [ ] `v1_strategy.py` restores `_log_universe_freshness()` invocation.
+> - [ ] On VPS: `lean_local` boots cleanly within 60s of `up -d` — no `Composer` errors, no `Sequence contains no matching element`, no `ValidateSubscription` errors.
+> - [ ] On VPS: api scheduler fires at 17:00 ET; `bar_sync_cycle_completed` log line lists `failed_markets=[]` (all 11 markets fetched + written).
+> - [ ] On VPS: LEAN cycle at 17:30 ET reports `signals_emitted_count + rejections_count = 11`; no `v1_history_unavailable failed_markets=[...]`.
+> - [ ] `verify_chain --env paper` passes.
+> - [ ] Audit chain unaffected (no new audit rows from the bar sync — it's a data-pipeline, not a state mutation).
+>
+> ## Things to NOT do
+>
+> - Do NOT spin up a second `ib_gateway` container. There's only one IBKR paper session per account; two = Error 162.
+> - Do NOT attempt to revive the QC `InteractiveBrokersBrokerage` NuGet plugin. The architectural mismatch (IBAutomater spawning its own gateway) cannot be resolved within v1's scope.
+> - Do NOT reintroduce DataBento or yfinance. The IBKR `reqHistoricalData` path is free and current.
+> - Do NOT add new audit event types. Bar sync is a data-pipeline operation; no audit-chain impact.
+> - Do NOT touch `services/risk/**`, `services/execution/**` (beyond using the existing `services/execution/ibkr_client.py` interface), `services/audit/**`, `alembic/**`, etc. The new module's IBKR access uses the existing ib-async client; no new broker contract.
+>
+> ## Operator pre-authorizations (from prior sessions; carry forward)
+>
+> - SSH to VPS (`ssh root@178.156.239.84`)
+> - `git push`, `gh pr create + merge --squash`, branch creation
+> - `docker compose build + restart` (with 60s+ pause between restarts)
+> - `curl` against `https://spratcapital.com/api/**` via LEAN bearer + bot bearer
+> - READ-only sops access on VPS
+> - `risk-review-approved` self-application is NOT needed if you keep the new code at `services/data/**` or `services/scheduler/**` (paths NOT on the forbidden whitelist). If you do touch `services/signal/**` etc., add the label explicitly.
+> - Cost approval: $0 (Option C has no ongoing data costs)
+>
+> ## Verification probe (do NOT redo)
+>
+> The 2026-05-19 evening IBKR probe is the canonical reference for "IBKR data path works":
+> - `/MES`, `/MGC`, `/MCL`, `TLT` all returned 5 daily bars via `reqHistoricalData`, today's bar present, **free**
+> - Delayed quote lag 1-3s actual (irrelevant for daily strategy)
+> - Documented in the 2026-05-20 decisions-log entry
+>
+> You do NOT need to re-run the probe. The Option C implementation just wraps the same `reqHistoricalData` calls inside a scheduled api worker + writes to disk.
+>
+> ## Final note on autonomy
+>
+> The operator (solo, non-coding, finance background) approved the v1 → v2 transition 2026-05-20 evening with: "I want to use delayed quotes from IBKR... finish up the implementation." Same autonomy as the v1 attempt — full implementation authority, SSH-delegated deploy, operator reviews via PR description (not diff).
+>
+> **Hard constraint:** `lean_local` is stopped on the VPS as of 2026-05-20 03:06 UTC. Paper trading is offline until v2 lands. Operator may choose to roll back to the pre-PR-#195 state at any time if v2 takes longer than acceptable.
+
 ### 2026-05-20 — Phase 1 data-layer pivot: IBKR delayed quotes replace seed-file architecture (DataBento + yfinance + synthesis cron all retired)
 
 - **Spec reference:**
