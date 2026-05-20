@@ -68,7 +68,9 @@ WORKDIR /build
 RUN echo '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><OutputType>Library</OutputType></PropertyGroup><ItemGroup><PackageReference Include="QuantConnect.Brokerages.InteractiveBrokers" Version="'"${IBKR_PLUGIN_VERSION}"'" /></ItemGroup></Project>' > stub.csproj \
     && dotnet publish stub.csproj -c Release -o /publish \
     && ls -la /publish/QuantConnect.Brokerages.InteractiveBrokers.dll \
-    && ls -la /publish/QuantConnect.IBAutomater.dll
+    && ls -la /publish/QuantConnect.IBAutomater.dll \
+    && ls -la /publish/CSharpAPI.dll \
+    && ls -la /publish/IBAutomater.jar
 
 # ------------------------------------------------------------------
 # Stage 2: final image based on quantconnect/lean:latest.
@@ -91,21 +93,54 @@ RUN apt-get update \
 # `No module named 'structlog'`.
 RUN /opt/miniconda3/bin/python3 -m pip install --no-cache-dir "structlog>=24.4"
 
-# 2026-05-20 data-layer sub-pivot: bake the IBKR brokerage plugin into
-# LEAN's launcher dir so live-mode boot can resolve the
+# 2026-05-20 data-layer sub-pivot: bake the IBKR brokerage plugin + its
+# runtime deps into LEAN's launcher dir so live-mode boot can resolve the
 # `InteractiveBrokersBrokerage` data-queue-handler + history-provider
-# class names from lean.json's `paper-internal` env. Without these two
-# DLLs, LEAN's Composer broker-factory lookup throws `Sequence contains
-# no matching element` exactly as it did on 2026-05-12 pre-PR-#120.
+# class names from lean.json's `paper-internal` env. Without ALL of
+# these files, LEAN's Composer broker-factory lookup throws either
+# `Sequence contains no matching element` (pre-2026-05-12 PR #120 fingerprint)
+# OR `FileNotFoundException: Could not load file or assembly 'CSharpAPI'`
+# (the 2026-05-20 boot-attempt-1 fingerprint discovered in this PR).
 #
-# We copy only the IBKR-specific DLLs because all OTHER transitive deps
+# We copy only the IBKR-specific files because the OTHER transitive deps
 # (QuantConnect.Brokerages.dll, QuantConnect.Lean.Engine.dll,
-# Newtonsoft.Json.dll, ...) already ship in /Lean/Launcher/bin/Debug/.
-# If LEAN boot ever raises FileNotFoundException for a different DLL,
-# add another COPY line here (the builder stage's /publish contains the
-# full transitive set).
+# Newtonsoft.Json.dll, Microsoft.*, System.*) already ship in
+# /Lean/Launcher/bin/Debug/ and shadowing those with NuGet-pulled versions
+# risks subtle ABI skew.
+#
+# **2026-05-20 boot-attempt-1 incident:** initial Dockerfile only copied the
+# two QuantConnect-named DLLs and missed the 5 IBKR-side runtime files
+# below. LEAN's `Composer.LoadPartsSafely(.../InteractiveBrokers.dll)`
+# raised `FileNotFoundException: Could not load file or assembly 'CSharpAPI,
+# Version=1.0.0.0, ...'` and the broker-factory lookup for the data-queue-
+# handler failed with `Unable to locate any exports matching the requested
+# typeName: InteractiveBrokersBrokerage`. The `dotnet publish` step in the
+# builder stage emits all 7 files to /publish/ (verified via direct probe);
+# they just weren't being copied across the multi-stage boundary.
+#
+# Files copied:
+#   1. QuantConnect.Brokerages.InteractiveBrokers.dll — the plugin (LEAN's
+#      Composer-discovered data-queue-handler entry point)
+#   2. QuantConnect.IBAutomater.dll — QC's .NET wrapper around IBC
+#      (IB Controller). Idle in the 2026-05-20 use case (LEAN connects to
+#      the existing ib_gateway sidecar; doesn't launch its own gateway)
+#      but a hard dep of the brokerage plugin's ctor
+#   3. CSharpAPI.dll — IBKR's official C# API client (~363KB). The
+#      load-bearing file the brokerage plugin's
+#      `<Reference Include="CSharpAPI" HintPath="CSharpAPI.dll" />` resolves to
+#   4. CSharpAPI.deps.json — runtime-deps manifest paired with CSharpAPI.dll
+#   5. IBAutomater.jar — Java agent IBC runs to drive the gateway GUI;
+#      bundled in the QC NuGet plugin even though the LEAN data path
+#      doesn't invoke it
+#   6. IBAutomater.sh — shell launcher for the .jar (idle-but-required)
+#   7. ICSharpCode.SharpZipLib.dll — zip library used by IBAutomater
 COPY --from=ib-plugin-builder /publish/QuantConnect.Brokerages.InteractiveBrokers.dll /Lean/Launcher/bin/Debug/
 COPY --from=ib-plugin-builder /publish/QuantConnect.IBAutomater.dll /Lean/Launcher/bin/Debug/
+COPY --from=ib-plugin-builder /publish/CSharpAPI.dll /Lean/Launcher/bin/Debug/
+COPY --from=ib-plugin-builder /publish/CSharpAPI.deps.json /Lean/Launcher/bin/Debug/
+COPY --from=ib-plugin-builder /publish/IBAutomater.jar /Lean/Launcher/bin/Debug/
+COPY --from=ib-plugin-builder /publish/IBAutomater.sh /Lean/Launcher/bin/Debug/
+COPY --from=ib-plugin-builder /publish/ICSharpCode.SharpZipLib.dll /Lean/Launcher/bin/Debug/
 
 # Entrypoint script: resolves /run/secrets/decrypted.yaml → env vars then
 # execs LEAN's standard runtime. The entrypoint script comes from this
