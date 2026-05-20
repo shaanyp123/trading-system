@@ -465,6 +465,57 @@ Operator learning allocation: 5–8 hours/week on Python basics, git operations,
 
 ---
 
+## Data-Layer Pivot v2 (post-Week-7 follow-up) — `[OPERATOR + CLAUDE_CODE]` next session
+
+**Status (2026-05-20 evening — `lean_local` STOPPED; paper trading offline):** the v1 data-layer pivot attempted 2026-05-20 (PRs #195 + #196 + #197 merged) hit 3 sequential boot failures + landed on an architectural mismatch with QC's `QuantConnect.Brokerages.InteractiveBrokers` NuGet plugin. The plugin's bundled `IBAutomater` insists on spawning its own IBKR gateway process inside `lean_local`, which conflicts with the existing `ib_gateway` sidecar that the api worker owns on `clientId=1` (IBKR's session model enforces single-IP-per-account). `lean_local` is stopped on the VPS pending v2. Paper trading has no 17:30 ET signal cycle until v2 lands. **The api worker, `ib_gateway`, audit chain, Discord bot, watchdog are all unaffected and running** — only the LEAN signal-generation component is offline.
+
+**Full postmortem:** `Docs/decisions-log.md` 2026-05-20 evening entry "Data-layer pivot deploy ceremony: 3 sequential failure modes; lean_local stopped pending v2 architecture" — covers all 3 failure modes (CSharpAPI missing → PR #196 fixed; ValidateSubscription needs creds + egress → PR #197 fixed; IBAutomater wants own gateway → blocking + needs v2).
+
+**v2 options (operator decision required at start of next session):**
+
+| Option | Path | Effort | Recommended? |
+|---|---|---|---|
+| A | Spin up a second `ib_gateway_lean` sidecar | ~1-2 hrs | ❌ Likely infeasible (IBKR single-session) |
+| B | Compile QC plugin from source + disable IBAutomater | ~3-4 hrs | ⚠️ Plugin drift + may still fail ValidateSubscription |
+| **C** | **api synthesizes bars from IBKR + LEAN reads from disk via FakeDataQueue** | **~1 day** | ⭐ **YES** |
+| D | Roll back PRs #195/#196/#197 + re-seed via DataBento + yfinance | ~30 min | ❌ Loses pivot learnings + reintroduces staleness |
+
+⭐ **Recommendation: Option C.** Reuses existing api ↔ IBKR connection (clientId=1); no second IBKR session; api refresh cadence makes staleness impossible; $0/yr cost; works regardless of QC tier; doesn't require patching closed-ish QC source; preserves strategy code unchanged.
+
+**Tasks (next session, ~1 day):**
+
+- **Step 1:** Operator confirms Option C at session start (or chooses A/B/D).
+- **Step 2 (`[CLAUDE_CODE]`):** New module at `services/data/bar_sync.py` (or `services/scheduler/bar_sync.py` — confirm path; new path, NOT on the forbidden whitelist, no `risk-review-approved` label needed). Implements `BarSyncWorker` that wakes daily at 17:00 ET, calls `IB.reqHistoricalData` via the existing ib-async client for all 11 Phase 1 markets, writes bars to the shared `lean_data` volume in LEAN's on-disk format. Reference: the deleted `scripts/seed_lean_*.py` files in git history have the canonical bar-writing logic (equity-daily zip + futures-daily zip + universes + map_files sentinels for Path 4 Raw-mode).
+- **Step 3 (`[CLAUDE_CODE]`):** Revert lean.json + docker-compose.yml + entrypoint.sh + v1_strategy.py to the pre-PR-#195 state (FakeDataQueue + SubscriptionDataReaderHistoryProvider; no ib-* keys; lean_local back on `internal`-only network; staleness check restored).
+- **Step 4 (`[BOTH]`):** Deploy + smoke. api scheduler fires at 17:00 ET writing fresh bars; LEAN cycle at 17:30 ET reports `failed_markets=[]` + 11 markets evaluated.
+- **Step 5 (`[CLAUDE_CODE]`):** Optional cleanup PR — remove the idle Dockerfile multi-stage NuGet pull + entrypoint's QC/IBKR cred reads if Option C lands cleanly and Option B (compile-from-source) is no longer a candidate.
+
+**Acceptance criteria (Option C):**
+- [ ] `services/data/bar_sync.py` (or equivalent path) ships with `BarSyncWorker` + parser + writer + freshness logic
+- [ ] 50+ new unit tests pass; existing 1777 tests still pass
+- [ ] `lean.json` reverts to FakeDataQueue + SubscriptionDataReaderHistoryProvider; no ib-* keys
+- [ ] `lean_local` boots cleanly within 60s; no `Composer` errors; no `ValidateSubscription` errors
+- [ ] api scheduler fires at 17:00 ET; `bar_sync_cycle_completed` log line lists `failed_markets=[]`
+- [ ] LEAN cycle at 17:30 ET reports `signals_emitted_count + rejections_count = 11`
+- [ ] `verify_chain --env paper` passes
+- [ ] No new audit event types (bar sync is data-pipeline, not state-mutation)
+
+**Comprehensive session prompt for the next session:** `Docs/decisions-log.md` 2026-05-20 evening entry — section "Detailed session prompt for v2 (Option C: API synthesizes bars from IBKR)" — paste verbatim into the next Claude Code session.
+
+**Operator immediate decisions (TONIGHT before next session):**
+
+1. **Keep `lean_local` stopped OR roll back to seed-file architecture?**
+   - **Keep stopped (chosen 2026-05-20 evening):** paper trading offline 18-24+ hours until v2 deploys. The 2026-05-17 seed data in `trading_lean_data` volume is preserved for rollback.
+   - **Roll back:** restore pre-PR-#195 `lean.json` + `docker-compose.yml lean_local` network → paper trading resumes with 2026-05-17 seed data (~3 days old; ~2 days viable before staleness threshold).
+2. **Time-budget the v2 session:** ~1 day operator-side wall-time. Best to start fresh next session morning (full focus block).
+
+**Risks for next session:**
+- The bar-format writer needs to match LEAN's on-disk expectations exactly. The deleted seed scripts in git history are the canonical reference + their tests in git history (`tests/unit/test_seed_lean_*_script.py`) lock the format.
+- Cron timing matters — the bar sync MUST complete before the 17:30 ET LEAN cycle. Aim for 17:00 ET fire time + 25 min safety margin.
+- `lean_data` volume mount permissions — api needs `rw` access (currently `ro` to lean_local).
+
+---
+
 ## Week 8 — Buffer + Phase 1 Handover
 
 **Goals:**

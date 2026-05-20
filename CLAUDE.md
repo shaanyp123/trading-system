@@ -15,20 +15,17 @@ You are working on a solo-operator algorithmic trading system. The operator is n
 >
 > See `Docs/decisions-log.md` 2026-05-12 entry "Phase-1 architecture pivot — QC ObjectStore → LEAN Local + direct IBKR (DP-025 → Option 4)" for the full rationale, the 4 underlying decision points (DP-023/024/025/026), and the diff manifest across all 6 foundation docs.
 
-> **🔄 DATA-LAYER SUB-PIVOT 2026-05-20 — supersedes the data-source portion of the 2026-05-12 pivot.** LEAN now reads market data from IBKR via the `InteractiveBrokersBrokerage` data-queue-handler + history-provider at `clientId=10` (delayed quotes with 1-3s actual wall-clock lag despite IBKR's "delayed 10-15 min" labeling + `reqHistoricalData` for warmup; both **free** for any IBKR account holder; verified via 2026-05-19 evening probe). The IBKR plugin DLL (`QuantConnect.Brokerages.InteractiveBrokers` v2.5.17699 from NuGet) is baked into the `lean_local` image via multi-stage Dockerfile.
+> **🔄 DATA-LAYER SUB-PIVOT 2026-05-20 — v1 ATTEMPT FAILED + v2 PLANNING.** The original ambition (LEAN reads delayed quotes directly from IBKR via the QC `InteractiveBrokersBrokerage` data-queue-handler at `clientId=10`) was attempted across PRs #195 + #196 + #197 (all merged) but blocked on a 3rd architectural failure mode: the QC plugin's `IBAutomater` component wants to **spawn its own IBKR gateway process** inside the `lean_local` container rather than connect to the existing `ib_gateway` sidecar (the api worker already owns that gateway on `clientId=1`). IBKR's session model enforces single-IP-per-account so a second gateway is infeasible.
 >
-> **Retired in this sub-pivot:**
-> - The seed-file architecture: `scripts/seed_lean_data.py` (yfinance ETFs), `scripts/seed_lean_futures_databento.py` (DataBento futures + custom converter), `scripts/verify_seed_data.py` (Tiingo cross-check), `tests/unit/test_verify_seed_data_script.py`, `deploy/lean_local/seed-data.md` — all DELETED.
-> - The 2026-05-19 evening synthesis-cron stopgap (which never landed on `main`) — permanently moot.
-> - The 2026-05-17 evening "7-micro `v1_history_unavailable` root cause" entry's 4 open follow-ups — structurally impossible to recur because IBKR's `reqHistoricalData` is always current.
+> **⚠️ Current state (2026-05-20 03:06 UTC):** `lean_local` is **STOPPED** on the VPS. Paper trading is offline (no 17:30 ET signal cycle until v2 lands). The api worker, `ib_gateway`, audit chain, Discord bot, watchdog are all unaffected and running. PRs #195/#196/#197 stay in tree as institutional memory — the Dockerfile multi-stage NuGet pull + entrypoint sops reads + lean.json ib-* keys are IDLE (no boot-loop because the container is stopped, not because the code is reverted).
 >
-> **Unchanged:**
-> - LEAN's `live-mode-brokerage` stays `PaperBrokerage` (LEAN does NOT place orders).
-> - The api's order-placement worker stays on `clientId=1` via `services/execution/ibkr_adapter.py`.
-> - IBKR clientId allocation: api=1, LEAN=10, operator probes/recovery=80-99 (codified in dev-guide §1.5 LOCKED).
-> - Cost: $0/yr (eliminates ~$0.96 per manual DataBento re-seed + ~$350/yr if the re-seed had been cron'd).
+> **v2 plan (next session — see decisions-log 2026-05-20 evening entry):** ⭐ **Option C — api synthesizes bars from IBKR + LEAN reads from disk via FakeDataQueue.** The api's existing ib-async `clientId=1` connection adds a daily `reqHistoricalData` fetch for all 11 Phase 1 markets, writes bars to the shared `lean_data` volume in LEAN's on-disk format, and LEAN reverts to the seed-file path (`FakeDataQueue` + `SubscriptionDataReaderHistoryProvider`) reading the api-managed bars. No second IBKR session. No QC plugin in the runtime path. $0/yr ongoing. Same data freshness as the v1 ambition. Estimated 1-day session. See the "Detailed session prompt for v2" block at the end of the 2026-05-20 evening decisions-log entry.
 >
-> See `Docs/decisions-log.md` 2026-05-20 entry "Phase 1 data-layer pivot: IBKR delayed quotes replace seed-file architecture (DataBento + yfinance + synthesis cron all retired)" for the full rationale + 2026-05-19 probe results + 5 open follow-ups.
+> **Until v2 lands, two operator options:**
+> 1. **Leave `lean_local` stopped** — paper trading offline until v2 deploy (chosen 2026-05-20 evening).
+> 2. **Roll back lean.json + docker-compose.yml lean_local network** — restore the pre-PR-#195 seed-file architecture; paper trading resumes with the 2026-05-17 seed data (going stale; staleness threshold ~5 days; ~2 days viable).
+>
+> See `Docs/decisions-log.md` 2026-05-20 evening entry "Data-layer pivot deploy ceremony: 3 sequential failure modes; lean_local stopped pending v2 architecture" for full postmortem + the 3 failure modes + 4 v2 options (A/B/C/D) + recommendation rationale + the comprehensive v2 session prompt.
 
 ## Read these at the start of every session
 
