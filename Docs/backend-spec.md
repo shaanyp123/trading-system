@@ -89,9 +89,11 @@ trading/
 
 A pre-merge linter enforces the **Hot-Fix Whitelist** path classification by enumerating the file paths that are agent-mutable vs. PR-required, and by grepping for the constants matching `RISK_RING_*`, `KILL_SWITCH_*`, `MARGIN_*`, `CLUSTER_CAP_*`, `PARAMETER_RANGE_*` in any agent-deployed change.
 
-## 1.2 Phase 1 Architecture (post-pivot 2026-05-12; LEAN Local + direct IBKR)
+## 1.2 Phase 1 Architecture (post-pivot 2026-05-12 + data-layer sub-pivot 2026-05-20; LEAN Local + direct IBKR)
 
-> **Pivot note:** the diagram + critical-contract paragraph below describe Phase 1 **post-pivot 2026-05-12**. The original Phase 1 plan (QC-Cloud-mediated, ObjectStore polling, instruction protocol) is **retained immediately below this current section as §1.2-RETIRED** for institutional memory. Operational reality from 2026-05-12 onward matches the diagram below.
+> **Pivot note:** the diagram + critical-contract paragraph below describe Phase 1 **post-pivot 2026-05-12 + 2026-05-20 data-layer sub-pivot**. The original Phase 1 plan (QC-Cloud-mediated, ObjectStore polling, instruction protocol) is **retained immediately below this current section as §1.2-RETIRED** for institutional memory. Operational reality from 2026-05-20 onward matches the diagram below.
+>
+> **2026-05-20 data-layer sub-pivot delta vs. 2026-05-12 pivot baseline:** the dashed edge from `LEAN` to `IBGW` in the diagram below was added in this sub-pivot. Pre-2026-05-20, LEAN read market data from on-disk seed files in the `trading_lean_data` Docker volume (`FakeDataQueue` + `SubscriptionDataReaderHistoryProvider`); the volume was populated by operator-side scripts `scripts/seed_lean_data.py` (yfinance ETFs) + `scripts/seed_lean_futures_databento.py` (DataBento futures + custom converter). Both scripts are DELETED in the sub-pivot; LEAN now reads delayed quotes + `reqHistoricalData` directly from `ib_gateway` via the `InteractiveBrokersBrokerage` data-queue-handler + history-provider on `clientId=10` (distinct from the api's order-placement `clientId=1`). See `Docs/decisions-log.md` 2026-05-20 entry "Phase 1 data-layer pivot: IBKR delayed quotes replace seed-file architecture" + 2026-05-19 evening IBKR probe results.
 
 ```mermaid
 graph TB
@@ -127,10 +129,11 @@ graph TB
     CADDY -.HTTPS.-> API
     API <--> PG
     LEAN -->|POST signal events<br/>shared bearer auth| API
+    LEAN -.->|delayed quotes + reqHistoricalData<br/>clientId=10<br/>2026-05-20 sub-pivot| IBGW
     API --> SIG
     SIG --> RISK
     RISK --> EXEC
-    EXEC <--> IBGW
+    EXEC <-->|order placement<br/>clientId=1| IBGW
     RECON <--> IBGW
     RECON --> AUDIT
     EXEC --> AUDIT
@@ -170,13 +173,15 @@ graph TB
   style AUDIT fill:#e6ffe6
 ```
 
-**Phase 1 critical contract (post-pivot):** the backend holds IBKR Pro credentials in sops-encrypted `secrets/<env>.enc.yaml` and connects directly to the broker via `ib_gateway` (Dockerized) using the `ib-async` Python library. LEAN runs locally in a separate `lean_local` container, hosts the v1 trend-following algorithm, and emits signal events to the backend via `POST /api/internal/lean/signals` (shared-bearer auth — `LeanAuthMiddleware` mirroring the Day 23 `BotAuthMiddleware` pattern). The execution path is signal-on-LEAN → POST to backend → risk-engine sizing → `ib-async.placeOrder` direct to IBKR.
+**Phase 1 critical contract (post-pivot + 2026-05-20 data-layer sub-pivot):** the backend holds IBKR Pro credentials in sops-encrypted `secrets/<env>.enc.yaml` and connects directly to the broker via `ib_gateway` (Dockerized) using the `ib-async` Python library on **`clientId=1`** (services/execution/ibkr_adapter.py::DEFAULT_CLIENT_ID; locked since PR #101). LEAN runs locally in a separate `lean_local` container (custom image extending `quantconnect/lean:latest` with the `QuantConnect.Brokerages.InteractiveBrokers` plugin baked in via NuGet at build time), hosts the v1 trend-following algorithm, **reads market data from the same `ib_gateway` on `clientId=10`** via the `InteractiveBrokersBrokerage` data-queue-handler + history-provider (delayed quotes + `reqHistoricalData`), and emits signal events to the backend via `POST /api/internal/lean/signals` (shared-bearer auth — `LeanAuthMiddleware` mirroring the Day 23 `BotAuthMiddleware` pattern). The execution path is signal-on-LEAN → POST to backend → risk-engine sizing → `ib-async.placeOrder` direct to IBKR on clientId=1. The data path is LEAN's `self.history(symbol, count, Resolution.DAILY)` → IBKR `reqHistoricalData` on clientId=10 (entirely separate socket; multiple distinct client-ids per gateway session are supported by IBKR). LEAN's `live-mode-brokerage` stays `PaperBrokerage` — LEAN does NOT place orders.
 
-**Key constraints (post-pivot):**
+**Key constraints (post-pivot + 2026-05-20 data-layer sub-pivot):**
 - IBKR credentials are sops-encrypted; the backend never logs them; gitleaks pre-commit hook covers source.
 - The `ib_gateway` container is on the `internal` Docker network only; port 4002 (paper) / 4001 (live) are not exposed to Caddy or the public internet.
-- LEAN Local's bearer auth is a sops-encrypted secret distinct from the Discord bot's (so a LEAN container compromise can't impersonate the bot or vice versa).
-- Audit chain integrity is preserved end-to-end. Every signal POSTed by LEAN → `signal_emitted` audit row; every `ib-async` fill confirmation → `order_filled` audit row. Hash chain unbroken.
+- LEAN Local's bearer auth (for the `POST /api/internal/lean/signals` path) is a sops-encrypted secret distinct from the Discord bot's (so a LEAN container compromise can't impersonate the bot or vice versa).
+- IBKR clientId allocation (locked in dev-guide §1.5): api order-placement worker = 1, LEAN data-queue-handler = 10, operator probes + recovery tools = 80-99. Reserve 2-7 for future expansion (multi-strategy or read-only telemetry clients). Never overlap; IBKR's "Trading TWS session is connected from a different IP address" Error 162 fires when two clients race the same clientId.
+- IBKR delayed-quote subscription (`ib-enable-delayed-streaming-data=true` in lean.json) is sufficient for the daily-cadence V1 strategy. Switch to `false` when a future strategy depends on intraday tick freshness + subscribe to IBKR's "US Real-Time Bundle" (~$10/mo).
+- Audit chain integrity is preserved end-to-end. Every signal POSTed by LEAN → `signal_emitted` audit row; every `ib-async` fill confirmation → `order_filled` audit row. Hash chain unbroken. **LEAN's data path emits no audit rows** (read-only IBKR queries; no state mutation).
 
 **Service inventory delta vs. spec §1.4 table:**
 - `qc_adapter` row: status flipped to "dormant under `qc_adapter_backfill` profile gate"; code preserved.
@@ -354,7 +359,7 @@ graph TB
 | 16 | `caddy` | caddy:2-alpine | n/a | ✅ | ✅ | `unless-stopped` |
 | 17 | `gitea` | gitea/gitea | n/a | ✅ | ✅ | `unless-stopped` |
 | 18 | `ib_gateway` | gnzsnz/ib-gateway | n/a | ✅ **Phase 1+ always-on** (port 4002 paper / 4001 live; internal network only) | ❌ Phase 2 only | `unless-stopped` |
-| 19 | `lean_local` | quantconnect/lean | n/a | ✅ **Phase 1+ always-on** (17:30 ET signal cycle) | ❌ Phase 2 on-demand | `unless-stopped` |
+| 19 | `lean_local` | custom (extends `quantconnect/lean:latest` with `QuantConnect.Brokerages.InteractiveBrokers` plugin DLL from NuGet baked in via multi-stage Dockerfile at `infrastructure/lean_local/Dockerfile`; post-2026-05-20 data-layer sub-pivot) | n/a | ✅ **Phase 1+ always-on** (17:30 ET signal cycle; reads IBKR market data via InteractiveBrokersBrokerage data-queue-handler on clientId=10) | ❌ Phase 2 on-demand | `unless-stopped` |
 
 **Post-pivot deltas vs. pre-pivot column:**
 - Row 4 `execution`: `ib-async` direct path is the canonical Phase 1+ path. The QC OS instruction-write code is RETIRED (lives in `services/qc_adapter/` but never executed in production).
@@ -445,19 +450,21 @@ For each service: **Purpose → Inputs → Outputs → Dependencies → Configur
 
 ## 2.1 Data Ingestion
 
-### 2.1.1 Market Data Ingestion (post-pivot 2026-05-12)
+### 2.1.1 Market Data Ingestion (post-pivot 2026-05-12 + data-layer sub-pivot 2026-05-20)
 
-**Phase 1+ (post-pivot):** LEAN Local runs in a Dockerized `lean_local` container on the operator's VPS. LEAN consumes historical bars from QuantConnect's bundled data (downloaded at container build / pull time; cached on disk volume) and live ticks via `ib-async`'s `reqMktData` / `reqHistoricalData` (snapshot + tick streams). LEAN computes signals inside the algorithm and POSTs `signal_emitted` events to the backend at `POST /api/internal/lean/signals` (shared-bearer auth). The backend's `signal` service is a thin orchestration layer that consumes those POSTs and dispatches to `risk` for sizing.
+**Phase 1+ (post-pivot + 2026-05-20 data-layer sub-pivot):** LEAN Local runs in a custom-built `lean_local` Docker container on the operator's VPS (extends `quantconnect/lean:latest` with `QuantConnect.Brokerages.InteractiveBrokers` plugin DLL baked in via NuGet at image build time). LEAN consumes BOTH historical bars + live ticks from IBKR via the `InteractiveBrokersBrokerage` data-queue-handler + history-provider, connecting to the `ib_gateway` sidecar on **`clientId=10`** (distinct from the api's order-placement `clientId=1`; IBKR allows multiple distinct client-ids per gateway session). Delayed quotes (`ib-enable-delayed-streaming-data=true`; 1-3s actual wall-clock lag per 2026-05-19 evening probe) are sufficient for the daily-cadence V1 strategy; `reqHistoricalData` returns current-trading-day bars including the settlement bar. **Free for any IBKR account holder** — no separate market-data subscription required. LEAN computes signals inside the algorithm and POSTs `signal_emitted` events to the backend at `POST /api/internal/lean/signals` (shared-bearer auth). The backend's `signal` service is a thin orchestration layer that consumes those POSTs and dispatches to `risk` for sizing.
 
-| Property | Value (Phase 1+ post-pivot) | Pre-pivot Phase 1 (RETIRED) |
-|---|---|---|
-| Inputs | IBKR live ticks via `ib-async` to `ib_gateway`; QC bundled historical bars cached in `lean_local` volume | QC ObjectStore polled |
-| Outputs | Parsed `bars` rows in Postgres + DuckDB Parquet historical store | Same |
-| Dependencies | `ib_gateway`, `lean_local`, audit | QC adapter, audit |
-| Config | `IBKR_MARKET_DATA_SUBSCRIPTION_LEVEL` (per IBKR account), `LEAN_LOCAL_SCHEDULE_ET=17:30` | `QC_OBJECTSTORE_POLL_INTERVAL_SECONDS=60`, `QC_INSTRUCTION_POLL_INTERVAL_SECONDS=5` |
-| Failure modes | `ib_gateway` TWS disconnect > 5 min during CME session → HALT_NEW (routine); LEAN Local crash > 10 min → HALT_NEW (defensive_envelope) | QC ObjectStore unavailable > 10 min → HALT_NEW (defensive_envelope) |
-| Auth | LEAN→backend shared bearer via sops `lean.api_bearer_token`; IBKR→backend via `ib_gateway` TWS session (paper / live credentials sops-encrypted) | QC API token sops-encrypted; ObjectStore polled with HMAC HTTP Basic |
-| Smoke (A27 satisfier) | `deploy/lean_local/README.md` + `deploy/ibkr/README.md` (Pivot-PR-A + Pivot-PR-B) | `deploy/qc_adapter/README.md` (RETIRED) |
+**Pre-2026-05-20 data-layer (RETIRED):** LEAN read market data from on-disk seed files in the `trading_lean_data` Docker volume via `FakeDataQueue` + `SubscriptionDataReaderHistoryProvider`. The volume was populated by operator-side scripts (`scripts/seed_lean_data.py` for yfinance ETFs + `scripts/seed_lean_futures_databento.py` for DataBento futures with a custom converter). Both scripts + the cross-check script (`scripts/verify_seed_data.py`) + the operator runbook (`deploy/lean_local/seed-data.md`) were DELETED in the 2026-05-20 sub-pivot. See `Docs/decisions-log.md` 2026-05-20 entry for the rationale + 2026-05-17 evening entry for the staleness foot-gun that motivated the sub-pivot.
+
+| Property | Value (Phase 1+ post-2026-05-20 sub-pivot) | Pre-2026-05-20 data-layer (RETIRED) | Pre-pivot Phase 1 (DOUBLE-RETIRED) |
+|---|---|---|---|
+| Data path | IBKR `InteractiveBrokersBrokerage` data-queue-handler + history-provider → `ib_gateway` on clientId=10 (distinct from api clientId=1) | On-disk seed files in `trading_lean_data` Docker volume (yfinance ETFs + DataBento futures) | QC ObjectStore polled |
+| Outputs | LEAN signals → `POST /api/internal/lean/signals` | Same | Same |
+| Dependencies | `ib_gateway`, `lean_local` (with IBKR plugin DLL baked in via NuGet at build time), audit | `ib_gateway` (orders only), `lean_local`, audit | QC adapter, audit |
+| Config | `ib-host=ib_gateway` + `ib-port=4002` + `ib-client-id=10` + `ib-enable-delayed-streaming-data=true` in `lean.json`; `LEAN_LOCAL_SCHEDULE_ET=17:30` | `LEAN_LOCAL_SCHEDULE_ET=17:30`; seed scripts via operator cadence | `QC_OBJECTSTORE_POLL_INTERVAL_SECONDS=60`, `QC_INSTRUCTION_POLL_INTERVAL_SECONDS=5` |
+| Failure modes | `ib_gateway` TWS disconnect > 5 min during CME session → HALT_NEW (routine); LEAN Local crash > 10 min → HALT_NEW (defensive_envelope); IBKR Error 162 (clientId collision) wedges LEAN's clientId=10 for ~30 min → HALT_NEW (defensive_envelope) | Seed data > 5 calendar days old → `v1_history_unavailable` per-cycle silent failure (this was the 2026-05-17 incident; sub-pivot makes it structurally impossible) | QC ObjectStore unavailable > 10 min → HALT_NEW (defensive_envelope) |
+| Auth | LEAN→backend shared bearer via sops `lean.api_bearer_token`; LEAN→IBKR via sops `ibkr.paper_username` / `.paper_password` / `.paper_account` (read by `lean_local` entrypoint into `IB_USER_NAME` / `IB_PASSWORD` / `IB_ACCOUNT` env vars) | LEAN→backend bearer only (no IBKR auth needed on LEAN side) | QC API token sops-encrypted; ObjectStore polled with HMAC HTTP Basic |
+| Smoke (A27 satisfier) | `deploy/lean_local/README.md` (post-2026-05-20 rewrite) + `deploy/ibkr/README.md` (Pivot-PR-B) | `deploy/lean_local/seed-data.md` (DELETED 2026-05-20) | `deploy/qc_adapter/README.md` (RETIRED) |
 
 ### 2.1.2 Calendar Ingestion (CRITICAL)
 

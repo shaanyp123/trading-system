@@ -27,15 +27,30 @@ ibkr:
   # port 4002 (paper) / 4001 (live) — but external callers connect via
   # socat at 4004 (paper) / 4003 (live) per gnzsnz convention; see
   # deploy/ibkr/README.md Step 4.
+  #
+  # DATA-LAYER SUB-PIVOT 2026-05-20: LEAN now ALSO reads these fields
+  # (in addition to the gateway login). The `lean_local` entrypoint
+  # exports them as IB_USER_NAME / IB_PASSWORD / IB_ACCOUNT env vars
+  # which substitute into `lean.json`'s `${IB_USER_NAME}` / `${IB_PASSWORD}` /
+  # `${IB_ACCOUNT}` placeholders for the `InteractiveBrokersBrokerage`
+  # data-queue-handler config (clientId=10; delayed quotes + reqHistoricalData).
+  # PR #120 (2026-05-12) had dropped the LEAN-side reads; the 2026-05-20
+  # data-layer sub-pivot restores them for the DATA path only (LEAN's
+  # live-mode-brokerage stays PaperBrokerage — LEAN does NOT place
+  # orders; the api still owns the broker contract on clientId=1 via
+  # services/execution/ibkr_adapter.py).
   paper_username: <TODO_FROM_PIVOT_PR_B_BRINGUP>
   paper_password: <TODO_FROM_PIVOT_PR_B_BRINGUP>
   # Paper account ID (distinct from `account_number` above which is the
   # live account). Find this in the IB Gateway boot log line
   #     "<DUQ_account> Trader Workstation Configuration (Simulated Trading)"
   # or in the IBKR portal → Paper Trading → Account Profile.
-  # Read by the api's IBKR FlexQuery flow (services/api/entrypoint.py).
-  # Post-ceremony 2026-05-12: LEAN no longer reads this — its broker is
-  # the built-in PaperBrokerage simulator and needs no IBKR credentials.
+  # Read by:
+  #   * api's IBKR FlexQuery flow (services/api/entrypoint.py — falls
+  #     back to ibkr.account_number above when paper_account is empty)
+  #   * lean_local entrypoint (DATA-LAYER SUB-PIVOT 2026-05-20 —
+  #     infrastructure/lean_local/entrypoint.sh exports as IB_ACCOUNT
+  #     for the InteractiveBrokersBrokerage data-queue-handler)
   paper_account: <TODO_FROM_PIVOT_PR_F_BRINGUP>
   # Live credentials. Empty (or placeholder) until Week 8 cutover ceremony.
   # The operator deliberately defers populating these until 30-paper-session
