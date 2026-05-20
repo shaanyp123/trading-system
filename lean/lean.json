@@ -25,7 +25,7 @@
     "VOL_TARGET_PCT_ANNUAL": "0.15",
     "INSTRUMENT_VOL_LOOKBACK_DAYS": "60",
     "ROLL_DAYS_BEFORE_EXPIRY": "5",
-    "STARTING_CASH_USD": "15000"
+    "STARTING_CASH_USD": "100000"
   },
   "$comment-parameters": "Mirrors strategies/v1_trend_following/parameters.py V1_DEFAULTS. The algorithm reads them via self.get_parameter(...) with V1_DEFAULTS as fallback. Keys are the canonical agent `tighten_parameter` enum names (backend-spec §12.3) — never rename without a parameter_sets migration.",
 
