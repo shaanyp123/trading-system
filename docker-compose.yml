@@ -109,8 +109,18 @@ services:
     # runs `sops -d` on the host and writes /opt/trading/secrets-decrypted/
     # decrypted.yaml — the api entrypoint reads it at /run/secrets/decrypted.yaml.
     # SECRETS_DIR is set in deploy/.env (default kept here for clarity).
+    #
+    # `lean_data` mount (post data-layer-pivot-v2 2026-05-20 evening; Option C):
+    # the api's BarSyncWorker (services/data/bar_sync.py) needs WRITE access
+    # to /Lean/Data/ so it can populate equity-daily zips, futures-daily
+    # zips, per-day universe CSVs, and map_file sentinels. lean_local
+    # mounts the same volume READ-ONLY (see lean_local volumes block
+    # below). This is the canonical separation: api owns the data
+    # producer role on clientId=2; lean_local consumes via the original
+    # FakeDataQueue + SubscriptionDataReaderHistoryProvider path.
     volumes:
       - ${SECRETS_DIR:-/opt/trading/secrets-decrypted}:/run/secrets:ro
+      - lean_data:/Lean/Data:rw
     depends_on:
       postgres:
         condition: service_healthy
@@ -505,14 +515,16 @@ services:
       context: .
       dockerfile: infrastructure/lean_local/Dockerfile
     restart: unless-stopped
-    # 2026-05-20 data-layer sub-pivot follow-up: `egress` added so LEAN's IBKR
-    # plugin can reach www.quantconnect.com:443 for its ValidateSubscription()
-    # call at startup. The plugin (from QC's NuGet feed) enforces a paid-
-    # subscription check before instantiating — calls /api/v2/authenticate
-    # with `job-user-id` + `api-access-token` from lean.json (sourced from
-    # sops `quantconnect.user_id` + `.api_token`). Without egress, lean_local
-    # restart-loops with `Resource temporarily unavailable (www.quantconnect.com:443)`.
-    networks: [internal, egress]
+    # Internal-only network (post data-layer-pivot-v2 2026-05-20 evening;
+    # Option C). The v1 attempt at the 2026-05-20 sub-pivot added `egress`
+    # so the QC IBKR plugin could hit www.quantconnect.com:443 for
+    # ValidateSubscription(); the v2 architecture (api fetches bars on
+    # clientId=2 + writes to disk; LEAN reads via FakeDataQueue) does NOT
+    # need the QC plugin or any external HTTPS reach from lean_local.
+    # Reverted to `[internal]` only — LEAN talks to api over the internal
+    # Docker network (for the `POST /api/internal/lean/signals` path) +
+    # reads bars from the shared `lean_data` volume.
+    networks: [internal]
     environment:
       ENVIRONMENT: ${ENVIRONMENT:-paper}
       LEAN_LIVE_MODE: ${LEAN_LIVE_MODE:-false}
@@ -531,8 +543,13 @@ services:
       # (uppercase) which exposed `v1_trend_following` at top level but
       # not the `strategies.*` namespace, breaking sibling imports.
       - ./strategies:/Lean/strategies:ro
-      # LEAN data directory (QC bundled historical bars cached here).
-      - lean_data:/Lean/Data
+      # LEAN data directory (post data-layer-pivot-v2 2026-05-20 evening):
+      # READ-ONLY mount of the shared lean_data volume. The api's
+      # BarSyncWorker (services/data/bar_sync.py; api side has rw mount
+      # of the same volume) writes daily-resolution OHLCV bars +
+      # per-day universe CSVs + map_file sentinels here; lean_local
+      # consumes via FakeDataQueue + SubscriptionDataReaderHistoryProvider.
+      - lean_data:/Lean/Data:ro
       # sops-decrypted bundle for bearer-token resolution at boot.
       - ${SECRETS_DIR:-/opt/trading/secrets-decrypted}:/run/secrets:ro
     depends_on:

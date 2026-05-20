@@ -15,17 +15,26 @@ You are working on a solo-operator algorithmic trading system. The operator is n
 >
 > See `Docs/decisions-log.md` 2026-05-12 entry "Phase-1 architecture pivot — QC ObjectStore → LEAN Local + direct IBKR (DP-025 → Option 4)" for the full rationale, the 4 underlying decision points (DP-023/024/025/026), and the diff manifest across all 6 foundation docs.
 
-> **🔄 DATA-LAYER SUB-PIVOT 2026-05-20 — v1 ATTEMPT FAILED + v2 PLANNING.** The original ambition (LEAN reads delayed quotes directly from IBKR via the QC `InteractiveBrokersBrokerage` data-queue-handler at `clientId=10`) was attempted across PRs #195 + #196 + #197 (all merged) but blocked on a 3rd architectural failure mode: the QC plugin's `IBAutomater` component wants to **spawn its own IBKR gateway process** inside the `lean_local` container rather than connect to the existing `ib_gateway` sidecar (the api worker already owns that gateway on `clientId=1`). IBKR's session model enforces single-IP-per-account so a second gateway is infeasible.
+> **🔄 DATA-LAYER PIVOT v2 — Option C LANDED 2026-05-21.** The api owns the bar-fetch responsibility via `services/data/bar_sync.py` (`BarSyncWorker` on `clientId=2`; daily 17:00 ET cycle) that calls IBKR `reqHistoricalData` for all 11 Phase 1 markets + writes the bars to the shared `lean_data` Docker volume in LEAN's expected on-disk format (equity-daily zip + futures-daily zip + per-day universe CSVs + map_files sentinels). `lean_local` reverts to the original `FakeDataQueue` + `SubscriptionDataReaderHistoryProvider` shape and reads on-disk via the api-managed bars (read-only volume mount). No second IBKR session. No QC plugin in the runtime path. $0/yr ongoing. Same data freshness as the v1 ambition would have provided.
 >
-> **⚠️ Current state (2026-05-20 03:06 UTC):** `lean_local` is **STOPPED** on the VPS. Paper trading is offline (no 17:30 ET signal cycle until v2 lands). The api worker, `ib_gateway`, audit chain, Discord bot, watchdog are all unaffected and running. PRs #195/#196/#197 stay in tree as institutional memory — the Dockerfile multi-stage NuGet pull + entrypoint sops reads + lean.json ib-* keys are IDLE (no boot-loop because the container is stopped, not because the code is reverted).
+> **v1 attempt postmortem (PRs #195 + #196 + #197 + the 2026-05-20 03:06 UTC `lean_local stop`):** the v1 ambition routed LEAN's market-data + history calls directly through IBKR via the QC `InteractiveBrokersBrokerage` data-queue-handler on `clientId=10`. Blocked on a 3rd architectural failure mode at deploy: the QC plugin's `IBAutomater` component wants to **spawn its own IBKR gateway process** inside the `lean_local` container rather than connect to the existing `ib_gateway` sidecar (the api worker already owns that gateway on `clientId=1`). IBKR's session model enforces single-IP-per-account so a second gateway is infeasible. Full 3-failure-mode timeline + 4-option analysis in `Docs/decisions-log.md` 2026-05-20 evening entry.
 >
-> **v2 plan (next session — see decisions-log 2026-05-20 evening entry):** ⭐ **Option C — api synthesizes bars from IBKR + LEAN reads from disk via FakeDataQueue.** The api's existing ib-async `clientId=1` connection adds a daily `reqHistoricalData` fetch for all 11 Phase 1 markets, writes bars to the shared `lean_data` volume in LEAN's on-disk format, and LEAN reverts to the seed-file path (`FakeDataQueue` + `SubscriptionDataReaderHistoryProvider`) reading the api-managed bars. No second IBKR session. No QC plugin in the runtime path. $0/yr ongoing. Same data freshness as the v1 ambition. Estimated 1-day session. See the "Detailed session prompt for v2" block at the end of the 2026-05-20 evening decisions-log entry.
+> **Architecture (post-Option-C):**
+> - **api clientId=1** — order-placement worker (long-lived; `services/execution/ibkr_adapter.py`)
+> - **api clientId=2** — bar_sync worker (per-cycle connect → fetch → disconnect; `services/data/bar_sync.py`; THIS PR)
+> - **operator probes + recovery tools** — clientId=80-99 (e.g., `scripts/operator_tools/replay_executions.py` uses 99)
+> - **reserve 3-7** — future multi-strategy / additional read-only telemetry clients
+> - **lean_local** — internal-only network; READ-ONLY mount of `lean_data` volume; reads via `FakeDataQueue` + `SubscriptionDataReaderHistoryProvider`; no direct IBKR connection
 >
-> **Until v2 lands, two operator options:**
-> 1. **Leave `lean_local` stopped** — paper trading offline until v2 deploy (chosen 2026-05-20 evening).
-> 2. **Roll back lean.json + docker-compose.yml lean_local network** — restore the pre-PR-#195 seed-file architecture; paper trading resumes with the 2026-05-17 seed data (going stale; staleness threshold ~5 days; ~2 days viable).
+> **Operator-side deploy ceremony (post-merge of THIS PR):**
+> 1. SSH to VPS; `git pull --ff-only`
+> 2. `docker compose --env-file deploy/.env build api lean_local` (api code changed → bar_sync worker; lean_local Dockerfile reverted to single-stage)
+> 3. `docker compose --env-file deploy/.env up -d --force-recreate api lean_local`
+> 4. Watch api logs for `bar_sync_worker_spawned` at boot + (at 17:00 ET) `bar_sync_cycle_firing` → `bar_sync_cycle_completed failed_markets=[]`
+> 5. Watch lean_local logs for clean `v1_strategy initialized` (no `v1_universe_data_missing` if bar_sync landed) + at 17:30 ET `v1_signals_generated session_date=… signals_emitted_count=…`
+> 6. Verify `verify_chain --env paper` still passes
 >
-> See `Docs/decisions-log.md` 2026-05-20 evening entry "Data-layer pivot deploy ceremony: 3 sequential failure modes; lean_local stopped pending v2 architecture" for full postmortem + the 3 failure modes + 4 v2 options (A/B/C/D) + recommendation rationale + the comprehensive v2 session prompt.
+> See `Docs/decisions-log.md` 2026-05-21 entry "Data-layer pivot v2 LANDS via Option C" for the full implementation rationale + the 2026-05-20 evening entry for the v1 postmortem.
 
 ## Read these at the start of every session
 

@@ -1,32 +1,49 @@
 # `deploy/lean_local/` — operator runbook for LEAN Local
 
-Pivot-PR-A (post-pivot 2026-05-12) baseline + **2026-05-20 data-layer
-sub-pivot** runbook. A27 satisfier per dev-guide §6.8 alternative (b) —
-operator-runbook with concrete fact-checks against the real LEAN
-runtime + the real backend `/api/internal/lean/signals` endpoint + the
-real IBKR `ib_gateway` data-queue connection on clientId=10.
+Pivot-PR-A (post-pivot 2026-05-12) baseline + **2026-05-21 data-layer
+pivot v2 Option C** runbook. A27 satisfier per dev-guide §6.8
+alternative (b) — operator-runbook with concrete fact-checks against
+the real LEAN runtime + the real backend `/api/internal/lean/signals`
+endpoint + the api-managed `lean_data` Docker volume.
 
 This runbook walks the operator through wiring + smoke-testing the
-`lean_local` Docker container against a freshly-deployed backend
-post-2026-05-20. The previous seed-data ceremony runbook
-(`seed-data.md`) was DELETED in the sub-pivot — there are no seed
-files to populate; LEAN reads market data from IBKR via the
-`InteractiveBrokersBrokerage` data-queue-handler on clientId=10.
+`lean_local` Docker container under the Option C architecture (api's
+`BarSyncWorker` writes bars on clientId=2; `lean_local` reads on-disk
+via `FakeDataQueue` + `SubscriptionDataReaderHistoryProvider`). The
+previous seed-data ceremony runbook (`seed-data.md`) was DELETED in the
+2026-05-20 v1 attempt and remains deleted under Option C — the api owns
+the data-producer role; no operator-side seed scripts to run. The v1
+attempt's runbook fragments below the prereqs (Steps 2-3) were updated
+in this PR to reflect Option C; the bearer-token wiring (Step 1) is
+unchanged.
 
 **Prereqs:**
 
-* Backend deployed at `99b8be9` or later (HEAD of `main` as of
-  2026-05-19), with the 2026-05-20 data-layer sub-pivot merged.
+* Backend deployed with the 2026-05-21 data-layer pivot v2 (Option C)
+  merged — `services/data/bar_sync.py` present, `lean.json` reverted
+  to `FakeDataQueue` + `SubscriptionDataReaderHistoryProvider`,
+  `docker-compose.yml::api` has `lean_data:/Lean/Data:rw`, and
+  `docker-compose.yml::lean_local` has `lean_data:/Lean/Data:ro` +
+  `networks: [internal]`.
 * `ib_gateway` container running + authenticated against the operator's
   IBKR paper account (`DUQ...`). Operator can verify by inspecting
   `docker compose logs ib_gateway` for `Authentication successful` +
-  no recent `Error 162`. The 2026-05-12 Pivot-PR-B brought this
-  container live; no new bring-up needed for the sub-pivot.
+  no recent `Error 162`. Used by BOTH the order worker (clientId=1) +
+  the bar_sync worker (clientId=2).
 * sops decryption working on the VPS (`/etc/credstore.encrypted/age_key`
   configured per the Day 5 carryover pattern).
 * `services/api/entrypoint.py` reads `lean.api_bearer_token` from sops →
   exports `API_LEAN_LOCAL_BEARER_TOKEN`.
 * SSH access to the operator's VPS at the standard `trading@<host>` path.
+
+**What Option C changes vs the v1 attempt:**
+
+* `lean.json` reverts to FakeDataQueue + SubscriptionDataReaderHistoryProvider — no IBKR plugin in LEAN's runtime.
+* `infrastructure/lean_local/Dockerfile` reverts to single-stage (no multi-stage NuGet pull; no `CSharpAPI.dll` / `IBAutomater.jar` / etc.).
+* `infrastructure/lean_local/entrypoint.sh` no longer reads `IB_USER_NAME` / `IB_PASSWORD` / `IB_ACCOUNT` / `QC_USER_ID` / `QC_API_TOKEN` from sops — those fields can stay in `secrets/<env>.enc.yaml` (the ib_gateway sidecar uses paper_username + paper_password to log into IBKR) but `lean_local` doesn't need them.
+* `docker-compose.yml::lean_local` reverts `networks: [internal, egress]` → `[internal]` (no external HTTPS reach needed).
+* `docker-compose.yml::api` adds `lean_data:/Lean/Data:rw` so the BarSyncWorker can write.
+* `lean/v1_strategy.py::initialize` restores the `self._log_universe_freshness()` invocation — now catches api-side bar-sync failures (instead of catching operator-side seed-file staleness as it did pre-2026-05-20).
 
 ---
 

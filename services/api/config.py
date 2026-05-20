@@ -396,6 +396,80 @@ class APISettings(BaseSettings):
         ),
     )
 
+    # --- Bar-sync worker (Option C of the 2026-05-20 data-layer v2) --------
+    #
+    # Daily 17:00 ET cycle fetches OHLCV bars for the Phase 1 universe
+    # from IBKR via a dedicated ib-async connection on clientId=2
+    # (distinct from the OrderPlacementWorker's clientId=1 per
+    # dev-guide §1.5 LOCKED) and writes them to the shared
+    # ``lean_data`` Docker volume in LEAN's expected on-disk format.
+    # LEAN reads via FakeDataQueue + SubscriptionDataReaderHistoryProvider
+    # on its 17:30 ET signal cycle.
+    #
+    # See ``services/data/bar_sync.py`` + ``Docs/decisions-log.md``
+    # 2026-05-20 evening entry "Data-layer pivot deploy ceremony"
+    # for the full architecture.
+    bar_sync_enabled: bool = Field(
+        default=True,
+        description=(
+            "When False, the api lifespan skips BarSyncWorker startup. "
+            "Use to pause bar refreshes without affecting the rest of "
+            "the api (e.g., during an IBKR-side outage or while the "
+            "operator manually populates lean_data)."
+        ),
+    )
+    bar_sync_client_id: int = Field(
+        default=2,
+        ge=1,
+        le=7,
+        description=(
+            "TWS API clientId for the bar-sync worker. Default 2 per "
+            "dev-guide §1.5 LOCKED (api worker=1, bar_sync=2, probes=80-99). "
+            "Distinct from `ibkr_client_id` so the read-only historical "
+            "fetch path doesn't share the live order socket."
+        ),
+    )
+    bar_sync_schedule_et: str = Field(
+        default="17:00",
+        pattern=r"^[0-2]\d:[0-5]\d$",
+        description=(
+            "Wall-clock time (HH:MM, America/New_York) at which the "
+            "bar_sync cycle fires. Default 17:00 ET is 30 min before "
+            "LEAN's 17:30 ET signal cycle so fresh bars land on disk "
+            "before LEAN reads."
+        ),
+    )
+    bar_sync_bars_per_fetch: int = Field(
+        default=250,
+        ge=30,
+        le=2000,
+        description=(
+            "Count of daily bars fetched per market per cycle. Default 250 "
+            "calendar days ≈ 250 trading days, comfortably above V1's "
+            "warmup minimum of 225 (MA_SLOW_DAYS=200 + ATR_LOOKBACK_DAYS=20 "
+            "+ 5-day pad). Lower bound 30 is a sanity floor; upper bound "
+            "2000 caps IBKR query cost."
+        ),
+    )
+    bar_sync_data_root: str = Field(
+        default="/Lean/Data",
+        description=(
+            "LEAN data-root path inside the api container. Matches the "
+            "`lean_data` Docker volume mount, which `lean_local` reads "
+            "from on the same volume. Override for dev-host testing."
+        ),
+    )
+    bar_sync_ibkr_call_timeout_seconds: float = Field(
+        default=60.0,
+        gt=0.0,
+        le=600.0,
+        description=(
+            "Per-IBKR-call deadline (seconds) inside the bar_sync cycle. "
+            "reqHistoricalData with ~250 daily bars typically returns "
+            "in <5s; we cap at 60s so a hung call doesn't wedge the cycle."
+        ),
+    )
+
     # --- Discord + Resend for the recon-break alert dispatch hook --------
     #
     # When the reconciliation scheduler detects an actionable break, the

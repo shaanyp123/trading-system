@@ -597,16 +597,23 @@ def collect_tracked_tasks(
     order_placement: tuple[object, object] | None,
     reconciliation: tuple[object, object] | None,
     heartbeat_probe: tuple[object, object] | None,
+    bar_sync: tuple[object, object] | None = None,
 ) -> tuple[TrackedTask, ...]:
     """Build the canonical TrackedTask tuple from lifespan state.
 
-    Pure-policy: takes the 3 ``(worker, task)`` tuples the lifespan
+    Pure-policy: takes the 4 ``(worker, task)`` tuples the lifespan
     constructs and returns the typed ``TrackedTask`` sequence. Tasks
     whose state-tuple is None get ``task=None`` (the monitor reports
     them as not-spawned at startup but doesn't probe them per-cycle).
 
     The argument order matches the lifespan's ordering for log
-    consistency: order_placement → reconciliation → heartbeat_probe.
+    consistency: order_placement → reconciliation → heartbeat_probe →
+    bar_sync.
+
+    The ``bar_sync`` kwarg defaults to None so existing callers in
+    tests that don't yet exercise the bar-sync path continue to work
+    unchanged (they tolerate the same "not spawned" treatment as a
+    real ``None`` from the lifespan).
     """
     return (
         TrackedTask(
@@ -623,6 +630,11 @@ def collect_tracked_tasks(
             name="heartbeat_probe.run_forever",
             task=_extract_task(heartbeat_probe),
             expected_alive=heartbeat_probe is not None,
+        ),
+        TrackedTask(
+            name="bar_sync_worker.run_forever",
+            task=_extract_task(bar_sync),
+            expected_alive=bar_sync is not None,
         ),
     )
 

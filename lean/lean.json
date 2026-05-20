@@ -2,8 +2,8 @@
   "$comment-1": "QuantConnect LEAN project config for v1_trend_following.",
   "$comment-2": "POST-PIVOT 2026-05-12 (Pivot-PR-A): canonical deploy path is LEAN Local in a Dockerized container on the operator's VPS. The pre-pivot 'QC Cloud' path is RETIRED — QC's /object/get is gated behind the Institutional subscription tier (DP-025), so the QC-Cloud-mediated Phase 1 architecture is no longer feasible.",
   "$comment-3": "POST-CEREMONY 2026-05-12: LEAN-side broker swapped from InteractiveBrokersBrokerage → PaperBrokerage. The bare quantconnect/lean:latest image does NOT ship QuantConnect.Brokerages.InteractiveBrokers.dll, so live-mode boot threw `Sequence contains no matching element` from LEAN's Composer broker-factory lookup. PaperBrokerage is LEAN's built-in zero-dependency simulator. The api owns the real IBKR broker contract via services/execution/ibkr_adapter.py — LEAN only generates signals + POSTs them.",
-  "$comment-4": "DATA-LAYER SUB-PIVOT 2026-05-20: LEAN now reads MARKET DATA from IBKR via the InteractiveBrokersBrokerage `data-queue-handler` + `history-provider` (delayed quotes 1-3s actual lag despite 'delayed' labeling + reqHistoricalData for warmup). The IBKR plugin DLL is baked into the custom lean_local image via NuGet at build time (infrastructure/lean_local/Dockerfile multi-stage). live-mode-brokerage STAYS PaperBrokerage — LEAN does NOT place orders; the api owns the broker contract at clientId=1, LEAN owns the data-queue contract at clientId=10 (distinct clientIds per dev-guide §1.5 LOCKED). Retires the seed-file architecture (seed_lean_data.py + seed_lean_futures_databento.py + universes/* + map_files/* + factor_files/*). See Docs/decisions-log.md 2026-05-20 entry.",
-  "$comment-5": "Post-pivot deploy: docker compose up -d lean_local. The container's entrypoint resolves sops bundle → env vars LEAN_LOCAL_BEARER_TOKEN + IB_USER_NAME + IB_PASSWORD + IB_ACCOUNT, then deep-merges this template on top of upstream LEAN's config.json and launches LEAN Launcher.",
+  "$comment-rollback-2026-05-20-v2": "DATA-LAYER PIVOT v2 (Option C of the 2026-05-20 v2 architecture; supersedes the v1 attempt in PRs #195 + #196 + #197). The v1 ambition (LEAN reads delayed quotes directly from IBKR via the QC `InteractiveBrokersBrokerage` data-queue-handler on clientId=10) was blocked by the QC plugin's IBAutomater design (the plugin tries to LAUNCH its own gateway rather than connect to an existing one — incompatible with the api's clientId=1 ownership of the ib_gateway sidecar). Option C reverts the data-queue-handler + history-provider to the original `FakeDataQueue` + `SubscriptionDataReaderHistoryProvider` shape; api now owns the bar-fetch responsibility via `services/data/bar_sync.py` (BarSyncWorker on clientId=2; daily 17:00 ET cycle; writes to the shared `lean_data` Docker volume). The 9 ib-* keys + job-user-id + api-access-token from the v1 attempt are removed. See `Docs/decisions-log.md` 2026-05-20 evening entry + the v2 landing entry.",
+  "$comment-5": "Post-pivot deploy: docker compose up -d lean_local. The container's entrypoint resolves sops bundle → env vars LEAN_LOCAL_BEARER_TOKEN, then deep-merges this template on top of upstream LEAN's config.json and launches LEAN Launcher.",
   "$comment-6": "Brokerage: PaperBrokerage (live-mode). LEAN simulates fills locally; the strategy never calls broker-mutating APIs (market_order / limit_order / etc.) — it only emits signals via HTTP POST to the api. The api dispatches approved signals to IBKR via ib-async (services/execution/ibkr_adapter.py) on clientId=1.",
   "$comment-7": "Strategy logic in strategies/v1_trend_following/ is broker-agnostic and runs identically under any of these environments.",
 
@@ -12,7 +12,7 @@
   "algorithm-location": "v1_strategy.py",
   "$comment-algorithm-location": "LEAN Local reads this field — the file was renamed from v1_qc_algorithm.py to v1_strategy.py post-pivot (Pivot-PR-A Q3 resolution). The QC Cloud deploy path is retired so the dual-filename pattern from the pre-pivot README is no longer needed.",
 
-  "description": "v1_trend_following — Donchian/MA/Hurst/ATR trend strategy on Phase 1 sub-universe (CME micro futures + bond ETFs). Daily resolution, 17:30 ET signal cycle. Runs locally via LEAN Local + PaperBrokerage (for fills) + InteractiveBrokersBrokerage data-queue-handler (for delayed quotes + reqHistoricalData bars from IBKR via ib_gateway on clientId=10).",
+  "description": "v1_trend_following — Donchian/MA/Hurst/ATR trend strategy on Phase 1 sub-universe (CME micro futures + bond ETFs). Daily resolution, 17:30 ET signal cycle. Runs locally via LEAN Local + PaperBrokerage (for fills) + FakeDataQueue + SubscriptionDataReaderHistoryProvider (reads on-disk bars written by the api's BarSyncWorker on clientId=2 at 17:00 ET; data-layer-pivot-v2 architecture per `services/data/bar_sync.py`).",
 
   "parameters": {
     "LOOKBACK_DAYS_DONCHIAN": "60",
@@ -29,41 +29,25 @@
   },
   "$comment-parameters": "Mirrors strategies/v1_trend_following/parameters.py V1_DEFAULTS. The algorithm reads them via self.get_parameter(...) with V1_DEFAULTS as fallback. Keys are the canonical agent `tighten_parameter` enum names (backend-spec §12.3) — never rename without a parameter_sets migration.",
 
-  "$comment-ib-keys": "IBKR data-queue-handler config keys (per QuantConnect.Brokerages.InteractiveBrokers v2.5.17699). The entrypoint deep-merge substitutes ${IB_USER_NAME} / ${IB_PASSWORD} / ${IB_ACCOUNT} from container env vars (sourced from sops `ibkr.paper_username` / `ibkr.paper_password` / `ibkr.paper_account`). ib-host points at the ib_gateway sidecar on the internal Docker network; ib-port is 4002 (paper) — distinct from the api's socat-fronted port 4004 because LEAN talks to IB Gateway's internal API listener directly. ib-client-id=10 reserves a distinct client-id slot from the api (clientId=1) per dev-guide §1.5 LOCKED. ib-enable-delayed-streaming-data=true is the canonical key for delayed-quote mode (verified vs. QuantConnect/Lean Launcher/config.json — defaults to false there; we override to true because the operator's IBKR Pro account is not subscribed to any real-time market-data feeds and the strategy is daily-resolution where 1-3s delay is irrelevant).",
-  "$comment-qc-subscription": "The QuantConnect.Brokerages.InteractiveBrokers v2.5.17699 NuGet plugin enforces a ValidateSubscription() check at instantiation — calls https://www.quantconnect.com/api/v2/authenticate with these credentials before allowing the data-queue-handler to register. Sourced from sops `quantconnect.user_id` (int) + `.api_token` (64-char string). Without these the plugin shuts down with `Invalid api user id or token, cannot authenticate subscription`. Discovered 2026-05-20 boot-attempt-2 deploy ceremony. See Docs/decisions-log.md.",
-  "job-user-id": "${QC_USER_ID}",
-  "api-access-token": "${QC_API_TOKEN}",
-  "ib-host": "ib_gateway",
-  "ib-port": "4002",
-  "ib-client-id": "10",
-  "ib-account": "${IB_ACCOUNT}",
-  "ib-user-name": "${IB_USER_NAME}",
-  "ib-password": "${IB_PASSWORD}",
-  "ib-trading-mode": "paper",
-  "ib-agent-description": "Individual",
-  "ib-enable-delayed-streaming-data": "true",
-  "ib-weekly-restart-utc-time": "22:00:00",
-
   "environments": {
-    "$comment": "LEAN Local environments. The `lean_local` Docker container's entrypoint deep-merges this section on top of the upstream `/Lean/Launcher/bin/Debug/config.json` defaults (Pivot-PR-F). The paper-internal env's handler bindings mirror upstream LEAN's `live-interactive` shape for the data-queue-handler + history-provider (InteractiveBrokersBrokerage) but keep `live-mode-brokerage = PaperBrokerage` (LEAN doesn't place orders; the api owns the broker contract on clientId=1). Production env is selected at runtime via `LEAN_LIVE_MODE`: `false` (default) → backtesting, `true` → paper-internal.",
+    "$comment": "LEAN Local environments. The `lean_local` Docker container's entrypoint deep-merges this section on top of the upstream `/Lean/Launcher/bin/Debug/config.json` defaults (Pivot-PR-F). Post data-layer pivot v2 (Option C; 2026-05-20 evening): handler bindings revert to the original `FakeDataQueue` + `SubscriptionDataReaderHistoryProvider` shape. LEAN reads on-disk bars written by the api's BarSyncWorker (see services/data/bar_sync.py) — clean separation between the api's IBKR ownership (orders on clientId=1, bars on clientId=2) and LEAN's read-only on-disk consumption. Production env is selected at runtime via `LEAN_LIVE_MODE`: `false` (default) → backtesting, `true` → paper-internal.",
     "backtesting": {
       "live-mode": false,
       "$comment": "Backtest against QC bundled historical bars. Used in CI golden tests + ad-hoc parameter sweeps. No broker dependency. Inherits backtesting handlers from upstream config.json defaults via the entrypoint deep-merge."
     },
     "paper-internal": {
       "$comment-1": "Live-mode operation under LEAN's built-in PaperBrokerage simulator. No real exchange connection from LEAN's order side — the strategy never places orders (the api owns broker contract via services/execution/ibkr_adapter.py on clientId=1). PaperBrokerage satisfies the IBrokerage interface for LEAN's internal subscription + scheduling machinery; portfolio queries return flat positions (LEAN doesn't own positions post-pivot; the api does).",
-      "$comment-2": "DATA-LAYER SUB-PIVOT 2026-05-20: handler bindings now mirror upstream LEAN's `live-interactive` env for DATA only. `data-queue-handler` = `InteractiveBrokersBrokerage` — LEAN connects to ib_gateway on clientId=10 (distinct from api's clientId=1) to receive delayed-quote ticks via reqMktData. `history-provider` = `[InteractiveBrokersBrokerage]` — the same plugin instance also implements IHistoryProvider so self.history(symbol, count, Resolution.DAILY) calls hit IBKR's reqHistoricalData (free for account holders, returns same-day settlement bar). The pre-2026-05-20 stack was `data-queue-handler = [FakeDataQueue]` + `history-provider = [SubscriptionDataReaderHistoryProvider]` reading on-disk seed files — retired in this pivot.",
-      "$comment-3": "transaction-handler stays `BacktestingTransactionHandler` because PaperBrokerage simulates fills internally — not BrokerageTransactionHandler (which would route fills through the data-queue-handler's brokerage instance and accidentally place orders at IBKR).",
-      "$comment-4": "Why live-mode-brokerage stays PaperBrokerage and is NOT the InteractiveBrokersBrokerage: the api owns the IBKR broker contract on clientId=1 with full state machine + fill processing + audit-chain integration. If LEAN ALSO claimed the broker contract, we'd have two competing order-placement paths racing on the same paper account. The clean separation is: api places orders (clientId=1); LEAN reads data (clientId=10); IBKR's TWS allows multiple client-ids per gateway session per the 2026-05-19 probe.",
+      "$comment-2": "DATA-LAYER PIVOT v2 (Option C; 2026-05-20 evening): `data-queue-handler` = `FakeDataQueue` (LEAN's built-in no-op live queue; the strategy doesn't need streaming ticks — all decisions are daily-resolution and derive from `self.history(...)` reads). `history-provider` = `[SubscriptionDataReaderHistoryProvider]` (reads on-disk daily bars from `/Lean/Data/`, populated by the api's BarSyncWorker via the shared `lean_data` Docker volume mount). The api fetches bars from IBKR via ib-async on clientId=2 daily at 17:00 ET; LEAN's 17:30 ET signal cycle reads the fresh data. See Docs/decisions-log.md 2026-05-20 evening entry for the full architecture + v1 attempt postmortem.",
+      "$comment-3": "transaction-handler stays `BacktestingTransactionHandler` because PaperBrokerage simulates fills internally — not BrokerageTransactionHandler.",
       "live-mode": true,
       "live-mode-brokerage": "PaperBrokerage",
       "setup-handler": "QuantConnect.Lean.Engine.Setup.BrokerageSetupHandler",
       "result-handler": "QuantConnect.Lean.Engine.Results.LiveTradingResultHandler",
       "data-feed-handler": "QuantConnect.Lean.Engine.DataFeeds.LiveTradingDataFeed",
-      "data-queue-handler": ["InteractiveBrokersBrokerage"],
+      "data-queue-handler": ["QuantConnect.Lean.Engine.DataFeeds.Queues.FakeDataQueue"],
       "real-time-handler": "QuantConnect.Lean.Engine.RealTime.LiveTradingRealTimeHandler",
       "transaction-handler": "QuantConnect.Lean.Engine.TransactionHandlers.BacktestingTransactionHandler",
-      "history-provider": ["InteractiveBrokersBrokerage"]
+      "history-provider": ["SubscriptionDataReaderHistoryProvider"]
     }
   }
 }
