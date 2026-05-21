@@ -127,7 +127,10 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
       - name: Install ruff
-        run: pip install 'ruff>=0.7.4'
+        # Pinned to match pyproject.toml dev deps. Keep these two in sync —
+        # local/CI version drift previously caused unnecessary CI cycles
+        # (PR #211 was reformatted by a newer ruff in CI than locally).
+        run: pip install 'ruff==0.15.14'
       - name: ruff format --check
         run: ruff format --check .
       - name: ruff check
