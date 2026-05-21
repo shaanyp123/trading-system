@@ -314,9 +314,7 @@ class MarketSyncResult:
     open_interest: int | None = (
         None  # None for ETFs; 0 on fetch failure; positive int when populated
     )
-    open_interest_was_sentinel: bool = (
-        False  # True only when substitution fired in sync_one_market
-    )
+    open_interest_was_sentinel: bool = False  # True only when substitution fired in sync_one_market
 
 
 @dataclass(frozen=True, slots=True)

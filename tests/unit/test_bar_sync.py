@@ -2424,9 +2424,7 @@ class TestBarSyncWorkerAlertSeam:
         assert worker._consecutive_sentinel_count == 0
         assert captured == []
 
-    def test_single_failure_increments_below_threshold(
-        self, small_config: BarSyncConfig
-    ) -> None:
+    def test_single_failure_increments_below_threshold(self, small_config: BarSyncConfig) -> None:
         ib = _FakeIb()
         ib.connect_should_raise = ConnectionRefusedError("ib_gateway down")
         captured, hook = self._hook_capture()
@@ -2440,9 +2438,7 @@ class TestBarSyncWorkerAlertSeam:
         assert worker._consecutive_failure_count == 1
         assert captured == []
 
-    def test_two_consecutive_failures_dispatch_alert(
-        self, small_config: BarSyncConfig
-    ) -> None:
+    def test_two_consecutive_failures_dispatch_alert(self, small_config: BarSyncConfig) -> None:
         captured, hook = self._hook_capture()
         worker = BarSyncWorker(
             config=small_config,
@@ -2466,9 +2462,7 @@ class TestBarSyncWorkerAlertSeam:
         assert captured[0].category == "data_quality_reject"
         assert captured[0].severity == "P2"
 
-    def test_failure_then_clean_cycle_resets_counter(
-        self, small_config: BarSyncConfig
-    ) -> None:
+    def test_failure_then_clean_cycle_resets_counter(self, small_config: BarSyncConfig) -> None:
         captured, hook = self._hook_capture()
         worker = BarSyncWorker(
             config=small_config,
@@ -2536,9 +2530,7 @@ class TestBarSyncWorkerAlertSeam:
         assert len(captured) == 1
         assert captured[0].category == "data_quality_quarantine"
 
-    def test_no_hook_logs_dropped_at_threshold(
-        self, small_config: BarSyncConfig
-    ) -> None:
+    def test_no_hook_logs_dropped_at_threshold(self, small_config: BarSyncConfig) -> None:
         # Without a hook, the descriptor MUST be logged via
         # bar_sync_alert_dropped_no_hook so the operator can grep for
         # the pattern.
@@ -2559,9 +2551,7 @@ class TestBarSyncWorkerAlertSeam:
         assert dropped[0]["severity"] == "P2"
         assert dropped[0]["category"] == "data_quality_reject"
 
-    def test_hook_exception_logged_and_swallowed(
-        self, small_config: BarSyncConfig
-    ) -> None:
+    def test_hook_exception_logged_and_swallowed(self, small_config: BarSyncConfig) -> None:
         # A Discord outage on the api hook side must NOT wedge the
         # cycle. Hook raises → exception is caught + logged as
         # bar_sync_alert_dispatch_failed → run_cycle returns cleanly.
@@ -2585,9 +2575,7 @@ class TestBarSyncWorkerAlertSeam:
         with capture_logs() as logs:
             asyncio.run(worker.run_cycle(today=date(2026, 5, 20)))
         assert calls == 1
-        failed = [
-            e for e in logs if e.get("event") == "bar_sync_alert_dispatch_failed"
-        ]
+        failed = [e for e in logs if e.get("event") == "bar_sync_alert_dispatch_failed"]
         assert len(failed) == 1
 
 

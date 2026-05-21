@@ -203,9 +203,7 @@ class TestBuildPartialCycleAlert:
         # counts. This test locks the contract that partial-cycle and
         # sentinel-substitution alerts have disjoint signals.
         cycle = _cycle(
-            successful=(
-                _successful("/MCL", open_interest=1, open_interest_was_sentinel=True),
-            ),
+            successful=(_successful("/MCL", open_interest=1, open_interest_was_sentinel=True),),
         )
         assert build_partial_cycle_alert(cycle, consecutive_failure_count=10) is None
 
@@ -237,23 +235,18 @@ class TestBuildSentinelSubstitutionAlert:
         cycle = _cycle(successful=(_successful("/MES", open_interest=257985),))
         for count in (0, 1, 2, 100):
             assert (
-                build_sentinel_substitution_alert(cycle, consecutive_sentinel_count=count)
-                is None
+                build_sentinel_substitution_alert(cycle, consecutive_sentinel_count=count) is None
             )
 
     def test_sentinel_below_threshold_returns_none(self) -> None:
         cycle = _cycle(
-            successful=(
-                _successful("/MCL", open_interest=1, open_interest_was_sentinel=True),
-            ),
+            successful=(_successful("/MCL", open_interest=1, open_interest_was_sentinel=True),),
         )
         assert build_sentinel_substitution_alert(cycle, consecutive_sentinel_count=1) is None
 
     def test_sentinel_at_threshold_returns_descriptor(self) -> None:
         cycle = _cycle(
-            successful=(
-                _successful("/MCL", open_interest=1, open_interest_was_sentinel=True),
-            ),
+            successful=(_successful("/MCL", open_interest=1, open_interest_was_sentinel=True),),
         )
         descriptor = build_sentinel_substitution_alert(cycle, consecutive_sentinel_count=2)
         assert descriptor is not None
@@ -285,9 +278,7 @@ class TestBuildSentinelSubstitutionAlert:
 
     def test_descriptor_title_carries_sentinel_value(self) -> None:
         cycle = _cycle(
-            successful=(
-                _successful("/MCL", open_interest=1, open_interest_was_sentinel=True),
-            ),
+            successful=(_successful("/MCL", open_interest=1, open_interest_was_sentinel=True),),
         )
         descriptor = build_sentinel_substitution_alert(cycle, consecutive_sentinel_count=4)
         assert descriptor is not None
@@ -296,9 +287,7 @@ class TestBuildSentinelSubstitutionAlert:
 
     def test_descriptor_body_describes_operator_decision_space(self) -> None:
         cycle = _cycle(
-            successful=(
-                _successful("/MCL", open_interest=1, open_interest_was_sentinel=True),
-            ),
+            successful=(_successful("/MCL", open_interest=1, open_interest_was_sentinel=True),),
         )
         descriptor = build_sentinel_substitution_alert(cycle, consecutive_sentinel_count=2)
         assert descriptor is not None
@@ -332,10 +321,7 @@ class TestBuildSentinelSubstitutionAlert:
         # with failures but no successful-market sentinels must not fire
         # the sentinel alert.
         cycle = _cycle(failed=(_failed("/MES"), _failed("/MCL")))
-        assert (
-            build_sentinel_substitution_alert(cycle, consecutive_sentinel_count=10)
-            is None
-        )
+        assert build_sentinel_substitution_alert(cycle, consecutive_sentinel_count=10) is None
 
 
 # ---------------------------------------------------------------------------
@@ -355,9 +341,7 @@ class TestCycleClassifiers:
 
     def test_cycle_had_sentinel_substitution_true_when_any_substituted(self) -> None:
         cycle = _cycle(
-            successful=(
-                _successful("/MCL", open_interest=1, open_interest_was_sentinel=True),
-            ),
+            successful=(_successful("/MCL", open_interest=1, open_interest_was_sentinel=True),),
         )
         assert cycle_had_sentinel_substitution(cycle) is True
 

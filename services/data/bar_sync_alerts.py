@@ -161,9 +161,7 @@ def _failed_markets(cycle_result: BarSyncCycleResult) -> tuple[MarketSyncResult,
 def _sentinel_substituted_markets(
     cycle_result: BarSyncCycleResult,
 ) -> tuple[MarketSyncResult, ...]:
-    return tuple(
-        r for r in cycle_result.successful_markets if r.open_interest_was_sentinel
-    )
+    return tuple(r for r in cycle_result.successful_markets if r.open_interest_was_sentinel)
 
 
 def build_partial_cycle_alert(
@@ -296,9 +294,7 @@ def build_sentinel_substitution_alert(
         "total_markets": cycle_result.total_markets,
         "sentinel_market_count": len(substituted),
         "sentinel_markets": sentinel_markets,
-        "sentinel_market_expiries": {
-            r.market: (r.front_month_expiry or "") for r in substituted
-        },
+        "sentinel_market_expiries": {r.market: (r.front_month_expiry or "") for r in substituted},
         "cycle_started_at_utc": _format_utc(cycle_result.cycle_started_at_utc),
         "cycle_completed_at_utc": _format_utc(cycle_result.cycle_completed_at_utc),
     }
