@@ -136,6 +136,21 @@ DEFAULT_IBKR_CALL_TIMEOUT_SECONDS: Final[float] = 60.0
 #: order-placement worker's clientId=1 per dev-guide §1.5 LOCKED.
 DEFAULT_BAR_SYNC_CLIENT_ID: Final[int] = 2
 
+#: Default wall-clock budget for the front-month OI snapshot poll
+#: (per futures market). IBKR's market-data ticks for futures
+#: generic-tick 588 typically arrive within 1-2s of subscription;
+#: 5s gives comfortable headroom without lengthening the cycle
+#: materially. Set to 0 (or negative) on the BarSyncConfig to disable
+#: the OI fetch entirely (universe files will then have empty OI
+#: columns, equivalent to pre-2026-05-20 sub-pivot behavior).
+DEFAULT_OI_WAIT_SECONDS: Final[float] = 5.0
+
+#: IBKR generic-tick ID that triggers ``futuresOpenInterest`` population
+#: on the returned :class:`ib_async.Ticker`. Verified against
+#: ``ib_async/ib.py::reqMktData`` docstring + ``ib_async/wrapper.py``
+#: tick-type map ``86: 'futuresOpenInterest'``.
+_IBKR_FUTURES_OI_GENERIC_TICK: Final[str] = "588"
+
 
 @dataclass(frozen=True, slots=True)
 class MarketMeta:
@@ -221,6 +236,12 @@ class MarketSyncResult:
     exclusive — both branches always populate the metadata fields
     (last_session_date may be None on the first-ever sync of a market
     that had no historical data).
+
+    ``open_interest`` is the snapshot value fetched from IBKR for the
+    futures front-month expiry (``None`` for ETFs and for failed
+    syncs; ``0`` when the OI fetch ran but produced no usable value;
+    a positive int when LEAN's resolver will have a real value to
+    pick on).
     """
 
     market: str
@@ -229,6 +250,9 @@ class MarketSyncResult:
     last_session_date: date | None
     front_month_expiry: str | None  # YYYYMM for futures; None for ETFs / failed syncs
     error: str | None
+    open_interest: int | None = (
+        None  # None for ETFs; 0 on fetch failure; positive int when populated
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,6 +318,10 @@ class BarSyncConfig:
     ibkr_account: str | None = None
     ibkr_call_timeout_seconds: float = DEFAULT_IBKR_CALL_TIMEOUT_SECONDS
     ibkr_connect_timeout_seconds: float = 30.0
+    #: Wall-clock budget for the front-month OI snapshot poll (futures only).
+    #: Set to 0 to skip OI fetch entirely; the bundle writer will still
+    #: produce a (single-expiry, empty-OI) universe file in that case.
+    oi_wait_seconds: float = DEFAULT_OI_WAIT_SECONDS
 
 
 # ---------------------------------------------------------------------------
@@ -920,6 +948,128 @@ async def fetch_futures_bars_and_front_month(
     return bars, front_month
 
 
+async def fetch_front_month_open_interest(
+    ib: Any,
+    market_key: str,
+    *,
+    meta: MarketMeta,
+    front_month_expiry_yyyymm: str,
+    wait_seconds: float = DEFAULT_OI_WAIT_SECONDS,
+    poll_interval_seconds: float = 0.1,
+) -> int:
+    """Fetch the current open-interest snapshot for the front-month future.
+
+    Implementation: ``ib.reqMktData(contract, genericTickList="588",
+    snapshot=False)`` subscribes to streaming ticks (snapshot=True does
+    NOT include generic ticks per IBKR's API contract). The returned
+    :class:`ib_async.Ticker` populates asynchronously as ticks arrive;
+    we poll ``ticker.futuresOpenInterest`` until it becomes non-NaN
+    (typically 1-2s) or the wall-clock budget elapses. Subscription is
+    cancelled in ``finally`` regardless of outcome.
+
+    Returns the snapshot value as ``int`` (IBKR's tick is float but OI
+    is conceptually a count). Returns ``0`` on any failure mode:
+
+    * ``wait_seconds`` elapsed without the tick arriving
+    * The ticker's ``futuresOpenInterest`` stays NaN (no subscription
+      entitlement or the contract has no published OI yet)
+    * The contract construction or ``reqMktData`` call raises
+
+    Returning 0 keeps the caller's contract simple — the cycle still
+    writes a usable LEAN bundle, just with empty-OI universe rows
+    (which is the pre-fix behavior). Real OI > 0 is what unblocks
+    LEAN's ``DataMappingMode.OPEN_INTEREST`` resolver downstream.
+
+    Notes
+    -----
+
+    * The front-month ``Future`` contract is built explicitly with
+      ``lastTradeDateOrContractMonth`` set so IBKR returns the OI of
+      that specific expiry — distinct from the ContFuture used for
+      historical-bar fetches (ContFuture has no OI; it's a synthetic
+      continuous series).
+    * IBKR's futures-OI tick is published once per contract per
+      streaming subscription — it does NOT replay on resubscribe
+      within the same TWS session. Cycling clientId=2 connect/
+      disconnect per cycle (as bar_sync does) guarantees a fresh
+      subscription each fire.
+    """
+    if meta.kind != "futures":
+        raise ValueError(f"fetch_front_month_open_interest called with non-futures meta {meta!r}")
+    if wait_seconds <= 0:
+        return 0
+
+    bound_log = log.bind(
+        op="fetch_front_month_open_interest",
+        market=market_key,
+        front_month_expiry=front_month_expiry_yyyymm,
+    )
+
+    try:
+        from ib_async import Future
+    except ImportError:  # pragma: no cover — defensive; production has ib_async
+        bound_log.exception("oi_fetch_ib_async_import_failed")
+        return 0
+
+    contract: Any
+    try:
+        contract = Future(
+            symbol=meta.ibkr_symbol,
+            exchange=meta.ibkr_exchange,
+            lastTradeDateOrContractMonth=front_month_expiry_yyyymm,
+        )
+    except Exception:  # pragma: no cover — Future ctor is dataclass-like
+        bound_log.exception("oi_fetch_contract_build_failed")
+        return 0
+
+    ticker: Any
+    try:
+        ticker = ib.reqMktData(
+            contract,
+            genericTickList=_IBKR_FUTURES_OI_GENERIC_TICK,
+            snapshot=False,
+        )
+    except Exception:
+        bound_log.exception("oi_fetch_reqmktdata_failed")
+        return 0
+
+    try:
+        deadline = asyncio.get_event_loop().time() + wait_seconds
+        while asyncio.get_event_loop().time() < deadline:
+            raw_oi = getattr(ticker, "futuresOpenInterest", float("nan"))
+            if raw_oi is None:
+                await asyncio.sleep(poll_interval_seconds)
+                continue
+            try:
+                oi_float = float(raw_oi)
+            except (TypeError, ValueError):
+                await asyncio.sleep(poll_interval_seconds)
+                continue
+            if math.isnan(oi_float) or math.isinf(oi_float):
+                await asyncio.sleep(poll_interval_seconds)
+                continue
+            oi_int = int(oi_float)
+            if oi_int <= 0:
+                # Some IBKR feeds emit OI=0 sentinel before real data arrives;
+                # keep polling within the budget rather than returning prematurely.
+                await asyncio.sleep(poll_interval_seconds)
+                continue
+            bound_log.info("oi_fetch_completed", open_interest=oi_int)
+            return oi_int
+        bound_log.warning(
+            "oi_fetch_timeout",
+            wait_seconds=wait_seconds,
+        )
+        return 0
+    finally:
+        cancel = getattr(ib, "cancelMktData", None)
+        if cancel is not None:
+            try:
+                cancel(contract)
+            except Exception:
+                bound_log.exception("oi_fetch_cancel_failed")
+
+
 # ---------------------------------------------------------------------------
 # Per-market sync orchestrator
 # ---------------------------------------------------------------------------
@@ -990,6 +1140,20 @@ async def sync_one_market(
                     front_month_expiry=front_month,
                     error="ibkr_returned_no_bars",
                 )
+            # Fetch the front-month OI snapshot AFTER bars + expiry are
+            # resolved. Failure to obtain OI does NOT fail the cycle —
+            # the helper returns 0 on any error, which the bundle writer
+            # treats as "OI unknown" (empty universe-file column +
+            # zero-line OI zip; equivalent to pre-fix behavior). Real
+            # OI > 0 is what unblocks LEAN's DataMappingMode.OPEN_INTEREST
+            # resolver downstream.
+            open_interest = await fetch_front_month_open_interest(
+                ib,
+                market_key,
+                meta=meta,
+                front_month_expiry_yyyymm=front_month,
+                wait_seconds=config.oi_wait_seconds,
+            )
             write_futures_bundle(
                 data_root=config.data_root,
                 ticker=meta.ibkr_symbol,
@@ -997,7 +1161,7 @@ async def sync_one_market(
                 market_code=meta.lean_market_code,
                 front_month_expiry_yyyymm=front_month,
                 bars=bars,
-                open_interest=0,
+                open_interest=open_interest,
             )
             return MarketSyncResult(
                 market=market_key,
@@ -1006,6 +1170,7 @@ async def sync_one_market(
                 last_session_date=bars[-1].session_date,
                 front_month_expiry=front_month,
                 error=None,
+                open_interest=open_interest,
             )
     except TimeoutError as exc:
         return MarketSyncResult(
@@ -1292,6 +1457,7 @@ __all__ = [
     "DEFAULT_BAR_SYNC_CLIENT_ID",
     "DEFAULT_DATA_ROOT",
     "DEFAULT_IBKR_CALL_TIMEOUT_SECONDS",
+    "DEFAULT_OI_WAIT_SECONDS",
     "DEFAULT_SYNC_TIME_ET",
     "DEFAULT_TICK_INTERVAL_SECONDS",
     "PHASE1_UNIVERSE_METADATA",
@@ -1315,6 +1481,7 @@ __all__ = [
     "equity_factor_file_path",
     "equity_map_file_path",
     "fetch_etf_bars",
+    "fetch_front_month_open_interest",
     "fetch_futures_bars_and_front_month",
     "futures_map_file_path",
     "futures_oi_zip_path",
