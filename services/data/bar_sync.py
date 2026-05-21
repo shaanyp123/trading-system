@@ -5,8 +5,8 @@ Option C of the 2026-05-20 data-layer pivot v2 (see
 deploy ceremony: 3 sequential failure modes; lean_local stopped
 pending v2 architecture"). The api owns the bar-sync responsibility:
 fetches daily OHLCV bars for the Phase 1 universe from IBKR via a
-dedicated ``ib-async`` connection on ``clientId=2`` (distinct from the
-order-placement worker's ``clientId=1``), writes them to the shared
+dedicated ``ib-async`` connection on ``clientId=3`` (distinct from the
+order-placement worker), writes them to the shared
 ``lean_data`` Docker volume in LEAN's expected on-disk format
 (equity-daily zip + futures-daily zip + per-day universe csv +
 map_files sentinels), and ``lean_local`` reads via ``FakeDataQueue``
@@ -24,11 +24,14 @@ Architectural notes
   bar_sync's read-only socket cannot backpressure the order worker's
   long-lived ``clientId=1`` socket.
 
-* **clientId allocation** (per dev-guide §1.5 LOCKED + this PR):
+* **clientId allocation** (per dev-guide §1.5 LOCKED — synced to
+  deploy reality 2026-05-21):
     - ``clientId=1`` — api order-placement worker (services/execution/ibkr_adapter.py)
-    - ``clientId=2`` — api bar_sync worker (this module)
+    - ``clientId=3`` — api bar_sync worker (this module)
     - ``clientId=80-99`` — operator probes + recovery tools
-    - reserve ``3-7`` for future expansion
+    - reserve ``4-7`` for future expansion (``clientId=2`` reserved
+      for the order-placement worker's deploy override; see the
+      decisions-log 2026-05-21 follow-up entry)
 
 * **Futures strategy.** For each futures market the worker:
     1. Fetches continuous-mapped daily bars via ``reqHistoricalData``
@@ -132,9 +135,13 @@ DEFAULT_DATA_ROOT: Final[Path] = Path("/Lean/Data")
 #: at 60s so a hung call doesn't wedge the cycle.
 DEFAULT_IBKR_CALL_TIMEOUT_SECONDS: Final[float] = 60.0
 
-#: Default clientId for the bar_sync worker — distinct from the
-#: order-placement worker's clientId=1 per dev-guide §1.5 LOCKED.
-DEFAULT_BAR_SYNC_CLIENT_ID: Final[int] = 2
+#: Default clientId for the bar_sync worker — synced to deploy
+#: reality 2026-05-21 (was ``2`` prior to PR #210). The order-
+#: placement worker's deploy override reserved clientId=2; bar_sync
+#: ships on clientId=3 to avoid the collision that would otherwise
+#: raise IBKR Error 162. See dev-guide §1.5 LOCKED + decisions-log
+#: 2026-05-21 follow-up entry.
+DEFAULT_BAR_SYNC_CLIENT_ID: Final[int] = 3
 
 #: Default wall-clock budget for the front-month OI snapshot poll
 #: (per futures market). IBKR's market-data ticks for futures
@@ -340,7 +347,8 @@ class BarSyncConfig:
         tick_interval_seconds: How often the scheduler checks whether
             sync_time_et has been reached.
         ibkr_host / ibkr_port / ibkr_client_id: ib-async connection
-            parameters. Default clientId=2 per dev-guide §1.5 LOCKED.
+            parameters. Default clientId=3 per dev-guide §1.5 LOCKED
+            (synced to deploy reality 2026-05-21).
         ibkr_account: optional account number (most accounts have a
             single default and don't need this).
         ibkr_call_timeout_seconds: per-call wall-clock deadline on
@@ -1046,7 +1054,7 @@ async def fetch_front_month_open_interest(
       continuous series).
     * IBKR's futures-OI tick is published once per contract per
       streaming subscription — it does NOT replay on resubscribe
-      within the same TWS session. Cycling clientId=2 connect/
+      within the same TWS session. Cycling clientId=3 connect/
       disconnect per cycle (as bar_sync does) guarantees a fresh
       subscription each fire.
     """
@@ -1316,7 +1324,7 @@ class BarSyncWorker:
         worker.request_stop()
 
     Per-cycle work:
-      1. Connect a fresh ib-async ``IB`` to ``ib_gateway`` on ``clientId=2``.
+      1. Connect a fresh ib-async ``IB`` to ``ib_gateway`` on ``clientId=3``.
       2. For each market in ``config.markets``, call :func:`sync_one_market`.
       3. Disconnect (best-effort).
       4. Log a single structured ``bar_sync_cycle_completed`` line.
