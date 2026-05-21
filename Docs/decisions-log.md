@@ -17,6 +17,51 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ## Entries
 
+### 2026-05-21 — bar_sync OI fetch saga: 3 sequential PRs land real OI for 6/7 futures (PRs #205 + #206 + #207)
+
+- **Trigger:** the first 21:00 UTC v2 bar_sync cycle (2026-05-20) wrote per-day futures universe files with an empty `open_interest` column. LEAN's 21:30 UTC cycle then logged `v1_history_unavailable failed_markets=['/MES', '/MNQ', '/MYM', '/M2K', '/MGC', '/MCL', '/MBT']` and emitted 0 signals because `DataMappingMode.OPEN_INTEREST` resolver scans for `OI > 0` and finds nothing to pick. Synthesis cron's prior-day-rolled file would have worked, but bar_sync overwrites it (it's the file owner now under v2).
+
+- **Root cause (held on first inspection):** `services/data/bar_sync.py::sync_one_market` futures branch passed `open_interest=0` hardcoded into `write_futures_bundle`. The bundle writer's `universe_oi = open_interest if open_interest > 0 else None` branch then rendered an empty universe-row OI column (trailing comma). ETF path unaffected (no universe files). The bar_sync architecture has always relied on a single-expiry universe file pinning the front-month, which is sufficient for `future.set_filter(0, 90)` + `pick_front_month_expiry` rolling at fetch time — the only thing missing was a real OI value.
+
+- **Why 3 PRs not 1:** the operator-provided session brief hypothesized that ib-async needed a `reqHistoricalData whatToShow="..."` value for OI. Verification against `ib_async/ib.py:1201-1207` docstring + `ib_async/wrapper.py:135` (tick map `86: 'futuresOpenInterest'`) showed IBKR has NO historical-OI endpoint for futures. The only path is a snapshot via `reqMktData` + `genericTickList="588"`. Each subsequent deploy then surfaced the next layer:
+
+  | PR | Title | Cycle that surfaced next layer | Time |
+  |---|---|---|---|
+  | [#205](https://github.com/shaanyp123/trading-system/pull/205) | `fetch real front-month OI in bar_sync to unblock LEAN resolver` | First post-deploy cycle at 00:16 UTC | All 7 futures: `oi_fetch_reqmktdata_failed` — `ValueError: Contract ... can't be hashed because no 'conId' value exists. Qualify contract to populate 'conId'.` |
+  | [#206](https://github.com/shaanyp123/trading-system/pull/206) | `qualify Future contracts before reqMktData in OI fetch` | First post-deploy cycle at 00:25 UTC | All 7 futures: `Error 354, reqId 6: Requested market data is not subscribed. ... Delayed market data is available.` |
+  | [#207](https://github.com/shaanyp123/trading-system/pull/207) | `reqMarketDataType(3) for OI — paper account is delayed tier` | First post-deploy cycle at 00:36 UTC | 6/7 futures: `oi_fetch_completed` with real values; /MCL: `oi_fetch_timeout` |
+
+- **Final on-disk state (2026-05-21 00:36 UTC cycle):**
+
+  | Market | universe-row OI | OI-zip column |
+  |---|---|---|
+  | /MES | `286442` | populated |
+  | /MNQ | `263989` | populated |
+  | /MYM | `52210` | populated |
+  | /M2K | `33151` | populated |
+  | /MGC | `50998` | populated |
+  | /MBT | `14850` | populated |
+  | /MCL | (empty) | `0` |
+  | TLT / IEF / SHY / TIP | n/a (ETFs have no universe) | n/a |
+
+- **/MCL gap — root-caused but NOT fixed in code:** an inline probe via `docker exec` + `clientId=92` with `wait_seconds=30.0` still timed out. A deeper probe (`clientId=93`) requesting all tick fields from /MCL with `genericTickList="588"` returned a populated tick row including `close=101.14, marketDataType=3, futuresOpenInterest=0.0` — IBKR DOES return the OI field, but the value is `0.0` (not NaN). The delayed-data tier for NYMEX OI returns `0` as a "not entitled" sentinel; the IBKR Market Data Subscription Manager would need a NYMEX-tier upgrade for real OI here. Bar_sync's graceful-degradation path (return 0 → empty universe-file OI column → `universe_oi = None` branch renders empty) is correct; the gap is data-entitlement, not code. /MCL will remain `v1_history_unavailable` until the operator decides to either (a) upgrade subscription, (b) drop /MCL from `PHASE1_UNIVERSE_METADATA`, or (c) add a sentinel-OI fallback (writes OI=1 just to satisfy LEAN's `OI > 0` check; v1 strategy doesn't consume OI values for logic, only for resolution).
+
+- **Race safety with synthesis cron:** the VPS systemd timer `lean-universe-synthesis.timer` fires at 21:00:00 UTC — same wall-clock minute as bar_sync. Verified safe in both interleavings: synthesis explicitly skips when `${TODAY}.csv` already exists (`if [ -f "$target" ]; then echo skipped`), so whichever fires first wins. With bar_sync as the active writer under v2, synthesis effectively becomes the safety-net for days bar_sync fails entirely (cycle outage / `bar_sync_cycle_connect_failed`) — exactly the role the session brief assigned it.
+
+- **clientId allocation drift:** the dev-guide §1.5 LOCKED note + `DEFAULT_BAR_SYNC_CLIENT_ID: Final[int] = 2` constant both say bar_sync uses clientId=2. The DEPLOYED config on VPS (per `bar_sync_worker_spawned ibkr_client_id=3` log line) uses clientId=3 — set via `API_BAR_SYNC_CLIENT_ID=3` env override in the api compose service (PR #200 carried this; "clientId=2 = api order worker" per the session brief). The code default + dev-guide doc are intentionally out-of-sync with deployment to leave clientId=2 unused. No action needed; flagging here so future readers don't chase the discrepancy. The session brief's operator-provided allocation note ("clientId=2 = api order worker, =3 = bar_sync_worker") is authoritative for deployment.
+
+- **Phase 1+ follow-ups (not done in this session):**
+  - /MCL data-entitlement decision (operator)
+  - Multi-expiry universe enumeration (still deferred; single-expiry + real OI satisfies LEAN's resolver under `future.set_filter(0, 90)` + ContFuture back-history pinned to current front-month)
+  - Could add an alert if `bar_sync_cycle_completed` shows `successful_count < 11` for two consecutive cycles (currently only `bar_sync_cycle_completed` event lands; no severity escalation)
+  - Could detect "OI=0 with other ticks populated → entitlement gap, return 0 sooner" optimization (saves ~5s per market without OI; cosmetic)
+
+- **Test contract added across PRs #205 + #206 + #207:** 26 new tests in `tests/unit/test_bar_sync.py` (116 → 142). Full `make ci`: 1922 passed at the end. The `_FakeIb` test helper now mirrors all 5 ib-async methods we touch: `connectAsync`, `reqHistoricalDataAsync`, `reqContractDetailsAsync`, `qualifyContractsAsync`, `reqMarketDataType`, `reqMktData`, `cancelMktData`, `disconnect`.
+
+- **What tomorrow's 21:00 UTC cycle should look like:** identical to tonight's 00:36 UTC output — 6/7 futures with `oi_fetch_completed`, /MCL with `oi_fetch_timeout`, 4/4 ETFs synced. 21:30 UTC LEAN cycle should resolve 6/7 futures + 4/4 ETFs via the populated universe files, with /MCL alone logging `v1_history_unavailable`.
+
+---
+
 ### 2026-05-20 — 🚀 OPERATIONAL DAY 1: paper trading formally live; vendor subscriptions reduced to IBKR + Hetzner only
 
 - **Status:** OPERATIONAL. Today is the canonical "Day 1" of the trading system being formally operational under the post-Option-C v2 architecture. Subsequent days count forward from here (Day 2 = 2026-05-21, etc.). This entry is the institutional marker of that transition. Drill 10 (2026-05-19) was the LIVE-validated end-to-end milestone for the order path; today's milestone is "v2 data path lands + paper trading is the canonical operational state going forward." Live-money cutover (`live-small` env tag) remains a future Phase milestone — today is paper-only.
