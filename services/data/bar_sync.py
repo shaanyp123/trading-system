@@ -1022,6 +1022,38 @@ async def fetch_front_month_open_interest(
         bound_log.exception("oi_fetch_contract_build_failed")
         return 0
 
+    # ib-async requires a qualified contract before ``reqMktData`` because
+    # the wrapper's ``startTicker`` calls ``hash(contract)`` which raises
+    # ``ValueError: ... can't be hashed because no 'conId' value exists``
+    # for unqualified Future objects. ``qualifyContractsAsync`` populates
+    # ``conId`` (and ``localSymbol``/``tradingClass``/etc.) in-place via a
+    # ``reqContractDetails`` roundtrip — typically ~1s per contract.
+    # See ib_async/contract.py:174 (hash guard) + ib_async/wrapper.py:406
+    # (startTicker → hash call site) + ib_async/ib.py:2110
+    # (qualifyContractsAsync impl).
+    try:
+        qualify = getattr(ib, "qualifyContractsAsync", None)
+        if qualify is None:
+            # Older ib-async or a non-conforming fake — degrade gracefully.
+            bound_log.warning("oi_fetch_qualify_unavailable")
+            return 0
+        qualified = await asyncio.wait_for(qualify(contract), timeout=max(wait_seconds, 1.0))
+    except Exception:
+        bound_log.exception("oi_fetch_qualify_failed")
+        return 0
+    # qualifyContractsAsync mutates the input contract in-place AND returns
+    # a list of qualified contracts (one per input). A failure to qualify
+    # (unknown symbol, ambiguous contract w/o filters) yields ``None`` in
+    # the result slot. Accept either ordering — defensive against minor
+    # ib-async behavioral changes.
+    qualified_list = list(qualified or [])
+    if not qualified_list or qualified_list[0] is None:
+        bound_log.warning("oi_fetch_qualify_returned_no_match")
+        return 0
+    # Prefer the returned qualified contract over the in-place mutated one
+    # (functionally identical but safer if a future ib-async stops mutating).
+    contract = qualified_list[0]
+
     ticker: Any
     try:
         ticker = ib.reqMktData(

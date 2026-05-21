@@ -152,6 +152,13 @@ class _FakeIb:
         self.oi_cancel_should_raise: Exception | None = None
         self.req_mkt_data_calls: list[dict[str, Any]] = []
         self.cancel_mkt_data_calls: list[Any] = []
+        # qualifyContractsAsync canned response. Default = "qualify
+        # succeeds and returns the contract unchanged". Tests can
+        # override to simulate failure / no-match / raise.
+        self.qualify_should_raise: Exception | None = None
+        self.qualify_returns_empty: bool = False
+        self.qualify_returns_none_slot: bool = False
+        self.qualify_calls: list[Any] = []
 
     async def connectAsync(
         self,
@@ -216,6 +223,23 @@ class _FakeIb:
         self.cancel_mkt_data_calls.append(contract)
         if self.oi_cancel_should_raise is not None:
             raise self.oi_cancel_should_raise
+
+    async def qualifyContractsAsync(self, *contracts: Any) -> list[Any]:
+        self.qualify_calls.append(list(contracts))
+        if self.qualify_should_raise is not None:
+            raise self.qualify_should_raise
+        if self.qualify_returns_empty:
+            return []
+        if self.qualify_returns_none_slot:
+            return [None for _ in contracts]
+        # Real ib-async populates conId in-place; mimic the mutation so
+        # downstream code paths can observe the qualified state.
+        for c in contracts:
+            try:
+                c.conId = 999  # deterministic test sentinel
+            except (AttributeError, TypeError):  # pragma: no cover — frozen contract
+                pass
+        return list(contracts)
 
     def disconnect(self) -> None:
         self.disconnect_calls += 1
@@ -1402,6 +1426,114 @@ class TestFetchFrontMonthOpenInterest:
             )
         )
         assert oi == 0
+
+    def test_qualify_called_before_reqmktdata(self, meta: MarketMeta) -> None:
+        # ib-async's reqMktData calls hash(contract) internally via
+        # startTicker, which requires conId populated. Production fix
+        # PR #205 hot-fix: qualifyContractsAsync must run BEFORE
+        # reqMktData to populate conId. This test locks the call order.
+        ib = _FakeIb()
+        ib.oi_value_to_serve = 100
+        asyncio.run(
+            fetch_front_month_open_interest(
+                ib,
+                "/MES",
+                meta=meta,
+                front_month_expiry_yyyymm="202606",
+                wait_seconds=0.5,
+                poll_interval_seconds=0.01,
+            )
+        )
+        assert len(ib.qualify_calls) == 1
+        # The qualified contract must be the one passed to reqMktData.
+        assert len(ib.req_mkt_data_calls) == 1
+        # After the qualify fake mutated the contract's conId in-place,
+        # the very same object is forwarded to reqMktData.
+        qualified_contract = ib.qualify_calls[0][0]
+        passed_to_mktdata = ib.req_mkt_data_calls[0]["contract"]
+        assert qualified_contract is passed_to_mktdata
+        # And conId was populated by the fake's qualify mutation.
+        assert getattr(qualified_contract, "conId", 0) == 999
+
+    def test_qualify_raises_returns_zero(self, meta: MarketMeta) -> None:
+        ib = _FakeIb()
+        ib.oi_value_to_serve = 100
+        ib.qualify_should_raise = RuntimeError("ib-async qualify exploded")
+        oi = asyncio.run(
+            fetch_front_month_open_interest(
+                ib,
+                "/MES",
+                meta=meta,
+                front_month_expiry_yyyymm="202606",
+                wait_seconds=0.5,
+                poll_interval_seconds=0.01,
+            )
+        )
+        assert oi == 0
+        # reqMktData must NOT fire when qualify fails — it would raise
+        # the same ValueError that motivated this hot-fix.
+        assert len(ib.req_mkt_data_calls) == 0
+
+    def test_qualify_returns_empty_returns_zero(self, meta: MarketMeta) -> None:
+        # ib-async returns ``[]`` from qualifyContractsAsync when the
+        # internal reqContractDetails call returns no rows (unknown
+        # symbol or bad exchange).
+        ib = _FakeIb()
+        ib.oi_value_to_serve = 100
+        ib.qualify_returns_empty = True
+        oi = asyncio.run(
+            fetch_front_month_open_interest(
+                ib,
+                "/MES",
+                meta=meta,
+                front_month_expiry_yyyymm="202606",
+                wait_seconds=0.5,
+                poll_interval_seconds=0.01,
+            )
+        )
+        assert oi == 0
+        assert len(ib.req_mkt_data_calls) == 0
+
+    def test_qualify_returns_none_slot_returns_zero(self, meta: MarketMeta) -> None:
+        # ib-async returns ``[None]`` when the contract was ambiguous
+        # (multiple matches and ``returnAll=False``).
+        ib = _FakeIb()
+        ib.oi_value_to_serve = 100
+        ib.qualify_returns_none_slot = True
+        oi = asyncio.run(
+            fetch_front_month_open_interest(
+                ib,
+                "/MES",
+                meta=meta,
+                front_month_expiry_yyyymm="202606",
+                wait_seconds=0.5,
+                poll_interval_seconds=0.01,
+            )
+        )
+        assert oi == 0
+        assert len(ib.req_mkt_data_calls) == 0
+
+    def test_qualify_unavailable_returns_zero(self, meta: MarketMeta) -> None:
+        # Defensive: if the ib client doesn't have qualifyContractsAsync
+        # (older ib-async or a non-conforming fake), degrade gracefully
+        # rather than raising AttributeError.
+        class _BareIb(_FakeIb):
+            qualifyContractsAsync = None  # type: ignore[assignment]
+
+        ib = _BareIb()
+        ib.oi_value_to_serve = 100
+        oi = asyncio.run(
+            fetch_front_month_open_interest(
+                ib,
+                "/MES",
+                meta=meta,
+                front_month_expiry_yyyymm="202606",
+                wait_seconds=0.5,
+                poll_interval_seconds=0.01,
+            )
+        )
+        assert oi == 0
+        assert len(ib.req_mkt_data_calls) == 0
 
 
 # ---------------------------------------------------------------------------
