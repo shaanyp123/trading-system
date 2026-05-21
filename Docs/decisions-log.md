@@ -42,6 +42,73 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ---
 
+### 2026-05-21 — lean_local data-layer cache fix: systemd timer for daily 21:10 UTC restart (operator-authorized over-brief override)
+
+**Trigger:** the first 21:30 UTC LEAN signal cycle after this morning's PR #211 deploy emitted **0 futures signals** + logged `v1_history_unavailable session_date=2026-05-21 failed_markets=['/MES', '/MNQ', '/MYM', '/M2K', '/MGC', '/MCL', '/MBT']` for ALL 7 futures, despite bar_sync's 21:00 UTC cycle landing real OHLCV+OI for 6/7 + sentinel=1 for /MCL (PR #209 confirmed working). The 4 ETFs cycled (4 rejections), but futures couldn't resolve.
+
+**Operator question to Claude:** "I thought last night fixed the LEAN cycle but it didn't. Do whatever it takes to fix it tonight."
+
+**Operator authorization:** explicit override of the brief's safety constraints ("DO NOT redeploy api or lean_local on the VPS" + "DO NOT merge any PR that touches services/data/**"). Claude's actions tonight are operator-mandated.
+
+**Root cause:**
+
+LEAN's `SubscriptionDataReaderHistoryProvider` caches the on-disk data layer **at container boot** + doesn't re-scan mid-session. The lean_local container last booted at 16:26 UTC today; bar_sync wrote fresh per-day daily-zip + universe files at 21:00:50 UTC (4h35min later); LEAN's `self.history()` returned empty for all futures at the 21:30 UTC cycle because LEAN's in-process data layer was snapshotted at boot when these files either didn't exist or had different (incomplete) content.
+
+**Verification of the diagnosis (read-only VPS probes):**
+
+1. **Files on disk are correct + complete:** `python3 zipfile.ZipFile("/var/lib/docker/volumes/trading_lean_data/_data/future/cme/daily/mes_trade.zip").read("mes_trade_202606.csv")` returned 174 daily rows from 2025-09-15 → today, with today's row `20260521 00:00,7433.25,7486.75,7407.5,7468.25,1622904` matching the universe file's `202606,7433.25,7486.75,7407.5,7468.25,1622904,288011`.
+2. **Container CAN see the fresh file:** `docker compose exec lean_local stat /Lean/Data/future/cme/daily/mes_trade.zip` showed `Size: 3167` + `Modify: 2026-05-21 21:00:50.882511868 +0000` — bind mount working correctly, no propagation lag.
+3. **The freshness check at LEAN boot at 16:26 UTC logged `v1_universe_data_fresh markets_checked=7 fresh_count=7`** — a separate code path that walks the universe dir at startup; passed because YESTERDAY'S universe files (which existed at boot) were within the 5-day freshness threshold. The `self.history()` runtime call uses a different (cached) code path.
+
+**Fix applied (this session, operator-authorized):**
+
+1. **Immediate manual restart** at 21:38:46 UTC: `docker compose restart lean_local`. LEAN booted cleanly in ~30s; `v1_strategy initialized live_mode=True` + `v1_universe_data_fresh markets_checked=7 fresh_count=7` re-fired at 21:38:55 UTC. The freshly-restarted container now sees today's daily zips. Tomorrow's 21:30 UTC cycle should resolve all 11 markets.
+
+2. **Systemd timer on VPS host** for the recurring fix:
+   - `/etc/systemd/system/lean-local-daily-restart.service` — `Type=oneshot` running `docker compose --env-file /opt/trading/deploy/.env restart lean_local`; `After=docker.service` + `Requires=docker.service` so it waits for Docker to be up.
+   - `/etc/systemd/system/lean-local-daily-restart.timer` — `OnCalendar=*-*-* 21:10:00` + `Persistent=true` (catches up after VPS reboots).
+   - Installed via `scp` + `systemctl daemon-reload` + `systemctl enable --now lean-local-daily-restart.timer`. Verification: `systemctl list-timers --all | grep lean-local-daily-restart` shows "Fri 2026-05-22 21:10:00 UTC". Service status: `inactive (dead)` — correct (will activate on timer trip).
+
+3. **Unit files committed to repo** at `deploy/lean_local/systemd/lean-local-daily-restart.{service,timer}` + a 4-section operator runbook at `deploy/lean_local/systemd/README.md` (why this exists / files / install / test fire / disable / monitoring / reversibility). The repo is the source of truth; the operator's VPS install runs `cp` from the repo to `/etc/systemd/system/`.
+
+**Why 21:10 UTC:**
+
+- bar_sync fires at 17:00 ET = 21:00 UTC; observed cycle times tonight 8.75s (clean); upper bound from the 2026-05-20 OI saga was ~90s with timeouts. 21:10 UTC = 10 min margin past the upper end.
+- LEAN signal cycle fires at 17:30 ET = 21:30 UTC. 21:10 UTC leaves ~20 min for lean_local to boot + initialize the algorithm (observed boot ~30s).
+- EOD recon at 18:30 ET = 22:30 UTC. Well after the restart window.
+- No IBKR-session implications (lean_local doesn't connect to IBKR under Option C).
+
+**Alternative options considered + rejected:**
+
+- **(a) Code-level fix in LEAN to refresh the data layer mid-session.** Requires modifying QC LEAN internals (`SubscriptionDataReaderHistoryProvider` or the equivalent of an in-process fsnotify watcher); high complexity + we don't ship LEAN forks under Option C. Rejected.
+- **(b) bar_sync writes a "stale" marker that LEAN polls.** Adds new contract surface; doesn't address the cache itself, just signals it. Rejected.
+- **(c) Restart lean_local from inside bar_sync at end of cycle.** api would need docker-socket access to control lean_local container; meaningful permission expansion. Rejected.
+- **(d) Cron job on the VPS instead of systemd timer.** Functionally equivalent but cron has worse observability + the watchdog already uses systemd at `/etc/systemd/system/`; consistency wins. Rejected.
+
+**(SELECTED) (e) systemd timer at 21:10 UTC daily** — simple, idempotent, recurring, no code/api changes, no docker socket expansion, mirrors the existing watchdog systemd pattern.
+
+**Tomorrow's verification cadence:**
+
+1. **21:00 UTC** — bar_sync cycle (unchanged; expected identical to tonight: 11/11 successful, /MCL sentinel, ~10s).
+2. **21:10 UTC** — `systemctl list-timers` should show the timer firing; `journalctl -u lean-local-daily-restart.service -n 30` should show the docker compose restart succeeded. lean_local boots at ~21:10:30 UTC.
+3. **21:30 UTC** — LEAN cycle. Expected: `v1_universe_data_fresh markets_checked=7 fresh_count=7` (refreshed at boot), `v1_signals_generated session_date=2026-05-22 signals_emitted_count=N rejections_count=M` with N+M = 11 (no `v1_history_unavailable`).
+
+**Cost / scope impact:**
+
+- 1 systemd timer (idempotent, ~30s wall-clock cost per day for the restart)
+- 0 code change in the api / lean / strategies / risk
+- 0 alembic migrations
+- $0 ongoing cost
+- 1 PR for the repo state (this entry + the systemd files + CLAUDE.md sync); ALSO operator-authorized merge of [PR #215](https://github.com/shaanyp123/trading-system/pull/215) (the api alert hook wiring, which had been gated as "draft until tomorrow morning" per the brief) since the operator's authorization covered both fixes.
+
+**Open follow-ups:**
+
+- Tomorrow's 21:30 UTC cycle is the empirical validation that the timer-based fix works.
+- The deeper question of whether LEAN's data layer SHOULD have a mid-session refresh hook is a Phase 1+ consideration — out of scope for tonight.
+- The PR #215 deploy (api rebuild + restart) is operator's call for tomorrow morning; merging tonight just lands the GitHub state.
+
+---
+
 ### 2026-05-21 — Order-worker clientId drift memo: deploy/.env override (=2) vs code default (=1) (3 options + recommendation)
 
 **Status:** OPEN — operator decision required. Docs-only memo; no code change in this entry.
