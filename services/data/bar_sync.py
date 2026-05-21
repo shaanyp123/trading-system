@@ -290,9 +290,19 @@ class MarketSyncResult:
 
     ``open_interest`` is the snapshot value fetched from IBKR for the
     futures front-month expiry (``None`` for ETFs and for failed
-    syncs; ``0`` when the OI fetch ran but produced no usable value;
-    a positive int when LEAN's resolver will have a real value to
-    pick on).
+    syncs; ``0`` when the OI fetch ran AND substitution is disabled
+    via :attr:`BarSyncConfig.oi_sentinel_when_fetch_failed=0`;
+    :data:`SENTINEL_OI_WHEN_FETCH_FAILED` (typically ``1``) when the
+    fetch returned 0 and substitution fired; a positive int distinct
+    from the sentinel when LEAN's resolver gets a real value).
+
+    ``open_interest_was_sentinel`` is ``True`` only when the futures
+    OI fetch returned 0 AND the sentinel substitution path fired
+    (``open_interest`` then equals the configured sentinel). Used by
+    :mod:`services.data.bar_sync_alerts` to detect the persistent
+    data-entitlement gap pattern (e.g., /MCL on a paper-tier NYMEX
+    subscription) for the P2 alert builder. Always ``False`` for ETFs
+    (no OI) and for failed syncs.
     """
 
     market: str
@@ -303,6 +313,9 @@ class MarketSyncResult:
     error: str | None
     open_interest: int | None = (
         None  # None for ETFs; 0 on fetch failure; positive int when populated
+    )
+    open_interest_was_sentinel: bool = (
+        False  # True only when substitution fired in sync_one_market
     )
 
 
@@ -1256,8 +1269,10 @@ async def sync_one_market(
                 wait_seconds=config.oi_wait_seconds,
             )
             effective_open_interest = raw_open_interest
+            sentinel_substituted = False
             if raw_open_interest <= 0 and config.oi_sentinel_when_fetch_failed > 0:
                 effective_open_interest = config.oi_sentinel_when_fetch_failed
+                sentinel_substituted = True
                 log.warning(
                     "oi_sentinel_substituted",
                     op="sync_one_market",
@@ -1284,6 +1299,7 @@ async def sync_one_market(
                 front_month_expiry=front_month,
                 error=None,
                 open_interest=effective_open_interest,
+                open_interest_was_sentinel=sentinel_substituted,
             )
     except TimeoutError as exc:
         return MarketSyncResult(
@@ -1328,6 +1344,11 @@ class BarSyncWorker:
       2. For each market in ``config.markets``, call :func:`sync_one_market`.
       3. Disconnect (best-effort).
       4. Log a single structured ``bar_sync_cycle_completed`` line.
+      5. Evaluate P2 alerts (partial-cycle-failure + OI-sentinel-
+         substitution) via :mod:`services.data.bar_sync_alerts`. Track
+         consecutive-cycle counters; emit alerts at ``count >= 2``
+         (avoids flap noise on transient single-cycle failures). A
+         cycle that recovers fully resets both counters.
 
     Per-market exceptions are captured in :class:`MarketSyncResult` —
     one market's failure doesn't abort the cycle. A connect failure
@@ -1335,7 +1356,8 @@ class BarSyncWorker:
     and the next session day's tick retries.
 
     Tests inject ``ib_factory`` for a fake IB + ``clock`` for a fake
-    UTC datetime stream.
+    UTC datetime stream + optional ``partial_cycle_alert_hook`` to
+    capture the descriptor without standing up a real Discord stack.
     """
 
     def __init__(
@@ -1345,7 +1367,13 @@ class BarSyncWorker:
         ib_factory: IbFactory | None = None,
         clock: Callable[[], datetime] | None = None,
         initial_fired_date: date | None = None,
+        partial_cycle_alert_hook: Any | None = None,
     ) -> None:
+        # Local import to break a circular dependency at module-import
+        # time — :mod:`bar_sync_alerts` imports from this module too.
+        from services.data import bar_sync_alerts as _bsa
+
+        self._bsa = _bsa
         self._config = config
         if ib_factory is None:
             # Lazy import so tests + dev hosts without ib_async installed
@@ -1362,6 +1390,11 @@ class BarSyncWorker:
         self._last_fired_session_date_et: date | None = initial_fired_date
         self._stop_event = asyncio.Event()
         self._is_running = False
+        self._partial_cycle_alert_hook = partial_cycle_alert_hook
+        # Consecutive-cycle counters for the two P2 alert flavors. Reset
+        # to 0 on a fully-clean cycle (no failures, no sentinels).
+        self._consecutive_failure_count: int = 0
+        self._consecutive_sentinel_count: int = 0
         self._log = log.bind(
             worker="bar_sync",
             sync_time_et=config.sync_time_et.isoformat(),
@@ -1486,12 +1519,14 @@ class BarSyncWorker:
                         )
                     )
                 cycle_completed = self._clock()
-                return BarSyncCycleResult(
+                connect_failed_result = BarSyncCycleResult(
                     cycle_started_at_utc=cycle_started,
                     cycle_completed_at_utc=cycle_completed,
                     successful_markets=tuple(successful),
                     failed_markets=tuple(failed),
                 )
+                await self._evaluate_alerts(connect_failed_result)
+                return connect_failed_result
             # Iterate markets serially — IBKR rate-limits aggressive
             # concurrent reqHistoricalData (max ~50 simultaneous; our 11
             # would fit but serial keeps log lines clean + makes timeout
@@ -1559,7 +1594,84 @@ class BarSyncWorker:
             ),
             failed_markets=[r.market for r in failed],
         )
+        await self._evaluate_alerts(cycle_result)
         return cycle_result
+
+    async def _evaluate_alerts(self, cycle_result: BarSyncCycleResult) -> None:
+        """Update consecutive-cycle counters + dispatch P2 alerts at threshold.
+
+        Two alert flavors evaluated independently:
+
+        * **Partial-cycle-failure** — any market failed to sync. Counter
+          increments on dirty cycles, resets on clean. Alert fires when
+          ``count >= CONSECUTIVE_ALERT_THRESHOLD`` (2). Category:
+          ``data_quality_reject``.
+        * **OI-sentinel-substitution** — any successful market had OI
+          sentinel-substituted (Task 2 path). Counter increments on
+          sentinel cycles, resets when no sentinels fire. Alert fires
+          when ``count >= 2``. Category: ``data_quality_quarantine``.
+          Surfaces /MCL's persistent entitlement gap.
+
+        When a ``partial_cycle_alert_hook`` is wired (separate api-
+        lifespan PR), each descriptor is dispatched via the hook. When
+        unwired (Phase 1 day-1 default), the descriptor is logged via
+        ``bar_sync_alert_dropped_no_hook`` and dropped — the structured
+        log carries the descriptor fields so the operator can grep for
+        the pattern manually.
+
+        Hook errors are caught + logged as
+        ``bar_sync_alert_dispatch_failed`` so a Discord outage doesn't
+        wedge the cycle.
+        """
+        had_failure = self._bsa.cycle_had_failures(cycle_result)
+        had_sentinel = self._bsa.cycle_had_sentinel_substitution(cycle_result)
+        if had_failure:
+            self._consecutive_failure_count += 1
+        else:
+            self._consecutive_failure_count = 0
+        if had_sentinel:
+            self._consecutive_sentinel_count += 1
+        else:
+            self._consecutive_sentinel_count = 0
+        partial_descriptor = self._bsa.build_partial_cycle_alert(
+            cycle_result,
+            consecutive_failure_count=self._consecutive_failure_count,
+        )
+        sentinel_descriptor = self._bsa.build_sentinel_substitution_alert(
+            cycle_result,
+            consecutive_sentinel_count=self._consecutive_sentinel_count,
+        )
+        for descriptor in (partial_descriptor, sentinel_descriptor):
+            if descriptor is None:
+                continue
+            await self._dispatch_alert(descriptor)
+
+    async def _dispatch_alert(self, descriptor: Any) -> None:
+        """Invoke the hook (if wired) or log the descriptor + drop.
+
+        Hook exceptions are caught + logged so an alert-side failure
+        doesn't wedge the cycle. The Phase-1-day-1 default (no hook)
+        logs the descriptor fields under ``bar_sync_alert_dropped_no_hook``
+        so the operator can grep for the pattern manually.
+        """
+        if self._partial_cycle_alert_hook is None:
+            self._log.warning(
+                "bar_sync_alert_dropped_no_hook",
+                severity=descriptor.severity,
+                category=descriptor.category,
+                title=descriptor.title,
+                payload=descriptor.payload,
+            )
+            return
+        try:
+            await self._partial_cycle_alert_hook(descriptor)
+        except Exception:
+            self._log.exception(
+                "bar_sync_alert_dispatch_failed",
+                severity=descriptor.severity,
+                category=descriptor.category,
+                title=descriptor.title,
+            )
 
     async def run_forever(self) -> None:
         """Supervisor: tick + maybe_fire loop until ``request_stop``.

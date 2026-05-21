@@ -1961,6 +1961,121 @@ class TestSyncOneMarket:
         sentinel_events = [e for e in logs if e.get("event") == "oi_sentinel_substituted"]
         assert len(sentinel_events) == 0
 
+    def test_market_sync_result_flags_sentinel_substitution(
+        self, tmp_path: Path, config: BarSyncConfig
+    ) -> None:
+        # Locks the Task 4 contract: MarketSyncResult.open_interest_was_sentinel
+        # is True iff the substitution path fired in sync_one_market.
+        # bar_sync_alerts builders depend on this field; the alert
+        # seam can't fire without it.
+        ib = _FakeIb()
+        ib.historical_bars = [
+            _FakeBarData(
+                date=date(2026, 5, 19),
+                open=7378.0,
+                high=7380.5,
+                low=7375.25,
+                close=7378.25,
+                volume=12500,
+            ),
+        ]
+        ib.contract_details = [
+            _FakeContractDetails(_FakeContract(lastTradeDateOrContractMonth="20260620")),
+        ]
+        ib.oi_value_to_serve = 0.0
+        narrow_config = BarSyncConfig(
+            markets=config.markets,
+            data_root=tmp_path,
+            bars_per_fetch=config.bars_per_fetch,
+            ibkr_call_timeout_seconds=config.ibkr_call_timeout_seconds,
+            oi_wait_seconds=0.1,
+        )
+        result = asyncio.run(
+            sync_one_market(
+                ib,
+                "/MCL",
+                PHASE1_UNIVERSE_METADATA["/MCL"],
+                config=narrow_config,
+                today=date(2026, 5, 19),
+            )
+        )
+        assert result.open_interest_was_sentinel is True
+
+    def test_market_sync_result_does_not_flag_when_real_oi(
+        self, tmp_path: Path, config: BarSyncConfig
+    ) -> None:
+        ib = _FakeIb()
+        ib.historical_bars = [
+            _FakeBarData(
+                date=date(2026, 5, 19),
+                open=7378.0,
+                high=7380.5,
+                low=7375.25,
+                close=7378.25,
+                volume=12500,
+            ),
+        ]
+        ib.contract_details = [
+            _FakeContractDetails(_FakeContract(lastTradeDateOrContractMonth="20260620")),
+        ]
+        ib.oi_value_to_serve = 257985.0
+        narrow_config = BarSyncConfig(
+            markets=config.markets,
+            data_root=tmp_path,
+            bars_per_fetch=config.bars_per_fetch,
+            ibkr_call_timeout_seconds=config.ibkr_call_timeout_seconds,
+            oi_wait_seconds=0.1,
+        )
+        result = asyncio.run(
+            sync_one_market(
+                ib,
+                "/MES",
+                PHASE1_UNIVERSE_METADATA["/MES"],
+                config=narrow_config,
+                today=date(2026, 5, 19),
+            )
+        )
+        assert result.open_interest_was_sentinel is False
+
+    def test_market_sync_result_does_not_flag_when_substitution_disabled(
+        self, tmp_path: Path, config: BarSyncConfig
+    ) -> None:
+        # Substitution disabled via config; flag stays False even on
+        # OI=0 fetch.
+        ib = _FakeIb()
+        ib.historical_bars = [
+            _FakeBarData(
+                date=date(2026, 5, 19),
+                open=7378.0,
+                high=7380.5,
+                low=7375.25,
+                close=7378.25,
+                volume=12500,
+            ),
+        ]
+        ib.contract_details = [
+            _FakeContractDetails(_FakeContract(lastTradeDateOrContractMonth="20260620")),
+        ]
+        ib.oi_value_to_serve = 0.0
+        narrow_config = BarSyncConfig(
+            markets=config.markets,
+            data_root=tmp_path,
+            bars_per_fetch=config.bars_per_fetch,
+            ibkr_call_timeout_seconds=config.ibkr_call_timeout_seconds,
+            oi_wait_seconds=0.1,
+            oi_sentinel_when_fetch_failed=0,
+        )
+        result = asyncio.run(
+            sync_one_market(
+                ib,
+                "/MCL",
+                PHASE1_UNIVERSE_METADATA["/MCL"],
+                config=narrow_config,
+                today=date(2026, 5, 19),
+            )
+        )
+        assert result.open_interest_was_sentinel is False
+
     def test_etf_empty_bars_returns_failure(self, tmp_path: Path, config: BarSyncConfig) -> None:
         ib = _FakeIb()
         ib.historical_bars = []
@@ -2239,6 +2354,243 @@ class TestBarSyncWorkerCycle:
         assert ib.disconnect_calls == 1
 
 
+class TestBarSyncWorkerAlertSeam:
+    """Task 4 — consecutive-cycle counters + P2 alert hook seam."""
+
+    @pytest.fixture
+    def small_config(self, tmp_path: Path) -> BarSyncConfig:
+        # Two-market universe with /MCL specifically so the sentinel
+        # path is exercisable in tests.
+        return BarSyncConfig(
+            markets={
+                "/MES": PHASE1_UNIVERSE_METADATA["/MES"],
+                "/MCL": PHASE1_UNIVERSE_METADATA["/MCL"],
+            },
+            data_root=tmp_path,
+            bars_per_fetch=5,
+            tick_interval_seconds=0.01,
+            ibkr_call_timeout_seconds=2.0,
+            ibkr_connect_timeout_seconds=2.0,
+            oi_wait_seconds=0.1,
+        )
+
+    @staticmethod
+    def _ib_with_real_bars(oi_value: Any) -> _FakeIb:
+        ib = _FakeIb()
+        ib.historical_bars = [
+            _FakeBarData(
+                date=date(2026, 5, 19),
+                open=100,
+                high=101,
+                low=99,
+                close=100.5,
+                volume=10,
+            ),
+        ]
+        ib.contract_details = [
+            _FakeContractDetails(_FakeContract(lastTradeDateOrContractMonth="20260620")),
+        ]
+        ib.oi_value_to_serve = oi_value
+        return ib
+
+    @staticmethod
+    def _hook_capture() -> tuple[list[Any], Any]:
+        captured: list[Any] = []
+
+        async def hook(descriptor: Any) -> None:
+            captured.append(descriptor)
+
+        return captured, hook
+
+    def test_default_hook_is_none(self, small_config: BarSyncConfig) -> None:
+        worker = BarSyncWorker(config=small_config)
+        # Internal state surface — locks contract that the seam is wired
+        # but defaults to logger-only behavior.
+        assert worker._partial_cycle_alert_hook is None
+        assert worker._consecutive_failure_count == 0
+        assert worker._consecutive_sentinel_count == 0
+
+    def test_clean_cycle_keeps_counters_zero(self, small_config: BarSyncConfig) -> None:
+        ib = self._ib_with_real_bars(oi_value=257985.0)
+        captured, hook = self._hook_capture()
+        worker = BarSyncWorker(
+            config=small_config,
+            ib_factory=lambda: ib,
+            clock=lambda: datetime(2026, 5, 19, 21, 0, tzinfo=UTC),
+            partial_cycle_alert_hook=hook,
+        )
+        asyncio.run(worker.run_cycle(today=date(2026, 5, 19)))
+        assert worker._consecutive_failure_count == 0
+        assert worker._consecutive_sentinel_count == 0
+        assert captured == []
+
+    def test_single_failure_increments_below_threshold(
+        self, small_config: BarSyncConfig
+    ) -> None:
+        ib = _FakeIb()
+        ib.connect_should_raise = ConnectionRefusedError("ib_gateway down")
+        captured, hook = self._hook_capture()
+        worker = BarSyncWorker(
+            config=small_config,
+            ib_factory=lambda: ib,
+            clock=lambda: datetime(2026, 5, 19, 21, 0, tzinfo=UTC),
+            partial_cycle_alert_hook=hook,
+        )
+        asyncio.run(worker.run_cycle(today=date(2026, 5, 19)))
+        assert worker._consecutive_failure_count == 1
+        assert captured == []
+
+    def test_two_consecutive_failures_dispatch_alert(
+        self, small_config: BarSyncConfig
+    ) -> None:
+        captured, hook = self._hook_capture()
+        worker = BarSyncWorker(
+            config=small_config,
+            ib_factory=lambda: (
+                _ib := _FakeIb(),
+                setattr(_ib, "connect_should_raise", ConnectionRefusedError("down")),
+            )[0],
+            clock=lambda: datetime(2026, 5, 19, 21, 0, tzinfo=UTC),
+            partial_cycle_alert_hook=hook,
+        )
+
+        # Cycle 1: failure (counter=1, no alert)
+        asyncio.run(worker.run_cycle(today=date(2026, 5, 19)))
+        assert worker._consecutive_failure_count == 1
+        assert captured == []
+
+        # Cycle 2: failure (counter=2, alert fires)
+        asyncio.run(worker.run_cycle(today=date(2026, 5, 20)))
+        assert worker._consecutive_failure_count == 2
+        assert len(captured) == 1
+        assert captured[0].category == "data_quality_reject"
+        assert captured[0].severity == "P2"
+
+    def test_failure_then_clean_cycle_resets_counter(
+        self, small_config: BarSyncConfig
+    ) -> None:
+        captured, hook = self._hook_capture()
+        worker = BarSyncWorker(
+            config=small_config,
+            ib_factory=lambda: (
+                _ib := _FakeIb(),
+                setattr(_ib, "connect_should_raise", ConnectionRefusedError("down")),
+            )[0],
+            clock=lambda: datetime(2026, 5, 19, 21, 0, tzinfo=UTC),
+            partial_cycle_alert_hook=hook,
+        )
+
+        # Cycle 1: failure
+        asyncio.run(worker.run_cycle(today=date(2026, 5, 19)))
+        assert worker._consecutive_failure_count == 1
+
+        # Cycle 2: swap to a clean-ib factory
+        clean_ib = self._ib_with_real_bars(oi_value=257985.0)
+        worker._ib_factory = lambda: clean_ib  # type: ignore[method-assign]
+        asyncio.run(worker.run_cycle(today=date(2026, 5, 20)))
+        assert worker._consecutive_failure_count == 0
+        assert captured == []  # no alert ever fired
+
+    def test_sentinel_substitution_alert_fires_at_threshold(
+        self, small_config: BarSyncConfig
+    ) -> None:
+        # /MCL gets oi_value=0.0 → sentinel substitution. /MES gets real
+        # OI. So the cycle is "clean failures-wise" but
+        # sentinel-substituted-wise.
+        captured, hook = self._hook_capture()
+
+        def make_ib() -> _FakeIb:
+            ib = _FakeIb()
+            ib.historical_bars = [
+                _FakeBarData(
+                    date=date(2026, 5, 19),
+                    open=100,
+                    high=101,
+                    low=99,
+                    close=100.5,
+                    volume=10,
+                ),
+            ]
+            ib.contract_details = [
+                _FakeContractDetails(_FakeContract(lastTradeDateOrContractMonth="20260620")),
+            ]
+            ib.oi_value_to_serve = 0.0  # both markets sentinel-substitute
+            return ib
+
+        worker = BarSyncWorker(
+            config=small_config,
+            ib_factory=make_ib,
+            clock=lambda: datetime(2026, 5, 19, 21, 0, tzinfo=UTC),
+            partial_cycle_alert_hook=hook,
+        )
+
+        # Cycle 1
+        asyncio.run(worker.run_cycle(today=date(2026, 5, 19)))
+        assert worker._consecutive_sentinel_count == 1
+        assert worker._consecutive_failure_count == 0
+        assert captured == []
+
+        # Cycle 2
+        asyncio.run(worker.run_cycle(today=date(2026, 5, 20)))
+        assert worker._consecutive_sentinel_count == 2
+        assert len(captured) == 1
+        assert captured[0].category == "data_quality_quarantine"
+
+    def test_no_hook_logs_dropped_at_threshold(
+        self, small_config: BarSyncConfig
+    ) -> None:
+        # Without a hook, the descriptor MUST be logged via
+        # bar_sync_alert_dropped_no_hook so the operator can grep for
+        # the pattern.
+        worker = BarSyncWorker(
+            config=small_config,
+            ib_factory=lambda: (
+                _ib := _FakeIb(),
+                setattr(_ib, "connect_should_raise", ConnectionRefusedError("down")),
+            )[0],
+            clock=lambda: datetime(2026, 5, 19, 21, 0, tzinfo=UTC),
+            # no partial_cycle_alert_hook
+        )
+        asyncio.run(worker.run_cycle(today=date(2026, 5, 19)))
+        with capture_logs() as logs:
+            asyncio.run(worker.run_cycle(today=date(2026, 5, 20)))
+        dropped = [e for e in logs if e.get("event") == "bar_sync_alert_dropped_no_hook"]
+        assert len(dropped) == 1
+        assert dropped[0]["severity"] == "P2"
+        assert dropped[0]["category"] == "data_quality_reject"
+
+    def test_hook_exception_logged_and_swallowed(
+        self, small_config: BarSyncConfig
+    ) -> None:
+        # A Discord outage on the api hook side must NOT wedge the
+        # cycle. Hook raises → exception is caught + logged as
+        # bar_sync_alert_dispatch_failed → run_cycle returns cleanly.
+        calls = 0
+
+        async def boom_hook(descriptor: Any) -> None:
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("discord went down")
+
+        worker = BarSyncWorker(
+            config=small_config,
+            ib_factory=lambda: (
+                _ib := _FakeIb(),
+                setattr(_ib, "connect_should_raise", ConnectionRefusedError("down")),
+            )[0],
+            clock=lambda: datetime(2026, 5, 19, 21, 0, tzinfo=UTC),
+            partial_cycle_alert_hook=boom_hook,
+        )
+        asyncio.run(worker.run_cycle(today=date(2026, 5, 19)))
+        with capture_logs() as logs:
+            asyncio.run(worker.run_cycle(today=date(2026, 5, 20)))
+        assert calls == 1
+        failed = [
+            e for e in logs if e.get("event") == "bar_sync_alert_dispatch_failed"
+        ]
+        assert len(failed) == 1
+
+
 class TestBarSyncWorkerScheduling:
     @pytest.fixture
     def small_config(self, tmp_path: Path) -> BarSyncConfig:
@@ -2410,6 +2762,20 @@ class TestModuleContract:
             error=None,
         )
         assert r.open_interest is None
+
+    def test_market_sync_result_open_interest_was_sentinel_defaults_false(self) -> None:
+        # Task 4 follow-up field. Defaults to False so all existing
+        # callers (and the connect-failed synthesizer) get the safe
+        # "not substituted" default without an explicit kwarg.
+        r = MarketSyncResult(
+            market="TLT",
+            success=True,
+            bars_written=1,
+            last_session_date=date(2026, 5, 19),
+            front_month_expiry=None,
+            error=None,
+        )
+        assert r.open_interest_was_sentinel is False
 
     def test_bar_sync_config_default_universe_is_phase1(self) -> None:
         cfg = BarSyncConfig()
