@@ -17,6 +17,31 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ## Entries
 
+<!--
+  TEMPLATE PRE-STAGED 2026-05-21 evening — for the operator to fill in
+  after observing the 21:00 UTC bar_sync cycle + 21:30 UTC LEAN cycle
+  outcomes. Replace each TODO marker with the observed value. Delete
+  this HTML comment block once filled in. Remove the whole entry if
+  the operator decides not to record this debrief.
+-->
+
+### 2026-05-22 — 2026-05-21 bar_sync OI saga first observed cycle (TODO: outcome)
+
+- **Tonight's 21:00 UTC bar_sync cycle outcome:** TODO_observed_state
+  - /MCL universe file ended with: TODO `,1` (sentinel) | `,<int>` (real OI) | `,` (empty — should NOT happen post-PR-#209)
+  - Sentinel substitution log fired for: TODO_list_of_markets
+  - failed_count: TODO
+  - duration_seconds: TODO
+- **21:30 UTC LEAN cycle outcome:** TODO_observed_state
+  - markets_checked: TODO; fresh_count: TODO
+  - signals_emitted_count: TODO
+  - v1_history_unavailable for: TODO_list_of_markets
+- **Hypothesis confirmed/disproved:** TODO whether /MCL's OI publisher is time-of-day-dependent or entitlement-gap
+- **Action items based on observed outcome:**
+  - TODO
+
+---
+
 ### 2026-05-21 — Order-worker clientId drift memo: deploy/.env override (=2) vs code default (=1) (3 options + recommendation)
 
 **Status:** OPEN — operator decision required. Docs-only memo; no code change in this entry.
