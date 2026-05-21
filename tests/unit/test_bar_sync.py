@@ -159,6 +159,10 @@ class _FakeIb:
         self.qualify_returns_empty: bool = False
         self.qualify_returns_none_slot: bool = False
         self.qualify_calls: list[Any] = []
+        # reqMarketDataType canned behavior. By default succeeds silently;
+        # tests can toggle to verify the call and assert on raise paths.
+        self.req_market_data_type_calls: list[int] = []
+        self.req_market_data_type_should_raise: Exception | None = None
 
     async def connectAsync(
         self,
@@ -223,6 +227,11 @@ class _FakeIb:
         self.cancel_mkt_data_calls.append(contract)
         if self.oi_cancel_should_raise is not None:
             raise self.oi_cancel_should_raise
+
+    def reqMarketDataType(self, marketDataType: int) -> None:
+        self.req_market_data_type_calls.append(marketDataType)
+        if self.req_market_data_type_should_raise is not None:
+            raise self.req_market_data_type_should_raise
 
     async def qualifyContractsAsync(self, *contracts: Any) -> list[Any]:
         self.qualify_calls.append(list(contracts))
@@ -293,6 +302,15 @@ class TestModuleConstants:
         # within 1-2s; 5s gives comfortable headroom without lengthening
         # the cycle materially.
         assert DEFAULT_OI_WAIT_SECONDS == 5.0
+
+    def test_default_oi_market_data_type_is_delayed(self) -> None:
+        # Locked at 3 (DELAYED) - paper account has no real-time
+        # futures-OI entitlement; delayed is free for any IBKR account
+        # holder. Override to 1 (LIVE) if/when a real-time subscription
+        # is acquired.
+        from services.data.bar_sync import DEFAULT_OI_MARKET_DATA_TYPE
+
+        assert DEFAULT_OI_MARKET_DATA_TYPE == 3
 
 
 class TestPhase1UniverseMetadata:
@@ -1861,6 +1879,109 @@ class TestBarSyncWorkerCycle:
         assert result.successful_markets[0].market == "TLT"
         assert result.failed_markets[0].market == "/MES"
 
+    def test_run_cycle_sets_market_data_type_before_market_loop(
+        self, small_config: BarSyncConfig
+    ) -> None:
+        # Hot-fix PR #207: the paper account has no real-time futures-OI
+        # entitlement. Without reqMarketDataType(3) before reqMktData,
+        # IBKR replies with Error 354 + the OI tick never arrives → 5s
+        # oi_fetch_timeout per market. This test locks the call order:
+        # connectAsync → reqMarketDataType → market loop.
+        ib = _FakeIb()
+        ib.historical_bars = [
+            _FakeBarData(
+                date=date(2026, 5, 19), open=100, high=101, low=99, close=100.5, volume=10
+            ),
+        ]
+        ib.contract_details = [
+            _FakeContractDetails(_FakeContract(lastTradeDateOrContractMonth="20260620")),
+        ]
+        ib.oi_value_to_serve = 50000
+        worker = BarSyncWorker(
+            config=small_config,
+            ib_factory=lambda: ib,
+            clock=lambda: datetime(2026, 5, 19, 21, 0, tzinfo=UTC),
+        )
+        asyncio.run(worker.run_cycle(today=date(2026, 5, 19)))
+        # Must be called exactly once per cycle, before the market loop.
+        assert ib.req_market_data_type_calls == [3]
+
+    def test_run_cycle_market_data_type_failure_logged_but_cycle_continues(
+        self, small_config: BarSyncConfig
+    ) -> None:
+        # If reqMarketDataType raises, the OI fetch may fail but the
+        # cycle must still write the bundle. Graceful degradation.
+        ib = _FakeIb()
+        ib.historical_bars = [
+            _FakeBarData(
+                date=date(2026, 5, 19), open=100, high=101, low=99, close=100.5, volume=10
+            ),
+        ]
+        ib.contract_details = [
+            _FakeContractDetails(_FakeContract(lastTradeDateOrContractMonth="20260620")),
+        ]
+        ib.req_market_data_type_should_raise = RuntimeError("ib_async exploded")
+        worker = BarSyncWorker(
+            config=small_config,
+            ib_factory=lambda: ib,
+            clock=lambda: datetime(2026, 5, 19, 21, 0, tzinfo=UTC),
+        )
+        result = asyncio.run(worker.run_cycle(today=date(2026, 5, 19)))
+        # Cycle still succeeds for both markets despite the MDT failure.
+        assert len(result.successful_markets) == 2
+        assert len(result.failed_markets) == 0
+
+    def test_run_cycle_skips_market_data_type_when_absent(
+        self, small_config: BarSyncConfig, tmp_path: Path
+    ) -> None:
+        # Defensive: if a future ib-async or non-conforming fake omits
+        # reqMarketDataType, run_cycle must continue without raising.
+        class _BareIb(_FakeIb):
+            reqMarketDataType = None  # type: ignore[assignment]
+
+        ib = _BareIb()
+        ib.historical_bars = [
+            _FakeBarData(
+                date=date(2026, 5, 19), open=100, high=101, low=99, close=100.5, volume=10
+            ),
+        ]
+        ib.contract_details = [
+            _FakeContractDetails(_FakeContract(lastTradeDateOrContractMonth="20260620")),
+        ]
+        worker = BarSyncWorker(
+            config=small_config,
+            ib_factory=lambda: ib,
+            clock=lambda: datetime(2026, 5, 19, 21, 0, tzinfo=UTC),
+        )
+        result = asyncio.run(worker.run_cycle(today=date(2026, 5, 19)))
+        assert len(result.successful_markets) == 2
+
+    def test_run_cycle_market_data_type_value_from_config(self, tmp_path: Path) -> None:
+        # Operator overrides oi_market_data_type=1 (LIVE) when they have
+        # a real-time subscription; the worker forwards the override
+        # to the IBKR connection unchanged.
+        config = BarSyncConfig(
+            markets={"TLT": PHASE1_UNIVERSE_METADATA["TLT"]},
+            data_root=tmp_path,
+            bars_per_fetch=1,
+            ibkr_call_timeout_seconds=2.0,
+            ibkr_connect_timeout_seconds=2.0,
+            oi_market_data_type=1,
+        )
+        ib = _FakeIb()
+        ib.historical_bars = [
+            _FakeBarData(
+                date=date(2026, 5, 19), open=100, high=101, low=99, close=100.5, volume=10
+            ),
+        ]
+        worker = BarSyncWorker(
+            config=config,
+            ib_factory=lambda: ib,
+            clock=lambda: datetime(2026, 5, 19, 21, 0, tzinfo=UTC),
+        )
+        asyncio.run(worker.run_cycle(today=date(2026, 5, 19)))
+        assert ib.req_market_data_type_calls == [1]
+
     def test_run_cycle_disconnects_even_on_partial_failure(
         self, small_config: BarSyncConfig
     ) -> None:
@@ -1978,6 +2099,7 @@ class TestModuleContract:
             "DEFAULT_BARS_PER_FETCH",
             "DEFAULT_DATA_ROOT",
             "DEFAULT_IBKR_CALL_TIMEOUT_SECONDS",
+            "DEFAULT_OI_MARKET_DATA_TYPE",
             "DEFAULT_OI_WAIT_SECONDS",
             "DEFAULT_SYNC_TIME_ET",
             "DEFAULT_TICK_INTERVAL_SECONDS",
