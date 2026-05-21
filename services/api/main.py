@@ -562,6 +562,210 @@ def _build_monitor_alert_dispatch_hook(
     return _hook
 
 
+def _build_bar_sync_alert_dispatch_hook(
+    settings: APISettings,
+) -> object | None:
+    """Construct the bar_sync ``partial_cycle_alert_hook`` closure or return None.
+
+    2026-05-21 OI saga follow-up batch (PR #211 deferred). The bar_sync
+    worker emits :class:`BarSyncAlertDescriptor` rows from
+    :func:`services.data.bar_sync.BarSyncWorker._evaluate_alerts` when
+    either (a) a partial cycle failure crosses
+    ``CONSECUTIVE_ALERT_THRESHOLD`` (= 2 consecutive cycles with at
+    least one failed market) or (b) the OI sentinel substitution
+    crosses the same threshold (LEAN's resolver picks the contract
+    because the sentinel is positive, but the value on disk is
+    synthetic — typically /MCL's paper-tier NYMEX entitlement gap).
+
+    Before this hook lands, the worker's ``_dispatch_alert`` path logs
+    ``bar_sync_alert_dropped_no_hook`` + drops the descriptor; with the
+    hook wired, each descriptor becomes:
+
+      1. INSERT one row into ``alerts`` (severity / category / message /
+         detail). ``triggering_audit_event_uuid`` stays NULL — bar_sync
+         alerts have no audit-event upstream (alembic 0004 schema
+         allows NULL on this column).
+      2. Invoke :func:`services.webhook_pusher.dispatcher.dispatch_alert`
+         with the newly minted alert_id so the operator-visible Discord
+         ``#alerts`` push fires.
+
+    Returns ``None`` (cleanly skipping the hook installation) when sops
+    ``discord.webhook_urls.alerts`` isn't populated. The worker still
+    fires alerts logging-only via ``bar_sync_alert_dropped_no_hook`` so
+    the operator can grep manually until the sops field lands. This
+    matches the recon + monitor hook-skip semantics.
+
+    Pattern mirror of ``_build_monitor_alert_dispatch_hook`` (not the
+    recon variant) because bar_sync alerts share the no-audit-upstream
+    + fire-time account_id resolution shape of the monitor surface.
+
+    Returns ``object | None`` to dodge a circular import — the actual
+    hook signature is :class:`services.data.bar_sync_alerts.BarSyncAlertDispatchHook`
+    and importing that at module-load would force a transitive load of
+    the bar_sync module (which loads ib_async lazily at first-cycle, so
+    the load itself is cheap, but the indirection keeps the module-top
+    consistent with the other hook builders).
+    """
+    # Lazy imports keep module-load fast + avoid the circular-import surface.
+    from services.data.bar_sync_alerts import BarSyncAlertDescriptor
+    from services.webhook_pusher.dispatcher import dispatch_alert
+    from services.webhook_pusher.payloads import (
+        AlertCategory,
+        AlertSeverity,
+        ChannelName,
+        EmailIdentity,
+    )
+
+    if settings.discord_webhook_url_alerts is None:
+        log.warning(
+            "bar_sync_alert_dispatch_hook_skipped_no_webhook_url",
+            note=(
+                "discord.webhook_urls.alerts not in sops; bar_sync cycles "
+                "will still emit structured `bar_sync_alert_dropped_no_hook` "
+                "WARNING logs on partial-cycle-failure + OI-sentinel "
+                "substitution at the consecutive_count >= 2 threshold, but "
+                "no Discord #alerts push will fire. Wire the sops field + "
+                "restart api to enable."
+            ),
+        )
+        return None
+
+    webhook_urls: dict[ChannelName, str] = {
+        ChannelName.DISCORD_ALERTS: settings.discord_webhook_url_alerts.get_secret_value(),
+    }
+    if settings.discord_webhook_url_critical is not None:
+        webhook_urls[ChannelName.DISCORD_CRITICAL] = (
+            settings.discord_webhook_url_critical.get_secret_value()
+        )
+
+    # bar_sync alerts are P2-only by spec (services.data.bar_sync_alerts
+    # BAR_SYNC_ALERT_SEVERITY = "P2"); P2 routes to #alerts only per
+    # webhook_pusher.payloads.SEVERITY_TO_CHANNELS. Email_identity is
+    # only required for P0 routing, so the construction here matches the
+    # recon hook's wire-it-if-the-fields-are-populated semantics rather
+    # than the P0-blocking "all-or-none" pattern. If a future bar_sync
+    # severity is added, the email path is already plumbed.
+    email_identity: EmailIdentity | None = None
+    if (
+        settings.resend_api_key is not None
+        and settings.resend_from_address is not None
+        and settings.resend_to_address is not None
+    ):
+        email_identity = EmailIdentity(
+            from_address=settings.resend_from_address,
+            to_address=settings.resend_to_address,
+            resend_api_key=settings.resend_api_key.get_secret_value(),
+        )
+
+    log.info(
+        "bar_sync_alert_dispatch_hook_constructed",
+        channels=[c.value for c in webhook_urls],
+        email_wired=email_identity is not None,
+    )
+
+    audit_env = _audit_env_from_settings(settings)
+
+    async def _hook(descriptor: BarSyncAlertDescriptor) -> None:
+        """Per-alert: INSERT alerts row + dispatch via webhook_pusher.
+
+        Resolves account_id at fire time so a missing-account-at-boot
+        path (operator hasn't run /setup yet) doesn't break hook
+        construction. If account_id is still unresolved at fire time,
+        log + skip the dispatch — the worker's structured
+        ``bar_sync_alert_dropped_no_hook`` path won't fire here because
+        the hook IS wired; instead we surface
+        ``bar_sync_alert_dispatch_skipped_no_account`` so the operator
+        can correlate against the worker's per-cycle log.
+
+        Two separate sessions per call mirror the recon + monitor hook
+        pattern:
+
+          1. INSERT into alerts using a fresh session_factory()-opened
+             session.
+          2. Open a fresh httpx.AsyncClient + session for the dispatch.
+
+        Hook failures propagate up to the worker's ``_dispatch_alert``
+        catch-and-log so a Discord 5xx doesn't wedge the cycle.
+        """
+        session_factory = api_db.get_session_factory()
+        async with session_factory() as repo_session:
+            repo = PostgresPhase1QueryRepo(repo_session)
+            account_id = await repo.fetch_active_account_id()
+        if account_id is None:
+            log.warning(
+                "bar_sync_alert_dispatch_skipped_no_account",
+                note=(
+                    "bar_sync fired a P2 alert descriptor but no active "
+                    "account is provisioned; alerts row INSERT would "
+                    "violate the NOT NULL FK to accounts. Run /setup to "
+                    "create the account row + restart api."
+                ),
+                severity=descriptor.severity,
+                category=descriptor.category,
+            )
+            return
+
+        # Defense-in-depth: validate severity + category map to the
+        # locked enums before attempting the INSERT (matches the
+        # recon + monitor hooks' enum cross-check). bar_sync_alerts
+        # already constrains via Literal types but enum validation
+        # raises early on the wire boundary if a future planner change
+        # leaks a non-canonical value.
+        AlertSeverity(descriptor.severity)
+        AlertCategory(descriptor.category)
+
+        message_text = f"{descriptor.title}\n\n{descriptor.body}"
+        async with session_factory() as ins_session:
+            row = (
+                await ins_session.execute(
+                    text(
+                        "INSERT INTO alerts ("
+                        "    account_id, severity, category, message, detail"
+                        ") VALUES ("
+                        "    :acct, :sev, :cat, :msg, CAST(:detail AS JSONB)"
+                        ") RETURNING id"
+                    ),
+                    {
+                        "acct": account_id,
+                        "sev": descriptor.severity,
+                        "cat": descriptor.category,
+                        "msg": message_text,
+                        "detail": json.dumps(descriptor.payload),
+                    },
+                )
+            ).fetchone()
+            assert row is not None
+            alert_id = UUID(str(row.id))
+            await ins_session.commit()
+
+        log.info(
+            "bar_sync_alert_inserted",
+            alert_id=str(alert_id),
+            severity=descriptor.severity,
+            category=descriptor.category,
+            account_id=str(account_id),
+            env=audit_env,
+        )
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as http_client:
+            async with session_factory() as disp_session:
+                report = await dispatch_alert(
+                    session=disp_session,
+                    alert_id=alert_id,
+                    http_client=http_client,
+                    webhook_urls=webhook_urls,
+                    email_identity=email_identity,
+                )
+        log.info(
+            "bar_sync_alert_dispatched",
+            alert_id=str(alert_id),
+            short_circuited=report.short_circuited,
+            delivery_status=dict(report.delivery_status),
+        )
+
+    return _hook
+
+
 def _build_state_transition_hook(
     settings: APISettings,
 ) -> object | None:
@@ -948,8 +1152,10 @@ async def _start_bar_sync_worker(
     Option C of the 2026-05-20 data-layer pivot v2 (see
     ``Docs/decisions-log.md`` 2026-05-20 evening entry). Fetches daily
     OHLCV bars for the Phase 1 universe from IBKR via a dedicated
-    ib-async connection on ``clientId=2`` (distinct from the
-    OrderPlacementWorker's ``clientId=1``) and writes them to the
+    ib-async connection on ``clientId=3`` (locked code default since
+    PR #210; deploy reality; distinct from the OrderPlacementWorker's
+    ``clientId=1`` code default + the ``clientId=2`` deploy override
+    the order-worker currently runs with) and writes them to the
     shared ``lean_data`` Docker volume in LEAN's expected on-disk
     format. LEAN reads via FakeDataQueue +
     SubscriptionDataReaderHistoryProvider on its 17:30 ET signal cycle.
@@ -962,7 +1168,18 @@ async def _start_bar_sync_worker(
     inside ``BarSyncWorker.run_cycle``, not held across ticks. The
     short-lived socket is intentional defense-in-depth: a bug or hang
     in the read-only historical path cannot backpressure the long-lived
-    ``clientId=1`` order socket.
+    order socket on ``clientId=1`` (or the ``clientId=2`` deploy-
+    override variant).
+
+    PR #211 follow-up (this PR): the worker is now constructed with a
+    ``partial_cycle_alert_hook`` built via
+    :func:`_build_bar_sync_alert_dispatch_hook`. When sops
+    ``discord.webhook_urls.alerts`` is populated the hook fires on the
+    two P2 alert flavors (partial-cycle failure + OI-sentinel
+    substitution) at ``consecutive_count >= 2``. When the URL isn't
+    populated the hook is None and the worker logs
+    ``bar_sync_alert_dropped_no_hook`` instead — same operator-visible
+    descriptor fields, manual-grep workflow.
     """
     if not settings.bar_sync_enabled:
         log.warning("bar_sync_worker_disabled_via_setting")
@@ -991,7 +1208,8 @@ async def _start_bar_sync_worker(
         ibkr_account=settings.ibkr_account,
         ibkr_call_timeout_seconds=settings.bar_sync_ibkr_call_timeout_seconds,
     )
-    worker = BarSyncWorker(config=config)
+    alert_dispatch_hook = _build_bar_sync_alert_dispatch_hook(settings)
+    worker = BarSyncWorker(config=config, partial_cycle_alert_hook=alert_dispatch_hook)
     task = asyncio.create_task(worker.run_forever(), name="bar_sync_worker.run_forever")
     log.info(
         "bar_sync_worker_spawned",
@@ -1004,6 +1222,7 @@ async def _start_bar_sync_worker(
         data_root=settings.bar_sync_data_root,
         ibkr_call_timeout_seconds=settings.bar_sync_ibkr_call_timeout_seconds,
         universe_size=len(config.markets),
+        alert_dispatch_hook_wired=alert_dispatch_hook is not None,
     )
     return worker, task
 
