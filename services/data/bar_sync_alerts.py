@@ -61,9 +61,9 @@ from typing import Any, Final, Literal
 import structlog
 
 from services.data.bar_sync import (
+    SENTINEL_OI_WHEN_FETCH_FAILED,
     BarSyncCycleResult,
     MarketSyncResult,
-    SENTINEL_OI_WHEN_FETCH_FAILED,
 )
 
 log = structlog.get_logger()
