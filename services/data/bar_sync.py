@@ -151,6 +151,24 @@ DEFAULT_OI_WAIT_SECONDS: Final[float] = 5.0
 #: tick-type map ``86: 'futuresOpenInterest'``.
 _IBKR_FUTURES_OI_GENERIC_TICK: Final[str] = "588"
 
+#: IBKR market-data-type code applied to the bar_sync connection
+#: before any ``reqMktData`` call. ``3`` = DELAYED (15-20 min lag);
+#: works for any IBKR account without a real-time live-data
+#: subscription. The operator's paper-trading account has NO
+#: real-time futures-OI entitlement (verified by IBKR Error 354 on
+#: 2026-05-21 00:25 UTC: "Requested market data is not subscribed.
+#: ... Delayed market data is available."). For futures OI which
+#: settles once per day, the 15-20 min lag on the delayed feed is
+#: immaterial.
+#:
+#: Other valid values (set via ``BarSyncConfig.oi_market_data_type``):
+#:   * 1 = LIVE — operator with paid real-time futures subscription
+#:   * 2 = FROZEN — last live value during market closure
+#:   * 4 = DELAYED_FROZEN — last delayed value during market closure
+#:
+#: See https://interactivebrokers.github.io/tws-api/market_data_type.html.
+DEFAULT_OI_MARKET_DATA_TYPE: Final[int] = 3
+
 
 @dataclass(frozen=True, slots=True)
 class MarketMeta:
@@ -322,6 +340,11 @@ class BarSyncConfig:
     #: Set to 0 to skip OI fetch entirely; the bundle writer will still
     #: produce a (single-expiry, empty-OI) universe file in that case.
     oi_wait_seconds: float = DEFAULT_OI_WAIT_SECONDS
+    #: IBKR market-data-type code (1=LIVE, 2=FROZEN, 3=DELAYED,
+    #: 4=DELAYED_FROZEN). Default 3 (DELAYED) — the operator's paper
+    #: account has no real-time futures-OI entitlement. Override to 1
+    #: if/when a live subscription is acquired.
+    oi_market_data_type: int = DEFAULT_OI_MARKET_DATA_TYPE
 
 
 # ---------------------------------------------------------------------------
@@ -1356,9 +1379,32 @@ class BarSyncWorker:
                     ),
                     timeout=self._config.ibkr_connect_timeout_seconds + 5.0,
                 )
+                # Set the connection-wide market-data-type BEFORE any
+                # downstream reqMktData call. IBKR Error 354 ("Requested
+                # market data is not subscribed") fires on real-time
+                # reqMktData when the account lacks the entitlement —
+                # but DELAYED (15-20 min lag) is free for any account
+                # holder. The operator's paper account has no real-time
+                # futures-OI subscription (verified 2026-05-21 00:25 UTC
+                # post-PR-#206 deploy). Effect is one-time per connection;
+                # all subsequent reqMktData calls inherit this type.
+                req_mdt = getattr(ib, "reqMarketDataType", None)
+                if req_mdt is not None:
+                    try:
+                        req_mdt(self._config.oi_market_data_type)
+                    except Exception:
+                        # Best-effort: a failure here means the OI fetch
+                        # will likely fail too (returning 0 → empty
+                        # universe-file OI), but the cycle still writes
+                        # the bundle. Log + continue.
+                        self._log.exception(
+                            "bar_sync_req_market_data_type_failed",
+                            requested_market_data_type=self._config.oi_market_data_type,
+                        )
                 self._log.info(
                     "bar_sync_ibkr_connected",
                     session_date_et=today.isoformat(),
+                    oi_market_data_type=self._config.oi_market_data_type,
                 )
             except Exception as exc:
                 self._log.exception(
@@ -1489,6 +1535,7 @@ __all__ = [
     "DEFAULT_BAR_SYNC_CLIENT_ID",
     "DEFAULT_DATA_ROOT",
     "DEFAULT_IBKR_CALL_TIMEOUT_SECONDS",
+    "DEFAULT_OI_MARKET_DATA_TYPE",
     "DEFAULT_OI_WAIT_SECONDS",
     "DEFAULT_SYNC_TIME_ET",
     "DEFAULT_TICK_INTERVAL_SECONDS",
