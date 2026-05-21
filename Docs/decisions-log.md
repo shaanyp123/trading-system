@@ -17,6 +17,140 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ## Entries
 
+<!--
+  TEMPLATE PRE-STAGED 2026-05-21 evening — for the operator to fill in
+  after observing the 21:00 UTC bar_sync cycle + 21:30 UTC LEAN cycle
+  outcomes. Replace each TODO marker with the observed value. Delete
+  this HTML comment block once filled in. Remove the whole entry if
+  the operator decides not to record this debrief.
+-->
+
+### 2026-05-22 — 2026-05-21 bar_sync OI saga first observed cycle (TODO: outcome)
+
+- **Tonight's 21:00 UTC bar_sync cycle outcome:** TODO_observed_state
+  - /MCL universe file ended with: TODO `,1` (sentinel) | `,<int>` (real OI) | `,` (empty — should NOT happen post-PR-#209)
+  - Sentinel substitution log fired for: TODO_list_of_markets
+  - failed_count: TODO
+  - duration_seconds: TODO
+- **21:30 UTC LEAN cycle outcome:** TODO_observed_state
+  - markets_checked: TODO; fresh_count: TODO
+  - signals_emitted_count: TODO
+  - v1_history_unavailable for: TODO_list_of_markets
+- **Hypothesis confirmed/disproved:** TODO whether /MCL's OI publisher is time-of-day-dependent or entitlement-gap
+- **Action items based on observed outcome:**
+  - TODO
+
+---
+
+### 2026-05-21 — Order-worker clientId drift memo: deploy/.env override (=2) vs code default (=1) (3 options + recommendation)
+
+**Status:** OPEN — operator decision required. Docs-only memo; no code change in this entry.
+
+**Trigger:** PR #210 synced the bar_sync clientId code default `2 → 3` to match deploy reality. The parallel order-worker drift was flagged in the [bar_sync OI saga follow-ups entry](#2026-05-21--bar_sync-oi-saga-follow-ups-sentinel-oi-for-mcl--p2-alert-seam--clientid-sync-prs-209--210--211) above ("Operator decision: order-worker `API_IBKR_CLIENT_ID=2` override vs code default `DEFAULT_CLIENT_ID=1`"). This entry is the structured memo the operator can act on without re-deriving the option space.
+
+**Drift state today (2026-05-21):**
+
+| Surface | clientId | Source |
+|---|---|---|
+| `services/execution/ibkr_adapter.py::DEFAULT_CLIENT_ID` | `1` | Locked code default since PR #101 (Worker-PR-1, 2026-05-13) |
+| `services/api/config.py::APISettings.ibkr_client_id` default | `1` | Mirrors the adapter default |
+| `Docs/claude-dev-guide.md` §1.5 LOCKED note | `1` (with inline override note) | Updated in PR #210 to acknowledge the drift |
+| `deploy/.env.example` documented default | `${API_IBKR_CLIENT_ID:-1}` (= 1 fallback) | Set in PR #167 (2026-05-17) |
+| **VPS `deploy/.env` actual override** | `API_IBKR_CLIENT_ID=2` | Set 2026-05-17 during a clientId=1 wedge incident; never reverted |
+
+**Drift history:**
+
+- **2026-05-13 (PR #101 Worker-PR-1):** `DEFAULT_CLIENT_ID = 1` constant locked. Worker connects on clientId=1; orderStatusEvent subscription wired.
+- **2026-05-17 (PR #167):** the IBKR TWS server-side session table held clientId=1 for 30+ minutes past an uncleanly-disconnected api session (Error 326 "client id is already in use"), blocking the worker from reconnecting. PR #167 surfaced `${API_IBKR_CLIENT_ID:-1}` in the compose file so the operator could bypass via env override. **Commit message explicitly said:** "Operators set `API_IBKR_CLIENT_ID=2` in `deploy/.env` on the VPS during a wedge incident, `docker compose up -d api`, **then revert to 1 once the wedge clears for consistency**." Default behavior unchanged.
+- **2026-05-17 → 2026-05-18:** operator set the override `=2` to clear the wedge. The drill 5 retrospective (CLAUDE.md file index header line 95) references "api's clientId=2 socket to the gateway stayed alive" — confirming the deploy was running on `=2` four days ago.
+- **2026-05-19 → 2026-05-21:** all subsequent deploys (drill 10, Operational Day 1, the bar_sync v2 pivot, the OI saga PRs) ran on `clientId=2` per the deploy/.env override. The revert never happened.
+- **2026-05-21 (PR #210):** the bar_sync code default was synced 2 → 3 to dodge a future clientId=2 collision between order-worker (deploy=2) + bar_sync (code=2 pre-fix). The order-worker drift was flagged + deferred to this memo.
+
+**The 3 options:**
+
+#### Option 1 — Align code default to deploy reality (`DEFAULT_CLIENT_ID = 2`)
+
+- **What changes:** `services/execution/ibkr_adapter.py::DEFAULT_CLIENT_ID = 1 → 2`. Mirror update in `services/api/config.py::APISettings.ibkr_client_id` default. Update `Docs/claude-dev-guide.md` §1.5 LOCKED note + `CLAUDE.md` line 27. Update `deploy/.env.example` documented default.
+- **Risk:** `services/execution/**` is on the FORBIDDEN whitelist per dev-guide §2.2 → `risk-review-approved` label required on the PR. The change itself is mechanically trivial but the review gate adds operator-time cost.
+- **Effort:** ~30 min implementation + tests + docs; ~1 day to land through the risk-review-approved gate.
+- **Reversibility:** trivial — revert the constants in another `risk-review-approved` PR.
+- **Side effect:** removes the wedge-bypass mechanism from the code (the env override loses its purpose; setting `=1` on the VPS during a future wedge of `=2` becomes the new bypass, mirroring the original pattern).
+
+#### Option 2 — Remove the deploy override (revert VPS `deploy/.env` to defaults; restore code/deploy alignment at `clientId=1`)
+
+- **What changes:** edit VPS `deploy/.env` to remove the `API_IBKR_CLIENT_ID=2` line (or set `=1` explicitly). `docker compose --env-file deploy/.env up -d --force-recreate api`. Watch the boot logs for `order_placement_worker_spawned ibkr_client_id=1`. No code change. No PR.
+- **Risk:** non-trivial. The original wedge (2026-05-17) lasted 30+ min and blocked the worker for the duration. If the IBKR TWS session table is still holding clientId=1 from a prior uncleanly-disconnected api session, the connect will fail with Error 326. **Prerequisite:** verify the wedge has cleared. Cheapest check: open a one-shot `ib-async` connection on clientId=1 to `ib_gateway:4004` via `scripts/operator_tools/replay_executions.py --client-order-ids dummy --client-id 1 --dry-run` (or equivalent) and confirm `connectAsync` returns without Error 326. If clear → restart api on `=1` is safe. If wedged → wait or re-do the wedge-bypass cycle.
+- **Effort:** ~15 min (the connect probe + the restart + log verification). No PR; the deploy/.env file lives on the VPS only.
+- **Reversibility:** trivial — re-add the `=2` override on the VPS + restart.
+- **Side effect:** preserves the wedge-bypass mechanism in the code (the env override remains useful for future wedge incidents). Restores the "code default = deploy" invariant that holds for every other config setting in the system.
+
+#### Option 3 — Leave as-is (continue running on `clientId=2`; document the drift; defer indefinitely)
+
+- **What changes:** nothing. The dev-guide §1.5 + CLAUDE.md already document the drift inline. This memo lands in the decisions-log as the canonical record. Future readers know what they're looking at.
+- **Risk:** zero immediate. The drift carries an audit-time cost (every future reader has to read the inline note + this memo to understand why the code default and deploy disagree). If the operator later forgets the wedge-bypass mechanism exists, a future wedge of `=2` triggers confusion about what the bypass should be (`=1`, `=3`, etc.).
+- **Effort:** zero.
+- **Reversibility:** N/A (no change made).
+- **Side effect:** persistent low-grade audit confusion. The bar_sync clientId=3 + order-worker clientId=2 + reserve 4-7 allocation works fine on its own — the drift is purely about what the code default says vs what runs.
+
+**Recommendation: Option 2** (revert the deploy override).
+
+**Why:**
+
+1. **The original PR #167 commit message explicitly anticipated this revert** ("revert to 1 once the wedge clears for consistency"). The drift exists because the revert step was forgotten, not because anyone affirmatively decided clientId=2 was the right operational state.
+2. **Cheapest path back to "code default = deploy reality" invariant.** Every other config setting in the system holds this invariant; the order-worker clientId is the lone outlier. Restoring it removes a permanent audit-cost paper cut.
+3. **Preserves the wedge-bypass mechanism.** Option 1 normalizes the deviation but loses the operationally-tested escape valve. Option 2 keeps the env override as an unused-but-ready tool, exactly the way PR #167 designed it.
+4. **No `services/execution/**` touch.** Option 1's `risk-review-approved` gate costs a full review cycle for what is effectively a config sync — disproportionate.
+5. **Verifiable in 15 minutes.** The probe-then-restart workflow is operationally cheap + reversible. If the wedge is still active on clientId=1, the probe surfaces it immediately and the operator can defer the cleanup to a quieter window.
+
+**Pre-flight check before executing Option 2:**
+
+```bash
+# SSH to VPS as operator
+# Open a one-shot probe on clientId=1 to verify the gateway session is clear.
+docker compose --env-file deploy/.env exec -T api python -m scripts.operator_tools.replay_executions \
+    --client-order-ids __probe__ \
+    --client-id 1 \
+    --env paper \
+    --dry-run
+# Expected on a clear gateway: exit 1 (no_match for the dummy CID) — but
+# the IBKR connect step succeeded, which is what we're checking.
+# Failure mode: IBKR Error 326 in stderr → wedge still active → defer.
+```
+
+If clear:
+
+```bash
+# Edit deploy/.env on the VPS — remove (or comment out) the line
+#   API_IBKR_CLIENT_ID=2
+# Restart api on the default clientId=1.
+docker compose --env-file deploy/.env up -d --force-recreate api
+# Watch logs:
+docker compose logs -f api | grep -E "order_placement_worker_spawned|ibkr_client_id|Error 326"
+# Expected: order_placement_worker_spawned ibkr_client_id=1 — clean.
+```
+
+**Cross-coupling if Option 1 is chosen instead:**
+
+If the operator chooses Option 1 (align code to deploy = 2), the following also need updating in the same PR:
+
+- `services/execution/ibkr_adapter.py::DEFAULT_CLIENT_ID = 1 → 2` (+ docstring)
+- `services/api/config.py::APISettings.ibkr_client_id default = 1 → 2`
+- `Docs/claude-dev-guide.md` §1.5 LOCKED note — drop the inline override paragraph; update the LOCKED bullet from `clientId=1` to `clientId=2`
+- `CLAUDE.md` line 27 `> - **api clientId=1** — order-placement worker (...)` → `clientId=2`
+- `deploy/.env.example` documented default: `${API_IBKR_CLIENT_ID:-1}` → `${API_IBKR_CLIENT_ID:-2}` (or drop the variable entirely + set the value in the compose file)
+- Reserve range updated `4-7` → either `4-7` (if 2 is locked) or `1, 4-7` (if 1 becomes the new bypass)
+- A new line in dev-guide §1.5 explaining that the wedge-bypass mechanism now uses `=1` (or another value) instead of `=2`
+
+The cross-coupling cost is meaningfully higher for Option 1 than Option 2, reinforcing the recommendation.
+
+**Cross-coupling if Option 3 is chosen:**
+
+None beyond the already-shipped inline notes in dev-guide §1.5 + PR #210's CLAUDE.md sync. This memo serves as the canonical "why does this drift exist" reference.
+
+**Decision: TBD.** This entry stays open-status until the operator picks a path. If Option 2 is chosen, append a "RESOLVED" note here pointing at the deploy ceremony evidence. If Option 1 is chosen, link the follow-up PR. If Option 3, append "ACCEPTED — drift documented; no action" and close the loop.
+
+---
+
 ### 2026-05-21 — bar_sync OI saga follow-ups: sentinel-OI for /MCL + P2 alert seam + clientId sync (PRs #209 + #210 + #211)
 
 Same-day continuation of the [earlier OI-fetch saga entry](#2026-05-21--bar_sync-oi-fetch-saga-3-sequential-prs-land-real-oi-for-67-futures-prs-205--206--207) below. Three follow-up PRs landed in this session, closing 3 of the 4 open follow-ups from that entry. Total session change: 6 files / +1,261 / -31 lines + 1 new module + 1 new test module.
