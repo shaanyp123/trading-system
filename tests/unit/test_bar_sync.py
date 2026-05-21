@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from structlog.testing import capture_logs
 
 from services.data import bar_sync
 from services.data.bar_sync import (
@@ -48,6 +49,7 @@ from services.data.bar_sync import (
     DEFAULT_SYNC_TIME_ET,
     DEFAULT_TICK_INTERVAL_SECONDS,
     PHASE1_UNIVERSE_METADATA,
+    SENTINEL_OI_WHEN_FETCH_FAILED,
     Bar,
     BarSyncConfig,
     BarSyncWorker,
@@ -311,6 +313,13 @@ class TestModuleConstants:
         from services.data.bar_sync import DEFAULT_OI_MARKET_DATA_TYPE
 
         assert DEFAULT_OI_MARKET_DATA_TYPE == 3
+
+    def test_default_sentinel_is_1(self) -> None:
+        # Operator-approved option (c) follow-up to the 2026-05-21 saga:
+        # /MCL's NYMEX delayed feed publishes OI=0 (not NaN), so the
+        # fetch returns 0. Substituting a sentinel of 1 lets LEAN's
+        # DataMappingMode.OPEN_INTEREST resolver pick the contract.
+        assert SENTINEL_OI_WHEN_FETCH_FAILED == 1
 
 
 class TestPhase1UniverseMetadata:
@@ -1676,10 +1685,12 @@ class TestSyncOneMarket:
         self, tmp_path: Path, config: BarSyncConfig
     ) -> None:
         # If IBKR doesn't serve OI (subscription gap, transient failure),
-        # the helper returns 0 and the cycle MUST still succeed. The
-        # universe file ends up with an empty OI column (pre-fix
-        # behavior), which is no worse than the current production
-        # state — the synthesis cron acts as the safety-net fallback.
+        # the helper returns 0. With the default sentinel
+        # ``oi_sentinel_when_fetch_failed=1``, the cycle MUST still
+        # succeed AND the universe file's OI column carries the
+        # sentinel value so LEAN's resolver picks the contract. Without
+        # the sentinel the resolver would skip the market entirely.
+        # (Operator-approved option (c) follow-up to 2026-05-21 saga.)
         ib = _FakeIb()
         ib.historical_bars = [
             _FakeBarData(
@@ -1714,12 +1725,239 @@ class TestSyncOneMarket:
         )
         assert result.success is True
         assert result.bars_written == 1
-        assert result.open_interest == 0  # canonical sentinel for "fetch failed"
-        # File should still be on-disk + valid CSV — just with empty OI.
+        # Effective OI reflects the sentinel substitution, NOT the raw 0
+        # the helper returned. Locks the contract: callers read the
+        # value LEAN sees on disk.
+        assert result.open_interest == SENTINEL_OI_WHEN_FETCH_FAILED == 1
         u_path = futures_universe_file_path(tmp_path, "MES", "cme", date(2026, 5, 19))
         content = u_path.read_text()
         assert content.startswith("#expiry,")
         assert "202606," in content
+        # Universe row's OI column carries the sentinel (NOT empty +
+        # NOT 0).
+        assert content.rstrip("\n").endswith(",1")
+
+    def test_sentinel_substitutes_when_fetch_returns_zero(
+        self, tmp_path: Path, config: BarSyncConfig
+    ) -> None:
+        # Pin the explicit sentinel value (not just the default) to lock
+        # the contract: substitution lands the exact configured value
+        # in both the MarketSyncResult AND the on-disk universe file.
+        ib = _FakeIb()
+        ib.historical_bars = [
+            _FakeBarData(
+                date=date(2026, 5, 19),
+                open=7378.0,
+                high=7380.5,
+                low=7375.25,
+                close=7378.25,
+                volume=12500,
+            ),
+        ]
+        ib.contract_details = [
+            _FakeContractDetails(_FakeContract(lastTradeDateOrContractMonth="20260620")),
+        ]
+        ib.oi_value_to_serve = 0.0  # /MCL NYMEX-delayed-tier shape
+        narrow_config = BarSyncConfig(
+            markets=config.markets,
+            data_root=tmp_path,
+            bars_per_fetch=config.bars_per_fetch,
+            ibkr_call_timeout_seconds=config.ibkr_call_timeout_seconds,
+            oi_wait_seconds=0.1,
+            oi_sentinel_when_fetch_failed=7,  # arbitrary non-default
+        )
+        result = asyncio.run(
+            sync_one_market(
+                ib,
+                "/MCL",
+                PHASE1_UNIVERSE_METADATA["/MCL"],
+                config=narrow_config,
+                today=date(2026, 5, 19),
+            )
+        )
+        assert result.success is True
+        assert result.open_interest == 7
+        u_path = futures_universe_file_path(tmp_path, "MCL", "nymex", date(2026, 5, 19))
+        assert u_path.read_text().rstrip("\n").endswith(",7")
+
+    def test_sentinel_disabled_when_config_zero(
+        self, tmp_path: Path, config: BarSyncConfig
+    ) -> None:
+        # With ``oi_sentinel_when_fetch_failed=0`` the substitution is
+        # disabled — the universe file gets an empty OI column,
+        # preserving the pre-2026-05-21 behavior. Operator escape hatch
+        # in case the sentinel ever causes downstream issues.
+        ib = _FakeIb()
+        ib.historical_bars = [
+            _FakeBarData(
+                date=date(2026, 5, 19),
+                open=7378.0,
+                high=7380.5,
+                low=7375.25,
+                close=7378.25,
+                volume=12500,
+            ),
+        ]
+        ib.contract_details = [
+            _FakeContractDetails(_FakeContract(lastTradeDateOrContractMonth="20260620")),
+        ]
+        ib.oi_value_to_serve = 0.0
+        narrow_config = BarSyncConfig(
+            markets=config.markets,
+            data_root=tmp_path,
+            bars_per_fetch=config.bars_per_fetch,
+            ibkr_call_timeout_seconds=config.ibkr_call_timeout_seconds,
+            oi_wait_seconds=0.1,
+            oi_sentinel_when_fetch_failed=0,
+        )
+        result = asyncio.run(
+            sync_one_market(
+                ib,
+                "/MCL",
+                PHASE1_UNIVERSE_METADATA["/MCL"],
+                config=narrow_config,
+                today=date(2026, 5, 19),
+            )
+        )
+        assert result.success is True
+        # Raw 0 propagates — no substitution.
+        assert result.open_interest == 0
+        u_path = futures_universe_file_path(tmp_path, "MCL", "nymex", date(2026, 5, 19))
+        content = u_path.read_text()
+        # Empty trailing OI column (pre-2026-05-21 behavior).
+        assert content.rstrip("\n").endswith(",")
+        assert not content.rstrip("\n").endswith(",0")
+
+    def test_sentinel_does_not_override_real_oi(
+        self, tmp_path: Path, config: BarSyncConfig
+    ) -> None:
+        # When the helper returns a real positive OI, the sentinel does
+        # NOT apply — locks the contract that substitution only fires
+        # when fetch returns 0. Critical for /MES/MNQ/etc. which the
+        # 2026-05-21 saga showed return real OI values.
+        ib = _FakeIb()
+        ib.historical_bars = [
+            _FakeBarData(
+                date=date(2026, 5, 19),
+                open=7378.0,
+                high=7380.5,
+                low=7375.25,
+                close=7378.25,
+                volume=12500,
+            ),
+        ]
+        ib.contract_details = [
+            _FakeContractDetails(_FakeContract(lastTradeDateOrContractMonth="20260620")),
+        ]
+        ib.oi_value_to_serve = 257985.0
+        narrow_config = BarSyncConfig(
+            markets=config.markets,
+            data_root=tmp_path,
+            bars_per_fetch=config.bars_per_fetch,
+            ibkr_call_timeout_seconds=config.ibkr_call_timeout_seconds,
+            oi_wait_seconds=0.1,
+            oi_sentinel_when_fetch_failed=1,  # explicit default
+        )
+        result = asyncio.run(
+            sync_one_market(
+                ib,
+                "/MES",
+                PHASE1_UNIVERSE_METADATA["/MES"],
+                config=narrow_config,
+                today=date(2026, 5, 19),
+            )
+        )
+        assert result.open_interest == 257985
+        u_path = futures_universe_file_path(tmp_path, "MES", "cme", date(2026, 5, 19))
+        assert u_path.read_text().rstrip("\n").endswith(",257985")
+
+    def test_sentinel_substitution_logged(self, tmp_path: Path, config: BarSyncConfig) -> None:
+        # The structured log line is the only signal Task 4's partial-
+        # cycle alert will see for "OI was sentinel-substituted" until
+        # MarketSyncResult.open_interest_was_sentinel lands. Lock the
+        # log shape so the alert query in Task 4 can grep deterministically.
+        ib = _FakeIb()
+        ib.historical_bars = [
+            _FakeBarData(
+                date=date(2026, 5, 19),
+                open=7378.0,
+                high=7380.5,
+                low=7375.25,
+                close=7378.25,
+                volume=12500,
+            ),
+        ]
+        ib.contract_details = [
+            _FakeContractDetails(_FakeContract(lastTradeDateOrContractMonth="20260620")),
+        ]
+        ib.oi_value_to_serve = 0.0
+        narrow_config = BarSyncConfig(
+            markets=config.markets,
+            data_root=tmp_path,
+            bars_per_fetch=config.bars_per_fetch,
+            ibkr_call_timeout_seconds=config.ibkr_call_timeout_seconds,
+            oi_wait_seconds=0.1,
+        )
+        with capture_logs() as logs:
+            asyncio.run(
+                sync_one_market(
+                    ib,
+                    "/MCL",
+                    PHASE1_UNIVERSE_METADATA["/MCL"],
+                    config=narrow_config,
+                    today=date(2026, 5, 19),
+                )
+            )
+        sentinel_events = [e for e in logs if e.get("event") == "oi_sentinel_substituted"]
+        assert len(sentinel_events) == 1
+        evt = sentinel_events[0]
+        assert evt["market"] == "/MCL"
+        assert evt["front_month_expiry"] == "202606"
+        assert evt["reason"] == "fetch_returned_zero"
+        assert evt["raw_open_interest"] == 0
+        assert evt["sentinel"] == 1
+        assert evt["log_level"] == "warning"
+
+    def test_sentinel_not_logged_when_fetch_succeeds(
+        self, tmp_path: Path, config: BarSyncConfig
+    ) -> None:
+        # No oi_sentinel_substituted event when the helper returned a
+        # real OI. Locks the contract that the log is only emitted on
+        # the substitution path.
+        ib = _FakeIb()
+        ib.historical_bars = [
+            _FakeBarData(
+                date=date(2026, 5, 19),
+                open=7378.0,
+                high=7380.5,
+                low=7375.25,
+                close=7378.25,
+                volume=12500,
+            ),
+        ]
+        ib.contract_details = [
+            _FakeContractDetails(_FakeContract(lastTradeDateOrContractMonth="20260620")),
+        ]
+        ib.oi_value_to_serve = 257985.0
+        narrow_config = BarSyncConfig(
+            markets=config.markets,
+            data_root=tmp_path,
+            bars_per_fetch=config.bars_per_fetch,
+            ibkr_call_timeout_seconds=config.ibkr_call_timeout_seconds,
+            oi_wait_seconds=0.1,
+        )
+        with capture_logs() as logs:
+            asyncio.run(
+                sync_one_market(
+                    ib,
+                    "/MES",
+                    PHASE1_UNIVERSE_METADATA["/MES"],
+                    config=narrow_config,
+                    today=date(2026, 5, 19),
+                )
+            )
+        sentinel_events = [e for e in logs if e.get("event") == "oi_sentinel_substituted"]
+        assert len(sentinel_events) == 0
 
     def test_etf_empty_bars_returns_failure(self, tmp_path: Path, config: BarSyncConfig) -> None:
         ib = _FakeIb()
@@ -2104,6 +2342,7 @@ class TestModuleContract:
             "DEFAULT_SYNC_TIME_ET",
             "DEFAULT_TICK_INTERVAL_SECONDS",
             "PHASE1_UNIVERSE_METADATA",
+            "SENTINEL_OI_WHEN_FETCH_FAILED",
             "Bar",
             "BarSyncConfig",
             "BarSyncCycleResult",
