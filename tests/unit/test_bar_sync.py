@@ -44,6 +44,7 @@ from services.data.bar_sync import (
     DEFAULT_BAR_SYNC_CLIENT_ID,
     DEFAULT_BARS_PER_FETCH,
     DEFAULT_DATA_ROOT,
+    DEFAULT_OI_WAIT_SECONDS,
     DEFAULT_SYNC_TIME_ET,
     DEFAULT_TICK_INTERVAL_SECONDS,
     PHASE1_UNIVERSE_METADATA,
@@ -64,6 +65,7 @@ from services.data.bar_sync import (
     equity_factor_file_path,
     equity_map_file_path,
     fetch_etf_bars,
+    fetch_front_month_open_interest,
     fetch_futures_bars_and_front_month,
     futures_map_file_path,
     futures_oi_zip_path,
@@ -108,12 +110,28 @@ class _FakeContractDetails:
     contract: _FakeContract
 
 
+@dataclass
+class _FakeTicker:
+    """Duck-typed ib-async ``Ticker`` with mutable ``futuresOpenInterest``.
+
+    The real ib-async ``Ticker`` populates its fields asynchronously as
+    tick callbacks arrive from IBKR. Tests pre-populate
+    ``futuresOpenInterest`` to whatever value (or NaN) they want the
+    poll loop to observe; a None value also makes the helper treat it
+    as "not yet arrived".
+    """
+
+    futuresOpenInterest: Any = None  # mirrors ib-async's camelCase
+
+
 class _FakeIb:
     """Fake ib-async ``IB`` instance.
 
     Tests configure the canned responses by setting
-    ``self.historical_bars``, ``self.contract_details``, and
-    ``self.connect_should_raise``. The instance records call args so
+    ``self.historical_bars``, ``self.contract_details``,
+    ``self.connect_should_raise``, ``self.oi_value_to_serve``,
+    ``self.oi_reqmktdata_should_raise``, and
+    ``self.oi_cancel_should_raise``. The instance records call args so
     tests can assert on the request shape.
     """
 
@@ -125,6 +143,15 @@ class _FakeIb:
         self.req_contract_details_calls: list[Any] = []
         self.disconnect_calls = 0
         self._connected = False
+        # OI snapshot canned response. ``None`` = "ticker stays empty"
+        # (no tick arrived); a number = "ticker's futuresOpenInterest
+        # is set to that value at subscribe time" (i.e., the very next
+        # poll sees it).
+        self.oi_value_to_serve: Any = None
+        self.oi_reqmktdata_should_raise: Exception | None = None
+        self.oi_cancel_should_raise: Exception | None = None
+        self.req_mkt_data_calls: list[dict[str, Any]] = []
+        self.cancel_mkt_data_calls: list[Any] = []
 
     async def connectAsync(
         self,
@@ -165,6 +192,30 @@ class _FakeIb:
     async def reqContractDetailsAsync(self, contract: Any) -> list[Any]:
         self.req_contract_details_calls.append(contract)
         return list(self.contract_details)
+
+    def reqMktData(
+        self,
+        contract: Any,
+        genericTickList: str = "",
+        snapshot: bool = False,
+        regulatorySnapshot: bool = False,
+        mktDataOptions: Any = None,
+    ) -> _FakeTicker:
+        self.req_mkt_data_calls.append(
+            {
+                "contract": contract,
+                "genericTickList": genericTickList,
+                "snapshot": snapshot,
+            }
+        )
+        if self.oi_reqmktdata_should_raise is not None:
+            raise self.oi_reqmktdata_should_raise
+        return _FakeTicker(futuresOpenInterest=self.oi_value_to_serve)
+
+    def cancelMktData(self, contract: Any) -> None:
+        self.cancel_mkt_data_calls.append(contract)
+        if self.oi_cancel_should_raise is not None:
+            raise self.oi_cancel_should_raise
 
     def disconnect(self) -> None:
         self.disconnect_calls += 1
@@ -212,6 +263,12 @@ class TestModuleConstants:
     def test_default_client_id_is_2(self) -> None:
         # Per dev-guide §1.5 LOCKED: api worker=1, bar_sync=2, probes=80-99.
         assert DEFAULT_BAR_SYNC_CLIENT_ID == 2
+
+    def test_default_oi_wait_seconds_5s(self) -> None:
+        # Locked at 5s - IBKR's futures generic-tick 588 typically arrives
+        # within 1-2s; 5s gives comfortable headroom without lengthening
+        # the cycle materially.
+        assert DEFAULT_OI_WAIT_SECONDS == 5.0
 
 
 class TestPhase1UniverseMetadata:
@@ -1096,6 +1153,257 @@ class TestFetchFuturesBarsAndFrontMonth:
             )
 
 
+class TestFetchFrontMonthOpenInterest:
+    """OI snapshot via reqMktData generic-tick 588 (futures only).
+
+    Closes the 2026-05-20 OI bug: pre-fix, ``sync_one_market`` hardcoded
+    ``open_interest=0`` in the bundle write, so universe files landed
+    with empty OI columns and LEAN's ``DataMappingMode.OPEN_INTEREST``
+    resolver could not pick a contract. Post-fix, this helper provides
+    a real snapshot value the writer threads into the universe row.
+    """
+
+    @pytest.fixture
+    def meta(self) -> MarketMeta:
+        return PHASE1_UNIVERSE_METADATA["/MES"]
+
+    def test_happy_path_returns_int_oi(self, meta: MarketMeta) -> None:
+        ib = _FakeIb()
+        ib.oi_value_to_serve = 257985.0  # IBKR ticks are float
+        oi = asyncio.run(
+            fetch_front_month_open_interest(
+                ib,
+                "/MES",
+                meta=meta,
+                front_month_expiry_yyyymm="202606",
+                wait_seconds=1.0,
+                poll_interval_seconds=0.01,
+            )
+        )
+        assert oi == 257985
+        assert isinstance(oi, int)
+        # Subscription must include generic tick 588 + NOT snapshot mode
+        # (IBKR's snapshot=True doesn't deliver generic ticks).
+        assert len(ib.req_mkt_data_calls) == 1
+        call = ib.req_mkt_data_calls[0]
+        assert call["genericTickList"] == "588"
+        assert call["snapshot"] is False
+        # Contract is the front-month Future, not a ContFuture.
+        assert call["contract"].lastTradeDateOrContractMonth == "202606"
+
+    def test_cancel_always_called_on_success(self, meta: MarketMeta) -> None:
+        ib = _FakeIb()
+        ib.oi_value_to_serve = 100
+        asyncio.run(
+            fetch_front_month_open_interest(
+                ib,
+                "/MES",
+                meta=meta,
+                front_month_expiry_yyyymm="202606",
+                wait_seconds=0.5,
+                poll_interval_seconds=0.01,
+            )
+        )
+        assert len(ib.cancel_mkt_data_calls) == 1
+
+    def test_nan_oi_returns_zero(self, meta: MarketMeta) -> None:
+        ib = _FakeIb()
+        ib.oi_value_to_serve = float("nan")
+        oi = asyncio.run(
+            fetch_front_month_open_interest(
+                ib,
+                "/MES",
+                meta=meta,
+                front_month_expiry_yyyymm="202606",
+                wait_seconds=0.2,
+                poll_interval_seconds=0.01,
+            )
+        )
+        assert oi == 0
+        # Cancellation still happens.
+        assert len(ib.cancel_mkt_data_calls) == 1
+
+    def test_none_oi_returns_zero_on_timeout(self, meta: MarketMeta) -> None:
+        # Ticker stays unpopulated (None) — simulates IBKR never sending
+        # the tick (no subscription entitlement, network issue, etc.).
+        ib = _FakeIb()
+        ib.oi_value_to_serve = None
+        oi = asyncio.run(
+            fetch_front_month_open_interest(
+                ib,
+                "/MES",
+                meta=meta,
+                front_month_expiry_yyyymm="202606",
+                wait_seconds=0.15,
+                poll_interval_seconds=0.01,
+            )
+        )
+        assert oi == 0
+
+    def test_zero_oi_keeps_polling_until_timeout(self, meta: MarketMeta) -> None:
+        # Some IBKR feeds emit OI=0 sentinel before real data arrives;
+        # the helper should not return 0 prematurely — it should keep
+        # polling within the wall-clock budget. We assert via the poll
+        # count by checking that the helper waited the whole budget.
+        ib = _FakeIb()
+        ib.oi_value_to_serve = 0.0
+        import time as _time
+
+        t0 = _time.monotonic()
+        oi = asyncio.run(
+            fetch_front_month_open_interest(
+                ib,
+                "/MES",
+                meta=meta,
+                front_month_expiry_yyyymm="202606",
+                wait_seconds=0.15,
+                poll_interval_seconds=0.02,
+            )
+        )
+        elapsed = _time.monotonic() - t0
+        assert oi == 0
+        # Should have polled near the full budget (allow generous slack
+        # for scheduler jitter).
+        assert elapsed >= 0.12
+
+    def test_negative_oi_treated_as_unavailable(self, meta: MarketMeta) -> None:
+        # IBKR occasionally returns -1 as an "unavailable" sentinel on
+        # other tick types; the OI poll should not return -1 as a real
+        # int either.
+        ib = _FakeIb()
+        ib.oi_value_to_serve = -1.0
+        oi = asyncio.run(
+            fetch_front_month_open_interest(
+                ib,
+                "/MES",
+                meta=meta,
+                front_month_expiry_yyyymm="202606",
+                wait_seconds=0.1,
+                poll_interval_seconds=0.01,
+            )
+        )
+        assert oi == 0
+
+    def test_inf_oi_returns_zero(self, meta: MarketMeta) -> None:
+        ib = _FakeIb()
+        ib.oi_value_to_serve = float("inf")
+        oi = asyncio.run(
+            fetch_front_month_open_interest(
+                ib,
+                "/MES",
+                meta=meta,
+                front_month_expiry_yyyymm="202606",
+                wait_seconds=0.1,
+                poll_interval_seconds=0.01,
+            )
+        )
+        assert oi == 0
+
+    def test_wait_seconds_zero_short_circuits(self, meta: MarketMeta) -> None:
+        # wait_seconds <= 0 disables the OI fetch — no IBKR call should fire.
+        ib = _FakeIb()
+        ib.oi_value_to_serve = 100
+        oi = asyncio.run(
+            fetch_front_month_open_interest(
+                ib,
+                "/MES",
+                meta=meta,
+                front_month_expiry_yyyymm="202606",
+                wait_seconds=0,
+                poll_interval_seconds=0.01,
+            )
+        )
+        assert oi == 0
+        assert len(ib.req_mkt_data_calls) == 0
+        assert len(ib.cancel_mkt_data_calls) == 0
+
+    def test_wait_seconds_negative_short_circuits(self, meta: MarketMeta) -> None:
+        ib = _FakeIb()
+        ib.oi_value_to_serve = 100
+        oi = asyncio.run(
+            fetch_front_month_open_interest(
+                ib,
+                "/MES",
+                meta=meta,
+                front_month_expiry_yyyymm="202606",
+                wait_seconds=-1.0,
+                poll_interval_seconds=0.01,
+            )
+        )
+        assert oi == 0
+        assert len(ib.req_mkt_data_calls) == 0
+
+    def test_reqmktdata_raises_returns_zero(self, meta: MarketMeta) -> None:
+        ib = _FakeIb()
+        ib.oi_reqmktdata_should_raise = RuntimeError("ib-async exploded")
+        oi = asyncio.run(
+            fetch_front_month_open_interest(
+                ib,
+                "/MES",
+                meta=meta,
+                front_month_expiry_yyyymm="202606",
+                wait_seconds=0.1,
+                poll_interval_seconds=0.01,
+            )
+        )
+        assert oi == 0
+        # cancelMktData is only called if reqMktData succeeded; since we
+        # raised at reqMktData, cancel should never run.
+        assert len(ib.cancel_mkt_data_calls) == 0
+
+    def test_cancel_failure_swallowed(self, meta: MarketMeta) -> None:
+        # A failure inside cancelMktData (e.g., contract no longer
+        # subscribed) must not propagate — the caller already has the
+        # OI value or knows to fall back to 0.
+        ib = _FakeIb()
+        ib.oi_value_to_serve = 500
+        ib.oi_cancel_should_raise = RuntimeError("already cancelled")
+        oi = asyncio.run(
+            fetch_front_month_open_interest(
+                ib,
+                "/MES",
+                meta=meta,
+                front_month_expiry_yyyymm="202606",
+                wait_seconds=0.5,
+                poll_interval_seconds=0.01,
+            )
+        )
+        assert oi == 500  # main value preserved
+        assert len(ib.cancel_mkt_data_calls) == 1
+
+    def test_non_futures_meta_raises(self, meta: MarketMeta) -> None:
+        ib = _FakeIb()
+        etf_meta = PHASE1_UNIVERSE_METADATA["TLT"]
+        with pytest.raises(ValueError, match="non-futures"):
+            asyncio.run(
+                fetch_front_month_open_interest(
+                    ib,
+                    "TLT",
+                    meta=etf_meta,
+                    front_month_expiry_yyyymm="202606",
+                    wait_seconds=0.1,
+                )
+            )
+
+    def test_string_oi_value_returns_zero(self, meta: MarketMeta) -> None:
+        # Defensive: if a future ib-async version changes the field type
+        # to a string, our int() conversion attempt should fall back
+        # gracefully rather than raise.
+        ib = _FakeIb()
+        ib.oi_value_to_serve = "not-a-number"
+        oi = asyncio.run(
+            fetch_front_month_open_interest(
+                ib,
+                "/MES",
+                meta=meta,
+                front_month_expiry_yyyymm="202606",
+                wait_seconds=0.1,
+                poll_interval_seconds=0.01,
+            )
+        )
+        assert oi == 0
+
+
 # ---------------------------------------------------------------------------
 # Per-market orchestrator
 # ---------------------------------------------------------------------------
@@ -1133,8 +1441,11 @@ class TestSyncOneMarket:
         assert result.bars_written == 1
         assert result.last_session_date == date(2026, 5, 19)
         assert result.front_month_expiry is None  # ETFs have no expiry
+        assert result.open_interest is None  # ETFs have no OI
         assert result.error is None
         assert equity_daily_zip_path(tmp_path, "TLT").exists()
+        # ETF path must NOT call reqMktData (OI fetch is futures-only).
+        assert len(ib.req_mkt_data_calls) == 0
 
     def test_futures_happy_path_writes_files_and_returns_success(
         self, tmp_path: Path, config: BarSyncConfig
@@ -1153,6 +1464,7 @@ class TestSyncOneMarket:
         ib.contract_details = [
             _FakeContractDetails(_FakeContract(lastTradeDateOrContractMonth="20260620")),
         ]
+        ib.oi_value_to_serve = 257985.0
         result = asyncio.run(
             sync_one_market(
                 ib,
@@ -1165,7 +1477,99 @@ class TestSyncOneMarket:
         assert result.success is True
         assert result.bars_written == 1
         assert result.front_month_expiry == "202606"
+        assert result.open_interest == 257985
         assert futures_trade_zip_path(tmp_path, "MES", "cme").exists()
+
+    def test_futures_oi_propagates_to_universe_file(
+        self, tmp_path: Path, config: BarSyncConfig
+    ) -> None:
+        # The on-disk universe file's OI column is the value LEAN's
+        # DataMappingMode.OPEN_INTEREST resolver consults. This test
+        # locks the end-to-end wiring: ib.oi_value_to_serve → real
+        # value in the per-day universe CSV.
+        ib = _FakeIb()
+        ib.historical_bars = [
+            _FakeBarData(
+                date=date(2026, 5, 19),
+                open=7378.0,
+                high=7380.5,
+                low=7375.25,
+                close=7378.25,
+                volume=12500,
+            ),
+        ]
+        ib.contract_details = [
+            _FakeContractDetails(_FakeContract(lastTradeDateOrContractMonth="20260620")),
+        ]
+        ib.oi_value_to_serve = 257985.0
+        asyncio.run(
+            sync_one_market(
+                ib,
+                "/MES",
+                PHASE1_UNIVERSE_METADATA["/MES"],
+                config=config,
+                today=date(2026, 5, 19),
+            )
+        )
+        u_path = futures_universe_file_path(tmp_path, "MES", "cme", date(2026, 5, 19))
+        content = u_path.read_text()
+        # Universe row format: <expiry>,<o>,<h>,<l>,<c>,<v>,<oi>
+        # OI must be the real value, NOT empty + NOT 0.
+        assert content.rstrip("\n").endswith(",257985")
+        # OI zip should also carry the value across all bar dates.
+        oi_zip = futures_oi_zip_path(tmp_path, "MES", "cme")
+        with zipfile.ZipFile(oi_zip) as zf:
+            oi_content = zf.read("mes_openinterest_202606.csv").decode()
+        assert "20260519 00:00,257985" in oi_content
+
+    def test_futures_oi_unavailable_does_not_fail_market(
+        self, tmp_path: Path, config: BarSyncConfig
+    ) -> None:
+        # If IBKR doesn't serve OI (subscription gap, transient failure),
+        # the helper returns 0 and the cycle MUST still succeed. The
+        # universe file ends up with an empty OI column (pre-fix
+        # behavior), which is no worse than the current production
+        # state — the synthesis cron acts as the safety-net fallback.
+        ib = _FakeIb()
+        ib.historical_bars = [
+            _FakeBarData(
+                date=date(2026, 5, 19),
+                open=7378.0,
+                high=7380.5,
+                low=7375.25,
+                close=7378.25,
+                volume=12500,
+            ),
+        ]
+        ib.contract_details = [
+            _FakeContractDetails(_FakeContract(lastTradeDateOrContractMonth="20260620")),
+        ]
+        ib.oi_value_to_serve = None  # ticker never populates
+        # Tight budget so the test doesn't pay the full 5s default.
+        narrow_config = BarSyncConfig(
+            markets=config.markets,
+            data_root=tmp_path,
+            bars_per_fetch=config.bars_per_fetch,
+            ibkr_call_timeout_seconds=config.ibkr_call_timeout_seconds,
+            oi_wait_seconds=0.1,
+        )
+        result = asyncio.run(
+            sync_one_market(
+                ib,
+                "/MES",
+                PHASE1_UNIVERSE_METADATA["/MES"],
+                config=narrow_config,
+                today=date(2026, 5, 19),
+            )
+        )
+        assert result.success is True
+        assert result.bars_written == 1
+        assert result.open_interest == 0  # canonical sentinel for "fetch failed"
+        # File should still be on-disk + valid CSV — just with empty OI.
+        u_path = futures_universe_file_path(tmp_path, "MES", "cme", date(2026, 5, 19))
+        content = u_path.read_text()
+        assert content.startswith("#expiry,")
+        assert "202606," in content
 
     def test_etf_empty_bars_returns_failure(self, tmp_path: Path, config: BarSyncConfig) -> None:
         ib = _FakeIb()
@@ -1250,6 +1654,7 @@ class TestBarSyncWorkerCycle:
     @pytest.fixture
     def small_config(self, tmp_path: Path) -> BarSyncConfig:
         # Two-market universe — one ETF + one futures, keeps the test fast.
+        # Tight oi_wait_seconds so tests don't pay the 5s production budget.
         return BarSyncConfig(
             markets={
                 "TLT": PHASE1_UNIVERSE_METADATA["TLT"],
@@ -1260,6 +1665,7 @@ class TestBarSyncWorkerCycle:
             tick_interval_seconds=0.01,
             ibkr_call_timeout_seconds=2.0,
             ibkr_connect_timeout_seconds=2.0,
+            oi_wait_seconds=0.1,
         )
 
     def test_run_cycle_happy_path_returns_two_successes(self, small_config: BarSyncConfig) -> None:
@@ -1272,6 +1678,7 @@ class TestBarSyncWorkerCycle:
         ib.contract_details = [
             _FakeContractDetails(_FakeContract(lastTradeDateOrContractMonth="20260620")),
         ]
+        ib.oi_value_to_serve = 50000
         clock_ts = datetime(2026, 5, 19, 21, 0, tzinfo=UTC)  # 17:00 ET
         worker = BarSyncWorker(
             config=small_config,
@@ -1283,6 +1690,9 @@ class TestBarSyncWorkerCycle:
         assert len(result.failed_markets) == 0
         assert result.total_markets == 2
         assert ib.disconnect_calls == 1
+        # OI should land on the futures market's result.
+        futures_result = next(r for r in result.successful_markets if r.market == "/MES")
+        assert futures_result.open_interest == 50000
 
     def test_run_cycle_connect_failure_marks_all_failed(self, small_config: BarSyncConfig) -> None:
         ib = _FakeIb()
@@ -1436,6 +1846,7 @@ class TestModuleContract:
             "DEFAULT_BARS_PER_FETCH",
             "DEFAULT_DATA_ROOT",
             "DEFAULT_IBKR_CALL_TIMEOUT_SECONDS",
+            "DEFAULT_OI_WAIT_SECONDS",
             "DEFAULT_SYNC_TIME_ET",
             "DEFAULT_TICK_INTERVAL_SECONDS",
             "PHASE1_UNIVERSE_METADATA",
@@ -1459,6 +1870,7 @@ class TestModuleContract:
             "equity_factor_file_path",
             "equity_map_file_path",
             "fetch_etf_bars",
+            "fetch_front_month_open_interest",
             "fetch_futures_bars_and_front_month",
             "futures_map_file_path",
             "futures_oi_zip_path",
@@ -1490,6 +1902,19 @@ class TestModuleContract:
         )
         with pytest.raises(Exception):
             r.success = False  # type: ignore[misc]
+
+    def test_market_sync_result_open_interest_defaults_none(self) -> None:
+        # Backward compatibility: existing callers that don't pass
+        # open_interest get the None default (ETF semantics).
+        r = MarketSyncResult(
+            market="TLT",
+            success=True,
+            bars_written=1,
+            last_session_date=date(2026, 5, 19),
+            front_month_expiry=None,
+            error=None,
+        )
+        assert r.open_interest is None
 
     def test_bar_sync_config_default_universe_is_phase1(self) -> None:
         cfg = BarSyncConfig()
