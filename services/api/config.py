@@ -419,12 +419,14 @@ class APISettings(BaseSettings):
         ),
     )
     bar_sync_client_id: int = Field(
-        default=2,
+        default=3,
         ge=1,
         le=7,
         description=(
-            "TWS API clientId for the bar-sync worker. Default 2 per "
-            "dev-guide §1.5 LOCKED (api worker=1, bar_sync=2, probes=80-99). "
+            "TWS API clientId for the bar-sync worker. Default 3 per "
+            "dev-guide §1.5 LOCKED (synced to deploy reality 2026-05-21: "
+            "api worker=1, bar_sync=3, probes=80-99, reserve 4-7; "
+            "clientId=2 reserved for the order-worker's deploy override). "
             "Distinct from `ibkr_client_id` so the read-only historical "
             "fetch path doesn't share the live order socket."
         ),

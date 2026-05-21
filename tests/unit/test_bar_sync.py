@@ -295,9 +295,11 @@ class TestModuleConstants:
     def test_default_data_root_is_lean_data(self) -> None:
         assert DEFAULT_DATA_ROOT == Path("/Lean/Data")
 
-    def test_default_client_id_is_2(self) -> None:
-        # Per dev-guide §1.5 LOCKED: api worker=1, bar_sync=2, probes=80-99.
-        assert DEFAULT_BAR_SYNC_CLIENT_ID == 2
+    def test_default_client_id_is_3(self) -> None:
+        # Synced to deploy reality 2026-05-21: api worker=1 (deploy
+        # override to 2), bar_sync=3, probes=80-99, reserve 4-7. See
+        # dev-guide §1.5 LOCKED + decisions-log 2026-05-21 follow-up.
+        assert DEFAULT_BAR_SYNC_CLIENT_ID == 3
 
     def test_default_oi_wait_seconds_5s(self) -> None:
         # Locked at 5s - IBKR's futures generic-tick 588 typically arrives
