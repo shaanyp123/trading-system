@@ -17,6 +17,56 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ## Entries
 
+### 2026-05-21 — bar_sync OI saga follow-ups: sentinel-OI for /MCL + P2 alert seam + clientId sync (PRs #209 + #210 + #211)
+
+Same-day continuation of the [earlier OI-fetch saga entry](#2026-05-21--bar_sync-oi-fetch-saga-3-sequential-prs-land-real-oi-for-67-futures-prs-205--206--207) below. Three follow-up PRs landed in this session, closing 3 of the 4 open follow-ups from that entry. Total session change: 6 files / +1,261 / -31 lines + 1 new module + 1 new test module.
+
+| PR | Title | Files | Risk-review-approved? |
+|---|---|---|---|
+| [#209](https://github.com/shaanyp123/trading-system/pull/209) | `feat(data): sentinel-OI fallback unblocks /MCL when paper feed publishes OI=0` | `services/data/bar_sync.py` + `tests/unit/test_bar_sync.py` | No |
+| [#210](https://github.com/shaanyp123/trading-system/pull/210) | `chore(data): sync bar_sync clientId default to deploy reality (2 -> 3)` | `services/data/bar_sync.py` + `services/api/config.py` + `Docs/claude-dev-guide.md` + `tests/unit/test_bar_sync.py` | No |
+| [#211](https://github.com/shaanyp123/trading-system/pull/211) | `feat(data): P2 alert seam for bar_sync partial cycle + OI sentinel patterns` | `services/data/bar_sync.py` + NEW `services/data/bar_sync_alerts.py` + `tests/unit/test_bar_sync.py` + NEW `tests/unit/test_bar_sync_alerts.py` | No |
+
+**#209 — sentinel-OI for /MCL:** the saga retrospective noted /MCL's NYMEX paper-tier delayed feed publishes `futuresOpenInterest=0.0` rather than NaN — an entitlement-gap signal disguised as a real tick. The operator-approved option (c) substitution lands here: new `SENTINEL_OI_WHEN_FETCH_FAILED: Final[int] = 1` module constant + new `BarSyncConfig.oi_sentinel_when_fetch_failed: int` field (set to 0 to disable; default 1 substitutes when the helper returns 0). `sync_one_market` futures branch now emits `oi_sentinel_substituted market=... raw_open_interest=0 sentinel=1` WARNING + writes the sentinel into the universe file's OI column so LEAN's `DataMappingMode.OPEN_INTEREST` resolver picks the contract. `MarketSyncResult.open_interest` reflects the effective OI written to disk (substituted if applicable). Strategy logic unaffected — the v1 strategy doesn't consume OI numerically; only LEAN's contract-picker does. /MCL now trades cleanly using the api's continuous-mapped back-history.
+
+  +7 tests in `tests/unit/test_bar_sync.py` (`TestModuleConstants::test_default_sentinel_is_1` + 5 new `TestSyncOneMarket` tests covering sentinel substitution + 1 updated test asserting the new default-on behavior; logging contract locked via `structlog.testing.capture_logs`).
+
+**#210 — clientId code default sync to deploy reality:** the saga retrospective documented the drift between code default (`DEFAULT_BAR_SYNC_CLIENT_ID = 2` + dev-guide §1.5 LOCKED bar_sync=2) and deploy (`API_BAR_SYNC_CLIENT_ID=3` env override). Operator-approved option (a): sync code/docs to deploy reality. No production behavior change — bar_sync was already shipping at clientId=3 via the env override; this PR makes the code default match. Reserve range updated `3-7` → `4-7` (clientId=2 reserved for the order-worker's parallel deploy override). `services/api/config.py::bar_sync_client_id default=2 → 3` also updated for consistency.
+
+  **Parallel order-worker drift flagged for operator (NOT addressed in #210):** VPS `deploy/.env` also overrides `API_IBKR_CLIENT_ID=2`, but `services/execution/ibkr_adapter.py::DEFAULT_CLIENT_ID = 1` remains the locked code default. Aligning that would touch `services/execution/**` (forbidden whitelist + `risk-review-approved` required). Inline notes added to dev-guide §1.5 + PR #210 body pointing at the 3 options (align default to 2 / remove override / leave as-is).
+
+**#211 — P2 alert seam for partial cycle + sentinel substitution:** the saga retrospective named "alert if `bar_sync_cycle_completed` shows `successful_count < 11` for two consecutive cycles" + "detect OI=0 with other ticks populated" as follow-ups. Both land here as the SEAM (descriptor builders + counters + hook parameter); the api lifespan wiring that translates descriptors into alerts row INSERTs + Discord fan-out is deferred to a separate follow-up PR (mirrors the recon-side `_build_alert_dispatch_hook` pattern).
+
+  Two alert flavors, both at P2 (`#alerts` channel only) + threshold ≥ 2 consecutive cycles (avoids flap noise):
+
+    1. **Partial cycle failure** — any market in `cycle_result.failed_markets`. Category: `data_quality_reject`.
+    2. **OI sentinel substitution** — any market had `open_interest_was_sentinel=True`. Category: `data_quality_quarantine`. Surfaces /MCL's persistent entitlement gap.
+
+  Both categories reuse existing alembic 0004 `alert_category` enum values — no new Postgres enum value, no alembic migration. New `MarketSyncResult.open_interest_was_sentinel: bool = False` field added (backward-compat) so the sentinel alert can detect the pattern. `BarSyncWorker._consecutive_failure_count` + `_consecutive_sentinel_count` state tracks the counters; clean cycles reset to 0. New `_evaluate_alerts` method called in both the connect-failure return path AND the normal cycle completion path. Hook exceptions caught + logged so a Discord outage cannot wedge the cycle. Phase 1 day-1 default (no hook) logs the descriptor via `bar_sync_alert_dropped_no_hook` so the operator can grep manually until the api-lifespan wiring lands.
+
+  +45 tests across 2 files (34 in new `tests/unit/test_bar_sync_alerts.py`; 11 in `tests/unit/test_bar_sync.py` including a new `TestBarSyncWorkerAlertSeam` class).
+
+**Saga follow-up #3 (lean_local backtest) DESCOPED:** running a backtest in the existing lean_local container requires stopping the live process (which would interfere with this evening's 21:00 UTC bar_sync cycle + 21:30 UTC LEAN signal cycle). The backtest path inherits a different handler set from upstream config.json defaults (FakeDataQueue + history-provider) so divergence from live is material. Per the brief's risk note, the existing freshness-log (yesterday's `v1_universe_data_fresh markets_checked=7 fresh_count=7`) + Task 2's sentinel + tonight's live cycle provide sufficient end-to-end validation without disruption.
+
+**Verification post-deploy (api 17:15 UTC 2026-05-21):**
+
+- `bar_sync_worker_spawned ibkr_client_id=3` — code default now matches deploy
+- All 3 long-lived workers spawned cleanly (bar_sync + reconciliation + heartbeat) + alert dispatch hooks constructed
+- No `bar_sync_cycle_firing` yet (next fire: 21:00 UTC tonight = ~3.5h from deploy)
+- /MCL universe file on-disk verification deferred to operator's evening check of `cat /opt/trading/.../future/nymex/universes/mcl/<today>.csv | tail -1` — expected to end with `,1` post-21:00-UTC cycle (was empty trailing comma pre-deploy)
+
+**Total open follow-ups from the original saga entry after this batch:**
+
+- [x] /MCL data-entitlement decision via sentinel substitution (#209)
+- [x] Partial-cycle alert seam (#211; api lifespan wiring still pending)
+- [x] OI sentinel substitution alert seam (#211; api lifespan wiring still pending)
+- [x] clientId allocation code/doc/deploy reconciliation (#210; order-worker drift flagged for operator)
+- [ ] **Operator decision: order-worker `API_IBKR_CLIENT_ID=2` override vs code default `DEFAULT_CLIENT_ID=1`** (touches `services/execution/**` — risk-review-approved required)
+- [ ] **Follow-up PR: api lifespan wiring of `BarSyncAlertDispatchHook`** (translates descriptor → alerts row INSERT + `webhook_pusher.dispatch_alert`; mirrors recon-side `_build_alert_dispatch_hook` pattern; `services/api/**` hot-fix scope)
+- [ ] Multi-expiry universe enumeration (deferred indefinitely; single-expiry + sentinel-OI is operationally sufficient under `future.set_filter(0, 90)` + ContFuture back-history)
+
+---
+
 ### 2026-05-21 — bar_sync OI fetch saga: 3 sequential PRs land real OI for 6/7 futures (PRs #205 + #206 + #207)
 
 - **Trigger:** the first 21:00 UTC v2 bar_sync cycle (2026-05-20) wrote per-day futures universe files with an empty `open_interest` column. LEAN's 21:30 UTC cycle then logged `v1_history_unavailable failed_markets=['/MES', '/MNQ', '/MYM', '/M2K', '/MGC', '/MCL', '/MBT']` and emitted 0 signals because `DataMappingMode.OPEN_INTEREST` resolver scans for `OI > 0` and finds nothing to pick. Synthesis cron's prior-day-rolled file would have worked, but bar_sync overwrites it (it's the file owner now under v2).
