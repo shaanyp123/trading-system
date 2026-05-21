@@ -145,6 +145,32 @@ DEFAULT_BAR_SYNC_CLIENT_ID: Final[int] = 2
 #: columns, equivalent to pre-2026-05-20 sub-pivot behavior).
 DEFAULT_OI_WAIT_SECONDS: Final[float] = 5.0
 
+#: Default sentinel value substituted into a futures universe file's
+#: open-interest column when :func:`fetch_front_month_open_interest`
+#: returns 0 (data-entitlement gap or transient failure). LEAN's
+#: ``DataMappingMode.OPEN_INTEREST`` resolver picks "the contract with
+#: ``OI > 0``"; an empty OI column causes the resolver to skip the
+#: market entirely. The v1 strategy doesn't consume OI numerically —
+#: only LEAN's contract-picker does — so substituting a small
+#: positive sentinel keeps the market tradeable without affecting
+#: strategy logic.
+#:
+#: Operator-approved follow-up (option (c)) to the 2026-05-21 OI saga:
+#: /MCL's paper-account NYMEX delayed feed publishes OI=0.0 (not NaN)
+#: because the entitlement gap returns a 0-sentinel rather than no
+#: tick at all. Without substitution /MCL would remain ``v1_history_
+#: unavailable`` until the operator upgrades the IBKR subscription or
+#: drops the market from the Phase 1 universe. With substitution the
+#: market trades cleanly using the api's continuous-mapped back-history.
+#:
+#: Set the corresponding :attr:`BarSyncConfig.oi_sentinel_when_fetch_failed`
+#: to ``0`` to disable the substitution (preserves pre-2026-05-21
+#: behavior where /MCL's universe file gets an empty OI column).
+#:
+#: See ``Docs/decisions-log.md`` 2026-05-21 entry "bar_sync OI fetch
+#: saga" + the same-day follow-up Task 2 entry.
+SENTINEL_OI_WHEN_FETCH_FAILED: Final[int] = 1
+
 #: IBKR generic-tick ID that triggers ``futuresOpenInterest`` population
 #: on the returned :class:`ib_async.Ticker`. Verified against
 #: ``ib_async/ib.py::reqMktData`` docstring + ``ib_async/wrapper.py``
@@ -345,6 +371,13 @@ class BarSyncConfig:
     #: account has no real-time futures-OI entitlement. Override to 1
     #: if/when a live subscription is acquired.
     oi_market_data_type: int = DEFAULT_OI_MARKET_DATA_TYPE
+    #: Sentinel OI value substituted into the universe file when
+    #: ``fetch_front_month_open_interest`` returns 0 (data-entitlement
+    #: gap or transient failure). Default ``1`` keeps markets with
+    #: published-but-unentitled OI (e.g., /MCL on a paper-tier NYMEX
+    #: subscription) tradeable; set to ``0`` to disable substitution
+    #: and preserve the pre-2026-05-21 empty-OI-column behavior.
+    oi_sentinel_when_fetch_failed: int = SENTINEL_OI_WHEN_FETCH_FAILED
 
 
 # ---------------------------------------------------------------------------
@@ -1197,18 +1230,35 @@ async def sync_one_market(
                 )
             # Fetch the front-month OI snapshot AFTER bars + expiry are
             # resolved. Failure to obtain OI does NOT fail the cycle —
-            # the helper returns 0 on any error, which the bundle writer
-            # treats as "OI unknown" (empty universe-file column +
-            # zero-line OI zip; equivalent to pre-fix behavior). Real
-            # OI > 0 is what unblocks LEAN's DataMappingMode.OPEN_INTEREST
-            # resolver downstream.
-            open_interest = await fetch_front_month_open_interest(
+            # the helper returns 0 on any error. When the helper
+            # returns 0 AND the operator-configured sentinel is
+            # positive, substitute the sentinel so LEAN's
+            # DataMappingMode.OPEN_INTEREST resolver picks the contract
+            # downstream (the v1 strategy doesn't consume OI
+            # numerically; only LEAN's picker does). When the sentinel
+            # is 0 the substitution is disabled and the bundle writer
+            # treats the raw 0 as "OI unknown" (empty universe-file
+            # column + zero-line OI zip; equivalent to pre-2026-05-21
+            # behavior).
+            raw_open_interest = await fetch_front_month_open_interest(
                 ib,
                 market_key,
                 meta=meta,
                 front_month_expiry_yyyymm=front_month,
                 wait_seconds=config.oi_wait_seconds,
             )
+            effective_open_interest = raw_open_interest
+            if raw_open_interest <= 0 and config.oi_sentinel_when_fetch_failed > 0:
+                effective_open_interest = config.oi_sentinel_when_fetch_failed
+                log.warning(
+                    "oi_sentinel_substituted",
+                    op="sync_one_market",
+                    market=market_key,
+                    front_month_expiry=front_month,
+                    reason="fetch_returned_zero",
+                    raw_open_interest=raw_open_interest,
+                    sentinel=effective_open_interest,
+                )
             write_futures_bundle(
                 data_root=config.data_root,
                 ticker=meta.ibkr_symbol,
@@ -1216,7 +1266,7 @@ async def sync_one_market(
                 market_code=meta.lean_market_code,
                 front_month_expiry_yyyymm=front_month,
                 bars=bars,
-                open_interest=open_interest,
+                open_interest=effective_open_interest,
             )
             return MarketSyncResult(
                 market=market_key,
@@ -1225,7 +1275,7 @@ async def sync_one_market(
                 last_session_date=bars[-1].session_date,
                 front_month_expiry=front_month,
                 error=None,
-                open_interest=open_interest,
+                open_interest=effective_open_interest,
             )
     except TimeoutError as exc:
         return MarketSyncResult(
@@ -1540,6 +1590,7 @@ __all__ = [
     "DEFAULT_SYNC_TIME_ET",
     "DEFAULT_TICK_INTERVAL_SECONDS",
     "PHASE1_UNIVERSE_METADATA",
+    "SENTINEL_OI_WHEN_FETCH_FAILED",
     "Bar",
     "BarSyncConfig",
     "BarSyncCycleResult",
