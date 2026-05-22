@@ -536,6 +536,22 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         except Exception as exc:  # noqa: BLE001 -- log + skip; alternative is crash
             self.log(f"v1_history_call_failed market={market_key} exc={exc!r}")
             return None
+
+        # DIAGNOSTIC PROBE (2026-05-22) — distinguish silent-empty paths
+        # (None vs empty DataFrame vs DataFrame-that-parses-to-empty). The
+        # 2026-05-22 00:55 UTC invasive cache-hypothesis test disproved
+        # the PR #218 framing; this probe locates which silent-empty branch
+        # fires for futures vs the working ETFs. Hot-fix scope (lean/**)
+        # per dev-guide §2.3; pure observability — never mutates state
+        # or changes control flow. See Docs/decisions-log.md 2026-05-22
+        # entry "Invasive cache-hypothesis test DISPROVES..." Priority 1.
+        self._log_history_probe(
+            market_key=market_key,
+            symbol=symbol,
+            history=history,
+            requested_count=count,
+        )
+
         if history is None:
             return None
 
@@ -546,6 +562,21 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
             return None
 
         if not bars:
+            # DIAGNOSTIC (2026-05-22) — fires only when LEAN returned a
+            # non-empty history that the parser dropped to []. Pairs with
+            # `v1_history_probe` above to localize parser-side bugs vs
+            # LEAN-side data-layer empties.
+            try:
+                hist_len: object = len(history)
+            except (TypeError, AttributeError):
+                try:
+                    hist_len = history.shape[0]  # type: ignore[attr-defined]
+                except Exception:  # noqa: BLE001 -- diagnostic only
+                    hist_len = "?"
+            self.log(
+                f"v1_history_parsed_empty market={market_key} "
+                f"hist_type={type(history).__name__} hist_len={hist_len}"
+            )
             return None
         # BarSeries `__post_init__` enforces strictly-increasing session_date.
         # LEAN returns bars in chronological order but defend against accidental
@@ -562,6 +593,85 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         except ValueError as exc:
             self.log(f"v1_barseries_invalid market={market_key} exc={exc!r}")
             return None
+
+    def _log_history_probe(
+        self,
+        *,
+        market_key: str,
+        symbol: object,
+        history: object,
+        requested_count: int,
+    ) -> None:
+        """Best-effort probe of ``self.history(...)`` return shape.
+
+        Emits a structured ``v1_history_probe`` log line capturing the
+        return type, length, column names, and index sample so the
+        operator can distinguish:
+
+        - ``hist_type=None`` — LEAN returned None outright (rare; pre-parse skip)
+        - ``hist_type=DataFrame hist_len=0`` — LEAN returned empty DataFrame
+          (most likely path for futures whose continuous-contract resolver
+          can't pick a front-month from the sentinel-only map_files; see
+          2026-05-22 invasive-test entry in decisions-log)
+        - ``hist_type=DataFrame hist_len>0`` — populated DataFrame, parser
+          will determine downstream outcome
+        - ``hist_type=<other>`` — non-DataFrame, non-None return (legacy
+          iterable-of-TradeBar path or unexpected shape)
+
+        Never raises. Diagnostic failures fall back to a
+        ``v1_history_probe_failed`` log line; the main cycle continues.
+        Added 2026-05-22 per Priority 1 of the cache-hypothesis-DISPROVED
+        decisions-log entry. Hot-fix scope (``lean/**``) per dev-guide
+        §2.3; pure observability — no state mutation, no control-flow
+        impact. Removable in a follow-up once the root-cause fix lands.
+        """
+        try:
+            if history is None:
+                hist_type = "None"
+                hist_len: object = 0
+                hist_cols: object = "n/a"
+                hist_idx: object = "n/a"
+            else:
+                hist_type = type(history).__name__
+                hist_len = "?"
+                try:
+                    hist_len = len(history)
+                except (TypeError, AttributeError):
+                    try:
+                        hist_len = history.shape[0]  # type: ignore[attr-defined]
+                    except Exception:  # noqa: BLE001 -- diagnostic only
+                        pass
+                hist_cols = "?"
+                try:
+                    cols_attr = getattr(history, "columns", None)
+                    if cols_attr is not None:
+                        hist_cols = list(cols_attr)
+                except Exception:  # noqa: BLE001 -- diagnostic only
+                    pass
+                hist_idx = "?"
+                try:
+                    idx_attr = getattr(history, "index", None)
+                    if (
+                        idx_attr is not None
+                        and isinstance(hist_len, int)
+                        and hist_len > 0
+                    ):
+                        first = idx_attr[0]
+                        last = idx_attr[-1] if hist_len > 1 else first
+                        hist_idx = f"first={first!r} last={last!r}"
+                except Exception:  # noqa: BLE001 -- diagnostic only
+                    pass
+            self.log(
+                f"v1_history_probe market={market_key} symbol={symbol!r} "
+                f"requested_count={requested_count} hist_type={hist_type} "
+                f"hist_len={hist_len} hist_cols={hist_cols} "
+                f"hist_idx={hist_idx}"
+            )
+        except Exception as exc:  # noqa: BLE001 -- never raise from probe
+            self.log(
+                f"v1_history_probe_failed market={market_key} "
+                f"requested_count={requested_count} exc={exc!r}"
+            )
 
     def _snapshot_position(self, *, market_key: str, symbol: object) -> Position:
         """Snapshot `self.portfolio[symbol]` to the strategy's `Position` dataclass.
