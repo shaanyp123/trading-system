@@ -17,6 +17,81 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ## Entries
 
+### 2026-05-22 — bar_sync map_file synthesis lands (resolver-unblocking fix for futures `self.history()`)
+
+**Trigger:** the "Diagnostic probe (PR #220) CONFIRMS root cause" entry below identified LEAN's continuous-contract resolver as the most-supported hypothesis for the 0/7 futures + 4/4 ETFs split in `v1_history_probe`. The "Tomorrow's fix path (concrete)" subsection of that entry described what this PR implements: a new `services/data/map_file_synthesis.py` module + a wiring hook in `BarSyncWorker.run_cycle`.
+
+**What landed:**
+
+1. **New module `services/data/map_file_synthesis.py`** (382 lines, pure-policy):
+   - `UniverseSession` + `FuturesRollTransition` + `MapFileSynthesisResult` frozen dataclasses
+   - `parse_universe_file(path)` reads bar_sync's on-disk `<YYYYMMDD>.csv` and returns the front-month `expiry` (YYYYMM)
+   - `iter_universe_sessions(universe_dir)` walks the dir in ascending session-date order
+   - `detect_real_rolls(sessions, *, persistence_days=15)` is the noise filter: groups consecutive same-expiry days into "runs", drops runs shorter than `persistence_days`, returns transitions between surviving stable runs. Skips same-expiry transitions (the bracket-of-filtered-noise case caught in the first test pass)
+   - `build_futures_map_file_with_rolls(...)` renders the LEAN-format content
+   - `synthesize_futures_map_file(...)` is the top-level orchestrator: reads → renders → writes atomically via tmp+rename + content-equal short-circuit (idempotent — preserves mtime on no-op cycles)
+
+2. **`BarSyncConfig` extensions** in `services/data/bar_sync.py`:
+   - `map_file_persistence_days: int = 15` (operator-recommended default)
+   - `enable_map_file_synthesis: bool = True` (default-on)
+
+3. **`BarSyncWorker._synthesize_futures_map_files()`** helper + 2 call sites in `run_cycle`: after the per-market loop (main flow) AND on the connect-failure path. Both paths fire before `_evaluate_alerts`. Per-ticker exceptions caught + logged as `map_file_synthesis_failed`; the cycle never aborts on a synthesis failure.
+
+4. **Tests** — 65 new in `tests/unit/test_map_file_synthesis.py` covering: locked constants, frozen-dataclass shape, filename + body parsers, sorted iteration + invalid-file skip, the full roll-detection algorithm with the operator-described /MES flip-flop pattern (collapses 30 stable + 14 flip-flops + 30 stable → 1 roll), persistence_days=0 raises, content rendering (empty + single + multi-roll + lowercase normalization + mode override + trailing-newline), the synthesizer end-to-end via `tmp_path`, idempotency (byte-identical bytes + content_changed flag + mtime preserved on no-op + no tmp leftovers + atomic replace when content does change), and cross-platform-filesystem defense (lowercase ticker dirs + macOS `._<name>.csv` shadow files). 5 new in `tests/unit/test_bar_sync.py` for the config knobs + worker wiring (synthesis-after-success + skipped-when-disabled + runs-on-connect-failure-path + skips-etfs + per-ticker-failure-doesnt-abort-cycle).
+
+5. **Decisions-log** — this entry.
+
+**Wire format chosen — and the explicit trade-off:**
+
+The map_file rows are rendered as `YYYYMMDD,<perm_lower>,<EXCHANGE>[,<mode>]` — the bare lowercased permtick in the `MappedSymbol` column. LEAN's reference data (`QuantConnect/Lean/Data/future/cme/map_files/es.csv` at HEAD) uses the SID-hash form `es uik2f7cj4v0h` per the `SecurityIdentifier.ToString()` convention; replicating that requires a Python port of LEAN's base36-encoded bit-packed `(date, market, securityType)` properties plus the per-exchange expiry-date rules (third-Friday for index futures, etc.). I deliberately chose NOT to compute the SID hash for this PR because:
+
+- LEAN's `FutureUniverse.Reader` reads the actual contract month from the per-day universe file (`stream.GetDateTime(DateFormat.YearMonth)`) and computes the Symbol via `Symbol.CreateFuture(symbol, market, expiry)` independently of the map_file's MappedSymbol. The data-file path resolution works without the SID hash.
+- The map_file's `MappedSymbol` only drives `Config.MappedSymbol` updates + `SymbolChangedEvent`-style observable side effects, which the v1 strategy doesn't subscribe to.
+- The fix's load-bearing claim is `MapFile.Count > 0`. Our output has Count = inception + roll boundaries + end sentinel (≥ 2; typically 5-10 for /MES over the universe-data window). If the resolver simply needs Count > 0 to unblock, this is sufficient.
+- The probe in `lean/v1_strategy.py::_log_history_probe` is still armed. Tomorrow's (2026-05-23) 21:30 UTC cycle will tell us whether the bare-permtick form is enough; if it isn't, the SID-hash form is the next follow-up PR (the synthesizer's `build_futures_map_file_with_rolls` already takes a `data_mapping_mode_int` knob — swapping MappedSymbol generation is a localized change).
+
+**Idempotency contract (locked):**
+
+`synthesize_futures_map_file` reads the existing map_file content (if any) BEFORE writing. If the freshly-rendered content matches byte-for-byte, the write is skipped entirely + `MapFileSynthesisResult.content_changed=False` is returned. The mtime-preservation test in `TestIdempotency::test_mtime_preserved_on_no_op_cycle` locks this — sleep 50ms between two no-op syntheses, assert mtime unchanged. Atomic writes (when content differs) go via `tempfile.NamedTemporaryFile` in the same directory + `os.replace` so a partial write can never produce a torn map_file LEAN would parse mid-rewrite.
+
+**Pre-flight check before deploy:**
+
+- `make lint` ✅ (4 files reformatted on first pass + all clean now; 7994 files already formatted at the repo level)
+- `make typecheck` ✅ (151 source files; 0 errors)
+- `make test-unit` ✅ (1961 tests pass in 117.73s; 65 + 5 = 70 net new tests for this PR)
+- `services/data/**` is on the §2.3 hot-fix whitelist; no `risk-review-approved` label required
+- Pure additive change at the bar_sync wiring; no risk to the OI saga path or alert-hook path that landed earlier this week
+- 0 alembic migrations
+- 0 cost (file-IO only)
+
+**Deploy ceremony (after merge):**
+
+1. SSH to VPS: `ssh root@178.156.239.84`
+2. `cd /opt/trading && git pull --ff-only`
+3. `docker compose --env-file deploy/.env build api` (bar_sync runs inside api)
+4. `docker compose --env-file deploy/.env up -d --force-recreate api`
+5. Watch api logs for `bar_sync_worker_spawned`. The first cycle at 21:00 UTC will (a) write today's bars (as before), (b) emit one `futures_map_file_synthesized` log per futures market with `roll_count` + `sessions_scanned` + `content_changed=true` (first ever populated map_files).
+6. Read one of the freshly-written map_files: `docker compose exec lean_local cat /Lean/Data/future/cme/map_files/mes.csv`. Expect inception + N roll rows + end sentinel with `,CME,2`.
+7. The 21:10 UTC systemd timer fires `lean_local` restart (already armed; "operational hygiene"). The 21:30 UTC LEAN cycle reads the new map_files. Probe output expected: `v1_history_probe market=/MES hist_type=DataFrame hist_len=205 hist_cols=['close','high','low','open','volume']` (mirroring ETFs). If yes → primary fix succeeded; PR #220's probe retirement is the next follow-up PR.
+8. If `hist_len` is still 0: the bare-permtick MappedSymbol wasn't enough. Next PR computes the SID hash form. Don't deploy a guess; falsify via the probe.
+
+**Open follow-ups:**
+
+1. **Validation cycle 2026-05-23 21:30 UTC.** Probe output is the empirical test of this fix.
+2. **PR #220 probe retirement.** Land after the validation cycle confirms the fix. Removes `_log_history_probe` + its call site.
+3. **/M2K bar_sync investigation.** Surfaced 2026-05-22 21:00 UTC as a 2nd-consecutive-day failure separate from the LEAN-side resolver issue. Pre-existing. Independent PR.
+4. **SID-hash fallback.** Only if (1) shows `hist_len=0` still. The synthesizer's API is extensible — `MappedSymbol` rendering is one helper away from the SID hash form.
+
+**Cost / scope impact:**
+
+- ~470 net lines (382 module + ~70 wiring + ~13 line bar_sync config knob comments)
+- 70 new tests (65 + 5)
+- 0 alembic migrations
+- 0 ongoing cost
+- Hot-fix whitelist (`services/data/**` + `tests/**`); no `risk-review-approved` label
+
+---
+
 ### 2026-05-22 — Diagnostic probe (PR #220) CONFIRMS root cause: LEAN's continuous-contract resolver returns empty DataFrame for futures
 
 **Trigger:** PR #220's diagnostic probe deployed at 17:46 UTC into `_build_bar_series` was designed to land actionable data at tonight's natural 21:30 UTC cycle and disambiguate the four remaining hypotheses for why futures `self.history()` returns empty. This entry records what the probe surfaced + the now-narrowed fix path.
