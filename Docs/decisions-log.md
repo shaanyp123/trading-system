@@ -17,32 +17,117 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ## Entries
 
-<!--
-  TEMPLATE PRE-STAGED 2026-05-21 evening — for the operator to fill in
-  after observing the 21:00 UTC bar_sync cycle + 21:30 UTC LEAN cycle
-  outcomes. Replace each TODO marker with the observed value. Delete
-  this HTML comment block once filled in. Remove the whole entry if
-  the operator decides not to record this debrief.
--->
+### 2026-05-22 — Invasive cache-hypothesis test DISPROVES lean_local-restart fix; /MCL OI saga itself confirmed working
 
-### 2026-05-22 — 2026-05-21 bar_sync OI saga first observed cycle (TODO: outcome)
+**Trigger:** the 21:30 UTC LEAN cycle on 2026-05-21 emitted ZERO futures signals + logged `v1_history_unavailable session_date=2026-05-21 failed_markets=[/MES, /MNQ, /MYM, /M2K, /MGC, /MCL, /MBT]` for all 7 futures, even though bar_sync's 21:00 UTC cycle landed real OHLCV+OI for 6/7 + sentinel=1 for /MCL (per the "lean_local data-layer cache fix" entry below). The 4 ETFs cycled (4 rejections; normal "no signal" outcome). Operator authorized an invasive 30-min validation test before tomorrow's 21:30 UTC cycle: "trust budget for 'tomorrow's cycle will prove it' is exhausted — going invasive tonight to KNOW vs HOPE."
 
-- **Tonight's 21:00 UTC bar_sync cycle outcome:** TODO_observed_state
-  - /MCL universe file ended with: TODO `,1` (sentinel) | `,<int>` (real OI) | `,` (empty — should NOT happen post-PR-#209)
-  - Sentinel substitution log fired for: TODO_list_of_markets
-  - failed_count: TODO
-  - duration_seconds: TODO
-- **21:30 UTC LEAN cycle outcome:** TODO_observed_state
-  - markets_checked: TODO; fresh_count: TODO
-  - signals_emitted_count: TODO
-  - v1_history_unavailable for: TODO_list_of_markets
-- **Hypothesis confirmed/disproved:** TODO whether /MCL's OI publisher is time-of-day-dependent or entitlement-gap
+**Test design (executed 2026-05-22 00:30-00:58 UTC = ET 20:30-20:58 May 21):**
+
+A one-shot `self.schedule.on(date_rules.on(2026, 5, 21), time_rules.at(20, 55), self.on_daily_signal_cycle)` block added to `lean/v1_strategy.py` after the existing 17:30 ET schedule (additive only; +10 lines; clean revert post-test). lean_local was force-recreated at 00:30:55 UTC, booted clean at 00:31:01 UTC, scheduled rule registered. Files on disk verified BEFORE boot:
+- All 7 futures daily zips with today's 2026-05-21 row (6 mtime 22:14-22:15 UTC from the 22:14 api-restart catchup; /M2K mtime 21:00 UTC from original 21:00 UTC cycle which the catchup failed to overwrite)
+- 6 of 7 universe files with both 20260521.csv (today) + 20260522.csv (partial overnight) at mtime 22:14-22:15 UTC; /M2K with only 20260520 + 20260521 (21:00 UTC mtime)
+- All 7 map_files present at `/Lean/Data/future/<exchange>/map_files/<ticker>.csv` with sentinel format `18991230,<ticker>` + `20501231,<ticker>,<EXCHANGE>`
+- LEAN boot logged `v1_universe_data_fresh markets_checked=7 fresh_count=7` ✓
+
+**Observed test result at 00:55:01 UTC = ET 20:55:01:**
+
+```
+20260522 00:55:02.454 TRACE:: Log: 2026-05-21 20:55:01 v1_history_unavailable session_date=2026-05-21 failed_markets=['/MES', '/MNQ', '/MYM', '/M2K', '/MGC', '/MCL', '/MBT']
+20260522 00:55:02.454 TRACE:: Log: 2026-05-21 20:55:01 v1_signals_generated session_date=2026-05-21 signals_emitted_count=0 rejections_count=4
+20260522 00:55:02.454 TRACE:: Log: 2026-05-21 20:55:01 lean_signal_post_succeeded status=202 event_type=lean_cycle_heartbeat
+```
+
+**IDENTICAL FAILURE PATTERN.** 7 futures unavailable, 4 ETFs cycled, 0 signals emitted, 4 rejections. No `v1_history_call_failed` / `v1_history_parse_failed` / `v1_barseries_invalid` log lines fired — meaning `self.history(symbol, count, Resolution.DAILY)` either returned `None` or returned an empty DataFrame that `parse_history_to_bars` silently converted to an empty list. The strategy never reached the per-market policy code for the 7 futures.
+
+**Hypothesis DISPROVED.** The "lean_local data-layer cache fix" entry below claimed: "LEAN's `SubscriptionDataReaderHistoryProvider` caches the on-disk data layer **at container boot** + doesn't re-scan mid-session." Tonight's test directly falsifies this — lean_local booted at 00:31:01 UTC with all 7 futures' files ALREADY on disk (mtime 21:00 UTC and 22:14-22:15 UTC, all before boot), and `self.history()` for those 7 symbols STILL returned empty 24 min later. The cache-at-boot hypothesis cannot explain this state. The data-layer-cache framing was wrong; the actual bug is elsewhere.
+
+**The systemd timer fix is therefore ineffective.** The 21:10 UTC daily-restart timer (deployed in the prior entry, still armed on the VPS as of 00:58 UTC) was designed to ensure lean_local boots AFTER bar_sync writes today's files. Tonight's test proves that booting AFTER the writes doesn't fix the bug. **Tomorrow's 2026-05-22 21:30 UTC cycle will fail the same way unless we find + fix the real root cause first.**
+
+**Diagnostic evidence pointing to next investigation:**
+
+LEAN's boot logs (00:31:02 UTC) showed a structural difference between futures and ETFs at the MapFile loader:
+
+- ETF subscriptions: `LiveMappingEventProvider(TLT,#0,TLT,Daily,TradeBar,...): new tradable date 20260521. New MapFile: True. MapFile.Count Old: 2 New: 2`
+- Future subscriptions: `LiveMappingEventProvider(//MES,#0,//MES,Daily,QuoteBar,Quote,Raw,OpenInterest): new tradable date 20260521. New MapFile: True. MapFile.Count Old: 0 New: 0`
+
+ETFs show `Count: 2` (matching the 2-row TLT map_file `19980102,tlt,P` + `20501231,tlt,P`). Futures show `Count: 0` despite their map_files also having 2 rows. The futures map_file rows differ in structure: row 1 is `18991230,mes` (no exchange column), row 2 is `20501231,mes,CME` (with exchange column). LEAN may be rejecting the malformed row 1 + treating the sentinel-only row 2 as "no actual roll dates defined" → effective Count = 0 valid mappings. With Count=0, the continuous-contract resolver may be unable to pick a front-month for `self.history()` calls.
+
+Other corroborating evidence:
+- Daily zip data depth: 174 trading days from 2025-09-15 → today. Strategy's `min_required_bars = max(60, 200, 21, ...)` = 200 (MA_SLOW_DAYS dominates). Strategy NEEDS 200 bars; data has 174 — but per `strategies/v1_trend_following/strategy.py:196` insufficient-bars would emit `RejectionReason.INSUFFICIENT_BAR_HISTORY` (a rejection), not `v1_history_unavailable`. So this is a corroborating concern but NOT the proximate cause of the silent-empty `self.history()` return.
+- LEAN subscription Start: `6/27/2025 5:00:00 AM` for all 7 futures (universe + data subscriptions). Reasonable window.
+- All 7 futures subscribed with `Daily,QuoteBar,Quote,Raw,OpenInterest` (data_normalization_mode=RAW per the Path 4 design from PR #131).
+
+**Most likely root cause (provisional, requires more diagnostic data):**
+
+LEAN's `self.history()` for a continuous-contract symbol (`/MES`, etc.) requires the map_file to have at least one valid roll mapping. Our map_files are sentinel-only (no actual roll dates between 1899 and 2050), so the continuous resolver cannot identify which per-expiry CSV (`mes_trade_<expiry>.csv`) to load. Result: empty history returned silently, strategy's `_build_bar_series` returns None, market goes into `failed_markets`.
+
+This is consistent with the Path 4 history (CLAUDE.md file index): bar_sync writes per-expiry trade+OI zips + per-day universe CSVs. Map_files were created with sentinel-only entries by the seed scripts (now deleted; see CLAUDE.md "DELETED 2026-05-20"). The Option C pivot retained this structure assuming LEAN's continuous resolver would use the universe files. But it appears LEAN may also require the map_file to be populated with actual roll dates before continuous-contract `self.history()` will return data.
+
+**Counter-evidence to consider:**
+
+The 21:30 UTC cycle log says `v1_universe_data_fresh markets_checked=7 fresh_count=7` — but that's a separate code path (`_log_universe_freshness`) that walks the universe dir at startup, NOT a measure of whether `self.history()` will work. Counts files; doesn't probe LEAN's runtime data layer.
+
+Also: have we EVER seen LEAN successfully return futures `self.history()` data on this VPS? CLAUDE.md drill-5 retrospective references the 2026-05-15 successful TLT round-trip (an ETF). The 2026-05-13 Path 4 deploy installed the futures seed but no per-cycle empirical evidence that `self.history()` worked for futures. **It is possible the futures path has been silently broken since Path 4 landed**, with the broken-ness only becoming visible now because Phase 1 universe is fully seeded + tested.
+
+**Action items (carried into 2026-05-22 morning):**
+
+1. **PRIORITY 1.** Add diagnostic logging to `lean/v1_strategy.py::_build_bar_series` that distinguishes the silent-empty paths: log when `history is None`, log when `parse_history_to_bars(history)` returns empty list with `len(history) > 0`, log when both return empty. Restart lean_local; trigger one diagnostic cycle (similar invasive test pattern); read which silent-empty path fires for futures.
+
+2. **PRIORITY 2.** Compare a working ETF's `self.history()` return shape vs a failing future's. Add probe: `history_returned_count = len(history) if hasattr(history, '__len__') else 'unknown'`. This isolates whether LEAN is returning empty DataFrame OR None OR malformed structure for futures.
+
+3. **PRIORITY 3.** If map_file structure is confirmed as the issue: investigate whether bar_sync should be writing per-expiry roll dates into the map_files. The map_file for /MES should look something like `20260321,mes,mar26,CME` + `20260620,mes,jun26,CME` + ... with one row per quarterly roll. The current sentinel-only structure may need replacement.
+
+4. **PRIORITY 4.** Confirm whether LEAN's `add_future(ticker, market=Market.CME)` returns a `ContinuousContract` symbol that REQUIRES per-roll map_file entries, vs whether passing a different argument shape (e.g., `add_future_contract(...)` for a specific expiry) would work as a fallback for Phase 1.
+
+5. **NICE-TO-HAVE.** The systemd timer's 21:10 UTC daily restart can stay armed for now — it doesn't hurt and provides defense-in-depth if the future bug fix has a cache-related component. But it should not be considered the fix; recategorize it as "operational hygiene" rather than "Issue D resolution."
+
+6. **NICE-TO-HAVE.** Re-survey LEAN GitHub issues + QC forums for `v1_history_unavailable` equivalents — searches for "Continuous contract history empty" / "FuturesChain map_file count 0" / "SubscriptionDataReaderHistoryProvider futures empty" likely surface prior community findings. Reference: prior LEAN issues sometimes match the symptom; the fix is often map_file population OR factor_file presence.
+
+**State preserved at session end (2026-05-22 00:58 UTC):**
+
+- `lean/v1_strategy.py` restored to git HEAD `985f87f` (no diff). Verified `grep -c "invasive\|TEMPORARY" lean/v1_strategy.py` returns 0.
+- lean_local rebuilt + force-recreated at 00:57:52 UTC; clean boot at 00:57:59 UTC; `v1_strategy initialized live_mode=True` + `v1_universe_data_fresh markets_checked=7 fresh_count=7`.
+- 8/8 containers healthy.
+- systemd timer `lean-local-daily-restart.timer` still armed for Fri 2026-05-22 21:10:00 UTC (20h from session end). Intentionally NOT disabled — but no longer expected to be the fix.
+- Test side effects: ZERO `signal_emitted` events POSTed to api during the test cycle (all 7 futures failed at history; 4 ETFs rejected without emitting). One `lean_cycle_heartbeat` event POSTed at 00:55:01 UTC — normal observability, not a pending signal. No `signals` table rows created; no operator cleanup needed in the morning beyond reading this entry.
+
+**Concrete next-session work (2026-05-22 morning, BEFORE 21:30 UTC):**
+
+The operator should pick up Priority 1 + 2 above. The diagnostic-logging PR can land + deploy via a single rebuild cycle (~10 min); the diagnostic test takes ~30 min; the actual fix depends on what the diagnostics surface. If map_file population is required, that's a bar_sync extension (writes one row per quarterly roll into `/Lean/Data/future/<exchange>/map_files/<ticker>.csv` whenever it sees a new front-month contract). If the fix is something else, follow the trail.
+
+**Cost / scope impact:**
+
+- 0 production-affecting code changes tonight (test added + reverted in same session)
+- 0 alembic migrations
+- 0 cost
+- Trust budget DEBT: the prior entry's "tomorrow's verification" cadence was the FIRST fix that needed retrospective falsification; this entry's "investigate root cause tomorrow morning" is the SECOND consecutive deferred-validation, but it has materially different epistemic standing — we now know the cache hypothesis is wrong and have a concrete next hypothesis (map_file structure) + a diagnostic plan to confirm or rule it out within ~30 min of next-session start.
+
+---
+
+### 2026-05-22 — 2026-05-21 bar_sync OI saga first observed cycle (PARTIAL: cycle observable evidence good; downstream LEAN consumption broken)
+
+This entry was pre-staged 2026-05-21 evening for tonight's observed-cycle debrief. The cycle itself behaved as designed; the downstream LEAN cycle did not (see the cache-hypothesis-DISPROVED entry above).
+
+- **2026-05-21 21:00 UTC bar_sync cycle outcome:** per the brief, 11/11 markets successful in 8.75s (the original cycle; the 22:14 UTC api-restart catchup cycle re-fired and was 10/11 successful with /M2K failing in 64.54s). For purposes of this entry, the relevant observable is what's on disk at end of day:
+  - /MCL universe file ended with: `,1` (sentinel — PR #209 working as designed; OHLCV today=99/102.64/95.76/96.35, OI=1)
+  - Sentinel substitution log fired for: /MCL (per the 22:14 UTC catchup cycle logs — fired again on the re-write)
+  - failed_count: 0 (original 21:00 UTC); 1 = /M2K (22:14 catchup re-fire; /M2K's universe file kept the 21:00 UTC content + mtime since the catchup didn't overwrite a failed market)
+  - duration_seconds: 8.75 (original); 64.54 (catchup)
+- **2026-05-21 21:30 UTC LEAN cycle outcome:** complete failure for futures
+  - markets_checked: 7; fresh_count: 7 (boot-time freshness check passed; lean_local booted at 16:26 UTC)
+  - signals_emitted_count: 0
+  - v1_history_unavailable for: [/MES, /MNQ, /MYM, /M2K, /MGC, /MCL, /MBT] (all 7 futures)
+- **Hypothesis confirmed/disproved:**
+  - /MCL OI publisher entitlement gap: CONFIRMED via sentinel substitution working (PR #209 + #210 + #211 saga closed) — this was tonight's surface-level fix and it DID land what it claimed.
+  - lean_local data-layer cache (the systemd-timer entry below): DISPROVED in the invasive test entry above.
 - **Action items based on observed outcome:**
-  - TODO
+  - All carried forward to the invasive-test entry above (Priorities 1-6). The bar_sync side is healthy; the LEAN consumption side needs a different fix path than the systemd timer provides.
 
 ---
 
 ### 2026-05-21 — lean_local data-layer cache fix: systemd timer for daily 21:10 UTC restart (operator-authorized over-brief override)
+
+> **🔴 FALSIFIED 2026-05-22 00:55 UTC** by the invasive cache-hypothesis test (see entry above). The root-cause framing in this entry — "LEAN's `SubscriptionDataReaderHistoryProvider` caches the on-disk data layer at container boot" — is WRONG. The systemd timer deployed below remains armed but is no longer expected to fix tomorrow's 21:30 UTC cycle. Real root cause under investigation; primary suspect is the sentinel-only structure of `/Lean/Data/future/<exchange>/map_files/<ticker>.csv` (LEAN reports `MapFile.Count Old: 0 New: 0` for futures vs `Count: 2` for working ETFs). See the entry above for diagnostic plan + Priorities 1-6.
 
 **Trigger:** the first 21:30 UTC LEAN signal cycle after this morning's PR #211 deploy emitted **0 futures signals** + logged `v1_history_unavailable session_date=2026-05-21 failed_markets=['/MES', '/MNQ', '/MYM', '/M2K', '/MGC', '/MCL', '/MBT']` for ALL 7 futures, despite bar_sync's 21:00 UTC cycle landing real OHLCV+OI for 6/7 + sentinel=1 for /MCL (PR #209 confirmed working). The 4 ETFs cycled (4 rejections), but futures couldn't resolve.
 
