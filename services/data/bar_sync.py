@@ -397,6 +397,20 @@ class BarSyncConfig:
     #: subscription) tradeable; set to ``0`` to disable substitution
     #: and preserve the pre-2026-05-21 empty-OI-column behavior.
     oi_sentinel_when_fetch_failed: int = SENTINEL_OI_WHEN_FETCH_FAILED
+    #: Minimum consecutive sessions a new front-month expiry must
+    #: persist before the map_file synthesizer counts it as a genuine
+    #: roll boundary. Default 15 (≈3 weeks; operator-recommended in
+    #: the 2026-05-22 brief). Lower values admit more noise; higher
+    #: values risk missing real rolls during illiquid stretches.
+    map_file_persistence_days: int = 15
+    #: When True, ``BarSyncWorker.run_cycle`` calls
+    #: :func:`services.data.map_file_synthesis.synthesize_futures_map_file`
+    #: for each futures market after the per-market sync loop. Set False
+    #: in tests that only exercise the sync path; default True per the
+    #: 2026-05-22 decisions-log entry "Diagnostic probe (PR #220)
+    #: CONFIRMS root cause: LEAN's continuous-contract resolver returns
+    #: empty DataFrame for futures".
+    enable_map_file_synthesis: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -1523,6 +1537,14 @@ class BarSyncWorker:
                     successful_markets=tuple(successful),
                     failed_markets=tuple(failed),
                 )
+                if self._config.enable_map_file_synthesis:
+                    # Even on connect failure: the on-disk universe files
+                    # from prior cycles are still valid inputs to the
+                    # synthesizer. Idempotent — no-op if content matches
+                    # what we last wrote. Lets the operator land the PR
+                    # and have map_files populated immediately without
+                    # waiting for a subsequent successful cycle.
+                    self._synthesize_futures_map_files()
                 await self._evaluate_alerts(connect_failed_result)
                 return connect_failed_result
             # Iterate markets serially — IBKR rate-limits aggressive
@@ -1592,8 +1614,58 @@ class BarSyncWorker:
             ),
             failed_markets=[r.market for r in failed],
         )
+        if self._config.enable_map_file_synthesis:
+            # Map_file synthesis runs after the per-market loop completes
+            # + before alert evaluation. See 2026-05-22 decisions-log
+            # entry "Diagnostic probe (PR #220) CONFIRMS root cause" for
+            # the fix's role: without populated map_files LEAN's
+            # continuous-contract resolver returns empty DataFrames for
+            # `self.history()` on every futures symbol.
+            self._synthesize_futures_map_files()
         await self._evaluate_alerts(cycle_result)
         return cycle_result
+
+    def _synthesize_futures_map_files(self) -> None:
+        """Synthesize LEAN futures map_files from on-disk universe history.
+
+        Walks the futures markets in :attr:`BarSyncConfig.markets` and
+        calls :func:`services.data.map_file_synthesis.synthesize_futures_map_file`
+        for each. Each call is wrapped in its own try/except so a
+        single ticker's I/O failure doesn't abort the loop; the
+        observability log line + a ``map_file_synthesis_failed`` event
+        on exception suffice for the operator to grep.
+
+        Triggered once per cycle AFTER the per-market sync loop
+        (regardless of partial failures — the universe files from
+        prior successful cycles remain on disk and are valid input).
+        See the 2026-05-22 decisions-log entry "Diagnostic probe (PR
+        #220) CONFIRMS root cause" for why this exists.
+        """
+        # Local import to break a circular dependency at module-import time —
+        # :mod:`map_file_synthesis` imports nothing from this module today,
+        # but the import-time order matters when api lifespan wires both
+        # via :class:`BarSyncWorker`. Following the same pattern as the
+        # ``bar_sync_alerts`` import in ``__init__``.
+        from services.data import map_file_synthesis as _mfs
+
+        for market_key, meta in self._config.markets.items():
+            if meta.kind != "futures":
+                continue
+            try:
+                _mfs.synthesize_futures_map_file(
+                    data_root=self._config.data_root,
+                    ticker=meta.ibkr_symbol,
+                    market_dir=meta.market_dir,
+                    market_code=meta.lean_market_code,
+                    persistence_days=self._config.map_file_persistence_days,
+                )
+            except Exception:
+                self._log.exception(
+                    "map_file_synthesis_failed",
+                    market=market_key,
+                    ticker=meta.ibkr_symbol,
+                    market_dir=meta.market_dir,
+                )
 
     async def _evaluate_alerts(self, cycle_result: BarSyncCycleResult) -> None:
         """Update consecutive-cycle counters + dispatch P2 alerts at threshold.

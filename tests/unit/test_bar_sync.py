@@ -2354,6 +2354,231 @@ class TestBarSyncWorkerCycle:
         assert ib.disconnect_calls == 1
 
 
+class TestBarSyncConfigMapFile:
+    """New config knobs landed alongside the 2026-05-22 map_file synthesis fix."""
+
+    def test_default_persistence_days_is_15(self, tmp_path: Path) -> None:
+        # Operator-recommended in the 2026-05-22 brief — collapses /MES's
+        # noisy 66 raw transitions over 2y → ~6 genuine quarterly rolls.
+        cfg = BarSyncConfig(data_root=tmp_path)
+        assert cfg.map_file_persistence_days == 15
+
+    def test_enable_map_file_synthesis_default_true(self, tmp_path: Path) -> None:
+        # Default-on so production deploys pick up the fix without
+        # explicit operator opt-in.
+        cfg = BarSyncConfig(data_root=tmp_path)
+        assert cfg.enable_map_file_synthesis is True
+
+    def test_persistence_days_override_round_trips(self, tmp_path: Path) -> None:
+        cfg = BarSyncConfig(data_root=tmp_path, map_file_persistence_days=30)
+        assert cfg.map_file_persistence_days == 30
+
+    def test_disable_synthesis_round_trips(self, tmp_path: Path) -> None:
+        cfg = BarSyncConfig(data_root=tmp_path, enable_map_file_synthesis=False)
+        assert cfg.enable_map_file_synthesis is False
+
+
+class TestBarSyncWorkerMapFileSynthesis:
+    """run_cycle invokes the map_file synthesizer after the per-market loop.
+
+    Locked by the 2026-05-22 decisions-log entry "Diagnostic probe (PR #220)
+    CONFIRMS root cause: LEAN's continuous-contract resolver returns empty
+    DataFrame for futures". Without the synthesizer, ``self.history(/MES, ...)``
+    returns empty even with on-disk daily zips because LEAN's MapFile.Count
+    is 0 for futures.
+    """
+
+    @pytest.fixture
+    def single_futures_config(self, tmp_path: Path) -> BarSyncConfig:
+        # Single-future universe — keeps the cycle short + makes the
+        # synthesis assertions easy to reason about.
+        return BarSyncConfig(
+            markets={"/MES": PHASE1_UNIVERSE_METADATA["/MES"]},
+            data_root=tmp_path,
+            bars_per_fetch=1,
+            tick_interval_seconds=0.01,
+            ibkr_call_timeout_seconds=2.0,
+            ibkr_connect_timeout_seconds=2.0,
+            oi_wait_seconds=0.1,
+            map_file_persistence_days=1,  # Keep test fast — single session counts
+        )
+
+    def _build_ib_with_one_bar(self) -> _FakeIb:
+        ib = _FakeIb()
+        ib.historical_bars = [
+            _FakeBarData(
+                date=date(2026, 5, 19),
+                open=7378.0,
+                high=7380.5,
+                low=7375.25,
+                close=7378.25,
+                volume=12500,
+            )
+        ]
+        ib.contract_details = [
+            _FakeContractDetails(_FakeContract(lastTradeDateOrContractMonth="20260620")),
+        ]
+        ib.oi_value_to_serve = 50000
+        return ib
+
+    def test_synthesis_runs_after_successful_cycle(
+        self, single_futures_config: BarSyncConfig, tmp_path: Path
+    ) -> None:
+        # First populate prior-day universe files at expiry 202603 + a fresh
+        # cycle today at expiry 202606 — that gives the synthesizer one
+        # genuine transition to detect (with persistence_days=1).
+        universes_dir = tmp_path / "future" / "cme" / "universes" / "mes"
+        universes_dir.mkdir(parents=True, exist_ok=True)
+        for d in (date(2026, 1, 15), date(2026, 1, 16)):
+            (universes_dir / f"{d:%Y%m%d}.csv").write_text(
+                "#expiry,open,high,low,close,volume,open_interest\n"
+                "202603,7400,7410,7390,7405,1000,100000\n",
+                encoding="utf-8",
+            )
+        ib = self._build_ib_with_one_bar()
+        worker = BarSyncWorker(
+            config=single_futures_config,
+            ib_factory=lambda: ib,
+            clock=lambda: datetime(2026, 5, 19, 21, 0, tzinfo=UTC),
+        )
+        asyncio.run(worker.run_cycle(today=date(2026, 5, 19)))
+        map_file = tmp_path / "future" / "cme" / "map_files" / "mes.csv"
+        content = map_file.read_text(encoding="utf-8")
+        lines = content.splitlines()
+        # Pre-synthesis (bar_sync's own sentinel) would be 2 lines without
+        # mode integer; post-synthesis we expect at least inception + 1 roll
+        # + end sentinel = 3 lines, and the end sentinel carries the mode.
+        assert lines[0] == "18991230,mes,CME"
+        assert lines[-1] == "20501231,mes,CME,2"
+        # Genuine transition 202603 → 202606 detected.
+        assert any(",mes,CME,2" in ln and ln != lines[-1] for ln in lines[1:-1])
+
+    def test_synthesis_skipped_when_disabled(self, tmp_path: Path) -> None:
+        config = BarSyncConfig(
+            markets={"/MES": PHASE1_UNIVERSE_METADATA["/MES"]},
+            data_root=tmp_path,
+            bars_per_fetch=1,
+            tick_interval_seconds=0.01,
+            ibkr_call_timeout_seconds=2.0,
+            ibkr_connect_timeout_seconds=2.0,
+            oi_wait_seconds=0.1,
+            enable_map_file_synthesis=False,
+        )
+        ib = self._build_ib_with_one_bar()
+        worker = BarSyncWorker(
+            config=config,
+            ib_factory=lambda: ib,
+            clock=lambda: datetime(2026, 5, 19, 21, 0, tzinfo=UTC),
+        )
+        asyncio.run(worker.run_cycle(today=date(2026, 5, 19)))
+        # bar_sync's own 2-row sentinel remains — the synthesizer did NOT
+        # rewrite it with the LEAN-format-with-mode shape.
+        map_file = tmp_path / "future" / "cme" / "map_files" / "mes.csv"
+        content = map_file.read_text(encoding="utf-8")
+        assert content == "18991230,mes\n20501231,mes,CME\n"
+
+    def test_synthesis_runs_on_connect_failure_path(self, tmp_path: Path) -> None:
+        # Even when ib_gateway can't be reached this cycle, prior universe
+        # data on disk should still be synthesized into a populated
+        # map_file. The cycle ends in connect_failed but the operator
+        # still gets the resolver-unblocking map_file from prior data.
+        universes_dir = tmp_path / "future" / "cme" / "universes" / "mes"
+        universes_dir.mkdir(parents=True, exist_ok=True)
+        # Two sessions of expiry 202603 — enough for the synthesizer's
+        # sentinel-only output to land (persistence_days=1).
+        for d in (date(2026, 1, 15), date(2026, 1, 16)):
+            (universes_dir / f"{d:%Y%m%d}.csv").write_text(
+                "#expiry,open,high,low,close,volume,open_interest\n"
+                "202603,7400,7410,7390,7405,1000,100000\n",
+                encoding="utf-8",
+            )
+        config = BarSyncConfig(
+            markets={"/MES": PHASE1_UNIVERSE_METADATA["/MES"]},
+            data_root=tmp_path,
+            bars_per_fetch=1,
+            tick_interval_seconds=0.01,
+            ibkr_call_timeout_seconds=2.0,
+            ibkr_connect_timeout_seconds=2.0,
+            oi_wait_seconds=0.1,
+            map_file_persistence_days=1,
+        )
+        ib = _FakeIb()
+        ib.connect_should_raise = ConnectionRefusedError("ib_gateway down")
+        worker = BarSyncWorker(
+            config=config,
+            ib_factory=lambda: ib,
+            clock=lambda: datetime(2026, 5, 19, 21, 0, tzinfo=UTC),
+        )
+        result = asyncio.run(worker.run_cycle(today=date(2026, 5, 19)))
+        # Cycle fails at connect → all markets marked failed.
+        assert result.all_failed is True
+        # But the synthesizer ran and produced a real map_file from the
+        # prior on-disk universes.
+        map_file = tmp_path / "future" / "cme" / "map_files" / "mes.csv"
+        assert map_file.exists()
+        content = map_file.read_text(encoding="utf-8")
+        # Inception + end sentinel with the mode int (no rolls since
+        # all prior data has the same expiry).
+        assert content == "18991230,mes,CME\n20501231,mes,CME,2\n"
+
+    def test_synthesis_skips_etfs(self, tmp_path: Path) -> None:
+        # ETFs use bar_sync's existing equity map_file via write_etf_bundle;
+        # the synthesizer must not touch their map_files (they live in
+        # equity/usa/map_files/, not future/.../map_files/).
+        config = BarSyncConfig(
+            markets={"TLT": PHASE1_UNIVERSE_METADATA["TLT"]},
+            data_root=tmp_path,
+            bars_per_fetch=1,
+            tick_interval_seconds=0.01,
+            ibkr_call_timeout_seconds=2.0,
+            ibkr_connect_timeout_seconds=2.0,
+        )
+        ib = _FakeIb()
+        ib.historical_bars = [
+            _FakeBarData(date=date(2026, 5, 19), open=85, high=86, low=84, close=85.5, volume=1000),
+        ]
+        worker = BarSyncWorker(
+            config=config,
+            ib_factory=lambda: ib,
+            clock=lambda: datetime(2026, 5, 19, 21, 0, tzinfo=UTC),
+        )
+        asyncio.run(worker.run_cycle(today=date(2026, 5, 19)))
+        # ETF map_file is unchanged — bar_sync's equity bundle owns it.
+        etf_map = tmp_path / "equity" / "usa" / "map_files" / "tlt.csv"
+        assert etf_map.exists()
+        # No `future/` tree should have been created (no futures in the
+        # universe).
+        assert not (tmp_path / "future").exists()
+
+    def test_synthesis_per_ticker_failure_does_not_abort_cycle(
+        self, single_futures_config: BarSyncConfig, tmp_path: Path
+    ) -> None:
+        # If the synthesizer raises for some pathological universe state,
+        # the cycle must still report the bar_sync outcome correctly.
+        # We force a failure by monkey-patching synthesize_futures_map_file.
+        from services.data import map_file_synthesis as mfs
+
+        original = mfs.synthesize_futures_map_file
+        try:
+
+            def _boom(**kwargs: object) -> object:  # pragma: no cover - exception path
+                raise RuntimeError("simulated synthesizer failure")
+
+            mfs.synthesize_futures_map_file = _boom  # type: ignore[assignment]
+            ib = self._build_ib_with_one_bar()
+            worker = BarSyncWorker(
+                config=single_futures_config,
+                ib_factory=lambda: ib,
+                clock=lambda: datetime(2026, 5, 19, 21, 0, tzinfo=UTC),
+            )
+            result = asyncio.run(worker.run_cycle(today=date(2026, 5, 19)))
+            # Cycle outcome unchanged by synthesizer failure.
+            assert len(result.successful_markets) == 1
+            assert result.successful_markets[0].market == "/MES"
+        finally:
+            mfs.synthesize_futures_map_file = original  # type: ignore[assignment]
+
+
 class TestBarSyncWorkerAlertSeam:
     """Task 4 — consecutive-cycle counters + P2 alert hook seam."""
 
