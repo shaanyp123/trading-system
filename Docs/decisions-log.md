@@ -17,6 +17,92 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ## Entries
 
+### 2026-05-22 — `add_future` bare-ticker fix unblocks LEAN's MapFileResolver (PR #222 deploy follow-up)
+
+**Trigger:** the PR #222 deploy at 22:58 UTC populated all 7 futures map_files with 6-15 genuine roll boundaries each (verified on disk; `bar_sync_cycle_completed successful_count=10 failed_count=1 [/M2K]`, then 7 `futures_map_file_synthesized content_changed=true`). lean_local was force-recreated at 23:02 UTC to reload. **MapFile.Count stayed at 0 for all 4 subscription configs per future** — same as the pre-deploy baseline. The fix's expected immediate validation (Count > 0) did not fire.
+
+**Root-cause investigation (23:02-23:23 UTC):**
+
+Read the LEAN source path `QCAlgorithm.AddFuture` (`Algorithm/QCAlgorithm.cs:2218-2235`):
+
+```cs
+public Future AddFuture(string ticker, ...) {
+    market = GetMarket(market, ticker, SecurityType.Future);
+    Symbol canonicalSymbol;
+    var alias = "/" + ticker;                            // ← LEAN prepends slash to alias
+    if (!SymbolCache.TryGetSymbol(alias, out canonicalSymbol) || ...) {
+        canonicalSymbol = QuantConnect.Symbol.Create(ticker, SecurityType.Future, market, alias);
+        // ↑ passes raw ticker to Create() which forwards to SecurityIdentifier.GenerateFuture(DefaultDate, ticker, market)
+    }
+    ...
+}
+```
+
+Our `lean/v1_strategy.py::initialize` was calling `self.add_future(f"/{ticker}", ...)` for each of the 7 micro-futures. With `ticker="/MES"` (Python's f-string):
+
+- `alias = "/" + "/MES" = "//MES"` (double slash; matches the canonical Value in the `LiveMappingEventProvider` log)
+- `Symbol.Create("/MES", SecurityType.Future, market, "//MES")` → `sid.Symbol = "/MES"` (with single slash)
+- `symbol.Value = "/" + sid.Symbol = "//MES"` (the displayed canonical)
+
+The `MapFileResolver.ResolveMapFile` lookup chain (`Common/Data/Auxiliary/MapFileResolver.cs:100-130`):
+
+1. `symbolID = symbol.ID.Symbol = "/MES"`
+2. `_bySymbol.TryGetValue("/MES", ...)` — fails (our `MappedSymbol` rows are `"mes"` → upper-cased to `"MES"`, no slash)
+3. Fall through to `_mapFilesByPermtick.TryGetValue("/MES", ...)` — fails (file is `mes.csv` → permtick `"MES"`, no slash)
+4. Returns `new MapFile(symbol, Enumerable.Empty<MapFileRow>())` → `Count == 0`
+
+LEAN's reference continuous-futures algorithm `Algorithm.CSharp/ContinuousFuturesDailyRegressionAlgorithm.cs` uses the bare ticker pattern:
+
+```cs
+_continuousContract = AddFuture(Futures.Indices.SP500EMini, ...)
+// where Futures.Indices.SP500EMini = "ES" (bare; no slash)
+```
+
+So the LEAN-canonical pattern is `AddFuture("MES", ...)`, NOT `AddFuture("/MES", ...)`. The strategy has been creating wrong-shaped canonical symbols since the Path 4 deploy (2026-05-13). The on-disk universe path `/Lean/Data/future/cme/universes/mes/<date>.csv` collides with the slash via Unix path-normalization (`universes//mes/...` collapses to `universes/mes/...`), which is why partial data flows worked but `MapFile.Count` stayed broken — the resolver's in-memory dict lookup doesn't get the same normalization.
+
+**Falsification of an alternative — slash-prefixed `MappedSymbol`:**
+
+Before settling on the AddFuture fix, manually rewrote `/Lean/Data/future/cme/map_files/mes.csv` with `MappedSymbol = "/mes"` (matching the canonical's `sid.Symbol`). lean_local force-recreate crashed at boot with:
+
+```
+The string must be splittable on space into two parts. in SecurityIdentifier.cs:line 818
+```
+
+LEAN tries to parse `MappedSymbol` strings as `SecurityIdentifier` values somewhere in the resolver lookup path; the slash-prefixed form triggers the strict parser. The bare `"mes"` form silently fails the parse (TryParse returns false, no throw) and returns the same empty MapFile, but doesn't crash the engine. **Slash-prefixed `MappedSymbol` is NOT a viable workaround.** The synthesizer's bare-permtick choice (PR #222) is correct; the bug is upstream in `AddFuture`.
+
+**Fix landed (this PR — see PR description for #):**
+
+`lean/v1_strategy.py::initialize` — change `self.add_future(f"/{ticker}", ...)` → `self.add_future(ticker, ...)`. The `_market_subscriptions` dict key stays `f"/{ticker}"` so the backend signal-payload contract (`market="/MES"`) and the strategy's own logging are unchanged. After this fix:
+
+- `alias = "/" + "MES" = "/MES"` (single slash)
+- `sid.Symbol = "MES"` (no slash)
+- `symbol.Value = "/" + "MES" = "/MES"` (single slash; `LiveMappingEventProvider` will log `(/MES,#0,/MES,...)` instead of `(//MES,#0,//MES,...)`)
+- `_bySymbol["MES"]` matches our map_file's 8 rows → `Count == 8` for /MES (mirrors the 6/6/6/6/7/15/15 roll counts the synthesizer produced for /MES/MNQ/MYM/M2K/MGC/MCL/MBT)
+
+**Pre-deploy ceremony evidence:**
+
+- 22:58 UTC: api restart triggered bar_sync's first-fire-of-day; populated all 7 futures map_files via the PR #222 synthesizer; /M2K's universe write failed with `PermissionError` on a root-owned `m2k/20260522.csv` (only root-owned file in the entire `lean_data` tree; chowned to `trading:trading` mid-session, root-cause for the 3-day /M2K failure streak now identified).
+- 23:02 UTC: lean_local force-recreate. Map_files visible inside container with full roll content. `LiveMappingEventProvider` MapFile.Count still 0 for futures → triggered the investigation above.
+
+**Validation cadence:**
+
+This entry's fix MUST be deployed before tomorrow's 21:30 UTC LEAN cycle for the synthesis to actually unblock futures `self.history()`. Deploy ceremony: VPS `git pull --ff-only` → `docker compose up -d --force-recreate lean_local` (no rebuild needed — `lean/v1_strategy.py` is mounted, not baked into the image). Expected: `LiveMappingEventProvider(/MES,#0,/MES,...): ... MapFile.Count Old: 0 New: 8` (for /MES with 6 rolls + 2 sentinels). If MapFile.Count > 0, the resolver is reading our synthesized map_files correctly; tomorrow's 21:30 UTC `v1_history_probe` then becomes the gate on whether the actual data layer also resolves cleanly.
+
+**Cost / scope impact:**
+
+- 1 file changed (`lean/v1_strategy.py`); ~3 lines of code + ~30 lines of comment explaining the bug
+- `lean/**` is on dev-guide §2.3 hot-fix whitelist; no `risk-review-approved` label required
+- 0 alembic migrations
+- 0 ongoing cost
+
+**Open follow-ups:**
+
+1. Validation cycle 2026-05-23 21:30 UTC: probe should now show `hist_type=DataFrame hist_len=205 hist_cols=['close','high','low','open','volume']` for all 7 futures.
+2. Tomorrow's `_market_subscriptions` key still uses `f"/{ticker}"` — verify the LEAN-emitted `signal_emitted` events arrive at the api with `market="/MES"` as expected. If LEAN's symbol-to-market translation upstream changes the wire value to bare `MES`, the api's signal-ingestion path will need a corresponding adjustment.
+3. PR #220 probe retirement still pending — defer until tomorrow's validation cycle.
+
+---
+
 ### 2026-05-22 — bar_sync map_file synthesis lands (resolver-unblocking fix for futures `self.history()`)
 
 **Trigger:** the "Diagnostic probe (PR #220) CONFIRMS root cause" entry below identified LEAN's continuous-contract resolver as the most-supported hypothesis for the 0/7 futures + 4/4 ETFs split in `v1_history_probe`. The "Tomorrow's fix path (concrete)" subsection of that entry described what this PR implements: a new `services/data/map_file_synthesis.py` module + a wiring hook in `BarSyncWorker.run_cycle`.
