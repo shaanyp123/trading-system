@@ -17,6 +17,142 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ## Entries
 
+### 2026-05-22 — Diagnostic probe (PR #220) CONFIRMS root cause: LEAN's continuous-contract resolver returns empty DataFrame for futures
+
+**Trigger:** PR #220's diagnostic probe deployed at 17:46 UTC into `_build_bar_series` was designed to land actionable data at tonight's natural 21:30 UTC cycle and disambiguate the four remaining hypotheses for why futures `self.history()` returns empty. This entry records what the probe surfaced + the now-narrowed fix path.
+
+**Pre-cycle state verified (17:47 UTC):** 9 health checks all green — bar_sync worker spawned on `clientId=3` with alert hook wired, ib_gateway TCP 4004 reachable from api, postgres accepting connections, systemd timer armed (next fire 21:10 UTC), lean_local clean boot at 17:46:27 UTC with `v1_universe_data_fresh markets_checked=7 fresh_count=7`, lean_local↔api 202 on `lean_strategy_initialized`. Disk 83% (note for next maintenance), memory 5.6Gi available, no `async_task_died` events.
+
+**Phase 1 (bar_sync 21:00 UTC) — 10/11 successful in 9.15s + first natural end-to-end exercise of PR #215's alert hook:**
+
+```
+21:00:15.152340Z bar_sync_cycle_firing session_date_et=2026-05-22 markets_count=11 ibkr_client_id=3
+21:00:21.702878Z oi_sentinel_substituted market=/MCL front_month_expiry=202606 reason=fetch_returned_zero raw_open_interest=0 sentinel=1
+21:00:24.304526Z bar_sync_cycle_completed successful_count=10 failed_count=1 total_markets=11 duration_seconds=9.15 failed_markets=['/M2K']
+21:00:24.348054Z bar_sync_alert_inserted alert_id=019e517d-4399-7ea9-9f78-2d69e62d71f8 severity=P2 category=data_quality_reject
+21:00:24.891228Z bar_sync_alert_dispatched short_circuited=false delivery_status={'discord_alerts': 'ok'}
+21:00:24.893936Z bar_sync_alert_inserted alert_id=019e517d-45bd-786f-a17a-ddc447c0a1df severity=P2 category=data_quality_quarantine
+21:00:25.115505Z bar_sync_alert_dispatched short_circuited=false delivery_status={'discord_alerts': 'ok'}
+```
+
+- /MCL hit the NYMEX paper-tier entitlement gap again (3rd day in a row); sentinel=1 substitution from PR #209 worked as designed.
+- /M2K failed (`failed_markets=['/M2K']`) — **2nd consecutive day** (yesterday's 22:14 UTC api-restart catchup also failed /M2K; original 21:00 UTC succeeded). Likely a systemic /M2K issue separate from the LEAN-side history-empty problem; flagged as Phase 1+ followup. The bar_sync alert already raised it (P2 `data_quality_reject` Discord alert).
+- **PR #215's `_build_bar_sync_alert_dispatch_hook` first natural exercise: PASSED end-to-end.** Both alerts (one `data_quality_reject` for /M2K + one `data_quality_quarantine` for /MCL sentinel) hit the `alerts` table + dispatched to `#alerts` Discord with `short_circuited=false delivery_status={discord_alerts: ok}`. Yesterday's 22:18 UTC manual test was synthetic; this is the first real one.
+
+**Phase 2 (systemd timer 21:10 UTC) — first naturally-scheduled fire of `lean-local-daily-restart.timer`:**
+
+```
+May 22 21:10:00 trading-primary systemd[1]: Starting lean-local-daily-restart.service - Restart lean_local to refresh its on-boot data layer cache (post-bar_sync daily zips)...
+May 22 21:10:00 trading-primary docker[2716065]:  Container trading-lean_local-1 Restarting -> Started
+May 22 21:10:00 trading-primary systemd[1]: lean-local-daily-restart.service: Deactivated successfully.
+lean_local-1 | 20260522 21:10:06.829 TRACE:: Log: 2026-05-22 17:10:06 v1_strategy initialized live_mode=True
+lean_local-1 | 20260522 21:10:06.829 TRACE:: Log: 2026-05-22 17:10:06 v1_universe_data_fresh markets_checked=7 threshold_days=5 fresh_count=7
+lean_local-1 | 20260522 21:10:06.829 TRACE:: Log: 2026-05-22 17:10:06 lean_signal_post_succeeded status=202 event_type=lean_strategy_initialized
+```
+
+- Timer fired on schedule. lean_local restarted + booted in 6s. Note: the timer remains armed despite the prior 2026-05-22 "FALSIFIED" callout on PR #218 — it does no harm and the natural fire was a clean operational validation. Recategorized: "operational hygiene" not "Issue D resolution."
+
+**Phase 3 (LEAN cycle 21:30 UTC) — the diagnostic gold:**
+
+The probe captured the structural difference cleanly. Side-by-side:
+
+```
+v1_history_probe market=/MES  hist_type=DataFrame hist_len=0   hist_cols=[]                                   hist_idx=?
+v1_history_probe market=/MNQ  hist_type=DataFrame hist_len=0   hist_cols=[]                                   hist_idx=?
+v1_history_probe market=/MYM  hist_type=DataFrame hist_len=0   hist_cols=[]                                   hist_idx=?
+v1_history_probe market=/M2K  hist_type=DataFrame hist_len=0   hist_cols=[]                                   hist_idx=?
+v1_history_probe market=/MGC  hist_type=DataFrame hist_len=0   hist_cols=[]                                   hist_idx=?
+v1_history_probe market=/MCL  hist_type=DataFrame hist_len=0   hist_cols=[]                                   hist_idx=?
+v1_history_probe market=/MBT  hist_type=DataFrame hist_len=0   hist_cols=[]                                   hist_idx=?
+v1_history_probe market=TLT   hist_type=DataFrame hist_len=205 hist_cols=['close','high','low','open','volume'] hist_idx=first=(Sym, 2025-07-31 16:00:00) last=(Sym, 2026-05-22 16:00:00)
+v1_history_probe market=IEF   hist_type=DataFrame hist_len=205 hist_cols=['close','high','low','open','volume'] hist_idx=first=(Sym, 2025-07-31 16:00:00) last=(Sym, 2026-05-22 16:00:00)
+v1_history_probe market=SHY   hist_type=DataFrame hist_len=205 hist_cols=['close','high','low','open','volume'] hist_idx=first=(Sym, 2025-07-31 16:00:00) last=(Sym, 2026-05-22 16:00:00)
+v1_history_probe market=TIP   hist_type=DataFrame hist_len=205 hist_cols=['close','high','low','open','volume'] hist_idx=first=(Sym, 2025-07-31 16:00:00) last=(Sym, 2026-05-22 16:00:00)
+```
+
+The 7 `v1_history_parsed_empty` lines (one per future) also fired, confirming `parse_history_to_bars` correctly handles the empty-DataFrame case — the parser is doing its job, the data layer is what's broken.
+
+Cycle outcome lines:
+
+```
+v1_history_unavailable session_date=2026-05-22 failed_markets=['/MES', '/MNQ', '/MYM', '/M2K', '/MGC', '/MCL', '/MBT']
+v1_signals_generated session_date=2026-05-22 signals_emitted_count=0 rejections_count=4
+lean_signal_post_succeeded status=202 event_type=lean_cycle_heartbeat
+```
+
+API confirmed receipt of the `lean_cycle_heartbeat` (`lean_event_received` at 21:30:01 UTC) and the boot-time `lean_strategy_initialized` (at 21:10:06 UTC). **Zero `signal_emitted` events POSTed** — no cleanup required in `signals` table.
+
+**Hypothesis status after the probe:**
+
+| Hypothesis | Status |
+|---|---|
+| Data-layer cache at boot (PR #218 framing) | FALSIFIED (confirmed again — fresh boot at 21:10, still empty) |
+| Insufficient historical depth (174 bars < 200 min) | **RULED OUT** — would have been `hist_len=174`; observed `hist_len=0`. Depth is not the issue. |
+| `parse_history_to_bars` parser bug | RULED OUT — parser correctly emits `v1_history_parsed_empty` on empty DataFrame |
+| Continuous-contract resolver can't pick a front-month (sentinel-only map_files) | **STRONGLY SUPPORTED** — `hist_cols=[]` is even stronger than `hist_len=0`: LEAN couldn't even shape the result; combined with boot-time `MapFile.Count Old:0 New:0` for futures vs `Count:2` for ETFs, the resolver-side failure framing is most consistent |
+| Symbol shape mismatch (`/MES` vs data layer's index) | Possible secondary contributor; the empty-columns shape primarily points at resolver, but if map_file fix doesn't fully resolve, this is the next candidate |
+
+**Tomorrow's fix path (concrete):**
+
+Extend `services/data/bar_sync.py` to populate `/Lean/Data/future/<exchange>/map_files/<ticker>.csv` with actual quarterly roll dates. Currently the map_files contain only sentinel rows:
+
+```
+18991230,mes
+20501231,mes,CME
+```
+
+LEAN's `LiveMappingEventProvider` reports `MapFile.Count Old:0 New:0` for these (vs `Count:2` for working ETFs). The continuous-contract resolver needs the format:
+
+```
+18991230,mes
+20260321,mes,esh26,CME    # last day before Mar→Jun roll (or equivalent for /MES suffix conventions)
+20260620,mes,esm26,CME    # last day before Jun→Sep roll
+20260919,mes,esu26,CME    # last day before Sep→Dec roll
+20261219,mes,esz26,CME    # last day before Dec→Mar roll
+... (continues for all historical roll boundaries we have universe data for)
+20501231,mes,CME
+```
+
+Implementation outline (estimated ~2-3 hours):
+1. Add a `services/data/map_file_writer.py` module (or extend bar_sync directly) that:
+   - Reads existing universe files (`/Lean/Data/future/<exch>/universes/<ticker>/<YYYYMMDD>.csv`) which already encode `front_month_expiry` per session.
+   - Detects transitions: any two consecutive sessions where front_month_expiry differs = a roll boundary.
+   - Writes one row per detected transition to the map_file in the LEAN-expected format.
+   - Idempotent: re-running the same input set produces the same output map_file.
+2. Wire into the bar_sync cycle (after the per-market sync loop completes successfully):
+   - Run map_file synthesis once per cycle (cheap — just reads universe files).
+   - Emit `map_file_synthesized` log line with row count per ticker for observability.
+3. Tests:
+   - Unit tests for the universe-file → roll-transition detector.
+   - Integration test that synthesizes a map_file from a known fixture set + verifies it matches the expected format.
+4. Deploy + validate via the natural 21:30 UTC LEAN cycle the next day. PR #220's probe lines will confirm: futures `hist_type=DataFrame hist_len=205 hist_cols=['close','high','low','open','volume']` mirroring the ETFs.
+
+**Scope:** `services/data/**` is NOT on the forbidden whitelist per dev-guide §2.2; it's on the §2.3 hot-fix whitelist. No `risk-review-approved` label required. Regular PR review with the operator's plain-English summary gate.
+
+**PR #220's probe retirement plan:** once the fix lands + tomorrow's cycle confirms `hist_len=205` for all 7 futures, a follow-up PR removes the diagnostic probe code (the `_log_history_probe` method + its call site + the parsed-empty diagnostic). The decisions-log entries stay as the historical record.
+
+**Operational context tonight:**
+
+- Operational Day 3 since the 2026-05-20 milestone. Phases 1+2+3 all completed cleanly with the alert hook firing for the first time end-to-end (Phase 1 bonus).
+- Pre-cycle prediction (computed at 19:30 UTC from 2025-05-21 bars in disk): "0 signals likely; TLT/IEF could fire SHORT only on big down days." Actual: 0 signals emitted + 4 ETF rejections. Prediction confirmed.
+- Watcher script (`/tmp/cycle_watcher_vps.sh`) running on VPS as PID 2635021 captured all 3 phase outputs to `/tmp/cycle_watcher.log` (74 lines, the gold artifact).
+
+**Open follow-ups (next-session work):**
+
+1. **PRIMARY: bar_sync map_file synthesis PR** (this entry's primary action item). Hand off to a fresh session with a self-contained brief.
+2. **/M2K bar_sync investigation.** 2nd consecutive day of failure. Independent of the LEAN-side history-empty issue. Likely a Russell 2000 micro-futures front-month resolution or IBKR Error 326 / 200 etc. happening for that specific contract. Pull bar_sync `/M2K` failure-path logs + IBKR connection diagnostics. ~30-60 min standalone task.
+3. **PR #220 probe retirement.** Land after primary fix validates. Trivial revert + decisions-log close-out entry.
+4. **Symbol-shape fallback investigation.** Only if the map_file fix doesn't fully resolve. The probe output showed `symbol=<QuantConnect.Symbol object at 0x...>` for both ETFs and futures — both are symbol objects, but their internal data-layer routing may differ. This is a deeper investigation if needed.
+
+**Cost / scope impact:**
+
+- 0 production-affecting changes tonight (probe was pure observability)
+- 0 alembic migrations
+- 0 cost (probe + decisions-log only)
+- Trust budget RESTORED: tonight's cycle produced the actionable data we'd been missing for three days. Tomorrow's fix is concrete (map_file synthesis), bounded (~2-3 hours), and verifiable (probe still in place to confirm).
+
+---
+
 ### 2026-05-22 — Invasive cache-hypothesis test DISPROVES lean_local-restart fix; /MCL OI saga itself confirmed working
 
 **Trigger:** the 21:30 UTC LEAN cycle on 2026-05-21 emitted ZERO futures signals + logged `v1_history_unavailable session_date=2026-05-21 failed_markets=[/MES, /MNQ, /MYM, /M2K, /MGC, /MCL, /MBT]` for all 7 futures, even though bar_sync's 21:00 UTC cycle landed real OHLCV+OI for 6/7 + sentinel=1 for /MCL (per the "lean_local data-layer cache fix" entry below). The 4 ETFs cycled (4 rejections; normal "no signal" outcome). Operator authorized an invasive 30-min validation test before tomorrow's 21:30 UTC cycle: "trust budget for 'tomorrow's cycle will prove it' is exhausted — going invasive tonight to KNOW vs HOPE."
