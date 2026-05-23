@@ -232,30 +232,65 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
 
         # Subscribe to micro futures (continuous contract via QC's `Future` API).
         for ticker in PHASE1_FUTURES:
-            # data_normalization_mode=Raw — explicitly Raw for the V1 strategy
-            # under any data source (post-2026-05-20 data-layer sub-pivot:
-            # LEAN reads bars from IBKR via the InteractiveBrokersBrokerage
-            # data-queue-handler + history-provider on clientId=10, no longer
-            # from on-disk seed files). add_future()'s default normalization
-            # mode resolves to BackwardsRatio per QC docs forum 17093 staff
-            # response: "if you use a data normalization mode that's not in
-            # the list, LEAN automatically converts it to
-            # DataNormalizationMode.BackwardsRatio". BackwardsRatio requires
-            # factor_files/<ticker>.csv with the continuous-contract scale
-            # math (BackwardsRatioScale, etc.) which is QC-internal — under
-            # the seed-file architecture we couldn't synthesize them, and
-            # under the IBKR data path we don't need them. Raw mode operates
+            # ``add_future`` requires the BARE ticker — LEAN's
+            # ``QCAlgorithm.AddFuture`` prepends ``/`` itself when constructing
+            # the canonical alias (``var alias = "/" + ticker``) and passes the
+            # caller's ``ticker`` unchanged to
+            # ``SecurityIdentifier.GenerateFuture(...)``. Passing ``"/MES"``
+            # results in ``sid.Symbol = "/MES"`` (with slash) + ``alias = "//MES"``
+            # (double slash) + ``symbol.Value = "//MES"``. ``LiveMappingEventProvider``
+            # then logs the canonical as ``//MES`` and tries to look up
+            # ``_bySymbol["/MES"]`` in the MapFileResolver — but the on-disk
+            # map_file's permtick is ``MES`` (filename ``mes.csv``) and its
+            # MappedSymbol column starts with ``mes`` (bare permtick on the
+            # inception sentinel; ``mes <sid_hash>`` on per-roll rows after
+            # the 2026-05-22 SID-hash extension), so the lookup misses and
+            # ``MapFile.Count`` stays at 0 for every futures symbol.
+            #
+            # The 2026-05-22 21:30 UTC + 23:02 UTC probes captured exactly
+            # this failure mode (``hist_type=DataFrame hist_len=0 hist_cols=[]``
+            # for /MES /MNQ /MYM /M2K /MGC /MCL /MBT vs ``hist_len=205`` for
+            # the 4 ETFs from the same code path). The bar_sync map_file
+            # synthesizer (PR #222) landed populated rolls but the
+            # ``_bySymbol["/MES"]`` lookup was still missing them. LEAN's
+            # reference algorithm
+            # ``Algorithm.CSharp/ContinuousFuturesDailyRegressionAlgorithm.cs``
+            # uses ``AddFuture(Futures.Indices.SP500EMini, ...)`` where
+            # ``SP500EMini = "ES"`` — the bare ticker. We mirror that here.
+            #
+            # This is the bare-ticker change FIRST landed in PR #223 (which
+            # got reverted via PR #224 because PR #222's bare-permtick
+            # ``MappedSymbol`` on per-roll rows crashed LEAN's
+            # ``SecurityIdentifier.Parse`` with "The string must be splittable
+            # on space into two parts in SecurityIdentifier.cs:line 818").
+            # The 2026-05-22 follow-up landed the LEAN-canonical
+            # ``<perm> <SID-hash>`` ``MappedSymbol`` rendering in
+            # ``services/data/map_file_synthesis.py`` (validated against 55/55
+            # historical ES contracts in LEAN's bundled
+            # ``Data/future/cme/map_files/es.csv``); this PR re-applies the
+            # bare-ticker change atomically with that synthesizer update so
+            # the crash mode can't recur.
+            #
+            # ``_market_subscriptions`` keeps the ``/<ticker>`` form as its
+            # dict key so the existing backend signal-payload contract
+            # (``market="/MES"``) and the strategy's logging stay unchanged.
+            # See ``Docs/decisions-log.md`` 2026-05-22 entries "bar_sync
+            # map_file synthesis lands" + "SID-hash MappedSymbol + bare-ticker
+            # add_future to unblock futures self.history()" for the chain.
+            #
+            # ``data_normalization_mode=Raw`` — explicitly Raw for the V1
+            # strategy under any data source.  ``add_future()``'s default
+            # normalization mode resolves to BackwardsRatio per QC docs forum
+            # 17093 staff response, which requires factor_files we can't
+            # synthesize under the Option C data-layer pivot. Raw mode operates
             # on un-adjusted per-expiry contract prices — LEAN's continuous-
-            # contract resolver picks the active contract per session date
-            # (via DataMappingMode.OPEN_INTEREST + IBKR's reqContractDetails
-            # under the sub-pivot), and the strategy's Donchian/MA/Hurst/ATR
-            # all derive from each active contract's own price levels.
-            # See Docs/decisions-log.md 2026-05-20 entry "Phase 1 data-layer
-            # pivot" + 2026-05-12 entry "Phase 1 futures seed via DataBento
-            # direct SDK + minimal LEAN converter (Path 4)" for the original
-            # rationale that motivated the explicit-Raw choice.
+            # contract resolver picks the active contract per session date via
+            # ``DataMappingMode.OPEN_INTEREST`` + the per-day universe file
+            # produced by bar_sync. See ``Docs/decisions-log.md`` 2026-05-20
+            # data-layer pivot entry + 2026-05-12 Path 4 entry for the
+            # original explicit-Raw rationale.
             future = self.add_future(
-                f"/{ticker}",
+                ticker,
                 resolution=Resolution.DAILY,  # noqa: F405
                 extended_market_hours=False,
                 data_mapping_mode=DataMappingMode.OPEN_INTEREST,  # noqa: F405

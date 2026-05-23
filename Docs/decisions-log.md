@@ -17,6 +17,88 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ## Entries
 
+### 2026-05-22 — SID-hash MappedSymbol + bare-ticker `add_future` to unblock futures `self.history()`
+
+**Trigger:** the chain of three immediately-prior 2026-05-22 entries (PR #222 "bar_sync map_file synthesis lands" → PR #223 "`add_future` bare-ticker fix unblocks LEAN's MapFileResolver" → PR #224 the revert). PR #222 populated futures map_files; PR #223 changed `self.add_future(f"/{ticker}", ...)` → `self.add_future(ticker, ...)` so LEAN's `MapFileResolver._bySymbol["MES"]` lookup hit instead of missing on the `"/MES"` form; the resolver lookup succeeded but LEAN's `LiveSynchronizer` then crashed in `SecurityIdentifier.cs:line 818` ("The string must be splittable on space into two parts") because PR #222 wrote bare `mes` in the `MappedSymbol` column for every per-roll row. PR #224 reverted PR #223 to stop the crash loop, restoring the populated-but-inert state.
+
+**What landed (this PR):** the two coupled changes that close the contract atomically:
+
+1. **`services/data/map_file_synthesis.py` SID-hash extension** (~370 net lines added on top of PR #222's 382). New public surface:
+   - `oadate(d: date) -> int` — .NET `DateTime.ToOADate()` integer days; guards `< 1900-03-01` with explicit `ValueError`
+   - `encode_base36(n: int) -> str` — mirror of LEAN's `Common/Extensions.cs::EncodeBase36`; uppercase output, lowercased by caller for on-disk; empty string for `n==0`
+   - `compute_future_sid_hash(*, expiry_date: date, market_dir: str) -> str` — mirror of `SecurityIdentifier.GenerateFuture`: `(oadate(expiry) * DAYS_OFFSET) + (market_id * MARKET_OFFSET) + (SECURITY_TYPE_FUTURE * SECURITY_TYPE_OFFSET)` → base36 → lowercase. Constants extracted from `QuantConnect/Lean/Common/SecurityIdentifier.cs` lines 79-101; market IDs from `Common/Market.cs::HardcodedMarkets` (CME=23, COMEX=22, NYMEX=7, CBOT=8). Validated against LEAN's bundled `Data/future/cme/map_files/es.csv` — **all 55 historical ES contracts reproduce byte-for-byte** (the test suite parametrizes 8 sample SIDs; the full 55 was the local validation pass).
+   - `compute_future_expiry(*, ticker: str, contract_month: str) -> date` — per-product expiry rule lookup mirroring `QuantConnect/Lean/Common/Securities/Future/FuturesExpiryFunctions.cs`:
+     - /MES, /MNQ, /MYM, /M2K (Indices.Micro*) — quarterly Mar/Jun/Sep/Dec, 3rd Friday with `AddBusinessDaysIfHoliday(-1)` if itself a holiday (e.g. /MES Jun 2026 = 2026-06-18 Thu because the 3rd Friday lands on Juneteenth 2026-06-19)
+     - /MGC (Metals.MicroGold) — bi-monthly Feb/Apr/Jun/Aug/Oct/Dec, 3rd-last business day with `AddBusinessDaysIfHoliday(-1)`
+     - /MCL (Energy.MicroCrudeOilWTI) — monthly, 4 biz days before the 25th of MONTH BEFORE (5 if the 25th is itself a holiday)
+     - /MBT (Currencies.MicroBTC) — monthly, last Friday of contract month with `AddBusinessDaysIfHoliday(-1)`
+   - Internal helpers `_third_friday_of_month`, `_last_friday_of_month`, `_nth_last_business_day`, `_add_business_days`, `_add_business_days_if_holiday`, `_not_holiday`, `_is_common_business_day` — all faithful Python ports of the LEAN C# implementations
+   - Holiday calendar: per-ticker `frozenset[date]` sourced from LEAN's `Data/market-hours/market-hours-database.json` (`Future-<market>-<TICKER>` entries, union of `holidays` + `bankHolidays`), restricted to 2020-2030. The base set has 69 holidays common to all 7 tickers; per-ticker `_PER_TICKER_HOLIDAY_EXTRA_2020_2030` adds 1-3 entries (e.g. /MGC and /MCL add Good Friday 2026-04-03; /MES adds Jan 2 2023). Phase 1+ swap to `pandas_market_calendars` if window expands beyond 2030.
+   - `build_futures_map_file_with_rolls(...)` extended with `market_dir: str | None = None` (defaults to `market_code.lower()`) + `emit_sid_hash: bool = True` (default-on). New output format per row:
+     - Inception sentinel: `18991230,<perm_lower>,<EXCHANGE>` (bare permtick — matches LEAN's bundled convention)
+     - Per-roll rows: `<YYYYMMDD>,<perm_lower> <sid_hash>,<EXCHANGE>,<mode>` (SID-hash MappedSymbol)
+     - End sentinel: `20501231,<perm_lower> <last_sid_hash>,<EXCHANGE>,<mode>` (last roll's SID propagated forward; falls back to bare permtick when no rolls detected)
+   - `synthesize_futures_map_file(...)` extended with `emit_sid_hash: bool = True` knob threading through to the renderer. Default-on; the bare-permtick fallback (`emit_sid_hash=False`) is preserved for the unlikely contingency where SID emission breaks LEAN in a way the probe doesn't catch.
+
+2. **`lean/v1_strategy.py::initialize` re-applies PR #223's bare-ticker `add_future` change.** `self.add_future(ticker, ...)` instead of `self.add_future(f"/{ticker}", ...)`. The comment block is updated to explain the FULL chain (bare-ticker + SID-hash) so future maintainers see the coupled contract. `_market_subscriptions[f"/{ticker}"]` keeps the slash-prefixed dict key so the backend signal-payload wire contract (`market="/MES"`) and all strategy logging stay unchanged.
+
+3. **Tests** — `tests/unit/test_map_file_synthesis.py` extended from 65 → 120 tests (+55 net). New test classes:
+   - `TestEncodeBase36` (5 tests) — known reference values + the full ES Dec 2009 `otherData=4_016_500_000_000_002_305 → "UIK2F7CJ4V0H"` reproduction + negative-input guard
+   - `TestOadate` (5 tests) — 4 parametrized known .NET reference values + pre-1900-03-01 raises + boundary
+   - `TestComputeFutureSidHash` (11 tests) — 8 parametrized real ES contracts from LEAN bundled `es.csv` (ES Dec 2009, Mar/Jun/Sep/Dec 2010, Jun 2015, Dec 2020, Jun 2023) + unknown-market raise + case-insensitive market_dir + market_id-affects-SID sanity + lowercase output
+   - `TestExpiryHelpers` (8 tests) — primitives for third_friday, last_friday, nth_last_business_day (no-holiday + Good Friday adjustment), add_business_days, add_business_days_if_holiday
+   - `TestComputeFutureExpiry` (18 tests) — per-ticker known expiries: MES/MNQ/MYM/M2K Mar 2026 = 2026-03-20, MES/MNQ/MYM/M2K Jun 2026 = 2026-06-18 (Juneteenth adjustment), MGC Feb 2026 = 2026-02-25, MGC Apr 2026 = 2026-04-28, MCL Dec 2025 = 2025-11-19, MCL Jul 2026 = 2026-06-18 (Juneteenth holiday skip), MBT Jun/Jul/Sep 2026 = 2026-06-26/2026-07-31/2026-09-25 + 4 error-path tests
+   - Existing `TestBuildFuturesMapFileWithRolls` (10 tests, updated) — assertions now expect SID-hash MappedSymbol on per-roll rows + SID-tagged end sentinel; preserves bare-permtick fallback via new `emit_sid_hash=False` test; preserves market_dir override scenario for /MYM-style cases
+   - Existing `TestSynthesizeFuturesMapFile` (6 tests, updated) — content assertions compute SIDs dynamically via `compute_future_sid_hash` so the test stays valid through future contract-month additions
+   
+   `tests/unit/test_bar_sync.py::TestBarSyncWorkerMapFileSynthesis::test_synthesis_runs_after_successful_cycle` updated to assert the SID-tagged end sentinel format. The other 4 synthesis tests cover sentinel-only output which remains unchanged.
+
+4. **No alembic migrations.** Pure pure-policy + LEAN-format-only changes.
+
+5. **Pre-flight check before deploy:**
+   - `make lint` ✅ (3 files reformatted on first ruff format pass; clean now)
+   - `make typecheck` ✅ (151 source files; 0 errors)
+   - `make test-unit` ✅ (2016 tests pass in 39.88s; +55 new tests = 1961 → 2016)
+   - `make ci` ✅ (full lint + typecheck + test + frontend-test in ~3 min)
+   - `services/data/**` is on the §2.3 hot-fix whitelist; `lean/**` is on the §2.3 hot-fix whitelist; no `risk-review-approved` label required
+   - 0 alembic migrations
+   - 0 cost (file-IO + Python integer arithmetic only)
+
+**Why one PR with both changes (not two):** the two changes are coupled. The synthesizer extension alone (SID-hash form without re-applying the bare-ticker `add_future`) is no-op — LEAN's `MapFileResolver._bySymbol["/MES"]` still misses because the on-disk permtick is `mes` (no slash). The `add_future` change alone (bare ticker without the SID-hash MappedSymbol) recreates PR #223's crash loop. They must deploy atomically; landing them as one PR makes the operator-side deploy ceremony a single restart and prevents the half-state crash.
+
+**Deploy ceremony (after merge):**
+
+1. SSH to VPS: `ssh root@178.156.239.84`
+2. `cd /opt/trading && git pull --ff-only`
+3. `docker compose --env-file deploy/.env build api` (rebuilds api with the new synthesizer). `lean_local` is bind-mounted from the host so no rebuild needed; `docker compose --env-file deploy/.env up -d --force-recreate api lean_local` picks up both changes.
+4. Watch api logs for `bar_sync_worker_spawned`. The api restart triggers bar_sync's first-fire-of-day (because `last_fired_session_date_et=None` on a fresh worker), which will re-synthesize all 7 futures map_files in the new SID-hash form. Expected per-ticker log: `futures_map_file_synthesized content_changed=true emit_sid_hash=true roll_count=N sessions_scanned=~615`.
+5. Read one of the freshly-synthesized map_files: `docker compose exec lean_local cat /Lean/Data/future/cme/map_files/mes.csv`. Expect: inception sentinel `18991230,mes,CME` + per-roll rows in the form `<YYYYMMDD>,mes <12-char-base36-hash>,CME,2` + end sentinel `20501231,mes <last-sid>,CME,2`.
+6. Watch lean_local boot logs:
+   ```bash
+   docker compose logs lean_local --since 60s | grep "LiveMappingEventProvider"
+   ```
+   Expected for /MES (and similarly for the other 6 futures): `LiveMappingEventProvider(/MES,...): new tradable date 20260523. New MapFile: True. MapFile.Count Old: 0 New: 8` (or 9/17 depending on roll count). ETFs should still show `Count: 2`.
+7. **DON'T trigger an off-schedule cycle.** The natural 21:00 UTC bar_sync (which re-fires the synthesizer with the new SID form) + 21:10 UTC systemd-timer-driven lean_local restart + 21:30 UTC LEAN cycle the next day (2026-05-23) is the canonical validation. PR #220's probe is still armed; expected output:
+   - **Success**: `v1_history_probe market=/MES hist_type=DataFrame hist_len=205 hist_cols=['close','high','low','open','volume']` for all 7 futures. ETFs unchanged. `v1_signals_generated session_date=2026-05-23 signals_emitted_count=N rejections_count=M` with N+M=11 (no `v1_history_unavailable`).
+   - **Still empty**: `hist_len=0 hist_cols=[]`. The SID-hash + add_future fix wasn't sufficient. Next candidates: /MYM's market_id may need to be CBOT (id=8) instead of CME (id=23) per LEAN's `FuturesExpiryFunctions.cs::MicroDow30EMini` registration — the handoff brief flagged this as ambiguous + recommended the CME choice as the empirically-validated default; if /MYM specifically returns empty while the other 6 work, swap the /MYM market_dir → "cbot" in a follow-up.
+
+**Open follow-ups:**
+
+1. **Validation cycle 2026-05-23 21:30 UTC.** Probe output is the empirical test of this fix. The probe in `lean/v1_strategy.py::_log_history_probe` is still armed; if all 7 futures land `hist_len=205`, the PR #220 probe retirement is the next follow-up PR.
+2. **/MYM market_id revisit.** If runtime shows /MYM's SID mismatching LEAN's internally-computed SID (visible as a downstream `Symbol` operation anomaly), swap market_dir → "cbot" per `FuturesExpiryFunctions.cs::MicroDow30EMini` registration. Today we use "cme" per the handoff brief's recommendation + the file lives at `future/cme/map_files/mym.csv` per bar_sync's existing `market_dir`.
+3. **/M2K bar_sync investigation.** Pre-existing per the prior decisions-log entries (2nd consecutive day failure). Independent PR.
+4. **PR #220 probe retirement.** Land after the validation cycle confirms the fix. Removes `_log_history_probe` + its call site.
+
+**Cost / scope impact:**
+
+- +370 net lines in `services/data/map_file_synthesis.py` (382 → ~750) + 55 net new tests in `tests/unit/test_map_file_synthesis.py` + 1 test updated in `tests/unit/test_bar_sync.py` + comment-block updates in `lean/v1_strategy.py::initialize` (+ the single-character `f"/{ticker}"` → `ticker` change)
+- 55 net new tests; total unit test count 1961 → 2016
+- 0 alembic migrations
+- 0 ongoing cost
+- Hot-fix whitelist (`services/data/**` + `lean/**` + `tests/**`); no `risk-review-approved` label
+
+---
+
 ### 2026-05-22 — bar_sync map_file synthesis lands (resolver-unblocking fix for futures `self.history()`)
 
 **Trigger:** the "Diagnostic probe (PR #220) CONFIRMS root cause" entry below identified LEAN's continuous-contract resolver as the most-supported hypothesis for the 0/7 futures + 4/4 ETFs split in `v1_history_probe`. The "Tomorrow's fix path (concrete)" subsection of that entry described what this PR implements: a new `services/data/map_file_synthesis.py` module + a wiring hook in `BarSyncWorker.run_cycle`.

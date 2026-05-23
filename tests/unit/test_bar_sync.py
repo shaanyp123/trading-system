@@ -2447,11 +2447,18 @@ class TestBarSyncWorkerMapFileSynthesis:
         lines = content.splitlines()
         # Pre-synthesis (bar_sync's own sentinel) would be 2 lines without
         # mode integer; post-synthesis we expect at least inception + 1 roll
-        # + end sentinel = 3 lines, and the end sentinel carries the mode.
+        # + end sentinel = 3 lines, and the end sentinel carries the mode
+        # AND the SID hash of the LAST detected roll (2026-05-22 SID-hash
+        # extension — emit_sid_hash=True is the default; per-roll rows
+        # MUST carry the LEAN-canonical `<perm> <SID-hash>` MappedSymbol
+        # form or `LiveSynchronizer` crashes on `SecurityIdentifier.Parse`).
+        from services.data.map_file_synthesis import compute_future_sid_hash
+
+        sid_jun_2026 = compute_future_sid_hash(expiry_date=date(2026, 6, 18), market_dir="cme")
         assert lines[0] == "18991230,mes,CME"
-        assert lines[-1] == "20501231,mes,CME,2"
+        assert lines[-1] == f"20501231,mes {sid_jun_2026},CME,2"
         # Genuine transition 202603 → 202606 detected.
-        assert any(",mes,CME,2" in ln and ln != lines[-1] for ln in lines[1:-1])
+        assert any(f",mes {sid_jun_2026},CME,2" in ln and ln != lines[-1] for ln in lines[1:-1])
 
     def test_synthesis_skipped_when_disabled(self, tmp_path: Path) -> None:
         config = BarSyncConfig(

@@ -14,8 +14,19 @@ Coverage:
 * TestDetectRealRolls — empty, single-expiry, clean-rolls, noisy-then-clean,
   the operator's /MES-like flip-flop pattern, persistence_days=1 boundary,
   persistence_days=0 raises
+* TestEncodeBase36 — known reference values from LEAN's
+  ``Common/Extensions.cs::EncodeBase36``
+* TestOadate — known .NET reference values
+* TestComputeFutureSidHash — 8+ parametrized cases reproducing real
+  contracts from LEAN's bundled ``Data/future/cme/map_files/es.csv``
+* TestExpiryHelpers — primitives (third_friday, last_friday,
+  nth_last_business_day, add_business_days, add_business_days_if_holiday)
+* TestExpiryRules — per-ticker known expiries
+  (e.g. MES Mar 2026 → 2026-03-20; MCL Dec 2025 → 2025-11-19;
+  MES Jun 2026 → 2026-06-18 because Juneteenth)
 * TestBuildFuturesMapFileWithRolls — empty rolls, single roll, multiple
-  rolls, mode override, lowercase normalization
+  rolls, mode override, lowercase normalization, SID emission default,
+  bare-permtick fallback, end-sentinel SID propagation
 * TestSynthesizeFuturesMapFile — integration via tmp_path
 * TestIdempotency — synthesis twice → byte-identical + mtime preserved on
   no-content-change cycle
@@ -42,8 +53,12 @@ from services.data.map_file_synthesis import (
     MapFileSynthesisResult,
     UniverseSession,
     build_futures_map_file_with_rolls,
+    compute_future_expiry,
+    compute_future_sid_hash,
     detect_real_rolls,
+    encode_base36,
     iter_universe_sessions,
+    oadate,
     parse_universe_file,
     synthesize_futures_map_file,
 )
@@ -405,12 +420,284 @@ class TestDetectRealRolls:
 
 
 # ---------------------------------------------------------------------------
+# encode_base36 + oadate — primitive helpers
+# ---------------------------------------------------------------------------
+
+
+class TestEncodeBase36:
+    def test_zero_returns_empty_string(self) -> None:
+        # Mirrors LEAN's Extensions.cs::EncodeBase36 ("" for n==0).
+        assert encode_base36(0) == ""
+
+    def test_basic_digits(self) -> None:
+        for n, expected in [
+            (1, "1"),
+            (9, "9"),
+            (10, "A"),
+            (35, "Z"),
+            (36, "10"),
+            (37, "11"),
+            (71, "1Z"),
+            (72, "20"),
+        ]:
+            assert encode_base36(n) == expected, (
+                f"{n!r} → {encode_base36(n)!r}, expected {expected!r}"
+            )
+
+    def test_es_dec_2009_otherdata_reproduces_uik2f7cj4v0h(self) -> None:
+        # The full integer for ES Dec 2009 (expiry 2009-12-18, market=cme,
+        # secType=Future): 4_016_500_000_000_002_305. base36 → UIK2F7CJ4V0H.
+        assert encode_base36(4_016_500_000_000_002_305) == "UIK2F7CJ4V0H"
+
+    def test_negative_raises(self) -> None:
+        with pytest.raises(ValueError, match="non-negative"):
+            encode_base36(-1)
+
+
+class TestOadate:
+    @pytest.mark.parametrize(
+        "d, expected",
+        [
+            # .NET reference values (cross-check via DateTime.ToOADate())
+            (date(1900, 3, 1), 61),
+            (date(2009, 12, 18), 40165),  # ES Dec 2009 contract
+            (date(2025, 3, 21), 45737),
+            (date(2026, 5, 22), 46164),
+        ],
+    )
+    def test_known_reference_values(self, d: date, expected: int) -> None:
+        assert oadate(d) == expected
+
+    def test_pre_1900_03_01_raises(self) -> None:
+        with pytest.raises(ValueError, match="1900-03-01"):
+            oadate(date(1899, 12, 30))
+
+    def test_1900_03_01_boundary_ok(self) -> None:
+        # The exact boundary should succeed.
+        assert oadate(date(1900, 3, 1)) == 61
+
+
+# ---------------------------------------------------------------------------
+# compute_future_sid_hash — 12 reference SIDs from LEAN's bundled es.csv
+# ---------------------------------------------------------------------------
+
+
+class TestComputeFutureSidHash:
+    @pytest.mark.parametrize(
+        "expiry, market_dir, expected_sid",
+        [
+            # All from QuantConnect/Lean/Data/future/cme/map_files/es.csv
+            # (third Friday of contract month; verified by walking gc.csv
+            # reverse-engineering then forward-validating).
+            (date(2009, 12, 18), "cme", "uik2f7cj4v0h"),  # ES Dec 2009
+            (date(2010, 3, 19), "cme", "ul1o3pmw3im9"),  # ES Mar 2010
+            (date(2010, 6, 18), "cme", "unj9s7x92681"),  # ES Jun 2010
+            (date(2010, 9, 17), "cme", "uq0vgq7m0ttt"),  # ES Sep 2010
+            (date(2010, 12, 17), "cme", "usih58hyzhfl"),  # ES Dec 2010
+            (date(2015, 6, 19), "cme", "w1i7j18mukg1"),  # ES Jun 2015
+            (date(2020, 12, 18), "cme", "xkgcmv4qk9vl"),  # ES Dec 2020
+            (date(2023, 6, 16), "cme", "y9cdfy0c6txd"),  # ES Jun 2023
+        ],
+    )
+    def test_es_bundled_reference(self, expiry: date, market_dir: str, expected_sid: str) -> None:
+        assert compute_future_sid_hash(expiry_date=expiry, market_dir=market_dir) == expected_sid
+
+    def test_unknown_market_dir_raises(self) -> None:
+        with pytest.raises(ValueError, match="not in known LEAN markets"):
+            compute_future_sid_hash(expiry_date=date(2026, 3, 20), market_dir="bogus")
+
+    def test_market_dir_case_insensitive(self) -> None:
+        # Uppercase "CME" should still resolve via lowercase lookup.
+        a = compute_future_sid_hash(expiry_date=date(2009, 12, 18), market_dir="CME")
+        b = compute_future_sid_hash(expiry_date=date(2009, 12, 18), market_dir="cme")
+        assert a == b == "uik2f7cj4v0h"
+
+    def test_market_id_affects_sid(self) -> None:
+        # Same expiry, different market → different SID. Sanity-checks
+        # the market_id is actually in the bit-packed integer.
+        cme_sid = compute_future_sid_hash(expiry_date=date(2026, 3, 20), market_dir="cme")
+        cbot_sid = compute_future_sid_hash(expiry_date=date(2026, 3, 20), market_dir="cbot")
+        comex_sid = compute_future_sid_hash(expiry_date=date(2026, 3, 20), market_dir="comex")
+        assert cme_sid != cbot_sid != comex_sid
+        assert cme_sid != comex_sid
+
+    def test_returned_value_is_lowercase(self) -> None:
+        sid = compute_future_sid_hash(expiry_date=date(2009, 12, 18), market_dir="cme")
+        assert sid == sid.lower()
+
+
+# ---------------------------------------------------------------------------
+# Expiry helpers — primitives
+# ---------------------------------------------------------------------------
+
+
+class TestExpiryHelpers:
+    def test_third_friday_of_month_examples(self) -> None:
+        # March 2026: 1st Fri = Mar 6 → 3rd Fri = Mar 20
+        assert mfs._third_friday_of_month(2026, 3) == date(2026, 3, 20)
+        # June 2026: 1st Fri = Jun 5 → 3rd Fri = Jun 19 (Juneteenth!)
+        assert mfs._third_friday_of_month(2026, 6) == date(2026, 6, 19)
+        # Dec 2009: 1st Fri = Dec 4 → 3rd Fri = Dec 18
+        assert mfs._third_friday_of_month(2009, 12) == date(2009, 12, 18)
+
+    def test_last_friday_of_month_examples(self) -> None:
+        # Jun 2026: last Friday = Jun 26
+        assert mfs._last_friday_of_month(2026, 6) == date(2026, 6, 26)
+        # Feb 2026: last Friday = Feb 27
+        assert mfs._last_friday_of_month(2026, 2) == date(2026, 2, 27)
+        # Mar 2026: last Friday = Mar 27
+        assert mfs._last_friday_of_month(2026, 3) == date(2026, 3, 27)
+
+    def test_nth_last_business_day_no_holidays(self) -> None:
+        # Feb 2013: EOM = Feb 28 (Thu). Last biz = Feb 28; 2nd-last = Feb 27;
+        # 3rd-last = Feb 26 (Tue). No holidays in Feb 2013.
+        empty_holidays: frozenset[date] = frozenset()
+        assert mfs._nth_last_business_day(2013, 2, 3, empty_holidays) == date(2013, 2, 26)
+
+    def test_nth_last_business_day_with_holiday(self) -> None:
+        # March 2013 EOM = Mar 31 (Sun). Last biz = Mar 29 (Fri).
+        # But Mar 29 2013 = Good Friday → holiday → skip.
+        # So last biz = Mar 28 (Thu); 2nd-last = Mar 27; 3rd-last = Mar 26.
+        holidays = frozenset({date(2013, 3, 29)})
+        assert mfs._nth_last_business_day(2013, 3, 3, holidays) == date(2013, 3, 26)
+
+    def test_add_business_days_negative(self) -> None:
+        # Nov 25 2025 (Tue) minus 4 biz days = Nov 19 (Wed) — used by /MCL.
+        empty_holidays: frozenset[date] = frozenset()
+        assert mfs._add_business_days(date(2025, 11, 25), -4, empty_holidays) == date(2025, 11, 19)
+
+    def test_add_business_days_skips_weekend(self) -> None:
+        # Mon plus 1 biz day = Tue (no weekend in between)
+        empty_holidays: frozenset[date] = frozenset()
+        assert mfs._add_business_days(date(2026, 6, 1), 1, empty_holidays) == date(2026, 6, 2)
+        # Fri plus 1 biz day = Mon (skip Sat + Sun)
+        assert mfs._add_business_days(date(2026, 6, 5), 1, empty_holidays) == date(2026, 6, 8)
+
+    def test_add_business_days_if_holiday_skips_when_not_holiday(self) -> None:
+        empty_holidays: frozenset[date] = frozenset()
+        # Mar 15 2026 is Sunday but our function only triggers on holiday match —
+        # since Mar 15 isn't in `holidays`, it's returned as-is.
+        d = date(2026, 3, 15)
+        assert mfs._add_business_days_if_holiday(d, -1, empty_holidays) == d
+
+    def test_add_business_days_if_holiday_subtracts_when_holiday(self) -> None:
+        # Jun 19 2026 is Juneteenth; subtract 1 biz day → Jun 18 (Thu).
+        holidays = frozenset({date(2026, 6, 19)})
+        assert mfs._add_business_days_if_holiday(date(2026, 6, 19), -1, holidays) == date(
+            2026, 6, 18
+        )
+
+
+# ---------------------------------------------------------------------------
+# compute_future_expiry — per-ticker rules
+# ---------------------------------------------------------------------------
+
+
+class TestComputeFutureExpiry:
+    @pytest.mark.parametrize(
+        "ticker, contract_month, expected",
+        [
+            # /MES, /MNQ, /MYM, /M2K — quarterly, third Friday.
+            # Mar 2026: 3rd Friday Mar 20 (no holiday).
+            ("MES", "202603", date(2026, 3, 20)),
+            ("MNQ", "202603", date(2026, 3, 20)),
+            ("MYM", "202603", date(2026, 3, 20)),
+            ("M2K", "202603", date(2026, 3, 20)),
+            # Jun 2026: 3rd Friday Jun 19 = Juneteenth → expiry Jun 18 Thu.
+            ("MES", "202606", date(2026, 6, 18)),
+            ("MNQ", "202606", date(2026, 6, 18)),
+            ("MYM", "202606", date(2026, 6, 18)),
+            ("M2K", "202606", date(2026, 6, 18)),
+            # Sep 2025: 3rd Friday Sep 19.
+            ("MES", "202509", date(2025, 9, 19)),
+            # Dec 2009: 3rd Friday Dec 18 (validates against the bundled es.csv reference).
+            ("MES", "200912", date(2009, 12, 18)),
+        ],
+    )
+    def test_quarterly_index_micros(self, ticker: str, contract_month: str, expected: date) -> None:
+        assert compute_future_expiry(ticker=ticker, contract_month=contract_month) == expected
+
+    @pytest.mark.parametrize(
+        "contract_month, expected",
+        [
+            # /MGC — bi-monthly, 3rd-last biz day of contract month
+            # (with Good Friday adjustment for Apr 2026).
+            #
+            # Feb 2026: EOM = Feb 28 (Sat). Last biz = Feb 27 (Fri).
+            # 2nd-last = Feb 26 (Thu). 3rd-last = Feb 25 (Wed).
+            ("202602", date(2026, 2, 25)),
+            # Apr 2026: EOM = Apr 30 (Thu). Last biz = Apr 30 (Thu).
+            # 2nd-last = Apr 29 (Wed). 3rd-last = Apr 28 (Tue).
+            # Apr 3 2026 is Good Friday but that's not within the last
+            # 3 biz days of April. Result: Apr 28 (no adjustment).
+            ("202604", date(2026, 4, 28)),
+        ],
+    )
+    def test_mgc_bimonthly(self, contract_month: str, expected: date) -> None:
+        assert compute_future_expiry(ticker="MGC", contract_month=contract_month) == expected
+
+    @pytest.mark.parametrize(
+        "contract_month, expected",
+        [
+            # /MCL — monthly, 4 biz days before the 25th of MONTH BEFORE.
+            #
+            # Dec 2025 contract: prev_month = Nov 2025. 25th = Tue Nov 25.
+            # -4 biz days: Nov 25 → walk: Nov 24 (Mon)=1, Nov 21 (Fri)=2,
+            # Nov 20 (Thu)=3, Nov 19 (Wed)=4 → return Nov 19.
+            ("202512", date(2025, 11, 19)),
+            # Jul 2026 contract: prev = Jun 2026. 25th = Thu Jun 25.
+            # -4 biz days: Jun 24=1, Jun 23=2, Jun 22=3, Jun 19=4
+            # (Jun 19 is Juneteenth — a /MCL holiday). The 25th itself isn't a
+            # holiday, so businessDays stays at -4. Skipping holiday Jun 19:
+            # Jun 24=1, 23=2, 22=3, 19 SKIP (holiday), 18=4 → Jun 18.
+            ("202607", date(2026, 6, 18)),
+        ],
+    )
+    def test_mcl_monthly(self, contract_month: str, expected: date) -> None:
+        assert compute_future_expiry(ticker="MCL", contract_month=contract_month) == expected
+
+    @pytest.mark.parametrize(
+        "contract_month, expected",
+        [
+            # /MBT — monthly, last Friday of contract month.
+            # Jun 2026 last Fri = Jun 26.
+            ("202606", date(2026, 6, 26)),
+            # Jul 2026 last Fri = Jul 31.
+            ("202607", date(2026, 7, 31)),
+            # Sep 2026 last Fri = Sep 25 (Sep 4 is not the last Fri).
+            ("202609", date(2026, 9, 25)),
+        ],
+    )
+    def test_mbt_monthly(self, contract_month: str, expected: date) -> None:
+        assert compute_future_expiry(ticker="MBT", contract_month=contract_month) == expected
+
+    def test_unknown_ticker_raises(self) -> None:
+        with pytest.raises(ValueError, match="no expiry rule"):
+            compute_future_expiry(ticker="BOGUS", contract_month="202606")
+
+    def test_malformed_contract_month_raises(self) -> None:
+        with pytest.raises(ValueError, match="6-digit YYYYMM"):
+            compute_future_expiry(ticker="MES", contract_month="2026")
+
+    def test_invalid_month_raises(self) -> None:
+        with pytest.raises(ValueError, match="invalid"):
+            compute_future_expiry(ticker="MES", contract_month="202613")
+
+    def test_ticker_case_insensitive(self) -> None:
+        a = compute_future_expiry(ticker="MES", contract_month="202603")
+        b = compute_future_expiry(ticker="mes", contract_month="202603")
+        assert a == b == date(2026, 3, 20)
+
+
+# ---------------------------------------------------------------------------
 # Map_file content rendering
 # ---------------------------------------------------------------------------
 
 
 class TestBuildFuturesMapFileWithRolls:
-    def test_empty_rolls_writes_2_sentinels(self) -> None:
+    def test_empty_rolls_writes_2_sentinels_bare(self) -> None:
+        # With no rolls there's no SID to propagate → end sentinel falls
+        # back to bare permtick. Inception sentinel is always bare.
         content = build_futures_map_file_with_rolls(
             ticker="MES",
             market_code="CME",
@@ -418,12 +705,12 @@ class TestBuildFuturesMapFileWithRolls:
         )
         assert content == "18991230,mes,CME\n20501231,mes,CME,2\n"
 
-    def test_single_roll_emits_3_rows(self) -> None:
+    def test_single_roll_emits_3_rows_with_sid(self) -> None:
         rolls = [
             FuturesRollTransition(
-                boundary_date=date(2026, 6, 20),
-                from_expiry="202603",
-                to_expiry="202606",
+                boundary_date=date(2026, 3, 20),
+                from_expiry="202512",
+                to_expiry="202603",
                 persisted_sessions=45,
             )
         ]
@@ -432,10 +719,17 @@ class TestBuildFuturesMapFileWithRolls:
             market_code="CME",
             rolls=rolls,
         )
-        expected = "18991230,mes,CME\n20260620,mes,CME,2\n20501231,mes,CME,2\n"
-        assert content == expected
+        lines = content.splitlines()
+        # Inception sentinel: bare permtick (no SID).
+        assert lines[0] == "18991230,mes,CME"
+        # Roll row: SID-hash MappedSymbol.
+        # MES 202603 → expiry Mar 20 2026 → SID computed from (Mar 20, cme).
+        expected_sid = compute_future_sid_hash(expiry_date=date(2026, 3, 20), market_dir="cme")
+        assert lines[1] == f"20260320,mes {expected_sid},CME,2"
+        # End sentinel: carries last roll's SID forward.
+        assert lines[2] == f"20501231,mes {expected_sid},CME,2"
 
-    def test_multiple_rolls_in_order(self) -> None:
+    def test_multiple_rolls_in_order_with_distinct_sids(self) -> None:
         rolls = [
             FuturesRollTransition(
                 boundary_date=date(2026, 3, 20),
@@ -444,7 +738,7 @@ class TestBuildFuturesMapFileWithRolls:
                 persisted_sessions=50,
             ),
             FuturesRollTransition(
-                boundary_date=date(2026, 6, 20),
+                boundary_date=date(2026, 6, 15),
                 from_expiry="202603",
                 to_expiry="202606",
                 persisted_sessions=50,
@@ -457,9 +751,14 @@ class TestBuildFuturesMapFileWithRolls:
         )
         lines = content.splitlines()
         assert lines[0] == "18991230,mes,CME"
-        assert lines[1] == "20260320,mes,CME,2"
-        assert lines[2] == "20260620,mes,CME,2"
-        assert lines[3] == "20501231,mes,CME,2"
+        sid_mar = compute_future_sid_hash(expiry_date=date(2026, 3, 20), market_dir="cme")
+        sid_jun = compute_future_sid_hash(expiry_date=date(2026, 6, 18), market_dir="cme")
+        # MES Jun 2026 expiry is Jun 18 (Juneteenth adjustment).
+        assert sid_mar != sid_jun
+        assert lines[1] == f"20260320,mes {sid_mar},CME,2"
+        assert lines[2] == f"20260615,mes {sid_jun},CME,2"
+        # End sentinel carries the LAST roll's SID.
+        assert lines[3] == f"20501231,mes {sid_jun},CME,2"
         assert len(lines) == 4
 
     def test_ticker_lowercased(self) -> None:
@@ -476,28 +775,49 @@ class TestBuildFuturesMapFileWithRolls:
             ticker="MGC",
             market_code="COMEX",
             rolls=[],
+            market_dir="comex",
         )
         assert "COMEX" in content
 
     def test_mode_int_override(self) -> None:
+        sid = compute_future_sid_hash(expiry_date=date(2026, 3, 20), market_dir="cme")
         content = build_futures_map_file_with_rolls(
             ticker="MES",
             market_code="CME",
             rolls=[
                 FuturesRollTransition(
-                    boundary_date=date(2026, 6, 20),
-                    from_expiry="202603",
-                    to_expiry="202606",
+                    boundary_date=date(2026, 3, 20),
+                    from_expiry="202512",
+                    to_expiry="202603",
                     persisted_sessions=20,
                 )
             ],
             data_mapping_mode_int=1,  # FirstDayMonth instead of OpenInterest
         )
         # Roll row + end sentinel both carry the override.
-        assert "20260620,mes,CME,1" in content
-        assert "20501231,mes,CME,1" in content
+        assert f"20260320,mes {sid},CME,1" in content
+        assert f"20501231,mes {sid},CME,1" in content
         # No mode-2 rows in this output.
         assert ",CME,2" not in content
+
+    def test_bare_permtick_fallback_via_emit_sid_hash_false(self) -> None:
+        # PR #222's pre-fix bare-permtick form, available for testing
+        # + safety fallback. Per-roll rows have NO sid-hash suffix.
+        content = build_futures_map_file_with_rolls(
+            ticker="MES",
+            market_code="CME",
+            rolls=[
+                FuturesRollTransition(
+                    boundary_date=date(2026, 3, 20),
+                    from_expiry="202512",
+                    to_expiry="202603",
+                    persisted_sessions=50,
+                )
+            ],
+            emit_sid_hash=False,
+        )
+        assert " " not in content.splitlines()[1].split(",")[1]  # no SID hash on row 1
+        assert content == "18991230,mes,CME\n20260320,mes,CME,2\n20501231,mes,CME,2\n"
 
     def test_trailing_newline(self) -> None:
         content = build_futures_map_file_with_rolls(
@@ -507,6 +827,60 @@ class TestBuildFuturesMapFileWithRolls:
         )
         assert content.endswith("\n")
         assert not content.endswith("\n\n")  # single trailing newline
+
+    def test_market_dir_override(self) -> None:
+        # /MYM canonical example: market_dir might differ from market_code.
+        # We pass market_dir="cbot" to compute SID against CBOT market_id=8
+        # while still writing CME in the third CSV column.
+        content_cme = build_futures_map_file_with_rolls(
+            ticker="MYM",
+            market_code="CME",
+            rolls=[
+                FuturesRollTransition(
+                    boundary_date=date(2026, 3, 20),
+                    from_expiry="202512",
+                    to_expiry="202603",
+                    persisted_sessions=50,
+                )
+            ],
+            market_dir="cme",
+        )
+        content_cbot = build_futures_map_file_with_rolls(
+            ticker="MYM",
+            market_code="CME",
+            rolls=[
+                FuturesRollTransition(
+                    boundary_date=date(2026, 3, 20),
+                    from_expiry="202512",
+                    to_expiry="202603",
+                    persisted_sessions=50,
+                )
+            ],
+            market_dir="cbot",
+        )
+        # CME vs CBOT yields different SIDs.
+        assert content_cme != content_cbot
+        # Both have CME in the exchange column (the 3rd CSV column).
+        for ln in content_cme.splitlines() + content_cbot.splitlines():
+            if ln and not ln.startswith("18991230,mes"):
+                assert ",CME" in ln
+
+    def test_unknown_ticker_with_sid_enabled_raises(self) -> None:
+        # Default emit_sid_hash=True needs to look up expiry rules — any
+        # unknown ticker triggers ValueError from compute_future_expiry.
+        with pytest.raises(ValueError, match="no expiry rule"):
+            build_futures_map_file_with_rolls(
+                ticker="BOGUS",
+                market_code="CME",
+                rolls=[
+                    FuturesRollTransition(
+                        boundary_date=date(2026, 3, 20),
+                        from_expiry="202512",
+                        to_expiry="202603",
+                        persisted_sessions=50,
+                    )
+                ],
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -548,22 +922,26 @@ class TestSynthesizeFuturesMapFile:
             market_code="CME",
         )
         content = result.map_file_path.read_text(encoding="utf-8")
-        # Inception sentinel + 1 roll row + end sentinel.
         lines = content.splitlines()
+        # 3 rows: inception + 1 roll + end sentinel.
+        assert len(lines) == 3
+        # Inception sentinel: bare permtick (no SID).
         assert lines[0] == "18991230,mes,CME"
-        assert lines[-1] == "20501231,mes,CME,2"
-        # The middle row pins the new expiry's first session-date.
-        boundary_idx = next(
-            i
-            for i, ln in enumerate(lines)
-            if ln.startswith("2") and ln != lines[0] and ln != lines[-1]
-        )
-        assert ",mes,CME,2" in lines[boundary_idx]
+        # Roll row: SID-hash MappedSymbol.
+        # The "to_expiry" is 202606 (June 2026) → MES Jun 2026 → expiry
+        # Jun 18 2026 (Juneteenth adjustment) → SID from (Jun 18, cme).
+        sid = compute_future_sid_hash(expiry_date=date(2026, 6, 18), market_dir="cme")
+        # Boundary date is the first session of the 2nd run (session index 30 in 30-30 split).
+        boundary = lines[1].split(",")[0]
+        assert lines[1] == f"{boundary},mes {sid},CME,2"
+        # End sentinel: carries last roll's SID.
+        assert lines[-1] == f"20501231,mes {sid},CME,2"
 
     def test_empty_universe_dir_writes_sentinel_only(self, tmp_path: Path) -> None:
         # The map_files/ dir doesn't yet exist + the universes/ dir is
         # empty — the synthesizer should produce a sentinel-only map_file
-        # rather than skip the write.
+        # rather than skip the write. End sentinel falls back to bare
+        # permtick (no SID to propagate).
         result = synthesize_futures_map_file(
             data_root=tmp_path,
             ticker="MES",
@@ -610,6 +988,24 @@ class TestSynthesizeFuturesMapFile:
         )
         assert len(lax.rolls) == 1
         assert len(strict.rolls) == 0
+
+    def test_emit_sid_hash_false_falls_back_to_bare_permtick(self, tmp_path: Path) -> None:
+        # PR #222's pre-fix output via the explicit knob.
+        universe_dir = tmp_path / "future" / "cme" / "universes" / "mes"
+        for s in _make_sessions([("202603", 30), ("202606", 30)]):
+            _write_universe_file(
+                universe_dir=universe_dir, session_date=s.session_date, expiry=s.expiry
+            )
+        result = synthesize_futures_map_file(
+            data_root=tmp_path,
+            ticker="MES",
+            market_dir="cme",
+            market_code="CME",
+            emit_sid_hash=False,
+        )
+        content = result.map_file_path.read_text(encoding="utf-8")
+        # No SID hashes anywhere; just bare permticks.
+        assert " " not in content  # no space-separated SID rows
 
 
 class TestIdempotency:
@@ -710,8 +1106,12 @@ class TestModuleContract:
             "MapFileSynthesisResult",
             "UniverseSession",
             "build_futures_map_file_with_rolls",
+            "compute_future_expiry",
+            "compute_future_sid_hash",
             "detect_real_rolls",
+            "encode_base36",
             "iter_universe_sessions",
+            "oadate",
             "parse_universe_file",
             "synthesize_futures_map_file",
         }
@@ -724,6 +1124,8 @@ class TestModuleContract:
         assert callable(synthesize_futures_map_file)
         assert callable(detect_real_rolls)
         assert callable(build_futures_map_file_with_rolls)
+        assert callable(compute_future_sid_hash)
+        assert callable(compute_future_expiry)
 
 
 # ---------------------------------------------------------------------------
