@@ -18,10 +18,12 @@ returned ``hist_len=205 hist_cols=['close','high','low','open',
 the full diagnostic chain.
 
 This module is the operator-authorized fix outlined in that entry's
-"Tomorrow's fix path (concrete)" subsection. Pure-policy — no IBKR
-I/O, no DB — reads the on-disk universe files
-:func:`services.data.bar_sync.write_futures_bundle` already produces
-and writes a populated map_file alongside the existing 2-row sentinel.
+"Tomorrow's fix path (concrete)" subsection plus the 2026-05-22 follow-up
+brief that motivated the LEAN-canonical ``<perm> <SID-hash>``
+``MappedSymbol`` rendering. Pure-policy — no IBKR I/O, no DB — reads the
+on-disk universe files :func:`services.data.bar_sync.write_futures_bundle`
+already produces and writes a populated map_file alongside the existing
+2-row sentinel.
 
 Roll detection algorithm
 ------------------------
@@ -55,34 +57,57 @@ MapFileRow.cs::Parse``::
 
 The format we render for each ticker::
 
-    18991230,<perm_lower>,<EXCHANGE>                 ← inception sentinel (no mode)
-    <YYYYMMDD>,<perm_lower>,<EXCHANGE>,2             ← roll boundary, mode=OpenInterest
+    18991230,<perm_lower>,<EXCHANGE>                              ← inception sentinel (bare permtick)
+    <YYYYMMDD>,<perm_lower> <sid_hash>,<EXCHANGE>,2               ← per-roll row, mode=OpenInterest
     ...
-    20501231,<perm_lower>,<EXCHANGE>,2               ← end sentinel, mode=OpenInterest
+    20501231,<perm_lower> <last_sid_hash>,<EXCHANGE>,2            ← end sentinel carries last roll's SID
 
-The ``MappedSymbol`` column is just the bare lowercased permtick (e.g.
-``mes``) — NOT the LEAN-reference SID-hash form (e.g. ``es
-uik2f7cj4v0h``). LEAN's reference data uses the SID hash because each
-historical contract has a distinct
-:class:`QuantConnect.SecurityIdentifier`; replicating that requires
-the Python port of LEAN's base36-encoded bit-packed
-``date+market+securityType`` plus the per-exchange expiry-date rules
-(third-Friday-of-month for index futures, varying for /MCL/MGC/MBT
-energies/metals/crypto). Since LEAN's
-``FutureUniverse.Reader`` reads the actual contract month from the
-per-day universe file (``stream.GetDateTime(DateFormat.YearMonth)``)
-and computes the Symbol via ``Symbol.CreateFuture(symbol, market,
-expiry)`` independently of the map_file's MappedSymbol, the data-file
-path resolution works without the SID hash. The map_file's
-``MappedSymbol`` only drives the
-:class:`SymbolChangedEvent`-style observable side (``Config.MappedSymbol``
-updates on roll boundaries) — the v1 strategy doesn't subscribe to
-those events.
+The ``MappedSymbol`` column on per-roll rows is the LEAN-canonical
+``<perm> <SID-hash>`` form (e.g. ``mes uik2f7cj4v0h`` — space-separated,
+permtick lowercased, SID hash lowercased). LEAN's
+:class:`LiveSynchronizer` parses this column via
+``SecurityIdentifier.Parse`` which mandates the two-part format;
+emitting bare ``mes`` on per-roll rows crashes the parser (the 2026-05-22
+PR #223 deploy proved this — runtime crash ``The string must be
+splittable on space into two parts in SecurityIdentifier.cs:line 818``
+forced the revert PR #224). The inception sentinel STAYS bare (matches
+LEAN's bundled reference data — e.g. ``Data/future/cme/map_files/es.csv``
+starts with ``18991230,es,CME``).
 
-If tomorrow's 21:30 UTC cycle's probe shows futures ``hist_len`` is
-still 0 after this PR lands, the SID-hash form is the next fallback;
-the probe in ``lean/v1_strategy.py::_log_history_probe`` is still
-armed.
+The SID hash is the base36-encoded representation of LEAN's bit-packed
+``otherData`` field per ``QuantConnect/Lean/Common/SecurityIdentifier.cs``
+``GenerateFuture``::
+
+    otherData = (oadate(expiry_date) * DAYS_OFFSET)
+              + (market_id * MARKET_OFFSET)
+              + (SECURITY_TYPE_FUTURE * SECURITY_TYPE_OFFSET)
+
+with constants from ``SecurityIdentifier.cs`` lines 79-101. Validated
+against LEAN's bundled ``Data/future/cme/map_files/es.csv`` —
+55/55 historical ES contracts reproduce byte-for-byte (see
+``tests/unit/test_map_file_synthesis.py::TestComputeFutureSidHash``).
+
+Per-product expiry rules (mirrored from ``QuantConnect/Lean/Common/
+Securities/Future/FuturesExpiryFunctions.cs``):
+
+* /MES, /MNQ, /MYM, /M2K — quarterly (Mar/Jun/Sep/Dec), 3rd Friday of
+  contract month, ``AddBusinessDaysIfHoliday(-1)`` if the 3rd Friday
+  is itself a holiday (e.g. /MES Jun 2026: 3rd Friday = 2026-06-19 =
+  Juneteenth → expiry = 2026-06-18 Thursday)
+* /MGC — bi-monthly (Feb/Apr/Jun/Aug/Oct/Dec), 3rd-last business day
+  of contract month, ``AddBusinessDaysIfHoliday(-1)`` if itself a
+  holiday
+* /MCL — monthly, trading terminates 4 business days prior to the 25th
+  calendar day of the month PRIOR to the contract month; if the 25th
+  itself is a holiday, subtract 5 business days instead
+* /MBT — monthly, last Friday of contract month,
+  ``AddBusinessDaysIfHoliday(-1)`` if itself a holiday
+
+Holiday set sourced from LEAN's ``Data/market-hours/market-hours-database.json``
+(``Future-<market>-<TICKER>`` entries, union of ``holidays`` +
+``bankHolidays`` fields), restricted to the 2020-2030 window —
+sufficient for any roll boundary in bar_sync's universe-data window
+(operator's bar_sync history spans ~2y back from today).
 
 Idempotency
 -----------
@@ -103,7 +128,7 @@ A-rule compliance
   regular PR review applies.
 * **A03** — ``structlog`` only; no ``print``, no stdlib ``logging``.
 * **A05** — no ``float`` for prices; this module handles dates +
-  expiry strings only.
+  expiry strings + integer base36 arithmetic only.
 * **A06** — :class:`datetime.date` objects (not :class:`datetime.datetime`);
   no tz needed since session-date is a calendar date, not a wall clock.
 """
@@ -112,9 +137,9 @@ from __future__ import annotations
 
 import os
 import tempfile
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Final
 
@@ -124,7 +149,7 @@ log = structlog.get_logger()
 
 
 # ---------------------------------------------------------------------------
-# Locked constants — LEAN format + roll-detection threshold
+# Locked constants — LEAN format + roll-detection threshold + SID encoding
 # ---------------------------------------------------------------------------
 
 
@@ -152,6 +177,150 @@ INCEPTION_SENTINEL_DATE: Final[date] = date(1899, 12, 30)
 
 #: LEAN's end-sentinel date (far-future).
 END_SENTINEL_DATE: Final[date] = date(2050, 12, 31)
+
+
+# --- LEAN SecurityIdentifier bit-packing constants
+# (from QuantConnect/Lean/Common/SecurityIdentifier.cs lines 79-101)
+
+#: Offset used to pack SecurityType in the lowest decimal place.
+_SECURITY_TYPE_OFFSET: Final[int] = 1
+
+#: Offset used to pack the Market integer identifier (HardcodedMarkets in Market.cs).
+_MARKET_OFFSET: Final[int] = 100
+
+#: Offset used to pack the expiry date as the .NET OADate integer (days since 1899-12-30).
+_DAYS_OFFSET: Final[int] = 100_000_000_000_000
+
+#: SecurityType.Future enum value (from QuantConnect/Lean/Common/Global.cs).
+_SECURITY_TYPE_FUTURE: Final[int] = 5
+
+#: Market integer identifiers from ``QuantConnect/Lean/Common/Market.cs``
+#: ``HardcodedMarkets``. Keyed by the lowercase market name (matching
+#: the on-disk ``market_dir`` convention + LEAN's ``Market`` constants).
+_MARKET_IDS: Final[dict[str, int]] = {
+    "usa": 1,
+    "nymex": 7,
+    "cbot": 8,
+    "comex": 22,
+    "cme": 23,
+}
+
+
+# --- LEAN future contract month cycles
+# (from QuantConnect/Lean/Common/Securities/Future/FutureExpirationCycles.cs)
+
+#: Quarterly cycle (March/June/September/December) used by /MES, /MNQ, /MYM, /M2K.
+_HMUZ_MONTHS: Final[frozenset[int]] = frozenset({3, 6, 9, 12})
+
+#: Bi-monthly cycle (Feb/Apr/Jun/Aug/Oct/Dec) used by /MGC (micro gold).
+_GJMQVZ_MONTHS: Final[frozenset[int]] = frozenset({2, 4, 6, 8, 10, 12})
+
+
+# --- Holiday calendar
+# Sourced from LEAN's Data/market-hours/market-hours-database.json (union of
+# ``holidays`` + ``bankHolidays`` per ``Future-<market>-<TICKER>`` entry),
+# restricted to 2020-2030. Sufficient for any roll boundary in bar_sync's
+# universe-data window (operator's history spans ~2y back from today).
+
+_BASE_FUTURES_HOLIDAYS_2020_2030: Final[frozenset[date]] = frozenset(
+    {
+        date(2020, 1, 1),
+        date(2020, 1, 20),
+        date(2020, 2, 17),
+        date(2020, 5, 25),
+        date(2020, 7, 3),
+        date(2020, 9, 7),
+        date(2020, 10, 12),
+        date(2020, 11, 11),
+        date(2020, 11, 26),
+        date(2021, 1, 18),
+        date(2021, 2, 15),
+        date(2021, 5, 31),
+        date(2021, 7, 5),
+        date(2021, 9, 6),
+        date(2021, 10, 11),
+        date(2021, 11, 11),
+        date(2021, 11, 25),
+        date(2021, 12, 31),
+        date(2022, 1, 17),
+        date(2022, 2, 21),
+        date(2022, 5, 30),
+        date(2022, 6, 20),
+        date(2022, 7, 4),
+        date(2022, 9, 5),
+        date(2022, 10, 10),
+        date(2022, 11, 11),
+        date(2022, 11, 24),
+        date(2022, 12, 26),
+        date(2023, 1, 16),
+        date(2023, 2, 20),
+        date(2023, 5, 29),
+        date(2023, 6, 19),
+        date(2023, 7, 4),
+        date(2023, 9, 4),
+        date(2023, 10, 9),
+        date(2023, 11, 11),
+        date(2023, 11, 23),
+        date(2023, 12, 25),
+        date(2024, 1, 1),
+        date(2024, 1, 15),
+        date(2024, 2, 19),
+        date(2024, 5, 27),
+        date(2024, 6, 19),
+        date(2024, 7, 4),
+        date(2024, 9, 2),
+        date(2024, 10, 14),
+        date(2024, 11, 11),
+        date(2024, 11, 28),
+        date(2024, 12, 25),
+        date(2025, 1, 1),
+        date(2025, 1, 20),
+        date(2025, 2, 17),
+        date(2025, 5, 26),
+        date(2025, 6, 19),
+        date(2025, 7, 4),
+        date(2025, 9, 1),
+        date(2025, 10, 13),
+        date(2025, 11, 11),
+        date(2025, 11, 27),
+        date(2025, 12, 25),
+        date(2026, 1, 1),
+        date(2026, 1, 19),
+        date(2026, 2, 16),
+        date(2026, 5, 25),
+        date(2026, 6, 19),
+        date(2026, 7, 3),
+        date(2026, 11, 26),
+        date(2026, 12, 25),
+        date(2027, 1, 1),
+    }
+)
+
+#: Per-ticker holiday additions beyond the common base. Sourced from
+#: per-ticker MHDB entries (``Future-cme-MES`` etc.); restricted to
+#: 2020-2030. Mostly tiny — most tickers add Jan 2 2023 (observed New
+#: Year's), some add Good Friday Apr 3 2026 (metals + crude), some
+#: add Labor Day Sep 7 2026.
+_PER_TICKER_HOLIDAY_EXTRA_2020_2030: Final[dict[str, frozenset[date]]] = {
+    "MES": frozenset({date(2023, 1, 2), date(2026, 9, 7)}),
+    "MNQ": frozenset({date(2023, 1, 2), date(2026, 9, 7)}),
+    "MYM": frozenset({date(2023, 1, 2), date(2026, 9, 7)}),
+    "M2K": frozenset({date(2023, 1, 2), date(2026, 9, 7)}),
+    "MGC": frozenset({date(2023, 1, 2), date(2026, 4, 3)}),
+    "MCL": frozenset({date(2023, 1, 2), date(2026, 4, 3), date(2026, 9, 7)}),
+    "MBT": frozenset({date(2026, 9, 7)}),
+}
+
+
+def _holidays_for_ticker(ticker: str) -> frozenset[date]:
+    """Return the LEAN-canonical holiday set for ``ticker`` (uppercase, no slash).
+
+    Falls back to the common base set for tickers without explicit
+    overrides — useful for tests and for any future expansion of the
+    Phase 1 universe.
+    """
+    extra = _PER_TICKER_HOLIDAY_EXTRA_2020_2030.get(ticker.upper(), frozenset())
+    return _BASE_FUTURES_HOLIDAYS_2020_2030 | extra
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +374,320 @@ class MapFileSynthesisResult:
     rolls: tuple[FuturesRollTransition, ...]
     map_file_path: Path
     content_changed: bool
+
+
+# ---------------------------------------------------------------------------
+# Pure-policy: LEAN SID-hash helpers
+# ---------------------------------------------------------------------------
+
+
+def oadate(d: date) -> int:
+    """Return .NET ``DateTime.ToOADate()`` integer days for ``d``.
+
+    The .NET OADate epoch is 1899-12-30 (Lotus 1-2-3 compatibility);
+    for any date on or after 1900-03-01 the simple subtraction matches
+    .NET's value exactly. Pre-1900-03-01 dates trigger an explicit
+    error rather than risk silent wrong output (no Phase 1 future has
+    an expiry that old, so this guard never trips in production).
+
+    Validated against multiple LEAN-bundled reference SIDs — e.g.
+    ``oadate(2009-12-18) == 40165`` (ES Dec 2009 contract → SID
+    ``uik2f7cj4v0h``).
+    """
+    if d < date(1900, 3, 1):
+        raise ValueError(
+            f"oadate not supported for dates before 1900-03-01 (got {d!r}); "
+            ".NET ToOADate has a Lotus 1-2-3 leap-year quirk before this date."
+        )
+    return (d - date(1899, 12, 30)).days
+
+
+def encode_base36(n: int) -> str:
+    """Encode a non-negative integer as uppercase base36.
+
+    Mirrors LEAN's ``QuantConnect/Lean/Common/Extensions.cs::EncodeBase36``
+    (which pushes digits onto a stack then reverses on output).
+    Returns the empty string for ``n == 0``. Raises ``ValueError`` on
+    negative input.
+    """
+    if n < 0:
+        raise ValueError(f"encode_base36 requires non-negative input, got {n!r}")
+    if n == 0:
+        return ""
+    digits: list[str] = []
+    while n:
+        n, r = divmod(n, 36)
+        digits.append(chr(ord("0") + r) if r < 10 else chr(ord("A") + r - 10))
+    return "".join(reversed(digits))
+
+
+def compute_future_sid_hash(*, expiry_date: date, market_dir: str) -> str:
+    """Compute the lowercased base36 SID hash for a futures contract.
+
+    Mirrors ``SecurityIdentifier.GenerateFuture(expiry, symbol, market)``
+    in ``QuantConnect/Lean/Common/SecurityIdentifier.cs``::
+
+        otherData = (oadate(expiry) * DAYS_OFFSET)
+                  + (market_id * MARKET_OFFSET)
+                  + (SECURITY_TYPE_FUTURE * SECURITY_TYPE_OFFSET)
+
+    Strike / strike-scale / option-style / put-call all zero for
+    futures → not added. Result is base36-encoded (uppercase per LEAN)
+    then lowercased to match the on-disk ``MapFileRow.ToCsv()``
+    convention (LEAN does ``MappedSymbol.ToLowerInvariant()`` when
+    writing).
+
+    Validated against LEAN's bundled ``Data/future/cme/map_files/es.csv``
+    — 55/55 historical ES contracts reproduce byte-for-byte. See
+    ``tests/unit/test_map_file_synthesis.py::TestComputeFutureSidHash``.
+
+    Raises ``ValueError`` if ``market_dir`` is unknown (the caller
+    almost certainly meant ``"cme"`` / ``"comex"`` / ``"nymex"`` /
+    ``"cbot"`` and we'd rather fail loudly than emit a wrong SID).
+    """
+    market_lower = market_dir.lower()
+    if market_lower not in _MARKET_IDS:
+        raise ValueError(
+            f"market_dir {market_dir!r} not in known LEAN markets; "
+            f"expected one of {sorted(_MARKET_IDS)!r}"
+        )
+    market_id = _MARKET_IDS[market_lower]
+    other_data = (
+        (oadate(expiry_date) * _DAYS_OFFSET)
+        + (market_id * _MARKET_OFFSET)
+        + (_SECURITY_TYPE_FUTURE * _SECURITY_TYPE_OFFSET)
+    )
+    return encode_base36(other_data).lower()
+
+
+# ---------------------------------------------------------------------------
+# Pure-policy: expiry-date helpers (mirror LEAN's
+# FuturesExpiryUtilityFunctions.cs)
+# ---------------------------------------------------------------------------
+
+
+def _is_common_business_day(d: date) -> bool:
+    """Mirror LEAN's ``Extensions.cs::IsCommonBusinessDay`` (Sat/Sun = False)."""
+    return d.weekday() < 5
+
+
+def _add_business_days(d: date, n: int, holidays: frozenset[date]) -> date:
+    """Mirror LEAN's ``FuturesExpiryUtilityFunctions.cs::AddBusinessDays``.
+
+    Adds ``n`` business days (positive or negative) to ``d``, skipping
+    weekends and holidays. The semantics intentionally include the
+    ``d.AddDays(±totalDays)`` final step from LEAN's C# implementation —
+    LEAN counts business days from day-after-d (positive) or
+    day-before-d (negative), NOT including d itself in the count.
+    """
+    if n == 0:
+        return d
+    if n < 0:
+        business_days = -n
+        total_days = 1
+        while True:
+            candidate = d - timedelta(days=total_days)
+            if candidate not in holidays and _is_common_business_day(candidate):
+                business_days -= 1
+                if business_days == 0:
+                    return d - timedelta(days=total_days)
+            total_days += 1
+    else:
+        business_days = n
+        total_days = 1
+        while True:
+            candidate = d + timedelta(days=total_days)
+            if candidate not in holidays and _is_common_business_day(candidate):
+                business_days -= 1
+                if business_days == 0:
+                    return d + timedelta(days=total_days)
+            total_days += 1
+
+
+def _add_business_days_if_holiday(d: date, n: int, holidays: frozenset[date]) -> date:
+    """Mirror ``AddBusinessDaysIfHoliday`` — adjust only if ``d`` is itself a holiday."""
+    if d in holidays:
+        return _add_business_days(d, n, holidays)
+    return d
+
+
+def _not_holiday(d: date, holidays: frozenset[date]) -> bool:
+    """Mirror LEAN's ``NotHoliday`` — business day AND not in holiday list."""
+    return _is_common_business_day(d) and d not in holidays
+
+
+def _nth_friday_of_month(year: int, month: int, n: int) -> date:
+    """Return the n-th Friday of (year, month). Mirror's LEAN's ``NthFriday``."""
+    if n < 1 or n > 5:
+        raise ValueError(f"n must be in [1, 5], got {n!r}")
+    d = date(year, month, 1)
+    days_to_first_fri = (4 - d.weekday()) % 7  # Friday = weekday 4
+    candidate = d + timedelta(days=days_to_first_fri + 7 * (n - 1))
+    if candidate.month != month:
+        raise ValueError(f"{n}th Friday does not exist in {year}-{month:02d}")
+    return candidate
+
+
+def _third_friday_of_month(year: int, month: int) -> date:
+    """Third Friday of (year, month) — quarterly index futures expiry primitive."""
+    return _nth_friday_of_month(year, month, 3)
+
+
+def _last_friday_of_month(year: int, month: int) -> date:
+    """Last Friday of (year, month) — /MBT crypto futures expiry primitive."""
+    # LEAN's LastWeekday walks day-of-month descending until it finds the target weekday.
+    # Equivalent: find the LAST Friday by counting backward from the last day.
+    daysinmonth = (
+        (date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)) - date(year, month, 1)
+    ).days
+    for day in range(daysinmonth, 0, -1):
+        d = date(year, month, day)
+        if d.weekday() == 4:
+            return d
+    raise AssertionError("unreachable: every month has a Friday")  # pragma: no cover
+
+
+def _nth_last_business_day(year: int, month: int, n: int, holidays: frozenset[date]) -> date:
+    """Mirror LEAN's ``NthLastBusinessDay`` — the n-th-last biz day of (year, month).
+
+    ``n=1`` is the last business day, ``n=2`` is 2nd-last, ``n=3`` is
+    3rd-last (the /MGC rule). Holidays count as non-business days.
+    """
+    if n < 1:
+        raise ValueError(f"n must be >= 1, got {n!r}")
+    daysinmonth = (
+        (date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)) - date(year, month, 1)
+    ).days
+    if n > daysinmonth:
+        raise ValueError(f"n ({n}) > days in month ({daysinmonth})")
+    last_day_of_month = date(year, month, daysinmonth)
+    # LEAN walks downward from last_day_of_month, decrementing n only when the
+    # candidate is a business day AND not a holiday. The final return is
+    # last_day_of_month.AddDays(-totalDays), where totalDays is the count of
+    # calendar days walked.
+    business_days = n
+    total_days = 0
+    while True:
+        candidate = last_day_of_month - timedelta(days=total_days)
+        if _not_holiday(candidate, holidays) and candidate not in holidays:
+            business_days -= 1
+            if business_days == 0:
+                return last_day_of_month - timedelta(days=total_days)
+        total_days += 1
+
+
+# ---------------------------------------------------------------------------
+# Pure-policy: per-product expiry rules
+# (mirror QuantConnect/Lean/Common/Securities/Future/FuturesExpiryFunctions.cs)
+# ---------------------------------------------------------------------------
+
+
+def _expiry_micro_index_quarterly(*, year: int, month: int, holidays: frozenset[date]) -> date:
+    """Expiry rule for /MES, /MNQ, /MYM, /M2K (quarterly index micro futures).
+
+    The contract month is forced to the next HMUZ (Mar/Jun/Sep/Dec)
+    month at or after ``(year, month)``, mirroring LEAN's:
+
+        while (!HMUZ.Contains(time.Month)) time = time.AddMonths(1);
+
+    Then takes the 3rd Friday of that month, with -1 biz day if the
+    3rd Friday is itself a holiday (e.g. /MES Jun 2026: 3rd Friday =
+    2026-06-19 = Juneteenth → expiry = 2026-06-18 Thursday).
+    """
+    # Roll to next HMUZ month
+    while month not in _HMUZ_MONTHS:
+        month += 1
+        if month > 12:
+            month -= 12
+            year += 1
+    third_friday = _third_friday_of_month(year, month)
+    return _add_business_days_if_holiday(third_friday, -1, holidays)
+
+
+def _expiry_micro_gold(*, year: int, month: int, holidays: frozenset[date]) -> date:
+    """Expiry rule for /MGC (micro gold, COMEX, bi-monthly Feb/Apr/Jun/Aug/Oct/Dec).
+
+    Per LEAN: roll to next GJMQVZ (Feb/Apr/Jun/Aug/Oct/Dec) month,
+    then 3rd-last business day of contract month, with -1 biz day if
+    itself a holiday.
+    """
+    while month not in _GJMQVZ_MONTHS:
+        month += 1
+        if month > 12:
+            month -= 12
+            year += 1
+    nlbd = _nth_last_business_day(year, month, 3, holidays)
+    return _add_business_days_if_holiday(nlbd, -1, holidays)
+
+
+def _expiry_micro_crude_oil(*, year: int, month: int, holidays: frozenset[date]) -> date:
+    """Expiry rule for /MCL (micro WTI crude oil, NYMEX, monthly).
+
+    Per LEAN ``FuturesExpiryFunctions.cs`` ``MicroCrudeOilWTI`` block::
+
+        previousMonth = contract_month.AddMonths(-1)
+        twentyFifthDay = new DateTime(previousMonth.Year, previousMonth.Month, 25)
+        businessDays = -4
+        if NOT NotHoliday(twentyFifthDay, holidays): businessDays -= 1
+        return AddBusinessDays(twentyFifthDay, businessDays, holidays)
+    """
+    prev_year = year if month > 1 else year - 1
+    prev_month = month - 1 if month > 1 else 12
+    twenty_fifth = date(prev_year, prev_month, 25)
+    business_days = -4
+    if not _not_holiday(twenty_fifth, holidays):
+        business_days -= 1
+    return _add_business_days(twenty_fifth, business_days, holidays)
+
+
+def _expiry_micro_bitcoin(*, year: int, month: int, holidays: frozenset[date]) -> date:
+    """Expiry rule for /MBT (micro Bitcoin, CME, monthly).
+
+    Per LEAN ``MicroBTC`` block: last Friday of contract month, -1
+    biz day if itself a holiday.
+    """
+    last_fri = _last_friday_of_month(year, month)
+    return _add_business_days_if_holiday(last_fri, -1, holidays)
+
+
+#: Per-ticker expiry rule lookup. Key is the bare uppercase ticker
+#: (no leading slash, matching the form returned by
+#: ``bar_sync.PHASE1_UNIVERSE_METADATA[...].ibkr_symbol``).
+_EXPIRY_RULES: Final[dict[str, Callable[..., date]]] = {
+    "MES": _expiry_micro_index_quarterly,
+    "MNQ": _expiry_micro_index_quarterly,
+    "MYM": _expiry_micro_index_quarterly,
+    "M2K": _expiry_micro_index_quarterly,
+    "MGC": _expiry_micro_gold,
+    "MCL": _expiry_micro_crude_oil,
+    "MBT": _expiry_micro_bitcoin,
+}
+
+
+def compute_future_expiry(*, ticker: str, contract_month: str) -> date:
+    """Compute the expiry date for ``ticker`` + ``contract_month`` (YYYYMM).
+
+    Looks up the per-product rule from :data:`_EXPIRY_RULES` and the
+    per-ticker holiday set from :data:`_PER_TICKER_HOLIDAY_EXTRA_2020_2030`.
+    Raises ``ValueError`` for unknown tickers + malformed contract_month
+    strings.
+    """
+    if len(contract_month) != 6 or not contract_month.isdigit():
+        raise ValueError(f"contract_month must be a 6-digit YYYYMM string, got {contract_month!r}")
+    year = int(contract_month[:4])
+    month = int(contract_month[4:6])
+    if year < 1900 or year > 2100 or month < 1 or month > 12:
+        raise ValueError(
+            f"contract_month {contract_month!r} parses to invalid (year, month) = ({year}, {month})"
+        )
+    rule = _EXPIRY_RULES.get(ticker.upper())
+    if rule is None:
+        raise ValueError(
+            f"no expiry rule registered for ticker {ticker!r}; "
+            f"known tickers: {sorted(_EXPIRY_RULES)!r}"
+        )
+    holidays = _holidays_for_ticker(ticker)
+    return rule(year=year, month=month, holidays=holidays)
 
 
 # ---------------------------------------------------------------------------
@@ -379,54 +862,121 @@ def _format_map_file_date(d: date) -> str:
     return f"{d:%Y%m%d}"
 
 
+def _resolve_market_dir(*, market_code: str, market_dir: str | None) -> str:
+    """Resolve the on-disk market directory for SID computation.
+
+    The synthesizer historically threaded ``market_code`` (uppercase
+    ``"CME"``/``"COMEX"``/``"NYMEX"``) — this lowercases to the
+    matching ``market_dir``. Pass ``market_dir`` explicitly to
+    override (e.g., /MYM lives in ``cme`` on disk but its LEAN
+    canonical market may be ``cbot`` per ``FuturesExpiryFunctions.cs``
+    registration; the operator's brief recommends ``cme`` until the
+    deployed runtime tells us otherwise).
+    """
+    return (market_dir if market_dir is not None else market_code).lower()
+
+
 def build_futures_map_file_with_rolls(
     *,
     ticker: str,
     market_code: str,
     rolls: Iterable[FuturesRollTransition],
     data_mapping_mode_int: int = DATA_MAPPING_MODE_OPEN_INTEREST,
+    market_dir: str | None = None,
+    emit_sid_hash: bool = True,
 ) -> str:
     """Render a LEAN-format futures map_file as a string.
 
     Structure (validated against ``QuantConnect/Lean/Data/future/cme/
     map_files/es.csv`` and the ``MapFileRow.Parse`` source)::
 
-        18991230,<lower>,<MARKET>
-        <YYYYMMDD>,<lower>,<MARKET>,<mode>      ← per roll
+        18991230,<lower>,<MARKET>                                ← inception sentinel (bare permtick)
+        <YYYYMMDD>,<lower> <sid_hash>,<MARKET>,<mode>            ← per roll, SID-hash MappedSymbol
         ...
-        20501231,<lower>,<MARKET>,<mode>
+        20501231,<lower> <last_sid_hash>,<MARKET>,<mode>         ← end sentinel carries last SID
 
-    The inception sentinel has NO ``DataMappingMode`` column so LEAN's
-    ``GetMappedSymbol`` returns ``MappedSymbol=<lower>`` for any mode
-    query before the first real roll boundary. The per-roll rows carry
-    the integer mode (``2`` for ``OpenInterest`` by default). The end
-    sentinel uses the same mode so any query past the last roll still
-    resolves cleanly.
+    The inception sentinel intentionally omits the ``DataMappingMode``
+    column AND the SID hash so LEAN's ``GetMappedSymbol`` returns
+    ``MappedSymbol=<lower>`` for any mode query before the first real
+    roll boundary. Per-roll rows carry the LEAN-canonical
+    ``<perm> <SID-hash>`` MappedSymbol (space-separated, both lowercased)
+    so ``SecurityIdentifier.Parse`` accepts them — the 2026-05-22 PR
+    #223 deploy proved that emitting bare permticks on per-roll rows
+    crashes the parser with "The string must be splittable on space
+    into two parts in SecurityIdentifier.cs:line 818".
 
-    The ``MappedSymbol`` column is the bare lowercased ticker (no
-    SID-hash suffix) — see the module docstring for the rationale.
+    The end sentinel carries the LAST roll's SID forward to
+    ``20501231`` (matches LEAN's bundled ``es.csv`` convention — its
+    end sentinel uses the most recent contract's SID). When ``rolls``
+    is empty, the end sentinel degrades to a bare permtick (no SID to
+    propagate); LEAN's resolver then has nothing to map and the strategy
+    can't construct a continuous future, but the file at least parses
+    cleanly — important because bar_sync writes a sentinel-only file
+    the first time it sees a new ticker before any roll boundaries are
+    detected.
+
+    Set ``emit_sid_hash=False`` to fall back to the pre-2026-05-22 PR
+    #222 bare-permtick form on per-roll rows. Reserved for testing
+    + the unlikely contingency where the SID-hash form breaks LEAN in
+    a way the operator hasn't anticipated; in production this should
+    always stay ``True``.
 
     Args:
         ticker: bare symbol (e.g., ``"MES"``) — case-insensitive; the
-            output is always lowercased.
+            output is always lowercased. Drives the per-product expiry
+            rule lookup.
         market_code: LEAN market code (e.g., ``"CME"``, ``"COMEX"``,
-            ``"NYMEX"``); uppercase preserved as-is.
+            ``"NYMEX"``); uppercase preserved as-is in the output's
+            3rd CSV column.
         rolls: detected transitions in ascending boundary-date order.
         data_mapping_mode_int: LEAN ``DataMappingMode`` integer; defaults
             to ``2`` (``OpenInterest``).
+        market_dir: override for the SID-hash market lookup; defaults
+            to ``market_code.lower()``. Pass explicitly when the
+            on-disk directory + canonical LEAN market disagree (e.g.,
+            /MYM lives in ``cme`` on disk per bar_sync's metadata).
+        emit_sid_hash: when True (default), emit per-roll rows in the
+            LEAN-canonical ``<perm> <SID-hash>`` form. When False,
+            emit bare permticks (PR #222's pre-fix form).
 
     Returns the map_file content as a string with trailing newline.
+
+    Raises ``ValueError`` from :func:`compute_future_sid_hash` /
+    :func:`compute_future_expiry` if any roll's ``to_expiry`` doesn't
+    parse + the ticker/market_dir are unknown (only when
+    ``emit_sid_hash=True``).
     """
     lower = ticker.lower()
+    resolved_market_dir = _resolve_market_dir(market_code=market_code, market_dir=market_dir)
+
     lines: list[str] = []
     lines.append(f"{_format_map_file_date(INCEPTION_SENTINEL_DATE)},{lower},{market_code}")
-    for roll in rolls:
+
+    rolls_list = list(rolls)
+    last_sid_hash: str | None = None
+    for roll in rolls_list:
+        if emit_sid_hash:
+            expiry_date = compute_future_expiry(ticker=ticker, contract_month=roll.to_expiry)
+            sid_hash = compute_future_sid_hash(
+                expiry_date=expiry_date, market_dir=resolved_market_dir
+            )
+            mapped_symbol = f"{lower} {sid_hash}"
+            last_sid_hash = sid_hash
+        else:
+            mapped_symbol = lower
         lines.append(
-            f"{_format_map_file_date(roll.boundary_date)},{lower},"
+            f"{_format_map_file_date(roll.boundary_date)},{mapped_symbol},"
             f"{market_code},{data_mapping_mode_int}"
         )
+
+    # End sentinel: bare permtick when no rolls; SID-tagged otherwise.
+    if last_sid_hash is None:
+        end_mapped = lower
+    else:
+        end_mapped = f"{lower} {last_sid_hash}"
     lines.append(
-        f"{_format_map_file_date(END_SENTINEL_DATE)},{lower},{market_code},{data_mapping_mode_int}"
+        f"{_format_map_file_date(END_SENTINEL_DATE)},{end_mapped},"
+        f"{market_code},{data_mapping_mode_int}"
     )
     return "\n".join(lines) + "\n"
 
@@ -479,15 +1029,18 @@ def synthesize_futures_map_file(
     market_code: str,
     persistence_days: int = DEFAULT_PERSISTENCE_DAYS,
     data_mapping_mode_int: int = DATA_MAPPING_MODE_OPEN_INTEREST,
+    emit_sid_hash: bool = True,
 ) -> MapFileSynthesisResult:
     """Synthesize one futures map_file from the on-disk universe history.
 
     Reads ``<data_root>/future/<market_dir>/universes/<ticker_lower>/``,
     detects rolls via :func:`detect_real_rolls`, renders the LEAN-format
-    content, and writes to ``<data_root>/future/<market_dir>/map_files/
-    <ticker_lower>.csv`` atomically. If the existing file content is
-    byte-identical to the freshly-rendered content, the write is
-    skipped (idempotent — preserves mtime).
+    content with SID-hash MappedSymbol entries via
+    :func:`build_futures_map_file_with_rolls`, and writes to
+    ``<data_root>/future/<market_dir>/map_files/<ticker_lower>.csv``
+    atomically. If the existing file content is byte-identical to the
+    freshly-rendered content, the write is skipped (idempotent —
+    preserves mtime).
 
     Returns a :class:`MapFileSynthesisResult` with the detected rolls
     + the actual on-disk path + a ``content_changed`` flag. Never
@@ -502,6 +1055,11 @@ def synthesize_futures_map_file(
     no rolls are detected so the on-disk format is consistent across
     "data still ingesting" and "data fully populated" states.
 
+    The SID-hash MappedSymbol path is on by default (``emit_sid_hash=True``).
+    The fallback bare-permtick form is preserved for testing + the
+    unlikely contingency where SID emission breaks LEAN; in production
+    this should always stay ``True``.
+
     Logs a single structured ``futures_map_file_synthesized`` event
     with ticker / market_code / roll_count / content_changed for
     observability — the operator can grep this line per cycle.
@@ -511,6 +1069,7 @@ def synthesize_futures_map_file(
         ticker=ticker.lower(),
         market_dir=market_dir,
         market_code=market_code,
+        emit_sid_hash=emit_sid_hash,
     )
     universe_dir = data_root / "future" / market_dir / "universes" / ticker.lower()
     sessions = list(iter_universe_sessions(universe_dir))
@@ -520,6 +1079,8 @@ def synthesize_futures_map_file(
         market_code=market_code,
         rolls=rolls,
         data_mapping_mode_int=data_mapping_mode_int,
+        market_dir=market_dir,
+        emit_sid_hash=emit_sid_hash,
     )
     map_file_path = data_root / "future" / market_dir / "map_files" / f"{ticker.lower()}.csv"
     existing = _read_existing_map_file(map_file_path)
@@ -553,8 +1114,12 @@ __all__ = [
     "MapFileSynthesisResult",
     "UniverseSession",
     "build_futures_map_file_with_rolls",
+    "compute_future_expiry",
+    "compute_future_sid_hash",
     "detect_real_rolls",
+    "encode_base36",
     "iter_universe_sessions",
+    "oadate",
     "parse_universe_file",
     "synthesize_futures_map_file",
 ]
