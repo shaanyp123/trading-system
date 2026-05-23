@@ -68,11 +68,19 @@ class TestLockedConstants:
             "/MCL",
         }
 
-    def test_v1_futures_market_paths_cme_subset(self) -> None:
-        # 5 of 7 are CME; MGC is COMEX; MCL is NYMEX. Matches
-        # scripts/seed_lean_futures_databento.py DEFAULT_UNIVERSE.
+    def test_v1_futures_market_paths_partition_by_exchange(self) -> None:
+        # 4 of 7 are CME (/MES, /MNQ, /M2K, /MBT); /MYM lives on CBOT
+        # per LEAN's FuturesExpiryFunctions.cs registration; /MGC is
+        # COMEX; /MCL is NYMEX. See services/data/bar_sync.py
+        # PHASE1_UNIVERSE_METADATA for the paired definitive metadata.
         cme_markets = {m for m, p in V1_FUTURES_MARKET_PATHS.items() if p.startswith("cme/")}
-        assert cme_markets == {"/MES", "/MNQ", "/MYM", "/M2K", "/MBT"}
+        cbot_markets = {m for m, p in V1_FUTURES_MARKET_PATHS.items() if p.startswith("cbot/")}
+        comex_markets = {m for m, p in V1_FUTURES_MARKET_PATHS.items() if p.startswith("comex/")}
+        nymex_markets = {m for m, p in V1_FUTURES_MARKET_PATHS.items() if p.startswith("nymex/")}
+        assert cme_markets == {"/MES", "/MNQ", "/M2K", "/MBT"}
+        assert cbot_markets == {"/MYM"}
+        assert comex_markets == {"/MGC"}
+        assert nymex_markets == {"/MCL"}
 
     def test_v1_futures_market_paths_format(self) -> None:
         # Each value: "<market>/universes/<lower>" — matches the seed

@@ -238,10 +238,23 @@ class MarketMeta:
 #: ("/MES" for futures, bare "TLT" for ETFs).
 PHASE1_UNIVERSE_METADATA: Final[dict[str, MarketMeta]] = {
     # Micro futures — exchange codes match the LEAN futures-daily directory
-    # convention (cme/comex/nymex).
+    # convention (cme/comex/nymex/cbot). /MYM lives on cbot per LEAN's
+    # FuturesExpiryFunctions.cs::MicroDow30EMini registration under
+    # Market.CBOT + MHDB ``Future-cbot-MYM`` entry; the other 5
+    # CME-listed index/crypto micros land on the cme directory.
     "/MES": MarketMeta("futures", "MES", "CME", "cme", "CME"),
     "/MNQ": MarketMeta("futures", "MNQ", "CME", "cme", "CME"),
-    "/MYM": MarketMeta("futures", "MYM", "CBOT", "cme", "CME"),
+    # /MYM market_dir + lean_market_code flipped from cme → cbot
+    # 2026-05-23 (PR #226). Empirical confirmation from the 2026-05-22
+    # PR #225 deploy: 6/7 futures resolved cleanly with MapFile.Count
+    # ≥ 8 but /MYM stayed at MapFile.Count: 0 because the synthesized
+    # map_file landed at ``future/cme/map_files/mym.csv`` while LEAN's
+    # resolver looked at ``future/cbot/map_files/mym.csv``. See
+    # ``Docs/decisions-log.md`` 2026-05-23 entry "/MYM market routing
+    # follows LEAN CBOT registration" for the operator-side data
+    # migration ceremony (one-time ``mv`` of existing /MYM universe +
+    # daily zip data from cme/ to cbot/ on the VPS).
+    "/MYM": MarketMeta("futures", "MYM", "CBOT", "cbot", "CBOT"),
     "/M2K": MarketMeta("futures", "M2K", "CME", "cme", "CME"),
     "/MGC": MarketMeta("futures", "MGC", "COMEX", "comex", "COMEX"),
     "/MCL": MarketMeta("futures", "MCL", "NYMEX", "nymex", "NYMEX"),

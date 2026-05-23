@@ -17,6 +17,102 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ## Entries
 
+### 2026-05-23 — /MYM market routing follows LEAN CBOT registration
+
+**Trigger:** the 2026-05-22 PR #225 ("SID-hash MappedSymbol + bare-ticker `add_future`") deploy at 02:15 UTC. 6 of 7 futures resolved cleanly with `MapFile.Count ≥ 8`:
+
+```
+LiveMappingEventProvider(MES18M26,#0,MES Z3DIALNO785D,...): MapFile.Count Old: 0 New: 8
+LiveMappingEventProvider(MNQ18M26,#0,MNQ Z3DIALNO785D,...): MapFile.Count Old: 0 New: 8
+LiveMappingEventProvider(M2K18M26,#0,M2K Z3DIALNO785D,...): MapFile.Count Old: 0 New: 8
+LiveMappingEventProvider(MGC26M26,#0,MGC Z3LDVCL0T9CT,...): MapFile.Count Old: 0 New: 9
+LiveMappingEventProvider(MCL21Q25,#0,MCL YUALVK7MSPMP,...): MapFile.Count Old: 0 New: 17
+LiveMappingEventProvider(MBT29Q25,#0,MBT YVD0B7H7S64H,...): MapFile.Count Old: 0 New: 17
+```
+
+But /MYM specifically returned `MapFile.Count Old: 0 New: 0`:
+
+```
+LiveMappingEventProvider(/MYM,#0,/MYM,Daily,TradeBar,Trade,Raw,OpenInterest): new tradable date 20260522. New MapFile: True. MapFile.Count Old: 0 New: 0
+```
+
+This is the /MYM market_id ambiguity the 2026-05-22 PR #225 handoff explicitly flagged as a known-unknown follow-up.
+
+**Root cause confirmed:** LEAN's `Common/Securities/Future/FuturesExpiryFunctions.cs` line 3269 registers `Symbol.Create(Futures.Indices.MicroDow30EMini, SecurityType.Future, Market.CBOT)` — note `Market.CBOT`, not `Market.CME`. Combined with the MHDB entry `Future-cbot-MYM` (vs `Future-cme-MES` / `Future-cme-MNQ` / etc.), LEAN's MapFileResolver for /MYM looks at `Data/future/cbot/map_files/mym.csv` — but bar_sync was writing the universe + map_file at `Data/future/cme/...mym...` per the original `PHASE1_UNIVERSE_METADATA["/MYM"].market_dir = "cme"`. PR #225's synthesizer landed a populated map_file at `future/cme/map_files/mym.csv` (8 lines, correct SID-hash form, validated locally) but LEAN never looked there for /MYM → `MapFile.Count: 0`.
+
+**What landed (this PR — #226):**
+
+1. **`services/data/bar_sync.py::PHASE1_UNIVERSE_METADATA["/MYM"]`** — flipped `market_dir="cme"` → `"cbot"` + `lean_market_code="CME"` → `"CBOT"`. `ibkr_symbol="MYM"` + `ibkr_exchange="CBOT"` unchanged (IBKR has always been on CBOT for /MYM).
+2. **`strategies/v1_trend_following/universe_freshness.py::V1_FUTURES_MARKET_PATHS["/MYM"]`** — flipped `"cme/universes/mym"` → `"cbot/universes/mym"` so the post-pivot freshness check at LEAN `initialize` time walks the correct on-disk dir.
+3. **2 tests updated**:
+   - `tests/unit/test_bar_sync.py::test_futures_market_dirs_partition_by_exchange` — /MYM moved out of the CME group, asserted under the new CBOT group
+   - `tests/unit/test_universe_freshness.py::test_v1_futures_market_paths_partition_by_exchange` (renamed from `_cme_subset`) — explicit partition across CME/CBOT/COMEX/NYMEX with /MYM under CBOT
+
+**Operator-side data migration (one-time, paired with this PR's merge):**
+
+```bash
+# On VPS, after `git pull --ff-only`:
+cd /var/lib/docker/volumes/trading_lean_data/_data
+mkdir -p future/cbot/{daily,map_files,universes}
+
+# Move /MYM's daily zip + universe history + the stale CME-side map_file
+mv future/cme/daily/mym_*.zip future/cbot/daily/
+mv future/cme/universes/mym future/cbot/universes/mym
+rm future/cme/map_files/mym.csv   # synthesizer will write the correct file at the new location on next bar_sync cycle
+chown -R 1000:1000 future/cbot/{daily,map_files,universes}
+
+# Then rebuild + restart api + lean_local; bar_sync's first-cycle-on-boot
+# fire will re-synthesize the /MYM map_file at future/cbot/map_files/mym.csv
+# with the SID-hash form computed against market_id=8 (CBOT).
+docker compose --env-file deploy/.env build api
+docker compose --env-file deploy/.env up -d --force-recreate api lean_local
+```
+
+**Post-deploy verification:**
+
+```bash
+# Expect MYM map_file at the cbot location
+docker compose exec lean_local cat /Lean/Data/future/cbot/map_files/mym.csv
+# Expect MapFile.Count > 0 in the LiveMappingEventProvider log
+docker compose logs lean_local --since 60s | grep -E "LiveMappingEventProvider.*MYM"
+```
+
+Expected pass:
+
+```
+LiveMappingEventProvider(MYM??M??,#0,MYM <12-char-base36>,...): MapFile.Count Old: 0 New: 8
+```
+
+The SID hash will differ from /MES's `Z3DIALNO785D` because /MYM's market_id is 8 (CBOT), not 23 (CME), so the bit-packed `otherData` differs even for the same expiry date (the /MYM Jun 2026 contract expires the same calendar day as /MES Jun 2026 since both use the third-Friday-of-quarterly rule).
+
+**Why the operator-side migration (rather than letting bar_sync rebuild fresh):** bar_sync's per-cycle write produces one day of universe history per fire. The synthesizer needs ≥ 15 sessions of consecutive same-expiry data per roll-noise filter (`DEFAULT_PERSISTENCE_DAYS=15`) to detect a roll. With a fresh start, /MYM would have only 1 session of history per universe expiry → 0 rolls detected → sentinel-only map_file → `MapFile.Count: 2` → continuous-contract resolver can't pick a contract → /MYM remains effectively broken until ~3 weeks of trading days accumulate.
+
+Migrating the existing ~615 sessions of universe history from `future/cme/universes/mym/` → `future/cbot/universes/mym/` preserves the operator's accumulated data window + lets the synthesizer detect all historical rolls on the first post-merge cycle.
+
+**Pre-flight check before deploy:**
+
+- `make lint` ✅
+- `make typecheck` ✅
+- `make test-unit` ✅ (2016 tests; no net change in count; 2 tests updated)
+- `make ci` ✅
+
+**Cost / scope impact:**
+
+- 2 lines changed in `services/data/bar_sync.py` (the /MYM MarketMeta) + comment block
+- 1 line changed in `strategies/v1_trend_following/universe_freshness.py` (the /MYM path) + comment block
+- 2 tests updated
+- 1 manual operator-side data migration (3 `mv` commands + 1 `rm`)
+- 0 alembic migrations
+- 0 ongoing cost
+- Hot-fix whitelist (`services/data/**` + `strategies/v1_trend_following/**`); no `risk-review-approved` label
+
+**Open follow-ups:**
+
+1. **Validation cycle 2026-05-23 21:30 UTC.** After this PR + the data migration deploy, all 7 futures should land `MapFile.Count > 0` + the probe should show `hist_len=205` across the universe.
+2. **PR #220 probe retirement.** Land after the 21:30 UTC cycle confirms.
+
+---
+
 ### 2026-05-22 — SID-hash MappedSymbol + bare-ticker `add_future` to unblock futures `self.history()`
 
 **Trigger:** the chain of three immediately-prior 2026-05-22 entries (PR #222 "bar_sync map_file synthesis lands" → PR #223 "`add_future` bare-ticker fix unblocks LEAN's MapFileResolver" → PR #224 the revert). PR #222 populated futures map_files; PR #223 changed `self.add_future(f"/{ticker}", ...)` → `self.add_future(ticker, ...)` so LEAN's `MapFileResolver._bySymbol["MES"]` lookup hit instead of missing on the `"/MES"` form; the resolver lookup succeeded but LEAN's `LiveSynchronizer` then crashed in `SecurityIdentifier.cs:line 818` ("The string must be splittable on space into two parts") because PR #222 wrote bare `mes` in the `MappedSymbol` column for every per-roll row. PR #224 reverted PR #223 to stop the crash loop, restoring the populated-but-inert state.

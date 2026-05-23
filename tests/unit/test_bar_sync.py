@@ -350,11 +350,15 @@ class TestPhase1UniverseMetadata:
             assert meta.lean_market_code == "P"  # NYSE Arca
 
     def test_futures_market_dirs_partition_by_exchange(self) -> None:
-        # CME family
-        for key in ("/MES", "/MNQ", "/MYM", "/M2K", "/MBT"):
+        # CME family (5 of 7) — /MYM moved to CBOT per PR #226 to match
+        # LEAN's FuturesExpiryFunctions.cs::MicroDow30EMini registration.
+        for key in ("/MES", "/MNQ", "/M2K", "/MBT"):
             meta = PHASE1_UNIVERSE_METADATA[key]
             assert meta.market_dir == "cme"
             assert meta.lean_market_code == "CME"
+        # CBOT (/MYM only)
+        assert PHASE1_UNIVERSE_METADATA["/MYM"].market_dir == "cbot"
+        assert PHASE1_UNIVERSE_METADATA["/MYM"].lean_market_code == "CBOT"
         # COMEX
         assert PHASE1_UNIVERSE_METADATA["/MGC"].market_dir == "comex"
         assert PHASE1_UNIVERSE_METADATA["/MGC"].lean_market_code == "COMEX"
