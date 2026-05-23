@@ -257,7 +257,15 @@ PHASE1_UNIVERSE_METADATA: Final[dict[str, MarketMeta]] = {
     "/MYM": MarketMeta("futures", "MYM", "CBOT", "cbot", "CBOT"),
     "/M2K": MarketMeta("futures", "M2K", "CME", "cme", "CME"),
     "/MGC": MarketMeta("futures", "MGC", "COMEX", "comex", "COMEX"),
-    "/MCL": MarketMeta("futures", "MCL", "NYMEX", "nymex", "NYMEX"),
+    # /MCL sidelined 2026-05-23 (PR #228) — IBKR paper-tier NYMEX
+    # entitlement gap. The sentinel-substitution + alert-builder code
+    # paths in this module remain in place + are exercised by
+    # ``tests/unit/test_bar_sync.py`` via the
+    # ``_MCL_TEST_FIXTURE_META`` constant so they don't bit-rot.
+    # See ``strategies/v1_trend_following/parameters.py``
+    # ``V1_SIDELINED_MARKETS`` for the canonical sideline registry +
+    # the re-enable runbook + ``Docs/decisions-log.md`` 2026-05-23
+    # entry "/MCL sidelined from Phase 1 universe" for the full saga.
     "/MBT": MarketMeta("futures", "MBT", "CME", "cme", "CME"),
     # ETFs — SMART-routed; map_files use the primary listing exchange code
     # (P = NYSE Arca, the listing venue for all 4 Phase 1 bond ETFs).

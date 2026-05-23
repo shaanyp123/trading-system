@@ -136,7 +136,11 @@ V1_FUTURES_MARKET_PATHS: dict[str, str] = {
     "/M2K": "cme/universes/m2k",
     "/MBT": "cme/universes/mbt",
     "/MGC": "comex/universes/mgc",
-    "/MCL": "nymex/universes/mcl",
+    # /MCL sidelined 2026-05-23 (PR #228). See
+    # ``strategies/v1_trend_following/parameters.py``
+    # ``V1_SIDELINED_MARKETS`` for the canonical sideline registry +
+    # the re-enable runbook. Add ``"/MCL": "nymex/universes/mcl"``
+    # back here as part of step 3 of that runbook when /MCL re-enables.
 }
 
 
