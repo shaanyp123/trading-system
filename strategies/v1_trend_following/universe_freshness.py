@@ -125,7 +125,14 @@ DEFAULT_STALENESS_THRESHOLD_DAYS = 5
 V1_FUTURES_MARKET_PATHS: dict[str, str] = {
     "/MES": "cme/universes/mes",
     "/MNQ": "cme/universes/mnq",
-    "/MYM": "cme/universes/mym",
+    # /MYM lives on cbot per LEAN's FuturesExpiryFunctions.cs registration
+    # under Market.CBOT — flipped from "cme/..." → "cbot/..." 2026-05-23
+    # in PR #226 to match the data path bar_sync now writes to + LEAN's
+    # MapFileResolver reads from. See services/data/bar_sync.py
+    # PHASE1_UNIVERSE_METADATA["/MYM"] for the paired metadata flip +
+    # Docs/decisions-log.md 2026-05-23 entry "/MYM market routing
+    # follows LEAN CBOT registration".
+    "/MYM": "cbot/universes/mym",
     "/M2K": "cme/universes/m2k",
     "/MBT": "cme/universes/mbt",
     "/MGC": "comex/universes/mgc",
