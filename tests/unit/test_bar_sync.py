@@ -87,6 +87,22 @@ from services.data.bar_sync import (
 # ---------------------------------------------------------------------------
 
 
+# Synthetic /MCL MarketMeta used by sentinel-substitution + alert-seam
+# tests. The /MCL key was dropped from PHASE1_UNIVERSE_METADATA in
+# 2026-05-23 PR #228 per the IBKR paper-tier NYMEX entitlement gap saga,
+# but the sentinel-substitution + alert-seam tests still need a NYMEX
+# example to exercise the code paths (which remain in services/data/
+# bar_sync.py against future re-enable). This constant carries the same
+# shape as the original /MCL entry in PHASE1_UNIVERSE_METADATA.
+_MCL_TEST_FIXTURE_META = MarketMeta(
+    kind="futures",
+    ibkr_symbol="MCL",
+    ibkr_exchange="NYMEX",
+    market_dir="nymex",
+    lean_market_code="NYMEX",
+)
+
+
 @dataclass
 class _FakeBarData:
     """Duck-typed ib-async ``BarData`` for fetch tests."""
@@ -325,22 +341,27 @@ class TestModuleConstants:
 
 
 class TestPhase1UniverseMetadata:
-    def test_universe_has_11_entries(self) -> None:
-        assert len(PHASE1_UNIVERSE_METADATA) == 11
+    def test_universe_has_10_entries(self) -> None:
+        # 10 entries post-PR-#228 (/MCL dropped per the IBKR paper-tier
+        # NYMEX entitlement gap saga). Re-bump to 11 when /MCL is
+        # re-enabled.
+        assert len(PHASE1_UNIVERSE_METADATA) == 10
 
-    def test_universe_includes_4_etfs_and_7_futures(self) -> None:
+    def test_universe_includes_4_etfs_and_6_futures(self) -> None:
         etfs = [k for k, v in PHASE1_UNIVERSE_METADATA.items() if v.kind == "etf"]
         futures = [k for k, v in PHASE1_UNIVERSE_METADATA.items() if v.kind == "futures"]
         assert len(etfs) == 4
-        assert len(futures) == 7
+        assert len(futures) == 6  # /MCL dropped 2026-05-23 (PR #228)
 
     def test_etf_keys_are_bare_tickers(self) -> None:
         etfs = sorted(k for k, v in PHASE1_UNIVERSE_METADATA.items() if v.kind == "etf")
         assert etfs == ["IEF", "SHY", "TIP", "TLT"]
 
     def test_futures_keys_are_slash_prefixed(self) -> None:
+        # 6 futures post-PR-#228 (/MCL dropped). Original 7-set was
+        # ["/M2K", "/MBT", "/MCL", "/MES", "/MGC", "/MNQ", "/MYM"].
         futs = sorted(k for k, v in PHASE1_UNIVERSE_METADATA.items() if v.kind == "futures")
-        assert futs == ["/M2K", "/MBT", "/MCL", "/MES", "/MGC", "/MNQ", "/MYM"]
+        assert futs == ["/M2K", "/MBT", "/MES", "/MGC", "/MNQ", "/MYM"]
 
     def test_etf_metadata_routes_via_smart_p(self) -> None:
         for key in ("TLT", "IEF", "SHY", "TIP"):
@@ -350,8 +371,10 @@ class TestPhase1UniverseMetadata:
             assert meta.lean_market_code == "P"  # NYSE Arca
 
     def test_futures_market_dirs_partition_by_exchange(self) -> None:
-        # CME family (5 of 7) — /MYM moved to CBOT per PR #226 to match
-        # LEAN's FuturesExpiryFunctions.cs::MicroDow30EMini registration.
+        # CME family — /MYM moved to CBOT per PR #226 to match LEAN's
+        # FuturesExpiryFunctions.cs::MicroDow30EMini registration.
+        # /MCL (NYMEX) dropped per PR #228; re-add the NYMEX assertion
+        # if/when /MCL is re-enabled.
         for key in ("/MES", "/MNQ", "/M2K", "/MBT"):
             meta = PHASE1_UNIVERSE_METADATA[key]
             assert meta.market_dir == "cme"
@@ -362,9 +385,8 @@ class TestPhase1UniverseMetadata:
         # COMEX
         assert PHASE1_UNIVERSE_METADATA["/MGC"].market_dir == "comex"
         assert PHASE1_UNIVERSE_METADATA["/MGC"].lean_market_code == "COMEX"
-        # NYMEX
-        assert PHASE1_UNIVERSE_METADATA["/MCL"].market_dir == "nymex"
-        assert PHASE1_UNIVERSE_METADATA["/MCL"].lean_market_code == "NYMEX"
+        # NYMEX entry intentionally absent (PR #228 dropped /MCL).
+        assert "/MCL" not in PHASE1_UNIVERSE_METADATA
 
 
 # ---------------------------------------------------------------------------
@@ -1776,7 +1798,7 @@ class TestSyncOneMarket:
             sync_one_market(
                 ib,
                 "/MCL",
-                PHASE1_UNIVERSE_METADATA["/MCL"],
+                _MCL_TEST_FIXTURE_META,
                 config=narrow_config,
                 today=date(2026, 5, 19),
             )
@@ -1820,7 +1842,7 @@ class TestSyncOneMarket:
             sync_one_market(
                 ib,
                 "/MCL",
-                PHASE1_UNIVERSE_METADATA["/MCL"],
+                _MCL_TEST_FIXTURE_META,
                 config=narrow_config,
                 today=date(2026, 5, 19),
             )
@@ -1909,7 +1931,7 @@ class TestSyncOneMarket:
                 sync_one_market(
                     ib,
                     "/MCL",
-                    PHASE1_UNIVERSE_METADATA["/MCL"],
+                    _MCL_TEST_FIXTURE_META,
                     config=narrow_config,
                     today=date(2026, 5, 19),
                 )
@@ -1998,7 +2020,7 @@ class TestSyncOneMarket:
             sync_one_market(
                 ib,
                 "/MCL",
-                PHASE1_UNIVERSE_METADATA["/MCL"],
+                _MCL_TEST_FIXTURE_META,
                 config=narrow_config,
                 today=date(2026, 5, 19),
             )
@@ -2073,7 +2095,7 @@ class TestSyncOneMarket:
             sync_one_market(
                 ib,
                 "/MCL",
-                PHASE1_UNIVERSE_METADATA["/MCL"],
+                _MCL_TEST_FIXTURE_META,
                 config=narrow_config,
                 today=date(2026, 5, 19),
             )
@@ -2600,7 +2622,7 @@ class TestBarSyncWorkerAlertSeam:
         return BarSyncConfig(
             markets={
                 "/MES": PHASE1_UNIVERSE_METADATA["/MES"],
-                "/MCL": PHASE1_UNIVERSE_METADATA["/MCL"],
+                "/MCL": _MCL_TEST_FIXTURE_META,
             },
             data_root=tmp_path,
             bars_per_fetch=5,

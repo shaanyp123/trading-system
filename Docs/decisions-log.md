@@ -17,6 +17,82 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ## Entries
 
+### 2026-05-23 — /MCL sidelined from Phase 1 universe (IBKR paper-tier NYMEX entitlement gap)
+
+> **Framing note (PR review feedback):** this is an *operator-reversible sideline*, not a permanent drop. All /MCL-specific support code (expiry rule, holiday calendar, sentinel substitution, alert builders, tick sizes, IBKR contract-resolution path, reconciliation labels) stays in the codebase. The canonical sideline registry is `V1_SIDELINED_MARKETS` in `strategies/v1_trend_following/parameters.py` — a new `Final[frozenset[str]]` whose docstring documents the re-enable runbook. Per-market re-enable preconditions are listed against each entry. The invariant `V1_SIDELINED_MARKETS ∩ set(V1_CANDIDATE_UNIVERSE) == ∅` is locked by `tests/unit/test_strategy_v1.py::TestSidelinedMarkets`.
+
+**Trigger:** the 2026-05-23 21:30 UTC LEAN cycle (the natural validation gate for PRs #225 + #226) emitted populated `v1_history_probe` lines for 6 of 7 futures but kept showing `hist_type=DataFrame hist_len=0 hist_cols=[]` for /MCL specifically. Diagnosis surfaced a long-standing data-quality issue that the PR #225 SID-hash + bare-ticker fix can't paper over:
+
+- **bar_sync's front-month picker degenerates for /MCL** because the operator's IBKR paper-tier account lacks NYMEX entitlement. IBKR's `reqContractDetails` for /MCL front-month returns no matches (`No security definition has been found for the request, contract: Future(symbol='MCL', lastTradeDateOrContractMonth='202606', exchange='NYMEX')` per the api logs). PR #209's `SENTINEL_OI_WHEN_FETCH_FAILED = 1` substitution unblocks the OI-mode resolver but doesn't restore the front-month picker.
+- **As a downstream consequence**, bar_sync's universe data for /MCL has been writing the same `expiry=202606` every day since at least 2025-08-21 (no genuine front-month rolls detected in 9+ months). The 2026-05-23 02:25 UTC synthesizer cycle correctly detected this — /MCL's map_file has 15 rolls between 2024-06-19 and 2025-08-20, then nothing. End sentinel carries the SID for the Aug 2025 contract forward to 2050.
+- **At LEAN's continuous-contract resolver runtime**, the resolver picks `MCL21Q25` (Aug 21 2025, EXPIRED) for today's session 2026-05-23 because the map_file's last per-roll row stamps that contract as the active mapping from 2025-08-20 forward. But bar_sync only wrote `mcl_trade_202606.csv` (June 2026 — the picker's degenerate stale pick) into the daily zip. No `MCL21Q25.csv` exists on disk → LEAN can't load any history for the contract its resolver picked → `self.history(/MCL, ..., Resolution.DAILY)` returns `hist_len=0 hist_cols=[]`.
+
+The other 6 futures (/MES /MNQ /MYM /M2K /MGC /MBT) all resolve cleanly with `hist_len=176-177` + populated OHLCV columns. /MCL is the only market gated by an entitlement issue + the only one that fails the resolver lookup.
+
+**What this PR removes from the ACTIVE universe (4 one-line drops, paired with the new sideline registry):**
+
+1. **`strategies/v1_trend_following/parameters.py::V1_CANDIDATE_UNIVERSE`** — `/MCL` removed; comment block documents the saga + re-enable preconditions.
+2. **`services/data/bar_sync.py::PHASE1_UNIVERSE_METADATA`** — `/MCL` entry removed; bar_sync no longer cycles /MCL (no daily zip refresh + no sentinel alert spam against `#alerts`). The /MCL-specific support code (sentinel substitution, alert builders) stays in place for future re-enable.
+3. **`strategies/v1_trend_following/universe_freshness.py::V1_FUTURES_MARKET_PATHS`** — `/MCL` removed; the universe-freshness check at LEAN `initialize` time no longer walks `future/nymex/universes/mcl/`.
+4. **`lean/v1_strategy.py::PHASE1_FUTURES`** — `"MCL"` removed; strategy no longer subscribes to /MCL.
+
+**What this PR adds:**
+
+5. **`strategies/v1_trend_following/parameters.py::V1_SIDELINED_MARKETS`** — new `Final[frozenset[str]]` carrying `{"/MCL"}` with a docstring documenting the re-enable runbook + per-market preconditions. Re-exported via `strategies/v1_trend_following/__init__.py::__all__` so future grep-for-sidelined queries land in one place.
+6. **`tests/unit/test_strategy_v1.py::TestSidelinedMarkets`** — 4 invariant tests: (a) `V1_SIDELINED_MARKETS ∩ set(V1_CANDIDATE_UNIVERSE) == ∅` so a market can't be simultaneously active + sidelined, (b) frozenset shape lock, (c) /MCL currently sidelined (delete this assertion in the re-enable PR), (d) /MCL absent from active universe (paired safety check).
+
+**What stays in the codebase (the property that makes this a sideline, not a drop):**
+
+- /MCL expiry rule + holiday calendar in `services/data/map_file_synthesis.py` (the `_expiry_micro_crude_oil` helper + `_PER_TICKER_HOLIDAY_EXTRA_2020_2030["MCL"]` entry + tests).
+- Sentinel substitution logic in `services/data/bar_sync.py` (`SENTINEL_OI_WHEN_FETCH_FAILED` constant + `oi_sentinel_substituted` event path + `BarSyncConfig.oi_sentinel_when_fetch_failed` knob).
+- Alert builders in `services/data/bar_sync_alerts.py` (sentinel-substitution variant).
+- Reconciliation test data in `tests/unit/test_reconciliation_*.py` (synthetic break rows labeled `/MCL` — harmless labels, no /MCL-specific reconciliation flow).
+- IBKR tick size table entry in `services/execution/ibkr_adapter.py` (`/MCL: 0.01`).
+
+**Tests updated:**
+
+- `tests/unit/test_bar_sync.py::TestPhase1UniverseMetadata` — locked-constant tests now expect 10 entries (was 11), 6 futures (was 7), futures keys exclude `/MCL`, partition test asserts `"/MCL" not in PHASE1_UNIVERSE_METADATA`.
+- `tests/unit/test_bar_sync.py` — sentinel-substitution + alert-seam tests (6 usages of `PHASE1_UNIVERSE_METADATA["/MCL"]`) repointed to a new module-level `_MCL_TEST_FIXTURE_META` constant carrying the same shape; preserves the test coverage of the sentinel code paths.
+- `tests/unit/test_universe_freshness.py::TestLockedConstants` — `test_v1_futures_market_paths_has_all_6_micros` (renamed from `_7_micros`); partition test asserts `nymex_markets == set()` with a comment pointing at the re-enable path.
+
+**Cost / scope impact:**
+
+- 4 production files changed (1-line drop each, paired comment blocks)
+- 2 test files updated (3 locked-constant test classes + 6 sentinel-substitution fixture references)
+- 0 alembic migrations
+- 0 ongoing cost
+- Hot-fix whitelist (`services/data/**` + `strategies/v1_trend_following/**` + `lean/**` + `tests/**`); no `risk-review-approved` label
+
+**Re-enable preconditions (any one is sufficient):**
+
+1. Upgrade the IBKR paper account to include NYMEX entitlement so `reqContractDetails` for /MCL returns the front-month contract.
+2. Swap /MCL's data source to an alternative feed (DataBento direct API, IEX Futures, etc.) — re-introduces a dep we'd retired but cleanly bypasses the NYMEX entitlement gap.
+3. Re-architect the /MCL universe file writer to use a static expiry-rule-driven front-month picker (deterministic; no IBKR call) so the sentinel substitution path produces the correct front-month even when the OI fetch fails.
+
+**Deploy ceremony (after merge):**
+
+```bash
+ssh root@178.156.239.84
+cd /opt/trading && git pull --ff-only
+docker compose --env-file deploy/.env build api
+docker compose --env-file deploy/.env up -d --force-recreate api lean_local
+```
+
+Optional cleanup (not required — bar_sync will simply stop touching /MCL files going forward; the existing on-disk /MCL data isn't being read by anything post-merge):
+
+```bash
+# On VPS, post-merge, if the operator wants to reclaim the ~5MB of /MCL on-disk state:
+cd /var/lib/docker/volumes/trading_lean_data/_data
+rm -rf future/nymex/{daily/mcl_*,map_files/mcl.csv,universes/mcl}
+```
+
+**Open follow-ups:**
+
+1. **Issue B — depth shortfall (the larger blocker for actual signal emission).** Today's cycle showed `hist_len=176-177` for all 6 working futures, but `MA_SLOW_DAYS=200` requires ≥ 200 bars → strategy rejects every market → 0 signals emitted. bar_sync's daily-zip architecture only writes the current front-month contract; LEAN's continuous-contract resolver needs MULTIPLE historical contracts' daily bars stitched together to reach 200+ days. Scoped as a separate session/PR.
+2. **PR #227 (probe retirement)** stays DRAFT until Issue B resolves + we see signals actually emit.
+
+---
+
 ### 2026-05-23 — /MYM market routing follows LEAN CBOT registration
 
 **Trigger:** the 2026-05-22 PR #225 ("SID-hash MappedSymbol + bare-ticker `add_future`") deploy at 02:15 UTC. 6 of 7 futures resolved cleanly with `MapFile.Count ≥ 8`:

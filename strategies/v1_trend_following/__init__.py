@@ -19,6 +19,7 @@ from strategies.v1_trend_following.audit_events import (
 from strategies.v1_trend_following.parameters import (
     V1_CANDIDATE_UNIVERSE,
     V1_DEFAULTS,
+    V1_SIDELINED_MARKETS,
     V1Parameters,
     default_v1_parameters,
 )
@@ -38,6 +39,7 @@ __all__ = [
     "STRATEGY_NAME",
     "V1_CANDIDATE_UNIVERSE",
     "V1_DEFAULTS",
+    "V1_SIDELINED_MARKETS",
     "Bar",
     "BarSeries",
     "CandidateSignal",

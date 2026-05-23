@@ -16,6 +16,8 @@ from decimal import Decimal
 import pytest
 
 from strategies.v1_trend_following import (
+    V1_CANDIDATE_UNIVERSE,
+    V1_SIDELINED_MARKETS,
     Bar,
     BarSeries,
     CandidateSignal,
@@ -320,6 +322,7 @@ def test_public_api_surface_intact() -> None:
         "STRATEGY_NAME",
         "V1_CANDIDATE_UNIVERSE",
         "V1_DEFAULTS",
+        "V1_SIDELINED_MARKETS",
         "Bar",
         "BarSeries",
         "CandidateSignal",
@@ -341,3 +344,45 @@ def test_public_api_surface_intact() -> None:
     assert expected.issubset(set(mod.__all__))
     for name in expected:
         assert hasattr(mod, name), f"strategies.v1_trend_following missing {name}"
+
+
+# ---------------------------------------------------------------------------
+# Sideline invariant
+# ---------------------------------------------------------------------------
+
+
+class TestSidelinedMarkets:
+    """``V1_SIDELINED_MARKETS`` is the canonical registry of markets that have
+    full infrastructure support in the codebase (expiry rules, holiday
+    calendars, sentinel substitution, alert builders, tick sizes, IBKR
+    contract-resolution paths, reconciliation labels) but are explicitly
+    excluded from the active strategy universe pending operator action on
+    documented re-enable preconditions.
+
+    These tests lock the invariant that no market is simultaneously active
+    AND sidelined, so a future re-enable (or an accidental sideline) can't
+    leave the system in a contradictory state.
+    """
+
+    def test_sidelined_markets_disjoint_from_candidate_universe(self) -> None:
+        # A market can't be both active and sidelined — would mean the
+        # strategy thinks it should trade something the rest of the system
+        # has explicitly disabled.
+        assert (V1_SIDELINED_MARKETS & set(V1_CANDIDATE_UNIVERSE)) == set()
+
+    def test_sidelined_markets_is_frozenset(self) -> None:
+        # frozenset (not set) — immutable so import-time consumers can't
+        # accidentally mutate the registry.
+        assert isinstance(V1_SIDELINED_MARKETS, frozenset)
+
+    def test_mcl_currently_sidelined(self) -> None:
+        # Lock the 2026-05-23 PR #228 sideline. When /MCL is re-enabled
+        # (see V1_SIDELINED_MARKETS docstring in parameters.py for the
+        # runbook), this assertion will need to be deleted in the same PR.
+        assert "/MCL" in V1_SIDELINED_MARKETS
+
+    def test_active_universe_excludes_mcl(self) -> None:
+        # Paired with test_mcl_currently_sidelined — locks the active
+        # universe doesn't accidentally re-include /MCL while it's still
+        # in the sideline registry.
+        assert "/MCL" not in V1_CANDIDATE_UNIVERSE

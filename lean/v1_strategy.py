@@ -123,7 +123,12 @@ from strategies.v1_trend_following.strategy import (  # type: ignore[import-not-
 # Phase 1 sub-universe — keep aligned with `strategies/v1_trend_following/parameters.py`
 # `V1_CANDIDATE_UNIVERSE`. The Week 2 sub-universe verification step gates this
 # list; do not add markets here without updating the canonical source.
-PHASE1_FUTURES = ("MES", "MNQ", "MYM", "M2K", "MGC", "MCL", "MBT")
+# /MCL sidelined 2026-05-23 (PR #228). See
+# ``strategies/v1_trend_following/parameters.py``
+# ``V1_SIDELINED_MARKETS`` for the canonical sideline registry + the
+# re-enable runbook. The 6 remaining micros all resolve cleanly under
+# the PR-#225 + PR-#226 SID-hash + bare-ticker + /MYM-cbot fix chain.
+PHASE1_FUTURES = ("MES", "MNQ", "MYM", "M2K", "MGC", "MBT")
 PHASE1_ETFS = ("TLT", "IEF", "SHY", "TIP")
 
 

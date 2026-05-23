@@ -57,7 +57,9 @@ class TestLockedConstants:
         # constant should be a deliberate decisions-log entry.
         assert DEFAULT_STALENESS_THRESHOLD_DAYS == 5
 
-    def test_v1_futures_market_paths_has_all_7_micros(self) -> None:
+    def test_v1_futures_market_paths_has_all_6_micros(self) -> None:
+        # 6 micros post-PR-#228 (/MCL dropped per the IBKR paper-tier
+        # NYMEX entitlement gap saga). Original 7-set included "/MCL".
         assert set(V1_FUTURES_MARKET_PATHS.keys()) == {
             "/MES",
             "/MNQ",
@@ -65,14 +67,15 @@ class TestLockedConstants:
             "/M2K",
             "/MBT",
             "/MGC",
-            "/MCL",
         }
 
     def test_v1_futures_market_paths_partition_by_exchange(self) -> None:
-        # 4 of 7 are CME (/MES, /MNQ, /M2K, /MBT); /MYM lives on CBOT
+        # 4 of 6 are CME (/MES, /MNQ, /M2K, /MBT); /MYM lives on CBOT
         # per LEAN's FuturesExpiryFunctions.cs registration; /MGC is
-        # COMEX; /MCL is NYMEX. See services/data/bar_sync.py
-        # PHASE1_UNIVERSE_METADATA for the paired definitive metadata.
+        # COMEX. /MCL (NYMEX) was dropped 2026-05-23 (PR #228) — re-add
+        # `nymex_markets == {"/MCL"}` if/when /MCL is re-enabled. See
+        # services/data/bar_sync.py PHASE1_UNIVERSE_METADATA for the
+        # paired definitive metadata.
         cme_markets = {m for m, p in V1_FUTURES_MARKET_PATHS.items() if p.startswith("cme/")}
         cbot_markets = {m for m, p in V1_FUTURES_MARKET_PATHS.items() if p.startswith("cbot/")}
         comex_markets = {m for m, p in V1_FUTURES_MARKET_PATHS.items() if p.startswith("comex/")}
@@ -80,7 +83,7 @@ class TestLockedConstants:
         assert cme_markets == {"/MES", "/MNQ", "/M2K", "/MBT"}
         assert cbot_markets == {"/MYM"}
         assert comex_markets == {"/MGC"}
-        assert nymex_markets == {"/MCL"}
+        assert nymex_markets == set()  # /MCL dropped PR #228
 
     def test_v1_futures_market_paths_format(self) -> None:
         # Each value: "<market>/universes/<lower>" — matches the seed

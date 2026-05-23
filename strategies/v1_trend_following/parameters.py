@@ -71,13 +71,21 @@ V1_DEFAULTS: Final[dict[str, int | str]] = {
 # (equity index, rates-via-ETF, commodity, crypto) at the smallest available
 # CME contract sizes plus the standard 4-point bond-ETF curve.
 V1_CANDIDATE_UNIVERSE: Final[tuple[str, ...]] = (
-    # CME micro futures.
+    # CME / CBOT / COMEX micro futures.
+    # /MCL intentionally absent (see ``V1_SIDELINED_MARKETS`` below
+    # for the re-enable runbook). All /MCL-specific support code
+    # (expiry rule, holiday calendar, sentinel substitution, alert
+    # builders, tick sizes, broker-adapter contract-resolution path)
+    # is preserved against re-enable — sidelining /MCL is a 4-line
+    # restore (this list + ``PHASE1_UNIVERSE_METADATA`` in
+    # ``services/data/bar_sync.py`` + ``V1_FUTURES_MARKET_PATHS`` in
+    # ``strategies/v1_trend_following/universe_freshness.py`` +
+    # ``PHASE1_FUTURES`` in ``lean/v1_strategy.py``).
     "/MES",  # E-mini S&P 500 Micro      ($5 x index;     ~$26k notional @ 5235)
     "/MNQ",  # E-mini Nasdaq-100 Micro   ($2 x index;     ~$36k notional @ 18000)
     "/MYM",  # E-mini Dow Micro          ($0.50 x index;  ~$20k notional @ 40000)
     "/M2K",  # E-mini Russell 2000 Micro ($5 x index;     ~$10k notional @ 2000)
     "/MGC",  # Gold Micro                (10 oz x $;      ~$24k notional @ $2400)
-    "/MCL",  # WTI Crude Micro           (100 bbl x $;    ~$8k notional  @ $80)
     "/MBT",  # Bitcoin Micro             (0.1 BTC x $;    ~$10k notional @ $100k)
     # NYSE bond ETFs (cash equity, no contract roll).
     "TLT",  # 20+ Year Treasury  — long-duration anchor
@@ -85,6 +93,48 @@ V1_CANDIDATE_UNIVERSE: Final[tuple[str, ...]] = (
     "SHY",  # 1-3 Year Treasury  — short
     "TIP",  # TIPS               — inflation-linked
 )
+
+
+# Sidelined markets: declared with all infrastructure support (expiry
+# rules, holiday calendars, sentinel substitution, alert builders,
+# tick sizes, reconciliation labels, IBKR contract-resolution path)
+# intact in the codebase but excluded from the active strategy universe
+# pending operator action on the documented re-enable preconditions.
+#
+# The invariant ``V1_SIDELINED_MARKETS ∩ set(V1_CANDIDATE_UNIVERSE) == ∅``
+# is enforced by a unit test in ``tests/unit/test_strategy_v1.py`` so a
+# market can't be both active and sidelined.
+#
+# To re-enable a sidelined market:
+#   1. Verify the precondition documented per-market below is satisfied.
+#   2. Remove the entry from this set.
+#   3. Add it back to ``V1_CANDIDATE_UNIVERSE`` (above) +
+#      ``PHASE1_UNIVERSE_METADATA`` (in ``services/data/bar_sync.py``) +
+#      ``V1_FUTURES_MARKET_PATHS`` (in
+#      ``strategies/v1_trend_following/universe_freshness.py``) +
+#      ``PHASE1_FUTURES`` (in ``lean/v1_strategy.py``).
+#   4. Rebuild api + force-recreate api + lean_local; verify the
+#      natural 21:30 UTC LEAN cycle's probe (if still armed) shows
+#      ``hist_len > 0`` for the re-enabled market.
+#   5. Update tests that pin the universe size (test_bar_sync's
+#      ``TestPhase1UniverseMetadata`` + test_universe_freshness's
+#      ``TestLockedConstants``).
+#
+# Per-market re-enable preconditions:
+#
+# - ``/MCL`` (PR #228, 2026-05-23) — sidelined because IBKR paper-tier
+#   NYMEX entitlement gap makes ``reqContractDetails`` for /MCL
+#   front-month return no matches, causing bar_sync's front-month
+#   picker to write a degenerate stale expiry. Re-enable when ANY of:
+#     (a) IBKR paper account upgraded with NYMEX entitlement, OR
+#     (b) /MCL data sourced from a non-IBKR feed (e.g. DataBento
+#         direct), OR
+#     (c) bar_sync's /MCL front-month picker rewritten to use a
+#         static expiry-rule-driven chooser independent of
+#         ``reqContractDetails``.
+#   See ``Docs/decisions-log.md`` 2026-05-23 entry "/MCL sidelined
+#   from Phase 1 universe" for the full saga.
+V1_SIDELINED_MARKETS: Final[frozenset[str]] = frozenset({"/MCL"})
 
 
 @dataclass(frozen=True, slots=True)
