@@ -17,6 +17,97 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ## Entries
 
+### 2026-05-24 — bar_sync per-bar front-month write (forward-fix for universe-file corruption)
+
+**Trigger:** the pre-cycle audit Sunday evening (Mon's 21:30 UTC cycle still hours away) into the secondary issue flagged in PR #231's decisions-log entry: the synthesized `/MES` map_file has a 9-month gap between rolls 2025-06-22 → 2026-03-16, suggesting bar_sync wrote wrong universe data during that period. Sampling on-disk universe files confirmed the root cause:
+
+| Date | Universe file's `expiry` | Correct front-month |
+|---|---|---|
+| 20250915 | `202606` | `202509` (Sep 2025 contract) |
+| 20251001 | `202606` | `202512` (Dec 2025 contract) |
+| 20251102 | `202512` ✓ | `202512` (correct on this day) |
+| 20251103 | `202606` | `202512` |
+| 20251215 | `202606` | `202512` |
+| 20260101 | `202603` ✓ | `202603` (correct on this day) |
+| 20260301 | `202603` ✓ | `202603` (correct on this day) |
+| 20260524 | `202606` ✓ | `202606` (today, current) |
+
+The OI value `299785` appears FROZEN across 175+ universe files from 2025-09-17 through 2026-05-22 — same value every day, regardless of session_date. That's not real OI; real OI varies day-to-day.
+
+**Root cause (`services/data/bar_sync.py::write_futures_bundle` per-bar loop, line ~917-920 pre-fix):**
+
+```python
+for bar in bars:
+    u_path = futures_universe_file_path(data_root, ticker, market_dir, bar.session_date)
+    u_path.parent.mkdir(parents=True, exist_ok=True)
+    u_body = build_futures_universe_csv(front_month_expiry_yyyymm, bar, universe_oi)  # ← SAME for every bar
+    u_path.write_bytes(u_body)
+```
+
+`front_month_expiry_yyyymm` is set ONCE per cycle (from `pick_front_month_expiry(reqContractDetails chain, today=cycle_today)`). The loop iterates over ALL 175+ historical bars but writes the SAME value into every per-day universe file. So:
+
+1. bar_sync runs today (2026-05-24) → picks `202606` as today's front-month
+2. The loop overwrites every universe file from 2025-09-17 → today with `expiry=202606`
+3. Older universe files (pre-Sep 17 2025, outside the 175-bar fetch window) survive with their previously-written values (which may be correct or stale depending on when they were written)
+4. The synthesizer reads all universe files → sees one long stable run of `202606` from 2025-09-17 → today → detects ONE roll boundary instead of three (2025-09 → 2025-12 → 2026-03)
+5. The map_file's resulting gap (2025-06-22 `yv` → 2026-03-16 `z3`) becomes the depth shortfall LEAN's `self.history()` exhibits
+
+The OI freeze is the same bug — `universe_oi = open_interest if open_interest > 0 else None` is set once with today's OI snapshot, then written into every per-bar universe file.
+
+This bug pre-dates the 2026-05-22 SID-hash + bare-ticker + /MYM-cbot + sideline chain. The pre-PR-225 era was hidden because LEAN's resolver returned empty before getting that far. Post-PR-225, with the resolver working, the corrupted universe-file inputs surface as the depth shortfall.
+
+**What this PR adds:**
+
+1. **`services/data/map_file_synthesis.py::front_month_for_session_date(*, ticker, session_date) -> str`** — new pure-policy helper that computes the front-month contract month (YYYYMM) active on a given session_date for a given ticker. Walks the ticker's cycle months (HMUZ for index quarterlies; GJMQVZ for /MGC; all 12 months for /MCL/MBT) in calendar order from `session_date.year` forward, computes each candidate's expiry via the existing `compute_future_expiry`, returns the smallest contract whose expiry is `>= session_date`. Deterministic — no IBKR call. 21 unit tests (`tests/unit/test_map_file_synthesis.py::TestFrontMonthForSessionDate`) covering quarterly micros, bi-monthly /MGC, monthly /MBT, the Juneteenth-adjusted /MES Jun 2026 expiry boundary, and unknown-ticker error paths. Re-exported via `services/data/map_file_synthesis.py::__all__`.
+
+2. **`services/data/bar_sync.py::_per_bar_front_month_or_fallback`** — internal helper wrapping `front_month_for_session_date` with a graceful fallback to the caller-supplied front-month if the helper raises (unknown ticker, no expiry rule, no candidate within 48 cycle iterations). The fallback path preserves pre-fix behavior for tickers we don't yet support (e.g., a new ticker added to `PHASE1_UNIVERSE_METADATA` without a paired `_EXPIRY_RULES` entry).
+
+3. **`services/data/bar_sync.py::write_futures_bundle` per-bar loop** updated to call `_per_bar_front_month_or_fallback(ticker, bar.session_date, fallback=front_month_expiry_yyyymm)` for each bar. The outer `front_month_expiry_yyyymm` parameter is still used for the trade-zip filename (which is bucketed under today's front-month — that's the correct contract for today's fetched bars). Universe files now reflect the per-bar historical front-month.
+
+4. **2 new regression tests in `tests/unit/test_bar_sync.py::TestWriteFuturesBundle`**:
+   - `test_universe_files_use_per_bar_historical_front_month` — 3 bars spanning Aug 2025 → Jan 2026 → May 2026; each universe file must have the correct historical front-month (202509 / 202603 / 202606) and NOT today's 202606 leaked into the older files.
+   - `test_universe_file_falls_back_to_caller_expiry_for_unknown_ticker` — locks the fallback path so a missing `_EXPIRY_RULES` entry doesn't crash the cycle.
+
+**One-time data repair (the value-add of this PR):**
+
+Monday's natural 21:00 UTC bar_sync cycle runs the per-bar loop against the same 175-bar window — but now each universe file gets its correct historical front-month. The synthesizer then detects:
+
+- 202509 stable run (~Jun 22 → Sep 19 2025) — already in the map_file
+- 202512 stable run (~Sep 22 → Dec 19 2025) — NEW roll boundary at 2025-09-22
+- 202603 stable run (~Dec 22 2025 → Mar 20 2026) — NEW roll boundary at 2025-12-22
+- 202606 stable run (~Mar 23 2026 → today) — boundary at 2026-03-23 (close to the current 2026-03-16 entry; may shift slightly)
+
+The resulting map_file gains 2 (probably 3) additional roll rows. LEAN's continuous-future resolver then has accurate per-session contract mappings. Combined with PR #231's `set_filter(-365, 90)`, the data layer should give `self.history()` the full ~205-day window.
+
+**Validation:** the natural Mon 2026-05-25 21:00 UTC bar_sync writes corrected universe files; 21:10 UTC systemd timer restarts lean_local; 21:30 UTC LEAN cycle's probe should show `hist_len ≥ 200` for all 6 active futures + `v1_signals_generated signals_emitted_count > 0` (or rejection mix without `insufficient_lookback`).
+
+**Cost / scope impact:**
+
+- ~110 lines added across `services/data/map_file_synthesis.py` + `services/data/bar_sync.py` (the new helper + its wrapper + the loop change + comment blocks)
+- 23 new tests (21 helper + 2 regression)
+- 1 line updated in `tests/unit/test_map_file_synthesis.py::TestModuleContract::test_public_surface` (added `front_month_for_session_date` to the expected `__all__` set)
+- 0 alembic migrations
+- 0 ongoing cost
+- Hot-fix whitelist (`services/data/**`); no `risk-review-approved` label
+
+**Deploy ceremony (after merge):**
+
+```bash
+ssh root@178.156.239.84
+cd /opt/trading && git pull --ff-only
+docker compose --env-file deploy/.env build api
+docker compose --env-file deploy/.env up -d --force-recreate api lean_local
+```
+
+Monday's natural 21:00 UTC bar_sync cycle then writes corrected universe files. 21:10 UTC lean_local restart. 21:30 UTC LEAN cycle → probe validates.
+
+**Open follow-ups:**
+
+1. **Monday 21:30 UTC validation.** Probe output is the empirical test for BOTH PR #231 (`set_filter`) and this PR (per-bar universe write). If `hist_len ≥ 200` + `signals_emitted_count ≥ 0` without `insufficient_lookback` rejections → ungate PR #227 (probe retirement).
+2. **Pre-fix bar_sync history audit.** If the operator wants the full ~2y on-disk universe history to be PER-BAR-CORRECT (not just the last 175 days), a one-shot batch job could walk the entire universe directory + re-write each file with the correct historical front-month using `front_month_for_session_date`. Not strictly necessary — bar_sync's daily cycle now corrects the most-recent 175 days, and the synthesizer's persistence filter (15 days) treats older corrupted runs as noise. Optional cleanup.
+
+---
+
 ### 2026-05-24 — `set_filter(-365, 90)` extends continuous-future chain for historical contract stitching
 
 **Trigger:** the 2026-05-24 21:30 UTC LEAN cycle's probe (the Sunday natural-validation cycle following PR #229's historical-contract backfill) captured `hist_len=176 hist_cols=['close', 'high', 'low', 'open', 'volume']` for all 6 active futures + `signals_emitted_count=0 rejections_count=10` — identical pattern to Saturday's pre-#229 cycle. Backfill landed (verified — `mes_trade.zip` now contains 7 contracts vs the original 1; manual lean_local restart at 20:38 UTC confirmed LEAN subscribed to all historical contract symbols at boot via `DataManager.AddSubscription` events). But `self.history(continuous_future, 205, Resolution.DAILY)` still returns only ~176 bars starting from the current front-month's listing date (2025-09-17).

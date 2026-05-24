@@ -690,6 +690,110 @@ def compute_future_expiry(*, ticker: str, contract_month: str) -> date:
     return rule(year=year, month=month, holidays=holidays)
 
 
+#: Per-ticker cycle months — the set of months on which contracts list.
+#: Used by :func:`front_month_for_session_date` to enumerate candidate
+#: contract months in calendar order.
+_CYCLE_MONTHS_BY_TICKER: Final[dict[str, frozenset[int]]] = {
+    # Quarterly Mar/Jun/Sep/Dec (HMUZ)
+    "MES": _HMUZ_MONTHS,
+    "MNQ": _HMUZ_MONTHS,
+    "MYM": _HMUZ_MONTHS,
+    "M2K": _HMUZ_MONTHS,
+    # Bi-monthly Feb/Apr/Jun/Aug/Oct/Dec (GJMQVZ)
+    "MGC": _GJMQVZ_MONTHS,
+    # Monthly — every month
+    "MCL": frozenset(range(1, 13)),
+    "MBT": frozenset(range(1, 13)),
+}
+
+
+def front_month_for_session_date(*, ticker: str, session_date: date) -> str:
+    """Return the YYYYMM of the front-month contract active on ``session_date``.
+
+    The "front-month" is the contract whose expiry is the EARLIEST not-yet-
+    past on ``session_date``. Equivalent to: pick the smallest contract
+    month from the ticker's cycle whose computed expiry date is
+    ``>= session_date``.
+
+    Worked example (/MES, quarterly HMUZ):
+
+    * ``session_date = 2025-09-01``: 202509 has expiry 2025-09-19
+      (third Friday). 2025-09-19 >= 2025-09-01 → return ``"202509"``.
+    * ``session_date = 2025-09-22`` (after 202509 expiry): skip 202509;
+      try 202512 with expiry 2025-12-19 >= 2025-09-22 → return
+      ``"202512"``.
+    * ``session_date = 2026-06-19`` (Juneteenth-adjusted 202606
+      expiry on 2026-06-18 is < 2026-06-19): skip 202606; try 202609
+      with expiry 2026-09-18 → return ``"202609"``.
+
+    This is the "what was the front-month on date X" function that bar_sync
+    needs when writing per-day universe files. Without it, bar_sync writes
+    TODAY's front-month into every historical session's universe file,
+    corrupting the synthesizer's roll-detection input (the 2026-05-22
+    /MES map_file gap 2025-06-22 → 2026-03-16 originates from this
+    pre-fix bar_sync behavior; see ``Docs/decisions-log.md`` 2026-05-24
+    entry "bar_sync per-bar front-month write" for the diagnostic chain).
+
+    Args:
+        ticker: bare uppercase ticker (e.g., ``"MES"``, ``"MGC"``).
+            Must be in :data:`_EXPIRY_RULES`.
+        session_date: the ET calendar date for which the front-month is
+            requested.
+
+    Returns the contract month as ``YYYYMM``.
+
+    Raises ``ValueError`` for unknown tickers. Raises ``RuntimeError``
+    if no front-month is found within 48 cycle months from
+    ``session_date`` (an internal safety bound; in practice the search
+    completes in 1-2 iterations).
+    """
+    ticker_upper = ticker.upper()
+    if ticker_upper not in _EXPIRY_RULES:
+        raise ValueError(
+            f"no expiry rule registered for ticker {ticker!r}; "
+            f"known tickers: {sorted(_EXPIRY_RULES)!r}"
+        )
+    cycle_months = _CYCLE_MONTHS_BY_TICKER[ticker_upper]
+    valid_months = sorted(cycle_months)
+
+    # Enumerate candidates: (cycle month, year) pairs starting at the
+    # session_date's year + valid_months in calendar order, walking
+    # forward through future years until we find a match.
+    candidates: list[tuple[date, str]] = []
+    safety_bound = 48  # 48 cycle iterations = ~4 years for quarterly, ~8 years for monthly
+    iterations = 0
+    for year_offset in range(0, 8):
+        year = session_date.year + year_offset
+        for month in valid_months:
+            iterations += 1
+            if iterations > safety_bound:
+                break
+            # Skip months in the start year that are too far in the past
+            # (the cycle month's expiry is well before session_date)
+            if year_offset == 0 and month < session_date.month - 1:
+                continue
+            contract_month = f"{year:04d}{month:02d}"
+            try:
+                expiry = compute_future_expiry(
+                    ticker=ticker_upper, contract_month=contract_month
+                )
+            except ValueError:
+                continue
+            if expiry >= session_date:
+                candidates.append((expiry, contract_month))
+        if iterations > safety_bound:
+            break
+
+    if not candidates:
+        raise RuntimeError(
+            f"front_month_for_session_date: no front-month found for "
+            f"ticker={ticker!r} session_date={session_date.isoformat()!r} "
+            f"within {safety_bound} cycle iterations"
+        )
+    candidates.sort()
+    return candidates[0][1]
+
+
 # ---------------------------------------------------------------------------
 # Pure-policy: universe-file parsing
 # ---------------------------------------------------------------------------
@@ -1118,6 +1222,7 @@ __all__ = [
     "compute_future_sid_hash",
     "detect_real_rolls",
     "encode_base36",
+    "front_month_for_session_date",
     "iter_universe_sessions",
     "oadate",
     "parse_universe_file",

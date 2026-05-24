@@ -690,6 +690,109 @@ class TestComputeFutureExpiry:
 
 
 # ---------------------------------------------------------------------------
+# front_month_for_session_date — the "what was front-month on date X" helper
+# ---------------------------------------------------------------------------
+
+
+class TestFrontMonthForSessionDate:
+    """Locks the 2026-05-24 forward-fix for bar_sync's per-bar universe-write
+    bug. Pre-fix, bar_sync wrote TODAY's front-month into every historical
+    session's universe file, corrupting the synthesizer's roll-detection
+    input. Post-fix, this helper computes the actual historical front-month
+    per session_date deterministically from each ticker's expiry rules.
+    """
+
+    @pytest.mark.parametrize(
+        "session_date, expected",
+        [
+            # Pre-Sep-2025 expiry — 202509 (Sep 19) >= Sep 1
+            (date(2025, 9, 1), "202509"),
+            # On expiry day — 202509 (Sep 19) >= Sep 19
+            (date(2025, 9, 19), "202509"),
+            # Day after expiry — rolls to 202512
+            (date(2025, 9, 22), "202512"),
+            # Pre-Dec expiry — 202512 still front
+            (date(2025, 12, 19), "202512"),
+            # Post-Dec expiry — 202603
+            (date(2025, 12, 22), "202603"),
+            # On Mar 2026 expiry day — 202603 still front
+            (date(2026, 3, 20), "202603"),
+            # Post-Mar expiry — 202606
+            (date(2026, 3, 23), "202606"),
+            # /MES Jun 2026 expiry is 2026-06-18 (Juneteenth adjustment)
+            (date(2026, 6, 18), "202606"),
+            # Day after Juneteenth-adjusted expiry — 202609
+            (date(2026, 6, 22), "202609"),
+            # Mid-cycle (Q3 2025) — 202509 still front
+            (date(2025, 7, 15), "202509"),
+            # Today's actual front-month for the 2026-05-24 cycle
+            (date(2026, 5, 24), "202606"),
+        ],
+    )
+    def test_mes_quarterly(self, session_date: date, expected: str) -> None:
+        assert mfs.front_month_for_session_date(
+            ticker="MES", session_date=session_date
+        ) == expected
+
+    def test_other_quarterly_micros_match_mes(self) -> None:
+        # /MNQ, /MYM, /M2K all use the same HMUZ cycle + third-Friday
+        # expiry rule as /MES, so they should produce the same front-month
+        # for any given session_date.
+        sd = date(2025, 12, 22)
+        mes = mfs.front_month_for_session_date(ticker="MES", session_date=sd)
+        for t in ("MNQ", "MYM", "M2K"):
+            assert mfs.front_month_for_session_date(ticker=t, session_date=sd) == mes
+
+    @pytest.mark.parametrize(
+        "session_date, expected",
+        [
+            # /MGC bi-monthly Feb/Apr/Jun/Aug/Oct/Dec. Oct 2025 expiry is
+            # 3rd-last business day of Oct = Oct 29 2025 (Wed).
+            (date(2025, 9, 15), "202510"),
+            # On Oct expiry day — still 202510
+            (date(2025, 10, 29), "202510"),
+            # After Oct expiry — rolls to 202512
+            (date(2025, 10, 30), "202512"),
+            # Today
+            (date(2026, 5, 24), "202606"),
+        ],
+    )
+    def test_mgc_bimonthly(self, session_date: date, expected: str) -> None:
+        assert mfs.front_month_for_session_date(
+            ticker="MGC", session_date=session_date
+        ) == expected
+
+    @pytest.mark.parametrize(
+        "session_date, expected",
+        [
+            # /MBT monthly, last Friday of contract month.
+            # Sep 2025 last Friday = Sep 26 (with -1 biz day if holiday;
+            # Sep 26 2025 is Fri, not a holiday) → expiry Sep 26.
+            (date(2025, 9, 15), "202509"),
+            # Today's front-month
+            (date(2026, 5, 24), "202605"),
+            # Past May 2026 expiry, rolls to Jun
+            (date(2026, 6, 1), "202606"),
+        ],
+    )
+    def test_mbt_monthly(self, session_date: date, expected: str) -> None:
+        assert mfs.front_month_for_session_date(
+            ticker="MBT", session_date=session_date
+        ) == expected
+
+    def test_unknown_ticker_raises(self) -> None:
+        with pytest.raises(ValueError, match="no expiry rule"):
+            mfs.front_month_for_session_date(
+                ticker="BOGUS", session_date=date(2026, 5, 24)
+            )
+
+    def test_ticker_case_insensitive(self) -> None:
+        a = mfs.front_month_for_session_date(ticker="MES", session_date=date(2026, 5, 24))
+        b = mfs.front_month_for_session_date(ticker="mes", session_date=date(2026, 5, 24))
+        assert a == b == "202606"
+
+
+# ---------------------------------------------------------------------------
 # Map_file content rendering
 # ---------------------------------------------------------------------------
 
@@ -1110,6 +1213,7 @@ class TestModuleContract:
             "compute_future_sid_hash",
             "detect_real_rolls",
             "encode_base36",
+            "front_month_for_session_date",
             "iter_universe_sessions",
             "oadate",
             "parse_universe_file",

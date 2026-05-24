@@ -1030,6 +1030,72 @@ class TestWriteFuturesBundle:
         assert content.startswith("#expiry,")
         assert "202606," in content
 
+    def test_universe_files_use_per_bar_historical_front_month(self, tmp_path: Path) -> None:
+        # 2026-05-24 forward-fix regression test: each per-bar universe
+        # file must reflect the front-month for THAT bar's session_date,
+        # NOT today's front-month repeated for all bars. Pre-fix, the
+        # loop wrote the same `front_month_expiry_yyyymm` arg into every
+        # file in the loop; post-fix, the loop computes per-bar via
+        # `_per_bar_front_month_or_fallback` → `front_month_for_session_date`.
+        #
+        # Three bars spanning roll boundaries:
+        #   - Aug 2025: /MES front-month = 202509 (Sep 2025 contract)
+        #   - Jan 2026: /MES front-month = 202603 (Mar 2026 contract)
+        #   - May 2026: /MES front-month = 202606 (Jun 2026 contract)
+        bars = [
+            _make_bar(session_date=date(2025, 8, 15), close="6300"),
+            _make_bar(session_date=date(2026, 1, 15), close="6900"),
+            _make_bar(session_date=date(2026, 5, 19), close="7378.25"),
+        ]
+        write_futures_bundle(
+            data_root=tmp_path,
+            ticker="MES",
+            market_dir="cme",
+            market_code="CME",
+            front_month_expiry_yyyymm="202606",  # Today's pick — used only for the trade-zip filename
+            bars=bars,
+        )
+        # Each universe file must have the CORRECT historical front-month.
+        aug_path = futures_universe_file_path(tmp_path, "MES", "cme", date(2025, 8, 15))
+        jan_path = futures_universe_file_path(tmp_path, "MES", "cme", date(2026, 1, 15))
+        may_path = futures_universe_file_path(tmp_path, "MES", "cme", date(2026, 5, 19))
+        aug_content = aug_path.read_text()
+        jan_content = jan_path.read_text()
+        may_content = may_path.read_text()
+        # First-column expiry (after the #header line) must be per-bar.
+        assert "\n202509," in aug_content, f"expected per-bar 202509, got: {aug_content!r}"
+        assert "\n202603," in jan_content, f"expected per-bar 202603, got: {jan_content!r}"
+        assert "\n202606," in may_content, f"expected per-bar 202606, got: {may_content!r}"
+        # Cross-check: NO bar should write today's 202606 into the Aug 2025
+        # universe file (the pre-fix bug pattern).
+        assert "\n202606," not in aug_content, (
+            "regression: per-bar loop wrote today's 202606 into the Aug 2025 universe file "
+            "(pre-2026-05-24 PR #232 bug)"
+        )
+        assert "\n202606," not in jan_content, (
+            "regression: per-bar loop wrote today's 202606 into the Jan 2026 universe file"
+        )
+
+    def test_universe_file_falls_back_to_caller_expiry_for_unknown_ticker(
+        self, tmp_path: Path
+    ) -> None:
+        # If the per-bar helper raises (e.g. ticker not in _EXPIRY_RULES),
+        # the bundle write falls back to the caller-supplied
+        # `front_month_expiry_yyyymm` rather than crashing. Preserves the
+        # pre-2026-05-24 behavior for code paths we don't yet support.
+        bars = [_make_bar(session_date=date(2026, 5, 19), close="100.0")]
+        write_futures_bundle(
+            data_root=tmp_path,
+            ticker="UNKNOWN",  # Not in _EXPIRY_RULES
+            market_dir="cme",
+            market_code="CME",
+            front_month_expiry_yyyymm="202609",
+            bars=bars,
+        )
+        u_path = futures_universe_file_path(tmp_path, "UNKNOWN", "cme", date(2026, 5, 19))
+        content = u_path.read_text()
+        assert "\n202609," in content
+
     def test_oi_zero_renders_empty_universe_oi(self, tmp_path: Path) -> None:
         bars = [_make_bar(session_date=date(2026, 5, 19))]
         write_futures_bundle(
