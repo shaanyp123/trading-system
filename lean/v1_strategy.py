@@ -302,7 +302,29 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
                 data_normalization_mode=DataNormalizationMode.RAW,  # noqa: F405
                 contract_depth_offset=0,
             )
-            future.set_filter(0, 90)  # rolling 0-90 day window for contract selection
+            # ``set_filter(-365, 90)`` — extend the continuous-future chain
+            # window to include contracts that expired up to 365 days ago
+            # (rather than ``(0, 90)`` which only includes not-yet-expired
+            # contracts in the next 90 days). The 2026-05-24 21:30 UTC LEAN
+            # cycle's probe captured ``hist_len=176 hist_cols=['close', ...]``
+            # for all 6 active futures vs ``hist_len=205`` for the 4 ETFs,
+            # even AFTER PR #229's historical-contract backfill placed
+            # ~7 historical contracts per ticker into the daily zip. Root
+            # cause: ``set_filter(0, 90)`` limits LEAN's continuous-future
+            # universe to currently-trading contracts; LEAN's resolver
+            # therefore loads bars only from the current front-month
+            # (e.g. /MES 202606 starting from its listing date ~2025-09-17),
+            # and ignores the 6 historical contracts the backfill wrote
+            # to disk. The fix is to relax the filter's lower bound so
+            # historical contracts re-enter the chain — LEAN then stitches
+            # them per the synthesized map_file's roll boundaries +
+            # ``self.history()`` can reach back further than the current
+            # contract's listing window. ``MA_SLOW_DAYS=200`` requires
+            # ≥ 200 daily bars to compute, so this is the gate on
+            # actual signal emission. See ``Docs/decisions-log.md``
+            # 2026-05-24 entry "set_filter extended to -365 days for
+            # historical contract stitching".
+            future.set_filter(-365, 90)
             self._market_subscriptions[f"/{ticker}"] = future.symbol
 
         # Subscribe to bond ETFs.

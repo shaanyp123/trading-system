@@ -17,6 +17,65 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ## Entries
 
+### 2026-05-24 — `set_filter(-365, 90)` extends continuous-future chain for historical contract stitching
+
+**Trigger:** the 2026-05-24 21:30 UTC LEAN cycle's probe (the Sunday natural-validation cycle following PR #229's historical-contract backfill) captured `hist_len=176 hist_cols=['close', 'high', 'low', 'open', 'volume']` for all 6 active futures + `signals_emitted_count=0 rejections_count=10` — identical pattern to Saturday's pre-#229 cycle. Backfill landed (verified — `mes_trade.zip` now contains 7 contracts vs the original 1; manual lean_local restart at 20:38 UTC confirmed LEAN subscribed to all historical contract symbols at boot via `DataManager.AddSubscription` events). But `self.history(continuous_future, 205, Resolution.DAILY)` still returns only ~176 bars starting from the current front-month's listing date (2025-09-17).
+
+**Root cause:** `lean/v1_strategy.py:305` had `future.set_filter(0, 90)`, which limits the continuous-future chain to contracts whose expiry is in `[today, today + 90d]`. For today = 2026-05-24, only `202606` (Jun 2026 expiry) matches that window; all historical contracts the backfill wrote (`_202406, _202409, _202412, _202503, _202506, _202509`) are excluded from the chain by the filter even though they're loaded into LEAN's data layer. The continuous-future resolver respects the filter when stitching `self.history()`, so historical contracts on disk get ignored.
+
+**Validation gap:** the boot-time `DataManager.AddSubscription` log entries for `MES19U25` / `MES19Z25` / `MES18M26` (3 historical generations subscribed) suggested the historical contracts were "live" in LEAN's data layer. But subscription ≠ stitch — `set_filter` is the additional gate on which contracts make it into the continuous-future chain. The probe surfaced this 3rd-order interaction: data on disk + subscription registered + map_file populated + SID-hash correct + add_future bare-ticker correct + /MYM-cbot routing correct, but still hist_len shortfall because of the filter.
+
+**What this PR changes (1-line code + comment block):**
+
+`lean/v1_strategy.py:305` — `set_filter(0, 90)` → `set_filter(-365, 90)`. The negative lower bound includes contracts that expired up to 365 days ago. For today = 2026-05-24, the chain now includes contracts expiring in `[2025-05-24, 2026-08-22]`:
+
+- `202606` (Jun 2026, current front-month) ✓
+- `202509` (Sep 2025, expired but within window) ✓
+- `202506` (Jun 2025, expired) ✓
+- `202503` (Mar 2025, expired) ✓
+- (No /MES contracts older than that within the 365-day window — quarterly cadence means we get ~4 historical contracts plus the current one)
+
+LEAN's continuous-future resolver should then stitch bars from these 5 contracts using the map_file's roll boundaries, yielding ~5 × 90 trading days = ~450 daily bars of history. `MA_SLOW_DAYS=200` becomes computable; the strategy can emit signals.
+
+**Secondary issue noted (not fixed in this PR):** the synthesized `/MES` map_file has a 9-month gap between rolls 2025-06-22 (`yv` → 202509) and 2026-03-16 (`z3` → 202606). bar_sync's front-month picker appears to have written `expiry=202606` early during that 9-month window, causing the synthesizer's persistence-filter to detect ONE long stable run instead of the 3 expected quarterly rolls (Sep 2025 → Dec 2025 → Mar 2026). The synthesizer behaves correctly given its inputs; the bug is upstream in bar_sync's front-month picker. This PR's `set_filter` fix sidesteps the gap because LEAN's resolver respects whichever contracts are in the chain — historical contracts give us bars even if the map_file's roll boundaries are slightly out of alignment. A separate follow-up should audit bar_sync's `pick_front_month_expiry` against the IBKR `reqContractDetails` chain to understand the wrong-expiry writes.
+
+**Deploy ceremony (after merge):**
+
+```bash
+ssh root@178.156.239.84
+cd /opt/trading && git pull --ff-only
+# lean_local is bind-mounted; no api rebuild needed for this change.
+docker compose --env-file deploy/.env up -d --force-recreate lean_local
+```
+
+**Validation cycle: natural Mon 2026-05-25 21:30 UTC.** Expected probe output:
+
+```
+v1_history_probe market=/MES hist_type=DataFrame hist_len=205 hist_cols=['close','high','low','open','volume']
+... (same for /MNQ /MYM /M2K /MGC /MBT)
+v1_signals_generated session_date=2026-05-25 signals_emitted_count=N rejections_count=M (N+M=10; ideally N > 0)
+```
+
+If `hist_len` still < 200 → the issue isn't `set_filter`; LEAN's live-mode `self.history()` has a different limitation we haven't identified yet. Next investigation candidates: (a) the synthesized map_file's 9-month gap blocks the resolver during that period regardless of filter; (b) live-mode history API caches per-contract and ignores the full chain; (c) `set_warm_up(225)` interaction with the historical contract chain.
+
+**Cost / scope impact:**
+
+- 1 line of code change (`0, 90` → `-365, 90`) in `lean/v1_strategy.py`
+- ~22 lines of comment block documenting the saga
+- 0 test changes (lean/ isn't in the project's pytest target list per pyproject.toml `exclude`; coverage is via runtime smoke at lean_local boot)
+- 0 alembic migrations
+- 0 ongoing cost
+- Hot-fix whitelist (`lean/**`); no `risk-review-approved` label
+- Deploy is lean_local-only (bind-mounted; no image rebuild)
+
+**Open follow-ups:**
+
+1. **Monday 21:30 UTC validation.** Probe output is the empirical test.
+2. **bar_sync front-month picker audit.** The 9-month map_file gap (2025-06-22 → 2026-03-16 missing rolls for 202509 → 202512 → 202603) suggests bar_sync wrote wrong expiries during that period. Independent investigation.
+3. **PR #227 (probe retirement)** stays DRAFT until both Issue B follow-ups (this PR + bar_sync audit) resolve.
+
+---
+
 ### 2026-05-23 — Historical contract backfill unblocks MA_SLOW=200 (PR #229)
 
 **Trigger:** the 2026-05-23 21:30 UTC LEAN cycle (the natural validation gate for PRs #225/#226/#228) emitted `v1_history_probe` lines with `hist_len=176-177` across all 6 active futures (/MES /MNQ /MYM /M2K /MGC /MBT) vs `hist_len=205` for the 4 ETFs. The strategy's `MA_SLOW_DAYS=200` floor rejected every futures market on the WARMUP_TREND filter → `v1_signals_generated session_date=2026-05-23 signals_emitted_count=0 rejections_count=10`. This is the "Issue B — depth shortfall" follow-up scoped against today's /MCL sideline entry.
