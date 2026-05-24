@@ -32,7 +32,7 @@ from __future__ import annotations
 import asyncio
 import zipfile
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -155,6 +155,13 @@ class _FakeIb:
 
     def __init__(self) -> None:
         self.historical_bars: list[Any] = []
+        # Optional per-contract-month dispatch for the historical-contract
+        # backfill path (2026-05-23+). When non-empty, reqHistoricalDataAsync
+        # looks up the 6-char ``YYYYMM`` prefix of the request's contract
+        # ``lastTradeDateOrContractMonth`` and returns the matching entry's
+        # value; falls back to ``self.historical_bars`` on miss / when empty.
+        # Mapping key is the YYYYMM string; value is the list of fake bars.
+        self.historical_bars_by_contract: dict[str, list[Any]] = {}
         self.contract_details: list[Any] = []
         self.connect_should_raise: Exception | None = None
         self.req_historical_calls: list[dict[str, Any]] = []
@@ -216,6 +223,14 @@ class _FakeIb:
                 "formatDate": formatDate,
             }
         )
+        # Per-contract dispatch (historical-contract backfill path). The
+        # contract's ``lastTradeDateOrContractMonth`` may be a YYYYMM or a
+        # YYYYMMDD string; take the first 6 chars for the lookup key.
+        if self.historical_bars_by_contract:
+            raw = getattr(contract, "lastTradeDateOrContractMonth", "") or ""
+            key = str(raw)[:6]
+            if key and key in self.historical_bars_by_contract:
+                return list(self.historical_bars_by_contract[key])
         return list(self.historical_bars)
 
     async def reqContractDetailsAsync(self, contract: Any) -> list[Any]:
@@ -689,6 +704,129 @@ class TestWriteZipWithMember:
             assert zf.read("member.csv") == b"new\n"
 
 
+class TestListZipMemberNames:
+    def test_returns_empty_set_when_file_missing(self, tmp_path: Path) -> None:
+        path = tmp_path / "nope.zip"
+        assert bar_sync.list_zip_member_names(path) == set()
+
+    def test_returns_names_when_zip_present(self, tmp_path: Path) -> None:
+        path = tmp_path / "z.zip"
+        with zipfile.ZipFile(path, "w") as zf:
+            zf.writestr("a.csv", b"x")
+            zf.writestr("b.csv", b"y")
+        assert bar_sync.list_zip_member_names(path) == {"a.csv", "b.csv"}
+
+    def test_returns_empty_set_on_corrupt_zip(self, tmp_path: Path) -> None:
+        # Defensive: a half-written / corrupted zip shouldn't crash the
+        # idempotency check — caller treats it as "no members present"
+        # and re-writes the zip atomically via write_zip_with_members_preserving.
+        path = tmp_path / "broken.zip"
+        path.write_bytes(b"not a real zip file")
+        assert bar_sync.list_zip_member_names(path) == set()
+
+
+class TestWriteZipWithMembersPreserving:
+    def test_creates_new_zip_when_file_missing(self, tmp_path: Path) -> None:
+        path = tmp_path / "future" / "cme" / "daily" / "mes_trade.zip"
+        size = bar_sync.write_zip_with_members_preserving(
+            path, {"mes_trade_202606.csv": b"hello,world\n"}
+        )
+        assert path.is_file()
+        assert size > 0
+        with zipfile.ZipFile(path) as zf:
+            assert zf.namelist() == ["mes_trade_202606.csv"]
+            assert zf.read("mes_trade_202606.csv") == b"hello,world\n"
+
+    def test_preserves_existing_members(self, tmp_path: Path) -> None:
+        path = tmp_path / "mes_trade.zip"
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("mes_trade_202403.csv", b"old\n")
+            zf.writestr("mes_trade_202406.csv", b"older\n")
+        bar_sync.write_zip_with_members_preserving(path, {"mes_trade_202606.csv": b"new\n"})
+        with zipfile.ZipFile(path) as zf:
+            assert set(zf.namelist()) == {
+                "mes_trade_202403.csv",
+                "mes_trade_202406.csv",
+                "mes_trade_202606.csv",
+            }
+            assert zf.read("mes_trade_202403.csv") == b"old\n"
+            assert zf.read("mes_trade_202406.csv") == b"older\n"
+            assert zf.read("mes_trade_202606.csv") == b"new\n"
+
+    def test_replaces_named_member_preserving_others(self, tmp_path: Path) -> None:
+        # Locks the load-bearing semantic for write_futures_bundle: when
+        # sync_one_market re-runs each cycle, the front-month CSV is
+        # overwritten with fresh bars but historical-contract CSVs stay
+        # intact. Without this behavior the backfill would have to
+        # re-fetch every historical contract every cycle.
+        path = tmp_path / "mes_trade.zip"
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("mes_trade_202403.csv", b"historical_kept\n")
+            zf.writestr("mes_trade_202606.csv", b"front_month_old\n")
+        bar_sync.write_zip_with_members_preserving(
+            path, {"mes_trade_202606.csv": b"front_month_new\n"}
+        )
+        with zipfile.ZipFile(path) as zf:
+            assert set(zf.namelist()) == {
+                "mes_trade_202403.csv",
+                "mes_trade_202606.csv",
+            }
+            assert zf.read("mes_trade_202403.csv") == b"historical_kept\n"
+            assert zf.read("mes_trade_202606.csv") == b"front_month_new\n"
+
+    def test_multiple_new_members_added_atomically(self, tmp_path: Path) -> None:
+        # The backfill orchestrator accumulates fetched contracts in a
+        # single dict + writes them via one preserving-call so a partial
+        # failure (one contract's IBKR fetch returns empty) doesn't leave
+        # the zip in a half-written state.
+        path = tmp_path / "mes_trade.zip"
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("mes_trade_202606.csv", b"front\n")
+        bar_sync.write_zip_with_members_preserving(
+            path,
+            {
+                "mes_trade_202403.csv": b"a\n",
+                "mes_trade_202406.csv": b"b\n",
+                "mes_trade_202409.csv": b"c\n",
+            },
+        )
+        with zipfile.ZipFile(path) as zf:
+            assert set(zf.namelist()) == {
+                "mes_trade_202403.csv",
+                "mes_trade_202406.csv",
+                "mes_trade_202409.csv",
+                "mes_trade_202606.csv",
+            }
+
+    def test_creates_parent_dirs(self, tmp_path: Path) -> None:
+        # Mirror TestWriteZipWithMember.test_creates_parent_dirs — the
+        # preserving variant must also auto-create intermediate dirs
+        # when the daily/ tree doesn't exist yet.
+        path = tmp_path / "future" / "cbot" / "daily" / "mym_trade.zip"
+        bar_sync.write_zip_with_members_preserving(path, {"mym_trade_202606.csv": b"x\n"})
+        assert path.is_file()
+
+    def test_recovers_when_existing_zip_is_corrupt(self, tmp_path: Path) -> None:
+        # If the existing file isn't a valid zip (partial-write from a
+        # killed cycle), the helper starts fresh rather than crashing.
+        # Operator-recovery property: cycle never wedges on a corrupt zip.
+        path = tmp_path / "mes_trade.zip"
+        path.write_bytes(b"\x00\x01corrupt\x02\x03")
+        bar_sync.write_zip_with_members_preserving(path, {"mes_trade_202606.csv": b"fresh\n"})
+        with zipfile.ZipFile(path) as zf:
+            assert zf.namelist() == ["mes_trade_202606.csv"]
+            assert zf.read("mes_trade_202606.csv") == b"fresh\n"
+
+    def test_tmp_file_does_not_leak_after_success(self, tmp_path: Path) -> None:
+        # Post-rename, no dot-prefixed .tmp files should remain in the
+        # daily/ dir. Locks the cleanup invariant against a regression
+        # where ``os.replace`` somehow doesn't consume the tmp.
+        path = tmp_path / "mes_trade.zip"
+        bar_sync.write_zip_with_members_preserving(path, {"a.csv": b"x"})
+        tmp_remnants = [p for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
+        assert tmp_remnants == []
+
+
 class TestWriteEtfBundle:
     def test_happy_path_writes_3_files(self, tmp_path: Path) -> None:
         bars = [
@@ -761,6 +899,73 @@ class TestWriteFuturesBundle:
         trade_zip = futures_trade_zip_path(tmp_path, "MES", "cme")
         with zipfile.ZipFile(trade_zip) as zf:
             assert zf.namelist() == ["mes_trade_202606.csv"]
+
+    def test_preserves_existing_historical_contract_members_in_trade_zip(
+        self, tmp_path: Path
+    ) -> None:
+        # The 2026-05-23 historical-contract backfill follow-up changed
+        # write_futures_bundle to use write_zip_with_members_preserving
+        # so prior cycles' backfilled historical CSVs survive the
+        # per-cycle front-month rewrite. Without this preservation, the
+        # backfill would have to re-fetch every historical contract on
+        # every cycle (~60-90 IBKR calls per cycle).
+        trade_zip = futures_trade_zip_path(tmp_path, "MES", "cme")
+        trade_zip.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(trade_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("mes_trade_202403.csv", b"historical1\n")
+            zf.writestr("mes_trade_202406.csv", b"historical2\n")
+            zf.writestr("mes_trade_202606.csv", b"front_month_old\n")
+        bars = [_make_bar(close="7378.25")]
+        write_futures_bundle(
+            data_root=tmp_path,
+            ticker="MES",
+            market_dir="cme",
+            market_code="CME",
+            front_month_expiry_yyyymm="202606",
+            bars=bars,
+        )
+        with zipfile.ZipFile(trade_zip) as zf:
+            names = set(zf.namelist())
+            assert names == {
+                "mes_trade_202403.csv",
+                "mes_trade_202406.csv",
+                "mes_trade_202606.csv",
+            }
+            # Historical CSVs unchanged byte-for-byte.
+            assert zf.read("mes_trade_202403.csv") == b"historical1\n"
+            assert zf.read("mes_trade_202406.csv") == b"historical2\n"
+            # Front-month CSV replaced with fresh bars.
+            assert zf.read("mes_trade_202606.csv") != b"front_month_old\n"
+            assert b"7378.25" in zf.read("mes_trade_202606.csv")
+
+    def test_preserves_existing_historical_contract_members_in_oi_zip(self, tmp_path: Path) -> None:
+        # Symmetric preservation in the OI zip — if the operator's future
+        # extension fetches per-historical-contract OI, the same lifecycle
+        # guarantee holds.
+        oi_zip = futures_oi_zip_path(tmp_path, "MES", "cme")
+        oi_zip.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(oi_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("mes_openinterest_202403.csv", b"oi_historical\n")
+            zf.writestr("mes_openinterest_202606.csv", b"oi_old\n")
+        bars = [_make_bar(close="7378.25")]
+        write_futures_bundle(
+            data_root=tmp_path,
+            ticker="MES",
+            market_dir="cme",
+            market_code="CME",
+            front_month_expiry_yyyymm="202606",
+            bars=bars,
+            open_interest=257985,
+        )
+        with zipfile.ZipFile(oi_zip) as zf:
+            names = set(zf.namelist())
+            assert names == {
+                "mes_openinterest_202403.csv",
+                "mes_openinterest_202606.csv",
+            }
+            assert zf.read("mes_openinterest_202403.csv") == b"oi_historical\n"
+            # Front-month OI CSV replaced.
+            assert b"257985" in zf.read("mes_openinterest_202606.csv")
 
     def test_writes_oi_zip_with_per_expiry_member(self, tmp_path: Path) -> None:
         bars = [_make_bar()]
@@ -1594,6 +1799,693 @@ class TestFetchFrontMonthOpenInterest:
 # ---------------------------------------------------------------------------
 # Per-market orchestrator
 # ---------------------------------------------------------------------------
+
+
+class TestFetchHistoricalContractBars:
+    """Per-historical-contract IBKR fetch — qualifies a specific expiry then
+    calls reqHistoricalData. Backfill orchestrator's per-contract workhorse.
+    """
+
+    @pytest.fixture
+    def meta(self) -> MarketMeta:
+        return PHASE1_UNIVERSE_METADATA["/MES"]
+
+    def test_happy_path_returns_parsed_bars(self, meta: MarketMeta) -> None:
+        ib = _FakeIb()
+        ib.historical_bars = [
+            _FakeBarData(
+                date=date(2024, 3, 14),
+                open=5290.0,
+                high=5300.0,
+                low=5280.0,
+                close=5295.0,
+                volume=10000,
+            ),
+            _FakeBarData(
+                date=date(2024, 3, 15),
+                open=5295.0,
+                high=5310.0,
+                low=5290.0,
+                close=5305.0,
+                volume=12000,
+            ),
+        ]
+        bars = asyncio.run(
+            bar_sync.fetch_historical_contract_bars(
+                ib,
+                "/MES",
+                meta=meta,
+                contract_month="202403",
+                expiry_date=date(2024, 3, 15),
+                bars_count=365,
+                call_timeout_seconds=5.0,
+            )
+        )
+        assert len(bars) == 2
+        assert bars[0].session_date == date(2024, 3, 14)
+        assert bars[-1].close == Decimal("5305.0")
+
+    def test_includes_expired_flag_on_future_contract(self, meta: MarketMeta) -> None:
+        # Locks the IBKR contract: includeExpired=True is REQUIRED for
+        # reqContractDetails (which qualifyContractsAsync invokes) to
+        # return expired contracts. Without the flag IBKR returns empty
+        # for any past-expiry symbology lookup.
+        ib = _FakeIb()
+        ib.historical_bars = [
+            _FakeBarData(
+                date=date(2024, 3, 14), open=5290.0, high=5300.0, low=5280.0, close=5295.0, volume=1
+            ),
+        ]
+        asyncio.run(
+            bar_sync.fetch_historical_contract_bars(
+                ib,
+                "/MES",
+                meta=meta,
+                contract_month="202403",
+                expiry_date=date(2024, 3, 15),
+                bars_count=365,
+                call_timeout_seconds=5.0,
+            )
+        )
+        # Inspect the qualifyContractsAsync call's contract argument.
+        assert len(ib.qualify_calls) == 1
+        qualified_contract = ib.qualify_calls[0][0]
+        assert getattr(qualified_contract, "includeExpired", False) is True
+        assert getattr(qualified_contract, "lastTradeDateOrContractMonth") == "202403"
+        assert getattr(qualified_contract, "symbol") == "MES"
+
+    def test_end_date_time_pinned_to_expiry_not_now(self, meta: MarketMeta) -> None:
+        # IBKR returns 0 bars for an expired contract when endDateTime="".
+        # Lock the contract: caller passes expiry_date and the function
+        # formats it as YYYYMMDD HH:MM:SS so IBKR returns bars up to (and
+        # including) the contract's last trading day.
+        ib = _FakeIb()
+        ib.historical_bars = [
+            _FakeBarData(
+                date=date(2024, 3, 14), open=5290.0, high=5300.0, low=5280.0, close=5295.0, volume=1
+            ),
+        ]
+        asyncio.run(
+            bar_sync.fetch_historical_contract_bars(
+                ib,
+                "/MES",
+                meta=meta,
+                contract_month="202403",
+                expiry_date=date(2024, 3, 15),
+                bars_count=365,
+                call_timeout_seconds=5.0,
+            )
+        )
+        assert len(ib.req_historical_calls) == 1
+        call = ib.req_historical_calls[0]
+        assert call["endDateTime"] == "20240315 23:59:59"
+        assert call["durationStr"] == "365 D"
+        assert call["barSizeSetting"] == "1 day"
+        assert call["whatToShow"] == "TRADES"
+        assert call["useRTH"] is False  # futures use full session
+        assert call["formatDate"] == 2
+
+    def test_qualify_failure_returns_empty(self, meta: MarketMeta) -> None:
+        ib = _FakeIb()
+        ib.qualify_should_raise = RuntimeError("ib_async exploded mid-qualify")
+        bars = asyncio.run(
+            bar_sync.fetch_historical_contract_bars(
+                ib,
+                "/MES",
+                meta=meta,
+                contract_month="202403",
+                expiry_date=date(2024, 3, 15),
+                bars_count=365,
+                call_timeout_seconds=5.0,
+            )
+        )
+        assert bars == []
+        # reqHistoricalData must NOT have been called when qualify raised.
+        assert len(ib.req_historical_calls) == 0
+
+    def test_qualify_returns_empty_returns_empty_bars(self, meta: MarketMeta) -> None:
+        ib = _FakeIb()
+        ib.qualify_returns_empty = True
+        bars = asyncio.run(
+            bar_sync.fetch_historical_contract_bars(
+                ib,
+                "/MES",
+                meta=meta,
+                contract_month="202403",
+                expiry_date=date(2024, 3, 15),
+                bars_count=365,
+                call_timeout_seconds=5.0,
+            )
+        )
+        assert bars == []
+        assert len(ib.req_historical_calls) == 0
+
+    def test_qualify_returns_none_slot_returns_empty(self, meta: MarketMeta) -> None:
+        # Mirror of fetch_front_month_open_interest's defensive None-slot
+        # handling. ib-async may return ``[None]`` when qualifyContractsAsync
+        # can't resolve the symbol.
+        ib = _FakeIb()
+        ib.qualify_returns_none_slot = True
+        bars = asyncio.run(
+            bar_sync.fetch_historical_contract_bars(
+                ib,
+                "/MES",
+                meta=meta,
+                contract_month="190001",  # absurdly old contract → no match
+                expiry_date=date(1900, 1, 15),
+                bars_count=365,
+                call_timeout_seconds=5.0,
+            )
+        )
+        assert bars == []
+
+    def test_qualify_unavailable_returns_empty(self, meta: MarketMeta) -> None:
+        # If the ib object doesn't expose qualifyContractsAsync (older
+        # ib-async or a non-conforming fake), degrade gracefully.
+        class _NoQualifyIb(_FakeIb):
+            qualifyContractsAsync = None  # type: ignore[assignment]
+
+        ib = _NoQualifyIb()
+        bars = asyncio.run(
+            bar_sync.fetch_historical_contract_bars(
+                ib,
+                "/MES",
+                meta=meta,
+                contract_month="202403",
+                expiry_date=date(2024, 3, 15),
+                bars_count=365,
+                call_timeout_seconds=5.0,
+            )
+        )
+        assert bars == []
+
+    def test_req_historical_failure_returns_empty(self, meta: MarketMeta) -> None:
+        class _BoomIb(_FakeIb):
+            async def reqHistoricalDataAsync(self, *a: Any, **kw: Any) -> Any:
+                raise RuntimeError("historical fetch exploded")
+
+        ib = _BoomIb()
+        bars = asyncio.run(
+            bar_sync.fetch_historical_contract_bars(
+                ib,
+                "/MES",
+                meta=meta,
+                contract_month="202403",
+                expiry_date=date(2024, 3, 15),
+                bars_count=365,
+                call_timeout_seconds=5.0,
+            )
+        )
+        assert bars == []
+        # Qualify must have been invoked once (failure happens AFTER qualify).
+        assert len(ib.qualify_calls) == 1
+
+    def test_req_historical_returns_empty_returns_empty_bars(self, meta: MarketMeta) -> None:
+        # Distinct from the unhandled-exception path: IBKR can return an
+        # empty list for a contract with no historical data depth.
+        ib = _FakeIb()
+        ib.historical_bars = []
+        bars = asyncio.run(
+            bar_sync.fetch_historical_contract_bars(
+                ib,
+                "/MES",
+                meta=meta,
+                contract_month="202403",
+                expiry_date=date(2024, 3, 15),
+                bars_count=365,
+                call_timeout_seconds=5.0,
+            )
+        )
+        assert bars == []
+
+    def test_non_futures_meta_raises(self) -> None:
+        with pytest.raises(ValueError, match="non-futures meta"):
+            asyncio.run(
+                bar_sync.fetch_historical_contract_bars(
+                    _FakeIb(),
+                    "TLT",
+                    meta=PHASE1_UNIVERSE_METADATA["TLT"],
+                    contract_month="202403",
+                    expiry_date=date(2024, 3, 15),
+                    bars_count=365,
+                    call_timeout_seconds=5.0,
+                )
+            )
+
+    def test_logs_historical_contract_fetched_on_success(self, meta: MarketMeta) -> None:
+        ib = _FakeIb()
+        ib.historical_bars = [
+            _FakeBarData(date=date(2024, 3, 14), open=1, high=1, low=1, close=1, volume=1),
+            _FakeBarData(date=date(2024, 3, 15), open=1, high=1, low=1, close=1, volume=1),
+        ]
+        with capture_logs() as logs:
+            asyncio.run(
+                bar_sync.fetch_historical_contract_bars(
+                    ib,
+                    "/MES",
+                    meta=meta,
+                    contract_month="202403",
+                    expiry_date=date(2024, 3, 15),
+                    bars_count=365,
+                    call_timeout_seconds=5.0,
+                )
+            )
+        success_events = [e for e in logs if e.get("event") == "historical_contract_fetched"]
+        assert len(success_events) == 1
+        evt = success_events[0]
+        assert evt["market"] == "/MES"
+        assert evt["contract_month"] == "202403"
+        assert evt["bars_count"] == 2
+
+
+class TestHistoricalContractMonthsFromDisk:
+    """Read on-disk universe history → detect rolls → return historical-expiry set."""
+
+    def _meta(self) -> MarketMeta:
+        return PHASE1_UNIVERSE_METADATA["/MES"]
+
+    def _write_universe_file(
+        self, root: Path, market_dir: str, ticker: str, session_date: date, expiry: str
+    ) -> None:
+        path = (
+            root
+            / "future"
+            / market_dir
+            / "universes"
+            / ticker.lower()
+            / (f"{session_date:%Y%m%d}.csv")
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "#expiry,open,high,low,close,volume,open_interest\n"
+            f"{expiry},5290,5300,5280,5295,1000,100000\n",
+            encoding="utf-8",
+        )
+
+    def test_returns_empty_when_universe_dir_missing(self, tmp_path: Path) -> None:
+        months, expiry_dates = bar_sync.historical_contract_months_from_disk(
+            data_root=tmp_path, meta=self._meta(), persistence_days=15
+        )
+        assert months == []
+        assert expiry_dates == {}
+
+    def test_returns_empty_for_single_expiry_history(self, tmp_path: Path) -> None:
+        # 30 sessions of 202606 only → no rolls detected → no historical
+        # contracts to backfill.
+        meta = self._meta()
+        for i in range(30):
+            self._write_universe_file(
+                tmp_path,
+                meta.market_dir,
+                meta.ibkr_symbol,
+                date(2026, 3, 1) + timedelta(days=i),
+                "202606",
+            )
+        months, expiry_dates = bar_sync.historical_contract_months_from_disk(
+            data_root=tmp_path, meta=meta, persistence_days=15
+        )
+        assert months == []
+        assert expiry_dates == {}
+
+    def test_detects_two_rolls_three_expiries(self, tmp_path: Path) -> None:
+        # 20 sessions of 202403 → 20 sessions of 202406 → 20 sessions of
+        # 202409. Synthesizer detects 2 rolls; historical-expiry set is
+        # the union (202403, 202406, 202409).
+        meta = self._meta()
+        idx = 0
+        for expiry in ("202403", "202406", "202409"):
+            for _ in range(20):
+                self._write_universe_file(
+                    tmp_path,
+                    meta.market_dir,
+                    meta.ibkr_symbol,
+                    date(2024, 1, 1) + timedelta(days=idx),
+                    expiry,
+                )
+                idx += 1
+        months, expiry_dates = bar_sync.historical_contract_months_from_disk(
+            data_root=tmp_path, meta=meta, persistence_days=15
+        )
+        assert months == ["202403", "202406", "202409"]
+        # Each expiry maps to its computed last-trading date (3rd Friday).
+        assert expiry_dates["202403"] == date(2024, 3, 15)
+        assert expiry_dates["202406"] == date(2024, 6, 21)
+        assert expiry_dates["202409"] == date(2024, 9, 20)
+
+    def test_non_futures_meta_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="non-futures meta"):
+            bar_sync.historical_contract_months_from_disk(
+                data_root=tmp_path,
+                meta=PHASE1_UNIVERSE_METADATA["TLT"],
+                persistence_days=15,
+            )
+
+    def test_persistence_filter_drops_noisy_runs(self, tmp_path: Path) -> None:
+        # 20 sessions 202403, 3 sessions 202406 (noise — below persistence
+        # threshold), 20 sessions 202409. The synthesizer's persistence
+        # filter (default 15) drops the 3-session run and treats this as
+        # a single 202403 → 202409 roll. Historical-expiry set excludes
+        # 202406 because it never stabilized.
+        meta = self._meta()
+        idx = 0
+        for expiry, n in (("202403", 20), ("202406", 3), ("202409", 20)):
+            for _ in range(n):
+                self._write_universe_file(
+                    tmp_path,
+                    meta.market_dir,
+                    meta.ibkr_symbol,
+                    date(2024, 1, 1) + timedelta(days=idx),
+                    expiry,
+                )
+                idx += 1
+        months, _ = bar_sync.historical_contract_months_from_disk(
+            data_root=tmp_path, meta=meta, persistence_days=15
+        )
+        assert months == ["202403", "202409"]
+        assert "202406" not in months
+
+
+class TestBackfillHistoricalContractsForTicker:
+    """Per-ticker backfill orchestrator — idempotent + per-contract failure isolation."""
+
+    @pytest.fixture
+    def meta(self) -> MarketMeta:
+        return PHASE1_UNIVERSE_METADATA["/MES"]
+
+    def _historical_bars_for(self, contract_month: str, count: int) -> list[_FakeBarData]:
+        base_date = date(int(contract_month[:4]), int(contract_month[4:6]), 1)
+        return [
+            _FakeBarData(
+                date=base_date + timedelta(days=i),
+                open=5290.0 + i,
+                high=5300.0 + i,
+                low=5280.0 + i,
+                close=5295.0 + i,
+                volume=1000 + i,
+            )
+            for i in range(count)
+        ]
+
+    def test_no_expiries_short_circuits(self, tmp_path: Path, meta: MarketMeta) -> None:
+        result = asyncio.run(
+            bar_sync.backfill_historical_contracts_for_ticker(
+                _FakeIb(),
+                "/MES",
+                meta=meta,
+                contract_months_to_ensure=(),
+                expiry_dates={},
+                data_root=tmp_path,
+                bars_per_contract=365,
+                call_timeout_seconds=5.0,
+            )
+        )
+        assert result.backfilled_expiries == ()
+        assert result.skipped_expiries == ()
+        assert result.failed_expiries == ()
+        assert result.bars_fetched_total == 0
+        # No zip should have been written.
+        assert not futures_trade_zip_path(tmp_path, "MES", "cme").exists()
+
+    def test_happy_path_writes_three_historical_csvs(
+        self, tmp_path: Path, meta: MarketMeta
+    ) -> None:
+        ib = _FakeIb()
+        ib.historical_bars_by_contract = {
+            "202403": self._historical_bars_for("202403", 8),
+            "202406": self._historical_bars_for("202406", 10),
+            "202409": self._historical_bars_for("202409", 12),
+        }
+        # Pre-seed the zip with the current front-month CSV (as sync_one_market
+        # would have done) so the test sees only the BACKFILL contribution.
+        trade_zip = futures_trade_zip_path(tmp_path, "MES", "cme")
+        trade_zip.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(trade_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("mes_trade_202606.csv", b"front_month\n")
+        expiry_dates = {
+            "202403": date(2024, 3, 15),
+            "202406": date(2024, 6, 21),
+            "202409": date(2024, 9, 20),
+        }
+        result = asyncio.run(
+            bar_sync.backfill_historical_contracts_for_ticker(
+                ib,
+                "/MES",
+                meta=meta,
+                contract_months_to_ensure=tuple(expiry_dates),
+                expiry_dates=expiry_dates,
+                data_root=tmp_path,
+                bars_per_contract=365,
+                call_timeout_seconds=5.0,
+            )
+        )
+        assert set(result.backfilled_expiries) == {"202403", "202406", "202409"}
+        assert result.skipped_expiries == ()
+        assert result.failed_expiries == ()
+        assert result.bars_fetched_total == 8 + 10 + 12
+        with zipfile.ZipFile(trade_zip) as zf:
+            assert set(zf.namelist()) == {
+                "mes_trade_202403.csv",
+                "mes_trade_202406.csv",
+                "mes_trade_202409.csv",
+                "mes_trade_202606.csv",
+            }
+            # Sample one historical CSV to confirm bars landed.
+            content = zf.read("mes_trade_202406.csv").decode()
+            assert "20240601 00:00" in content
+
+    def test_idempotent_skips_already_present(self, tmp_path: Path, meta: MarketMeta) -> None:
+        # Pre-seed the zip with all 3 historical contracts already present.
+        # Backfill must skip ALL of them + emit zero IBKR calls.
+        trade_zip = futures_trade_zip_path(tmp_path, "MES", "cme")
+        trade_zip.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(trade_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("mes_trade_202403.csv", b"already_here\n")
+            zf.writestr("mes_trade_202406.csv", b"already_here\n")
+            zf.writestr("mes_trade_202409.csv", b"already_here\n")
+            zf.writestr("mes_trade_202606.csv", b"front\n")
+        ib = _FakeIb()
+        expiry_dates = {
+            "202403": date(2024, 3, 15),
+            "202406": date(2024, 6, 21),
+            "202409": date(2024, 9, 20),
+        }
+        result = asyncio.run(
+            bar_sync.backfill_historical_contracts_for_ticker(
+                ib,
+                "/MES",
+                meta=meta,
+                contract_months_to_ensure=tuple(expiry_dates),
+                expiry_dates=expiry_dates,
+                data_root=tmp_path,
+                bars_per_contract=365,
+                call_timeout_seconds=5.0,
+            )
+        )
+        assert result.backfilled_expiries == ()
+        assert set(result.skipped_expiries) == {"202403", "202406", "202409"}
+        assert result.failed_expiries == ()
+        assert result.bars_fetched_total == 0
+        # No IBKR calls should have been issued.
+        assert len(ib.qualify_calls) == 0
+        assert len(ib.req_historical_calls) == 0
+        # Zip contents unchanged.
+        with zipfile.ZipFile(trade_zip) as zf:
+            assert zf.read("mes_trade_202403.csv") == b"already_here\n"
+
+    def test_partial_failure_isolated_others_succeed(
+        self, tmp_path: Path, meta: MarketMeta
+    ) -> None:
+        # One contract returns empty (treat as failure); two succeed.
+        # Final zip should have the two successful CSVs.
+        ib = _FakeIb()
+        ib.historical_bars_by_contract = {
+            "202403": self._historical_bars_for("202403", 8),
+            "202406": [],  # IBKR has no data → failure
+            "202409": self._historical_bars_for("202409", 12),
+        }
+        expiry_dates = {
+            "202403": date(2024, 3, 15),
+            "202406": date(2024, 6, 21),
+            "202409": date(2024, 9, 20),
+        }
+        result = asyncio.run(
+            bar_sync.backfill_historical_contracts_for_ticker(
+                ib,
+                "/MES",
+                meta=meta,
+                contract_months_to_ensure=tuple(expiry_dates),
+                expiry_dates=expiry_dates,
+                data_root=tmp_path,
+                bars_per_contract=365,
+                call_timeout_seconds=5.0,
+            )
+        )
+        assert set(result.backfilled_expiries) == {"202403", "202409"}
+        assert result.failed_expiries == ("202406",)
+        assert result.skipped_expiries == ()
+        trade_zip = futures_trade_zip_path(tmp_path, "MES", "cme")
+        with zipfile.ZipFile(trade_zip) as zf:
+            assert set(zf.namelist()) == {
+                "mes_trade_202403.csv",
+                "mes_trade_202409.csv",
+            }
+
+    def test_mix_of_skipped_and_backfilled(self, tmp_path: Path, meta: MarketMeta) -> None:
+        # One contract already in zip (skip), two need fetching.
+        trade_zip = futures_trade_zip_path(tmp_path, "MES", "cme")
+        trade_zip.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(trade_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("mes_trade_202403.csv", b"already_here\n")
+        ib = _FakeIb()
+        ib.historical_bars_by_contract = {
+            "202406": self._historical_bars_for("202406", 10),
+            "202409": self._historical_bars_for("202409", 12),
+        }
+        expiry_dates = {
+            "202403": date(2024, 3, 15),
+            "202406": date(2024, 6, 21),
+            "202409": date(2024, 9, 20),
+        }
+        result = asyncio.run(
+            bar_sync.backfill_historical_contracts_for_ticker(
+                ib,
+                "/MES",
+                meta=meta,
+                contract_months_to_ensure=tuple(expiry_dates),
+                expiry_dates=expiry_dates,
+                data_root=tmp_path,
+                bars_per_contract=365,
+                call_timeout_seconds=5.0,
+            )
+        )
+        assert result.skipped_expiries == ("202403",)
+        assert set(result.backfilled_expiries) == {"202406", "202409"}
+        assert result.failed_expiries == ()
+        # IBKR called exactly 2 times (skipped one short-circuits before
+        # any IBKR I/O).
+        assert len(ib.qualify_calls) == 2
+
+    def test_missing_expiry_date_marked_failed(self, tmp_path: Path, meta: MarketMeta) -> None:
+        # contract_months_to_ensure lists 202406 but expiry_dates is
+        # missing that key — the backfill marks it failed and continues
+        # with subsequent contracts.
+        ib = _FakeIb()
+        ib.historical_bars_by_contract = {
+            "202403": self._historical_bars_for("202403", 8),
+        }
+        result = asyncio.run(
+            bar_sync.backfill_historical_contracts_for_ticker(
+                ib,
+                "/MES",
+                meta=meta,
+                contract_months_to_ensure=("202403", "202406"),
+                expiry_dates={"202403": date(2024, 3, 15)},
+                data_root=tmp_path,
+                bars_per_contract=365,
+                call_timeout_seconds=5.0,
+            )
+        )
+        assert result.backfilled_expiries == ("202403",)
+        assert result.failed_expiries == ("202406",)
+
+    def test_non_futures_meta_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="non-futures meta"):
+            asyncio.run(
+                bar_sync.backfill_historical_contracts_for_ticker(
+                    _FakeIb(),
+                    "TLT",
+                    meta=PHASE1_UNIVERSE_METADATA["TLT"],
+                    contract_months_to_ensure=("202606",),
+                    expiry_dates={"202606": date(2026, 6, 18)},
+                    data_root=tmp_path,
+                    bars_per_contract=365,
+                    call_timeout_seconds=5.0,
+                )
+            )
+
+    def test_logs_completed_for_ticker_event(self, tmp_path: Path, meta: MarketMeta) -> None:
+        ib = _FakeIb()
+        ib.historical_bars_by_contract = {
+            "202403": self._historical_bars_for("202403", 8),
+        }
+        with capture_logs() as logs:
+            asyncio.run(
+                bar_sync.backfill_historical_contracts_for_ticker(
+                    ib,
+                    "/MES",
+                    meta=meta,
+                    contract_months_to_ensure=("202403",),
+                    expiry_dates={"202403": date(2024, 3, 15)},
+                    data_root=tmp_path,
+                    bars_per_contract=365,
+                    call_timeout_seconds=5.0,
+                )
+            )
+        events = [
+            e
+            for e in logs
+            if e.get("event") == "historical_contracts_backfill_completed_for_ticker"
+        ]
+        assert len(events) == 1
+        evt = events[0]
+        assert evt["ticker"] == "mes"
+        assert evt["market_dir"] == "cme"
+        assert evt["backfilled_count"] == 1
+        assert evt["skipped_count"] == 0
+        assert evt["failed_count"] == 0
+        assert evt["bars_fetched_total"] == 8
+        assert evt["backfilled_expiries"] == ["202403"]
+
+    def test_unhandled_exception_in_fetch_marks_failed_continues(
+        self, tmp_path: Path, meta: MarketMeta
+    ) -> None:
+        # If fetch_historical_contract_bars unexpectedly raises (despite
+        # its own try/except), the orchestrator wraps in try/except and
+        # treats as a failure for that contract, continuing with the rest.
+        from services.data import bar_sync as _bs
+
+        original = _bs.fetch_historical_contract_bars
+        try:
+            call_count = 0
+
+            async def _flaky(*args: Any, **kwargs: Any) -> list[Any]:
+                nonlocal call_count
+                call_count += 1
+                if kwargs.get("contract_month") == "202406":
+                    raise RuntimeError("simulated unhandled exception")
+                return [
+                    Bar(
+                        session_date=date(2024, 3, 14),
+                        open=Decimal("5290"),
+                        high=Decimal("5300"),
+                        low=Decimal("5280"),
+                        close=Decimal("5295"),
+                        volume=1000,
+                    )
+                ]
+
+            _bs.fetch_historical_contract_bars = _flaky  # type: ignore[assignment]
+            result = asyncio.run(
+                bar_sync.backfill_historical_contracts_for_ticker(
+                    _FakeIb(),
+                    "/MES",
+                    meta=meta,
+                    contract_months_to_ensure=("202403", "202406", "202409"),
+                    expiry_dates={
+                        "202403": date(2024, 3, 15),
+                        "202406": date(2024, 6, 21),
+                        "202409": date(2024, 9, 20),
+                    },
+                    data_root=tmp_path,
+                    bars_per_contract=365,
+                    call_timeout_seconds=5.0,
+                )
+            )
+            assert set(result.backfilled_expiries) == {"202403", "202409"}
+            assert result.failed_expiries == ("202406",)
+            assert call_count == 3
+        finally:
+            _bs.fetch_historical_contract_bars = original  # type: ignore[assignment]
 
 
 class TestSyncOneMarket:
@@ -2612,6 +3504,280 @@ class TestBarSyncWorkerMapFileSynthesis:
             mfs.synthesize_futures_map_file = original  # type: ignore[assignment]
 
 
+class TestBarSyncWorkerBackfill:
+    """run_cycle invokes _backfill_historical_contracts for each futures market
+    AFTER the per-market sync loop + BEFORE map_file synthesis.
+
+    Locked by the 2026-05-23 decisions-log entry "Historical contract backfill
+    unblocks MA_SLOW=200". Without the backfill, LEAN's continuous-contract
+    resolver returns at most ~177 trading days (the current front-month's
+    history depth) for any futures symbol — the strategy's MA_SLOW=200 floor
+    can't be satisfied + every market is rejected on the WARMUP_TREND filter.
+    """
+
+    @pytest.fixture
+    def single_futures_config(self, tmp_path: Path) -> BarSyncConfig:
+        return BarSyncConfig(
+            markets={"/MES": PHASE1_UNIVERSE_METADATA["/MES"]},
+            data_root=tmp_path,
+            bars_per_fetch=1,
+            tick_interval_seconds=0.01,
+            ibkr_call_timeout_seconds=2.0,
+            ibkr_connect_timeout_seconds=2.0,
+            oi_wait_seconds=0.1,
+            map_file_persistence_days=1,  # keeps fixtures small
+            historical_backfill_bars_per_contract=10,
+        )
+
+    def _seed_multi_expiry_universe(self, root: Path, market_dir: str, ticker: str) -> None:
+        # Two stable runs across two distinct expiries → the synthesizer
+        # detects one genuine roll → historical-expiry set = {old, new}.
+        universes = root / "future" / market_dir / "universes" / ticker.lower()
+        universes.mkdir(parents=True, exist_ok=True)
+        for d in (date(2026, 1, 12), date(2026, 1, 13)):
+            (universes / f"{d:%Y%m%d}.csv").write_text(
+                "#expiry,open,high,low,close,volume,open_interest\n"
+                "202603,7400,7410,7390,7405,1000,100000\n",
+                encoding="utf-8",
+            )
+        for d in (date(2026, 4, 1), date(2026, 4, 2)):
+            (universes / f"{d:%Y%m%d}.csv").write_text(
+                "#expiry,open,high,low,close,volume,open_interest\n"
+                "202606,7500,7510,7490,7505,1000,100000\n",
+                encoding="utf-8",
+            )
+
+    def _build_ib_with_historical_bars(self) -> _FakeIb:
+        ib = _FakeIb()
+        ib.historical_bars = [
+            _FakeBarData(
+                date=date(2026, 5, 19),
+                open=7500.0,
+                high=7510.0,
+                low=7490.0,
+                close=7505.0,
+                volume=1000,
+            ),
+        ]
+        ib.contract_details = [
+            _FakeContractDetails(_FakeContract(lastTradeDateOrContractMonth="20260620")),
+        ]
+        ib.oi_value_to_serve = 50000
+        ib.historical_bars_by_contract = {
+            "202603": [
+                _FakeBarData(
+                    date=date(2026, 1, 12) + timedelta(days=i),
+                    open=7400.0 + i,
+                    high=7410.0 + i,
+                    low=7390.0 + i,
+                    close=7405.0 + i,
+                    volume=1000,
+                )
+                for i in range(7)
+            ],
+            "202606": [
+                _FakeBarData(
+                    date=date(2026, 4, 1) + timedelta(days=i),
+                    open=7500.0 + i,
+                    high=7510.0 + i,
+                    low=7490.0 + i,
+                    close=7505.0 + i,
+                    volume=1000,
+                )
+                for i in range(5)
+            ],
+        }
+        return ib
+
+    def test_backfill_runs_after_successful_cycle_writes_historical_csvs(
+        self, single_futures_config: BarSyncConfig, tmp_path: Path
+    ) -> None:
+        self._seed_multi_expiry_universe(tmp_path, "cme", "MES")
+        ib = self._build_ib_with_historical_bars()
+        worker = BarSyncWorker(
+            config=single_futures_config,
+            ib_factory=lambda: ib,
+            clock=lambda: datetime(2026, 5, 19, 21, 0, tzinfo=UTC),
+        )
+        asyncio.run(worker.run_cycle(today=date(2026, 5, 19)))
+        trade_zip = futures_trade_zip_path(tmp_path, "MES", "cme")
+        with zipfile.ZipFile(trade_zip) as zf:
+            names = set(zf.namelist())
+        # Front-month CSV from sync_one_market + 2 historical CSVs from backfill.
+        # (202603 is the from_expiry of the roll detected on disk; 202606 is
+        # the to_expiry — same as the current front-month so the backfill
+        # would skip it via idempotency, but sync_one_market wrote it
+        # already, so the zip has both regardless.)
+        assert "mes_trade_202606.csv" in names  # from sync_one_market
+        assert "mes_trade_202603.csv" in names  # from backfill
+
+    def test_backfill_disabled_skips_historical_fetch(self, tmp_path: Path) -> None:
+        # enable_historical_contract_backfill=False short-circuits the
+        # backfill phase entirely. Locks the operator escape hatch.
+        config = BarSyncConfig(
+            markets={"/MES": PHASE1_UNIVERSE_METADATA["/MES"]},
+            data_root=tmp_path,
+            bars_per_fetch=1,
+            tick_interval_seconds=0.01,
+            ibkr_call_timeout_seconds=2.0,
+            ibkr_connect_timeout_seconds=2.0,
+            oi_wait_seconds=0.1,
+            map_file_persistence_days=1,
+            enable_historical_contract_backfill=False,
+        )
+        self._seed_multi_expiry_universe(tmp_path, "cme", "MES")
+        ib = self._build_ib_with_historical_bars()
+        worker = BarSyncWorker(
+            config=config,
+            ib_factory=lambda: ib,
+            clock=lambda: datetime(2026, 5, 19, 21, 0, tzinfo=UTC),
+        )
+        asyncio.run(worker.run_cycle(today=date(2026, 5, 19)))
+        trade_zip = futures_trade_zip_path(tmp_path, "MES", "cme")
+        with zipfile.ZipFile(trade_zip) as zf:
+            # Only the front-month CSV from sync_one_market — no backfill
+            # ran, so the historical CSV is absent.
+            assert zf.namelist() == ["mes_trade_202606.csv"]
+        # No qualify call carries ``includeExpired=True`` (the OI fetch path
+        # qualifies the front-month contract too but with includeExpired=False;
+        # only the historical-contract backfill sets the flag).
+        backfill_qualify_calls = [
+            call for call in ib.qualify_calls for c in call if getattr(c, "includeExpired", False)
+        ]
+        assert backfill_qualify_calls == []
+
+    def test_backfill_skips_etfs(self, tmp_path: Path) -> None:
+        # ETFs have no concept of historical contracts. The backfill loop
+        # iterates only futures markets. Locks the no-op for ETFs.
+        config = BarSyncConfig(
+            markets={"TLT": PHASE1_UNIVERSE_METADATA["TLT"]},
+            data_root=tmp_path,
+            bars_per_fetch=1,
+            tick_interval_seconds=0.01,
+            ibkr_call_timeout_seconds=2.0,
+            ibkr_connect_timeout_seconds=2.0,
+        )
+        ib = _FakeIb()
+        ib.historical_bars = [
+            _FakeBarData(
+                date=date(2026, 5, 19),
+                open=85.0,
+                high=86.0,
+                low=84.0,
+                close=85.5,
+                volume=1000,
+            ),
+        ]
+        worker = BarSyncWorker(
+            config=config,
+            ib_factory=lambda: ib,
+            clock=lambda: datetime(2026, 5, 19, 21, 0, tzinfo=UTC),
+        )
+        asyncio.run(worker.run_cycle(today=date(2026, 5, 19)))
+        # Single ETF reqHistoricalData call (from fetch_etf_bars); no
+        # historical-contract qualify calls (no futures in universe).
+        assert len(ib.qualify_calls) == 0
+        # No futures/ tree on disk (no futures in the universe).
+        assert not (tmp_path / "future").exists()
+
+    def test_backfill_skipped_on_connect_failure(
+        self, single_futures_config: BarSyncConfig, tmp_path: Path
+    ) -> None:
+        # If connect fails, the per-market loop never runs + the backfill
+        # never runs (the connect-failed early-return short-circuits both).
+        # Even if disk has multi-expiry universe history, no IBKR calls
+        # are made.
+        self._seed_multi_expiry_universe(tmp_path, "cme", "MES")
+        ib = _FakeIb()
+        ib.connect_should_raise = ConnectionRefusedError("ib_gateway down")
+        worker = BarSyncWorker(
+            config=single_futures_config,
+            ib_factory=lambda: ib,
+            clock=lambda: datetime(2026, 5, 19, 21, 0, tzinfo=UTC),
+        )
+        result = asyncio.run(worker.run_cycle(today=date(2026, 5, 19)))
+        assert result.all_failed is True
+        assert len(ib.qualify_calls) == 0
+
+    def test_backfill_no_rolls_skips_with_log(
+        self, single_futures_config: BarSyncConfig, tmp_path: Path
+    ) -> None:
+        # When the synthesizer detects no rolls (e.g., brand-new market
+        # with only the current-expiry history), the backfill no-ops
+        # for that ticker + emits a structured skip log.
+        ib = self._build_ib_with_historical_bars()
+        with capture_logs() as logs:
+            worker = BarSyncWorker(
+                config=single_futures_config,
+                ib_factory=lambda: ib,
+                clock=lambda: datetime(2026, 5, 19, 21, 0, tzinfo=UTC),
+            )
+            asyncio.run(worker.run_cycle(today=date(2026, 5, 19)))
+        skip_events = [
+            e for e in logs if e.get("event") == "historical_contracts_backfill_skip_no_rolls"
+        ]
+        assert len(skip_events) == 1
+        evt = skip_events[0]
+        assert evt["market"] == "/MES"
+        assert evt["ticker"] == "MES"
+        # Zip only has the front-month CSV (no backfill happened for /MES).
+        trade_zip = futures_trade_zip_path(tmp_path, "MES", "cme")
+        with zipfile.ZipFile(trade_zip) as zf:
+            assert zf.namelist() == ["mes_trade_202606.csv"]
+
+    def test_backfill_per_ticker_failure_does_not_abort_cycle(
+        self, single_futures_config: BarSyncConfig, tmp_path: Path
+    ) -> None:
+        # If backfill_historical_contracts_for_ticker raises for one ticker
+        # (e.g., I/O failure mid-write), the cycle must still report the
+        # bar_sync outcome correctly.
+        self._seed_multi_expiry_universe(tmp_path, "cme", "MES")
+        from services.data import bar_sync as _bs
+
+        original = _bs.backfill_historical_contracts_for_ticker
+        try:
+
+            async def _boom(*args: Any, **kwargs: Any) -> Any:  # pragma: no cover - exception path
+                raise RuntimeError("simulated backfill explosion")
+
+            _bs.backfill_historical_contracts_for_ticker = _boom  # type: ignore[assignment]
+            ib = self._build_ib_with_historical_bars()
+            worker = BarSyncWorker(
+                config=single_futures_config,
+                ib_factory=lambda: ib,
+                clock=lambda: datetime(2026, 5, 19, 21, 0, tzinfo=UTC),
+            )
+            result = asyncio.run(worker.run_cycle(today=date(2026, 5, 19)))
+            # Cycle outcome unchanged by backfill failure.
+            assert len(result.successful_markets) == 1
+            assert result.successful_markets[0].market == "/MES"
+        finally:
+            _bs.backfill_historical_contracts_for_ticker = original  # type: ignore[assignment]
+
+    def test_backfill_emits_cycle_completed_log(
+        self, single_futures_config: BarSyncConfig, tmp_path: Path
+    ) -> None:
+        # Per-cycle aggregate observability — operator can grep
+        # historical_contracts_backfill_cycle_completed to see total
+        # contracts fetched + bars across the cycle.
+        self._seed_multi_expiry_universe(tmp_path, "cme", "MES")
+        ib = self._build_ib_with_historical_bars()
+        with capture_logs() as logs:
+            worker = BarSyncWorker(
+                config=single_futures_config,
+                ib_factory=lambda: ib,
+                clock=lambda: datetime(2026, 5, 19, 21, 0, tzinfo=UTC),
+            )
+            asyncio.run(worker.run_cycle(today=date(2026, 5, 19)))
+        cycle_events = [
+            e for e in logs if e.get("event") == "historical_contracts_backfill_cycle_completed"
+        ]
+        assert len(cycle_events) == 1
+        evt = cycle_events[0]
+        assert evt["session_date_et"] == "2026-05-19"
+        assert evt["tickers_processed"] == 1
+
+
 class TestBarSyncWorkerAlertSeam:
     """Task 4 — consecutive-cycle counters + P2 alert hook seam."""
 
@@ -2936,6 +4102,7 @@ class TestModuleContract:
             "DEFAULT_BAR_SYNC_CLIENT_ID",
             "DEFAULT_BARS_PER_FETCH",
             "DEFAULT_DATA_ROOT",
+            "DEFAULT_HISTORICAL_BACKFILL_BARS",
             "DEFAULT_IBKR_CALL_TIMEOUT_SECONDS",
             "DEFAULT_OI_MARKET_DATA_TYPE",
             "DEFAULT_OI_WAIT_SECONDS",
@@ -2947,10 +4114,12 @@ class TestModuleContract:
             "BarSyncConfig",
             "BarSyncCycleResult",
             "BarSyncWorker",
+            "HistoricalContractBackfillResult",
             "HistoricalDataFetcher",
             "IbFactory",
             "MarketMeta",
             "MarketSyncResult",
+            "backfill_historical_contracts_for_ticker",
             "build_equity_daily_csv",
             "build_equity_factor_file",
             "build_equity_map_file",
@@ -2965,10 +4134,13 @@ class TestModuleContract:
             "fetch_etf_bars",
             "fetch_front_month_open_interest",
             "fetch_futures_bars_and_front_month",
+            "fetch_historical_contract_bars",
             "futures_map_file_path",
             "futures_oi_zip_path",
             "futures_trade_zip_path",
             "futures_universe_file_path",
+            "historical_contract_months_from_disk",
+            "list_zip_member_names",
             "parse_ibkr_bars",
             "pick_front_month_expiry",
             "should_fire_now",
@@ -2976,6 +4148,7 @@ class TestModuleContract:
             "write_etf_bundle",
             "write_futures_bundle",
             "write_zip_with_member",
+            "write_zip_with_members_preserving",
         }
         assert set(bar_sync.__all__) == expected_surface
 

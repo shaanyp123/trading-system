@@ -87,6 +87,8 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
+import tempfile
 import zipfile
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
@@ -183,6 +185,16 @@ SENTINEL_OI_WHEN_FETCH_FAILED: Final[int] = 1
 #: ``ib_async/ib.py::reqMktData`` docstring + ``ib_async/wrapper.py``
 #: tick-type map ``86: 'futuresOpenInterest'``.
 _IBKR_FUTURES_OI_GENERIC_TICK: Final[str] = "588"
+
+#: Default count of daily bars fetched per historical-contract backfill call.
+#: Each futures contract typically has ~9 months (~190 trading days) of
+#: liquid history before expiry. 365 calendar days = ~260 trading days,
+#: comfortably above the per-contract envelope so the union across rolls
+#: covers the strategy's MA_SLOW_DAYS=200 requirement. The actual fetched
+#: count is capped by IBKR's per-contract data depth (it serves what it
+#: has — typically all of the contract's lifetime).
+DEFAULT_HISTORICAL_BACKFILL_BARS: Final[int] = 365
+
 
 #: IBKR market-data-type code applied to the bar_sync connection
 #: before any ``reqMktData`` call. ``3`` = DELAYED (15-20 min lag);
@@ -432,6 +444,23 @@ class BarSyncConfig:
     #: CONFIRMS root cause: LEAN's continuous-contract resolver returns
     #: empty DataFrame for futures".
     enable_map_file_synthesis: bool = True
+    #: When True, ``BarSyncWorker.run_cycle`` calls
+    #: :func:`backfill_historical_contracts_for_ticker` for each futures
+    #: market AFTER the per-market sync loop + BEFORE map_file synthesis.
+    #: Adds per-historical-contract daily CSVs to each ticker's trade
+    #: zip so LEAN's continuous-contract resolver can stitch ≥ 200 bars
+    #: from the roll history (the strategy's ``MA_SLOW_DAYS=200`` floor).
+    #: Set False in tests that only exercise the front-month sync path;
+    #: default True per the 2026-05-23 decisions-log entry "Historical
+    #: contract backfill unblocks MA_SLOW=200".
+    enable_historical_contract_backfill: bool = True
+    #: Count of daily bars requested per historical-contract backfill
+    #: call (``durationStr=f"{N} D"``). 365 calendar days = ~260 trading
+    #: days; covers a typical 9-month futures contract lifetime with
+    #: headroom. Smaller values fetch faster but may under-serve LEAN's
+    #: per-contract resolver if a contract's actual lifetime exceeds
+    #: the request.
+    historical_backfill_bars_per_contract: int = DEFAULT_HISTORICAL_BACKFILL_BARS
 
 
 # ---------------------------------------------------------------------------
@@ -721,6 +750,89 @@ def write_zip_with_member(zip_path: Path, member_name: str, body: bytes) -> int:
     return zip_path.stat().st_size
 
 
+def list_zip_member_names(zip_path: Path) -> set[str]:
+    """Return the set of member filenames in ``zip_path``.
+
+    Returns empty set if the file doesn't exist or is unreadable as a
+    zip (the caller treats both as "no members present"). Used by the
+    historical-contract backfill path to short-circuit IBKR fetches
+    when the per-contract CSV is already on disk.
+    """
+    if not zip_path.is_file():
+        return set()
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            return set(zf.namelist())
+    except (zipfile.BadZipFile, OSError):  # pragma: no cover — defensive
+        return set()
+
+
+def write_zip_with_members_preserving(zip_path: Path, members_to_write: dict[str, bytes]) -> int:
+    """Add/replace ``members_to_write`` in ``zip_path``; preserve other members.
+
+    Atomic via tmp-file + ``os.replace`` (single-syscall rename on the
+    same filesystem; mirrors the pattern in
+    :mod:`services.data.map_file_synthesis._write_atomic`).
+
+    Existing members whose names appear in ``members_to_write`` are
+    replaced with the new bytes; other existing members are preserved
+    byte-for-byte. If the file doesn't exist a fresh zip is created
+    containing only ``members_to_write``.
+
+    This is the load-bearing primitive for the historical-contract
+    backfill (2026-05-23+): :func:`write_futures_bundle` writes the
+    current front-month here so prior cycles' backfilled historical
+    CSVs survive the rewrite; :func:`backfill_historical_contracts_for_ticker`
+    writes the newly-fetched historical CSVs in a single rewrite so the
+    zip stays consistent on partial failure (atomic).
+
+    Returns the resulting file's size in bytes. Raises ``OSError`` if
+    the tmp-file or replace fails — the caller's error policy is
+    per-call (the backfill orchestrator catches + logs per ticker).
+    """
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    # Snapshot existing members (excluding any that we're about to overwrite).
+    existing: dict[str, bytes] = {}
+    if zip_path.is_file():
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                for name in zf.namelist():
+                    if name in members_to_write:
+                        continue
+                    existing[name] = zf.read(name)
+        except (zipfile.BadZipFile, OSError):  # pragma: no cover — defensive
+            # Existing zip is unreadable — start fresh.
+            existing = {}
+    # tempfile.NamedTemporaryFile on the same dir guarantees ``os.replace``
+    # is atomic (single-filesystem rename); ``delete=False`` so the close
+    # in our finally block doesn't auto-delete before the rename.
+    tmp = tempfile.NamedTemporaryFile(
+        mode="wb",
+        dir=str(zip_path.parent),
+        prefix=f".{zip_path.name}.",
+        suffix=".tmp",
+        delete=False,
+    )
+    try:
+        tmp.close()  # close the handle so ZipFile can open the path fresh
+        with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as zf:
+            # Existing members first in sorted order (deterministic on-disk
+            # layout simplifies diffs / debugging) then the new/updated ones.
+            for name in sorted(existing):
+                zf.writestr(name, existing[name])
+            for name in sorted(members_to_write):
+                zf.writestr(name, members_to_write[name])
+        os.replace(tmp.name, zip_path)
+    except Exception:
+        # Best-effort cleanup of the tmp file on any failure.
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+        raise
+    return zip_path.stat().st_size
+
+
 def write_etf_bundle(
     *,
     data_root: Path,
@@ -775,6 +887,17 @@ def write_futures_bundle(
         session-date in ``bars`` (one file per bar)
       * ``future/<market_dir>/map_files/<lower>.csv`` (2-row sentinel)
 
+    The trade-zip + OI-zip writes go through
+    :func:`write_zip_with_members_preserving` so prior cycles'
+    backfilled historical-contract CSVs survive the per-cycle rewrite
+    (added 2026-05-23 for the historical-contract backfill follow-up
+    PR; see ``Docs/decisions-log.md`` 2026-05-23 entry "Historical
+    contract backfill unblocks MA_SLOW=200"). Without the
+    preserving-write, ``sync_one_market`` would wipe the historical
+    CSVs the backfill phase wrote each cycle, forcing re-fetch of every
+    historical contract on every cycle (~60-90 IBKR calls / cycle vs.
+    ~0 in steady state).
+
     Returns the trade-zip's size in bytes. Raises ``ValueError`` if
     ``bars`` is empty.
     """
@@ -783,11 +906,11 @@ def write_futures_bundle(
     trade_csv_bytes = build_futures_trade_csv(bars)
     trade_zip = futures_trade_zip_path(data_root, ticker, market_dir)
     trade_member = f"{ticker.lower()}_trade_{front_month_expiry_yyyymm}.csv"
-    trade_size = write_zip_with_member(trade_zip, trade_member, trade_csv_bytes)
+    trade_size = write_zip_with_members_preserving(trade_zip, {trade_member: trade_csv_bytes})
     oi_csv_bytes = build_futures_oi_csv(bars, open_interest)
     oi_zip = futures_oi_zip_path(data_root, ticker, market_dir)
     oi_member = f"{ticker.lower()}_openinterest_{front_month_expiry_yyyymm}.csv"
-    write_zip_with_member(oi_zip, oi_member, oi_csv_bytes)
+    write_zip_with_members_preserving(oi_zip, {oi_member: oi_csv_bytes})
     # Per-day universe files — one per session_date in bars.
     universe_oi = open_interest if open_interest > 0 else None
     for bar in bars:
@@ -1213,6 +1336,381 @@ async def fetch_front_month_open_interest(
 
 
 # ---------------------------------------------------------------------------
+# Historical-contract backfill (added 2026-05-23 — bars_per_fetch=250 D against
+# ContFuture only returns the current front-month's ~177 trading days because
+# IBKR's ContFuture does NOT splice in bars from prior expiries; it serves
+# the current front-month contract's full history. MA_SLOW_DAYS=200 needs
+# ≥ 200 bars per market for entry signals to emit; without per-historical-
+# contract CSVs the strategy rejects every market on the WARMUP_TREND
+# filter. See ``Docs/decisions-log.md`` 2026-05-23 entry.)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalContractBackfillResult:
+    """Outcome of one ticker's historical-contract backfill pass.
+
+    Returned by :func:`backfill_historical_contracts_for_ticker`. Aggregated
+    per-cycle into the structured log lines so the operator can grep
+    ``historical_contracts_backfill_completed_for_ticker`` to see the
+    per-ticker count of newly-fetched contracts.
+
+    ``backfilled_expiries`` lists the YYYYMM strings whose CSVs were
+    fetched + written this call; ``skipped_expiries`` lists the YYYYMM
+    strings that were already on disk (idempotency); ``failed_expiries``
+    lists the YYYYMM strings whose IBKR fetch raised or returned no
+    bars (the cycle continues; the cumulative on-disk state degrades
+    gracefully — strategy reads what's there, drops what isn't).
+    """
+
+    ticker: str
+    market_dir: str
+    backfilled_expiries: tuple[str, ...]
+    skipped_expiries: tuple[str, ...]
+    failed_expiries: tuple[str, ...]
+    bars_fetched_total: int
+
+
+async def fetch_historical_contract_bars(
+    ib: Any,
+    market_key: str,
+    *,
+    meta: MarketMeta,
+    contract_month: str,
+    expiry_date: date,
+    bars_count: int,
+    call_timeout_seconds: float,
+) -> list[Bar]:
+    """Fetch daily bars for ONE specific futures contract month.
+
+    Builds a non-continuous :class:`ib_async.Future` with
+    ``lastTradeDateOrContractMonth=contract_month`` + ``includeExpired=True``
+    so IBKR resolves both currently-trading + expired contracts.
+    Qualifies the contract via :meth:`IB.qualifyContractsAsync` (populates
+    ``conId`` in-place; required for ``reqHistoricalData`` on expired
+    contracts) then issues ``reqHistoricalDataAsync`` with
+    ``endDateTime`` pinned to the contract's expiry date so IBKR returns
+    bars up to that contract's last trading day (not "up to now" —
+    that would return no bars for an expired contract).
+
+    Returns the parsed :class:`Bar` list (sorted ascending by
+    ``session_date`` + de-duped). Returns ``[]`` on any failure mode
+    (qualification raises / returns no match, ``reqHistoricalData``
+    times out, IBKR returns no bars). Per-failure-mode logging is at
+    WARNING; the caller treats an empty list as "skip this contract".
+
+    Used by :func:`backfill_historical_contracts_for_ticker` for each
+    historical roll boundary in the synthesizer's per-ticker rolls.
+
+    Args:
+        ib: ib-async ``IB`` instance (or test fake).
+        market_key: ``/MES``-style key for logging.
+        meta: :class:`MarketMeta` — must be ``kind="futures"``.
+        contract_month: 6-digit ``YYYYMM`` (e.g., ``"202403"``).
+        expiry_date: actual last-trading day for ``contract_month``;
+            used as ``endDateTime``. Compute via
+            :func:`services.data.map_file_synthesis.compute_future_expiry`.
+        bars_count: count of daily bars to request (passed to IBKR as
+            ``durationStr=f"{N} D"``).
+        call_timeout_seconds: per-call wall-clock budget for each
+            ib-async await.
+
+    Raises ``ValueError`` if ``meta.kind != "futures"``.
+    """
+    if meta.kind != "futures":
+        raise ValueError(f"fetch_historical_contract_bars called with non-futures meta {meta!r}")
+    from ib_async import Future
+
+    bound_log = log.bind(
+        op="fetch_historical_contract_bars",
+        market=market_key,
+        contract_month=contract_month,
+        expiry_date=expiry_date.isoformat(),
+    )
+
+    contract: Any
+    try:
+        contract = Future(
+            symbol=meta.ibkr_symbol,
+            exchange=meta.ibkr_exchange,
+            lastTradeDateOrContractMonth=contract_month,
+            includeExpired=True,
+        )
+    except Exception:  # pragma: no cover — Future ctor is dataclass-like
+        bound_log.exception("historical_contract_build_failed")
+        return []
+
+    qualify = getattr(ib, "qualifyContractsAsync", None)
+    if qualify is None:
+        bound_log.warning("historical_contract_qualify_unavailable")
+        return []
+    try:
+        qualified = await asyncio.wait_for(qualify(contract), timeout=call_timeout_seconds)
+    except TimeoutError:
+        bound_log.warning(
+            "historical_contract_qualify_timeout",
+            call_timeout_seconds=call_timeout_seconds,
+        )
+        return []
+    except Exception as exc:
+        bound_log.warning(
+            "historical_contract_qualify_failed",
+            error=str(exc),
+            exception_type=type(exc).__name__,
+        )
+        return []
+    qualified_list = list(qualified or [])
+    if not qualified_list or qualified_list[0] is None:
+        bound_log.warning("historical_contract_qualify_returned_no_match")
+        return []
+    qualified_contract = qualified_list[0]
+
+    # IBKR expects ``YYYYMMDD HH:MM:SS`` format on ``endDateTime``; an
+    # empty string would default to "now" and return zero bars for an
+    # expired contract. Anchor to the contract's last trading day at
+    # end-of-day so IBKR includes bars up to (and including) expiry.
+    end_dt_str = f"{expiry_date:%Y%m%d} 23:59:59"
+    duration = f"{bars_count} D"
+    try:
+        bar_datas = await asyncio.wait_for(
+            ib.reqHistoricalDataAsync(
+                qualified_contract,
+                endDateTime=end_dt_str,
+                durationStr=duration,
+                barSizeSetting="1 day",
+                whatToShow="TRADES",
+                useRTH=False,
+                formatDate=2,
+            ),
+            timeout=call_timeout_seconds,
+        )
+    except TimeoutError:
+        bound_log.warning(
+            "historical_contract_reqhistorical_timeout",
+            call_timeout_seconds=call_timeout_seconds,
+        )
+        return []
+    except Exception as exc:
+        bound_log.warning(
+            "historical_contract_reqhistorical_failed",
+            error=str(exc),
+            exception_type=type(exc).__name__,
+        )
+        return []
+
+    bars = parse_ibkr_bars(bar_datas or [])
+    bound_log.info("historical_contract_fetched", bars_count=len(bars))
+    return bars
+
+
+def historical_contract_months_from_disk(
+    *,
+    data_root: Path,
+    meta: MarketMeta,
+    persistence_days: int,
+) -> tuple[list[str], dict[str, date]]:
+    """Compute the historical-expiry set + per-expiry date map from disk.
+
+    Reads the ticker's on-disk universe sessions via
+    :func:`services.data.map_file_synthesis.iter_universe_sessions`
+    + runs the persistence-filtered roll detector via
+    :func:`services.data.map_file_synthesis.detect_real_rolls`. Returns
+    the union of ``from_expiry`` + ``to_expiry`` across all detected
+    rolls (sorted ascending) paired with a dict mapping each YYYYMM to
+    its computed last-trading date (via
+    :func:`services.data.map_file_synthesis.compute_future_expiry`).
+
+    Returns ``([], {})`` when the universe directory doesn't exist
+    yet OR no rolls are detected (single-expiry history). The caller
+    short-circuits backfill in that case.
+
+    A non-futures :class:`MarketMeta` raises ``ValueError`` — the
+    caller filters before invoking.
+    """
+    if meta.kind != "futures":
+        raise ValueError(
+            f"historical_contract_months_from_disk called with non-futures meta {meta!r}"
+        )
+    # Local import to avoid the module-import-time circular dependency
+    # with :mod:`map_file_synthesis` (mirrors the pattern in
+    # :meth:`BarSyncWorker._synthesize_futures_map_files`).
+    from services.data import map_file_synthesis as _mfs
+
+    universe_dir = data_root / "future" / meta.market_dir / "universes" / meta.ibkr_symbol.lower()
+    sessions = list(_mfs.iter_universe_sessions(universe_dir))
+    rolls = _mfs.detect_real_rolls(sessions, persistence_days=persistence_days)
+    expiries: set[str] = set()
+    for roll in rolls:
+        expiries.add(roll.from_expiry)
+        expiries.add(roll.to_expiry)
+    if not expiries:
+        return [], {}
+    expiry_dates: dict[str, date] = {}
+    for yyyymm in expiries:
+        try:
+            expiry_dates[yyyymm] = _mfs.compute_future_expiry(
+                ticker=meta.ibkr_symbol, contract_month=yyyymm
+            )
+        except ValueError:
+            # Unknown ticker or malformed contract_month — skip rather
+            # than fail the whole ticker's backfill.
+            continue
+    sorted_expiries = sorted(yyyymm for yyyymm in expiries if yyyymm in expiry_dates)
+    return sorted_expiries, expiry_dates
+
+
+async def backfill_historical_contracts_for_ticker(
+    ib: Any,
+    market_key: str,
+    *,
+    meta: MarketMeta,
+    contract_months_to_ensure: Iterable[str],
+    expiry_dates: dict[str, date],
+    data_root: Path,
+    bars_per_contract: int,
+    call_timeout_seconds: float,
+) -> HistoricalContractBackfillResult:
+    """Backfill historical-contract daily CSVs into the ticker's trade zip.
+
+    Idempotent: for each YYYYMM in ``contract_months_to_ensure``,
+    short-circuits if the per-expiry CSV is already in the zip
+    (cheap ``zipfile.namelist`` check, no IBKR call). Newly-fetched
+    contracts are accumulated in memory then written via a single
+    :func:`write_zip_with_members_preserving` call so the zip stays
+    consistent on partial failure (atomic single-rename).
+
+    Per-contract IBKR failures are caught + logged at WARNING; the
+    backfill continues with subsequent expiries. The function NEVER
+    raises (the worker treats backfill as best-effort observability;
+    a failed backfill degrades to fewer historical bars, never a
+    cycle-level abort).
+
+    Args:
+        ib: ib-async ``IB`` instance (or test fake).
+        market_key: ``/MES``-style key for logging.
+        meta: :class:`MarketMeta` — must be ``kind="futures"``.
+        contract_months_to_ensure: YYYYMM strings to ensure present in
+            the zip; typically the synthesizer's historical-expiry
+            union via :func:`historical_contract_months_from_disk`.
+        expiry_dates: per-YYYYMM last-trading date (paired with
+            ``contract_months_to_ensure``); used as ``endDateTime`` on
+            the IBKR fetch. Missing keys → that expiry skipped with
+            warning log.
+        data_root: LEAN on-disk root.
+        bars_per_contract: count of daily bars to request per historical
+            contract (``durationStr=f"{N} D"``).
+        call_timeout_seconds: per-call wall-clock deadline on each
+            ib-async await.
+
+    Returns a :class:`HistoricalContractBackfillResult` summarizing the
+    pass.
+    """
+    if meta.kind != "futures":
+        raise ValueError(
+            f"backfill_historical_contracts_for_ticker called with non-futures meta {meta!r}"
+        )
+    bound_log = log.bind(
+        op="backfill_historical_contracts_for_ticker",
+        market=market_key,
+        ticker=meta.ibkr_symbol.lower(),
+        market_dir=meta.market_dir,
+    )
+    months = tuple(contract_months_to_ensure)
+    if not months:
+        bound_log.info("historical_contracts_backfill_no_expiries")
+        return HistoricalContractBackfillResult(
+            ticker=meta.ibkr_symbol.lower(),
+            market_dir=meta.market_dir,
+            backfilled_expiries=(),
+            skipped_expiries=(),
+            failed_expiries=(),
+            bars_fetched_total=0,
+        )
+
+    trade_zip = futures_trade_zip_path(data_root, meta.ibkr_symbol, meta.market_dir)
+    existing_members = list_zip_member_names(trade_zip)
+    new_members: dict[str, bytes] = {}
+    backfilled: list[str] = []
+    skipped: list[str] = []
+    failed: list[str] = []
+    bars_total = 0
+    for yyyymm in sorted(months):
+        member_name = f"{meta.ibkr_symbol.lower()}_trade_{yyyymm}.csv"
+        if member_name in existing_members:
+            skipped.append(yyyymm)
+            continue
+        expiry_date = expiry_dates.get(yyyymm)
+        if expiry_date is None:
+            bound_log.warning(
+                "historical_contracts_backfill_skip_no_expiry_date",
+                contract_month=yyyymm,
+            )
+            failed.append(yyyymm)
+            continue
+        try:
+            bars = await fetch_historical_contract_bars(
+                ib,
+                market_key,
+                meta=meta,
+                contract_month=yyyymm,
+                expiry_date=expiry_date,
+                bars_count=bars_per_contract,
+                call_timeout_seconds=call_timeout_seconds,
+            )
+        except Exception as exc:
+            bound_log.warning(
+                "historical_contracts_backfill_fetch_unhandled_exception",
+                contract_month=yyyymm,
+                error=str(exc),
+                exception_type=type(exc).__name__,
+            )
+            failed.append(yyyymm)
+            continue
+        if not bars:
+            # fetch_historical_contract_bars already logged the specific
+            # failure mode (timeout / no match / IBKR error). Treat as a
+            # per-contract failure for the result summary.
+            failed.append(yyyymm)
+            continue
+        new_members[member_name] = build_futures_trade_csv(bars)
+        backfilled.append(yyyymm)
+        bars_total += len(bars)
+
+    if new_members:
+        try:
+            write_zip_with_members_preserving(trade_zip, new_members)
+        except Exception:
+            bound_log.exception(
+                "historical_contracts_backfill_zip_write_failed",
+                trade_zip=str(trade_zip),
+                new_member_count=len(new_members),
+            )
+            # Demote successfully-fetched expiries from "backfilled" to
+            # "failed" — they didn't actually land on disk this cycle.
+            failed.extend(backfilled)
+            backfilled = []
+            bars_total = 0
+
+    bound_log.info(
+        "historical_contracts_backfill_completed_for_ticker",
+        backfilled_count=len(backfilled),
+        skipped_count=len(skipped),
+        failed_count=len(failed),
+        bars_fetched_total=bars_total,
+        backfilled_expiries=backfilled,
+        failed_expiries=failed,
+    )
+    return HistoricalContractBackfillResult(
+        ticker=meta.ibkr_symbol.lower(),
+        market_dir=meta.market_dir,
+        backfilled_expiries=tuple(backfilled),
+        skipped_expiries=tuple(skipped),
+        failed_expiries=tuple(failed),
+        bars_fetched_total=bars_total,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Per-market sync orchestrator
 # ---------------------------------------------------------------------------
 
@@ -1605,6 +2103,16 @@ class BarSyncWorker:
                         market=market_key,
                         error=result.error,
                     )
+            # Historical-contract backfill runs INSIDE the connect-succeeded
+            # arm of the try block — it needs a live ib connection. Runs
+            # AFTER the per-market sync loop completes so the synthesizer's
+            # rolls reflect the freshly-written universe files; runs BEFORE
+            # the finally-block disconnect so the ib session is still
+            # usable. Best-effort: per-ticker exceptions are caught + logged
+            # by ``_backfill_historical_contracts`` so a backfill failure
+            # never aborts the cycle.
+            if self._config.enable_historical_contract_backfill:
+                await self._backfill_historical_contracts(ib, today=today)
         finally:
             # Best-effort disconnect. Wrap in try/except because a
             # connect-failed cycle has ib in an indeterminate state.
@@ -1687,6 +2195,99 @@ class BarSyncWorker:
                     ticker=meta.ibkr_symbol,
                     market_dir=meta.market_dir,
                 )
+
+    async def _backfill_historical_contracts(
+        self, ib: Any, *, today: date
+    ) -> tuple[HistoricalContractBackfillResult, ...]:
+        """Backfill historical-contract daily CSVs for every futures market.
+
+        Walks the futures markets in :attr:`BarSyncConfig.markets` and
+        calls :func:`backfill_historical_contracts_for_ticker` for each,
+        feeding in the per-ticker historical-expiry set derived from
+        on-disk universe sessions via
+        :func:`historical_contract_months_from_disk` (which delegates
+        to :func:`services.data.map_file_synthesis.detect_real_rolls`).
+
+        Per-ticker exceptions are caught + logged so a single ticker's
+        I/O / IBKR failure doesn't abort the backfill loop. Returns the
+        per-ticker results as a tuple so test code (+ future cycle-level
+        observability) can inspect.
+
+        Why this lives inside the BarSyncWorker class rather than as a
+        free function: it shares the in-process ``ib`` connection with
+        ``sync_one_market`` and runs inside the connect-succeeded arm
+        of :meth:`run_cycle`'s try block — same lifecycle as the
+        per-market sync loop. The free-function
+        :func:`backfill_historical_contracts_for_ticker` is the per-
+        ticker workhorse; this method is the per-cycle orchestrator.
+
+        See the 2026-05-23 decisions-log entry "Historical contract
+        backfill unblocks MA_SLOW=200" for the saga + the architectural
+        rationale (IBKR ContFuture only serves the current front-
+        month's bars; the strategy's MA_SLOW_DAYS=200 floor needs the
+        union across historical contracts).
+        """
+        results: list[HistoricalContractBackfillResult] = []
+        for market_key, meta in self._config.markets.items():
+            if meta.kind != "futures":
+                continue
+            try:
+                months, expiry_dates = historical_contract_months_from_disk(
+                    data_root=self._config.data_root,
+                    meta=meta,
+                    persistence_days=self._config.map_file_persistence_days,
+                )
+            except Exception:
+                self._log.exception(
+                    "historical_contracts_backfill_disk_scan_failed",
+                    market=market_key,
+                    ticker=meta.ibkr_symbol,
+                    market_dir=meta.market_dir,
+                )
+                continue
+            if not months:
+                # No detected rolls yet — the synthesizer's persistence
+                # filter hasn't seen enough universe history for this
+                # ticker. Backfill no-op + log so the operator can see
+                # the per-ticker disposition.
+                self._log.info(
+                    "historical_contracts_backfill_skip_no_rolls",
+                    market=market_key,
+                    ticker=meta.ibkr_symbol,
+                    market_dir=meta.market_dir,
+                )
+                continue
+            try:
+                ticker_result = await backfill_historical_contracts_for_ticker(
+                    ib,
+                    market_key,
+                    meta=meta,
+                    contract_months_to_ensure=months,
+                    expiry_dates=expiry_dates,
+                    data_root=self._config.data_root,
+                    bars_per_contract=self._config.historical_backfill_bars_per_contract,
+                    call_timeout_seconds=self._config.ibkr_call_timeout_seconds,
+                )
+            except Exception:
+                self._log.exception(
+                    "historical_contracts_backfill_for_ticker_failed",
+                    market=market_key,
+                    ticker=meta.ibkr_symbol,
+                    market_dir=meta.market_dir,
+                )
+                continue
+            results.append(ticker_result)
+        self._log.info(
+            "historical_contracts_backfill_cycle_completed",
+            session_date_et=today.isoformat(),
+            tickers_processed=len(results),
+            tickers_with_new_contracts=sum(1 for r in results if r.backfilled_expiries),
+            new_contracts_total=sum(len(r.backfilled_expiries) for r in results),
+            skipped_contracts_total=sum(len(r.skipped_expiries) for r in results),
+            failed_contracts_total=sum(len(r.failed_expiries) for r in results),
+            bars_fetched_total=sum(r.bars_fetched_total for r in results),
+        )
+        return tuple(results)
 
     async def _evaluate_alerts(self, cycle_result: BarSyncCycleResult) -> None:
         """Update consecutive-cycle counters + dispatch P2 alerts at threshold.
@@ -1795,6 +2396,7 @@ __all__ = [
     "DEFAULT_BARS_PER_FETCH",
     "DEFAULT_BAR_SYNC_CLIENT_ID",
     "DEFAULT_DATA_ROOT",
+    "DEFAULT_HISTORICAL_BACKFILL_BARS",
     "DEFAULT_IBKR_CALL_TIMEOUT_SECONDS",
     "DEFAULT_OI_MARKET_DATA_TYPE",
     "DEFAULT_OI_WAIT_SECONDS",
@@ -1806,10 +2408,12 @@ __all__ = [
     "BarSyncConfig",
     "BarSyncCycleResult",
     "BarSyncWorker",
+    "HistoricalContractBackfillResult",
     "HistoricalDataFetcher",
     "IbFactory",
     "MarketMeta",
     "MarketSyncResult",
+    "backfill_historical_contracts_for_ticker",
     "build_equity_daily_csv",
     "build_equity_factor_file",
     "build_equity_map_file",
@@ -1824,10 +2428,13 @@ __all__ = [
     "fetch_etf_bars",
     "fetch_front_month_open_interest",
     "fetch_futures_bars_and_front_month",
+    "fetch_historical_contract_bars",
     "futures_map_file_path",
     "futures_oi_zip_path",
     "futures_trade_zip_path",
     "futures_universe_file_path",
+    "historical_contract_months_from_disk",
+    "list_zip_member_names",
     "parse_ibkr_bars",
     "pick_front_month_expiry",
     "should_fire_now",
@@ -1835,4 +2442,5 @@ __all__ = [
     "write_etf_bundle",
     "write_futures_bundle",
     "write_zip_with_member",
+    "write_zip_with_members_preserving",
 ]
