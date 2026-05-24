@@ -17,6 +17,80 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ## Entries
 
+### 2026-05-23 — Historical contract backfill unblocks MA_SLOW=200 (PR #229)
+
+**Trigger:** the 2026-05-23 21:30 UTC LEAN cycle (the natural validation gate for PRs #225/#226/#228) emitted `v1_history_probe` lines with `hist_len=176-177` across all 6 active futures (/MES /MNQ /MYM /M2K /MGC /MBT) vs `hist_len=205` for the 4 ETFs. The strategy's `MA_SLOW_DAYS=200` floor rejected every futures market on the WARMUP_TREND filter → `v1_signals_generated session_date=2026-05-23 signals_emitted_count=0 rejections_count=10`. This is the "Issue B — depth shortfall" follow-up scoped against today's /MCL sideline entry.
+
+**Root cause:** bar_sync fetches continuous-mapped daily bars via `ContFuture`. IBKR serves those from the CURRENT front-month contract's history depth only (~178 trading days for a typical 9-month listing horizon) — it does NOT splice in bars from prior expiries. So `<lower>_trade.zip` contained exactly one CSV per ticker (`<lower>_trade_<current_front_month>.csv` with ~177 trading days), and LEAN's continuous-contract resolver topped out at that contract's depth regardless of how many roll boundaries the synthesized map_file listed.
+
+**What landed (this PR — #229):**
+
+`services/data/bar_sync.py` (+612 lines):
+
+1. **`write_zip_with_members_preserving(path, members)`** — atomic tmp-file+`os.replace`; preserves existing zip members not named in `members`. Load-bearing for survival of backfilled historical CSVs across per-cycle front-month rewrites. Mirrors the `_write_atomic` pattern in `services/data/map_file_synthesis.py`.
+2. **`list_zip_member_names(path) -> set[str]`** — defensive idempotency read (returns empty set on missing/corrupt zip).
+3. **`fetch_historical_contract_bars(ib, market_key, *, meta, contract_month, expiry_date, bars_count, call_timeout_seconds)`** — per-historical-contract IBKR fetch. Uses `Future(symbol, exchange, lastTradeDateOrContractMonth=YYYYMM, includeExpired=True)` + `qualifyContractsAsync` + `reqHistoricalDataAsync` (the same pattern the OI fetch path already uses for the front-month). Pins `endDateTime` to `expiry_date` so IBKR returns bars up to the contract's last trading day (an empty `endDateTime` returns 0 bars for an expired contract). Returns `[]` on any failure mode (qualify timeout / no match / reqHistoricalData error / IBKR returns no bars) — each failure mode logs at WARNING.
+4. **`historical_contract_months_from_disk(*, data_root, meta, persistence_days)`** — reads on-disk universe sessions via `services.data.map_file_synthesis.iter_universe_sessions` + detects rolls via `detect_real_rolls`. Returns `(sorted_expiries, expiry_dates)` where expiries are the union of `from_expiry` + `to_expiry` across all rolls and expiry_dates maps each to its computed last-trading date via `compute_future_expiry`.
+5. **`backfill_historical_contracts_for_ticker(ib, market_key, *, meta, contract_months_to_ensure, expiry_dates, ...)`** — per-ticker orchestrator. Reads existing zip members → short-circuits already-present CSVs without IBKR I/O (idempotent) → fetches missing contracts → writes via single atomic `write_zip_with_members_preserving` call. Per-contract failures isolated (treated as failed; cycle continues). Returns `HistoricalContractBackfillResult` for observability.
+6. **`BarSyncWorker._backfill_historical_contracts(ib, *, today)`** — per-cycle orchestrator. Walks futures markets, calls per-ticker backfill, aggregates results, emits structured `historical_contracts_backfill_cycle_completed` log. Per-ticker exceptions caught + logged so a single ticker's I/O failure doesn't abort the loop.
+
+`write_futures_bundle` switched from `write_zip_with_member` (truncates) to `write_zip_with_members_preserving` so prior cycles' backfilled CSVs survive the per-cycle front-month rewrite. Without this, every cycle would have to re-fetch every historical contract (~60-90 IBKR calls / cycle vs ~0 in steady state).
+
+`BarSyncConfig` extensions:
+- `enable_historical_contract_backfill: bool = True` — operator escape hatch
+- `historical_backfill_bars_per_contract: int = 365` — `durationStr=f"{N} D"` per fetch
+
+Wire-in: `run_cycle` calls the backfill AFTER the per-market sync loop + BEFORE the map_file synthesizer, inside the connect-succeeded arm of the try block. Skipped on connect-failed cycles.
+
+44 new tests across 4 new test classes + 2 added to `TestWriteFuturesBundle` (`tests/unit/test_bar_sync.py`: 170 → 214 tests). Full `make ci` (lint + typecheck + 2163 unit tests in 183s) passes.
+
+**Deploy outcome (2026-05-24 01:38 UTC):**
+
+```
+bar_sync_cycle_completed successful_count=10 failed_count=0 total_markets=10 duration_seconds=103.83
+historical_contracts_backfill_cycle_completed tickers_processed=6 tickers_with_new_contracts=6
+  new_contracts_total=46 skipped_contracts_total=6 failed_contracts_total=0 bars_fetched_total=13066
+```
+
+Per-ticker backfill (all 0 failed):
+- /MES — backfilled 6 contracts (202406/202409/202412/202503/202506/202509), 1948 bars
+- /MNQ — backfilled 6 contracts (same boundaries), 1948 bars
+- /MYM — backfilled 6 contracts (same boundaries; cbot routing intact), 1556 bars
+- /M2K — backfilled 6 contracts (same boundaries), 1948 bars
+- /MGC — backfilled 7 contracts (bi-monthly: 202408/202410/202412/202502/202504/202506/202508), 2553 bars
+- /MBT — backfilled 15 contracts (monthly: 202406-202508), 3113 bars
+
+On-disk verification:
+
+```
+$ unzip -l mes_trade.zip   → 7 files (was 1)
+$ unzip -l mnq_trade.zip   → 7 files
+$ unzip -l mym_trade.zip   → 7 files (cbot/ tree per PR #226)
+$ unzip -l m2k_trade.zip   → 7 files
+$ unzip -l mgc_trade.zip   → 8 files (one extra for the bi-monthly /MGC pattern)
+$ unzip -l mbt_trade.zip   → 16 files (one CSV per monthly /MBT expiry)
+```
+
+The cycle's 103.83s duration is ~90s longer than pre-merge (~14.63s reference from the 2026-05-23 23:47 UTC pre-deploy cycle). Subsequent cycles will be idempotent (skip all already-present contracts) so duration approaches the pre-merge baseline.
+
+**Cost / scope impact:**
+
+- 2 files changed in production code (`services/data/bar_sync.py` +612 lines; +44 new tests in `tests/unit/test_bar_sync.py`)
+- 0 alembic migrations
+- 0 new third-party deps; uses existing `ib_async` + stdlib `zipfile` + stdlib `tempfile`
+- Hot-fix whitelist (`services/data/**` + `tests/**`); no `risk-review-approved` label
+- One-shot backfill on first deploy: ~90s additional cycle time + ~46 IBKR `reqHistoricalDataAsync` calls; subsequent cycles unchanged
+- ib-async's internal pacing handles IBKR's 60-req-per-10-min rule transparently; 0 throttling observed in the first cycle
+
+**Open follow-ups:**
+
+1. **Validation cycle 2026-05-24 21:30 UTC** — the natural LEAN cycle the day after deploy. Expected: `v1_history_probe market=/MES hist_len>=200` (was 177) for all 6 active futures + `v1_signals_generated signals_emitted_count>0 rejections_count<10` (was 0/10). The systemd-timer restart at 21:10 UTC refreshes lean_local's data-layer cache so the new historical CSVs are visible to the 21:30 UTC cycle.
+2. **PR #227 (probe retirement)** stays DRAFT until the 2026-05-24 21:30 UTC cycle confirms the empirical outcome.
+
+**References:** PRs #222/#225/#226/#228 (the prior chain that unblocked 6 of 7 markets at `hist_len=177`); the same-day "/MCL sidelined from Phase 1 universe" entry's Open follow-up #1 ("Issue B — depth shortfall") which this PR closes.
+
+---
+
 ### 2026-05-23 — /MCL sidelined from Phase 1 universe (IBKR paper-tier NYMEX entitlement gap)
 
 > **Framing note (PR review feedback):** this is an *operator-reversible sideline*, not a permanent drop. All /MCL-specific support code (expiry rule, holiday calendar, sentinel substitution, alert builders, tick sizes, IBKR contract-resolution path, reconciliation labels) stays in the codebase. The canonical sideline registry is `V1_SIDELINED_MARKETS` in `strategies/v1_trend_following/parameters.py` — a new `Final[frozenset[str]]` whose docstring documents the re-enable runbook. Per-market re-enable preconditions are listed against each entry. The invariant `V1_SIDELINED_MARKETS ∩ set(V1_CANDIDATE_UNIVERSE) == ∅` is locked by `tests/unit/test_strategy_v1.py::TestSidelinedMarkets`.
