@@ -866,6 +866,46 @@ def write_etf_bundle(
     return zip_size
 
 
+def _per_bar_front_month_or_fallback(
+    *, ticker: str, session_date: date, fallback: str
+) -> str:
+    """Compute the historical front-month for ``ticker`` on ``session_date``.
+
+    Delegates to :func:`map_file_synthesis.front_month_for_session_date`
+    which walks the ticker's cycle months + uses the existing per-ticker
+    expiry rules to find the smallest contract whose expiry is >=
+    ``session_date``.
+
+    If the lookup raises (unknown ticker, no expiry rule registered, no
+    candidate within 48 cycle iterations), falls back to the caller-
+    supplied ``fallback`` (typically today's pick). The fallback path
+    preserves the pre-2026-05-24 behavior — same expiry for all bars —
+    rather than crashing the per-bar loop on a stale or misconfigured
+    ticker. The fallback only fires for code paths we don't yet support
+    (e.g., a new ticker added to ``PHASE1_UNIVERSE_METADATA`` without a
+    matching entry in ``_EXPIRY_RULES``).
+
+    Lazy import of :mod:`map_file_synthesis` matches the existing pattern
+    elsewhere in this module (avoids any startup-order coupling between
+    bar_sync's module-level state + the synthesizer).
+    """
+    try:
+        from services.data.map_file_synthesis import (
+            front_month_for_session_date as _front_month,
+        )
+
+        return _front_month(ticker=ticker, session_date=session_date)
+    except (ValueError, RuntimeError) as exc:
+        log.warning(
+            "per_bar_front_month_fallback",
+            ticker=ticker,
+            session_date=session_date.isoformat(),
+            fallback=fallback,
+            error=str(exc),
+        )
+        return fallback
+
+
 def write_futures_bundle(
     *,
     data_root: Path,
@@ -912,11 +952,33 @@ def write_futures_bundle(
     oi_member = f"{ticker.lower()}_openinterest_{front_month_expiry_yyyymm}.csv"
     write_zip_with_members_preserving(oi_zip, {oi_member: oi_csv_bytes})
     # Per-day universe files — one per session_date in bars.
+    #
+    # Each universe file's first-column `expiry` is the front-month for
+    # THAT bar's session_date (NOT today's front-month). This is the
+    # 2026-05-24 forward-fix for the per-bar universe-write bug surfaced
+    # by the 21:30 UTC LEAN cycle's depth-shortfall diagnosis: pre-fix,
+    # this loop wrote `front_month_expiry_yyyymm` (today's pick) into
+    # EVERY universe file in the 175-bar window, corrupting the
+    # synthesizer's roll-detection input + producing the /MES map_file's
+    # 9-month gap between rolls 2025-06-22 (`yv` -> 202509) and 2026-03-16
+    # (`z3` -> 202606). See ``Docs/decisions-log.md`` 2026-05-24 entry
+    # "bar_sync per-bar front-month write" for the full diagnostic chain.
+    #
+    # The per-bar expiry is computed deterministically from the bar's
+    # session_date via :func:`map_file_synthesis.front_month_for_session_date`
+    # which uses the existing per-ticker expiry rules (third-Friday for
+    # index quarterlies; 3rd-last business day for /MGC; etc.). No IBKR
+    # call per bar.
     universe_oi = open_interest if open_interest > 0 else None
     for bar in bars:
         u_path = futures_universe_file_path(data_root, ticker, market_dir, bar.session_date)
         u_path.parent.mkdir(parents=True, exist_ok=True)
-        u_body = build_futures_universe_csv(front_month_expiry_yyyymm, bar, universe_oi)
+        bar_front_month = _per_bar_front_month_or_fallback(
+            ticker=ticker,
+            session_date=bar.session_date,
+            fallback=front_month_expiry_yyyymm,
+        )
+        u_body = build_futures_universe_csv(bar_front_month, bar, universe_oi)
         u_path.write_bytes(u_body)
     # 2-row sentinel map_file.
     map_path = futures_map_file_path(data_root, ticker, market_dir)
