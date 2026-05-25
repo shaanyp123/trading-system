@@ -1663,6 +1663,29 @@ def _extract_backtest_delta(results: dict[str, Any]) -> dict[str, Any]:
     }
 ```
 
+## 5.9 Multi-Agent Review for Risk-Touching PRs
+
+**Added 2026-05-25 via `Docs/claude-setup-overhaul.md` WS#6.** This codifies the operational policy; the enforcement lives in the `/pre-pr-checklist` slash command (`.claude/commands/pre-pr-checklist.md`) which surfaces the reminder.
+
+**Policy.** Every PR carrying the `risk-review-approved` label MUST run `/ultrareview` before merge.
+
+**Why.** Risk-review-approved PRs touch the §11 [A02] forbidden-without-label whitelist — `services/risk`, `services/signal`, `services/audit`, `services/execution`, `services/reconciliation`, `services/calibration`, `services/agent/decisions`, `services/agent/risk_actions`, `services/agent/parameter_changes`, `services/agent/prompts/decision`, `alembic`. These have existential blast radius if changed silently. The single-operator + single-Claude-session pattern means there is no independent reviewer at PR-creation time. `/ultrareview` is the multi-agent cloud review that fills that gap by spinning up independent reviewer agents that examine the diff without the implementer's framing.
+
+**Operational flow.**
+
+1. Implementer (Claude) edits a file on the A02 whitelist (`risk_path_guard.sh` hook from claude-setup-overhaul WS#4 fires a stderr warning at edit time)
+2. Implementer opens PR with the `risk-review-approved` label
+3. `/pre-pr-checklist` step 7 emits the reminder line: "**Reminder: run `/ultrareview` before merge.**"
+4. Operator runs `/ultrareview` from the PR (or `/ultrareview <PR#>` from a separate session) — billed user-trigger; cannot be Claude-initiated
+5. Reviewer agents return findings; operator gates merge on the combined surface (PR review artifact + ultrareview output)
+
+**Hot-fix whitelist exemption.** §2.3 hot-fix paths (`services/api/**`, `services/data/**`, `strategies/**`, `lean/**`, `watchdog/**`, `scripts/operator_tools/**`, `.github/**`, `deploy/**`) do NOT require `risk-review-approved` and therefore do NOT require `/ultrareview` by default. Operator may still invoke `/ultrareview` ad-hoc for high-stakes hot-fix changes; the policy floor is the A02 whitelist.
+
+**Cross-refs.**
+
+- `risk-review` subagent (`.claude/agents/risk-review.md`) is COMPLEMENTARY to `/ultrareview`, not a replacement. The subagent runs in-session against pre-PR code; `/ultrareview` runs in cloud against the opened PR. Both should land for A02-path changes.
+- `Docs/claude-setup-overhaul.md` WS#6 entry holds the design rationale + alternatives considered.
+
 ---
 
 # 6. Testing Patterns

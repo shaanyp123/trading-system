@@ -65,8 +65,15 @@ secrets-decrypted/
 # Operator handoff prompts (session-local; not for the repo)
 HANDOFF_PROMPT_*.md
 
-# Claude Code session-local working dir (worktrees, transient session state)
-# The user's global ~/.config/git/ignore covers **/.claude/settings.local.json,
-# but the directory itself is not globally ignored. Keep session-local junk
-# out of the repo.
-.claude/
+# Claude Code session-local working dir (worktrees, transient session state).
+# Updated 2026-05-25 via claude-setup-overhaul WS#4+WS#3+WS#5: project-level
+# hooks, commands, agents, skills, and shared settings.json should be in the
+# repo so future sessions / future contributors inherit them. Personal /
+# operator-local config stays gitignored.
+.claude/*
+!.claude/settings.json
+!.claude/README.md
+!.claude/hooks/
+!.claude/commands/
+!.claude/agents/
+!.claude/skills/
