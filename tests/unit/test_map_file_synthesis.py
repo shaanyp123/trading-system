@@ -730,9 +730,7 @@ class TestFrontMonthForSessionDate:
         ],
     )
     def test_mes_quarterly(self, session_date: date, expected: str) -> None:
-        assert mfs.front_month_for_session_date(
-            ticker="MES", session_date=session_date
-        ) == expected
+        assert mfs.front_month_for_session_date(ticker="MES", session_date=session_date) == expected
 
     def test_other_quarterly_micros_match_mes(self) -> None:
         # /MNQ, /MYM, /M2K all use the same HMUZ cycle + third-Friday
@@ -758,9 +756,7 @@ class TestFrontMonthForSessionDate:
         ],
     )
     def test_mgc_bimonthly(self, session_date: date, expected: str) -> None:
-        assert mfs.front_month_for_session_date(
-            ticker="MGC", session_date=session_date
-        ) == expected
+        assert mfs.front_month_for_session_date(ticker="MGC", session_date=session_date) == expected
 
     @pytest.mark.parametrize(
         "session_date, expected",
@@ -776,15 +772,11 @@ class TestFrontMonthForSessionDate:
         ],
     )
     def test_mbt_monthly(self, session_date: date, expected: str) -> None:
-        assert mfs.front_month_for_session_date(
-            ticker="MBT", session_date=session_date
-        ) == expected
+        assert mfs.front_month_for_session_date(ticker="MBT", session_date=session_date) == expected
 
     def test_unknown_ticker_raises(self) -> None:
         with pytest.raises(ValueError, match="no expiry rule"):
-            mfs.front_month_for_session_date(
-                ticker="BOGUS", session_date=date(2026, 5, 24)
-            )
+            mfs.front_month_for_session_date(ticker="BOGUS", session_date=date(2026, 5, 24))
 
     def test_ticker_case_insensitive(self) -> None:
         a = mfs.front_month_for_session_date(ticker="MES", session_date=date(2026, 5, 24))

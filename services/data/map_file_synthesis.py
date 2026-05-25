@@ -774,9 +774,7 @@ def front_month_for_session_date(*, ticker: str, session_date: date) -> str:
                 continue
             contract_month = f"{year:04d}{month:02d}"
             try:
-                expiry = compute_future_expiry(
-                    ticker=ticker_upper, contract_month=contract_month
-                )
+                expiry = compute_future_expiry(ticker=ticker_upper, contract_month=contract_month)
             except ValueError:
                 continue
             if expiry >= session_date:
