@@ -487,11 +487,35 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
             )
             return
 
+        # Per-market rejection visibility — added 2026-05-25 after the saga's
+        # 21:30 UTC validation cycle showed ``signals_emitted_count=0
+        # rejections_count=10`` with no way to tell which filter (no_breakout
+        # vs hurst_below_threshold vs trend_filter_failed vs ...) rejected
+        # each of the 10 markets. ``result.rejections`` is
+        # ``tuple[tuple[str, RejectionReason], ...]`` (see
+        # ``strategies/v1_trend_following/signals.py::SignalGenerationResult``);
+        # the reasons were always computed, just never surfaced at the LEAN
+        # runtime layer. Each rejection becomes a structured log line for
+        # operator at-a-glance debugging; aggregate counts by reason are
+        # appended to the existing summary for trend visibility across cycles.
+        # Hot-fix scope (lean/**); pure observability addition.
+        rejection_reason_counts: dict[str, int] = {}
+        for rejected_market, reason in result.rejections:
+            reason_str = reason.value
+            rejection_reason_counts[reason_str] = (
+                rejection_reason_counts.get(reason_str, 0) + 1
+            )
+            self.log(
+                f"v1_signal_rejected session_date={session_date} "
+                f"market={rejected_market} reason={reason_str}"
+            )
+
         signals_count = len(result.signals)
         rejections_count = len(result.rejections)
         self.log(
             f"v1_signals_generated session_date={session_date} "
-            f"signals_emitted_count={signals_count} rejections_count={rejections_count}"
+            f"signals_emitted_count={signals_count} rejections_count={rejections_count} "
+            f"reasons={rejection_reason_counts}"
         )
 
         # Step 6: heartbeat with per-cycle summary (always emitted so
