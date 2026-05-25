@@ -17,6 +17,51 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ## Entries
 
+### 2026-05-25 — Retire PR #220 diagnostic history probe (post-saga validation)
+
+**Trigger:** the 8-PR saga 2026-05-22 → 2026-05-24 (PRs #220 → #222 → #223/#224 revert pair → #225 → #226 → #228 → #229 → #231 → #232) restored the futures `self.history()` resolution chain end-to-end: SID-hash `MappedSymbol` synthesis (#225) + bare-ticker `add_future` (#225) + /MYM cbot routing (#226) + /MCL sidelined via `V1_SIDELINED_MARKETS` registry (#228) + historical contract backfill (#229) + `set_filter(-365, 90)` (#231) + per-bar front-month universe writes (#232). The natural 2026-05-25 21:30 UTC LEAN cycle is the final empirical gate — once its output shows `v1_history_probe hist_len ≥ 200 hist_cols=['close','high','low','open','volume']` for all **6 active futures** (/MES /MNQ /MYM /M2K /MGC /MBT; /MCL sidelined per #228) and `v1_signals_generated signals_emitted_count + rejections_count = 10` (4 ETFs + 6 micros) with no `v1_history_unavailable` lines, the probe has served its purpose and this PR lands.
+
+This entry was originally drafted 2026-05-23 against the universe-of-7 + `hist_len=205` target. Rebased 2026-05-25 after PRs #226 + #228 + #229 + #231 + #232 + #233 + #234 landed; updated for post-saga reality (universe-of-6, hist_len ≥ 200 target).
+
+**What this PR removes (~98 lines net deleted):**
+
+1. **The `_log_history_probe` method body in `lean/v1_strategy.py`** (~78 lines) — the probe that PR #220 introduced 2026-05-22. Best-effort introspection of `self.history(...)` return shape; emitted `v1_history_probe market=... hist_type=... hist_len=... hist_cols=... hist_idx=...` log lines per market per cycle.
+2. **The probe call site in `_build_bar_series`** (~14 lines including the explanatory comment block referencing the 2026-05-22 cache-hypothesis-DISPROVED entry).
+3. **Updated comment on the `v1_history_parsed_empty` log** to remove the probe-pairing reference. The log line itself is preserved — it remains useful for diagnosing future parser-side bugs (e.g. DataFrame whose every row had a NaN OHLC cell that the parser dropped to `[]`).
+
+**What stays:**
+
+- `v1_history_parsed_empty` log line + its `hist_len` fallback chain — useful operator signal independent of the now-resolved 2026-05-22 saga.
+- `v1_history_call_failed`, `v1_history_parse_failed`, `v1_barseries_invalid` log lines — all pre-existing error paths.
+- `v1_history_unavailable` aggregate log + `v1_signals_generated` summary — the cycle-level observability.
+
+**Pre-merge validation gate (post-saga):**
+
+DO NOT merge until the 2026-05-25 21:30 UTC LEAN cycle confirms:
+
+```
+v1_history_probe market=/MES  hist_type=DataFrame hist_len≥200 hist_cols=['close','high','low','open','volume'] hist_idx=first=(...) last=(...)
+v1_history_probe market=/MNQ  hist_type=DataFrame hist_len≥200 ...
+v1_history_probe market=/MYM  hist_type=DataFrame hist_len≥200 ...   # cbot routing per #226
+v1_history_probe market=/M2K  hist_type=DataFrame hist_len≥200 ...
+v1_history_probe market=/MGC  hist_type=DataFrame hist_len≥200 ...
+v1_history_probe market=/MBT  hist_type=DataFrame hist_len≥200 ...
+# /MCL absent — sidelined per #228 V1_SIDELINED_MARKETS
+v1_signals_generated session_date=2026-05-25 signals_emitted_count=N rejections_count=M (N+M = 10; no v1_history_unavailable line)
+```
+
+If ANY active futures market still shows `hist_len < 200` or different cols → DO NOT merge this PR; investigate further (next diagnostic candidates per decisions-log 2026-05-24 entry "set_filter(-365, 90)": bar_sync's `pick_front_month_expiry` audit against IBKR `reqContractDetails`, or LEAN's live-mode history-API per-contract caching theory).
+
+**Cost / scope impact:**
+
+- 98 net lines deleted from `lean/v1_strategy.py`
+- 0 test changes (no tests pinned the probe — `grep _log_history_probe tests/` returns 0)
+- 0 alembic migrations
+- 0 ongoing cost
+- Hot-fix whitelist (`lean/**`); no `risk-review-approved` label
+
+---
+
 ### 2026-05-24 — bar_sync per-bar front-month write (forward-fix for universe-file corruption)
 
 **Trigger:** the pre-cycle audit Sunday evening (Mon's 21:30 UTC cycle still hours away) into the secondary issue flagged in PR #231's decisions-log entry: the synthesized `/MES` map_file has a 9-month gap between rolls 2025-06-22 → 2026-03-16, suggesting bar_sync wrote wrong universe data during that period. Sampling on-disk universe files confirmed the root cause:
