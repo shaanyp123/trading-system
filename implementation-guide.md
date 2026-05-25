@@ -485,20 +485,20 @@ Operator learning allocation: 5–8 hours/week on Python basics, git operations,
 **Tasks (next session, ~1 day):**
 
 - **Step 1:** Operator confirms Option C at session start (or chooses A/B/D).
-- **Step 2 (`[CLAUDE_CODE]`):** New module at `services/data/bar_sync.py` (or `services/scheduler/bar_sync.py` — confirm path; new path, NOT on the forbidden whitelist, no `risk-review-approved` label needed). Implements `BarSyncWorker` that wakes daily at 17:00 ET, calls `IB.reqHistoricalData` via the existing ib-async client for all 11 Phase 1 markets, writes bars to the shared `lean_data` volume in LEAN's on-disk format. Reference: the deleted `scripts/seed_lean_*.py` files in git history have the canonical bar-writing logic (equity-daily zip + futures-daily zip + universes + map_files sentinels for Path 4 Raw-mode).
+- **Step 2 (`[CLAUDE_CODE]`):** New module at `services/data/bar_sync.py` (or `services/scheduler/bar_sync.py` — confirm path; new path, NOT on the forbidden whitelist, no `risk-review-approved` label needed). Implements `BarSyncWorker` that wakes daily at 17:00 ET, calls `IB.reqHistoricalData` via the existing ib-async client for all Phase 1 markets (originally 11; **10 post-saga-2026-05-23 per PR #228** which sidelined /MCL via the new `V1_SIDELINED_MARKETS` registry), writes bars to the shared `lean_data` volume in LEAN's on-disk format. Reference: the deleted `scripts/seed_lean_*.py` files in git history have the canonical bar-writing logic (equity-daily zip + futures-daily zip + universes + map_files sentinels for Path 4 Raw-mode).
 - **Step 3 (`[CLAUDE_CODE]`):** Revert lean.json + docker-compose.yml + entrypoint.sh + v1_strategy.py to the pre-PR-#195 state (FakeDataQueue + SubscriptionDataReaderHistoryProvider; no ib-* keys; lean_local back on `internal`-only network; staleness check restored).
-- **Step 4 (`[BOTH]`):** Deploy + smoke. api scheduler fires at 17:00 ET writing fresh bars; LEAN cycle at 17:30 ET reports `failed_markets=[]` + 11 markets evaluated.
+- **Step 4 (`[BOTH]`):** Deploy + smoke. api scheduler fires at 17:00 ET writing fresh bars; LEAN cycle at 17:30 ET reports `failed_markets=[]` + 11 markets evaluated (now **10 markets post-saga-2026-05-23 per PR #228** /MCL sideline).
 - **Step 5 (`[CLAUDE_CODE]`):** Optional cleanup PR — remove the idle Dockerfile multi-stage NuGet pull + entrypoint's QC/IBKR cred reads if Option C lands cleanly and Option B (compile-from-source) is no longer a candidate.
 
 **Acceptance criteria (Option C):**
-- [ ] `services/data/bar_sync.py` (or equivalent path) ships with `BarSyncWorker` + parser + writer + freshness logic
-- [ ] 50+ new unit tests pass; existing 1777 tests still pass
-- [ ] `lean.json` reverts to FakeDataQueue + SubscriptionDataReaderHistoryProvider; no ib-* keys
-- [ ] `lean_local` boots cleanly within 60s; no `Composer` errors; no `ValidateSubscription` errors
-- [ ] api scheduler fires at 17:00 ET; `bar_sync_cycle_completed` log line lists `failed_markets=[]`
-- [ ] LEAN cycle at 17:30 ET reports `signals_emitted_count + rejections_count = 11`
-- [ ] `verify_chain --env paper` passes
-- [ ] No new audit event types (bar sync is data-pipeline, not state-mutation)
+- [x] `services/data/bar_sync.py` (or equivalent path) ships with `BarSyncWorker` + parser + writer + freshness logic — landed 2026-05-21
+- [x] 50+ new unit tests pass; existing 1777 tests still pass — current total 2163 tests as of saga close 2026-05-24
+- [x] `lean.json` reverts to FakeDataQueue + SubscriptionDataReaderHistoryProvider; no ib-* keys — landed 2026-05-21
+- [x] `lean_local` boots cleanly within 60s; no `Composer` errors; no `ValidateSubscription` errors — verified 2026-05-21
+- [x] api scheduler fires at 17:00 ET; `bar_sync_cycle_completed` log line lists `failed_markets=[]` — confirmed in production cycles since 2026-05-21
+- [ ] LEAN cycle at 17:30 ET reports `signals_emitted_count + rejections_count = 11` — **READY FOR MONDAY 2026-05-25 21:30 UTC VALIDATION** (universe revised to 10 post-PR-#228 /MCL sideline so target is now `signals_emitted_count + rejections_count = 10`; the 8-PR LEAN futures data-layer saga 2026-05-22 → 2026-05-24 unblocked futures `self.history()` end-to-end. PR #227 probe retirement stays DRAFT pending Monday's empirical pass)
+- [x] `verify_chain --env paper` passes — verified in every saga PR's pre-flight + post-deploy
+- [x] No new audit event types (bar sync is data-pipeline, not state-mutation) — confirmed across PRs #205-#232
 
 **Comprehensive session prompt for the next session:** `Docs/decisions-log.md` 2026-05-20 evening entry — section "Detailed session prompt for v2 (Option C: API synthesizes bars from IBKR)" — paste verbatim into the next Claude Code session.
 
