@@ -866,9 +866,7 @@ def write_etf_bundle(
     return zip_size
 
 
-def _per_bar_front_month_or_fallback(
-    *, ticker: str, session_date: date, fallback: str
-) -> str:
+def _per_bar_front_month_or_fallback(*, ticker: str, session_date: date, fallback: str) -> str:
     """Compute the historical front-month for ``ticker`` on ``session_date``.
 
     Delegates to :func:`map_file_synthesis.front_month_for_session_date`
