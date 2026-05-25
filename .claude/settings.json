@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "_comment": "Project-level Claude Code settings — committed to the repo. See Docs/claude-setup-overhaul.md for the design rationale across WS#4 (hooks) + WS#5 (permissions allowlist). Personal/operator-local additions go in .claude/settings.local.json which is gitignored.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/risk_path_guard.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/secret_handling_guard.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(git status:*)",
+      "Bash(git log:*)",
+      "Bash(git diff:*)",
+      "Bash(git branch:*)",
+      "Bash(git show:*)",
+      "Bash(git rev-parse:*)",
+      "Bash(git blame:*)",
+      "Bash(git remote -v)",
+      "Bash(git ls-files:*)",
+      "Bash(git stash list)",
+      "Bash(docker compose ps:*)",
+      "Bash(docker compose top:*)",
+      "Bash(docker ps:*)",
+      "Bash(docker images:*)",
+      "Bash(docker volume ls)",
+      "Bash(docker network ls)",
+      "Bash(make ci)",
+      "Bash(make test)",
+      "Bash(make lint)",
+      "Bash(make typecheck)",
+      "Bash(make format)",
+      "Bash(make frontend-test)",
+      "Bash(make dep-drift-check)",
+      "Bash(pytest:*)",
+      "Bash(pnpm typecheck)",
+      "Bash(pnpm lint)",
+      "Bash(pnpm build)",
+      "Bash(pnpm test:*)",
+      "Bash(gh pr view:*)",
+      "Bash(gh pr list:*)",
+      "Bash(gh pr checks:*)",
+      "Bash(gh pr diff:*)",
+      "Bash(gh issue view:*)",
+      "Bash(gh issue list:*)",
+      "Bash(gh repo view:*)",
+      "Bash(gh run list:*)",
+      "Bash(gh run view:*)",
+      "Bash(ls:*)",
+      "Bash(find . -name:*)",
+      "Bash(find . -type:*)",
+      "Bash(find . -path:*)",
+      "Bash(wc:*)",
+      "Bash(file:*)",
+      "Bash(stat:*)",
+      "Bash(tree:*)",
+      "Bash(jq:*)",
+      "Bash(yq:*)",
+      "Bash(which:*)",
+      "Bash(python3 --version)",
+      "Bash(python --version)",
+      "Bash(node --version)",
+      "Bash(pnpm --version)",
+      "Bash(uv --version)",
+      "Bash(docker --version)",
+      "Bash(mkdir -p:*)"
+    ]
+  }
+}
