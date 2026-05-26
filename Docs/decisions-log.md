@@ -17,6 +17,63 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ## Entries
 
+### 2026-05-25 — ib_gateway stuck-at-login recurrence + recovery (drill 6)
+
+**Trigger:** the natural 2026-05-25 21:00 UTC bar_sync cycle FAILED with `TimeoutError` on `connectAsync` to `ib_gateway:4004`:
+
+```json
+{
+  "event": "bar_sync_cycle_connect_failed",
+  "exception_type": "TimeoutError",
+  "timestamp_utc": "2026-05-25T21:00:57.698335Z"
+}
+```
+
+Traceback bottoms out in `ib_async/client.py::connectAsync` → `asyncio.wait_for(self.apiStart, timeout)`. `docker compose ps ib_gateway` reported `Up 7 days (healthy)`. Brief assumed the failure was at the gateway↔IBKR session layer (Memorial Day session pause hypothesis). Diagnostic investigation found a different root cause.
+
+**Diagnostic timeline (UTC; IBC log timestamps converted from container TZ `America/New_York`):**
+
+| UTC time | Event |
+|---|---|
+| 2026-05-25 03:46:39 | Previous bar_sync cycle ✅ completed (10/10 markets, 5173 bars backfilled; this was the deploy-catch-up cycle the operator triggered manually after the PR #232 merge) |
+| 2026-05-25 03:59:00 | IBKR Gateway nightly auto-restart begins ("Restart in progress" dialog opens) |
+| 2026-05-25 03:59:03 | IBC exits cleanly (exit status 0), respawns with `IbcGateway` |
+| 2026-05-25 03:59:09 | New Gateway main window opens, login dialog opens (`LoginState is LOGGED_OUT`) |
+| 2026-05-25 03:59:09 → ~22:18 | **IBC log silent for ~18h.** Java process (PID 90094) alive but stuck. socat logs `connect refused` to 127.0.0.1:4002 every minute |
+| 2026-05-25 21:00:27 | bar_sync cycle fires; `connectAsync` times out after 30s (the failure documented in the brief) |
+| 2026-05-25 22:18:32 | Operator-authorized `docker compose restart ib_gateway` |
+| 2026-05-25 22:18:38 → 22:18:44 | IBC clean recovery: trading mode set → user/password entered → "Paper Log In" clicked → "Authenticating..." → "Login has completed" → Warning dialog auto-dismissed via `I understand and accept` → config dialog auto-handled → "Configuration tasks completed" |
+| 2026-05-25 22:18:44 → now | socat `connect refused` errors stop. API server listening on 127.0.0.1:4002. Gateway healthy. |
+
+**Root cause:** the IBKR Gateway's nightly auto-restart at ~03:59 UTC (23:59 ET, the IBC `Auto restart time` default) got stuck after opening the login dialog. The IBC automation reached `Login dialog WINDOW_OPENED: LoginState is LOGGED_OUT` and never advanced — no "Setting user name", no "Click button: Paper Log In", no error, no dialog event. The Java process stayed alive but never reached the point where the API server starts listening on 4002. **Brief's Memorial Day session-pause hypothesis is REJECTED** — the stuck state began ~17 hours BEFORE the natural failure surfaced, during the routine nightly maintenance window, not during US market hours.
+
+**Connection to drill 5 (2026-05-18):** same failure mode (Gateway Java process stuck during nightly restart, blocking 4002), different proximate trigger. Drill 5's trigger was the "Existing session detected" dialog hang (operator's TWS Desktop was logged in for the same account). The drill 5 follow-up `IBC ExistingSessionDetectedAction=primary` IS in place (visible in the IBC settings dump in this incident's logs), so that specific trigger did not recur. This incident's trigger is unknown — possibly IBKR's auth servers were transiently unresponsive at 03:59 UTC May 25 (early Memorial Day weekend), possibly some other dialog appeared that IBC's automation doesn't handle. Without a `ps -ef`-equivalent snapshot of the Java thread state mid-incident, we cannot tell.
+
+**Recovery:** `docker compose restart ib_gateway` — same as drill 5. Clean reboot of the IBC + Java stack. Login completed in 6 seconds (much faster than the failed restart). The newly-recovered gateway successfully serves connections from the api on clientId=3 (bar_sync) and clientId=1 (order placement worker; idle this session — no approved signals queued).
+
+**Observability gaps surfaced:**
+
+1. **`docker compose ps` healthcheck is a false positive.** The `gnzsnz/ib-gateway:stable` image's healthcheck probes Xvfb + socat process liveness, NOT the IBKR API socket on 4002 (or even 4004 end-to-end). A stuck Java process with socat backing it shows as `(healthy)` indefinitely. A healthcheck that probes 127.0.0.1:4002 from inside the container would correctly flag this state within seconds. **Follow-up candidate:** override the healthcheck in `docker-compose.yml` to `CMD-SHELL bash -c '</dev/tcp/127.0.0.1/4002' || exit 1` (Bash's TCP probe — no need to add nc/curl dependencies to the image).
+2. **No Discord `#alerts` notification fired** — but this is by-design, not a wiring gap. The api lifespan IS wiring `partial_cycle_alert_hook` to `webhook_pusher.dispatch_alert` (verified at `services/api/main.py:1212`); the CLAUDE.md 2026-05-21 pivot block's "outstanding follow-up" language is stale. The threshold for alert dispatch is `consecutive_count >= 2` per `services/data/bar_sync.py::_evaluate_alerts`, and tonight was the FIRST failure since 2026-05-24 23:46 UTC's success (so `consecutive_count=1`). **A second consecutive failure tomorrow would fire `#alerts`.** That's appropriate — single transient failures shouldn't page the operator at night. The trade-off: if the operator isn't watching logs or `/status` Discord between 21:00 UTC failure N+1 and 21:00 UTC failure N+2, they have a 24-hour window where the gateway could be stuck silently. Pairing this with healthcheck improvement (1) would tighten that window.
+3. **No auto-recovery.** Docker's default `restart: unless-stopped` policy in `docker-compose.yml` only fires on container EXIT, not on `(unhealthy)` state. Even with healthcheck (1) fixed, the operator would still need a separate mechanism (autoheal sidecar, systemd timer that grep's `docker compose ps`, or a Compose extension like `autoheal=true` label) to convert "unhealthy" into "restart". **Follow-up candidate:** add `containrrr/watchtower` or `willfarrell/autoheal` sidecar in `docker-compose.yml` (low-blast-radius — both are widely-used 3rd-party images).
+
+**Operational state at session end (2026-05-25 22:20 UTC):**
+
+- ib_gateway healthy (clean post-restart, IBC login completed, socat connect-refused errors stopped)
+- VPS git fast-forwarded `769ea53` → `fa10dd3` (PRs #227 + #235 now on disk)
+- lean_local rebuilt + force-recreated; clean boot + warmup (146 subscriptions, normal tick rate)
+- Pending validation gates: **tomorrow's 21:00 UTC bar_sync cycle** is the actual gateway end-to-end validation (post-Memorial-Day, normal trading day). Tonight's 22:30 UTC reconciliation EOD cycle does NOT exercise the gateway — it uses IBKR's FlexQuery XML-over-HTTPS web service (`services/reconciliation/flex_query_fetcher.py`), independent of `ib_gateway:4004`. The watchdog at `188.245.37.16` polling `/api/health` every 5 min has returned 200 throughout the 18h stuck-state because the api is healthy independent of broker connectivity
+
+**Cost / scope impact:**
+
+- This entry only (docs change, no code)
+- 0 alembic migrations
+- 0 test changes
+- 3 follow-up candidates identified (healthcheck improvement; alert hook wiring; auto-recovery sidecar) — each its own focused PR; none done in this session per the brief's "diagnostic over implementation" guidance
+- Hot-fix scope (`Docs/**`); no `risk-review-approved` label
+
+---
+
 ### 2026-05-25 — Retire PR #220 diagnostic history probe (post-saga validation)
 
 **Trigger:** the 8-PR saga 2026-05-22 → 2026-05-24 (PRs #220 → #222 → #223/#224 revert pair → #225 → #226 → #228 → #229 → #231 → #232) restored the futures `self.history()` resolution chain end-to-end: SID-hash `MappedSymbol` synthesis (#225) + bare-ticker `add_future` (#225) + /MYM cbot routing (#226) + /MCL sidelined via `V1_SIDELINED_MARKETS` registry (#228) + historical contract backfill (#229) + `set_filter(-365, 90)` (#231) + per-bar front-month universe writes (#232). The natural 2026-05-25 21:30 UTC LEAN cycle is the final empirical gate — once its output shows `v1_history_probe hist_len ≥ 200 hist_cols=['close','high','low','open','volume']` for all **6 active futures** (/MES /MNQ /MYM /M2K /MGC /MBT; /MCL sidelined per #228) and `v1_signals_generated signals_emitted_count + rejections_count = 10` (4 ETFs + 6 micros) with no `v1_history_unavailable` lines, the probe has served its purpose and this PR lands.
