@@ -42,16 +42,31 @@ class DonchianChannel(NamedTuple):
 
 
 def donchian_channel(bars: Sequence[Bar], lookback_days: int) -> DonchianChannel:
-    """Donchian channel over the trailing `lookback_days` bars (inclusive).
+    """Donchian channel over the `lookback_days` bars PRIOR TO the current bar.
 
-    Raises `ValueError` if `len(bars) < lookback_days`. Caller is responsible for
-    handling INSUFFICIENT_BAR_HISTORY rejections at the strategy level.
+    Per backend-spec §2.3 ("`LOOKBACK_DAYS_DONCHIAN`-day high broken to upside,
+    low broken to downside"), the channel is the high/low of the N PRIOR days
+    — exclusive of the current (last) bar. The caller compares the current
+    bar's close against this prior-window channel to detect a breakout.
+
+    An inclusive-of-current-bar window would make a long breakout
+    mathematically impossible: it would require `current_close > max(highs)`
+    which includes the current bar's high, and `current_close <= current_high`
+    by definition. The implementation here matches the spec language + the
+    canonical Turtle Donchian interpretation.
+
+    Requires `len(bars) >= lookback_days + 1` (lookback for the channel +
+    the current bar). Raises `ValueError` otherwise.
     """
     if lookback_days < 2:
         raise ValueError(f"lookback_days={lookback_days} must be >= 2")
-    if len(bars) < lookback_days:
-        raise ValueError(f"donchian_channel: need {lookback_days} bars, got {len(bars)}")
-    window = bars[-lookback_days:]
+    if len(bars) < lookback_days + 1:
+        raise ValueError(
+            f"donchian_channel: need {lookback_days + 1} bars (lookback + current), "
+            f"got {len(bars)}"
+        )
+    # Window = the lookback_days bars PRIOR to the current (last) bar.
+    window = bars[-(lookback_days + 1) : -1]
     high = max(b.high for b in window)
     low = min(b.low for b in window)
     return DonchianChannel(high=high, low=low)

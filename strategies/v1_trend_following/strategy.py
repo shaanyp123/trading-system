@@ -91,9 +91,11 @@ class V1TrendFollowing:
         # `min_required_bars` is the largest lookback the strategy needs.
         # Donchian and Hurst share the same lookback per backend-spec §2.3
         # ("confirmed by Hurst exponent over the same lookback"). MA_SLOW
-        # may exceed it. ATR needs lookback + 1 prior bar.
+        # may exceed it. ATR needs lookback + 1 prior bar. Donchian needs
+        # lookback + 1 bars too (channel from prior N bars + the current bar
+        # for the breakout-comparison close).
         self._min_required_bars = max(
-            parameters.lookback_days_donchian,
+            parameters.lookback_days_donchian + 1,
             parameters.ma_slow_days,
             parameters.atr_lookback_days + 1,
             parameters.instrument_vol_lookback_days,  # for Stage 1 sigma; not strictly used here
@@ -258,10 +260,12 @@ class V1TrendFollowing:
         """Compute all indicators required for the entry decision."""
         params = self._params
         closes = tuple(b.close for b in bars)
-        # Donchian uses today's bar in the lookback per backend-spec §2.3
-        # ("LOOKBACK_DAYS_DONCHIAN-day high broken to upside"). The breakout check
-        # then compares last_close against the channel; the high must therefore
-        # be computed over bars[-lookback:] inclusive.
+        # Donchian channel = high/low over the N PRIOR days (exclusive of the
+        # current bar), per backend-spec §2.3 "N-day high broken to upside, low
+        # broken to downside" — canonical Turtle interpretation. The breakout
+        # check below compares last_close against this prior-window channel.
+        # See indicators.donchian_channel docstring for the rationale on why
+        # inclusive-of-current would be mathematically impossible to fire.
         channel = donchian_channel(bars, params.lookback_days_donchian)
         ma_fast = simple_moving_average(closes, params.ma_fast_days)
         ma_slow = simple_moving_average(closes, params.ma_slow_days)
