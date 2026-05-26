@@ -10,6 +10,8 @@ service-side write paths (never raw SQL).
 | Script | Purpose | Mutates state? |
 |---|---|---|
 | `replay_executions.py` | Pull executions back from IBKR and feed them through `process_fill_event` to recover from backend-blind fills | Yes — writes audit chain + fills / positions_current / balances / trades |
+| `recovery_agent.py` | Poll `alerts` for `worker_failure` events and decide whether to invoke `replay_executions.py` (transient) or alert-only (hard crash) | Yes — writes `RECOVERY_ACTION_TAKEN` audit + UPDATEs alerts row + may invoke replay subprocess |
+| `trigger_v1_cycle.py` | On-demand V1 strategy cycle trigger (mirrors what LEAN does at 21:30 UTC); reads bars from disk + POSTs to `/api/internal/lean/signals` | Yes (when `--no-dry-run`) — POSTs signal_emitted events which become audit rows + signals INSERTs via the api endpoint. **--dry-run default = ON.** |
 
 ---
 
@@ -289,3 +291,244 @@ This is the committable, parameterized version of the transient
 `/tmp/drill5_recovery.py` script that closed the 2026-05-18 drill 5
 backend-blind-fills incident. See `Docs/decisions-log.md` 2026-05-18
 entry for the full retrospective.
+
+---
+
+## `trigger_v1_cycle.py` — on-demand V1 strategy cycle trigger
+
+### When to use
+
+**Canonical scenarios:**
+
+- Test a strategy logic change without waiting for tomorrow's 21:30 UTC cycle.
+- Replay a missed cycle (e.g., `lean_local` was down at 21:30 UTC).
+- Manual signal probe for forensic / debugging purposes.
+- Diagnostic question: "what would the strategy say RIGHT NOW with the current data on disk?"
+
+**Concrete origin:** PR #247 (2026-05-26) fixed a Donchian inclusive-window bug that suppressed signal firing for 7 days. The fix is deployed; tomorrow's natural cycle will fire — but this tool is the future answer when an operator wants to fire a cycle off-schedule.
+
+### What it does
+
+For a given `--session-date` (default = today ET):
+
+1. Verifies `risk_state.state == 'NORMAL'`. Aborts on `HALT_NEW` or `CONVALESCENT` (this tool is **not** a backdoor around the kill-switch).
+2. Loads `V1Parameters` from the `parameter_sets` head pointer.
+3. Loads current positions from `positions_current` (joined with open `trades` rows for the `opened_at_session_date` field).
+4. For each market in `V1_CANDIDATE_UNIVERSE \ V1_SIDELINED_MARKETS`:
+   - Reads bars from the shared `lean_data` Docker volume (`bar_sync` writes here daily at 17:00 ET on `clientId=3`).
+   - For futures: picks the latest `<lower>_trade_<YYYYMM>.csv` member in the zip (= today's front-month per bar_sync).
+   - For ETFs: reads `<lower>.csv` and decodes the deci-cent integer scaling back to `Decimal`.
+5. Calls `V1TrendFollowing.generate_signals(...)` against the universe + position snapshot.
+6. For each emitted signal: dedups against the `signals` table by `(account_id, env, market, session_date)`; if a row already exists today, logs `trigger_v1_cycle_dedup_skip` and skips. Otherwise POSTs to `/api/internal/lean/signals` (or logs the would-POST payload in `--dry-run`).
+7. Logs each rejection (`market`, `reason`) for forensic visibility.
+8. Emits a summary line: `trigger_v1_cycle_completed session_date=YYYY-MM-DD signals_emitted=N rejections=M dedup_skipped=K reasons={...}`.
+
+### When NOT to use
+
+- **Risk state is not NORMAL.** The tool fails closed; the operator's recourse is to resume from `HALT_NEW` via the web UI.
+- **Today's natural 21:30 UTC LEAN cycle already ran AND emitted what you expected.** Dedup will skip everything; the tool's effective output is the rejection log + summary, no new signals.
+- **Bar staleness > 5 days.** The tool logs a `trigger_v1_cycle_bars_stale` warning per market but still continues — operator may want to trigger against last-known data while bar_sync recovers. If you see this warning unexpectedly, investigate bar_sync first.
+- **env is `live-small` or `live-scale` and you don't have authorization.** The tool requires `--allow-non-paper` for any non-paper env (fail-closed default for tooling that touches production signal flow).
+
+### Pre-flight checks
+
+```bash
+ssh root@178.156.239.84
+cd /opt/trading
+
+# 1. api container healthy
+docker compose --env-file deploy/.env exec -T api \
+  /opt/venv/bin/python -c "print('api importable')" || \
+  { echo "FAIL: api container not healthy"; exit 1; }
+
+# 2. lean_data volume mount visible from api container
+docker compose --env-file deploy/.env exec -T api \
+  ls /Lean/Data/equity/usa/daily/ 2>&1 | head -5 || \
+  { echo "FAIL: /Lean/Data not mounted in api"; exit 1; }
+
+# 3. sops decrypts cleanly
+export SOPS_AGE_KEY_FILE=/etc/credstore.encrypted/age_key
+sops --decrypt secrets/paper.enc.yaml > /dev/null || \
+  { echo "FAIL: sops can't decrypt secrets/paper.enc.yaml"; exit 1; }
+```
+
+If any check fails, stop and resolve before continuing. Root-cause discipline per `Docs/claude-dev-guide.md` §1.3.
+
+### Run command (paper env, dry-run — REQUIRED FIRST)
+
+The tool defaults to `--dry-run=True`; you have to pass `--no-dry-run` to actually POST. **Always do a dry-run first** to confirm the strategy + dedup output is what you expect.
+
+```bash
+ssh root@178.156.239.84 -- 'set -euo pipefail
+  cd /opt/trading
+  (
+    export SOPS_AGE_KEY_FILE=/etc/credstore.encrypted/age_key
+    PG_PASS=$(sops -d secrets/paper.enc.yaml | yq -r .postgres.app_service_password)
+    docker compose --env-file deploy/.env exec -T \
+      -w /app \
+      -e PYTHONPATH=/app \
+      -e DATABASE_URL="postgresql+asyncpg://app_service:${PG_PASS}@postgres:5432/trading" \
+      api \
+      /opt/venv/bin/python -m scripts.operator_tools.trigger_v1_cycle \
+        --env paper
+  )
+'
+```
+
+Notes:
+
+- `DATABASE_URL` is scoped to the docker-exec invocation only (subshell env), per the same pattern as `replay_executions.py`. Never displayed; never persisted in the api container's environment.
+- `LEAN_LOCAL_BEARER_TOKEN` is NOT required for dry-run (the bearer check fires only when `--no-dry-run` is set).
+- The tool defaults `--session-date` to today's ET calendar date.
+
+Inspect the structured log output for:
+- `trigger_v1_cycle_context_loaded` — confirms account, risk_state, active universe, dedup set.
+- `trigger_v1_cycle_dry_run_would_post` — one per signal the strategy emitted (or zero if rejections dominate).
+- `trigger_v1_cycle_rejection` — one per rejected market with the reason.
+- `trigger_v1_cycle_completed` — summary line.
+
+### Run command (paper env, wet — committing)
+
+Once the dry-run looks correct, re-run with `--no-dry-run` and the bearer staged.
+
+```bash
+ssh root@178.156.239.84 -- 'set -euo pipefail
+  cd /opt/trading
+  (
+    export SOPS_AGE_KEY_FILE=/etc/credstore.encrypted/age_key
+    PG_PASS=$(sops -d secrets/paper.enc.yaml | yq -r .postgres.app_service_password)
+    LEAN_BEARER=$(sops -d secrets/paper.enc.yaml | yq -r .lean.api_bearer_token)
+    docker compose --env-file deploy/.env exec -T \
+      -w /app \
+      -e PYTHONPATH=/app \
+      -e DATABASE_URL="postgresql+asyncpg://app_service:${PG_PASS}@postgres:5432/trading" \
+      -e LEAN_LOCAL_BEARER_TOKEN="${LEAN_BEARER}" \
+      api \
+      /opt/venv/bin/python -m scripts.operator_tools.trigger_v1_cycle \
+        --env paper \
+        --no-dry-run
+  )
+'
+```
+
+Notes:
+
+- Both `PG_PASS` and `LEAN_BEARER` are subshell-scoped and never echoed. Per `feedback_secret_handling.md`: do NOT `cat` the sops output; do NOT `echo $LEAN_BEARER`; do NOT print the decrypted YAML to stdout. The `yq -r` extraction is the only consumer.
+- The api endpoint (`/api/internal/lean/signals`) writes the audit row + INSERTs the `signals` row via the canonical `ingest_signal_emitted` pipeline — same path LEAN's natural cycle uses. Audit-first ordering is the api's responsibility.
+
+### Run command (live env — requires authorization)
+
+```bash
+# Same as above, swap `paper` → `live-small` and add --allow-non-paper.
+# Operator must have explicit authorization to drive production signal flow.
+ssh root@178.156.239.84 -- 'set -euo pipefail
+  cd /opt/trading
+  (
+    export SOPS_AGE_KEY_FILE=/etc/credstore.encrypted/age_key
+    PG_PASS=$(sops -d secrets/live-small.enc.yaml | yq -r .postgres.app_service_password)
+    LEAN_BEARER=$(sops -d secrets/live-small.enc.yaml | yq -r .lean.api_bearer_token)
+    docker compose --env-file deploy/.env exec -T \
+      -w /app \
+      -e PYTHONPATH=/app \
+      -e DATABASE_URL="postgresql+asyncpg://app_service:${PG_PASS}@postgres:5432/trading" \
+      -e LEAN_LOCAL_BEARER_TOKEN="${LEAN_BEARER}" \
+      api \
+      /opt/venv/bin/python -m scripts.operator_tools.trigger_v1_cycle \
+        --env live-small \
+        --no-dry-run \
+        --allow-non-paper
+  )
+'
+```
+
+### Replay a missed cycle
+
+If LEAN was down on a past day, pass `--session-date YYYY-MM-DD`. The tool will:
+
+- Use that date as the `as_of_session_date` for the strategy.
+- Compute the dedup set against `signals` rows for that specific session_date.
+- Use the bars currently on disk (which represent bar_sync's most-recent successful sync; you cannot replay against a historical disk state without restoring it first).
+
+```bash
+# Example: replay 2026-05-24's cycle (a Sunday is fine — strategy uses bars only)
+docker compose ... \
+  /opt/venv/bin/python -m scripts.operator_tools.trigger_v1_cycle \
+    --env paper \
+    --session-date 2026-05-24
+```
+
+### Exit codes
+
+| Code | Meaning | Operator action |
+|---|---|---|
+| 0 | Success — cycle ran cleanly; all eligible signals POSTed (or marked would-POST in `--dry-run`) | Verify per next section; optionally Discord-POST per the `replay_executions.py` template |
+| 1 | Risk state blocked dispatch (not NORMAL) | Investigate why kill-switch is engaged; resume manually via `/system` if appropriate |
+| 3 | At least one signal POST returned non-2xx | Check the per-signal `trigger_v1_cycle_post_rejected` log lines; the audit_log will show the ones that succeeded |
+| 5 | DB init failure | Verify `DATABASE_URL` env var + Postgres connectivity |
+| 6 | Invalid CLI args | Check the `--env=live-*` requires `--allow-non-paper` gate + `--session-date` format |
+| 7 | `LEAN_LOCAL_BEARER_TOKEN` env var unset (and not `--dry-run`) | Stage via sops per the run command above |
+| 99 | Unexpected exception (traceback on stderr) | Escalate; capture stderr + the input args |
+
+### Verification (post-success)
+
+```bash
+# 1. Audit chain extends + still passes verification.
+docker compose --env-file deploy/.env exec -T \
+  -e DATABASE_URL="$DATABASE_URL" \
+  api \
+  /opt/venv/bin/python -m services.audit.verify_chain --env paper
+# Expected: CHAIN OK: <N> rows verified  (N now larger by however many signals POSTed)
+
+# 2. signals table has new rows tagged with the operator-trigger strategy_version.
+docker compose --env-file deploy/.env exec -T \
+  -e PGPASSWORD="$PG_PASS" \
+  postgres \
+  psql -U app_service -d trading -h postgres -c "
+SELECT id, market, direction, status, session_date, emitted_at_utc
+FROM signals
+WHERE emitted_at_utc > NOW() - INTERVAL '1 hour'
+ORDER BY emitted_at_utc DESC
+LIMIT 10;
+"
+
+# 3. audit_log shows the SIGNAL_EMITTED rows.
+docker compose --env-file deploy/.env exec -T \
+  -e PGPASSWORD="$PG_PASS" \
+  postgres \
+  psql -U app_service -d trading -h postgres -c "
+SELECT sequence_no, event_type, ingest_clock_ts
+FROM audit_log
+WHERE event_type = 'signal_emitted'
+  AND ingest_clock_ts > NOW() - INTERVAL '1 hour'
+ORDER BY sequence_no DESC
+LIMIT 10;
+"
+```
+
+### Will this mess anything up? (operator concern)
+
+Built-in mitigations for each failure mode:
+
+| Risk | Mitigation |
+|---|---|
+| Double-emit (today's natural cycle + this tool) | Dedup against `signals.(account_id, env, market, session_date)`; markets already emitted today are skipped with `trigger_v1_cycle_dedup_skip` |
+| Bar staleness | Logged as `trigger_v1_cycle_bars_stale` warning per market; tool continues (operator-trigger may want last-known data) |
+| Kill-switch bypass | Hard-fail on non-NORMAL risk_state; manual resume via web UI required |
+| /MCL re-emission | `V1_SIDELINED_MARKETS` honored via set difference; /MCL never appears in the active universe |
+| Audit chain integrity | The api endpoint handles audit-first ordering per backend-spec §2.10.1; this tool stays out of the audit-write path |
+| Live-env unauthorized run | `--allow-non-paper` gate; argparse error code 6 if missing |
+| Bearer leak | Bearer staged via sops to a subshell-scoped env var; never echoed; the tool reads via `os.environ` |
+
+### Architecture note
+
+`scripts/operator_tools/**` is NEW path on the dev-guide hot-fix scope but NOT on the §11 anti-pattern [A02] forbidden-modification whitelist. The tool CALLS `services/api/routes/internal/lean.py` (via HTTP POST) + `strategies/v1_trend_following/strategy.py` (via direct import) but does not modify them — regular PR review applies.
+
+The tool's strategy invocation is the same `V1TrendFollowing.generate_signals(...)` call that `lean/v1_strategy.py::on_daily_signal_cycle` makes at 21:30 UTC. The POST payload shape matches what LEAN emits. The only divergences are deliberate:
+
+1. **`strategy_version`** is `v1_trend_following@operator-trigger` (LEAN uses `v1_trend_following@phase1-pivot-d`). Forensic-visibility distinction so the operator can filter audit_log + `/signals` to see which were tool-triggered.
+2. **`target_contracts`** is hard-coded to 1 — same conservative single-lot allocation LEAN uses (`_naive_target_contracts`). The full Stage 0-5 server-side sizing runs when the operator approves the signal.
+3. **`opened_at_session_date`** on positions is sourced from the open `trades` row (when one exists) rather than LEAN's `holding.invested_since`. When no open trade is recorded, the strategy's MIN_HOLDING_DAYS check is conservatively skipped — same behavior LEAN gets when `invested_since` is missing.
+
+### Lineage
+
+Born from the operator brief after PR #247 (Donchian fix) revealed a gap: the operator wanted to trigger a cycle off-schedule to test the fix without waiting overnight. Built to be reusable for any future "I want to run a cycle right now" scenario. Designed to match LEAN's emission contract bit-for-bit so the api endpoint can't distinguish operator-triggered from LEAN-triggered signals (same `ingest_signal_emitted` pipeline; same audit-chain payload shape).
