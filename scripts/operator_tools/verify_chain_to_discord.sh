@@ -53,9 +53,6 @@ if [ ! -r "$WEBHOOK_FILE" ]; then
 fi
 WEBHOOK_URL="$(cat "$WEBHOOK_FILE")"
 
-# Run verify_chain inside the api container. The api container's environment
-# carries DATABASE_URL (set via docker-compose env_file -> sops decrypt at
-# deploy time). If the api container is down, this fails — captured in EXIT.
 cd "$TRADING_ROOT" || {
   curl -fsS -X POST "$WEBHOOK_URL" \
     -H 'Content-Type: application/json' \
@@ -64,10 +61,45 @@ cd "$TRADING_ROOT" || {
   exit 0
 }
 
-docker compose --env-file /opt/trading/deploy/.env exec -T api \
-  /opt/venv/bin/python -m services.audit.verify_chain --env "$ENV_TAG" \
-  > "$TMP_OUTPUT" 2>&1
-EXIT=$?
+# Construct DATABASE_URL from sops (per deploy/audit/README.md §3 manual
+# ceremony). The api container's runtime env doesn't carry DATABASE_URL
+# directly; the api process loads it via sops at startup. For verify_chain
+# CLI to run, we replicate that path here.
+#
+# Per feedback_secret_handling.md: password lives in env var only, never
+# echoed; temp pw file is shredded immediately after read; DATABASE_URL is
+# unset after the docker exec returns.
+
+# Source deploy/.env to get SOPS_AGE_KEY_FILE
+set -a
+# shellcheck disable=SC1091
+. /opt/trading/deploy/.env 2>/dev/null
+set +a
+
+# Decrypt + extract the app_service password
+PW_TMP="$(mktemp /tmp/verify-chain-pw.XXXXXX)"
+chmod 600 "$PW_TMP"
+if ! sops -d "/opt/trading/secrets/${ENV_TAG}.enc.yaml" 2>/dev/null \
+     | yq '.postgres.app_service_password' -r > "$PW_TMP" 2>/dev/null \
+     || ! [ -s "$PW_TMP" ]; then
+  shred -u "$PW_TMP" 2>/dev/null || rm -f "$PW_TMP"
+  printf 'sops decrypt failed for /opt/trading/secrets/%s.enc.yaml; check SOPS_AGE_KEY_FILE\n' "$ENV_TAG" > "$TMP_OUTPUT"
+  EXIT=99
+else
+  APP_SERVICE_PW="$(cat "$PW_TMP")"
+  shred -u "$PW_TMP" 2>/dev/null || rm -f "$PW_TMP"
+
+  export DATABASE_URL="postgresql://app_service:${APP_SERVICE_PW}@postgres:5432/trading"
+  unset APP_SERVICE_PW
+
+  docker compose --env-file /opt/trading/deploy/.env exec -T \
+    -e DATABASE_URL="$DATABASE_URL" \
+    api /opt/venv/bin/python -m services.audit.verify_chain --env "$ENV_TAG" \
+    > "$TMP_OUTPUT" 2>&1
+  EXIT=$?
+
+  unset DATABASE_URL
+fi
 
 # Parse the result. verify_chain emits one of:
 #   CHAIN OK: <N> rows verified              -> exit 0
