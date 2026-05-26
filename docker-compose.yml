@@ -426,6 +426,15 @@ services:
     image: ghcr.io/gnzsnz/ib-gateway:stable
     restart: unless-stopped
     networks: [internal, egress]
+    labels:
+      # Mark this container as a target for the autoheal sidecar (see
+      # `deploy/autoheal/README.md` + the `autoheal:` service block
+      # later in this file). When the healthcheck above (which probes
+      # BOTH external socat + internal Java ports per drill 6 fix) reports
+      # `(unhealthy)`, autoheal invokes `docker restart ib_gateway` within
+      # ~30s, recovering from drill-5/drill-6-class stuck states without
+      # operator intervention. Remove this label to opt out.
+      autoheal: 'true'
     environment:
       # paper or live; flipped at deploy time via deploy/.env LEAN_LIVE_MODE
       TWS_USERID: ${IB_GATEWAY_USERNAME:-}
@@ -479,6 +488,47 @@ services:
       timeout: 10s
       retries: 3
       start_period: 120s  # IBC takes ~90s to log in fresh
+
+  # ---- autoheal sidecar ------------------------------------------------
+  # Drill 6 follow-up #3 (2026-05-25; `Docs/decisions-log.md` entry
+  # "ib_gateway stuck-at-login recurrence + recovery"). Monitors all
+  # containers labeled `autoheal=true` (currently only `ib_gateway`) and
+  # invokes `docker restart <name>` whenever Docker's healthcheck
+  # reports `(unhealthy)`. Pairs with the drill-6 healthcheck fix
+  # (probes BOTH external socat + internal Java ports) so a stuck
+  # ib_gateway is auto-recovered within ~3-4 min instead of 18+ hours.
+  #
+  # Trade-off: requires the Docker socket mount, which gives this
+  # container root-equivalent access to the host. The willfarrell/
+  # autoheal image is small (~10MB Alpine + bash + curl + jq script);
+  # source at https://github.com/willfarrell/docker-autoheal. Treat
+  # any compromise of this container as host-root compromise. See
+  # `deploy/autoheal/README.md` for the operator runbook (debug
+  # commands, opt-out, tuning, deeper trust-boundary discussion).
+  autoheal:
+    image: willfarrell/autoheal:latest
+    restart: unless-stopped
+    # No networks needed — autoheal only uses the Docker socket
+    # (mounted below) to query container health + invoke restarts.
+    # Joining `internal` for consistency with other internal-only
+    # services + so it appears in the same `docker compose ps`
+    # network column.
+    networks: [internal]
+    environment:
+      # Only monitor containers explicitly labeled `autoheal=true`.
+      # Default ("autoheal") works for us but pinning it here is
+      # self-documenting + future-proof against image-default drift.
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+      # Poll the Docker API every 30s (default 5s). The ib_gateway
+      # healthcheck cadence is `interval=60s × retries=3 = 180s` to
+      # detection, so a faster poll wouldn't shorten time-to-recovery
+      # meaningfully + adds Docker socket noise. Upper bound on
+      # time-to-restart from-stuck-state: 180s (detection) + 30s
+      # (autoheal poll) ≈ 3.5 min.
+      AUTOHEAL_INTERVAL: '30'
+      TZ: America/New_York
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
 
   # lean_local — LEAN algorithm engine (Pivot-PR-A; post-pivot 2026-05-12).
   #
