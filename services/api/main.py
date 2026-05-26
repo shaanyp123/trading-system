@@ -562,6 +562,198 @@ def _build_monitor_alert_dispatch_hook(
     return _hook
 
 
+def _build_task_death_alert_hook(
+    settings: APISettings,
+) -> object | None:
+    """Construct the AsyncTaskMonitor's task-death hook or return None.
+
+    Recovery-agent follow-up to drill 5 (2026-05-18) + drill 7 (2026-05-18),
+    landed 2026-05-26. When the AsyncTaskMonitor's
+    ``_probe_tracked_tasks`` observes that an allow-listed lifespan
+    task transitioned to ``.done()`` unexpectedly (today: only
+    ``order_placement_worker.run_forever``), the monitor fires this
+    hook with a ``MonitorAlertDescriptor``. The hook closure performs
+    two state mutations in audit-first order (backend-spec §2.10.1):
+
+      1. ``append_audit_event(ASYNC_TASK_DIED)`` — durable audit row
+         capturing the task name, exit reason, exception type/repr,
+         monitor's observed_at_utc.
+      2. ``INSERT INTO alerts (category='worker_failure', severity='P0',
+         triggering_audit_event_uuid=<the audit row's UUID>, ...)`` —
+         the recovery-agent's inbox. The recovery agent at
+         ``scripts/operator_tools/recovery_agent.py`` polls this table
+         every 60s via systemd timer.
+
+    Notably, this hook does NOT call ``dispatch_alert``. The recovery
+    agent fires its own Discord ``#critical`` post via a dedicated
+    webhook URL (``/etc/trading/critical-webhook.url``, mirroring the
+    verify-chain pattern) — independent of api uptime. If the api is
+    down at the time of detection, the alerts row + audit row land via
+    the in-process hook; the Discord push then becomes the recovery
+    agent's responsibility on its next 60s tick. This decouples
+    notification from queueing and matches the operator's locked
+    preference for an independent Discord webhook (per the operator
+    brief).
+
+    Returns ``None`` only on test paths that explicitly disable the
+    hook via ``settings.task_death_alert_hook_enabled = False``. The
+    default is always-on — the audit + alerts INSERT are best-effort
+    safety-net writes that the recovery agent depends on.
+
+    The account_id is resolved at hook fire time (not construction
+    time) so a missing-account-at-boot path (operator hasn't run
+    /setup yet) doesn't break hook construction. If account_id is
+    still unresolved at fire time, log + skip both writes — the
+    monitor ERROR log already fired the load-bearing observability.
+
+    Pattern mirror of ``_build_monitor_alert_dispatch_hook`` (the IBKR
+    connectivity hook) minus the dispatch_alert call + plus the
+    leading append_audit_event. Returns ``object | None`` to dodge the
+    same circular-import surface.
+    """
+    # Lazy imports keep module-load fast + avoid the circular-import surface.
+    from services.api.async_task_monitor import MonitorAlertDescriptor
+    from services.audit.event_types import AuditEventType
+    from services.audit.writer import append_audit_event
+    from services.webhook_pusher.payloads import AlertCategory, AlertSeverity
+
+    if not getattr(settings, "task_death_alert_hook_enabled", True):
+        log.info(
+            "task_death_alert_hook_disabled_via_setting",
+            note=(
+                "settings.task_death_alert_hook_enabled is False; the "
+                "AsyncTaskMonitor's structured async_task_died ERROR log "
+                "will still fire on death, but no audit row or alerts "
+                "row will be written. Disable only for test envs."
+            ),
+        )
+        return None
+
+    log.info("task_death_alert_hook_constructed")
+    audit_env = _audit_env_from_settings(settings)
+
+    async def _hook(descriptor: MonitorAlertDescriptor) -> None:
+        """Per-task-death: audit-first emit + alerts INSERT.
+
+        Resolves account_id at fire time so a missing-account-at-boot
+        path doesn't break hook construction. If account_id is still
+        unresolved at fire time, log + skip — the monitor ERROR log
+        already fired the load-bearing observability.
+
+        Three separate sessions:
+
+          1. Account resolution session (read-only).
+          2. Audit emit session (committed by ``append_audit_event``'s
+             internal SERIALIZABLE + advisory-lock transaction).
+          3. Alerts INSERT session (committed inline).
+
+        Order: account → audit → alerts. The audit row's UUID is
+        threaded into the alerts row's ``triggering_audit_event_uuid``
+        FK so the recovery agent can join back to it without parsing
+        the descriptor's payload.
+
+        Hook failures propagate; the monitor's
+        ``_schedule_alert_dispatch`` catches them + logs at WARNING so
+        a Postgres serialization-retry-exhausted or unexpected error
+        doesn't crash the run_forever loop.
+        """
+        # Defense-in-depth: validate severity + category map to the
+        # locked enums before any DB I/O (matches the recon + IBKR
+        # hooks' cross-checks).
+        AlertSeverity(descriptor.severity)
+        AlertCategory(descriptor.category)
+
+        session_factory = api_db.get_session_factory()
+        async with session_factory() as repo_session:
+            repo = PostgresPhase1QueryRepo(repo_session)
+            account_id = await repo.fetch_active_account_id()
+        if account_id is None:
+            log.warning(
+                "task_death_alert_skipped_no_account",
+                note=(
+                    "Monitor fired task-death hook but no active account "
+                    "is provisioned; the audit emit's FK to accounts AND "
+                    "the alerts INSERT's FK both would fail. Run /setup "
+                    "to create the account row + restart api."
+                ),
+                severity=descriptor.severity,
+                category=descriptor.category,
+                task_name=descriptor.payload.get("task_name"),
+            )
+            return
+
+        # ---- 1. Audit-first: emit ASYNC_TASK_DIED ------------------
+        # Per backend-spec §2.10.1: the audit row commits BEFORE the
+        # alerts row (which is the dependent state mutation). The
+        # append_audit_event helper handles SERIALIZABLE + advisory
+        # lock + retry internally; we get back the inserted row's
+        # event_uuid for FK chaining into the alerts INSERT.
+        async with session_factory() as audit_session:
+            audit_payload: dict[str, object] = {
+                "task_name": descriptor.payload.get("task_name"),
+                "exit_reason": descriptor.payload.get("exit_reason"),
+                "exception_type": descriptor.payload.get("exception_type"),
+                "exception_repr": descriptor.payload.get("exception_repr"),
+                "monitor_observed_at_utc": descriptor.payload.get("observed_at_utc"),
+            }
+            audit_record = await append_audit_event(
+                audit_session,
+                AuditEventType.ASYNC_TASK_DIED,
+                audit_payload,
+                account_id=account_id,
+                env=audit_env,
+                phase_at_emit=1,
+            )
+
+        log.info(
+            "task_death_audit_emitted",
+            audit_event_uuid=str(audit_record.event_uuid),
+            sequence_no=audit_record.sequence_no,
+            task_name=descriptor.payload.get("task_name"),
+            env=audit_env,
+        )
+
+        # ---- 2. INSERT alerts row with FK to the audit row ---------
+        message_text = f"{descriptor.title}\n\n{descriptor.body}"
+        async with session_factory() as ins_session:
+            row = (
+                await ins_session.execute(
+                    text(
+                        "INSERT INTO alerts ("
+                        "    account_id, severity, category, message, detail, "
+                        "    triggering_audit_event_uuid"
+                        ") VALUES ("
+                        "    :acct, :sev, :cat, :msg, CAST(:detail AS JSONB), :audit_uuid"
+                        ") RETURNING id"
+                    ),
+                    {
+                        "acct": account_id,
+                        "sev": descriptor.severity,
+                        "cat": descriptor.category,
+                        "msg": message_text,
+                        "detail": json.dumps(descriptor.payload),
+                        "audit_uuid": audit_record.event_uuid,
+                    },
+                )
+            ).fetchone()
+            assert row is not None
+            alert_id = UUID(str(row.id))
+            await ins_session.commit()
+
+        log.info(
+            "task_death_alert_inserted",
+            alert_id=str(alert_id),
+            audit_event_uuid=str(audit_record.event_uuid),
+            severity=descriptor.severity,
+            category=descriptor.category,
+            account_id=str(account_id),
+            task_name=descriptor.payload.get("task_name"),
+            env=audit_env,
+        )
+
+    return _hook
+
+
 def _build_bar_sync_alert_dispatch_hook(
     settings: APISettings,
 ) -> object | None:
@@ -1259,6 +1451,7 @@ async def _start_async_task_monitor(
     heartbeat_probe: tuple[object, object] | None,
     bar_sync: tuple[object, object] | None = None,
     monitor_alert_hook: object | None = None,
+    task_death_alert_hook: object | None = None,
 ) -> tuple[object, object] | None:
     """Construct + start the AsyncTaskMonitor; return (monitor, task) or None.
 
@@ -1318,10 +1511,19 @@ async def _start_async_task_monitor(
             ),
         )
 
+    # Recovery-agent task-death hook (drill 5/6 follow-up, 2026-05-26).
+    # Typed as the concrete TaskDeathAlertHook for the monitor; the
+    # builder returns object | None to dodge import-time circularity.
+    from services.api.async_task_monitor import TaskDeathAlertHook
+
+    typed_task_death_hook: TaskDeathAlertHook | None = (
+        None if task_death_alert_hook is None else task_death_alert_hook  # type: ignore[assignment]
+    )
     monitor = AsyncTaskMonitor(
         tracked,
         interval_seconds=settings.async_task_monitor_interval_seconds,
         ibkr_error_state=ibkr_error_tracker,
+        task_death_alert_hook=typed_task_death_hook,
     )
     task = asyncio.create_task(
         monitor.run_forever(),
@@ -1332,6 +1534,7 @@ async def _start_async_task_monitor(
         interval_seconds=settings.async_task_monitor_interval_seconds,
         tracked_count=len(tracked),
         ibkr_probe_wired=ibkr_error_tracker is not None,
+        task_death_hook_wired=typed_task_death_hook is not None,
     )
     return monitor, task
 
@@ -1491,6 +1694,16 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             # monitor degrades gracefully (WARNING log fires, no
             # Discord push).
             monitor_alert_hook = _build_monitor_alert_dispatch_hook(settings)
+            # Recovery-agent task-death hook (drill 5/6 follow-up landed
+            # 2026-05-26). Audit-first emit of ASYNC_TASK_DIED +
+            # INSERT of an alerts row (category='worker_failure',
+            # severity='P0') when an allow-listed lifespan task
+            # transitions to .done(). The recovery agent at
+            # scripts/operator_tools/recovery_agent.py polls the
+            # alerts table every 60s and invokes replay_executions.py
+            # for transient failures. Hook returns None only when
+            # explicitly disabled via setting; default is always-on.
+            task_death_alert_hook = _build_task_death_alert_hook(settings)
             async_task_monitor_state = await _start_async_task_monitor(
                 settings,
                 order_placement=worker_state,
@@ -1498,6 +1711,7 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 heartbeat_probe=heartbeat_probe_state,
                 bar_sync=bar_sync_state,
                 monitor_alert_hook=monitor_alert_hook,
+                task_death_alert_hook=task_death_alert_hook,
             )
         except Exception:
             # Monitor startup is best-effort; the api functions without

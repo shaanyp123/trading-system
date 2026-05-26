@@ -1638,6 +1638,146 @@ class TestBuildMonitorAlertDispatchHook:
         assert hook is not None
 
 
+class TestBuildTaskDeathAlertHook:
+    """Recovery-agent follow-up to drill 5/7 (landed 2026-05-26).
+
+    The hook closure built by ``_build_task_death_alert_hook`` is fired
+    by the monitor's ``_probe_tracked_tasks`` when an allow-listed
+    lifespan task transitions to ``.done()``. Per backend-spec §2.10.1
+    audit-first ordering, the closure MUST emit ``ASYNC_TASK_DIED``
+    audit row BEFORE INSERTing the ``alerts`` row.
+
+    The first two tests pin construction (always-on by default,
+    operator-disable via setting). The third test is the load-bearing
+    audit-first ordering pin — a regression that swaps the order (or
+    consolidates the two transactions "for atomicity") silently breaks
+    backend-spec §2.10.1 without test failure; this test catches it.
+    """
+
+    def test_returns_callable_by_default(self) -> None:
+        from services.api import main as api_main
+
+        hook = api_main._build_task_death_alert_hook(_settings())
+        assert hook is not None
+        assert callable(hook)
+
+    def test_disabled_setting_returns_none(self) -> None:
+        from services.api import main as api_main
+
+        hook = api_main._build_task_death_alert_hook(_settings(task_death_alert_hook_enabled=False))
+        assert hook is None
+
+    def test_audit_emit_precedes_alerts_insert(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Pin backend-spec §2.10.1 audit-first ordering on the monitor hook.
+
+        Build the closure → fire it with a synthetic descriptor →
+        assert the ordered call log starts with the audit emit AND the
+        alerts ``INSERT`` SQL executes strictly later. The closure
+        opens three sessions (account-resolve, audit emit, alerts
+        INSERT); we record into a shared list so a single ``assert
+        operations[i] == "..."`` chain pins the ordering.
+
+        Mocks the world:
+          - ``api_db.get_session_factory`` returns a callable that
+            hands out ``_RecordingSession`` instances
+          - ``PostgresPhase1QueryRepo.fetch_active_account_id`` returns
+            a fixed UUID
+          - ``services.audit.writer.append_audit_event`` records
+            "audit_emit" + returns a fake ``AuditLogRecord``
+
+        Anyone who later refactors the hook to do the alerts INSERT
+        first (or to fold both into one transaction without preserving
+        the commit-ordering invariant) will see this test fail.
+        """
+        import asyncio
+        from dataclasses import dataclass
+        from uuid import UUID, uuid4
+
+        from services.api import db as api_db
+        from services.api import main as api_main
+        from services.api.async_task_monitor import MonitorAlertDescriptor
+
+        operations: list[str] = []
+
+        @dataclass
+        class _FakeAuditRecord:
+            sequence_no: int
+            event_uuid: UUID
+
+        class _RecordingSession:
+            async def __aenter__(self) -> _RecordingSession:
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> None:  # type: ignore[no-untyped-def]
+                return None
+
+            async def execute(self, statement, params=None):  # type: ignore[no-untyped-def]
+                sql_str = str(statement)
+                if "INSERT INTO alerts" in sql_str:
+                    operations.append("alerts_insert")
+                row = SimpleNamespace(id=uuid4(), fetchone=lambda: None, fetchall=lambda: [])
+                # Return-shape supports both .fetchone() and the
+                # (await session.execute(...)).fetchone() pattern.
+                return SimpleNamespace(fetchone=lambda: row, fetchall=lambda: [row])
+
+            async def commit(self) -> None:
+                operations.append("alerts_commit")
+
+        def fake_session_factory():  # type: ignore[no-untyped-def]
+            return _RecordingSession()
+
+        monkeypatch.setattr(api_db, "get_session_factory", lambda: fake_session_factory)
+
+        async def fake_fetch_active_account_id(self) -> UUID:  # type: ignore[no-untyped-def]
+            return uuid4()
+
+        monkeypatch.setattr(
+            "services.api.repos.phase1.PostgresPhase1QueryRepo.fetch_active_account_id",
+            fake_fetch_active_account_id,
+        )
+
+        async def fake_append_audit_event(
+            session,
+            event_type,
+            payload,
+            **kwargs,
+        ):  # type: ignore[no-untyped-def]
+            operations.append(f"audit_emit:{event_type.value}")
+            return _FakeAuditRecord(sequence_no=42, event_uuid=uuid4())
+
+        monkeypatch.setattr("services.audit.writer.append_audit_event", fake_append_audit_event)
+
+        descriptor = MonitorAlertDescriptor(
+            severity="P0",
+            category="worker_failure",
+            title="async task died: order_placement_worker.run_forever",
+            body="synthetic test body",
+            payload={
+                "task_name": "order_placement_worker.run_forever",
+                "exit_reason": "exception",
+                "exception_type": "TimeoutError",
+                "exception_repr": "TimeoutError('synthetic')",
+                "observed_at_utc": "2026-05-26T22:00:00+00:00",
+            },
+        )
+
+        hook = api_main._build_task_death_alert_hook(_settings())
+        assert hook is not None
+
+        async def _runner() -> None:
+            await hook(descriptor)  # type: ignore[operator]
+
+        asyncio.run(_runner())
+
+        # Audit-first: the audit emit MUST come before the alerts INSERT.
+        # Other entries (alerts_commit) follow.
+        assert "audit_emit:async_task_died" in operations
+        assert "alerts_insert" in operations
+        audit_idx = operations.index("audit_emit:async_task_died")
+        insert_idx = operations.index("alerts_insert")
+        assert audit_idx < insert_idx, f"audit-first ordering violated: operations={operations!r}"
+
+
 class TestBuildIbkrErrorTrackerWithHook:
     """Drill 5 follow-up #2-FU-1 — `_build_ibkr_error_tracker` threads the hook.
 

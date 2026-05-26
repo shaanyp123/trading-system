@@ -264,7 +264,7 @@ Both tasks run on next Claude Code launch if the app was closed at cron time. Bo
 
 - **VPS cron for `verify_chain --env paper`** — 24/7 safety-critical; sample script provided. Lives on `trading-primary` VPS, posts result to Discord `#audit` channel.
 - **Discord MCP integration** — once connected (per WS#7), scheduled-task output goes directly to Discord channels.
-- **Recovery agent on `async_task_died`** — when api's async-task-monitor logs `async_task_died`, fire an agentic recovery routine that runs `replay_executions.py`. Currently this is operator-manual per `Docs/decisions-log.md` 2026-05-18 drill 5 retrospective.
+- **Recovery agent on `async_task_died`** — ✅ LANDED 2026-05-26. Files: `scripts/operator_tools/recovery_agent.py` + `recovery_agent_tick.sh` + `deploy/audit/systemd/recovery-agent-poll.{service,timer}`. Polls `alerts WHERE category='worker_failure'` every 60s, audit-first emits `RECOVERY_ACTION_TAKEN`, invokes `replay_executions.py` for transient failures, posts to Discord `#critical`. Closes the operator-manual step from drill 5/7 retrospectives. See `Docs/agentic-patterns.md` Pattern 6 for the canonical reference.
 - **Pre-deploy ceremony reminder** — operator-on-demand one-time scheduled task with `fireAt`; described in Pattern 3.
 
 ---

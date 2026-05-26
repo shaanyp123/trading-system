@@ -890,7 +890,7 @@ class TestDeliveryStatusValues:
 
 
 class TestAlertCategoryEnumMirror:
-    """29 values per backend-spec §3.27 + alembic 0004 alert_category enum.
+    """31 values per backend-spec §3.27 + alembic 0004 alert_category enum.
 
     If alembic adds a new value without updating the Python enum here,
     ``_parse_category`` raises at dispatch time. This test catches the
@@ -898,9 +898,12 @@ class TestAlertCategoryEnumMirror:
     """
 
     def test_alert_category_count_matches_spec(self) -> None:
-        # alembic 0004:311-341 lists 29 values; 2026-05-17_heartbeat_stale_category
-        # migration adds 1 more (`heartbeat_stale` for the staleness probe).
-        assert len(list(AlertCategory)) == 30
+        # alembic 0004:311-341 lists 29 values;
+        # 2026-05-17_heartbeat_stale_category migration adds 1
+        # (`heartbeat_stale` for the staleness probe);
+        # 2026-05-26_worker_failure_alert_category migration adds 1 more
+        # (`worker_failure` for the recovery-agent task-death hook).
+        assert len(list(AlertCategory)) == 31
 
     def test_canonical_values_present(self) -> None:
         # Sentinel check; full set in alembic 0004 + spec §3.27.

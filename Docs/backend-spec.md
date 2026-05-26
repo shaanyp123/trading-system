@@ -1873,7 +1873,12 @@ class AuditEventType(str, Enum):
     INCIDENT_REVIEW_LOGGED = "incident_review_logged"
     AUDIT_CHAIN_INTEGRITY_VERIFIED = "audit_chain_integrity_verified"
     AUDIT_REPAIR_APPLIED = "audit_repair_applied"
+    HEARTBEAT_STALE_DETECTED = "heartbeat_stale_detected"
+    ASYNC_TASK_DIED = "async_task_died"
+    RECOVERY_ACTION_TAKEN = "recovery_action_taken"
 ```
+
+`ASYNC_TASK_DIED` / `RECOVERY_ACTION_TAKEN` are the recovery-agent pair (drill-5 follow-up landed 2026-05-26): the monitor hook in `services/api/async_task_monitor.py` emits `ASYNC_TASK_DIED` + INSERTs a `worker_failure` alerts row when a tracked lifespan task dies; the polling agent at `scripts/operator_tools/recovery_agent.py` emits `RECOVERY_ACTION_TAKEN` (audit-first) before invoking `replay_executions.py` and UPDATEing the alert. Payload contract for `RECOVERY_ACTION_TAKEN`: `triggering_alert_uuid`, `triggering_audit_event_uuid`, `decision` ∈ `{invoke_replay, alert_only}`, `task_name`, `classification` ∈ `{transient, hard_crash, ambiguous}`, `plan`.
 
 ---
 

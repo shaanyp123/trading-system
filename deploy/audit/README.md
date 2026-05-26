@@ -362,3 +362,205 @@ re-reads the file on every run).
 | Discord posts `AUDIT CHAIN BREAK at sequence_no=...` | Real chain break — incident-level | Stop. Run the manual ceremony from §3 above. Escalate per `Docs/decisions-log.md` |
 | Discord posts `unexpected exit=N` | api container down or docker daemon issue | Check `docker compose ps`; restart api if needed; manual ceremony to re-verify chain afterward |
 | Posts stop coming silently | The webhook URL was revoked at Discord side | Step 6 (re-create + replace file) |
+
+---
+
+## Recovery agent — install ceremony
+
+A second systemd timer (landed alongside the verify-chain timer in
+2026-05-26) polls the `alerts` table every 60s for unhandled
+`worker_failure` events — INSERTed by the new task-death hook in
+`services/api/async_task_monitor.py` when a tracked lifespan task
+(today: `order_placement_worker.run_forever`) transitions to `.done()`
+unexpectedly. For each unhandled alert the agent classifies the
+failure (transient vs hard crash), invokes
+`scripts/operator_tools/replay_executions.py` for transient failures,
+audit-first emits `RECOVERY_ACTION_TAKEN`, UPDATEs the alert row, and
+posts a recovery summary to Discord `#critical`. Closes the manual
+operator step from drill 5 (2026-05-18) + drill 7 (2026-05-18) where
+the operator hand-ran `replay_executions.py` to recover backend-blind
+fills.
+
+**Files (in repo):**
+- `scripts/operator_tools/recovery_agent.py` — the agent
+- `scripts/operator_tools/recovery_agent_tick.sh` — bash wrapper
+- `deploy/audit/systemd/recovery-agent-poll.service` — what runs
+- `deploy/audit/systemd/recovery-agent-poll.timer` — every 60s
+
+**Why a dedicated Discord webhook (not webhook_pusher):**
+Independent of the api service — same reasoning as the audit cron. If
+the api is down, the recovery agent's direct Postgres + Discord access
+still fires. Pairs with autoheal (PR #240, handles gateway stuck-state)
+and the verify-chain cron above as the third pillar of the 24/7 safety
+net.
+
+### Install ceremony (operator-side, run once on the VPS)
+
+**Step 1 — Create the Discord webhook for `#critical`.**
+
+If you don't already have one: in Discord, `#critical` channel →
+settings (gear icon) → Integrations → Webhooks → New Webhook → Name
+it "recovery-agent" → Copy Webhook URL.
+
+If you have an existing `#critical` webhook (e.g., from
+`secrets/paper.enc.yaml::discord.webhook_urls.critical`), reuse that
+URL — the recovery agent and webhook_pusher can share the same
+target. The file is the single point of truth for the systemd path.
+
+**Step 2 — Save the webhook URL on the VPS (per `feedback_secret_handling.md`).**
+
+```bash
+# SSH to VPS as operator/trading user. Paste the URL via here-doc.
+sudo mkdir -p /etc/trading
+sudo tee /etc/trading/critical-webhook.url > /dev/null <<'EOF'
+PASTE_CRITICAL_WEBHOOK_URL_ON_THIS_LINE
+EOF
+sudo chmod 600 /etc/trading/critical-webhook.url
+sudo chown trading:trading /etc/trading/critical-webhook.url
+
+# Verify file size only — never display content
+wc -c /etc/trading/critical-webhook.url   # Discord webhook URLs are ~120-150 bytes
+```
+
+**Step 3 — Apply the alembic migration (adds `worker_failure` to alert_category enum).**
+
+```bash
+cd /opt/trading
+git pull --ff-only  # if not already done
+docker compose --env-file deploy/.env exec api alembic upgrade head
+
+# Verify the migration applied
+docker compose --env-file deploy/.env exec api alembic current
+# Expected: 20260526_worker_failure (head)
+```
+
+**Step 4 — Rebuild api container (picks up the new monitor hook).**
+
+```bash
+docker compose --env-file deploy/.env build api
+docker compose --env-file deploy/.env up -d --force-recreate api
+
+# Watch api boot logs for the new wiring
+docker compose --env-file deploy/.env logs api --tail 50 | grep -E "task_death_alert_hook_constructed|async_task_monitor_spawned"
+# Expected:
+#   task_death_alert_hook_constructed
+#   async_task_monitor_spawned interval_seconds=30.0 ... task_death_hook_wired=True
+```
+
+**Step 5 — Install the systemd units.**
+
+```bash
+sudo cp /opt/trading/deploy/audit/systemd/recovery-agent-poll.service \
+        /etc/systemd/system/recovery-agent-poll.service
+sudo cp /opt/trading/deploy/audit/systemd/recovery-agent-poll.timer \
+        /etc/systemd/system/recovery-agent-poll.timer
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now recovery-agent-poll.timer
+```
+
+**Step 6 — Verify the timer is armed.**
+
+```bash
+systemctl list-timers recovery-agent-poll.timer
+# Expected: NEXT column shows ~60s out; ACTIVATES shows the .service unit
+```
+
+**Step 7 — Smoke test via synthetic alert.**
+
+```bash
+# INSERT a synthetic worker_failure alert directly into the alerts
+# table to drive the agent through its full code path without
+# actually killing a worker.
+docker compose --env-file deploy/.env exec postgres psql -U app_service -d trading -c \
+  "INSERT INTO alerts (account_id, severity, category, message, detail)
+   VALUES (
+     (SELECT id FROM accounts LIMIT 1),
+     'P0',
+     'worker_failure',
+     'SYNTHETIC: recovery-agent install smoke test',
+     '{\"task_name\":\"order_placement_worker.run_forever\",
+       \"exit_reason\":\"exception\",
+       \"exception_type\":\"TimeoutError\",
+       \"exception_repr\":\"TimeoutError(synthetic)\",
+       \"observed_at_utc\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}'::jsonb
+   );"
+
+# Wait 60-90s. The next tick of recovery-agent-poll.timer fires and
+# processes the synthetic alert.
+
+# Verify the audit chain has a RECOVERY_ACTION_TAKEN row
+docker compose --env-file deploy/.env exec api /opt/venv/bin/python -m services.audit.verify_chain --env paper | tail -5
+
+# Verify the alerts row is now acknowledged + resolved
+docker compose --env-file deploy/.env exec postgres psql -U app_service -d trading -c \
+  "SELECT id, acknowledged, resolved_at_utc IS NOT NULL AS resolved,
+          detail->'recovery_outcome'->>'decision' AS decision
+   FROM alerts WHERE message LIKE 'SYNTHETIC:%';"
+
+# Check Discord #critical for the recovery summary embed
+# Title: "Recovery agent: invoke_replay for order_placement_worker.run_forever"
+# (decision is invoke_replay because TimeoutError is in TRANSIENT_EXCEPTION_TYPES;
+# the orphan-CID query likely returns empty in a quiet system → replay
+# subprocess returns invoked=False but the agent still processes the alert)
+```
+
+**Step 8 — Cleanup the synthetic alert (optional but recommended).**
+
+```bash
+docker compose --env-file deploy/.env exec postgres psql -U app_service -d trading -c \
+  "DELETE FROM alerts WHERE message LIKE 'SYNTHETIC:%';"
+
+# Note: the RECOVERY_ACTION_TAKEN audit row is immutable per alembic
+# 0005 — it stays in the chain. That's correct behavior (the chain is
+# append-only); the operator can ignore the synthetic row in future
+# verify_chain runs.
+```
+
+### Operations
+
+```bash
+# Tail the agent's per-tick output
+journalctl -u recovery-agent-poll.service --since '5 min ago'
+
+# How often is the timer firing?
+systemctl list-timers recovery-agent-poll.timer
+
+# Force a tick manually (for testing or post-incident)
+sudo systemctl start recovery-agent-poll.service
+journalctl -u recovery-agent-poll.service --since '1 min ago'
+
+# Disable temporarily (e.g., during a planned operator-led incident)
+sudo systemctl stop recovery-agent-poll.timer
+# Re-enable:
+sudo systemctl start recovery-agent-poll.timer
+
+# Rotate the Discord webhook URL
+# Repeat Step 2 above with a new URL; no restart needed (the script
+# re-reads the file on every tick).
+```
+
+### Failure modes
+
+| Symptom | Diagnosis | Fix |
+|---|---|---|
+| Discord `#critical` silent after a known worker death | Either the monitor hook isn't wired OR the recovery agent timer isn't firing | Check Step 4 boot logs for `task_death_hook_wired=True`; then Step 6 to verify the timer; then `journalctl -u recovery-agent-poll.service` for the per-tick logs |
+| `recovery_agent_no_critical_webhook_url` WARNING in journal | Step 2 not done or perms wrong | Re-run Step 2 |
+| `recovery_agent_db_init_failed` ERROR | DATABASE_URL build failed | Check sops decrypt: `sops -d secrets/paper.enc.yaml | grep app_service_password`. Check `journalctl -u recovery-agent-poll.service` for the bash wrapper's error |
+| Synthetic alert in Step 7 stays acknowledged=FALSE | Timer firing but agent crashing per-tick | `journalctl -u recovery-agent-poll.service -n 100` for the traceback. Common cause: alembic migration in Step 3 was skipped; the `worker_failure` enum value doesn't exist yet |
+| `recovery_agent_alert_processing_failed` with FillProcessingError | Replay subprocess hit a terminal fill-processor error | Investigate via the replay script's exit code in the alert's `detail.recovery_outcome.replay_exit_code` — 3 = fill_processing_error per `scripts/operator_tools/replay_executions.py` docstring |
+| Replay subprocess timeout (exit 124 / `timed_out=True`) | ib_gateway wedged (drill 6 pattern) | Check `docker compose ps ib_gateway` + autoheal logs; the synchronous restart via autoheal should self-heal within ~5.5min |
+
+### Operator runbook reference
+
+For the full lineage + design rationale:
+- `Docs/decisions-log.md` 2026-05-18 drill 5 retrospective (the
+  original incident; `/tmp/drill5_recovery.py` lineage)
+- `Docs/decisions-log.md` 2026-05-25 drill 6 retrospective (the
+  gateway-stuck-state pattern; autoheal sidecar context)
+- `Docs/agentic-patterns.md` Pattern 6 — VPS cron / systemd timers
+  is the 24/7 floor
+- `scripts/operator_tools/replay_executions.py` — the recovery tool
+  the agent invokes (clientId=99, fill_processor lineage)
+- `scripts/operator_tools/recovery_agent.py` — the agent itself
+  (classification logic, exit code contract, A-gates)

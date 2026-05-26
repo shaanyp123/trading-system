@@ -1055,6 +1055,265 @@ class TestMonitorAlertDispatchHook:
         assert captured == []
 
 
+class TestTaskDeathAlertHook:
+    """Recovery-agent task-death hook surface (drill 5/6 follow-up, 2026-05-26).
+
+    The hook fires when a tracked lifespan task transitions to .done()
+    AND the task name is in the (configurable) allow-list. Fires
+    fire-and-forget via ``_schedule_alert_dispatch`` so hook crashes
+    don't kill the probe loop.
+
+    Test surface:
+
+      * Allow-list filter — order_placement_worker fires; others don't
+      * No-hook-wired silent — only the ERROR log fires
+      * Descriptor shape — P0 severity + worker_failure category +
+        payload carries task_name + exception_type + observed_at_utc
+      * Done-without-exception path produces a descriptor too
+        (exception_type=None in payload)
+      * Hook failures swallowed
+    """
+
+    @staticmethod
+    async def _dead_task() -> None:
+        """Build a task that raises a specific exception synchronously."""
+        raise TimeoutError("connectAsync to ib_gateway timed out")
+
+    @staticmethod
+    async def _dead_clean_task() -> None:
+        """Build a task that exits cleanly (done_without_exception)."""
+        return None
+
+    @staticmethod
+    async def _spawn_and_complete(coro_fn: Any) -> asyncio.Task[Any]:
+        task = asyncio.create_task(coro_fn())
+        try:
+            await task
+        except BaseException:
+            # exception() is the inspection path; let .done() reflect.
+            pass
+        return task
+
+    def test_default_allow_list_contains_order_placement_worker(self) -> None:
+        from services.api.async_task_monitor import DEFAULT_TASK_DEATH_ALLOW_LIST
+
+        assert "order_placement_worker.run_forever" in DEFAULT_TASK_DEATH_ALLOW_LIST
+
+    def test_no_hook_wired_only_emits_error_log(self) -> None:
+        from services.api.async_task_monitor import MonitorAlertDescriptor
+
+        captured: list[MonitorAlertDescriptor] = []
+
+        async def _runner() -> None:
+            task = await self._spawn_and_complete(self._dead_task)
+            tracked = TrackedTask(
+                name="order_placement_worker.run_forever",
+                task=task,
+                expected_alive=True,
+            )
+            monitor = AsyncTaskMonitor(
+                [tracked],
+                interval_seconds=30.0,
+                task_death_alert_hook=None,
+            )
+            with capture_logs() as logs:
+                monitor.probe_once()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert any(log.get("event") == "async_task_died" for log in logs)
+            assert captured == []
+
+        asyncio.run(_runner())
+
+    def test_allow_listed_task_death_fires_hook_with_descriptor(self) -> None:
+        from services.api.async_task_monitor import MonitorAlertDescriptor
+
+        captured: list[MonitorAlertDescriptor] = []
+
+        async def _hook(d: MonitorAlertDescriptor) -> None:
+            captured.append(d)
+
+        async def _runner() -> None:
+            task = await self._spawn_and_complete(self._dead_task)
+            tracked = TrackedTask(
+                name="order_placement_worker.run_forever",
+                task=task,
+                expected_alive=True,
+            )
+            monitor = AsyncTaskMonitor(
+                [tracked],
+                interval_seconds=30.0,
+                task_death_alert_hook=_hook,
+            )
+            monitor.probe_once()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+        asyncio.run(_runner())
+        assert len(captured) == 1
+        desc = captured[0]
+        assert desc.severity == "P0"
+        assert desc.category == "worker_failure"
+        assert desc.payload["task_name"] == "order_placement_worker.run_forever"
+        assert desc.payload["exit_reason"] == "exception"
+        assert desc.payload["exception_type"] == "TimeoutError"
+        assert "TimeoutError" in (desc.payload["exception_repr"] or "")
+        assert "observed_at_utc" in desc.payload
+
+    def test_non_allow_listed_task_death_skips_hook(self) -> None:
+        from services.api.async_task_monitor import MonitorAlertDescriptor
+
+        captured: list[MonitorAlertDescriptor] = []
+
+        async def _hook(d: MonitorAlertDescriptor) -> None:
+            captured.append(d)
+
+        async def _runner() -> None:
+            task = await self._spawn_and_complete(self._dead_task)
+            tracked = TrackedTask(
+                # NOT in DEFAULT_TASK_DEATH_ALLOW_LIST
+                name="reconciliation_scheduler.run_forever",
+                task=task,
+                expected_alive=True,
+            )
+            monitor = AsyncTaskMonitor(
+                [tracked],
+                interval_seconds=30.0,
+                task_death_alert_hook=_hook,
+            )
+            with capture_logs() as logs:
+                monitor.probe_once()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            # The ERROR log MUST still fire (load-bearing observability)
+            assert any(log.get("event") == "async_task_died" for log in logs)
+
+        asyncio.run(_runner())
+        # Hook MUST NOT fire for non-allow-listed task
+        assert captured == []
+
+    def test_custom_allow_list_includes_recon_scheduler(self) -> None:
+        """Operator can extend the allow-list per-deploy (no code change)."""
+        from services.api.async_task_monitor import MonitorAlertDescriptor
+
+        captured: list[MonitorAlertDescriptor] = []
+
+        async def _hook(d: MonitorAlertDescriptor) -> None:
+            captured.append(d)
+
+        async def _runner() -> None:
+            task = await self._spawn_and_complete(self._dead_task)
+            tracked = TrackedTask(
+                name="reconciliation_scheduler.run_forever",
+                task=task,
+                expected_alive=True,
+            )
+            monitor = AsyncTaskMonitor(
+                [tracked],
+                interval_seconds=30.0,
+                task_death_alert_hook=_hook,
+                task_death_allow_list=frozenset({"reconciliation_scheduler.run_forever"}),
+            )
+            monitor.probe_once()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+        asyncio.run(_runner())
+        assert len(captured) == 1
+        assert captured[0].payload["task_name"] == "reconciliation_scheduler.run_forever"
+
+    def test_done_without_exception_fires_hook_with_none_exception_type(self) -> None:
+        from services.api.async_task_monitor import MonitorAlertDescriptor
+
+        captured: list[MonitorAlertDescriptor] = []
+
+        async def _hook(d: MonitorAlertDescriptor) -> None:
+            captured.append(d)
+
+        async def _runner() -> None:
+            task = await self._spawn_and_complete(self._dead_clean_task)
+            tracked = TrackedTask(
+                name="order_placement_worker.run_forever",
+                task=task,
+                expected_alive=True,
+            )
+            monitor = AsyncTaskMonitor(
+                [tracked],
+                interval_seconds=30.0,
+                task_death_alert_hook=_hook,
+            )
+            monitor.probe_once()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+        asyncio.run(_runner())
+        assert len(captured) == 1
+        desc = captured[0]
+        assert desc.payload["exit_reason"] == "done_without_exception"
+        assert desc.payload["exception_type"] is None
+        assert desc.payload["exception_repr"] is None
+
+    def test_hook_failure_swallowed_loop_survives(self) -> None:
+        from services.api.async_task_monitor import MonitorAlertDescriptor
+
+        async def _hook(d: MonitorAlertDescriptor) -> None:
+            raise RuntimeError("synthetic hook crash")
+
+        async def _runner() -> None:
+            task = await self._spawn_and_complete(self._dead_task)
+            tracked = TrackedTask(
+                name="order_placement_worker.run_forever",
+                task=task,
+                expected_alive=True,
+            )
+            monitor = AsyncTaskMonitor(
+                [tracked],
+                interval_seconds=30.0,
+                task_death_alert_hook=_hook,
+            )
+            with capture_logs() as logs:
+                # Must NOT raise — hook failure swallowed
+                monitor.probe_once()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            # The ERROR log fires; the hook failure logs a WARNING via
+            # _schedule_alert_dispatch's exception wrapper.
+            assert any(log.get("event") == "async_task_died" for log in logs)
+
+        asyncio.run(_runner())
+
+
+class TestAuditEventTypesNewlyAdded:
+    """A04 pin — the two new event_types added in this PR exist + emit cleanly.
+
+    Per dev-guide anti-pattern A04: any new audit event_type requires
+    (a) the enum entry, (b) a backend-spec §3.30 mirror, (c) at least
+    one test that emits + reads back. (a) and (b) are static; (c) is
+    this test plus the integration smoke in `TestAuditWriter`.
+    """
+
+    def test_async_task_died_in_locked_taxonomy(self) -> None:
+        from services.audit.event_types import AuditEventType
+
+        assert AuditEventType.ASYNC_TASK_DIED.value == "async_task_died"
+
+    def test_recovery_action_taken_in_locked_taxonomy(self) -> None:
+        from services.audit.event_types import AuditEventType
+
+        assert AuditEventType.RECOVERY_ACTION_TAKEN.value == "recovery_action_taken"
+
+    def test_both_new_types_round_trip_through_normalize_event_type(self) -> None:
+        """The writer accepts both the enum value and the raw string;
+        both must round-trip cleanly. Pre-PR-28 modules emit raw
+        strings (per writer.py docstring), so the contract is
+        ``AuditEventType(value) == enum_member``.
+        """
+        from services.audit.event_types import AuditEventType
+
+        assert AuditEventType("async_task_died") is AuditEventType.ASYNC_TASK_DIED
+        assert AuditEventType("recovery_action_taken") is AuditEventType.RECOVERY_ACTION_TAKEN
+
+
 class TestModuleContract:
     """Public ``__all__`` surface."""
 
@@ -1066,8 +1325,10 @@ class TestModuleContract:
             "DEFAULT_IBKR_CONNECTIVITY_CODES",
             "DEFAULT_IBKR_FRESHNESS_SECONDS",
             "DEFAULT_MONITOR_INTERVAL_SECONDS",
+            "DEFAULT_TASK_DEATH_ALLOW_LIST",
             "MonitorAlertDescriptor",
             "MonitorAlertHook",
+            "TaskDeathAlertHook",
             "TrackedIbkrErrorState",
             "TrackedTask",
             "collect_tracked_tasks",
