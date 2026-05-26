@@ -28,8 +28,12 @@ Requires=docker.service
 [Service]
 Type=oneshot
 WorkingDirectory=/opt/trading
-User=trading
-Group=trading
+# Runs as root — matches the existing convention from lean-local-daily-restart.service.
+# Required because /opt/trading/deploy/.env is chmod 600 root:root (contains GHCR_OWNER
+# + other deploy interpolation values). The script's docker compose exec call needs
+# this env-file to resolve image names.
+# The webhook URL file at /etc/trading/audit-webhook.url is chmod 600 trading:trading
+# but root can read regardless.
 ExecStart=/opt/trading/scripts/operator_tools/verify_chain_to_discord.sh paper
 # Single-shot timer; runaway restart not possible.
 TimeoutStartSec=300

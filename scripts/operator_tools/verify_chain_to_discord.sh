@@ -64,7 +64,7 @@ cd "$TRADING_ROOT" || {
   exit 0
 }
 
-docker compose exec -T api \
+docker compose --env-file /opt/trading/deploy/.env exec -T api \
   /opt/venv/bin/python -m services.audit.verify_chain --env "$ENV_TAG" \
   > "$TMP_OUTPUT" 2>&1
 EXIT=$?
@@ -75,28 +75,28 @@ EXIT=$?
 #   <usage message>                          -> exit 2
 TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-case "$EXIT" in
-  0)
-    # Parse the row count for the success message
-    SUMMARY="$(grep -oE 'CHAIN OK: [0-9]+ rows verified' "$TMP_OUTPUT" | head -1)"
-    [ -z "$SUMMARY" ] && SUMMARY='CHAIN OK (row count not parsed)'
-    PAYLOAD="$(printf '{"content":"OK %s — env=%s, %s"}' "$TIMESTAMP" "$ENV_TAG" "$SUMMARY")"
-    ;;
-  1)
-    # CHAIN BREAK — louder message; include the break line
-    BREAK_LINE="$(grep 'CHAIN BREAK' "$TMP_OUTPUT" | head -1 | sed 's/"/\\"/g')"
-    [ -z "$BREAK_LINE" ] && BREAK_LINE='(break line not captured)'
-    PAYLOAD="$(printf '{"content":"AUDIT CHAIN BREAK %s — env=%s\\n%s\\nRun /verify-chain locally + investigate IMMEDIATELY."}' \
-              "$TIMESTAMP" "$ENV_TAG" "$BREAK_LINE")"
-    ;;
-  2)
-    PAYLOAD="$(printf '{"content":"verify-chain cron usage error (exit 2) %s — env=%s. Check systemd journal."}' "$TIMESTAMP" "$ENV_TAG")"
-    ;;
-  *)
-    # Unexpected exit code — likely api container down or docker daemon issue
-    PAYLOAD="$(printf '{"content":"verify-chain cron unexpected exit=%s %s — env=%s. api container or docker daemon may be down."}' "$EXIT" "$TIMESTAMP" "$ENV_TAG")"
-    ;;
-esac
+# Categorize by what's in the output, not just exit code — `docker compose exec`
+# failures can map to exit=1 too (it would be ambiguous with verify_chain's
+# CHAIN-BREAK exit). Reject ambiguity: only treat exit=1 as a chain break if the
+# string "CHAIN BREAK" is present in the output. Otherwise it's an infrastructure
+# error (docker exec failed, env-file missing, container not running, etc.).
+if grep -q 'CHAIN OK' "$TMP_OUTPUT"; then
+  SUMMARY="$(grep -oE 'CHAIN OK: [0-9]+ rows verified' "$TMP_OUTPUT" | head -1)"
+  [ -z "$SUMMARY" ] && SUMMARY='CHAIN OK (row count not parsed)'
+  PAYLOAD="$(printf '{"content":"OK %s — env=%s, %s"}' "$TIMESTAMP" "$ENV_TAG" "$SUMMARY")"
+elif grep -q 'CHAIN BREAK' "$TMP_OUTPUT"; then
+  BREAK_LINE="$(grep 'CHAIN BREAK' "$TMP_OUTPUT" | head -1 | sed 's/"/\\"/g')"
+  PAYLOAD="$(printf '{"content":"AUDIT CHAIN BREAK %s — env=%s\\n%s\\nRun /verify-chain locally + investigate IMMEDIATELY."}' \
+            "$TIMESTAMP" "$ENV_TAG" "$BREAK_LINE")"
+else
+  # Output had neither marker → infrastructure error (docker exec failed,
+  # env-file missing, container down, etc.). Surface enough to triage.
+  # Take the last meaningful line for the error message (skip blank lines).
+  ERR_LINE="$(tail -10 "$TMP_OUTPUT" | grep -vE '^\s*$' | tail -1 | sed 's/"/\\"/g; s/\\/\\\\/g' | head -c 200)"
+  [ -z "$ERR_LINE" ] && ERR_LINE="(no output captured)"
+  PAYLOAD="$(printf '{"content":"verify-chain cron INFRASTRUCTURE ERROR %s — env=%s, exit=%s\\nLast output: %s\\nCheck: docker compose ps, systemd journalctl -u verify-chain-daily.service"}' \
+            "$TIMESTAMP" "$ENV_TAG" "$EXIT" "$ERR_LINE")"
+fi
 
 # POST to Discord; --fail-with-body so we get the HTTP status surfaced in journal
 curl -fsS -X POST "$WEBHOOK_URL" \
