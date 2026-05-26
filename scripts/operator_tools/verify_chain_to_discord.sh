@@ -89,7 +89,9 @@ else
   APP_SERVICE_PW="$(cat "$PW_TMP")"
   shred -u "$PW_TMP" 2>/dev/null || rm -f "$PW_TMP"
 
-  export DATABASE_URL="postgresql://app_service:${APP_SERVICE_PW}@postgres:5432/trading"
+  # +asyncpg driver scheme required — verify_chain.py uses sqlalchemy async
+  # which rejects psycopg2 (sync) URLs. See services/api/db.py for the contract.
+  export DATABASE_URL="postgresql+asyncpg://app_service:${APP_SERVICE_PW}@postgres:5432/trading"
   unset APP_SERVICE_PW
 
   docker compose --env-file /opt/trading/deploy/.env exec -T \
