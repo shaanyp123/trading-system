@@ -24,6 +24,7 @@
     ]
   },
   "permissions": {
+    "defaultMode": "bypassPermissions",
     "allow": [
       "Bash(git status:*)",
       "Bash(git log:*)",
@@ -79,7 +80,15 @@
       "Bash(pnpm --version)",
       "Bash(uv --version)",
       "Bash(docker --version)",
-      "Bash(mkdir -p:*)"
+      "Bash(mkdir -p:*)",
+      "mcp__plugin_discord_discord__reply",
+      "mcp__plugin_discord_discord__fetch_messages",
+      "mcp__plugin_discord_discord__react",
+      "mcp__plugin_discord_discord__edit_message",
+      "mcp__plugin_discord_discord__download_attachment",
+      "mcp__scheduled-tasks__list_scheduled_tasks",
+      "mcp__scheduled-tasks__create_scheduled_task",
+      "mcp__scheduled-tasks__update_scheduled_task"
     ]
   }
 }
