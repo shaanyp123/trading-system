@@ -180,6 +180,25 @@ class AuditEventType(StrEnum):
     # Single durable breadcrumb per stale-detection cycle; dedup +
     # cooldown live on the probe side.
     HEARTBEAT_STALE_DETECTED = "heartbeat_stale_detected"
+    # Recovery-agent follow-up to drill 5 (2026-05-18) + drill 6 (2026-05-25).
+    # Emitted by ``services/api/async_task_monitor.py`` when a tracked
+    # lifespan task (today: order_placement_worker.run_forever) transitions
+    # to .done() with an exception OR a clean exit no caller was awaiting.
+    # Pairs with the ``alerts`` row (category='worker_failure') INSERTed by
+    # the same monitor hook; the audit row is the durable record + the
+    # alerts row is the recovery-agent inbox. Drill 5's manual
+    # ``/tmp/drill5_recovery.py`` step lives behind this event in v1.
+    ASYNC_TASK_DIED = "async_task_died"
+    # Emitted by ``scripts/operator_tools/recovery_agent.py`` BEFORE it
+    # mutates state (alerts UPDATE + subprocess replay_executions.py).
+    # Payload carries ``triggering_alert_uuid``, ``triggering_audit_event_uuid``
+    # (the ASYNC_TASK_DIED row this responds to), ``decision``
+    # ('invoke_replay' | 'alert_only'), ``task_name``, ``classification``
+    # ('transient' | 'hard_crash' | 'ambiguous'), ``plan``. Preserves
+    # audit-first ordering (backend-spec §2.10.1) on the recovery agent's
+    # actions; the replay subprocess itself emits its own audit chain via
+    # ``process_fill_event``.
+    RECOVERY_ACTION_TAKEN = "recovery_action_taken"
 
 
 __all__ = ["AuditEventType"]

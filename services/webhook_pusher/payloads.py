@@ -140,6 +140,15 @@ class AlertCategory(StrEnum):
     # (#alerts channel only); P0/P1 escalation tied to specific stuck
     # services is a future enhancement.
     HEARTBEAT_STALE = "heartbeat_stale"
+    # Recovery-agent follow-up to drill 5 (2026-05-18) + drill 6
+    # (2026-05-25), landed 2026-05-26. INSERTed by the task-death hook
+    # in ``services.api.async_task_monitor`` when a tracked lifespan
+    # task (today: ``order_placement_worker.run_forever``) transitions
+    # to ``.done()``. P0-severity routing — fans out to ``#alerts`` +
+    # ``#critical`` + email backup. The recovery agent at
+    # ``scripts/operator_tools/recovery_agent.py`` polls
+    # ``alerts WHERE category = 'worker_failure'`` for unhandled events.
+    WORKER_FAILURE = "worker_failure"
 
 
 class ChannelName(StrEnum):

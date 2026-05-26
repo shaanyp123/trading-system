@@ -198,6 +198,10 @@ The main session continues; the background agent's results land when you next in
 
 - **VPS systemd timer for `verify_chain --env paper`** — landed 2026-05-26 (claude-setup-overhaul follow-up). Files: `scripts/operator_tools/verify_chain_to_discord.sh` + `deploy/audit/systemd/verify-chain-daily.{service,timer}`. Runs daily at 02:00 ET (06:00 UTC); POSTs to Discord `#audit` channel via a dedicated webhook URL stored at `/etc/trading/audit-webhook.url` (chmod 600). Independent of api's `webhook_pusher` by design so compounded failures (chain broken + api down) still surface. Install ceremony in `deploy/audit/README.md`.
 
+- **Recovery agent for `async_task_died` events** — landed 2026-05-26 (drill-5 / drill-7 follow-up). Files: `scripts/operator_tools/recovery_agent.py` + `scripts/operator_tools/recovery_agent_tick.sh` + `deploy/audit/systemd/recovery-agent-poll.{service,timer}`. Fires every 60s; polls `alerts WHERE category = 'worker_failure' AND acknowledged = FALSE`, classifies the failure (transient vs hard crash), invokes `scripts/operator_tools/replay_executions.py` for transient failures, audit-first emits `RECOVERY_ACTION_TAKEN` before the alerts UPDATE + Discord post. Discord posts go to `#critical` via dedicated webhook at `/etc/trading/critical-webhook.url`. Pairs with autoheal sidecar (PR #240, handles gateway stuck-state) and verify-chain cron (PRs #242-#245) as the third pillar of the 24/7 safety net. Install ceremony in `deploy/audit/README.md` ("Recovery agent — install ceremony").
+
+  Closes the manual operator step from drill 5 (2026-05-18): when an `OrderPlacementWorker` task died, the operator had to hand-run `/tmp/drill5_recovery.py` (the transient precursor of `replay_executions.py`) to recover backend-blind fills. Drill 7 repeated the same pattern. The agent now decides + acts within ~60s, with classification fail-closed on unknown exception types (operator-gated investigation rather than blind replay).
+
 **Phase 1+ extensions (still recommended):**
 
 ---

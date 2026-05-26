@@ -100,6 +100,31 @@ class TrackedTask:
 DEFAULT_MONITOR_INTERVAL_SECONDS: Final[float] = 30.0
 
 
+#: Allow-list of tracked-task names whose death triggers the recovery-agent
+#: hook. Other tracked tasks still log ``async_task_died`` at ERROR but don't
+#: INSERT an ``alerts`` row (category='worker_failure') + fire Discord
+#: ``#critical`` + ``#alerts`` + email. Per drill 5 (2026-05-18) +
+#: drill 7 (2026-05-18) retrospectives, only the order placement worker's
+#: death produces the backend-blind-fills failure mode that
+#: ``scripts/operator_tools/recovery_agent.py`` is built to resolve (via
+#: subprocess ``replay_executions.py``). Other tracked tasks (recon
+#: scheduler, heartbeat probe, bar_sync) fail in ways that don't leave
+#: the audit chain inconsistent with IBKR state — their death is still
+#: log-visible (and operator-actionable via /verify-chain + Discord
+#: ``#alerts`` from the existing partial-cycle alert hooks).
+#:
+#: Extending this set is an operator-reversible decision — pass a custom
+#: ``task_death_allow_list`` to ``AsyncTaskMonitor`` (see
+#: ``services/api/main.py::_start_async_task_monitor``). The default is
+#: conservative (one task) to limit the recovery agent's blast radius
+#: while v1 builds operational confidence.
+DEFAULT_TASK_DEATH_ALLOW_LIST: Final[frozenset[str]] = frozenset(
+    {
+        "order_placement_worker.run_forever",
+    }
+)
+
+
 #: Connectivity-error codes that trigger an
 #: ``async_task_monitor_ibkr_connectivity_warn`` WARNING. Default set
 #: lifted from ``services.execution.ibkr_adapter.IBKR_CONNECTIVITY_ERROR_CODES``
@@ -152,6 +177,25 @@ class MonitorAlertDescriptor:
 #: the monitor — the hook's failure mode is "Discord didn't fire," not
 #: "monitor crashed").
 MonitorAlertHook = Callable[[MonitorAlertDescriptor], Awaitable[None]]
+
+
+#: Hook signature for monitor-emitted task-death dispatch. Same shape as
+#: :data:`MonitorAlertHook` — the closure (built in
+#: ``services.api.main._build_task_death_alert_hook``) (a) emits an
+#: ``ASYNC_TASK_DIED`` audit event (audit-first per backend-spec
+#: §2.10.1), (b) INSERTs an ``alerts`` row with
+#: ``category='worker_failure'`` and ``triggering_audit_event_uuid``
+#: pointed at the audit row, (c) calls
+#: ``services.webhook_pusher.dispatcher.dispatch_alert`` which fans the
+#: P0 alert to ``#alerts`` + ``#critical`` + email. The recovery agent
+#: at ``scripts/operator_tools/recovery_agent.py`` polls the alerts row
+#: for unhandled ``worker_failure`` events on a 60s systemd timer.
+#:
+#: Aliased to :data:`MonitorAlertHook` (same signature) to dodge type
+#: duplication. The semantic split lives on the
+#: :class:`AsyncTaskMonitor` constructor — two separate parameters so
+#: lifespan callers can wire each independently.
+TaskDeathAlertHook = MonitorAlertHook
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,6 +254,8 @@ class AsyncTaskMonitor:
         *,
         interval_seconds: float = DEFAULT_MONITOR_INTERVAL_SECONDS,
         ibkr_error_state: TrackedIbkrErrorState | None = None,
+        task_death_alert_hook: TaskDeathAlertHook | None = None,
+        task_death_allow_list: frozenset[str] = DEFAULT_TASK_DEATH_ALLOW_LIST,
     ) -> None:
         self._tracked: tuple[TrackedTask, ...] = tuple(tracked)
         self._interval: float = float(interval_seconds)
@@ -234,6 +280,15 @@ class AsyncTaskMonitor:
         # 30s. A new error event (different timestamp OR different code)
         # produces a fresh WARNING.
         self._reported_ibkr_errors: set[tuple[int, datetime]] = set()
+        # Recovery-agent task-death hook (drill 5/6 follow-up, 2026-05-26).
+        # Optional; when wired, the monitor fires the hook on death of a
+        # task in ``task_death_allow_list``. The hook closure (built in
+        # ``services.api.main._build_task_death_alert_hook``) emits the
+        # ``ASYNC_TASK_DIED`` audit event + INSERTs an alerts row +
+        # dispatches via webhook_pusher. When None, only the existing
+        # structured ``async_task_died`` ERROR log fires.
+        self._task_death_alert_hook: TaskDeathAlertHook | None = task_death_alert_hook
+        self._task_death_allow_list: frozenset[str] = task_death_allow_list
         self._log = log.bind(component="async_task_monitor")
 
     def request_stop(self) -> None:
@@ -316,7 +371,91 @@ class AsyncTaskMonitor:
                 )
             self._reported_dead.add(tracked.name)
             newly_dead += 1
+            # Recovery-agent task-death hook (drill 5/6 follow-up).
+            # Fires only for tasks in the allow-list (default:
+            # ``order_placement_worker.run_forever`` only). The hook
+            # closure handles ``ASYNC_TASK_DIED`` audit emit +
+            # ``alerts`` INSERT + dispatch_alert; failure is swallowed
+            # by ``_schedule_alert_dispatch`` so a Discord 5xx doesn't
+            # crash the probe loop. The structured ERROR log above is
+            # the load-bearing observability; the hook is the
+            # recovery-agent inbox.
+            if (
+                self._task_death_alert_hook is not None
+                and tracked.name in self._task_death_allow_list
+            ):
+                descriptor = self._build_task_death_descriptor(
+                    task_name=tracked.name,
+                    exit_reason="done_without_exception" if exc is None else "exception",
+                    exception=exc,
+                )
+                self._schedule_alert_dispatch(self._task_death_alert_hook, descriptor)
         return newly_dead
+
+    @staticmethod
+    def _build_task_death_descriptor(
+        *,
+        task_name: str,
+        exit_reason: str,
+        exception: BaseException | None,
+    ) -> MonitorAlertDescriptor:
+        """Translate a dead-task observation into a MonitorAlertDescriptor.
+
+        Severity locked P0 — operator-actionable AND the recovery agent
+        needs to act within ~60s (the systemd-timer cadence). P0 routes
+        to ``#alerts`` + ``#critical`` + email per
+        ``services/webhook_pusher/payloads.py::SEVERITY_TO_CHANNELS``.
+
+        Category locked ``worker_failure`` per the alembic
+        ``2026-05-26_worker_failure_alert_category`` migration + spec
+        §3.27.
+
+        Title is a short operator-grep handle; body carries the human-
+        readable explanation. Payload is structured for the recovery
+        agent's classification logic: ``exception_type`` +
+        ``exception_repr`` drive the transient-vs-hard-crash heuristic
+        (see ``scripts.operator_tools.recovery_agent.classify_failure``).
+        """
+        title = f"async task died: {task_name}"
+        if exception is None:
+            body = (
+                f"Tracked lifespan task `{task_name}` transitioned to "
+                "`.done()` with exit_reason=`done_without_exception` — "
+                "the run_forever loop exited cleanly without a stop signal. "
+                "Likely cause: BaseException (SystemExit/KeyboardInterrupt) "
+                "inside the loop, OR the inner while loop's condition "
+                "flipped without an explicit request_stop(). Recovery "
+                "agent will classify as alert_only (operator-gated "
+                "investigation)."
+            )
+            exception_type: str | None = None
+            exception_repr: str | None = None
+        else:
+            exception_type = type(exception).__name__
+            exception_repr = repr(exception)
+            body = (
+                f"Tracked lifespan task `{task_name}` raised "
+                f"`{exception_type}`: {exception_repr}\n\n"
+                "Recovery agent will classify (transient vs hard crash) "
+                "and invoke replay_executions.py if there are orphan "
+                "fills to recover from this dead window. Audit + alert "
+                "details in the audit chain + alerts table."
+            )
+        observed_at_utc = datetime.now(tz=UTC).isoformat()
+        payload: dict[str, Any] = {
+            "task_name": task_name,
+            "exit_reason": exit_reason,
+            "exception_type": exception_type,
+            "exception_repr": exception_repr,
+            "observed_at_utc": observed_at_utc,
+        }
+        return MonitorAlertDescriptor(
+            severity="P0",
+            category="worker_failure",
+            title=title,
+            body=body,
+            payload=payload,
+        )
 
     def _probe_ibkr_error_state(self) -> None:
         """Read the IBKR adapter's last-error snapshot; warn if connectivity loss is fresh.
@@ -660,9 +799,11 @@ __all__: Final = (
     "DEFAULT_IBKR_CONNECTIVITY_CODES",
     "DEFAULT_IBKR_FRESHNESS_SECONDS",
     "DEFAULT_MONITOR_INTERVAL_SECONDS",
+    "DEFAULT_TASK_DEATH_ALLOW_LIST",
     "AsyncTaskMonitor",
     "MonitorAlertDescriptor",
     "MonitorAlertHook",
+    "TaskDeathAlertHook",
     "TrackedIbkrErrorState",
     "TrackedTask",
     "collect_tracked_tasks",
