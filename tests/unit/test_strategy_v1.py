@@ -129,19 +129,70 @@ class TestV1Parameters:
 # indicators.py
 # ---------------------------------------------------------------------------
 class TestIndicators:
-    def test_donchian_channel_basic(self) -> None:
+    def test_donchian_channel_excludes_current_bar(self) -> None:
+        """Channel = high/low of the N bars PRIOR to the current (last) bar.
+
+        Monotone-increasing closes: 100, 101, ..., 160 over 61 bars. The last
+        bar (close=160) is the current bar and is EXCLUDED from the channel.
+        The channel should reflect the highest PRIOR bar (the one before last,
+        close=159, high=160). This locks the spec-canonical exclusive Donchian
+        interpretation per backend-spec §2.3.
+        """
         bars = [
             _make_bar(date(2026, 1, 1) + timedelta(days=i), close=Decimal(str(100 + i)))
-            for i in range(60)
+            for i in range(61)
         ]
         ch = donchian_channel(bars, lookback_days=60)
-        assert ch.high == bars[-1].high  # last bar is highest in monotone series
+        # The channel high comes from bars[-2] (the previous bar), NOT bars[-1].
+        assert ch.high == bars[-2].high
+        assert ch.high != bars[-1].high  # current bar excluded
+        # The channel low is the first bar in the 60-bar prior window = bars[0].
         assert ch.low == bars[0].low
 
     def test_donchian_insufficient_bars_raises(self) -> None:
+        # Need lookback_days + 1 bars (channel window + current bar). Provide 1.
         bars = [_make_bar(date(2026, 1, 1), close=Decimal("100"))]
-        with pytest.raises(ValueError, match="need 60 bars"):
+        with pytest.raises(ValueError, match="need 61 bars"):
             donchian_channel(bars, lookback_days=60)
+
+    def test_donchian_breakout_when_close_exceeds_prior_60day_high(self) -> None:
+        """The /MNQ-tonight regression test.
+
+        2026-05-26: /MNQ closed at 30038.25 with intraday high 30119. Prior
+        60-day max high was ~29783.75 (May 14). The canonical Turtle breakout
+        interpretation says this IS a long breakout (close exceeded the 60-day
+        prior high), but the previous inclusive-window implementation rejected
+        it because today's close <= today's own high.
+
+        This test recreates that situation: 60 prior bars where all highs are
+        below 200, then a current bar with close=210 and high=215. The channel
+        should be from the prior window (max high < 200), and the close (210)
+        should exceed it.
+        """
+        # 60 prior bars with highs at most ~150 (close around 100-150)
+        prior_bars = [
+            _make_bar(date(2026, 1, 1) + timedelta(days=i), close=Decimal(str(100 + i * 0.5)))
+            for i in range(60)
+        ]
+        # Current bar: close=210, high=215 (high > close, as always; close above prior range)
+        current_bar = _make_bar(
+            date(2026, 1, 1) + timedelta(days=60), close=Decimal("210")
+        )
+        bars = prior_bars + [current_bar]
+
+        ch = donchian_channel(bars, lookback_days=60)
+
+        # Channel should be from the prior 60 bars — max high there is bars[-2].high = ~130.5
+        # NOT from the current bar (215).
+        assert ch.high < Decimal("200")
+        assert ch.high != current_bar.high
+
+        # The breakout check (current_close > channel.high) should now succeed.
+        # Previously (inclusive window) this would fail because channel.high = 215.
+        assert current_bar.close > ch.high, (
+            f"close={current_bar.close} should exceed prior-60-day high={ch.high}; "
+            f"if this assertion fails, the exclusive-window fix regressed"
+        )
 
     def test_simple_moving_average_arithmetic_mean(self) -> None:
         closes = [Decimal("100"), Decimal("110"), Decimal("90"), Decimal("100")]
