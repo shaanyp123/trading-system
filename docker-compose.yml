@@ -466,15 +466,41 @@ services:
       # `deploy/ibkr/README.md` "Existing session collisions" section.
       EXISTING_SESSION_DETECTED_ACTION: 'primary'
     healthcheck:
-      # Probe the externally-published socat port (4004 paper / 4003 live)
-      # rather than the internal gateway port (4002/4001). Inside the
-      # container, both bind to localhost, but probing the socat port
-      # catches the failure mode where the gateway listens but socat dies
-      # — which would silently break every external caller. Use bash's
-      # /dev/tcp pseudo-device because `nc` is NOT installed in the
-      # gnzsnz/ib-gateway:stable image (verified at deploy-time
-      # 2026-05-12); bash IS installed (/usr/bin/bash).
-      test: ['CMD-SHELL', 'bash -c "</dev/tcp/localhost/4004" 2>/dev/null || bash -c "</dev/tcp/localhost/4003" 2>/dev/null || exit 1']
+      # Probe BOTH the externally-published socat port (4004 paper / 4003
+      # live) AND the internal IBKR Gateway Java port (4002 paper / 4001
+      # live). Each port catches a distinct failure mode:
+      #
+      # - External port (4004/4003) catches: socat dies but the Java
+      #   process is OK. socat is the sidecar that forwards external
+      #   :4004 → internal :4002 inside the container; if socat crashes
+      #   while the Java listener is alive, the external caller would
+      #   silently fail (TCP RST from no listener on :4004). Original
+      #   2026-05-12 motivation per the prior healthcheck commit.
+      #
+      # - Internal port (4002/4001) catches: Java process is alive but
+      #   stuck. The IBC automation can hang after a nightly restart
+      #   (drill 5 2026-05-18 "Existing session detected" dialog hang;
+      #   drill 6 2026-05-25 unknown trigger leaving login dialog
+      #   unfilled for 18h). When the Java process is stuck, socat
+      #   accepts TCP connects on :4004 (it's still running) but the
+      #   forward to :4002 hits "connection refused" — visible as
+      #   `socat[...] E connect(5, AF=2 127.0.0.1:4002, 16): Connection
+      #   refused` in `docker compose logs ib_gateway`. The pre-drill-6
+      #   single-probe healthcheck reported healthy throughout the 18h
+      #   stuck state (drill 6 retrospective: `Docs/decisions-log.md`
+      #   2026-05-25 entry).
+      #
+      # Both-required composition: `(external_paper && internal_paper) ||
+      # (external_live && internal_live) || exit 1`. In paper mode
+      # (operational default per CLAUDE.md), only 4004 + 4002 are bound;
+      # 4003 + 4001 refuse connections so the second alternative fails
+      # naturally. In live mode (post live-money-cutover), only 4003 +
+      # 4001 are bound; the first alternative fails naturally.
+      #
+      # Bash's `</dev/tcp/host/port` pseudo-device is the probe primitive
+      # because `nc` is NOT in the gnzsnz/ib-gateway:stable image
+      # (verified 2026-05-12); bash IS at /usr/bin/bash.
+      test: ['CMD-SHELL', '( bash -c "</dev/tcp/localhost/4004" 2>/dev/null && bash -c "</dev/tcp/localhost/4002" 2>/dev/null ) || ( bash -c "</dev/tcp/localhost/4003" 2>/dev/null && bash -c "</dev/tcp/localhost/4001" 2>/dev/null ) || exit 1']
       interval: 60s
       timeout: 10s
       retries: 3
