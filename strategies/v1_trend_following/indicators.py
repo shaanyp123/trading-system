@@ -62,8 +62,7 @@ def donchian_channel(bars: Sequence[Bar], lookback_days: int) -> DonchianChannel
         raise ValueError(f"lookback_days={lookback_days} must be >= 2")
     if len(bars) < lookback_days + 1:
         raise ValueError(
-            f"donchian_channel: need {lookback_days + 1} bars (lookback + current), "
-            f"got {len(bars)}"
+            f"donchian_channel: need {lookback_days + 1} bars (lookback + current), got {len(bars)}"
         )
     # Window = the lookback_days bars PRIOR to the current (last) bar.
     window = bars[-(lookback_days + 1) : -1]
