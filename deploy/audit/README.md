@@ -275,3 +275,90 @@ For test coverage see `tests/unit/test_audit_chain.py::TestVerifyChainWalker`
 contract; 14 tests across 5 `Test*` classes), and
 `tests/integration/test_audit_writer.py::test_verify_chain_count_matches_select_count`
 (testcontainers; locks the SQL contract for the `<N>` value above).
+
+---
+
+## Daily automated verification (systemd timer)
+
+The runbook above is operator-driven (manual). For 24/7 safety-net
+coverage independent of operator presence, a systemd timer runs the
+verification daily at 02:00 ET (06:00 UTC) and posts the result to
+the Discord `#audit` channel.
+
+**Files (in repo):**
+- `scripts/operator_tools/verify_chain_to_discord.sh` — the script
+- `deploy/audit/systemd/verify-chain-daily.service` — what runs
+- `deploy/audit/systemd/verify-chain-daily.timer` — when (02:00 ET)
+
+**Why a dedicated Discord webhook (not webhook_pusher):**
+Independent of the api service. If the audit chain is broken AND api
+is down, this script's curl path still works as long as docker + the
+postgres container are running. Avoids compounded-failure silence.
+
+### Install ceremony (operator-side, run once on the VPS)
+
+**Step 1 — Create the Discord webhook.**
+
+In Discord: `#audit` channel → settings (gear icon) → Integrations →
+Webhooks → New Webhook → Name it "verify-chain cron" → Copy Webhook
+URL.
+
+**Step 2 — Save the webhook URL on the VPS (per `feedback_secret_handling.md`).**
+
+```bash
+# SSH to VPS as operator/trading user. Paste the URL via a here-doc to
+# avoid it appearing in your shell history.
+sudo mkdir -p /etc/trading
+sudo tee /etc/trading/audit-webhook.url > /dev/null <<'EOF'
+PASTE_WEBHOOK_URL_ON_THIS_LINE
+EOF
+sudo chmod 600 /etc/trading/audit-webhook.url
+sudo chown trading:trading /etc/trading/audit-webhook.url
+
+# Verify file size only — never display content
+wc -c /etc/trading/audit-webhook.url   # Discord webhook URLs are ~120-150 bytes
+```
+
+**Step 3 — Install the systemd units.**
+
+```bash
+sudo cp /opt/trading/deploy/audit/systemd/verify-chain-daily.service \
+        /etc/systemd/system/verify-chain-daily.service
+sudo cp /opt/trading/deploy/audit/systemd/verify-chain-daily.timer \
+        /etc/systemd/system/verify-chain-daily.timer
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now verify-chain-daily.timer
+```
+
+**Step 4 — Verify the timer is armed.**
+
+```bash
+systemctl list-timers verify-chain-daily.timer
+# Expected: NEXT column shows tomorrow 06:00 UTC
+```
+
+**Step 5 — Smoke test (manual fire).**
+
+```bash
+sudo systemctl start verify-chain-daily.service
+journalctl -u verify-chain-daily.service --since '1 min ago'
+# Expected: clean exit; no errors. Check the #audit Discord channel
+# for a message like "OK 2026-05-26T... — env=paper, CHAIN OK: N rows verified"
+```
+
+**Step 6 — Rotation: rotating the Discord webhook URL.**
+
+If you ever need to rotate (e.g., the URL leaked), regenerate in
+Discord → repeat Step 2 → no restart of the timer needed (the script
+re-reads the file on every run).
+
+### Failure modes
+
+| Symptom | Diagnosis | Fix |
+|---|---|---|
+| No Discord post for >24h | Timer not armed | Re-run Step 4; if NEXT is empty, re-run Step 3 |
+| Discord posts `verify-chain cron: cannot read /etc/...webhook.url` | Step 2 not done or wrong perms | Re-run Step 2 |
+| Discord posts `AUDIT CHAIN BREAK at sequence_no=...` | Real chain break — incident-level | Stop. Run the manual ceremony from §3 above. Escalate per `Docs/decisions-log.md` |
+| Discord posts `unexpected exit=N` | api container down or docker daemon issue | Check `docker compose ps`; restart api if needed; manual ceremony to re-verify chain afterward |
+| Posts stop coming silently | The webhook URL was revoked at Discord side | Step 6 (re-create + replace file) |

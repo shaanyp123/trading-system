@@ -1,0 +1,27 @@
+[Unit]
+# Fires verify-chain-daily.service at 02:00 ET daily (06:00 UTC).
+#
+# Why 02:00 ET (06:00 UTC):
+#   * After overnight IBKR maintenance (23:59 ET → 00:30 ET typical
+#     completion; ib_gateway restart settled by then). Audit chain has
+#     captured any HALT_NEW / NORMAL transitions from the maintenance.
+#   * After the prior day's EOD recon (22:30 UTC → typically complete
+#     by 23:00 UTC) — recon-driven audit rows are in.
+#   * Before the morning daily-briefing routine (09:00 ET) — the
+#     briefing can reference the most recent verify_chain result.
+#   * Off-peak for the VPS — no contention with bar_sync, LEAN cycle,
+#     or recon.
+#
+# Persistent=true: if the VPS was down at the scheduled time, fire on
+# next boot. Standard pattern matching deploy/lean_local/systemd/.
+
+Description=Daily verify_chain ceremony at 02:00 ET (06:00 UTC)
+Documentation=https://github.com/shaanyp123/trading-system/blob/main/deploy/audit/README.md
+
+[Timer]
+OnCalendar=*-*-* 06:00:00
+Persistent=true
+Unit=verify-chain-daily.service
+
+[Install]
+WantedBy=timers.target

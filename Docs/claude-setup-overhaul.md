@@ -285,6 +285,42 @@ The next session will pick up the new memories, hooks, slash commands, subagent,
 
 This overhaul is complete. Future meta-tooling changes land in additional WS#N entries in this doc, OR in `Docs/decisions-log.md` if they're closer to runtime architecture.
 
+## Follow-ups landed same-day (2026-05-26)
+
+After the initial 8 workstreams merged (#237), several Phase 1+ extensions landed the same day as operator dogfooded the new tooling.
+
+### Discord plugin + scheduled-task routing
+
+- Installed Cowork's `claude-plugins-official/discord` plugin
+- Saved bot token + locked allowlist policy + registered `#daily-brief` channel for outbound
+- Discovered + resolved 4 setup gotchas (bun runtime requirement, macOS launchd PATH, MESSAGE CONTENT INTENT, hosted-Claude inbound notification quirk)
+- Captured discoveries in 3 new memory entries: `project_discord_bridge_setup`, `project_autoheal_sidecar` (cross-link from drill-6 PR work), `feedback_hosted_claude_inbound_quirk`
+- Updated both scheduled tasks (`daily-briefing`, `weekly-monday-review`) to post to `#daily-brief` channel ID `1501403003461173422`
+
+### Permission posture: bypassPermissions + MCP allowlist (merged as PR #241)
+
+- Set `permissions.defaultMode = "bypassPermissions"` at project level so scheduled tasks run without permission prompts; matches the operator's interactive session mode
+- Allowlisted 8 MCP tools (Discord 5 + scheduled-tasks 3) explicitly for safety-conscious documentation
+- Safety floor preserved: risk-path hook + secret-handling hook still warn (informational); pre-merge linter + branch protection + operator PR review still gate
+
+### VPS systemd timer for `verify_chain` (24/7 audit safety net)
+
+The largest Phase 1+ extension from agentic-patterns.md Pattern 6. Landed:
+- `scripts/operator_tools/verify_chain_to_discord.sh` — bash script; runs verify_chain in api container, parses exit, POSTs to Discord `#audit` webhook
+- `deploy/audit/systemd/verify-chain-daily.service` + `.timer` — fires daily at 02:00 ET (06:00 UTC); follows the existing `lean_local` systemd convention
+- `deploy/audit/README.md` — install ceremony added (Discord webhook setup, systemd install, smoke test, failure modes table)
+- Independent of api's webhook_pusher by design (audit chain check works even if api is down)
+
+### `/health-check` slash command
+
+Quick snapshot ceremony for "is everything OK right now?" without remembering all the SSH commands. Wraps container state + cycle log greps + risk-state psql + audit-chain tail + IBKR connection check + autoheal status into one paste-ready block. At `.claude/commands/health-check.md`.
+
+### What's still pending (operator action)
+
+- **Token rotation** — Discord bot token still in chat history from `/discord:configure`; operator can rotate via Developer Portal → Reset Token + re-run `/discord:configure <new>` when convenient. Not urgent given the locked allowlist + the operator's local-only transcript.
+- **Discord webhook creation + VPS install** — the systemd timer is in the repo but not yet deployed. Operator needs to (1) create Discord webhook for `#audit`, (2) save URL to `/etc/trading/audit-webhook.url` on VPS, (3) install + enable the timer. Ceremony in `deploy/audit/README.md`.
+- **Validation of tomorrow's 09:00 ET daily-briefing fire** — confirm it posts to `#daily-brief` cleanly without prompts now that bypassPermissions is default + MCP allowlist is set.
+
 ## Files touched
 
 **Modified:**

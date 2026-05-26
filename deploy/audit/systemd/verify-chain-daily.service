@@ -1,0 +1,40 @@
+[Unit]
+# Daily audit-chain verification ceremony.
+#
+# Runs `scripts/operator_tools/verify_chain_to_discord.sh paper` which:
+#   1. Executes `services.audit.verify_chain --env paper` inside the api
+#      container (relies on the container's pre-injected DATABASE_URL).
+#   2. Parses the result + posts to a dedicated Discord webhook (#audit
+#      channel) — independent of api's webhook_pusher so a compounded
+#      failure (audit broken AND api down) still surfaces an alert.
+#   3. Always exits 0 (cron-friendly); the verify_chain exit code is
+#      communicated via the Discord post body, not the systemd exit.
+#
+# Why a dedicated cron / systemd timer instead of a scheduled task in
+# Claude Code:
+#   * Scheduled tasks only run when Claude Code is open. Audit chain
+#     integrity is a 24/7 concern — it must surface even when the
+#     operator hasn't touched Claude Code for a week.
+#   * Per Docs/agentic-patterns.md Pattern 6, VPS cron / systemd is the
+#     correct surface for safety-critical 24/7 monitoring.
+#
+# See deploy/audit/README.md for the install ceremony.
+
+Description=Daily audit-chain verification (verify_chain --env paper -> Discord #audit)
+Documentation=https://github.com/shaanyp123/trading-system/blob/main/deploy/audit/README.md
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/trading
+User=trading
+Group=trading
+ExecStart=/opt/trading/scripts/operator_tools/verify_chain_to_discord.sh paper
+# Single-shot timer; runaway restart not possible.
+TimeoutStartSec=300
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

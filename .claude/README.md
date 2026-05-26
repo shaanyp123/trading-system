@@ -21,6 +21,7 @@ This directory holds Claude Code configuration that is committed to the repo + s
 | `/pre-pr-checklist` | Run before submitting a PR — checks risk-path label, test status, audit-trail completeness, backtest-delta requirement, ultrareview reminder |
 | `/verify-chain <env>` | Generates the canonical SSH ceremony for `verify_chain --env <env>` against api container |
 | `/eod-recon [date]` | Generates observation + diagnostic commands for the daily EOD reconciliation cycle |
+| `/health-check` | Generates the operator-side SSH ceremony for a quick system health snapshot — containers, last cycles (bar_sync/LEAN/recon), risk state, audit chain, IBKR connection, autoheal status |
 
 ## Subagents
 
