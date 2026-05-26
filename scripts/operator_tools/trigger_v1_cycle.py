@@ -57,22 +57,35 @@ Hard constraints (lifted directly from the operator brief)
 Bar-loading strategy
 ====================
 
-``services/data/bar_sync.py::write_futures_bundle`` writes a member
-named ``<lower>_trade_<front_month_yyyymm>.csv`` into the per-ticker
-zip. That single member contains the FULL continuous-mapped back
-history (~250 daily bars) — the output of
-``ib.reqHistoricalDataAsync(ContFuture(...))``. PR #229's historical-
-contract backfill ALSO writes per-contract CSVs into the same zip
-(``<lower>_trade_<historical_expiry>.csv``) so LEAN's continuous-
-contract resolver can stitch them at roll boundaries; those per-
-contract members are LEAN-stitching helpers, NOT the authoritative
-continuous series. This tool reads the LATEST-suffix member (= today's
-front-month) as the continuous-mapped series.
+**Futures: per-day universe files.** ``services/data/bar_sync.py``
+writes one universe file per session_date at ``future/<market_dir>/
+universes/<lower>/<YYYYMMDD>.csv``. Each file's single data row
+carries the front-month bar for that date (in the format
+``<expiry>,<O>,<H>,<L>,<C>,<V>,<OI>``). This is what LEAN's
+``DataMappingMode.OPEN_INTEREST`` resolver consumes; we read the same
+files directly to construct an equivalent continuous-mapped series.
 
-For ETFs ``services/data/bar_sync.py::write_etf_bundle`` writes a
-single member named ``<lower>.csv`` with deci-cent integer-scaled
-prices (LEAN's equity-daily convention; ``$85.56`` → ``855600``). This
-tool decodes the deci-cent scaling back to ``Decimal`` at parse time.
+**Why NOT the zip CSVs:** ``write_futures_bundle`` writes per-expiry
+members named ``<lower>_trade_<YYYYMM>.csv`` into the per-ticker zip,
+one per contract. The current-front-month member contains
+``reqHistoricalDataAsync(ContFuture(...))`` output, but that call only
+returns ~175 bars for typical micros (limited by the front-month's
+listing-to-now window) — short of the strategy's ``MA_SLOW_DAYS=200``
+floor. PR #229's historical-contract backfill ALSO writes per-historical-
+contract CSVs to the same zip so LEAN's continuous-contract resolver
+can stitch them at roll boundaries. **The v1 of this tool (PR #248)
+read only the front-month zip member and hit ``insufficient_bar_history``
+for every futures market** — fixed here by switching to universe files
+which give 600+ bars going back to bar_sync's earliest cycle. See
+``Docs/decisions-log.md`` 2026-05-23 "Historical contract backfill
+unblocks MA_SLOW=200" + the same-day's PR #229/#231/#232 trio for the
+LEAN-side parity.
+
+**ETFs: single equity-daily CSV (unchanged).** ``write_etf_bundle``
+writes a single member named ``<lower>.csv`` with deci-cent integer-
+scaled prices (LEAN's equity-daily convention; ``$85.56`` → ``855600``).
+This tool decodes the deci-cent scaling back to ``Decimal`` at parse
+time. No contract roll → single CSV is sufficient.
 
 Architecture
 ============
@@ -159,14 +172,13 @@ import argparse
 import asyncio
 import json
 import os
-import re
 import sys
 import traceback
 import zipfile
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
-from decimal import Decimal
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Final, Literal
 from uuid import UUID
@@ -419,40 +431,54 @@ def compute_active_universe() -> tuple[str, ...]:
 # ---------------------------------------------------------------------------
 
 
-#: Regex for futures per-expiry trade CSV members like ``mes_trade_202606.csv``.
-_FUTURES_TRADE_MEMBER_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"^(?P<ticker>[a-z0-9]+)_trade_(?P<yyyymm>\d{6})\.csv$"
-)
-
-
 def _parse_yyyymmdd_to_date(token: str) -> date:
     """Parse a ``YYYYMMDD`` token to a ``date`` instance."""
     return datetime.strptime(token, "%Y%m%d").date()
 
 
-def _parse_futures_csv_row(row: str) -> Bar | None:
-    """One row of ``YYYYMMDD HH:MM,O,H,L,C,V`` → ``Bar`` (raw prices).
+def _parse_universe_file_bar(file_bytes: bytes, session_date: date) -> Bar | None:
+    """Parse one bar_sync universe file → ``Bar`` (raw front-month prices).
 
-    Returns None on any parse failure (empty row, malformed cell, NaN
-    sentinel like close=-1 — the same sentinel ``bar_sync._bar_data_to_bar``
-    filters out at write time). Defensive — bar_sync's writer already
-    drops invalid rows, but this function runs against on-disk data
-    that could be from a prior buggy bar_sync revision.
+    Format per ``services/data/bar_sync.py::build_futures_universe_csv``:
+
+        #expiry,open,high,low,close,volume,open_interest
+        <expiry>,<O>,<H>,<L>,<C>,<V>,<OI>
+
+    The data row's bar IS the front-month bar for ``session_date`` (the
+    expiry tag tells you WHICH contract was active that day; for
+    strategy purposes we only need the OHLCV). ``session_date`` comes
+    from the FILENAME — the data row doesn't carry a timestamp.
+
+    Returns None on any parse failure (empty file, header-only, malformed
+    cell, ``close <= 0`` sentinel). Defensive — bar_sync's writer
+    produces well-formed files, but this function runs against on-disk
+    data which could be from a prior buggy bar_sync revision OR a
+    half-written file mid-cycle.
     """
-    parts = row.strip().split(",")
+    data_row: str | None = None
+    for line in file_bytes.decode("utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        data_row = stripped
+        break
+    if data_row is None:
+        return None
+    parts = data_row.split(",")
     if len(parts) < 6:
         return None
-    timestamp_token = parts[0].strip().split()[0] if parts[0].strip() else ""
-    if not timestamp_token:
-        return None
     try:
-        session_date = _parse_yyyymmdd_to_date(timestamp_token)
+        # parts[0] = expiry (informational; tells you which contract; we
+        # don't need it for strategy evaluation since the prices are
+        # absolute per-contract under RAW mode). decimal.InvalidOperation
+        # is NOT a ValueError subclass, so we catch it explicitly for
+        # malformed numeric cells.
         open_v = Decimal(parts[1].strip())
         high_v = Decimal(parts[2].strip())
         low_v = Decimal(parts[3].strip())
         close_v = Decimal(parts[4].strip())
         volume = int(parts[5].strip())
-    except (ValueError, IndexError):
+    except (ValueError, IndexError, InvalidOperation):
         return None
     if close_v <= 0:
         return None
@@ -473,7 +499,7 @@ def _parse_etf_csv_row(row: str) -> Bar | None:
 
     Inverse of ``bar_sync._equity_daily_csv_line`` — divides each price
     cell by 10000 to recover the original Decimal. Returns None on any
-    parse failure (same shape as ``_parse_futures_csv_row``).
+    parse failure (same shape as ``_parse_universe_file_bar``).
     """
     parts = row.strip().split(",")
     if len(parts) < 6:
@@ -556,91 +582,124 @@ def read_etf_bars_from_zip(zip_path: Path, ticker: str) -> list[Bar]:
     return sorted(seen.values(), key=lambda b: b.session_date)
 
 
-def read_futures_bars_from_zip(zip_path: Path, ticker: str) -> list[Bar]:
-    """Read continuous-mapped futures-daily bars from a bar_sync futures zip.
+#: Default number of trailing calendar days of universe files to read
+#: per futures market. The V1 strategy's MA_SLOW_DAYS=200 (trading days)
+#: → ~280 calendar days (200 / 0.71 weekday ratio). 365 gives comfortable
+#: headroom against bar_sync gaps (holiday clusters, prior cycle misses).
+#: Each universe file is a single bar, so the cost is ~365 small-file
+#: reads per futures market per cycle — bounded + fast.
+DEFAULT_FUTURES_UNIVERSE_LOOKBACK_DAYS: Final[int] = 365
 
-    Strategy: list per-expiry trade CSV members
-    (``<lower>_trade_<YYYYMM>.csv``), pick the one with the LATEST
-    YYYYMM suffix (= current front-month). That member contains the
-    full continuous-mapped back history per
-    ``services/data/bar_sync.py::fetch_futures_bars_and_front_month``.
 
-    PR #229 added per-historical-contract members
-    (``<lower>_trade_<historical_expiry>.csv``) for LEAN's continuous-
-    contract resolver to stitch. Those are LEAN-stitching helpers, NOT
-    the authoritative continuous series — we ignore them here because
-    bar_sync's front-month member already has the continuous bars.
+def read_futures_bars_from_universe_files(
+    universes_dir: Path,
+    ticker: str,
+    *,
+    as_of: date,
+    lookback_days: int = DEFAULT_FUTURES_UNIVERSE_LOOKBACK_DAYS,
+) -> list[Bar]:
+    """Read continuous-mapped futures bars by walking per-day universe files.
 
-    Returns a chronologically-sorted, deduped list. Returns empty list
-    if the zip is missing, unreadable, or no expected member is
-    present.
+    ``services/data/bar_sync.py::write_futures_bundle`` writes one
+    universe file per session_date at ``future/<market_dir>/universes/
+    <lower>/<YYYYMMDD>.csv``. Each file's single data row is the
+    front-month bar for that date (the contract picked by LEAN's
+    ``DataMappingMode.OPEN_INTEREST`` resolver). Reading these directly
+    replicates LEAN's continuous-mapped series ⇒ ≥200 bars available
+    across ~365 calendar days for the V1 ``MA_SLOW_DAYS=200`` floor.
+
+    Why not the zip CSVs (the v1 of this tool, PR #248): the zip's
+    front-month member (``<lower>_trade_<current_yyyymm>.csv``) only
+    contains the current contract's lifetime-to-date (~175 bars for
+    typical micros) → ``insufficient_bar_history`` for every futures
+    market. PR #229's historical-contract backfill writes per-contract
+    CSVs that LEAN stitches, but stitching by hand from those CSVs is
+    error-prone (per-contract date ranges overlap; the "active" contract
+    per date depends on OI rather than calendar). The universe files
+    are LEAN's canonical answer to "which contract was active on this
+    date + what was its OHLCV?" — we just consume the same artifact.
+
+    Walks ``universes_dir``, filters to files in ``(as_of -
+    lookback_days, as_of]``, parses each into a Bar, returns
+    chronologically-sorted list. Returns empty list if the directory is
+    missing, unreadable, or contains no parseable files in the window.
     """
-    if not zip_path.is_file():
+    if not universes_dir.is_dir():
         log.warning(
-            "trigger_v1_cycle_futures_zip_missing",
+            "trigger_v1_cycle_futures_universes_dir_missing",
             ticker=ticker,
-            zip_path=str(zip_path),
+            universes_dir=str(universes_dir),
         )
         return []
-    ticker_lower = ticker.lower()
+    earliest = as_of - timedelta(days=lookback_days)
+    bars: list[Bar] = []
+    file_count = 0
+    skipped_unparseable = 0
     try:
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            members = zf.namelist()
-            matches: list[tuple[str, str]] = []
-            for member in members:
-                m = _FUTURES_TRADE_MEMBER_PATTERN.match(member)
-                if m is None:
-                    continue
-                if m.group("ticker") != ticker_lower:
-                    continue
-                matches.append((m.group("yyyymm"), member))
-            if not matches:
-                log.warning(
-                    "trigger_v1_cycle_futures_no_trade_members",
-                    ticker=ticker,
-                    zip_path=str(zip_path),
-                    namelist=members,
-                )
-                return []
-            # Largest yyyymm (lexicographic == chronological for YYYYMM)
-            # wins — that's the current front-month per bar_sync.
-            matches.sort()
-            chosen_yyyymm, chosen_member = matches[-1]
-            raw_bytes = zf.read(chosen_member)
-    except (zipfile.BadZipFile, OSError) as exc:
+        entries = list(universes_dir.iterdir())
+    except OSError as exc:
         log.error(
-            "trigger_v1_cycle_futures_zip_read_failed",
+            "trigger_v1_cycle_futures_universes_dir_read_failed",
             ticker=ticker,
-            zip_path=str(zip_path),
+            universes_dir=str(universes_dir),
             error=str(exc),
             error_class=type(exc).__name__,
         )
         return []
-    log.info(
-        "trigger_v1_cycle_futures_member_selected",
-        ticker=ticker,
-        chosen_member=chosen_member,
-        chosen_front_month_yyyymm=chosen_yyyymm,
-    )
-    seen: dict[date, Bar] = {}
-    for row in raw_bytes.decode("utf-8").splitlines():
-        if not row.strip():
+    for entry in entries:
+        if not entry.is_file() or entry.suffix != ".csv":
             continue
-        bar = _parse_futures_csv_row(row)
+        try:
+            session_date = _parse_yyyymmdd_to_date(entry.stem)
+        except ValueError:
+            continue
+        if session_date < earliest or session_date > as_of:
+            continue
+        try:
+            file_bytes = entry.read_bytes()
+        except OSError as exc:
+            log.warning(
+                "trigger_v1_cycle_universe_file_read_failed",
+                ticker=ticker,
+                file=str(entry),
+                error=str(exc),
+            )
+            continue
+        bar = _parse_universe_file_bar(file_bytes, session_date)
         if bar is None:
+            skipped_unparseable += 1
             continue
-        seen[bar.session_date] = bar
-    return sorted(seen.values(), key=lambda b: b.session_date)
+        bars.append(bar)
+        file_count += 1
+    bars.sort(key=lambda b: b.session_date)
+    log.info(
+        "trigger_v1_cycle_futures_universe_files_loaded",
+        ticker=ticker,
+        bars_loaded=file_count,
+        skipped_unparseable=skipped_unparseable,
+        oldest_session_date=(bars[0].session_date.isoformat() if bars else None),
+        newest_session_date=(bars[-1].session_date.isoformat() if bars else None),
+        lookback_days=lookback_days,
+        as_of_session_date=as_of.isoformat(),
+    )
+    return bars
 
 
-def load_bars_for_market(market: str, data_root: Path) -> list[Bar]:
+def load_bars_for_market(market: str, data_root: Path, *, as_of: date) -> list[Bar]:
     """Dispatch to the ETF or futures bar reader for a single market.
 
     Keys mirror ``V1_CANDIDATE_UNIVERSE``: ``/MES``-style for futures,
     bare ticker (``TLT``) for ETFs. Path computation mirrors
-    ``services/data/bar_sync.py``'s ``equity_daily_zip_path`` /
-    ``futures_trade_zip_path`` so on-disk layout stays consistent
-    between writer + reader.
+    ``services/data/bar_sync.py``'s ``equity_daily_zip_path`` so on-disk
+    layout stays consistent between writer + reader. Futures use the
+    per-day universe files at ``future/<market_dir>/universes/<lower>/``
+    rather than the per-expiry zip members so the read replicates
+    LEAN's continuous-mapped series (see
+    :func:`read_futures_bars_from_universe_files` for the rationale).
+
+    ``as_of`` is the cycle's ``session_date``; futures reads anchor on
+    this to bound the lookback window. ETFs ignore it (single CSV
+    contains the full history).
 
     For markets not in the locked PHASE1_UNIVERSE_METADATA, this
     function returns an empty list with a warning (silently dropping
@@ -653,7 +712,6 @@ def load_bars_for_market(market: str, data_root: Path) -> list[Bar]:
     from services.data.bar_sync import (
         PHASE1_UNIVERSE_METADATA,
         equity_daily_zip_path,
-        futures_trade_zip_path,
     )
 
     meta = PHASE1_UNIVERSE_METADATA.get(market)
@@ -669,10 +727,14 @@ def load_bars_for_market(market: str, data_root: Path) -> list[Bar]:
             equity_daily_zip_path(data_root, meta.ibkr_symbol),
             ticker=meta.ibkr_symbol,
         )
-    # Futures — meta.kind == "futures"
-    return read_futures_bars_from_zip(
-        futures_trade_zip_path(data_root, meta.ibkr_symbol, meta.market_dir),
+    # Futures — meta.kind == "futures". Universe files mirror what
+    # bar_sync writes (per-day, front-month bar tagged with active
+    # contract expiry). Path: future/<market_dir>/universes/<lower>/.
+    universes_dir = data_root / "future" / meta.market_dir / "universes" / meta.ibkr_symbol.lower()
+    return read_futures_bars_from_universe_files(
+        universes_dir,
         ticker=meta.ibkr_symbol,
+        as_of=as_of,
     )
 
 
@@ -1338,7 +1400,7 @@ async def run_cycle(
     history_missing: list[str] = []
     stale_markets: list[str] = []
     for market in active_universe_markets:
-        bars = load_bars_for_market(market, args.data_root)
+        bars = load_bars_for_market(market, args.data_root, as_of=args.session_date)
         if not bars:
             history_missing.append(market)
             continue
@@ -1682,6 +1744,7 @@ __all__ = [
     "DATA_ROOT_ENV",
     "DEFAULT_API_BASE_URL",
     "DEFAULT_DATA_ROOT",
+    "DEFAULT_FUTURES_UNIVERSE_LOOKBACK_DAYS",
     "DEFAULT_HTTP_TIMEOUT_SECONDS",
     "EXIT_BAD_ARGS",
     "EXIT_BEARER_MISSING",
@@ -1719,6 +1782,6 @@ __all__ = [
     "main",
     "post_signal",
     "read_etf_bars_from_zip",
-    "read_futures_bars_from_zip",
+    "read_futures_bars_from_universe_files",
     "run_cycle",
 ]
