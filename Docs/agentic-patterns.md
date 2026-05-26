@@ -194,16 +194,11 @@ The main session continues; the background agent's results land when you next in
 - `services/reconciliation/eod_cycle.py::ReconciliationScheduler` — daily 22:30 UTC EOD recon
 - `services/data/bar_sync.py::BarSyncWorker` — daily 17:00 ET bar fetch
 
-**Phase 1+ extensions (recommended):**
+**Landed extensions:**
 
-- **VPS cron entry for `verify_chain --env paper`** — runs daily at 02:00 ET; POSTs the result to Discord `#audit` channel via webhook (no Claude needed). If exit != 0, also POSTs to `#critical`. Specification:
+- **VPS systemd timer for `verify_chain --env paper`** — landed 2026-05-26 (claude-setup-overhaul follow-up). Files: `scripts/operator_tools/verify_chain_to_discord.sh` + `deploy/audit/systemd/verify-chain-daily.{service,timer}`. Runs daily at 02:00 ET (06:00 UTC); POSTs to Discord `#audit` channel via a dedicated webhook URL stored at `/etc/trading/audit-webhook.url` (chmod 600). Independent of api's `webhook_pusher` by design so compounded failures (chain broken + api down) still surface. Install ceremony in `deploy/audit/README.md`.
 
-```
-# /etc/cron.d/audit-chain-verify (on trading-primary Hetzner Ashburn)
-0 2 * * * trading /opt/trading/scripts/operator_tools/verify_chain_to_discord.sh paper
-```
-
-The shell script wraps `docker compose exec` + parses the exit code + curls the webhook. Operator-side script — not Claude-generated mid-session.
+**Phase 1+ extensions (still recommended):**
 
 ---
 
