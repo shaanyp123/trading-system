@@ -175,10 +175,8 @@ class TestIndicators:
             for i in range(60)
         ]
         # Current bar: close=210, high=215 (high > close, as always; close above prior range)
-        current_bar = _make_bar(
-            date(2026, 1, 1) + timedelta(days=60), close=Decimal("210")
-        )
-        bars = prior_bars + [current_bar]
+        current_bar = _make_bar(date(2026, 1, 1) + timedelta(days=60), close=Decimal("210"))
+        bars = [*prior_bars, current_bar]
 
         ch = donchian_channel(bars, lookback_days=60)
 
