@@ -126,3 +126,105 @@
 www.{$DOMAIN} {
 	redir https://{$DOMAIN}{uri} permanent
 }
+
+# ----------------------------------------------------------------------------
+# Live-money subdomain — per O1 (Docs/live-money-cutover-plan.md §10 step 6)
+# live takes `live.{$DOMAIN}`; paper stays at the apex.
+#
+# Routes traffic to the LIVE compose project's api container. Live runs as a
+# separate compose project (`trading-live`) on the SAME VPS — see
+# docker-compose.live.yml.
+#
+# CROSS-PROJECT NETWORKING — deferred operator decision (resolves at cutover):
+#
+# Paper's Caddy (this container) lives on `trading_internal` network and can
+# resolve `api:8000` to paper's api. To route this site block to LIVE's api,
+# Caddy needs a path to reach the trading-live project's api container. Three
+# options, picked at cutover ceremony:
+#
+#   (a) Shared external network. Operator runs once pre-cutover:
+#         docker network create caddy_to_live
+#       Both paper's caddy AND trading-live's api join `caddy_to_live`. Caddy
+#       resolves `trading-live-api-1:8000` by docker service name.
+#       Requires modifying paper's docker-compose.yml caddy block to join
+#       this network — single-line addition, low-blast-radius.
+#
+#   (b) Host-port publish. trading-live's api publishes 8000 → host port
+#       8001. Caddy reaches via `host.docker.internal:8001` (needs the
+#       `extra_hosts: ['host.docker.internal:host-gateway']` directive on the
+#       caddy service). Simpler but couples Caddy config to host networking.
+#
+#   (c) Separate Caddy per stack. trading-live runs its own Caddy on a
+#       different host port pair (e.g., 81/444 → reverse-proxied at the
+#       router or Hetzner Cloud LB). Cleanest isolation but operator must
+#       manage two Caddy instances.
+#
+# Recommended default: (a). Codified as cutover-day decision; this Caddyfile
+# block uses the (a)-style upstream name `trading-live-api-1` which is the
+# docker default when `--project-name trading-live` + service name `api` +
+# scale 1. If the operator picks (b) or (c), this block needs editing pre-
+# `docker compose restart caddy`.
+live.{$DOMAIN} {
+	encode gzip zstd
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		# Same Next.js `unsafe-inline` script-src tradeoff as the apex block;
+		# nonce-based CSP migration is a shared Phase 1+ follow-up.
+		Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; connect-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'"
+	}
+
+	# SSE — must not buffer; long read timeout for the 24h replay window.
+	handle /api/sse/events {
+		reverse_proxy trading-live-api-1:8000 {
+			flush_interval -1
+			transport http {
+				read_timeout 24h
+			}
+		}
+	}
+
+	# Watchdog push endpoint — IP-allowlisted to the Hetzner Nuremberg static
+	# IP. The watchdog polls BOTH live + paper per cutover plan §9.
+	@watchdog {
+		path /api/internal/watchdog
+		remote_ip {$WATCHDOG_IP}
+	}
+	handle @watchdog {
+		reverse_proxy trading-live-api-1:8000
+	}
+
+	# All other API traffic
+	handle /api/* {
+		reverse_proxy trading-live-api-1:8000
+	}
+
+	# Maintenance fallback for 5xx.
+	handle_errors {
+		@5xx expression `{http.error.status_code} >= 500`
+		handle @5xx {
+			respond "Live service temporarily unavailable. Watchdog has been notified." 503
+		}
+	}
+
+	# Default → live Next.js frontend (deferred; not yet in
+	# docker-compose.live.yml). Until the live nextjs service ships, requests
+	# to `/` fall through to handle_errors above. /api/* routes work standalone.
+	#
+	# Temporary "simple auth" gate mirrors paper. Re-decide pre-cutover
+	# whether live should use the same basic_auth gate or rely solely on the
+	# WebAuthn/TOTP ceremony at /login (which is now wired end-to-end per
+	# Day 24 ceremony). Until decided, live carries the same gate as paper.
+	#
+	# Password hash regenerate via:
+	#   docker run --rm caddy:2-alpine caddy hash-password --plaintext '<pw>'
+	handle {
+		basic_auth {
+			spratcapital2026! $2a$14$.tOJT3KwonivfSDdTeoZEe2bvYmFvxDg8uCv6SA.v9iQRt4lmdFTO
+		}
+		reverse_proxy trading-live-nextjs-1:3000
+	}
+}

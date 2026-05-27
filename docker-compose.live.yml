@@ -1,0 +1,168 @@
+# docker-compose.live.yml — live-money cutover compose stack.
+#
+# STANDALONE compose file (NOT an overlay on docker-compose.yml). Runs as a
+# SEPARATE compose project (`trading-live`) on the same VPS, alongside the
+# existing paper project (`trading`). Paper continues uninterrupted; live
+# runs in parallel with isolated networks + volumes + IBKR session.
+#
+# Operator command at cutover (per Docs/live-money-cutover-plan.md §10):
+#
+#   docker compose -p trading-live --env-file deploy/.env.live \
+#       -f docker-compose.live.yml up -d
+#
+# The `-p trading-live` flag prefixes all volume + network names with
+# `trading-live_`, so:
+#   * `trading-live_postgres_data` — live's Postgres data (isolated from paper)
+#   * `trading-live_lean_data`     — live's LEAN bars (isolated)
+#   * `trading-live_internal`      — live private network
+#   * `trading-live_egress`        — live's internet egress (for IBKR FlexQuery)
+#
+# SCOPE — what this file currently DOES include:
+#   * postgres    — live database (isolated volume)
+#   * api         — FastAPI + worker + bar_sync (joined to internal + egress)
+#   * ib_gateway  — gnzsnz/ib-gateway with TRADING_MODE=live + port 4003
+#   * autoheal    — sidecar restarts ib_gateway on (unhealthy)
+#
+# SCOPE — what's NOT yet included (follow-up sessions; cutover-blocker
+# evaluation per Docs/live-money-cutover-plan.md Appendix A):
+#   * caddy       — paper's Caddy serves both apex (paper) + live subdomain;
+#                   see deploy/Caddyfile live block. Cross-project networking
+#                   for paper's Caddy → live's api resolves at cutover-day
+#                   per the comment in the Caddyfile.
+#   * lean_local  — live LEAN signal generator. Same image as paper; runs
+#                   against live's data volume + POSTs to live's api.
+#   * webhook_pusher — Discord/email pusher. Cross-env channel routing
+#                   resolves at cutover day (paper + live share channels
+#                   per L11; embed tag distinguishes).
+#   * nextjs      — frontend at live.spratcapital.com. Same image as paper;
+#                   config differs (NEXT_PUBLIC_API_BASE).
+#   * discord_bot — slash commands target live api via different bearer token
+#                   (S10 in sops live template).
+#
+# Anti-pattern A18 enforced — no bare `<your-domain>`; substitute via env.
+
+networks:
+  internal:
+    driver: bridge
+    internal: true       # no internet egress except via `egress`
+  egress:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  lean_data:
+
+services:
+
+  # ---- API (FastAPI + uvicorn + workers) -------------------------------
+  api:
+    image: ghcr.io/${GHCR_OWNER:?set GHCR_OWNER in deploy/.env.live}/trading-api:${RELEASE_SHA:-latest}
+    restart: unless-stopped
+    networks: [internal, egress]
+    environment:
+      API_ENVIRONMENT: ${ENVIRONMENT:-live-small}
+      API_VERSION: ${RELEASE_SHA:-dev}
+      API_LOG_LEVEL: ${API_LOG_LEVEL:-INFO}
+      API_DB_HOST: postgres
+      API_DB_NAME: trading
+      # IBKR TWS API port — 4003 for live (gnzsnz socat). Paper uses 4004
+      # internally; live gateway runs in its own container so no collision.
+      API_IBKR_PORT: ${API_IBKR_PORT:-4003}
+      # IBKR live account number (U25655583 per cutover plan §10 step 1).
+      # The api passes this to IbAsyncIbkrClient.connect() so order placement
+      # targets the right account when the gateway has multiple accounts.
+      API_IBKR_ACCOUNT: ${API_IBKR_ACCOUNT:-U25655583}
+      # Live's ib_gateway is a separate container, so live's clientId=1
+      # is fully isolated from paper's clientId=1.
+      API_IBKR_CLIENT_ID: ${API_IBKR_CLIENT_ID:-1}
+      API_BAR_SYNC_CLIENT_ID: ${API_BAR_SYNC_CLIENT_ID:-2}
+    volumes:
+      # Live secrets-decrypted dir is DISTINCT from paper's so a paper-side
+      # sops accident can't bleed into live's runtime. Operator's pre-cutover
+      # ceremony populates SECRETS_DIR per deploy/.env.example.live.
+      - ${SECRETS_DIR:-/opt/trading/secrets-decrypted-live}:/run/secrets:ro
+      - lean_data:/Lean/Data:rw
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', 'http://localhost:8000/api/health']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ---- Datastore --------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    networks: [internal]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?set POSTGRES_SUPERUSER_PASSWORD in deploy/.env.live}
+      POSTGRES_DB: trading
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=scram-sha-256
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d trading']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ---- IB Gateway (live mode) ------------------------------------------
+  # gnzsnz/ib-gateway with TRADING_MODE=live publishes the socat at port
+  # 4003 → internal IBKR Java 4001 (vs paper 4004 → 4002). Live runs in its
+  # OWN container — fully isolated from paper's ib_gateway. Both gateways
+  # connect from the same VPS IP; IBKR's session model permits multiple
+  # accounts per IP as long as the accounts differ (paper DUQ825170 vs
+  # live U25655583).
+  ib_gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    restart: unless-stopped
+    networks: [internal, egress]
+    labels:
+      autoheal: 'true'
+    environment:
+      TWS_USERID: ${IB_GATEWAY_USERNAME:-}
+      TWS_PASSWORD: ${IB_GATEWAY_PASSWORD:-}
+      TRADING_MODE: ${IB_GATEWAY_MODE:-live}
+      VNC_SERVER_PASSWORD: ${IB_GATEWAY_VNC_PASSWORD:-}
+      TZ: America/New_York
+      AUTO_RESTART_TIME: '11:59 PM'
+      RELOGIN_AFTER_TWOFA_TIMEOUT: 'yes'
+      TWOFA_DEVICE: 'YubiKey'
+      TWS_ACCEPT_INCOMING: 'accept'
+      READ_ONLY_API: 'no'
+      EXISTING_SESSION_DETECTED_ACTION: 'primary'
+      # Master Client ID per Mitigation A of the cross-clientId cancel
+      # limitation. Recommended: match API_IBKR_CLIENT_ID so the order
+      # worker can cancel orders from any clientId. Set in deploy/.env.live.
+      TWS_MASTER_CLIENT_ID: ${IBKR_MASTER_CLIENT_ID:-}
+    healthcheck:
+      # Live socat = host port 4003 → internal Java 4001 (vs paper
+      # 4004 → 4002). Drill 6 dual-probe pattern: external + internal ports
+      # must BOTH be reachable to count healthy.
+      test:
+        - 'CMD-SHELL'
+        - '( bash -c "</dev/tcp/localhost/4003" 2>/dev/null && bash -c "</dev/tcp/localhost/4001" 2>/dev/null ) || exit 1'
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+  # ---- Autoheal sidecar -------------------------------------------------
+  # Mirrors paper's autoheal setup (drill 6 follow-up #3; 2026-05-25). Both
+  # stacks' ib_gateway containers carry `autoheal: 'true'` labels; the
+  # live autoheal container watches ONLY the live stack's containers per
+  # the docker label scope. Trade-off (Docker socket mount = host-root-
+  # equivalent access) accepted per deploy/autoheal/README.md.
+  autoheal:
+    image: willfarrell/autoheal:latest
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      AUTOHEAL_INTERVAL: '30'
+      AUTOHEAL_CONTAINER_LABEL: 'autoheal'
