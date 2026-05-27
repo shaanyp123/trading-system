@@ -1946,22 +1946,29 @@ class TestOnOrderStatusTerminal:
 
 
 class TestHaltGuard:
-    """run_once must short-circuit when risk_state is HALT_NEW. The
-    approve-time gate in apply_signal_dispatch covers the operator-side
-    block (signal can't transition to 'approved' under HALT); this
-    worker-side gate covers the racy edge case where a signal was
-    approved before the halt fired + is now sitting in the table."""
+    """run_once filters entries under HALT_NEW but allows exits to drain
+    per ``Docs/exit-pipeline-design.md`` L5 + ``Docs/backend-spec.md``
+    §2.5. The approve-time gate in apply_signal_dispatch covers the
+    operator-side block on entries (signal can't transition to
+    'approved' under HALT); this worker-side gate covers (a) the racy
+    edge case where an entry signal was approved before the halt fired
+    + is now sitting in the table, and (b) the design-load-bearing case
+    where an approved EXIT must drain during HALT so an open position
+    can be closed during the halt window."""
 
-    async def test_halt_new_skips_drain(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """When fetch_current_risk_state returns 'HALT_NEW', run_once
-        returns 0 + does NOT call fetch_approved_signals."""
+    async def test_halt_new_with_only_entries_dispatches_nothing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """HALT_NEW + queue contains only entry signals → run_once
+        returns 0 + does NOT call _dispatch_entry_signal. The
+        fetch_approved_signals call still happens (we need to inspect
+        signal_type) but the loop body is skipped."""
         from services.risk import order_placement_worker as worker_mod
 
-        fetch_signals_calls: list[None] = []
+        entry_signal = _signal()  # signal_type defaults to 'donchian_breakout'
 
         async def _fake_fetch_signals(*args: Any, **kwargs: Any) -> list[Any]:
-            fetch_signals_calls.append(None)
-            return []
+            return [entry_signal]
 
         monkeypatch.setattr(
             "services.risk.signal_dispatch.fetch_current_risk_state",
@@ -1983,9 +1990,68 @@ class TestHaltGuard:
             account_id=uuid4(),
             env="paper",
         )
+        dispatch_entry = AsyncMock(return_value=1)
+        dispatch_exit = AsyncMock(return_value=1)
+        monkeypatch.setattr(worker, "_dispatch_entry_signal", dispatch_entry)
+        monkeypatch.setattr(worker, "_dispatch_exit_signal", dispatch_exit)
         placed = await worker.run_once()
         assert placed == 0
-        assert fetch_signals_calls == []  # fetch_approved_signals NOT called
+        dispatch_entry.assert_not_awaited()
+        dispatch_exit.assert_not_awaited()
+
+    async def test_halt_new_dispatches_exit_skips_entry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """HALT_NEW + queue contains BOTH an entry and an exit → exit
+        is dispatched, entry is filtered. Returns 1."""
+        from services.risk import order_placement_worker as worker_mod
+
+        entry_signal = _signal()
+        exit_signal = ApprovedSignalRow(
+            signal_id=uuid4(),
+            account_id=uuid4(),
+            env="paper",
+            market="/MES",
+            direction="flat",
+            target_contracts=0,
+            decision_price=Decimal("4250.50"),
+            strategy_hash="a" * 40,
+            parameter_set_hash="b" * 64,
+            sizing_trace={},
+            signal_type="exit",
+        )
+
+        async def _fake_fetch_signals(*args: Any, **kwargs: Any) -> list[Any]:
+            return [entry_signal, exit_signal]
+
+        monkeypatch.setattr(
+            "services.risk.signal_dispatch.fetch_current_risk_state",
+            AsyncMock(return_value="HALT_NEW"),
+        )
+        monkeypatch.setattr(worker_mod, "fetch_approved_signals", _fake_fetch_signals)
+
+        session = MagicMock()
+        session.execute = AsyncMock()
+
+        @asynccontextmanager
+        async def factory() -> Any:
+            yield session
+
+        ibkr = MagicMock()
+        worker = OrderPlacementWorker(
+            session_factory=factory,  # type: ignore[arg-type]
+            ibkr_client=ibkr,
+            account_id=uuid4(),
+            env="paper",
+        )
+        dispatch_entry = AsyncMock(return_value=1)
+        dispatch_exit = AsyncMock(return_value=1)
+        monkeypatch.setattr(worker, "_dispatch_entry_signal", dispatch_entry)
+        monkeypatch.setattr(worker, "_dispatch_exit_signal", dispatch_exit)
+        placed = await worker.run_once()
+        assert placed == 1
+        dispatch_entry.assert_not_awaited()
+        dispatch_exit.assert_awaited_once_with(exit_signal)
 
     async def test_normal_proceeds_to_drain(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """NORMAL passes the gate; fetch_approved_signals is called."""

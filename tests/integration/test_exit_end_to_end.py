@@ -25,17 +25,22 @@ simulates the broker round-trip.
   pre-placed close orders row stays in ``status='pending'`` for
   operator reconciliation.
 
+* HALT_NEW bypass per design L5 + backend-spec §2.5: a risk_state row
+  is seeded as HALT_NEW and ``worker.run_once()`` is invoked (rather
+  than ``_dispatch_exit_signal`` directly), proving the worker's
+  per-signal-type filter dispatches the exit even when entries would
+  be blocked. The audit chain still verifies clean afterwards.
+
 **Not covered here** (separate test files):
 
 * The fill-processing side (``process_fill_event`` →
   ORDER_FILLED → POSITION_CLOSED → TRADE_CLOSED) is covered by
   ``tests/integration/test_fill_processor_exit.py``.
-* The HALT_NEW bypass that the design doc L5 specifies (exits proceed
-  during HALT_NEW) is NOT implemented at the worker layer today —
-  ``OrderPlacementWorker.run_once`` gates ALL signals (entries + exits)
-  on ``risk_state in {NORMAL, CONVALESCENT}``. Test for this behavior
-  is intentionally omitted; documented in the PR description as a
-  worker-vs-design gap for follow-up.
+* The entry-side filter under HALT_NEW (entry signal stays at
+  ``status='approved'`` + ``_dispatch_entry_signal`` is not invoked)
+  is covered by the unit-level ``TestHaltGuard`` cases in
+  ``tests/unit/test_order_placement_worker.py`` which monkeypatch
+  the dispatch helpers directly.
 
 If Docker is unreachable, the module skips cleanly.
 """
@@ -691,6 +696,120 @@ async def test_exit_dispatch_position_unprotected_branch_invokes_alert_hook(
     assert sig_row.status == "approved"
 
     # ----- Chain still verifies clean across +2 rows -----
+    async with async_session_factory() as session:
+        verify_result = await verify_chain(session)
+    assert verify_result[0] is True
+
+
+def _seed_halt_new_risk_state(sync_engine: Engine, *, account_id: UUID) -> None:
+    """Seed a HALT_NEW risk_state row for the account, matching the
+    pattern used by ``tests/integration/test_kill_switch_end_to_end.py``.
+
+    ``audit_event_uuid`` is FK-less in the schema; a random UUID seeds
+    the slot without needing an upstream state-transition audit row.
+    """
+    with sync_engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO risk_state ("
+                "    account_id, state, severity, reason, entered_at_utc, "
+                "    convalescent_session_count, vacation_active, "
+                "    audit_event_uuid, is_current"
+                ") VALUES ("
+                "    :acc, 'HALT_NEW', 'routine', 'trailing_dd_breach', now(), "
+                "    0, FALSE, :seed, TRUE"
+                ")"
+            ),
+            {"acc": account_id, "seed": uuid.uuid4()},
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_once_dispatches_exit_under_halt_new_bypass(
+    async_session_factory: async_sessionmaker[AsyncSession],
+    sync_engine: Engine,
+    fresh_account_id: UUID,
+    slippage_head_version_id: UUID,
+) -> None:
+    """HALT_NEW bypass for exits (design L5 + backend-spec §2.5).
+
+    Seeds a HALT_NEW risk_state row + the canonical exit-pipeline state
+    (open trade, working bracket, approved exit signal) and invokes
+    :meth:`OrderPlacementWorker.run_once` (not ``_dispatch_exit_signal``
+    directly) so the per-signal-type filter at the run_once layer is
+    exercised end-to-end.
+
+    Asserts:
+      * Worker returns 1 (the exit dispatched).
+      * The canonical 2 audit rows landed (ORDER_CANCELLED → ORDER_PLACED).
+      * Bracket-stop flipped to cancelled + close row at status='working'.
+      * Exit signal flipped to status='working'.
+      * Chain verifies clean across the +2 rows.
+
+    Pre-PR-#264 + pre-this-PR, the run_once HALT_NEW gate short-circuited
+    on ANY non-permitting risk_state and returned 0; with the gate split,
+    the exit signal's signal_type='exit' carries it through. Entries
+    under HALT_NEW are covered by the unit-level TestHaltGuard cases.
+    """
+    state = _seed_open_trade_with_exit_signal(
+        sync_engine,
+        account_id=fresh_account_id,
+        slip_id=slippage_head_version_id,
+    )
+    _seed_halt_new_risk_state(sync_engine, account_id=fresh_account_id)
+
+    ibkr = _fake_ibkr_client()
+    worker = OrderPlacementWorker(
+        session_factory=async_session_factory,
+        ibkr_client=ibkr,
+        account_id=fresh_account_id,
+        env="paper",
+    )
+
+    placed = await worker.run_once()
+    assert placed == 1
+
+    ibkr.cancel_order.assert_awaited_once_with(state["stop_cid"])
+    ibkr.place_order.assert_awaited_once()
+
+    with sync_engine.connect() as conn:
+        audit_event_types = conn.execute(
+            text(
+                "SELECT event_type FROM audit_log WHERE account_id = :acct "
+                "ORDER BY sequence_no DESC LIMIT 2"
+            ),
+            {"acct": fresh_account_id},
+        ).fetchall()
+    assert [r.event_type for r in audit_event_types] == [
+        "order_placed",
+        "order_cancelled",
+    ]
+
+    with sync_engine.connect() as conn:
+        stop_row = conn.execute(
+            text("SELECT status FROM orders WHERE id = :oid"),
+            {"oid": state["stop_order_id"]},
+        ).one()
+    assert stop_row.status == "cancelled"
+
+    with sync_engine.connect() as conn:
+        close_row = conn.execute(
+            text(
+                "SELECT status, broker_order_id FROM orders "
+                "WHERE signal_id = :sig AND order_type = 'limit_marketable'"
+            ),
+            {"sig": state["exit_signal_id"]},
+        ).one()
+    assert close_row.status == "working"
+    assert close_row.broker_order_id == "3"
+
+    with sync_engine.connect() as conn:
+        sig_row = conn.execute(
+            text("SELECT status FROM signals WHERE id = :sid"),
+            {"sid": state["exit_signal_id"]},
+        ).one()
+    assert sig_row.status == "working"
+
     async with async_session_factory() as session:
         verify_result = await verify_chain(session)
     assert verify_result[0] is True
