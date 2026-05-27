@@ -8,7 +8,6 @@ layer translates these into a ``CapitalEventPlan`` then applies via
 
 from __future__ import annotations
 
-from decimal import Decimal
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -91,8 +90,3 @@ __all__ = [
     "CapitalEventInvokeRequest",
     "CapitalEventInvokeResponse",
 ]
-
-
-# Sanity-import to satisfy mypy that the Decimal import is used downstream
-# (the schema validates as string + the route coerces).
-_DECIMAL_REF: type = Decimal
