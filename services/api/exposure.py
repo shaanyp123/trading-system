@@ -108,25 +108,33 @@ def compute_exposure_breakdown(
     nav: Decimal | None,
 ) -> ExposureBreakdown:
     """Aggregate ``positions_current`` rows into a cluster-bucketed
-    notional breakdown + gross/net NAV percentages.
+    percent-of-NAV breakdown + gross/net NAV percentages.
 
     Phase 1 simplification per the design brief: uses ``avg_cost`` as the
-    mark for every position (live MTM lands in Task 3). The math:
+    mark for every position (live MTM lands separately). The math:
 
     * ``notional_per_position`` = ``|qty| * avg_cost * multiplier``
     * ``signed_notional`` = ``sign(qty) * notional_per_position``
-    * ``by_cluster[c]`` = sum of ``notional_per_position`` for positions
-      whose market maps to cluster ``c`` (absolute dollar amounts)
-    * ``gross_exposure_pct_nav`` = ``sum_of_notional / NAV``
-      (quantized to 0.0001)
-    * ``net_exposure_pct_nav`` = ``sum_of_signed_notional / NAV``
-      (quantized to 0.0001)
+    * ``by_cluster[c]`` = ``(sum of notional_per_position in cluster c) /
+      NAV * 100`` (percent units, quantized to 0.01)
+    * ``gross_exposure_pct_nav`` = ``sum_of_notional / NAV * 100``
+      (percent units, quantized to 0.01)
+    * ``net_exposure_pct_nav`` = ``sum_of_signed_notional / NAV * 100``
+      (percent units, quantized to 0.01)
 
-    When ``nav`` is ``None`` or non-positive, both pct fields fall back
-    to ``Decimal("0")`` (matches ``positions.py``'s NAV guard). The
-    cluster breakdown is computed regardless of NAV.
+    All three response fields share the same percent-units (0-100) scale
+    so the frontend's ``ExposureBar`` math (``filled = current / limit
+    * 100`` against cluster limits stated in percent like ``60`` for
+    equity-index) renders correctly. Returning dollar notionals here
+    causes the Today-page widget to saturate with bogus values like
+    "14625% / 60% cap" -- see the 2026-05-27 fix.
+
+    When ``nav`` is ``None`` or non-positive, ALL THREE fields fall back
+    to ``Decimal("0")``. Because by_cluster is now also a fraction of
+    NAV, the cluster breakdown is undefined when NAV is unavailable;
+    zeroing matches the gross/net behavior.
     """
-    by_cluster: dict[ExposureCluster, Decimal] = dict(_ZERO_CLUSTERS)
+    by_cluster_notional: dict[ExposureCluster, Decimal] = dict(_ZERO_CLUSTERS)
     gross_notional = Decimal("0")
     net_notional = Decimal("0")
 
@@ -135,8 +143,6 @@ def compute_exposure_breakdown(
         qty_raw = row["quantity"]
         avg_cost_raw = row["avg_cost"]
 
-        # Coerce to int/Decimal. Both come from psycopg as native types
-        # (int + Decimal) for live rows; tests pass them as-is.
         qty = qty_raw if isinstance(qty_raw, int) else int(str(qty_raw))
         if isinstance(avg_cost_raw, Decimal):
             avg_cost = avg_cost_raw
@@ -147,19 +153,25 @@ def compute_exposure_breakdown(
         notional = abs(Decimal(qty)) * avg_cost * meta.multiplier
         signed_notional = Decimal(qty) * avg_cost * meta.multiplier
 
-        by_cluster[meta.cluster] = by_cluster[meta.cluster] + notional
+        by_cluster_notional[meta.cluster] = by_cluster_notional[meta.cluster] + notional
         gross_notional += notional
         net_notional += signed_notional
 
+    pct_quantum = Decimal("0.01")
     if nav is not None and nav > 0:
-        gross_pct = (gross_notional / nav).quantize(Decimal("0.0001"))
-        net_pct = (net_notional / nav).quantize(Decimal("0.0001"))
+        by_cluster_pct: dict[ExposureCluster, Decimal] = {
+            cluster: (cluster_notional / nav * Decimal("100")).quantize(pct_quantum)
+            for cluster, cluster_notional in by_cluster_notional.items()
+        }
+        gross_pct = (gross_notional / nav * Decimal("100")).quantize(pct_quantum)
+        net_pct = (net_notional / nav * Decimal("100")).quantize(pct_quantum)
     else:
+        by_cluster_pct = dict(_ZERO_CLUSTERS)
         gross_pct = Decimal("0")
         net_pct = Decimal("0")
 
     return ExposureBreakdown(
-        by_cluster=by_cluster,
+        by_cluster=by_cluster_pct,
         gross_exposure_pct_nav=gross_pct,
         net_exposure_pct_nav=net_pct,
     )
