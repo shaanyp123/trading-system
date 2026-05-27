@@ -476,13 +476,20 @@ class TestV1TrendFollowing:
                 as_of_session_date=series.bars[-1].session_date,
             )
 
-    def test_exit_pipeline_scaffolded(self, strategy: V1TrendFollowing) -> None:
-        with pytest.raises(NotImplementedError, match="scaffolded for Week 3-4"):
-            strategy.generate_exit_candidates(
-                active_universe={},
-                current_positions={},
-                as_of_session_date=date(2026, 5, 1),
-            )
+    def test_exit_pipeline_implemented_returns_empty_when_no_positions(
+        self, strategy: V1TrendFollowing
+    ) -> None:
+        """Smoke test: generate_exit_candidates no longer raises
+        NotImplementedError (PR-A of exit-pipeline-design.md). With no
+        held positions it returns an empty result. Full branch coverage
+        lives in tests/unit/test_v1_exit_pipeline.py."""
+        result = strategy.generate_exit_candidates(
+            active_universe={},
+            current_positions={},
+            as_of_session_date=date(2026, 5, 1),
+        )
+        assert result.signals == ()
+        assert result.rejections == ()
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +507,7 @@ def test_public_api_surface_intact() -> None:
         "BarSeries",
         "CandidateSignal",
         "Direction",
+        "ExitGenerationResult",
         "Position",
         "RejectionReason",
         "SignalEmittedPayload",

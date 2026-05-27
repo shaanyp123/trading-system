@@ -15,17 +15,15 @@ Implements the strategy logic locked in `Docs/backend-spec.md §2.3`:
   outputs `CandidateSignal` with `decision_price` + `stop_price` + indicator
   snapshot; risk engine fills `target_contracts` + `sizing_trace`.
 
-Day 2 skeleton: implements the entry-signal pipeline + rejection codes + audit
-event payload assembly. Exit handling (stop, reversal, min-holding) is
-scaffolded with `NotImplementedError` because:
-1. It depends on broker position state via `Position` snapshots, which the
-   QC adapter delivers (Phase 0 Week 4-5 deliverable).
-2. The exit decision interacts with the kill-switch state machine (HALT_NEW
-   blocks new entries but allows exits) — that interaction lives in the signal
-   service, not here.
-The `generate_exit_candidates` API surface is declared so the QC LEAN wrapper
-and the signal service can both call it once the rest of the system catches up;
-the v1 PR adding exit logic will land in Week 3-4.
+Day 2 shipped the entry-signal pipeline + rejection codes + audit
+event payload assembly. PR-A of `Docs/exit-pipeline-design.md` (2026-05-26)
+adds the strategy-side exit pipeline: `generate_exit_candidates` evaluates
+(b) reversal, (c) trend-flip, and (d) decommission per market and emits at
+most one CLOSE candidate per held position per cycle. (a) stop-hit is
+unchanged — it stays handled by the bracket stop-market at IBKR. The
+strategy is broker-agnostic and pure-policy: the LEAN wrapper +
+trigger_v1_cycle (PR-B) and the dispatcher / order_placement_worker
+(PR-C) consume the new ExitGenerationResult and actuate it.
 
 Strategy version identity (`strategy_hash`) is the git SHA of the head commit
 when this code is loaded. Computation is in `services/version/composite_hash.py`,
@@ -38,7 +36,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
-from typing import Final
+from typing import Final, Literal
 
 import structlog
 
@@ -54,6 +52,7 @@ from strategies.v1_trend_following.signals import (
     BarSeries,
     CandidateSignal,
     Direction,
+    ExitGenerationResult,
     Position,
     RejectionReason,
     SignalGenerationResult,
@@ -187,7 +186,9 @@ class V1TrendFollowing:
         """Per-market entry-signal evaluation. Returns a CandidateSignal on
         passing all filters, or a RejectionReason on failure.
 
-        Order of checks matches backend-spec §2.3:
+        Order of checks matches backend-spec §2.3 (with the decommission
+        short-circuit prepended per exit-pipeline-design.md §7):
+          0. STRATEGY_DECOMMISSIONED?      -> STRATEGY_DECOMMISSIONED
           1. enough history?               -> INSUFFICIENT_BAR_HISTORY
           2. Donchian breakout?            -> NO_BREAKOUT
           3. trend filter passes?          -> TREND_FILTER_FAILED
@@ -197,6 +198,17 @@ class V1TrendFollowing:
              - opposite-direction position + held < MIN_HOLDING_DAYS
                                           -> MIN_HOLDING_DAYS_NOT_SATISFIED
         """
+        # Step 0: decommission short-circuit. When the operator flips
+        # ``STRATEGY_DECOMMISSIONED=True``, the entry pipeline emits no
+        # candidates for any market. The exit pipeline emits a CLOSE
+        # candidate (exit_reason='decommission') for every held position
+        # regardless of indicator state. This avoids the "candidate emitted
+        # that can never fill" anti-pattern (see design §7 interaction
+        # table). Rejection is recorded so the audit log shows the
+        # short-circuit decision per market.
+        if self._params.strategy_decommissioned:
+            return RejectionReason.STRATEGY_DECOMMISSIONED
+
         bars = series.bars
         if len(bars) < self._min_required_bars:
             return RejectionReason.INSUFFICIENT_BAR_HISTORY
@@ -317,7 +329,7 @@ class V1TrendFollowing:
         raise ValueError(f"_compute_stop_price: unexpected direction {direction!r}")
 
     # ------------------------------------------------------------------
-    # Exit-signal pipeline (scaffolded; full logic lands Week 3-4)
+    # Exit-signal pipeline (PR-A of exit-pipeline-design.md)
     # ------------------------------------------------------------------
     def generate_exit_candidates(
         self,
@@ -325,22 +337,265 @@ class V1TrendFollowing:
         active_universe: Mapping[str, BarSeries],
         current_positions: Mapping[str, Position],
         as_of_session_date: date,
-    ) -> SignalGenerationResult:
-        """Exit signal pipeline.
+        as_of_emitted_at_utc: datetime | None = None,
+        entry_candidates: tuple[CandidateSignal, ...] = (),
+    ) -> ExitGenerationResult:
+        """Run the exit-signal pipeline over the held positions.
 
-        Per backend-spec §2.3, exit conditions for a held position are:
-          (a) stop hit (handled by execution service watching the stop-market order)
-          (b) signal reversal (Donchian breakout in opposite direction; uses
-              `generate_signals` output)
-          (c) MIN_HOLDING_DAYS satisfied AND trend filter flips
-          (d) strategy decommission (orchestrated outside the strategy module)
+        Per backend-spec §2.3 + exit-pipeline-design.md §3:
+          (a) stop hit — unchanged; the bracket stop-market fires at IBKR.
+              This pipeline emits no candidate for (a).
+          (b) reversal — held position + opposite direction passes ALL 3
+              entry filters (Donchian + trend + Hurst). Detected via the
+              ``entry_candidates`` argument: the entry pipeline's output is
+              the authoritative signal that the opposite direction is "live."
+          (c) trend_flip — held LONG + ``close < MA_FAST`` (mirror for SHORT)
+              AND held duration >= MIN_HOLDING_DAYS. Per design L2: lazy
+              interpretation — ``close < MA_FAST`` only, NOT the full death
+              cross.
+          (d) decommission — ``STRATEGY_DECOMMISSIONED=True`` forces a CLOSE
+              for every held position regardless of indicator state.
 
-        Day 2 status: scaffolded. Implementation lands in Week 3-4 with the
-        signal service end-to-end (implementation-guide §3 Week 3). Inputs and
-        return type are stable; callers can rely on the API surface.
+        Precedence when a position satisfies more than one condition:
+        ``decommission > reversal > trend_flip``. Decommission is the operator
+        kill switch and overrides every indicator decision (per L6). Reversal
+        is preferred over trend_flip because reversal triggers a paired
+        follow-on entry — losing it to trend_flip would emit only the close
+        and leave the cycle without the new direction. At most ONE exit
+        signal per market per cycle is emitted; the ``exit_reason`` field on
+        the candidate captures which condition fired.
+
+        ``entry_candidates`` is the result of the SAME cycle's
+        ``generate_signals`` call. The caller (LEAN wrapper or
+        trigger_v1_cycle) is expected to invoke ``generate_signals`` first
+        and pass the result here; reversal detection couples on it. Passing
+        an empty tuple disables reversal detection (only (c) and (d) fire);
+        useful for ``--exits-only`` forensic runs and for unit tests that
+        exercise (c)/(d) in isolation.
+
+        Returns an ``ExitGenerationResult``. ``signals`` are the emitted
+        CLOSE candidates (each with ``signal_type='exit'`` and an
+        ``exit_reason`` populated); ``rejections`` are per-market reasons
+        no exit fired (TREND_HOLDS, MIN_HOLDING_NOT_REACHED,
+        INSUFFICIENT_BAR_HISTORY). Markets with no held position do not
+        appear in either tuple — the strategy has nothing to say about them.
         """
-        del active_universe, current_positions, as_of_session_date
-        raise NotImplementedError(
-            "V1TrendFollowing.generate_exit_candidates is scaffolded for Week 3-4. "
-            "Day 2 ships the entry pipeline only."
+        emitted_at = as_of_emitted_at_utc or datetime.now(tz=UTC)
+        exit_signals: list[CandidateSignal] = []
+        exit_rejections: list[tuple[str, RejectionReason]] = []
+
+        # Pre-compute the set of markets where ``generate_signals`` emitted
+        # an opposite-direction breakout. (b) couples on this — the exit
+        # pipeline does NOT re-run the entry filters in reverse; it
+        # observes the entry pipeline's output. This guarantees the
+        # reversal exit fires if and only if all 3 entry filters confirm
+        # the opposite direction (per L1: "Donchian-alone is insufficient").
+        reversing_entries_by_market: dict[str, CandidateSignal] = {}
+        for candidate in entry_candidates:
+            held = current_positions.get(candidate.market)
+            if held is None or held.direction is Direction.FLAT:
+                continue
+            if held.direction is candidate.direction:
+                continue
+            # Held LONG + entry candidate SHORT (or vice versa) =>
+            # reversal pair for this market.
+            reversing_entries_by_market[candidate.market] = candidate
+
+        for market, position in current_positions.items():
+            if position.direction is Direction.FLAT:
+                # No held position to exit. The exit pipeline has nothing to
+                # say about this market; entry-side logic owns FLAT markets.
+                continue
+
+            # --- (d) decommission — highest precedence -----------------
+            # Operator kill switch overrides every indicator decision. This
+            # check runs before reversal/trend_flip so that a sudden flip
+            # of STRATEGY_DECOMMISSIONED while a reversal+trend_flip would
+            # have fired still emits a decommission close (operator intent
+            # = wind everything down; don't open new opposite positions
+            # under decommission via the reversal path).
+            if self._params.strategy_decommissioned:
+                exit_signals.append(
+                    self._build_exit_candidate(
+                        market=market,
+                        position=position,
+                        as_of_session_date=as_of_session_date,
+                        exit_reason="decommission",
+                        series=active_universe.get(market),
+                    )
+                )
+                continue
+
+            # --- (b) reversal — second precedence ----------------------
+            entry_candidate = reversing_entries_by_market.get(market)
+            if entry_candidate is not None:
+                exit_signals.append(
+                    self._build_exit_candidate(
+                        market=market,
+                        position=position,
+                        as_of_session_date=as_of_session_date,
+                        exit_reason="reversal",
+                        series=active_universe.get(market),
+                        paired_entry_market=entry_candidate.market,
+                    )
+                )
+                continue
+
+            # --- (c) trend_flip — third precedence ---------------------
+            series = active_universe.get(market)
+            if series is None or len(series.bars) < self._min_required_bars:
+                # Without enough bars we cannot evaluate the trend-flip
+                # condition. Decommission would have fired already; reversal
+                # needs an entry-side candidate which itself requires bars
+                # to be computed. Falling through here means: no exit, but
+                # the operator should know the reason via the audit log.
+                exit_rejections.append((market, RejectionReason.INSUFFICIENT_BAR_HISTORY))
+                continue
+
+            # MIN_HOLDING_DAYS gate. Matches the entry-side gate at step 5
+            # of ``_evaluate_market`` and the backend-spec §2.3 contract:
+            # an exit driven by indicator flips waits until the position
+            # has had a chance to develop. The floor never blocks
+            # decommission (operator override) or reversal (the opposite-
+            # direction full-filter confirmation is its own bar for a
+            # legitimate exit).
+            #
+            # If ``opened_at_session_date`` is None we conservatively skip
+            # the floor check — mirrors strategy.py:_evaluate_market step 5
+            # behavior. This branch is unusual; in production every held
+            # position has an opened_at written by the reconciliation path.
+            if position.opened_at_session_date is not None:
+                held_days = (as_of_session_date - position.opened_at_session_date).days
+                if held_days < self._params.min_holding_days:
+                    exit_rejections.append((market, RejectionReason.MIN_HOLDING_NOT_REACHED))
+                    continue
+
+            try:
+                snapshot = self._compute_snapshot(series.bars)
+            except ValueError as exc:
+                log.warning(
+                    "v1_exit_indicator_compute_failed",
+                    market=market,
+                    session_date=str(as_of_session_date),
+                    error=str(exc),
+                )
+                exit_rejections.append((market, RejectionReason.INSUFFICIENT_BAR_HISTORY))
+                continue
+
+            trend_flipped = self._evaluate_trend_flip(
+                position_direction=position.direction,
+                last_close=snapshot.last_close,
+                ma_fast=snapshot.ma_fast,
+            )
+
+            if not trend_flipped:
+                exit_rejections.append((market, RejectionReason.TREND_HOLDS))
+                continue
+
+            exit_signals.append(
+                self._build_exit_candidate(
+                    market=market,
+                    position=position,
+                    as_of_session_date=as_of_session_date,
+                    exit_reason="trend_flip",
+                    series=series,
+                    snapshot=snapshot,
+                )
+            )
+
+        return ExitGenerationResult(
+            signals=tuple(exit_signals),
+            rejections=tuple(exit_rejections),
+            as_of_emitted_at_utc=emitted_at,
+        )
+
+    @staticmethod
+    def _evaluate_trend_flip(
+        *,
+        position_direction: Direction,
+        last_close: Decimal,
+        ma_fast: Decimal,
+    ) -> bool:
+        """Lazy trend-flip predicate per exit-pipeline-design.md §L2.
+
+        For a held LONG: ``close < MA_FAST`` triggers a flip. For SHORT:
+        ``close > MA_FAST`` triggers. This is the "lazy" reading — NOT the
+        full death cross (which would also require MA_FAST < MA_SLOW). The
+        looser bar exits earlier on weakness; combined with MIN_HOLDING_DAYS
+        it strikes the spec's balance between whipsaw protection and
+        trend-following timing.
+
+        FLAT direction is impossible at the call site (FLAT markets are
+        filtered earlier in ``generate_exit_candidates``); a defensive
+        return False here would mask logic errors, so the call site is the
+        single source of truth on direction validity.
+        """
+        if position_direction is Direction.LONG:
+            return last_close < ma_fast
+        if position_direction is Direction.SHORT:
+            return last_close > ma_fast
+        # FLAT was filtered above. Defensive False keeps the type checker
+        # happy without silently masking a future caller's bug — any FLAT
+        # leaking through is by definition not a trend flip.
+        return False
+
+    def _build_exit_candidate(
+        self,
+        *,
+        market: str,
+        position: Position,
+        as_of_session_date: date,
+        exit_reason: Literal["reversal", "trend_flip", "decommission"],
+        series: BarSeries | None,
+        snapshot: _IndicatorSnapshot | None = None,
+        paired_entry_market: str | None = None,
+    ) -> CandidateSignal:
+        """Construct a ``CandidateSignal`` with ``signal_type='exit'``.
+
+        Pricing conventions:
+        - ``decision_price``: last close from the market's series when
+          available. Falls back to ``position.avg_cost`` if the market has
+          dropped out of ``active_universe`` (the only realistic case is
+          decommission against a delisted / suspended market — the active
+          universe excludes it but we still want to flatten).
+        - ``stop_price``: ``Decimal('0')`` sentinel. NOT MEANINGFUL for
+          exits — the dispatcher does NOT place a new bracket stop on a
+          close order because the position is going to zero. The dispatcher
+          must read ``signal_type`` and skip stop placement; if it ever
+          treats this Decimal('0') as a real stop, that's a downstream bug
+          surfacing as a $0 stop-out attempt.
+        - ``direction``: ``Direction.FLAT`` sentinel = "target ending
+          position is flat." The dispatcher computes the actual buy/sell
+          side from a fresh ``positions_current`` read at place-order time
+          (design §Q3 dispatcher-side sizing); the strategy DOES NOT
+          encode +/- here.
+        - ``indicators_snapshot``: populated only when a snapshot was
+          computed (trend_flip). Reversal exits inherit no snapshot from
+          this side — the paired entry candidate carries the indicator
+          state. Decommission exits have an empty snapshot — no indicator
+          participated in the decision.
+        """
+        decision_price = (
+            series.bars[-1].close if series is not None and series.bars else position.avg_cost
+        )
+        indicators: dict[str, Decimal | int] = {}
+        if snapshot is not None:
+            indicators = {
+                "ma_fast": snapshot.ma_fast,
+                "ma_slow": snapshot.ma_slow,
+                "last_close": snapshot.last_close,
+                "atr": snapshot.atr,
+            }
+        return CandidateSignal(
+            market=market,
+            direction=Direction.FLAT,
+            signal_type="exit",
+            session_date=as_of_session_date,
+            decision_price=decision_price,
+            stop_price=Decimal("0"),
+            indicators_snapshot=indicators,
+            exit_reason=exit_reason,
+            prior_position_direction=position.direction,
+            prior_position_quantity=position.quantity,
+            paired_entry_market=paired_entry_market,
         )

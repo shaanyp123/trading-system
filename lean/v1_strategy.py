@@ -575,6 +575,14 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         if self._v1_parameters is not None:
             return self._v1_parameters
         raw = self._params
+        # TODO PR-B: read STRATEGY_DECOMMISSIONED + EXIT_AUTO_APPROVE from raw
+        # so an operator UPDATE to parameter_sets.parameters propagates into
+        # the daily LEAN cycle. Until then both fall back to V1Parameters
+        # dataclass defaults (False/False) and the kill-switch ceremony
+        # documented in Docs/exit-pipeline-design.md §11 R6 is silently inert
+        # via this entrypoint. Exit-emission wiring (generate_exit_candidates
+        # call) also lands with PR-B; reading the flag here without that
+        # would be a half-fix.
         self._v1_parameters = V1Parameters(
             lookback_days_donchian=int(raw["LOOKBACK_DAYS_DONCHIAN"]),
             ma_fast_days=int(raw["MA_FAST_DAYS"]),
