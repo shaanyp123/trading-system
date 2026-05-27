@@ -141,9 +141,19 @@ class FillContext:
     env: Environment
     market: str
     contract_id: UUID | None
-    signal_direction: Literal["long", "short"]
+    signal_direction: Literal["long", "short", "flat"]
     """Direction from the signals row. PR-G entry case: matches the
-    order direction (long→buy, short→sell)."""
+    order direction (long→buy, short→sell). Exit-pipeline PR-C
+    (2026-05-27): widened to include 'flat' for ``signal_type='exit'``
+    signals (the strategy emits direction=FLAT for explicit exits per
+    Docs/exit-pipeline-design.md §5.2). The classifier branches on
+    same_direction_add vs opposite-direction using
+    ``prior_position_quantity * order_direction`` sign relationship —
+    signal_direction is NOT load-bearing for the exit branch. For the
+    entry branch, the classifier raises
+    :class:`UnsupportedFillScenarioError` when signal_direction='flat'
+    (orphan exit fill reaching the entry path is an invariant
+    violation upstream)."""
 
     order_direction: Literal["buy", "sell"]
     """Direction from the orders row — the actual buy/sell flag IBKR
@@ -192,6 +202,14 @@ class FillContext:
     real-world producer is :func:`fetch_fill_context` which LEFT JOINs
     ``contracts`` + COALESCEs to 1.
     """
+
+    signal_type: Literal["entry", "exit"] = "entry"
+    """Exit-pipeline PR-C (2026-05-27). Plumbed through from the
+    ``signals.signal_type`` column via :func:`fetch_fill_context`.
+    Today's planner reads this only for audit-trail observability
+    (the scenario classification keys on direction/quantity geometry,
+    not signal_type); future PRs may use it to differentiate
+    EXIT_REVERSAL handling from EXIT_FULL_CLOSE more cleanly."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -578,7 +596,7 @@ FillScenario = Literal["ENTRY", "EXIT_FULL_CLOSE"]
 
 def _classify_fill_scenario(
     *,
-    signal_direction: Literal["long", "short"],
+    signal_direction: Literal["long", "short", "flat"],
     order_direction: Literal["buy", "sell"],
     prior_position_quantity: int,
     fill_quantity: int,
@@ -594,9 +612,13 @@ def _classify_fill_scenario(
     * **EXIT_FULL_CLOSE** — opposite-direction fill that takes
       ``|prior_position_quantity|`` to **exactly zero** (the bracket
       stop-loss fires, or LEAN emits an explicit close signal). The
-      signal_direction is the ORIGINAL entry direction because the
-      stop order reuses the entry signal_id per the bracket-order
-      placement contract.
+      signal_direction may be the ORIGINAL entry direction
+      (long/short — bracket-stop reuses the entry signal_id per
+      Option B) OR ``'flat'`` (exit-pipeline PR-C: explicit exit
+      signal emitted with direction=FLAT per design §5.2). Either
+      way the exit branch keys off the sign of
+      ``prior_position_quantity`` vs ``order_direction``, NOT
+      ``signal_direction``.
 
     Raises :class:`UnsupportedFillScenarioError` for:
 
@@ -609,6 +631,16 @@ def _classify_fill_scenario(
       signal_direction vs prior position direction) — these are
       almost-certainly programmer-error paths preserved from the
       pre-2026-05-17 ``_validate_entry_direction_match`` guard.
+    * **Orphan exit on entry branch** — ``signal_direction='flat'``
+      reaching the same_direction_add branch (prior=0 OR same-sided
+      fill against a same-direction prior). An explicit-exit signal
+      should always be opposite-direction against a non-zero prior;
+      this case implies upstream invariants broke (operator-flatten
+      between exit signal emit + worker dispatch raced past the
+      POSITION_ALREADY_FLAT gate, or a programmer-side bug in
+      :func:`services.risk.order_placement_worker._dispatch_exit_signal`).
+      Raising here surfaces the violation rather than silently
+      mis-routing through the entry planner.
     """
     # Same-direction (or first-fill) → ENTRY
     same_direction_add = (
@@ -617,6 +649,27 @@ def _classify_fill_scenario(
         or (prior_position_quantity < 0 and order_direction == "sell")
     )
     if same_direction_add:
+        if signal_direction == "flat":
+            # Exit-pipeline PR-C (2026-05-27) defensive guard: a
+            # flat-direction exit fill should NEVER land on the same-
+            # direction (entry) branch. The worker's POSITION_ALREADY_FLAT
+            # gate runs before dispatching exits, so reaching here means
+            # an invariant broke between gate + fill arrival.
+            raise UnsupportedFillScenarioError(
+                (
+                    "Flat-direction signal classified onto entry branch "
+                    "(prior_position_quantity is 0 or same-sided as fill). "
+                    "Exit signals must close an opposite-direction position; "
+                    "orphan exit fills imply an upstream invariant violation "
+                    "(see order_placement_worker._dispatch_exit_signal's "
+                    "POSITION_ALREADY_FLAT guard)."
+                ),
+                details={
+                    "signal_direction": signal_direction,
+                    "order_direction": order_direction,
+                    "prior_position_quantity": prior_position_quantity,
+                },
+            )
         expected_order_side = "buy" if signal_direction == "long" else "sell"
         if order_direction != expected_order_side:
             raise UnsupportedFillScenarioError(
@@ -813,6 +866,24 @@ def _plan_entry_fill_application(
          NOT emit a new trade audit event; the trade row is UPDATEd
          in place + ORDER_FILLED + POSITION_UPDATED capture the state.
     """
+    # Exit-pipeline PR-C (2026-05-27): :class:`FillContext.signal_direction`
+    # is widened to include 'flat' for exit-signal fills. The classifier
+    # guarantees the entry branch only sees 'long' / 'short' (the
+    # 'flat' guard in same_direction_add raises), so we narrow here for
+    # the TRADE_OPENED + TradeMutation paths that expect the entry-
+    # direction literal. A defensive assert turns the contract violation
+    # into a loud crash instead of a silent type-coercion bug.
+    if context.signal_direction not in ("long", "short"):
+        raise FillProcessingError(
+            error_code="ENTRY_SIGNAL_DIRECTION_NOT_LONG_OR_SHORT",
+            message=(
+                f"Entry fill planner reached with signal_direction="
+                f"{context.signal_direction!r}; classifier should have routed "
+                "this to the exit branch or raised UnsupportedFillScenarioError."
+            ),
+        )
+    entry_signal_direction: Literal["long", "short"] = context.signal_direction
+
     prior_qty_signed = prior_position.quantity if prior_position is not None else 0
 
     # Signed delta to apply to positions_current.quantity. Buys are
@@ -1009,7 +1080,7 @@ def _plan_entry_fill_application(
                     "order_id": str(context.order_id),
                     "account_id": str(context.account_id),
                     "market": context.market,
-                    "direction": context.signal_direction,
+                    "direction": entry_signal_direction,
                     "total_quantity": new_trade_total_quantity,
                     "avg_entry_price": str(new_trade_avg_entry),
                     "realized_commission_usd": str(new_trade_commission),
@@ -1072,7 +1143,7 @@ def _plan_entry_fill_application(
         contract_id=context.contract_id,
         entry_signal_id=context.signal_id,
         entry_order_id=context.order_id,
-        direction=context.signal_direction,
+        direction=entry_signal_direction,
         opened_at_utc=trade_opened_at_utc,
         new_total_quantity=new_trade_total_quantity,
         new_avg_entry_price=new_trade_avg_entry,
@@ -1442,6 +1513,7 @@ async def fetch_fill_context(
                       o.contract_id,
                       o.direction AS order_direction,
                       s.direction AS signal_direction,
+                      s.signal_type,
                       s.target_contracts,
                       s.strategy_hash,
                       s.parameter_set_hash,
@@ -1461,6 +1533,22 @@ async def fetch_fill_context(
         ).fetchone()
     if row is None:
         return None
+    # Narrow ``signal_type`` literal — DB column is free TEXT; treat
+    # unknown values as 'entry' for forwards-compat (consistent with
+    # the order_placement_worker's narrowing convention).
+    sig_type_raw = str(row.signal_type) if row.signal_type is not None else "entry"
+    sig_type: Literal["entry", "exit"] = "exit" if sig_type_raw == "exit" else "entry"
+    # Narrow ``signal_direction`` literal — DB CHECK already gates the
+    # value to ('long','short','flat'), but mypy doesn't know about
+    # database CHECK constraints.
+    sig_dir_raw = str(row.signal_direction)
+    sig_dir: Literal["long", "short", "flat"]
+    if sig_dir_raw == "long":
+        sig_dir = "long"
+    elif sig_dir_raw == "short":
+        sig_dir = "short"
+    else:
+        sig_dir = "flat"
     return FillContext(
         order_id=row.order_id,
         order_created_at=row.order_created_at,
@@ -1469,8 +1557,9 @@ async def fetch_fill_context(
         env=row.env,
         market=row.market,
         contract_id=row.contract_id,
-        signal_direction=row.signal_direction,
+        signal_direction=sig_dir,
         order_direction=row.order_direction,
+        signal_type=sig_type,
         target_contracts=row.target_contracts,
         strategy_hash=row.strategy_hash,
         parameter_set_hash=row.parameter_set_hash,
