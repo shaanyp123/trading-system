@@ -51,10 +51,10 @@ from services.discord_bot.commands.capital import (
     _validate_reason,
     register_capital_event_commands,
 )
-from services.discord_bot.embeds import EMBED_COLOR_INFO, EMBED_COLOR_OK
 from services.discord_bot.commands.halt import HaltConfirmView, register_halt
 from services.discord_bot.commands.positions import register_positions
 from services.discord_bot.commands.status import register_status
+from services.discord_bot.embeds import EMBED_COLOR_INFO, EMBED_COLOR_OK
 
 # ---------------------------------------------------------------------------
 # Fixtures: stub ApiClient + mock Interaction
