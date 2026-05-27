@@ -176,7 +176,7 @@ import sys
 import traceback
 import zipfile
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -201,6 +201,12 @@ from strategies.v1_trend_following.signals import (
     Position,
 )
 from strategies.v1_trend_following.strategy import STRATEGY_NAME, V1TrendFollowing
+
+#: PR-B (2026-05-26): valid exit-reason values for the --reason-filter CLI
+#: flag. Mirrors the Literal on CandidateSignal.exit_reason and the
+#: dispatcher-side _VALID_EXIT_REASONS in
+#: ``services/qc_adapter/signal_ingestion.py``.
+VALID_EXIT_REASONS: Final[tuple[str, ...]] = ("reversal", "trend_flip", "decommission")
 
 log = structlog.get_logger()
 
@@ -273,6 +279,12 @@ class ParsedArgs:
     api_base_url: str
     http_timeout_seconds: float
     allow_non_paper: bool
+    # PR-B (2026-05-26) per exit-pipeline-design §Q6: --exits-only /
+    # --entries-only / --reason-filter for forensic targeting. Defaults
+    # below run both entries and exits (the natural cycle's behavior).
+    exits_only: bool = False
+    entries_only: bool = False
+    reason_filter: tuple[str, ...] = ()
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -364,6 +376,46 @@ def _build_parser() -> argparse.ArgumentParser:
             "does)."
         ),
     )
+    # PR-B (2026-05-26) per exit-pipeline-design §Q6: forensic targeting
+    # flags. --exits-only / --entries-only are mutually exclusive; default
+    # behavior (neither set) runs BOTH entry + exit pipelines just like
+    # the natural 21:30 UTC LEAN cycle.
+    target_group = parser.add_mutually_exclusive_group()
+    target_group.add_argument(
+        "--exits-only",
+        action="store_true",
+        default=False,
+        help=(
+            "Run only the exit pipeline. Entry candidates are NOT emitted "
+            "(but generate_signals still runs server-side to feed reversal "
+            "detection in generate_exit_candidates). Use for forensic exit "
+            "re-emission when entries already ran cleanly."
+        ),
+    )
+    target_group.add_argument(
+        "--entries-only",
+        action="store_true",
+        default=False,
+        help=(
+            "Run only the entry pipeline. Exit candidates are NOT emitted. "
+            "Use to backfill a missed entry cycle without re-evaluating "
+            "the exit conditions (e.g., when LEAN was down at 21:30 UTC)."
+        ),
+    )
+    parser.add_argument(
+        "--reason-filter",
+        action="append",
+        default=None,
+        choices=VALID_EXIT_REASONS,
+        help=(
+            "Limit exit emission to a specific exit_reason. May be passed "
+            "multiple times to allow several reasons (e.g., "
+            "--reason-filter=decommission --reason-filter=reversal). When "
+            "omitted, all exit_reasons are emitted. No effect on the entry "
+            "pipeline. Useful for the decommission ceremony "
+            "(--reason-filter=decommission --no-dry-run)."
+        ),
+    )
     return parser
 
 
@@ -394,6 +446,15 @@ def _parse_args(argv: Sequence[str] | None) -> ParsedArgs:
     if args.http_timeout_seconds <= 0:
         parser.error("--http-timeout-seconds must be > 0")
 
+    # PR-B (2026-05-26): --reason-filter without --exits-only and without
+    # exits-equivalent default behavior is fine — the filter just narrows
+    # the exit emission set; if exits-only=False and entries-only=True
+    # the filter is a no-op but not an error (the operator might combine
+    # flags ahead of a follow-up cycle). We don't error on the no-op
+    # combination but a warning would be friendly; deferred to the caller
+    # because parser.error() exits before the log is configured.
+    reason_filter: tuple[str, ...] = tuple(args.reason_filter) if args.reason_filter else ()
+
     return ParsedArgs(
         env=env,
         session_date=session_date,
@@ -402,6 +463,9 @@ def _parse_args(argv: Sequence[str] | None) -> ParsedArgs:
         api_base_url=api_base_url,
         http_timeout_seconds=float(args.http_timeout_seconds),
         allow_non_paper=bool(args.allow_non_paper),
+        exits_only=bool(args.exits_only),
+        entries_only=bool(args.entries_only),
+        reason_filter=reason_filter,
     )
 
 
@@ -781,6 +845,13 @@ def build_v1_parameters_from_dict(raw: dict[str, object]) -> V1Parameters:
     (zero-row parameter_sets state — bootstrap migration hasn't run yet).
     Raises ``KeyError`` if the dict is non-empty but missing a required
     key (programming error — surfaces a parameter-set schema drift).
+
+    PR-B (2026-05-26): STRATEGY_DECOMMISSIONED + EXIT_AUTO_APPROVE are now
+    read from the JSONB (default False, matching the V1Parameters dataclass
+    defaults). Missing keys are tolerated — they round-trip to the SAFE
+    default — because parameter_sets rows written before PR-B's parameter
+    addition won't carry them; the operator's UPDATE flips them on at
+    decommission ceremony time.
     """
     if not raw:
         return default_v1_parameters()
@@ -788,14 +859,6 @@ def build_v1_parameters_from_dict(raw: dict[str, object]) -> V1Parameters:
     # int / str depending on driver), but the canonical V1_DEFAULTS keys
     # are all int-or-Decimal-string-able. ``int(str(...))`` round-trips
     # both shapes cleanly while keeping mypy --strict happy.
-    # TODO PR-B: read STRATEGY_DECOMMISSIONED + EXIT_AUTO_APPROVE from raw
-    # so an operator UPDATE to parameter_sets.parameters propagates here.
-    # Until then both fall back to V1Parameters dataclass defaults (False/False)
-    # and the kill-switch ceremony documented in Docs/exit-pipeline-design.md §11 R6
-    # is silently inert via this entrypoint. Exit-emission wiring lands with PR-B
-    # so the half-fix (read the flag here only) would be even more confusing
-    # than the current "fully inert until PR-B" state — keeping the bug
-    # explicit instead.
     return V1Parameters(
         lookback_days_donchian=int(str(raw["LOOKBACK_DAYS_DONCHIAN"])),
         ma_fast_days=int(str(raw["MA_FAST_DAYS"])),
@@ -807,7 +870,27 @@ def build_v1_parameters_from_dict(raw: dict[str, object]) -> V1Parameters:
         vol_target_pct_annual=Decimal(str(raw["VOL_TARGET_PCT_ANNUAL"])),
         instrument_vol_lookback_days=int(str(raw["INSTRUMENT_VOL_LOOKBACK_DAYS"])),
         roll_days_before_expiry=int(str(raw["ROLL_DAYS_BEFORE_EXPIRY"])),
+        strategy_decommissioned=_coerce_bool_param(raw.get("STRATEGY_DECOMMISSIONED")),
+        exit_auto_approve=_coerce_bool_param(raw.get("EXIT_AUTO_APPROVE")),
     )
+
+
+def _coerce_bool_param(value: object) -> bool:
+    """JSONB / string → bool for STRATEGY_DECOMMISSIONED / EXIT_AUTO_APPROVE.
+
+    Mirrors ``lean/v1_strategy.py::_coerce_bool_param``. JSONB values
+    come back as Python ``bool``, ``int``, or ``str`` depending on the
+    driver + how the parameter was originally written. SAFE default
+    (False) on any unexpected shape — matches the design's §L4 + §L6
+    operator-only-flips-True intent.
+    """
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    return str(value).strip().lower() == "true"
 
 
 # ---------------------------------------------------------------------------
@@ -915,7 +998,7 @@ def build_signal_post_payload(
     strategy_version: str,
     emitted_at_utc: datetime,
 ) -> dict[str, Any]:
-    """Compose the ``LeanEventRequest``-shaped POST body for one signal.
+    """Compose the ``LeanEventRequest``-shaped POST body for one entry signal.
 
     Field shape MUST match ``services/api/schemas/lean.py::LeanEventRequest``
     + the route-side required-field gate in
@@ -946,6 +1029,110 @@ def build_signal_post_payload(
         "decision_price": str(signal.decision_price),
         "sizing_trace": sizing_trace,
         "strategy_version": strategy_version,
+        # PR-B (2026-05-26): explicit entry discriminator. api defaults to
+        # 'entry' but we send it so the audit payload carries the value
+        # rather than relying on the route's default.
+        "signal_type": "entry",
+    }
+
+
+def build_exit_signal_post_payload(
+    *,
+    exit_signal: CandidateSignal,
+    session_date: date,
+    equity: Decimal,
+    strategy_version: str,
+    emitted_at_utc: datetime,
+) -> dict[str, Any]:
+    """Compose the ``LeanEventRequest``-shaped POST body for one exit signal.
+
+    Mirrors ``build_signal_post_payload`` for the exit-side payload shape.
+    Required fields per the route-side gate at
+    ``services/api/routes/internal/lean.py::post_lean_signal`` for
+    signal_type='exit': market / direction='flat' / exit_reason /
+    prior_position_direction / prior_position_quantity / decision_price /
+    sizing_trace / strategy_version.
+
+    target_contracts is set to 0 explicitly (the dispatcher computes the
+    close qty at place-order time per design §Q3; 0 is the
+    well-defined sentinel that downstream consumers can rely on rather
+    than dealing with NULL).
+
+    decision_price is serialized as a STRING per A05.
+
+    paired_entry_market is included ONLY when ``exit_reason='reversal'``
+    AND the strategy populated it; otherwise the route's cross-field
+    invariant (paired_entry_market only valid for reversal) would 422
+    the request.
+    """
+    prior_dir = exit_signal.prior_position_direction
+    payload: dict[str, Any] = {
+        "event_type": "signal_emitted",
+        "ts_utc": emitted_at_utc.isoformat(),
+        "algorithm_id": STRATEGY_NAME,
+        "session_date_et": session_date.isoformat(),
+        "equity_usd": str(equity),
+        "live_mode": True,
+        "market": exit_signal.market,
+        # Exits emit direction='flat' (sentinel for target ending position).
+        # Strategy enforces this via Direction.FLAT in _build_exit_candidate.
+        "direction": exit_signal.direction.value,
+        "target_contracts": 0,
+        "decision_price": str(exit_signal.decision_price),
+        "sizing_trace": build_exit_sizing_trace(
+            exit_signal=exit_signal,
+            equity=equity,
+        ),
+        "strategy_version": strategy_version,
+        "signal_type": "exit",
+        "exit_reason": exit_signal.exit_reason,
+        "prior_position_direction": (prior_dir.value if prior_dir is not None else None),
+        "prior_position_quantity": exit_signal.prior_position_quantity,
+    }
+    if exit_signal.paired_entry_market is not None:
+        payload["paired_entry_market"] = exit_signal.paired_entry_market
+    return payload
+
+
+def build_exit_sizing_trace(
+    *,
+    exit_signal: CandidateSignal,
+    equity: Decimal,
+) -> dict[str, Any]:
+    """Stage 0-shaped sizing_trace for exits — mirrors LEAN's exit shape.
+
+    Distinct from ``build_minimal_sizing_trace`` because exit candidates
+    have no Donchian / Hurst indicators (decommission + reversal exits
+    have an empty ``indicators_snapshot``; trend_flip has ma_fast +
+    ma_slow + last_close + atr only — no donchian_high/low/hurst keys).
+    Match LEAN's ``_build_exit_sizing_trace`` so identical payloads
+    round-trip through the api ingestion path.
+    """
+    snapshot = exit_signal.indicators_snapshot or {}
+    strategy_inputs: dict[str, dict[str, str]] = {
+        exit_signal.market: {k: str(v) for k, v in snapshot.items()}
+    }
+    prior_dir = exit_signal.prior_position_direction
+    return {
+        "schema_version": 1,
+        "stage_0_universe": {
+            "active_markets": [exit_signal.market],
+            "excluded": [],
+            "strategy_inputs": strategy_inputs,
+        },
+        "lean_naive_sizing": {
+            "target_contracts": 0,
+            "equity_usd": str(equity),
+            "rationale": (
+                "Operator-trigger exit signal — full close of prior position. "
+                "Dispatcher computes actual close qty from current positions "
+                "at place-order time per exit-pipeline-design §Q3."
+            ),
+            "exit_reason": exit_signal.exit_reason,
+            "prior_position_direction": (prior_dir.value if prior_dir is not None else None),
+            "prior_position_quantity": exit_signal.prior_position_quantity,
+            "paired_entry_market": exit_signal.paired_entry_market,
+        },
     }
 
 
@@ -961,13 +1148,26 @@ class CycleContext:
     Loaded once per invocation by ``load_cycle_context``; passed by
     value into ``run_cycle`` so the orchestration is testable without
     a live DB.
+
+    PR-B (2026-05-26) split ``already_emitted_markets`` into entry-side
+    and exit-side sets so the two pipelines dedup independently per
+    exit-pipeline-design.md §Q6.
     """
 
     account_id: UUID
     risk_state: str
     parameters: V1Parameters
     current_positions: dict[str, Position]
+    # Markets with ANY entry-side signal row for this session_date.
+    # Conservative: if a row exists at all, skip — matches the natural
+    # cycle's POSITION_ALREADY_SAME_DIRECTION pyramid guard.
     already_emitted_markets: frozenset[str]
+    # PR-B (2026-05-26): exits dedup is status-filtered per §Q6 — re-emit
+    # exits whose status is in {'rejected','cancelled','expired'} so the
+    # operator can re-trigger a fresh evaluation after rejecting one. The
+    # frozenset here contains markets where a NON-rejected/cancelled/expired
+    # exit row already exists for this session_date.
+    already_emitted_exits: frozenset[str]
     latest_balance_nav: Decimal
 
 
@@ -1083,9 +1283,14 @@ async def fetch_already_emitted_markets(
 ) -> frozenset[str]:
     """SELECT signals.market for the (account, env, session_date) tuple.
 
-    The dedup key. Any market that already has a signal row for this
-    session_date is skipped by the orchestrator — typically because
-    today's natural 21:30 UTC LEAN cycle has already emitted it.
+    The entry-side dedup key. Any market that already has a signal row
+    for this session_date is skipped by the entry-emission path — typically
+    because today's natural 21:30 UTC LEAN cycle has already emitted it.
+
+    This is intentionally broad (any signal_type, any status) so the
+    operator tool stays conservative on entries. The natural cycle
+    bypasses this dedup entirely; the operator tool defers to existing
+    rows by design.
 
     Returns a frozenset so callers can use ``in`` cheaply.
     """
@@ -1098,6 +1303,54 @@ async def fetch_already_emitted_markets(
                 "WHERE account_id = :acct "
                 "  AND env = :env "
                 "  AND session_date = :sd"
+            ),
+            {"acct": account_id, "env": env, "sd": session_date},
+        )
+    ).fetchall()
+    return frozenset(row.market for row in rows)
+
+
+async def fetch_already_emitted_exits(
+    session: Any,
+    *,
+    account_id: UUID,
+    env: EnvName,
+    session_date: date,
+) -> frozenset[str]:
+    """SELECT signals.market for exits already emitted today, status-filtered.
+
+    Per exit-pipeline-design.md §Q6: dedup exits ONLY when an existing
+    exit row is still actionable. Re-emit when the prior exit was
+    ``rejected``/``cancelled``/``expired`` so the operator can re-trigger
+    a fresh evaluation after rejecting one (the prior rejection might
+    have been a transient operator decision; the next cycle may legitimately
+    want the exit emitted again).
+
+    Status values come from the signals.status CHECK constraint
+    (alembic 0002:150-156). The terminal-but-not-actionable values are:
+
+      * ``rejected`` — operator declined
+      * ``cancelled`` — operator or auto-cancel withdrew it
+      * ``expired`` — outlived the expiry window without dispatch
+
+    Everything else (``pending``, ``approved``, ``deferred``, ``working``,
+    ``partially_filled``, ``filled``, ``closed``, ``stopped_out``,
+    ``sub_minimum_size``, ``macro_window_drop``,
+    ``market_drop_settlement_unavailable``) blocks re-emission — the prior
+    exit is either still in-flight or already resolved into a position
+    state change.
+    """
+    from sqlalchemy import text
+
+    rows = (
+        await session.execute(
+            text(
+                "SELECT DISTINCT market FROM signals "
+                "WHERE account_id = :acct "
+                "  AND env = :env "
+                "  AND session_date = :sd "
+                "  AND signal_type = 'exit' "
+                "  AND status NOT IN ('rejected','cancelled','expired')"
             ),
             {"acct": account_id, "env": env, "sd": session_date},
         )
@@ -1159,6 +1412,12 @@ async def load_cycle_context(
             env=env,
             session_date=session_date,
         )
+        already_emitted_exits = await fetch_already_emitted_exits(
+            session,
+            account_id=account_id,
+            env=env,
+            session_date=session_date,
+        )
         balance_nav = await fetch_latest_balance_nav(session, account_id)
     return CycleContext(
         account_id=account_id,
@@ -1166,6 +1425,7 @@ async def load_cycle_context(
         parameters=build_v1_parameters_from_dict(params_dict),
         current_positions=positions,
         already_emitted_markets=already_emitted,
+        already_emitted_exits=already_emitted_exits,
         latest_balance_nav=balance_nav if balance_nav is not None else Decimal("0"),
     )
 
@@ -1221,6 +1481,125 @@ async def post_signal(
 # ---------------------------------------------------------------------------
 # Per-market orchestration (pure structure; HTTP injectable for tests)
 # ---------------------------------------------------------------------------
+
+
+async def emit_exit_signal_with_dedup(
+    *,
+    exit_signal: CandidateSignal,
+    session_date: date,
+    equity: Decimal,
+    already_emitted_exits: frozenset[str],
+    strategy_version: str,
+    emitted_at_utc: datetime,
+    dry_run: bool,
+    http_client: httpx.AsyncClient | None,
+    api_base_url: str,
+    bearer_token: str | None,
+) -> SignalPostOutcome:
+    """End-to-end per-exit POST flow with status-filtered dedup + dry-run.
+
+    Mirrors ``emit_signal_with_dedup`` for exits. Uses
+    ``already_emitted_exits`` (the status-filtered set from
+    ``fetch_already_emitted_exits``) so re-emitting after operator
+    rejection is allowed per design §Q6.
+    """
+    if exit_signal.market in already_emitted_exits:
+        log.info(
+            "trigger_v1_cycle_exit_dedup_skip",
+            market=exit_signal.market,
+            session_date=session_date.isoformat(),
+            exit_reason=exit_signal.exit_reason,
+            reason=(
+                "market already has an actionable exit row (status NOT IN "
+                "('rejected','cancelled','expired')) for this session_date"
+            ),
+        )
+        return SignalPostOutcome(market=exit_signal.market, status="dedup_skipped")
+
+    payload = build_exit_signal_post_payload(
+        exit_signal=exit_signal,
+        session_date=session_date,
+        equity=equity,
+        strategy_version=strategy_version,
+        emitted_at_utc=emitted_at_utc,
+    )
+
+    if dry_run:
+        log.info(
+            "trigger_v1_cycle_exit_dry_run_would_post",
+            market=exit_signal.market,
+            exit_reason=exit_signal.exit_reason,
+            prior_position_direction=(
+                exit_signal.prior_position_direction.value
+                if exit_signal.prior_position_direction is not None
+                else None
+            ),
+            prior_position_quantity=exit_signal.prior_position_quantity,
+            paired_entry_market=exit_signal.paired_entry_market,
+            decision_price=str(exit_signal.decision_price),
+            session_date=session_date.isoformat(),
+            payload_keys=sorted(payload.keys()),
+        )
+        return SignalPostOutcome(market=exit_signal.market, status="dry_run_skipped")
+
+    assert http_client is not None
+    assert bearer_token is not None
+
+    try:
+        status_code, body = await post_signal(
+            http_client=http_client,
+            api_base_url=api_base_url,
+            bearer_token=bearer_token,
+            payload=payload,
+        )
+    except httpx.HTTPError as exc:
+        log.error(
+            "trigger_v1_cycle_exit_post_network_failed",
+            market=exit_signal.market,
+            exit_reason=exit_signal.exit_reason,
+            error=str(exc),
+            error_class=type(exc).__name__,
+        )
+        return SignalPostOutcome(
+            market=exit_signal.market,
+            status="post_failed",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+    if 200 <= status_code < 300:
+        signal_id = body.get("signal_id") if isinstance(body, dict) else None
+        audit_event_uuid = body.get("audit_event_uuid") if isinstance(body, dict) else None
+        log.info(
+            "trigger_v1_cycle_exit_post_succeeded",
+            market=exit_signal.market,
+            exit_reason=exit_signal.exit_reason,
+            decision_price=str(exit_signal.decision_price),
+            session_date=session_date.isoformat(),
+            http_status_code=status_code,
+            signal_id=signal_id,
+            audit_event_uuid=audit_event_uuid,
+        )
+        return SignalPostOutcome(
+            market=exit_signal.market,
+            status="posted",
+            http_status_code=status_code,
+            signal_id=str(signal_id) if signal_id else None,
+            audit_event_uuid=str(audit_event_uuid) if audit_event_uuid else None,
+        )
+
+    log.error(
+        "trigger_v1_cycle_exit_post_rejected",
+        market=exit_signal.market,
+        exit_reason=exit_signal.exit_reason,
+        http_status_code=status_code,
+        api_error_body=body,
+    )
+    return SignalPostOutcome(
+        market=exit_signal.market,
+        status="post_failed",
+        http_status_code=status_code,
+        error=f"api returned {status_code}: {body}",
+    )
 
 
 async def emit_signal_with_dedup(
@@ -1351,7 +1730,14 @@ async def emit_signal_with_dedup(
 
 @dataclass(frozen=True, slots=True)
 class CycleSummary:
-    """Aggregate outcome surfaced to the operator + the exit-code computer."""
+    """Aggregate outcome surfaced to the operator + the exit-code computer.
+
+    PR-B (2026-05-26): added exit-side counters mirroring the entry-side
+    set. ``post_failed`` is a UNIFIED count across both pipelines (the
+    exit-code computer treats any post-failure as a hard failure).
+    Per-pipeline counts let the operator see at-a-glance which side
+    failed in the log line.
+    """
 
     signals_generated: int
     signals_emitted: int
@@ -1362,6 +1748,16 @@ class CycleSummary:
     rejection_reasons: dict[str, int]
     history_missing_markets: tuple[str, ...]
     stale_markets: tuple[str, ...]
+    # PR-B exit-side counters. exit_rejections_count is the count of
+    # markets where generate_exit_candidates emitted a rejection
+    # (TREND_HOLDS / MIN_HOLDING_NOT_REACHED / INSUFFICIENT_BAR_HISTORY).
+    exits_generated: int = 0
+    exits_emitted: int = 0
+    exits_dedup_skipped: int = 0
+    exits_dry_run_skipped: int = 0
+    exits_post_failed: int = 0
+    exit_rejections_count: int = 0
+    exit_rejection_reasons: dict[str, int] = field(default_factory=dict)
 
 
 def _summarize(
@@ -1370,22 +1766,42 @@ def _summarize(
     rejections: Sequence[tuple[str, Any]],
     history_missing_markets: tuple[str, ...],
     stale_markets: tuple[str, ...],
+    exit_outcomes: Sequence[SignalPostOutcome] = (),
+    exit_rejections: Sequence[tuple[str, Any]] = (),
 ) -> CycleSummary:
     """Roll per-signal outcomes + strategy rejections into a single summary."""
     reason_counts: dict[str, int] = {}
     for _, reason in rejections:
         reason_str = reason.value if hasattr(reason, "value") else str(reason)
         reason_counts[reason_str] = reason_counts.get(reason_str, 0) + 1
+    exit_reason_counts: dict[str, int] = {}
+    for _, reason in exit_rejections:
+        reason_str = reason.value if hasattr(reason, "value") else str(reason)
+        exit_reason_counts[reason_str] = exit_reason_counts.get(reason_str, 0) + 1
     return CycleSummary(
         signals_generated=len(outcomes),
         signals_emitted=sum(1 for o in outcomes if o.status == "posted"),
         dedup_skipped=sum(1 for o in outcomes if o.status == "dedup_skipped"),
         dry_run_skipped=sum(1 for o in outcomes if o.status == "dry_run_skipped"),
-        post_failed=sum(1 for o in outcomes if o.status == "post_failed"),
+        # post_failed is UNIFIED — entry-side post failures + exit-side
+        # post failures sum into the single counter the exit-code
+        # computer reads. The per-pipeline counters below let the operator
+        # diagnose which side failed.
+        post_failed=(
+            sum(1 for o in outcomes if o.status == "post_failed")
+            + sum(1 for o in exit_outcomes if o.status == "post_failed")
+        ),
         rejections_count=len(rejections),
         rejection_reasons=reason_counts,
         history_missing_markets=history_missing_markets,
         stale_markets=stale_markets,
+        exits_generated=len(exit_outcomes),
+        exits_emitted=sum(1 for o in exit_outcomes if o.status == "posted"),
+        exits_dedup_skipped=sum(1 for o in exit_outcomes if o.status == "dedup_skipped"),
+        exits_dry_run_skipped=sum(1 for o in exit_outcomes if o.status == "dry_run_skipped"),
+        exits_post_failed=sum(1 for o in exit_outcomes if o.status == "post_failed"),
+        exit_rejections_count=len(exit_rejections),
+        exit_rejection_reasons=exit_reason_counts,
     )
 
 
@@ -1462,26 +1878,105 @@ async def run_cycle(
 
     emitted_at_utc = datetime.now(tz=UTC)
     outcomes: list[SignalPostOutcome] = []
-    for signal in result.signals:
-        outcome = await emit_signal_with_dedup(
-            signal=signal,
-            session_date=args.session_date,
-            equity=context.latest_balance_nav,
-            already_emitted=context.already_emitted_markets,
-            strategy_version=STRATEGY_VERSION_MARKER,
-            emitted_at_utc=emitted_at_utc,
-            dry_run=args.dry_run,
-            http_client=http_client,
-            api_base_url=args.api_base_url,
-            bearer_token=bearer_token,
+
+    # PR-B (2026-05-26): --entries-only suppresses exit emission;
+    # --exits-only suppresses entry emission. Default (neither set) runs
+    # both — same as the natural cycle. Per §Q6 we still always run
+    # generate_signals server-side (above) so reversal detection in
+    # generate_exit_candidates has access to the entry pipeline's
+    # output for the same cycle — but we only POST entries when
+    # --exits-only is NOT set.
+    if not args.exits_only:
+        for signal in result.signals:
+            outcome = await emit_signal_with_dedup(
+                signal=signal,
+                session_date=args.session_date,
+                equity=context.latest_balance_nav,
+                already_emitted=context.already_emitted_markets,
+                strategy_version=STRATEGY_VERSION_MARKER,
+                emitted_at_utc=emitted_at_utc,
+                dry_run=args.dry_run,
+                http_client=http_client,
+                api_base_url=args.api_base_url,
+                bearer_token=bearer_token,
+            )
+            outcomes.append(outcome)
+    else:
+        log.info(
+            "trigger_v1_cycle_entries_suppressed",
+            session_date=args.session_date.isoformat(),
+            entry_candidates_count=len(result.signals),
+            reason="--exits-only flag set; entry candidates evaluated but not emitted",
         )
-        outcomes.append(outcome)
+
+    # ----------- Exit pipeline (PR-B per design §Q6) -----------
+    exit_outcomes: list[SignalPostOutcome] = []
+    exit_rejections: tuple[tuple[str, Any], ...] = ()
+    if not args.entries_only:
+        try:
+            exit_result = strategy.generate_exit_candidates(
+                active_universe=active_universe,
+                current_positions=context.current_positions,
+                as_of_session_date=args.session_date,
+                entry_candidates=result.signals,
+            )
+        except Exception as exc:
+            log.error(
+                "trigger_v1_cycle_generate_exit_candidates_failed",
+                session_date=args.session_date.isoformat(),
+                error=str(exc),
+                error_class=type(exc).__name__,
+            )
+            exit_result = None
+        if exit_result is not None:
+            exit_rejections = exit_result.rejections
+            for rejected_market, reason in exit_result.rejections:
+                reason_str = reason.value if hasattr(reason, "value") else str(reason)
+                log.info(
+                    "trigger_v1_cycle_exit_rejection",
+                    market=rejected_market,
+                    reason=reason_str,
+                    session_date=args.session_date.isoformat(),
+                )
+
+            for exit_signal in exit_result.signals:
+                # --reason-filter narrows the emit set to specific
+                # exit_reasons. Empty tuple = no filter = emit all.
+                if args.reason_filter and exit_signal.exit_reason not in args.reason_filter:
+                    log.info(
+                        "trigger_v1_cycle_exit_filtered_by_reason",
+                        market=exit_signal.market,
+                        exit_reason=exit_signal.exit_reason,
+                        allowed_reasons=list(args.reason_filter),
+                    )
+                    continue
+                exit_outcome = await emit_exit_signal_with_dedup(
+                    exit_signal=exit_signal,
+                    session_date=args.session_date,
+                    equity=context.latest_balance_nav,
+                    already_emitted_exits=context.already_emitted_exits,
+                    strategy_version=STRATEGY_VERSION_MARKER,
+                    emitted_at_utc=emitted_at_utc,
+                    dry_run=args.dry_run,
+                    http_client=http_client,
+                    api_base_url=args.api_base_url,
+                    bearer_token=bearer_token,
+                )
+                exit_outcomes.append(exit_outcome)
+    else:
+        log.info(
+            "trigger_v1_cycle_exits_suppressed",
+            session_date=args.session_date.isoformat(),
+            reason="--entries-only flag set; exit pipeline skipped entirely",
+        )
 
     return _summarize(
         outcomes=outcomes,
         rejections=result.rejections,
         history_missing_markets=tuple(history_missing),
         stale_markets=tuple(stale_markets),
+        exit_outcomes=exit_outcomes,
+        exit_rejections=exit_rejections,
     )
 
 
@@ -1721,6 +2216,18 @@ async def _amain(
         rejection_reasons=summary.rejection_reasons,
         history_missing_markets=list(summary.history_missing_markets),
         stale_markets=list(summary.stale_markets),
+        # PR-B exit-side counters
+        exits_generated=summary.exits_generated,
+        exits_emitted=summary.exits_emitted,
+        exits_dedup_skipped=summary.exits_dedup_skipped,
+        exits_dry_run_skipped=summary.exits_dry_run_skipped,
+        exits_post_failed=summary.exits_post_failed,
+        exit_rejections_count=summary.exit_rejections_count,
+        exit_rejection_reasons=summary.exit_rejection_reasons,
+        # Flag matrix the operator passed (for cross-cycle log analysis)
+        exits_only=args.exits_only,
+        entries_only=args.entries_only,
+        reason_filter=list(args.reason_filter),
         dry_run=args.dry_run,
     )
     return _compute_exit_code(summary, args.dry_run)
@@ -1763,23 +2270,29 @@ __all__ = [
     "EXIT_UNEXPECTED",
     "LEAN_BEARER_ENV",
     "STRATEGY_VERSION_MARKER",
+    "VALID_EXIT_REASONS",
     "CycleContext",
     "CycleSummary",
     "ParsedArgs",
     "SignalPostOutcome",
     "_amain",
     "_build_parser",
+    "_coerce_bool_param",
     "_compute_exit_code",
     "_parse_args",
     "_summarize",
+    "build_exit_signal_post_payload",
+    "build_exit_sizing_trace",
     "build_minimal_sizing_trace",
     "build_position_from_row",
     "build_signal_post_payload",
     "build_v1_parameters_from_dict",
     "compute_active_universe",
+    "emit_exit_signal_with_dedup",
     "emit_signal_with_dedup",
     "fetch_account_id",
     "fetch_active_parameters_dict",
+    "fetch_already_emitted_exits",
     "fetch_already_emitted_markets",
     "fetch_latest_balance_nav",
     "fetch_positions_for_v1_markets",

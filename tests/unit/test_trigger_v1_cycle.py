@@ -69,15 +69,18 @@ from scripts.operator_tools.trigger_v1_cycle import (
     ParsedArgs,
     SignalPostOutcome,
     _amain,
+    _coerce_bool_param,
     _compute_exit_code,
     _parse_args,
     _parse_universe_file_bar,
     _summarize,
+    build_exit_signal_post_payload,
     build_minimal_sizing_trace,
     build_position_from_row,
     build_signal_post_payload,
     build_v1_parameters_from_dict,
     compute_active_universe,
+    emit_exit_signal_with_dedup,
     emit_signal_with_dedup,
     is_bar_series_stale,
     read_etf_bars_from_zip,
@@ -1018,6 +1021,12 @@ def _build_session_factory_for_context(*, risk_state: str) -> Any:
     All other queries return empty / sensible defaults so the cycle can
     run without bar-on-disk dependencies (we override args.data_root to
     a tmp_path with no zips, so the cycle generates 0 signals).
+
+    PR-B (2026-05-26): there are now TWO ``FROM signals`` queries — the
+    entry-side dedup (broad) and the exit-side dedup (status-filtered).
+    Order matters in the matcher because the first key whose substring is
+    found in the SQL string wins. The exit-side key must come BEFORE the
+    entry-side key so its narrower predicate matches the exit dedup query.
     """
     account_id = uuid4()
     query_results: dict[str, Any] = {
@@ -1029,7 +1038,10 @@ def _build_session_factory_for_context(*, risk_state: str) -> Any:
         "FROM parameter_sets": _result_one(None),
         # positions_current → empty
         "FROM positions_current": _result_many([]),
-        # signals (dedup) → empty
+        # signals (exit-side dedup, status-filtered per PR-B). MUST come
+        # before "FROM signals" so the narrower needle matches first.
+        "signal_type = 'exit'": _result_many([]),
+        # signals (entry-side dedup) → empty
         "FROM signals": _result_many([]),
         # balances → no row
         "FROM balances": _result_one(None),
@@ -1319,13 +1331,19 @@ class TestAmainEndToEndDryRun:
             allow_non_paper=False,
         )
         account_id = uuid4()
-        # Return TLT in the dedup-query response → that market gets skipped
+        # Return TLT in the entry-side dedup-query response → that market
+        # gets skipped on the entry pipeline. Exit dedup is empty so any
+        # held positions could still emit exits (but the fixture seeds no
+        # held positions, so the exit pipeline emits nothing).
         already_emitted_rows = [SimpleNamespace(market="TLT")]
         query_results: dict[str, Any] = {
             "FROM accounts": _result_one(SimpleNamespace(id=account_id)),
             "FROM risk_state": _result_one(SimpleNamespace(state="NORMAL")),
             "FROM parameter_sets": _result_one(None),
             "FROM positions_current": _result_many([]),
+            # Exit-side dedup (status-filtered) — narrower needle must come
+            # first per the matcher's first-match-wins iteration order.
+            "signal_type = 'exit'": _result_many([]),
             "FROM signals": _result_many(already_emitted_rows),
             "FROM balances": _result_one(SimpleNamespace(net_liquidation=20000)),
         }
@@ -1351,6 +1369,695 @@ class TestAmainEndToEndDryRun:
         # TLT should NOT appear in any POST payload
         posted_markets = {p["json"]["market"] for p in client.posts}
         assert "TLT" not in posted_markets
+
+
+# ---------------------------------------------------------------------------
+# PR-B (2026-05-26) — exit-pipeline integration via the operator tool.
+# ---------------------------------------------------------------------------
+
+
+def _make_exit_signal(
+    *,
+    market: str = "TLT",
+    exit_reason: str = "trend_flip",
+    prior_position_direction: Direction = Direction.LONG,
+    prior_position_quantity: int = 3,
+    decision_price: Decimal = Decimal("100.00"),
+    paired_entry_market: str | None = None,
+    indicators_snapshot: dict | None = None,
+) -> CandidateSignal:
+    """Construct an exit CandidateSignal mirroring generate_exit_candidates output."""
+    snapshot = indicators_snapshot if indicators_snapshot is not None else {}
+    return CandidateSignal(
+        market=market,
+        direction=Direction.FLAT,
+        signal_type="exit",
+        session_date=date(2026, 5, 26),
+        decision_price=decision_price,
+        stop_price=Decimal("0"),
+        indicators_snapshot=snapshot,
+        exit_reason=exit_reason,  # type: ignore[arg-type]
+        prior_position_direction=prior_position_direction,
+        prior_position_quantity=prior_position_quantity,
+        paired_entry_market=paired_entry_market,
+    )
+
+
+class TestParseArgsExitFlags:
+    """PR-B CLI flag matrix per design §Q6."""
+
+    def test_default_neither_exits_only_nor_entries_only(self) -> None:
+        args = _parse_args(["--env", "paper"])
+        assert args.exits_only is False
+        assert args.entries_only is False
+        assert args.reason_filter == ()
+
+    def test_exits_only_flag(self) -> None:
+        args = _parse_args(["--env", "paper", "--exits-only"])
+        assert args.exits_only is True
+        assert args.entries_only is False
+
+    def test_entries_only_flag(self) -> None:
+        args = _parse_args(["--env", "paper", "--entries-only"])
+        assert args.entries_only is True
+        assert args.exits_only is False
+
+    def test_exits_only_and_entries_only_mutually_exclusive(self) -> None:
+        with pytest.raises(SystemExit):
+            _parse_args(["--env", "paper", "--exits-only", "--entries-only"])
+
+    def test_reason_filter_single(self) -> None:
+        args = _parse_args(["--env", "paper", "--reason-filter", "decommission"])
+        assert args.reason_filter == ("decommission",)
+
+    def test_reason_filter_multiple(self) -> None:
+        args = _parse_args(
+            [
+                "--env",
+                "paper",
+                "--reason-filter",
+                "decommission",
+                "--reason-filter",
+                "reversal",
+            ]
+        )
+        assert args.reason_filter == ("decommission", "reversal")
+
+    def test_reason_filter_invalid_value_rejected(self) -> None:
+        with pytest.raises(SystemExit):
+            _parse_args(["--env", "paper", "--reason-filter", "bogus"])
+
+
+class TestCoerceBoolParam:
+    """The JSONB / string → bool coercion for STRATEGY_DECOMMISSIONED."""
+
+    def test_none_returns_false(self) -> None:
+        assert _coerce_bool_param(None) is False
+
+    def test_true_string_returns_true(self) -> None:
+        assert _coerce_bool_param("True") is True
+        assert _coerce_bool_param("true") is True
+        assert _coerce_bool_param("TRUE") is True
+        # Tolerates surrounding whitespace
+        assert _coerce_bool_param("  true  ") is True
+
+    def test_false_string_returns_false(self) -> None:
+        assert _coerce_bool_param("False") is False
+        assert _coerce_bool_param("false") is False
+        assert _coerce_bool_param("") is False
+        assert _coerce_bool_param("anything else") is False
+
+    def test_bool_passthrough(self) -> None:
+        assert _coerce_bool_param(True) is True
+        assert _coerce_bool_param(False) is False
+
+    def test_int_nonzero_is_true(self) -> None:
+        assert _coerce_bool_param(1) is True
+        assert _coerce_bool_param(0) is False
+
+
+class TestBuildV1ParametersExitFields:
+    """PR-B: STRATEGY_DECOMMISSIONED + EXIT_AUTO_APPROVE are now read from JSONB."""
+
+    def test_missing_exit_fields_default_to_false(self) -> None:
+        raw: dict[str, object] = {
+            k: v
+            for k, v in V1_DEFAULTS.items()
+            if k not in ("STRATEGY_DECOMMISSIONED", "EXIT_AUTO_APPROVE")
+        }
+        params = build_v1_parameters_from_dict(raw)
+        assert params.strategy_decommissioned is False
+        assert params.exit_auto_approve is False
+
+    def test_strategy_decommissioned_true_propagates(self) -> None:
+        raw: dict[str, object] = dict(V1_DEFAULTS)
+        raw["STRATEGY_DECOMMISSIONED"] = True
+        params = build_v1_parameters_from_dict(raw)
+        assert params.strategy_decommissioned is True
+
+    def test_strategy_decommissioned_string_true_propagates(self) -> None:
+        """JSONB driver may return strings for bool values written as strings."""
+        raw: dict[str, object] = dict(V1_DEFAULTS)
+        raw["STRATEGY_DECOMMISSIONED"] = "True"
+        params = build_v1_parameters_from_dict(raw)
+        assert params.strategy_decommissioned is True
+
+    def test_exit_auto_approve_true_propagates(self) -> None:
+        raw: dict[str, object] = dict(V1_DEFAULTS)
+        raw["EXIT_AUTO_APPROVE"] = True
+        params = build_v1_parameters_from_dict(raw)
+        assert params.exit_auto_approve is True
+
+    def test_default_v1_parameters_matches_safe_defaults(self) -> None:
+        """V1_DEFAULTS includes both flags as False (SAFE)."""
+        params = build_v1_parameters_from_dict(dict(V1_DEFAULTS))
+        assert params.strategy_decommissioned is False
+        assert params.exit_auto_approve is False
+
+
+class TestBuildExitSignalPostPayload:
+    """The exit-side payload shape mirrors LeanEventRequest's exit branch."""
+
+    def test_trend_flip_payload_has_required_exit_fields(self) -> None:
+        signal = _make_exit_signal(
+            indicators_snapshot={
+                "ma_fast": Decimal("96.00"),
+                "ma_slow": Decimal("92.00"),
+                "last_close": Decimal("95.00"),
+                "atr": Decimal("1.50"),
+            },
+        )
+        payload = build_exit_signal_post_payload(
+            exit_signal=signal,
+            session_date=date(2026, 5, 26),
+            equity=Decimal("20000.00"),
+            strategy_version=STRATEGY_VERSION_MARKER,
+            emitted_at_utc=datetime(2026, 5, 26, 21, 30, tzinfo=UTC),
+        )
+        assert payload["event_type"] == "signal_emitted"
+        assert payload["signal_type"] == "exit"
+        assert payload["direction"] == "flat"
+        assert payload["exit_reason"] == "trend_flip"
+        assert payload["prior_position_direction"] == "long"
+        assert payload["prior_position_quantity"] == 3
+        assert payload["target_contracts"] == 0
+        assert payload["decision_price"] == "100.00"
+        # paired_entry_market omitted for trend_flip
+        assert "paired_entry_market" not in payload
+        # sizing_trace carries the rationale + prior position state
+        sizing = payload["sizing_trace"]
+        assert sizing["lean_naive_sizing"]["exit_reason"] == "trend_flip"
+        assert sizing["lean_naive_sizing"]["prior_position_direction"] == "long"
+
+    def test_reversal_payload_carries_paired_entry_market(self) -> None:
+        signal = _make_exit_signal(
+            exit_reason="reversal",
+            paired_entry_market="MES",
+            indicators_snapshot={},  # reversal exits have no snapshot
+        )
+        payload = build_exit_signal_post_payload(
+            exit_signal=signal,
+            session_date=date(2026, 5, 26),
+            equity=Decimal("20000.00"),
+            strategy_version=STRATEGY_VERSION_MARKER,
+            emitted_at_utc=datetime(2026, 5, 26, 21, 30, tzinfo=UTC),
+        )
+        assert payload["exit_reason"] == "reversal"
+        assert payload["paired_entry_market"] == "MES"
+        # Empty indicators snapshot in sizing_trace
+        sizing = payload["sizing_trace"]
+        assert sizing["stage_0_universe"]["strategy_inputs"]["TLT"] == {}
+
+    def test_decommission_short_position(self) -> None:
+        signal = _make_exit_signal(
+            exit_reason="decommission",
+            prior_position_direction=Direction.SHORT,
+            prior_position_quantity=-5,
+        )
+        payload = build_exit_signal_post_payload(
+            exit_signal=signal,
+            session_date=date(2026, 5, 26),
+            equity=Decimal("20000.00"),
+            strategy_version=STRATEGY_VERSION_MARKER,
+            emitted_at_utc=datetime(2026, 5, 26, 21, 30, tzinfo=UTC),
+        )
+        assert payload["exit_reason"] == "decommission"
+        assert payload["prior_position_direction"] == "short"
+        assert payload["prior_position_quantity"] == -5
+
+
+class TestEmitExitSignalWithDedup:
+    """Exit-side per-signal orchestration mirrors emit_signal_with_dedup."""
+
+    @pytest.mark.asyncio
+    async def test_market_in_dedup_set_short_circuits(self) -> None:
+        signal = _make_exit_signal(market="TLT")
+        client = _StubAsyncClient(_StubResponse(202, {}))
+        outcome = await emit_exit_signal_with_dedup(
+            exit_signal=signal,
+            session_date=date(2026, 5, 26),
+            equity=Decimal("20000.00"),
+            already_emitted_exits=frozenset({"TLT"}),
+            strategy_version=STRATEGY_VERSION_MARKER,
+            emitted_at_utc=datetime(2026, 5, 26, 21, 30, tzinfo=UTC),
+            dry_run=False,
+            http_client=client,  # type: ignore[arg-type]
+            api_base_url=DEFAULT_API_BASE_URL,
+            bearer_token="fake-token",
+        )
+        assert outcome.status == "dedup_skipped"
+        assert client.posts == []
+
+    @pytest.mark.asyncio
+    async def test_dry_run_skips_post(self) -> None:
+        signal = _make_exit_signal(market="TLT")
+        client = _StubAsyncClient(_StubResponse(202, {}))
+        outcome = await emit_exit_signal_with_dedup(
+            exit_signal=signal,
+            session_date=date(2026, 5, 26),
+            equity=Decimal("20000.00"),
+            already_emitted_exits=frozenset(),
+            strategy_version=STRATEGY_VERSION_MARKER,
+            emitted_at_utc=datetime(2026, 5, 26, 21, 30, tzinfo=UTC),
+            dry_run=True,
+            http_client=client,  # type: ignore[arg-type]
+            api_base_url=DEFAULT_API_BASE_URL,
+            bearer_token="fake-token",
+        )
+        assert outcome.status == "dry_run_skipped"
+        assert client.posts == []
+
+    @pytest.mark.asyncio
+    async def test_post_succeeds_carries_signal_type_exit(self) -> None:
+        signal = _make_exit_signal(market="MES")
+        signal_id = str(uuid4())
+        audit_uuid = str(uuid4())
+        client = _StubAsyncClient(
+            _StubResponse(202, {"signal_id": signal_id, "audit_event_uuid": audit_uuid})
+        )
+        outcome = await emit_exit_signal_with_dedup(
+            exit_signal=signal,
+            session_date=date(2026, 5, 26),
+            equity=Decimal("20000.00"),
+            already_emitted_exits=frozenset(),
+            strategy_version=STRATEGY_VERSION_MARKER,
+            emitted_at_utc=datetime(2026, 5, 26, 21, 30, tzinfo=UTC),
+            dry_run=False,
+            http_client=client,  # type: ignore[arg-type]
+            api_base_url=DEFAULT_API_BASE_URL,
+            bearer_token="fake-token",
+        )
+        assert outcome.status == "posted"
+        assert outcome.signal_id == signal_id
+        # Verify the POSTed body carried signal_type='exit'
+        assert len(client.posts) == 1
+        sent = client.posts[0]["json"]
+        assert sent["signal_type"] == "exit"
+        assert sent["exit_reason"] == "trend_flip"
+        assert sent["prior_position_direction"] == "long"
+        assert sent["prior_position_quantity"] == 3
+
+
+class TestSummarizeExits:
+    """_summarize now folds exit_outcomes + exit_rejections into the same struct."""
+
+    def test_exit_outcomes_counted(self) -> None:
+        exit_outcomes = [
+            SignalPostOutcome(market="TLT", status="posted", http_status_code=202),
+            SignalPostOutcome(market="MES", status="dry_run_skipped"),
+            SignalPostOutcome(market="IEF", status="dedup_skipped"),
+            SignalPostOutcome(market="MNQ", status="post_failed", http_status_code=500),
+        ]
+        s = _summarize(
+            outcomes=[],
+            rejections=[],
+            history_missing_markets=(),
+            stale_markets=(),
+            exit_outcomes=exit_outcomes,
+            exit_rejections=[("TIP", RejectionReason.TREND_HOLDS)],
+        )
+        assert s.exits_generated == 4
+        assert s.exits_emitted == 1
+        assert s.exits_dedup_skipped == 1
+        assert s.exits_dry_run_skipped == 1
+        assert s.exits_post_failed == 1
+        assert s.exit_rejections_count == 1
+        assert s.exit_rejection_reasons["trend_holds"] == 1
+        # Unified post_failed: entry + exit failures sum
+        assert s.post_failed == 1
+
+    def test_unified_post_failed_sums_entry_plus_exit(self) -> None:
+        outcomes = [SignalPostOutcome(market="TLT", status="post_failed")]
+        exit_outcomes = [SignalPostOutcome(market="MES", status="post_failed")]
+        s = _summarize(
+            outcomes=outcomes,
+            rejections=[],
+            history_missing_markets=(),
+            stale_markets=(),
+            exit_outcomes=exit_outcomes,
+        )
+        assert s.post_failed == 2  # 1 entry + 1 exit
+        assert s.exits_post_failed == 1
+
+
+class TestAmainExitFlagMatrix:
+    """End-to-end: --exits-only / --entries-only flow through _amain."""
+
+    @pytest.mark.asyncio
+    async def test_entries_only_skips_exit_pipeline(
+        self,
+        lean_data_root_with_breakout: tuple[Path, date],
+    ) -> None:
+        """--entries-only: even if positions exist, no exit POSTs fire."""
+        data_root, as_of = lean_data_root_with_breakout
+        args = ParsedArgs(
+            env="paper",
+            session_date=as_of,
+            dry_run=True,
+            data_root=data_root,
+            api_base_url=DEFAULT_API_BASE_URL,
+            http_timeout_seconds=15.0,
+            allow_non_paper=False,
+            entries_only=True,
+        )
+        sf = _build_session_factory_for_context(risk_state="NORMAL")
+        client = _StubAsyncClient(_StubResponse(202, {}))
+        result = await _amain(
+            args,
+            session_factory_override=sf,
+            http_client_override=client,  # type: ignore[arg-type]
+            bearer_token_override=None,
+        )
+        assert result == EXIT_OK
+        # Dry-run + no real POSTs
+        assert client.posts == []
+
+    @pytest.mark.asyncio
+    async def test_exits_only_skips_entry_pipeline_emissions(
+        self,
+        lean_data_root_with_breakout: tuple[Path, date],
+    ) -> None:
+        """--exits-only: entry candidates evaluated but not POSTed."""
+        data_root, as_of = lean_data_root_with_breakout
+        args = ParsedArgs(
+            env="paper",
+            session_date=as_of,
+            dry_run=False,
+            data_root=data_root,
+            api_base_url=DEFAULT_API_BASE_URL,
+            http_timeout_seconds=15.0,
+            allow_non_paper=False,
+            exits_only=True,
+        )
+        sf = _build_session_factory_for_context(risk_state="NORMAL")
+        client = _StubAsyncClient(_StubResponse(202, {}))
+        result = await _amain(
+            args,
+            session_factory_override=sf,
+            http_client_override=client,  # type: ignore[arg-type]
+            bearer_token_override="fake-bearer",
+        )
+        # No held positions in the fixture → 0 entries, 0 exits → exit_ok.
+        # The point is no entries are POSTed even though the breakout fires.
+        assert result == EXIT_OK
+        # Zero entry POSTs (no positions = no exits either, but the key
+        # invariant is no entries on --exits-only)
+        entry_posts = [p for p in client.posts if p["json"].get("signal_type") == "entry"]
+        assert entry_posts == []
+
+
+def _emit_held_position_bars(start: date, n_bars: int) -> list[tuple[date, Decimal]]:
+    """Emit bars that DON'T fire a breakout but DO satisfy MA_SLOW=200.
+
+    Used in tests that need positions held (mocked) without the entry
+    pipeline firing breakouts at the same time. Sideways trajectory.
+    """
+    base = Decimal("100")
+    out: list[tuple[date, Decimal]] = []
+    for i in range(n_bars):
+        # Drift around base; small noise; no breakout
+        wave = Decimal(str((i % 7 - 3) * 0.1))
+        out.append((start + timedelta(days=i), base + wave))
+    return out
+
+
+@pytest.fixture
+def lean_data_root_sideways(tmp_path: Path) -> tuple[Path, date]:
+    """Bars that won't trigger entries — useful for isolating exit tests."""
+    n_bars = 250
+    start = date(2025, 9, 1)
+    bars = _emit_held_position_bars(start, n_bars)
+    as_of = bars[-1][0]
+    for ticker in ("TLT", "IEF", "SHY", "TIP"):
+        _write_etf_bar_zip(
+            tmp_path / "equity" / "usa" / "daily" / f"{ticker.lower()}.zip",
+            ticker=ticker,
+            bars=bars,
+        )
+    futures = [
+        ("MES", "cme"),
+        ("MNQ", "cme"),
+        ("MYM", "cbot"),
+        ("M2K", "cme"),
+        ("MGC", "comex"),
+        ("MBT", "cme"),
+    ]
+    for ticker, market_dir in futures:
+        _write_futures_universe_files(
+            tmp_path / "future" / market_dir / "universes" / ticker.lower(),
+            bars=bars,
+        )
+    return tmp_path, as_of
+
+
+class TestAmainKillSwitchCeremony:
+    """STRATEGY_DECOMMISSIONED=True drives a decommission CLOSE per held position.
+
+    This exercises the operator's kill-switch ceremony end-to-end via the
+    operator tool (the equivalent path for LEAN runs inside a container +
+    is not testable directly here per the mypy/ruff exclusion).
+    """
+
+    @pytest.mark.asyncio
+    async def test_decommission_emits_exit_for_each_held(
+        self,
+        lean_data_root_sideways: tuple[Path, date],
+    ) -> None:
+        data_root, as_of = lean_data_root_sideways
+        args = ParsedArgs(
+            env="paper",
+            session_date=as_of,
+            dry_run=False,
+            data_root=data_root,
+            api_base_url=DEFAULT_API_BASE_URL,
+            http_timeout_seconds=15.0,
+            allow_non_paper=False,
+        )
+        account_id = uuid4()
+        # Two held positions — both should emit a decommission exit.
+        # MES held LONG +2, TLT held SHORT -10. opened_at_utc set well
+        # before as_of so MIN_HOLDING_DAYS is satisfied (though
+        # decommission overrides that gate anyway).
+        position_rows = [
+            SimpleNamespace(
+                market="/MES",
+                quantity=2,
+                avg_cost=Decimal("5000"),
+                opened_at_utc=datetime(2026, 4, 1, 12, 0, tzinfo=UTC),
+            ),
+            SimpleNamespace(
+                market="TLT",
+                quantity=-10,
+                avg_cost=Decimal("85"),
+                opened_at_utc=datetime(2026, 4, 1, 12, 0, tzinfo=UTC),
+            ),
+        ]
+        # parameter_sets row carries STRATEGY_DECOMMISSIONED=True
+        param_row = SimpleNamespace(parameters={**V1_DEFAULTS, "STRATEGY_DECOMMISSIONED": True})
+        query_results: dict[str, Any] = {
+            "FROM accounts": _result_one(SimpleNamespace(id=account_id)),
+            "FROM risk_state": _result_one(SimpleNamespace(state="NORMAL")),
+            "FROM parameter_sets": _result_one(param_row),
+            "FROM positions_current": _result_many(position_rows),
+            "signal_type = 'exit'": _result_many([]),
+            "FROM signals": _result_many([]),
+            "FROM balances": _result_one(SimpleNamespace(net_liquidation=20000)),
+        }
+
+        def sf() -> _FakeSession:
+            return _FakeSession(query_results=query_results)
+
+        client = _StubAsyncClient(
+            _StubResponse(
+                202,
+                {"signal_id": str(uuid4()), "audit_event_uuid": str(uuid4())},
+            )
+        )
+        result = await _amain(
+            args,
+            session_factory_override=sf,
+            http_client_override=client,  # type: ignore[arg-type]
+            bearer_token_override="fake-bearer",
+        )
+        assert result == EXIT_OK
+        # Both held markets received a decommission exit POST
+        exit_posts = [p["json"] for p in client.posts if p["json"].get("signal_type") == "exit"]
+        exit_markets = {p["market"] for p in exit_posts}
+        assert exit_markets == {"/MES", "TLT"}
+        for p in exit_posts:
+            assert p["exit_reason"] == "decommission"
+            assert p["direction"] == "flat"
+            assert p["target_contracts"] == 0
+        # MES prior_position_direction='long', qty=2; TLT short, qty=-10
+        by_market = {p["market"]: p for p in exit_posts}
+        assert by_market["/MES"]["prior_position_direction"] == "long"
+        assert by_market["/MES"]["prior_position_quantity"] == 2
+        assert by_market["TLT"]["prior_position_direction"] == "short"
+        assert by_market["TLT"]["prior_position_quantity"] == -10
+
+    @pytest.mark.asyncio
+    async def test_decommission_with_reason_filter_only_decommission_emits(
+        self,
+        lean_data_root_sideways: tuple[Path, date],
+    ) -> None:
+        """--reason-filter=decommission lets decommission exits through;
+        a non-matching reason in the filter would block them."""
+        data_root, as_of = lean_data_root_sideways
+        args = ParsedArgs(
+            env="paper",
+            session_date=as_of,
+            dry_run=False,
+            data_root=data_root,
+            api_base_url=DEFAULT_API_BASE_URL,
+            http_timeout_seconds=15.0,
+            allow_non_paper=False,
+            reason_filter=("reversal",),  # decommission NOT in filter
+        )
+        account_id = uuid4()
+        position_rows = [
+            SimpleNamespace(
+                market="/MES",
+                quantity=2,
+                avg_cost=Decimal("5000"),
+                opened_at_utc=datetime(2026, 4, 1, 12, 0, tzinfo=UTC),
+            ),
+        ]
+        param_row = SimpleNamespace(parameters={**V1_DEFAULTS, "STRATEGY_DECOMMISSIONED": True})
+        query_results: dict[str, Any] = {
+            "FROM accounts": _result_one(SimpleNamespace(id=account_id)),
+            "FROM risk_state": _result_one(SimpleNamespace(state="NORMAL")),
+            "FROM parameter_sets": _result_one(param_row),
+            "FROM positions_current": _result_many(position_rows),
+            "signal_type = 'exit'": _result_many([]),
+            "FROM signals": _result_many([]),
+            "FROM balances": _result_one(SimpleNamespace(net_liquidation=20000)),
+        }
+
+        def sf() -> _FakeSession:
+            return _FakeSession(query_results=query_results)
+
+        client = _StubAsyncClient(_StubResponse(202, {}))
+        result = await _amain(
+            args,
+            session_factory_override=sf,
+            http_client_override=client,  # type: ignore[arg-type]
+            bearer_token_override="fake-bearer",
+        )
+        assert result == EXIT_OK
+        # decommission exits filtered out by --reason-filter=reversal
+        exit_posts = [p["json"] for p in client.posts if p["json"].get("signal_type") == "exit"]
+        assert exit_posts == []
+
+
+class TestExitDedupReEmitsAfterRejection:
+    """Status-filtered dedup re-emits exits rejected/cancelled/expired."""
+
+    @pytest.mark.asyncio
+    async def test_exit_already_in_pending_blocks_re_emit(
+        self,
+        lean_data_root_sideways: tuple[Path, date],
+    ) -> None:
+        """An exit already in non-terminal status blocks re-emission."""
+        data_root, as_of = lean_data_root_sideways
+        args = ParsedArgs(
+            env="paper",
+            session_date=as_of,
+            dry_run=False,
+            data_root=data_root,
+            api_base_url=DEFAULT_API_BASE_URL,
+            http_timeout_seconds=15.0,
+            allow_non_paper=False,
+        )
+        account_id = uuid4()
+        position_rows = [
+            SimpleNamespace(
+                market="/MES",
+                quantity=2,
+                avg_cost=Decimal("5000"),
+                opened_at_utc=datetime(2026, 4, 1, 12, 0, tzinfo=UTC),
+            ),
+        ]
+        param_row = SimpleNamespace(parameters={**V1_DEFAULTS, "STRATEGY_DECOMMISSIONED": True})
+        # exit-side dedup query returns /MES — the prior exit is pending/
+        # approved/working etc., so the tool MUST NOT re-emit.
+        query_results: dict[str, Any] = {
+            "FROM accounts": _result_one(SimpleNamespace(id=account_id)),
+            "FROM risk_state": _result_one(SimpleNamespace(state="NORMAL")),
+            "FROM parameter_sets": _result_one(param_row),
+            "FROM positions_current": _result_many(position_rows),
+            "signal_type = 'exit'": _result_many([SimpleNamespace(market="/MES")]),
+            "FROM signals": _result_many([]),
+            "FROM balances": _result_one(SimpleNamespace(net_liquidation=20000)),
+        }
+
+        def sf() -> _FakeSession:
+            return _FakeSession(query_results=query_results)
+
+        client = _StubAsyncClient(_StubResponse(202, {}))
+        result = await _amain(
+            args,
+            session_factory_override=sf,
+            http_client_override=client,  # type: ignore[arg-type]
+            bearer_token_override="fake-bearer",
+        )
+        assert result == EXIT_OK
+        # No exit POST because /MES dedup matched
+        exit_posts = [p["json"] for p in client.posts if p["json"].get("signal_type") == "exit"]
+        assert exit_posts == []
+
+    @pytest.mark.asyncio
+    async def test_dedup_query_filters_by_signal_type_and_status(
+        self,
+        lean_data_root_sideways: tuple[Path, date],
+    ) -> None:
+        """Verify the SQL issued by the exit dedup has signal_type='exit'
+        AND status NOT IN ('rejected','cancelled','expired') predicates.
+        """
+        data_root, as_of = lean_data_root_sideways
+        args = ParsedArgs(
+            env="paper",
+            session_date=as_of,
+            dry_run=True,
+            data_root=data_root,
+            api_base_url=DEFAULT_API_BASE_URL,
+            http_timeout_seconds=15.0,
+            allow_non_paper=False,
+        )
+        account_id = uuid4()
+        captured_queries: list[str] = []
+
+        class _CapturingFakeSession(_FakeSession):
+            async def execute(self, statement: Any, params: dict[str, Any] | None = None) -> Any:
+                captured_queries.append(str(statement))
+                return await super().execute(statement, params)
+
+        query_results: dict[str, Any] = {
+            "FROM accounts": _result_one(SimpleNamespace(id=account_id)),
+            "FROM risk_state": _result_one(SimpleNamespace(state="NORMAL")),
+            "FROM parameter_sets": _result_one(None),
+            "FROM positions_current": _result_many([]),
+            "signal_type = 'exit'": _result_many([]),
+            "FROM signals": _result_many([]),
+            "FROM balances": _result_one(None),
+        }
+
+        def sf() -> _CapturingFakeSession:
+            return _CapturingFakeSession(query_results=query_results)
+
+        result = await _amain(
+            args,
+            session_factory_override=sf,
+            http_client_override=MagicMock(),
+            bearer_token_override=None,
+        )
+        assert result == EXIT_OK
+        # At least one captured query carries the exit-side predicates
+        exit_dedup_queries = [q for q in captured_queries if "signal_type = 'exit'" in q]
+        assert exit_dedup_queries, "Expected an exit-side dedup query with signal_type filter"
+        # Status filter is also present in the dedup query
+        assert any(
+            "rejected" in q and "cancelled" in q and "expired" in q for q in exit_dedup_queries
+        )
 
 
 # ---------------------------------------------------------------------------

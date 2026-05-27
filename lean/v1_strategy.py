@@ -111,6 +111,7 @@ from strategies.v1_trend_following.parameters import (  # type: ignore[import-no
 from strategies.v1_trend_following.signals import (  # type: ignore[import-not-found]
     Bar,
     BarSeries,
+    CandidateSignal,
     Direction,
     Position,
 )
@@ -134,6 +135,13 @@ PHASE1_ETFS = ("TLT", "IEF", "SHY", "TIP")
 
 # Parameter keys + V1_DEFAULTS fallbacks (kept in sync with
 # strategies/v1_trend_following/parameters.py V1_DEFAULTS).
+#
+# PR-B (2026-05-26): STRATEGY_DECOMMISSIONED + EXIT_AUTO_APPROVE added so an
+# operator UPDATE to parameter_sets.parameters propagates into the daily
+# LEAN cycle. Both default to "False" (the SAFE value) at launch per
+# exit-pipeline-design.md §L4/L6. The strings round-trip cleanly through
+# LEAN's parameter map: "True"/"False" → bool(...) via the "True" literal
+# check in the lazy V1Parameters builder.
 V1_PARAMETER_DEFAULTS = {
     "LOOKBACK_DAYS_DONCHIAN": "60",
     "MA_FAST_DAYS": "50",
@@ -146,6 +154,8 @@ V1_PARAMETER_DEFAULTS = {
     "INSTRUMENT_VOL_LOOKBACK_DAYS": "60",
     "ROLL_DAYS_BEFORE_EXPIRY": "5",
     "STARTING_CASH_USD": "100000",
+    "STRATEGY_DECOMMISSIONED": "False",
+    "EXIT_AUTO_APPROVE": "False",
 }
 
 
@@ -165,6 +175,23 @@ _API_TIMEOUT_SECONDS = 10.0
 # Phase 1 ceremony because `_derive_strategy_hash` sha1's any non-40-hex
 # suffix into a deterministic hash, preserving audit-chain integrity.
 _STRATEGY_VERSION_DEFAULT = f"{STRATEGY_NAME}@phase1-pivot-d"
+
+
+def _coerce_bool_param(value) -> bool:  # noqa: ANN001 — LEAN dict[str, str] surface, untyped on purpose
+    """LEAN parameter-map -> bool for STRATEGY_DECOMMISSIONED / EXIT_AUTO_APPROVE.
+
+    LEAN's ``get_parameter`` returns strings. PR-B (2026-05-26) added two
+    bool flags whose SAFE default is False (per exit-pipeline-design.md
+    §L4 + §L6). We treat ANY value other than the literal ``"True"``
+    (case-insensitive) as False - defensive: typos / blank-strings / None
+    all collapse to the safer default rather than silently enabling the
+    kill-switch or auto-approve. A real bool input is preserved as-is.
+    """
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() == "true"
 
 
 class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]  # noqa: F405
@@ -531,7 +558,7 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
             },
         )
 
-        # Step 7: emit each signal.
+        # Step 7: emit each entry signal.
         for signal in result.signals:
             target_contracts = self._naive_target_contracts(equity=equity)
             if target_contracts <= 0:
@@ -557,9 +584,191 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
                     "decision_price": str(signal.decision_price),
                     "sizing_trace": sizing_trace,
                     "strategy_version": self._strategy_version_str,
+                    # PR-B (2026-05-26): explicit entry discriminator. The
+                    # api defaults to 'entry' for backwards compat with
+                    # pre-PR-B emitters, but we send it explicitly so the
+                    # value round-trips cleanly into the audit payload +
+                    # the signals row + downstream SSE events.
+                    "signal_type": "entry",
                 },
             )
+
+        # Step 8 (PR-B): run the exit pipeline and emit each exit candidate.
+        # Independent try/except so an exit-side failure doesn't suppress
+        # already-emitted entry signals (and vice versa). The exit pipeline
+        # reads the entry-side result for reversal coupling (paired-emission
+        # per design §Q1).
+        self._run_and_emit_exits(
+            strategy=strategy,
+            active_universe=active_universe,
+            current_positions=current_positions,
+            entry_candidates=result.signals,
+            session_date=session_date,
+            equity=equity,
+        )
         return
+
+    def _run_and_emit_exits(
+        self,
+        *,
+        strategy: V1TrendFollowing,
+        active_universe: dict,  # type: ignore[type-arg]  -- LEAN runtime; mypy excluded
+        current_positions: dict,  # type: ignore[type-arg]
+        entry_candidates: tuple,  # type: ignore[type-arg]  -- tuple[CandidateSignal,...]
+        session_date,  # noqa: ANN001  -- date; LEAN runtime
+        equity,  # noqa: ANN001  -- Decimal; LEAN runtime
+    ) -> None:
+        """Run ``generate_exit_candidates`` and POST each exit per design §6.1.
+
+        Independent of the entry path. Failure here does NOT roll back
+        entry POSTs (and vice versa) — each exit POST is best-effort via
+        ``_post_event`` so a single market's exit can't suppress others.
+        Reversal candidates carry ``paired_entry_market`` so the dispatcher
+        can serialize the paired EXIT-then-ENTRY sequence per §11 R2.
+        """
+        try:
+            exit_result = strategy.generate_exit_candidates(
+                active_universe=active_universe,
+                current_positions=current_positions,
+                as_of_session_date=session_date,
+                entry_candidates=entry_candidates,
+            )
+        except Exception as exc:  # noqa: BLE001 -- log + skip; don't crash the algorithm
+            self.log(
+                f"v1_generate_exit_candidates_failed session_date={session_date} exc={exc!r}"
+            )
+            return
+
+        # Per-rejection structured log lines for forensic visibility
+        # (mirror the entry-side pattern earlier in this cycle). Each
+        # exit-side rejection counts the markets where (b)/(c) condition
+        # didn't trip — TREND_HOLDS / MIN_HOLDING_NOT_REACHED /
+        # INSUFFICIENT_BAR_HISTORY. Useful for diagnosing "why didn't we
+        # exit /M2K today" without inspecting the strategy code.
+        exit_rejection_reason_counts: dict[str, int] = {}
+        for rejected_market, reason in exit_result.rejections:
+            reason_str = reason.value
+            exit_rejection_reason_counts[reason_str] = (
+                exit_rejection_reason_counts.get(reason_str, 0) + 1
+            )
+            self.log(
+                f"v1_exit_rejected session_date={session_date} "
+                f"market={rejected_market} reason={reason_str}"
+            )
+
+        exit_count = len(exit_result.signals)
+        self.log(
+            f"v1_exits_generated session_date={session_date} "
+            f"exits_emitted_count={exit_count} "
+            f"exit_rejections_count={len(exit_result.rejections)} "
+            f"exit_reasons={exit_rejection_reason_counts}"
+        )
+
+        for exit_signal in exit_result.signals:
+            payload = self._build_exit_signal_payload(
+                exit_signal=exit_signal,
+                session_date=session_date,
+                equity=equity,
+            )
+            self._post_event("signal_emitted", extra=payload)
+
+    def _build_exit_signal_payload(
+        self,
+        *,
+        exit_signal: CandidateSignal,
+        session_date,  # noqa: ANN001  -- date
+        equity,  # noqa: ANN001  -- Decimal
+    ) -> dict:
+        """Assemble the LeanEventRequest body for an exit candidate.
+
+        The api's route-side validation requires market / direction /
+        decision_price / sizing_trace / strategy_version + the exit fields
+        (exit_reason / prior_position_direction / prior_position_quantity).
+        target_contracts is OPTIONAL for exits — the dispatcher computes
+        the close qty at place-order time per design §Q3 — but we still
+        send 0 explicitly to keep the signals row's target_contracts column
+        well-defined.
+        """
+        prior_dir = exit_signal.prior_position_direction
+        prior_qty = exit_signal.prior_position_quantity
+        payload: dict = {
+            "session_date_et": session_date.isoformat(),
+            "equity_usd": str(equity),
+            "live_mode": bool(self.live_mode),
+            "market": exit_signal.market,
+            # Exit-direction sentinel is FLAT — see design §4 + §Q3. The
+            # dispatcher resolves the actual buy/sell side from the prior
+            # position at place-order time.
+            "direction": exit_signal.direction.value,
+            "target_contracts": 0,
+            "decision_price": str(exit_signal.decision_price),
+            "sizing_trace": self._build_exit_sizing_trace(
+                exit_signal=exit_signal,
+                equity=equity,
+            ),
+            "strategy_version": self._strategy_version_str,
+            "signal_type": "exit",
+            "exit_reason": exit_signal.exit_reason,
+            "prior_position_direction": prior_dir.value if prior_dir is not None else None,
+            "prior_position_quantity": prior_qty,
+        }
+        if exit_signal.paired_entry_market is not None:
+            payload["paired_entry_market"] = exit_signal.paired_entry_market
+        return payload
+
+    def _build_exit_sizing_trace(
+        self,
+        *,
+        exit_signal: CandidateSignal,
+        equity,  # noqa: ANN001  -- Decimal
+    ) -> dict:
+        """Stage 0-shaped trace for exits (Decimal-as-string per A05).
+
+        Distinct from the entry-side ``_build_minimal_sizing_trace``
+        because exit candidates DO NOT carry the Donchian / Hurst keys
+        (per CandidateSignal docstring: indicators_snapshot is populated
+        only when a snapshot was computed — trend_flip exits — and is
+        empty for decommission / reversal exits). We surface the
+        exit_reason + prior_position state in lean_naive_sizing so the
+        operator-facing /signals page + the audit_log payload have the
+        forensic context next to the size decision.
+        """
+        snapshot = exit_signal.indicators_snapshot or {}
+        # Coerce snapshot values to strings (Decimal → str per A05) so the
+        # JSONB column doesn't carry mixed types. Empty snapshot stays as
+        # an empty dict on the wire.
+        strategy_inputs: dict = {
+            exit_signal.market: {k: str(v) for k, v in snapshot.items()}
+        }
+        prior_dir = exit_signal.prior_position_direction
+        return {
+            "schema_version": 1,
+            "stage_0_universe": {
+                "active_markets": [exit_signal.market],
+                "excluded": [],
+                "strategy_inputs": strategy_inputs,
+            },
+            "lean_naive_sizing": {
+                # Exits never carry a target_contracts the strategy can
+                # justify — the dispatcher closes the full prior position.
+                # 0 is the sentinel; ``lean_naive_sizing.rationale`` makes
+                # the intent explicit so the field can't be silently
+                # misread as "size 0 contracts" by a future reader.
+                "target_contracts": 0,
+                "equity_usd": str(equity),
+                "rationale": (
+                    "Exit signal — full close of prior position. Dispatcher "
+                    "computes actual close qty from current positions at "
+                    "place-order time per exit-pipeline-design §Q3."
+                ),
+                "exit_reason": exit_signal.exit_reason,
+                "prior_position_direction": (
+                    prior_dir.value if prior_dir is not None else None
+                ),
+                "prior_position_quantity": exit_signal.prior_position_quantity,
+                "paired_entry_market": exit_signal.paired_entry_market,
+            },
+        }
 
     # ------------------------------------------------------------------
     # Strategy plumbing helpers (Pivot-PR-D)
@@ -571,18 +780,17 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         Lazy — built on the first `on_daily_signal_cycle` rather than in
         `initialize()` so a malformed parameter is surfaced as a cycle log
         line (after warmup) instead of crashing the algorithm at boot.
+
+        PR-B (2026-05-26): STRATEGY_DECOMMISSIONED + EXIT_AUTO_APPROVE are
+        now read from the parameter map (default "False"). String→bool
+        coercion uses the literal "True" check (case-insensitive) — LEAN's
+        parameter map serializes every value as a string. Any value other
+        than "True"/"true" is treated as False (defensive: the SAFE default
+        for both flags is False per design §L4 + §L6).
         """
         if self._v1_parameters is not None:
             return self._v1_parameters
         raw = self._params
-        # TODO PR-B: read STRATEGY_DECOMMISSIONED + EXIT_AUTO_APPROVE from raw
-        # so an operator UPDATE to parameter_sets.parameters propagates into
-        # the daily LEAN cycle. Until then both fall back to V1Parameters
-        # dataclass defaults (False/False) and the kill-switch ceremony
-        # documented in Docs/exit-pipeline-design.md §11 R6 is silently inert
-        # via this entrypoint. Exit-emission wiring (generate_exit_candidates
-        # call) also lands with PR-B; reading the flag here without that
-        # would be a half-fix.
         self._v1_parameters = V1Parameters(
             lookback_days_donchian=int(raw["LOOKBACK_DAYS_DONCHIAN"]),
             ma_fast_days=int(raw["MA_FAST_DAYS"]),
@@ -594,6 +802,8 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
             vol_target_pct_annual=Decimal(str(raw["VOL_TARGET_PCT_ANNUAL"])),
             instrument_vol_lookback_days=int(raw["INSTRUMENT_VOL_LOOKBACK_DAYS"]),
             roll_days_before_expiry=int(raw["ROLL_DAYS_BEFORE_EXPIRY"]),
+            strategy_decommissioned=_coerce_bool_param(raw.get("STRATEGY_DECOMMISSIONED")),
+            exit_auto_approve=_coerce_bool_param(raw.get("EXIT_AUTO_APPROVE")),
         )
         return self._v1_parameters
 

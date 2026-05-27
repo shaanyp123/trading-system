@@ -79,7 +79,11 @@ _ET: Final[ZoneInfo] = ZoneInfo("America/New_York")
 
 
 #: Required keys in the QC ``signal_emitted`` payload per backend-spec
-#: §4.5.1. Missing → :class:`SignalIngestError`.
+#: §4.5.1. Missing → :class:`SignalIngestError`. ``signal_type`` is NOT
+#: required at the payload boundary because pre-PR-B emitters (QC adapter
+#: backfill paths + old LEAN images) don't include it; we default to
+#: ``'entry'`` for backwards compatibility. See exit-pipeline-design.md
+#: §Q2 (discriminator approach).
 _REQUIRED_PAYLOAD_KEYS: Final[frozenset[str]] = frozenset(
     {"market", "direction", "target_contracts", "decision_price", "sizing_trace"}
 )
@@ -88,6 +92,17 @@ _REQUIRED_PAYLOAD_KEYS: Final[frozenset[str]] = frozenset(
 #: Locked directions per the signals.direction CHECK constraint
 #: (alembic 0002:138).
 _VALID_DIRECTIONS: Final[frozenset[str]] = frozenset({"long", "short", "flat"})
+
+#: PR-B exit-pipeline discriminator values. Mirrors the ``signal_type``
+#: Literal on the strategy-side CandidateSignal + the LeanEventRequest
+#: schema. The signals.signal_type column is free TEXT (no DB CHECK
+#: constraint per backend-spec §3.3), so widening here is the canonical
+#: gate. See exit-pipeline-design.md §5.2 + §Q2.
+_VALID_SIGNAL_TYPES: Final[frozenset[str]] = frozenset({"entry", "exit"})
+
+#: PR-B exit-reason values. Mirrors the strategy-side Literal at
+#: ``strategies/v1_trend_following/strategy.py::generate_exit_candidates``.
+_VALID_EXIT_REASONS: Final[frozenset[str]] = frozenset({"reversal", "trend_flip", "decommission"})
 
 
 class SignalIngestError(ValueError):
@@ -169,6 +184,88 @@ async def ingest_signal_emitted(
             f"sizing_trace must be object, got {type(sizing_trace_raw).__name__}"
         )
 
+    # ---- PR-B exit-pipeline discriminator + companion fields ----
+    # signal_type defaults to 'entry' for backwards compat with pre-PR-B
+    # emitters (QC adapter backfill + legacy LEAN images that don't include
+    # the field). Exits carry exit_reason + prior_position_* + optional
+    # paired_entry_market per design §5.2 / §Q2.
+    signal_type_raw = payload.get("signal_type", "entry")
+    if signal_type_raw not in _VALID_SIGNAL_TYPES:
+        raise SignalIngestError(
+            f"signal_type must be one of {sorted(_VALID_SIGNAL_TYPES)}, got {signal_type_raw!r}"
+        )
+    signal_type: str = signal_type_raw
+
+    exit_reason: str | None = None
+    prior_position_direction: str | None = None
+    prior_position_quantity: int | None = None
+    paired_entry_market: str | None = None
+    if signal_type == "exit":
+        exit_reason_raw = payload.get("exit_reason")
+        if exit_reason_raw is None:
+            raise SignalIngestError(
+                f"signal_type='exit' requires exit_reason (one of {sorted(_VALID_EXIT_REASONS)})"
+            )
+        if exit_reason_raw not in _VALID_EXIT_REASONS:
+            raise SignalIngestError(
+                f"exit_reason must be one of {sorted(_VALID_EXIT_REASONS)}, got {exit_reason_raw!r}"
+            )
+        exit_reason = exit_reason_raw
+
+        prior_dir_raw = payload.get("prior_position_direction")
+        if prior_dir_raw is None:
+            raise SignalIngestError("signal_type='exit' requires prior_position_direction")
+        if prior_dir_raw not in _VALID_DIRECTIONS or prior_dir_raw == "flat":
+            # 'flat' is in _VALID_DIRECTIONS as a column value but is
+            # semantically invalid as a prior position for an exit (nothing
+            # to close). Reject loudly so an emitter bug surfaces here
+            # rather than landing a row that the dispatcher can't act on.
+            raise SignalIngestError(
+                "prior_position_direction must be 'long' or 'short' for "
+                f"signal_type='exit'; got {prior_dir_raw!r}"
+            )
+        prior_position_direction = prior_dir_raw
+
+        prior_qty_raw = payload.get("prior_position_quantity")
+        if prior_qty_raw is None:
+            raise SignalIngestError("signal_type='exit' requires prior_position_quantity")
+        if not isinstance(prior_qty_raw, int) or isinstance(prior_qty_raw, bool):
+            raise SignalIngestError(
+                f"prior_position_quantity must be int, got {type(prior_qty_raw).__name__}"
+            )
+        if prior_qty_raw == 0:
+            raise SignalIngestError(
+                "prior_position_quantity must be non-zero for signal_type='exit'"
+            )
+        prior_position_quantity = prior_qty_raw
+
+        paired_raw = payload.get("paired_entry_market")
+        if paired_raw is not None:
+            if not isinstance(paired_raw, str) or not paired_raw:
+                raise SignalIngestError(
+                    f"paired_entry_market must be non-empty string when set, got {paired_raw!r}"
+                )
+            if exit_reason != "reversal":
+                raise SignalIngestError(
+                    "paired_entry_market may only be set when "
+                    f"exit_reason='reversal'; got exit_reason={exit_reason!r}"
+                )
+            paired_entry_market = paired_raw
+    else:
+        # signal_type='entry' — fields belonging to exits must not appear.
+        for forbidden in (
+            "exit_reason",
+            "prior_position_direction",
+            "prior_position_quantity",
+            "paired_entry_market",
+        ):
+            if payload.get(forbidden) is not None:
+                raise SignalIngestError(
+                    f"{forbidden!r} is only valid for signal_type='exit'; got "
+                    f"signal_type={signal_type!r} with {forbidden}="
+                    f"{payload.get(forbidden)!r}"
+                )
+
     # Build the AUDIT payload — must be A05-clean (no floats). Convert
     # the entire payload's money-shaped fields to Decimal via _convert_floats.
     audit_payload: dict[str, Any] = {
@@ -180,7 +277,14 @@ async def ingest_signal_emitted(
         "target_contracts": target_contracts,
         "decision_price": decision_price,
         "sizing_trace": _convert_floats_to_decimal(sizing_trace_raw),
+        "signal_type": signal_type,
     }
+    if signal_type == "exit":
+        audit_payload["exit_reason"] = exit_reason
+        audit_payload["prior_position_direction"] = prior_position_direction
+        audit_payload["prior_position_quantity"] = prior_position_quantity
+        if paired_entry_market is not None:
+            audit_payload["paired_entry_market"] = paired_entry_market
     # Sanity check: must JCS-serialize without raising A05.
     try:
         jcs_serialize(audit_payload)
@@ -191,6 +295,8 @@ async def ingest_signal_emitted(
         service_name="qc_adapter",
         market=market,
         direction=direction,
+        signal_type=signal_type,
+        exit_reason=exit_reason,
         qc_sequence_no=event.sequence_no,
     )
 
@@ -223,6 +329,12 @@ async def ingest_signal_emitted(
     )
 
     # Step 3: INSERT the signals row in a fresh session/transaction.
+    #
+    # PR-B (2026-05-26): signal_type is no longer hard-coded "entry" — it
+    # comes from the payload (default "entry" for backwards compat per
+    # _VALID_SIGNAL_TYPES). The exit-pipeline emit path lands rows with
+    # signal_type='exit' here; the dispatcher reads this discriminator to
+    # branch entry vs exit dispatch logic.
     async with session_factory() as insert_session:
         async with insert_session.begin():
             signal_row = qc_db.SignalInsertRow(
@@ -232,7 +344,7 @@ async def ingest_signal_emitted(
                 emitted_at_utc=event.source_clock_ts,
                 session_date=_session_date_from_utc(event.source_clock_ts),
                 direction=direction,
-                signal_type="entry",
+                signal_type=signal_type,
                 strategy_hash=_derive_strategy_hash(event.qc_algorithm_version),
                 parameter_set_hash=_derive_parameter_set_hash(payload),
                 slippage_calibration_version_id=slippage_version_id,
