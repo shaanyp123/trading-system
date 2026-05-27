@@ -199,18 +199,24 @@ def _validate_amount(amount: float) -> tuple[str | None, str | None]:
         amount_dec = Decimal(str(amount))
     except (ArithmeticError, InvalidOperation):
         return None, f"Amount `{amount}` is not a valid number."
-    if amount_dec <= 0:
-        return None, f"Amount must be positive; got `{amount_dec}`."
+    # NaN / Infinity check MUST come before the <= 0 comparison —
+    # comparisons against Decimal NaN raise InvalidOperation (NaN's
+    # ordering is undefined). is_nan() / is_infinite() are safe predicates.
     if amount_dec.is_nan() or amount_dec.is_infinite():
         return None, f"Amount `{amount}` is NaN or Infinity."
-    # Render at most 2 decimals (USD cents). Trailing-zero-strip the
-    # rendering so '25000' stays clean, '25000.50' keeps the cents.
+    if amount_dec <= 0:
+        return None, f"Amount must be positive; got `{amount_dec}`."
+    # Quantize to 2 decimals (USD cents), then render. Whole-dollar
+    # amounts strip the trailing ".00" so 25000 displays as "25000"
+    # (not "25000.00"); fractional amounts preserve both cents digits
+    # so 25000.5 displays as "25000.50" (operator-typed exact-half-
+    # dollar shouldn't lose its zero). Use plain f-string instead of
+    # ``.normalize()`` to avoid scientific-notation edge cases at
+    # large magnitudes.
     quantized = amount_dec.quantize(Decimal("0.01"))
-    amount_str = str(quantized.normalize()) if quantized != 0 else "0"
-    if "E" in amount_str:
-        # Scientific notation can sneak in from .normalize() on integer
-        # Decimal — render plain.
-        amount_str = f"{quantized:f}"
+    amount_str = f"{quantized:.2f}"
+    if amount_str.endswith(".00"):
+        amount_str = amount_str[:-3]
     return amount_str, None
 
 

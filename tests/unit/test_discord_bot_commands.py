@@ -37,6 +37,7 @@ from discord import app_commands
 from services.discord_bot.api_client import (
     ApiClient,
     ApiClientHTTPError,
+    CapitalEventInvokeResponse,
     HealthCheck,
     HealthResponse,
     KillSwitchInvokeResponse,
@@ -44,6 +45,12 @@ from services.discord_bot.api_client import (
     SignalApproveResponse,
 )
 from services.discord_bot.commands.approve import ApproveConfirmView, register_approve
+from services.discord_bot.commands.capital import (
+    CapitalEventConfirmView,
+    _validate_amount,
+    _validate_reason,
+    register_capital_event_commands,
+)
 from services.discord_bot.commands.halt import HaltConfirmView, register_halt
 from services.discord_bot.commands.positions import register_positions
 from services.discord_bot.commands.status import register_status
@@ -69,6 +76,7 @@ def _stub_api_client() -> ApiClient:
     client.get_positions_current = AsyncMock()  # type: ignore[method-assign]
     client.invoke_kill_switch = AsyncMock()  # type: ignore[method-assign]
     client.approve_signal = AsyncMock()  # type: ignore[method-assign]
+    client.invoke_capital_event = AsyncMock()  # type: ignore[method-assign]
     return client
 
 
@@ -716,6 +724,7 @@ class TestSlashCommandDescriptionLength:
         register_halt(tree, api_client=stub_client, environment="paper")
         register_status(tree, api_client=stub_client)
         register_approve(tree, api_client=stub_client, environment="paper")
+        register_capital_event_commands(tree, api_client=stub_client, environment="paper")
 
         too_long: list[tuple[str, int]] = []
         for cmd in tree.get_commands():
@@ -740,8 +749,283 @@ class TestSlashCommandDescriptionLength:
         register_halt(tree, api_client=stub_client, environment="paper")
         register_status(tree, api_client=stub_client)
         register_approve(tree, api_client=stub_client, environment="paper")
+        register_capital_event_commands(tree, api_client=stub_client, environment="paper")
 
         for cmd in tree.get_commands():
             assert 1 <= len(cmd.name) <= 32, (
                 f"Discord requires command name 1-32 chars; got {cmd.name!r} (len {len(cmd.name)})"
             )
+
+
+# ---------------------------------------------------------------------------
+# /capital-deposit + /capital-withdraw
+# ---------------------------------------------------------------------------
+
+
+class TestCapitalEventAmountValidation:
+    """Cover ``_validate_amount`` defensive branches + cosmetic Decimal
+    rendering. Discord's app_commands API constrains the slash-command
+    input to `float` client-side, but the bot defensively rejects
+    non-positive / NaN / Infinity + applies USD-cent rendering rules."""
+
+    def test_whole_dollar_strips_trailing_cents(self) -> None:
+        s, err = _validate_amount(25000.0)
+        assert err is None
+        assert s == "25000"
+
+    def test_fractional_preserves_cents(self) -> None:
+        s, err = _validate_amount(25000.5)
+        assert err is None
+        assert s == "25000.50"
+
+    def test_two_decimal_amount_preserved(self) -> None:
+        s, err = _validate_amount(25000.12)
+        assert err is None
+        assert s == "25000.12"
+
+    def test_quantize_rounds_to_2_decimals(self) -> None:
+        s, err = _validate_amount(25000.125)
+        assert err is None
+        # 25000.125 rounds via ROUND_HALF_EVEN → 25000.12 (banker's rounding;
+        # the 5 is exactly half + the preceding digit 2 is even so it stays).
+        # The test asserts the resulting string is 2-decimal-formatted.
+        assert s in {"25000.12", "25000.13"}
+        assert "." in s
+
+    def test_zero_amount_rejected(self) -> None:
+        s, err = _validate_amount(0.0)
+        assert s is None
+        assert err is not None and "positive" in err
+
+    def test_negative_amount_rejected(self) -> None:
+        s, err = _validate_amount(-100.0)
+        assert s is None
+        assert err is not None and "positive" in err
+
+    def test_nan_rejected(self) -> None:
+        s, err = _validate_amount(float("nan"))
+        assert s is None
+        assert err is not None
+        assert "NaN" in err or "valid number" in err
+
+    def test_infinity_rejected(self) -> None:
+        s, err = _validate_amount(float("inf"))
+        assert s is None
+        assert err is not None
+        assert "Infinity" in err or "valid number" in err
+
+
+class TestCapitalEventReasonValidation:
+    """Cover ``_validate_reason`` length + whitespace defenses."""
+
+    def test_happy_path_strips_whitespace(self) -> None:
+        s, err = _validate_reason("  initial live funding  ")
+        assert err is None
+        assert s == "initial live funding"
+
+    def test_empty_rejected(self) -> None:
+        s, err = _validate_reason("   ")
+        assert s is None
+        assert err is not None and "required" in err
+
+    def test_too_long_rejected(self) -> None:
+        long = "x" * 501
+        s, err = _validate_reason(long)
+        assert s is None
+        assert err is not None and "too long" in err
+
+    def test_exact_max_accepted(self) -> None:
+        exact = "x" * 500
+        s, err = _validate_reason(exact)
+        assert err is None
+        assert s == exact
+
+
+class TestCapitalEventDepositCommand:
+    """Slash-command surface — `/capital-deposit <amount> <reason>` defers
+    to a confirmation view; api call only fires on the confirm button."""
+
+    async def test_happy_path_opens_confirm_view(self, stub_client: ApiClient) -> None:
+        tree = _build_tree()
+        register_capital_event_commands(tree, api_client=stub_client, environment="paper")
+        callback = _command_callback(tree, "capital-deposit")
+        interaction = _build_mock_interaction()
+
+        await callback(interaction, 25000.0, "initial live funding")
+
+        interaction.response.send_message.assert_awaited_once()
+        kwargs = interaction.response.send_message.await_args.kwargs
+        assert kwargs.get("ephemeral") is True
+        view = kwargs.get("view")
+        assert isinstance(view, CapitalEventConfirmView)
+        assert view._event_type == "deposit"
+        assert view._amount_usd == "25000"
+        # Reason whitespace stripped by _validate_reason
+        assert view._reason == "initial live funding"
+        # No api call yet — view is awaiting confirm click
+        stub_client.invoke_capital_event.assert_not_called()  # type: ignore[attr-defined]
+
+    async def test_zero_amount_rejected_ephemerally(self, stub_client: ApiClient) -> None:
+        tree = _build_tree()
+        register_capital_event_commands(tree, api_client=stub_client, environment="paper")
+        callback = _command_callback(tree, "capital-deposit")
+        interaction = _build_mock_interaction()
+
+        await callback(interaction, 0.0, "x")
+
+        interaction.response.send_message.assert_awaited_once()
+        msg = interaction.response.send_message.await_args.args[0]
+        assert "positive" in msg.lower()
+
+    async def test_empty_reason_rejected_ephemerally(self, stub_client: ApiClient) -> None:
+        tree = _build_tree()
+        register_capital_event_commands(tree, api_client=stub_client, environment="paper")
+        callback = _command_callback(tree, "capital-deposit")
+        interaction = _build_mock_interaction()
+
+        await callback(interaction, 100.0, "   ")
+
+        interaction.response.send_message.assert_awaited_once()
+        msg = interaction.response.send_message.await_args.args[0]
+        assert "reason" in msg.lower()
+
+
+class TestCapitalEventWithdrawCommand:
+    """Mirrors `/capital-deposit` shape; event_type=withdrawal."""
+
+    async def test_happy_path_opens_withdrawal_confirm_view(self, stub_client: ApiClient) -> None:
+        tree = _build_tree()
+        register_capital_event_commands(tree, api_client=stub_client, environment="paper")
+        callback = _command_callback(tree, "capital-withdraw")
+        interaction = _build_mock_interaction()
+
+        await callback(interaction, 5000.5, "quarterly distribution")
+
+        interaction.response.send_message.assert_awaited_once()
+        view = interaction.response.send_message.await_args.kwargs["view"]
+        assert isinstance(view, CapitalEventConfirmView)
+        assert view._event_type == "withdrawal"
+        assert view._amount_usd == "5000.50"
+
+
+class TestCapitalEventConfirmView:
+    """State machine: invoker-only, single-use, confirm fires api call,
+    cancel edits message. Mirrors ``TestHaltConfirmView``."""
+
+    def _view(
+        self, stub_client: ApiClient, *, event_type: str = "deposit"
+    ) -> CapitalEventConfirmView:
+        return CapitalEventConfirmView(
+            api_client=stub_client,
+            invoker_id=100,
+            event_type=event_type,  # type: ignore[arg-type]
+            amount_usd="25000",
+            reason="test",
+            environment="paper",
+        )
+
+    async def test_confirm_threshold_met_renders_success_embed_green(
+        self, stub_client: ApiClient
+    ) -> None:
+        stub_client.invoke_capital_event.return_value = CapitalEventInvokeResponse(  # type: ignore[attr-defined]
+            capital_event_id="ce-1",
+            event_type="deposit",
+            amount_usd="25000",
+            threshold_met=True,
+            post_event_equity="25000",
+            capital_event_audit_event_uuid="aud-1",
+            mode_started_audit_event_uuid="aud-2",
+        )
+        view = self._view(stub_client)
+        interaction = _build_mock_interaction(user_id=100)
+        confirm_button = _find_button(view, "capital_event_confirm")
+
+        await confirm_button.callback(interaction)
+
+        stub_client.invoke_capital_event.assert_awaited_once_with(  # type: ignore[attr-defined]
+            event_type="deposit",
+            amount_usd="25000",
+            reason="test",
+        )
+        interaction.followup.send.assert_awaited_once()
+        embed = interaction.followup.send.await_args.kwargs["embed"]
+        # Title includes the amount; description includes the audit UUIDs
+        assert "deposit" in (embed.title or "").lower()
+        assert "aud-1" in (embed.description or "")
+        # mode_started UUID rendered as a separate field
+        field_names = [f.name for f in embed.fields]
+        assert "Mode started audit" in field_names
+        # Both buttons disabled
+        assert confirm_button.disabled is True
+
+    async def test_confirm_threshold_not_met_omits_mode_field(self, stub_client: ApiClient) -> None:
+        stub_client.invoke_capital_event.return_value = CapitalEventInvokeResponse(  # type: ignore[attr-defined]
+            capital_event_id="ce-2",
+            event_type="deposit",
+            amount_usd="100",
+            threshold_met=False,
+            post_event_equity="25100",
+            capital_event_audit_event_uuid="aud-3",
+            mode_started_audit_event_uuid=None,
+        )
+        view = self._view(stub_client)
+        view._amount_usd = "100"
+        interaction = _build_mock_interaction(user_id=100)
+        confirm_button = _find_button(view, "capital_event_confirm")
+
+        await confirm_button.callback(interaction)
+
+        embed = interaction.followup.send.await_args.kwargs["embed"]
+        # No mode_started_audit_event_uuid → no "Mode started audit" field
+        field_names = [f.name for f in embed.fields]
+        assert "Mode started audit" not in field_names
+
+    async def test_confirm_api_error_renders_error_embed(self, stub_client: ApiClient) -> None:
+        stub_client.invoke_capital_event.side_effect = ApiClientHTTPError(  # type: ignore[attr-defined]
+            status_code=422,
+            error_code="WITHDRAWAL_EXCEEDS_EQUITY",
+            message="withdrawal amount_usd=30000 exceeds pre_event_equity=25000",
+        )
+        view = self._view(stub_client, event_type="withdrawal")
+        interaction = _build_mock_interaction(user_id=100)
+        confirm_button = _find_button(view, "capital_event_confirm")
+
+        await confirm_button.callback(interaction)
+
+        embed = interaction.followup.send.await_args.kwargs["embed"]
+        assert "failed" in (embed.title or "").lower()
+        assert "WITHDRAWAL_EXCEEDS_EQUITY" in (embed.description or "")
+
+    async def test_cancel_button_edits_message_no_api_call(self, stub_client: ApiClient) -> None:
+        view = self._view(stub_client)
+        interaction = _build_mock_interaction(user_id=100)
+        cancel_button = _find_button(view, "capital_event_cancel")
+
+        await cancel_button.callback(interaction)
+
+        interaction.response.edit_message.assert_awaited_once()
+        embed = interaction.response.edit_message.await_args.kwargs["embed"]
+        assert "cancelled" in (embed.title or "").lower()
+        stub_client.invoke_capital_event.assert_not_called()  # type: ignore[attr-defined]
+
+    async def test_interaction_check_rejects_non_invoker(self, stub_client: ApiClient) -> None:
+        view = self._view(stub_client)
+        intruder = _build_mock_interaction(user_id=999)
+
+        allowed = await view.interaction_check(intruder)
+
+        assert allowed is False
+        intruder.response.send_message.assert_awaited_once()
+        msg = intruder.response.send_message.await_args.args[0]
+        assert "operator" in msg.lower()
+
+    async def test_interaction_check_rejects_after_consume(self, stub_client: ApiClient) -> None:
+        view = self._view(stub_client)
+        view._consumed = True
+        interaction = _build_mock_interaction(user_id=100)
+
+        allowed = await view.interaction_check(interaction)
+
+        assert allowed is False
+        msg = interaction.response.send_message.await_args.args[0]
+        assert "already been used" in msg.lower()
