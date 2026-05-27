@@ -51,6 +51,7 @@ from services.discord_bot.commands.capital import (
     _validate_reason,
     register_capital_event_commands,
 )
+from services.discord_bot.embeds import EMBED_COLOR_INFO, EMBED_COLOR_OK
 from services.discord_bot.commands.halt import HaltConfirmView, register_halt
 from services.discord_bot.commands.positions import register_positions
 from services.discord_bot.commands.status import register_status
@@ -952,6 +953,10 @@ class TestCapitalEventConfirmView:
         # Title includes the amount; description includes the audit UUIDs
         assert "deposit" in (embed.title or "").lower()
         assert "aud-1" in (embed.description or "")
+        # Threshold-met success uses the OK-green color (not INFO-blue).
+        # discord.Embed normalizes int colors to discord.Color; compare values.
+        assert embed.color is not None
+        assert embed.color.value == EMBED_COLOR_OK
         # mode_started UUID rendered as a separate field
         field_names = [f.name for f in embed.fields]
         assert "Mode started audit" in field_names
@@ -979,6 +984,9 @@ class TestCapitalEventConfirmView:
         # No mode_started_audit_event_uuid → no "Mode started audit" field
         field_names = [f.name for f in embed.fields]
         assert "Mode started audit" not in field_names
+        # Threshold-NOT-met uses INFO-blue (event recorded but no mode activation)
+        assert embed.color is not None
+        assert embed.color.value == EMBED_COLOR_INFO
 
     async def test_confirm_api_error_renders_error_embed(self, stub_client: ApiClient) -> None:
         stub_client.invoke_capital_event.side_effect = ApiClientHTTPError(  # type: ignore[attr-defined]
