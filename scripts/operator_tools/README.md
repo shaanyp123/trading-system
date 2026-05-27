@@ -12,6 +12,7 @@ service-side write paths (never raw SQL).
 | `replay_executions.py` | Pull executions back from IBKR and feed them through `process_fill_event` to recover from backend-blind fills | Yes — writes audit chain + fills / positions_current / balances / trades |
 | `recovery_agent.py` | Poll `alerts` for `worker_failure` events and decide whether to invoke `replay_executions.py` (transient) or alert-only (hard crash) | Yes — writes `RECOVERY_ACTION_TAKEN` audit + UPDATEs alerts row + may invoke replay subprocess |
 | `trigger_v1_cycle.py` | On-demand V1 strategy cycle trigger (mirrors what LEAN does at 21:30 UTC); reads bars from disk + POSTs to `/api/internal/lean/signals` | Yes (when `--no-dry-run`) — POSTs signal_emitted events which become audit rows + signals INSERTs via the api endpoint. **--dry-run default = ON.** |
+| `replace_protective_stop.py` | POSITION_UNPROTECTED recovery: places a fresh bracket-stop for a position whose protective stop was cancelled but never replaced (PR-C exit-pipeline failure mode) | Yes (when `--no-dry-run --confirm`) — writes ORDER_PLACED audit + INSERTs orders row + places stop_market at IBKR. **--dry-run default = ON; two-flag gate.** |
 
 ---
 
@@ -532,3 +533,99 @@ The tool's strategy invocation is the same `V1TrendFollowing.generate_signals(..
 ### Lineage
 
 Born from the operator brief after PR #247 (Donchian fix) revealed a gap: the operator wanted to trigger a cycle off-schedule to test the fix without waiting overnight. Built to be reusable for any future "I want to run a cycle right now" scenario. Designed to match LEAN's emission contract bit-for-bit so the api endpoint can't distinguish operator-triggered from LEAN-triggered signals (same `ingest_signal_emitted` pipeline; same audit-chain payload shape).
+
+---
+
+## `replace_protective_stop.py` — POSITION_UNPROTECTED recovery
+
+### When to use
+
+Run this tool when a `POSITION_UNPROTECTED` P0 alert fires in Discord `#critical`. That alert is paired 1:1 with the `POSITION_UNPROTECTED` audit row emitted by `services/risk/order_placement_worker.py::apply_exit_close_placement` when the bracket-stop CANCEL step succeeded but the subsequent close-order PLACE failed. The position is now NAKED (no protective stop) until either:
+
+- The next strategy cycle re-emits the exit (which re-runs the full cancel→place pipeline and will re-cancel whatever this tool places), OR
+- The market moves enough to fill the original entry's intent without further intervention (rare).
+
+Either way, the immediate bridge is to restore a protective stop. That's what this tool does.
+
+### When NOT to use
+
+- The position is NOT naked (a working bracket-stop already exists). The tool's idempotency guard surfaces this with `EXIT_BRACKET_ALREADY_PROTECTED` (code 2); pass `--force` only if you intentionally want to add a second protective stop (e.g., widening the level while leaving the original in place until you manually cancel it).
+- The position has been closed (positions_current row missing). Surfaces as `EXIT_NO_POSITION` (code 1); investigate whether the bracket fired or the operator flattened manually.
+- You want to CHANGE the stop level on a working bracket: cancel the existing bracket in TWS first, then run this tool to place a fresh one at the new level.
+
+### Pre-flight checks
+
+1. Confirm the POSITION_UNPROTECTED audit row + alert row in the DB:
+   ```
+   docker compose --env-file deploy/.env exec -T -e PGPASSWORD="$PG_PASS" \
+     postgres psql -U app_service -d trading -h postgres -c "
+   SELECT sequence_no, ingest_clock_ts FROM audit_log
+   WHERE event_type = 'position_unprotected'
+   ORDER BY sequence_no DESC LIMIT 5;
+   "
+   ```
+2. Confirm the position exists + note its `(account_id, market, quantity, avg_cost)`:
+   ```
+   docker compose ... psql ... -c "
+   SELECT market, quantity, avg_cost FROM positions_current;
+   "
+   ```
+3. Confirm no working bracket-stop already exists for the entry signal (the tool checks this too, but eyeball first):
+   ```
+   docker compose ... psql ... -c "
+   SELECT client_order_id, stop_price, status FROM orders
+   WHERE order_type = 'stop_market' AND status = 'working';
+   "
+   ```
+
+### Run command (paper env)
+
+```
+docker compose --env-file deploy/.env exec -T \
+  -e DATABASE_URL="$DATABASE_URL" \
+  api \
+  /opt/venv/bin/python -m scripts.operator_tools.replace_protective_stop \
+    --market /M2K \
+    --env paper \
+    --no-dry-run \
+    --confirm
+```
+
+Stop price defaults to the ATR-derived level from the original entry's `sizing_trace`. Override with `--stop-price 2750.20` if the original level is no longer protective (market moved past it) or if you want to widen/tighten.
+
+### Dry-run mode (default)
+
+Without `--no-dry-run`, the tool builds + logs the plan without touching IBKR or the DB:
+
+```
+docker compose ... -- \
+  /opt/venv/bin/python -m scripts.operator_tools.replace_protective_stop \
+    --market /M2K --env paper
+```
+
+Use this to preview the would-do plan: stop price, side, quantity, client_order_id, source (`sizing_trace` vs `operator_override`). Exits 0 cleanly.
+
+### Exit codes
+
+| Code | Meaning | Operator action |
+|---|---|---|
+| 0 | Success (placed OR dry-run plan printed) | None |
+| 1 | No open position for this market | Investigate whether position closed out-of-band |
+| 2 | Working bracket-stop already exists | Cancel it first OR pass `--force` |
+| 3 | Stop-price direction sanity violated | Pass `--stop-price` strictly below avg_cost (long) or above (short) |
+| 4 | IBKR connection failure | Verify ib_gateway healthy; retry |
+| 5 | DB init failure | Verify `DATABASE_URL` env var staged |
+| 6 | Invalid CLI args | Check args |
+| 7 | `--confirm` missing for `--no-dry-run` | Pass both flags |
+| 8 | Broker rejected the placement | Escalate; check margin / halted market / instrument permission |
+| 99 | Unexpected exception | Capture traceback + escalate |
+
+### Architecture note
+
+`scripts/operator_tools/**` is NOT on the dev-guide §11 [A02] forbidden whitelist. The tool CALLS `services/audit` (writer), `services/execution` (IBKR client), and the orders/positions_current/trades tables (read-only SELECTs + a single INSERT/UPDATE on orders), but does NOT modify those modules. Regular PR review applies — no `risk-review-approved` label.
+
+Two-flag gate (`--no-dry-run` AND `--confirm`) is DELIBERATELY stricter than `trigger_v1_cycle`'s one-flag gate because this tool bypasses the risk-state check (recovery must work during HALT_NEW) and writes to the live IBKR account.
+
+### Lineage
+
+Designed in `Docs/exit-pipeline-design.md` §Q5 as the operator-side bridge for the POSITION_UNPROTECTED failure mode introduced by exit-pipeline PR-C (services/risk/order_placement_worker.py's exit-close path). Shape mirrors `replay_executions.py` (one-shot IBKR tool with audit-first writes) rather than `trigger_v1_cycle.py` (HTTP POST to api).
