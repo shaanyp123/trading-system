@@ -1642,6 +1642,54 @@ class TestListFills:
             "has_more": False,
         }
 
+    @pytest.mark.asyncio
+    async def test_populated_fills_mapped_to_fill_objects(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        """Post-2026-05-27 fix: route maps fills JOIN orders rows to
+        Fill Pydantic objects with Phase 1 field defaults."""
+        account_id = uuid4()
+        fill_id = uuid4()
+        order_id = uuid4()
+        signal_id = uuid4()
+        fills_rows = [
+            {
+                "fill_id": fill_id,
+                "order_id": order_id,
+                "signal_id": signal_id,
+                "market": "/M2K",
+                "side": "buy",
+                "fill_quantity": 1,
+                "fill_price": Decimal("2925.00"),
+                "realized_slippage_bps": None,
+                "filled_at_utc": datetime(2026, 5, 27, 13, 31, tzinfo=UTC),
+            }
+        ]
+        repo = _StubRepo(
+            account_id=account_id,
+            fills_page=(fills_rows, None, False),
+        )
+        _bind_repo(override_dep, fills_route, repo)
+        response = await api_client.get("/api/fills")
+        assert response.status_code == 200
+        body = response.json()
+        assert len(body["fills"]) == 1
+        f = body["fills"][0]
+        assert f["fill_uuid"] == str(fill_id)
+        assert f["order_uuid"] == str(order_id)
+        assert f["signal_uuid"] == str(signal_id)
+        # Phase 1 simplification: instrument_id is the market symbol
+        assert f["instrument_id"] == "/M2K"
+        assert f["side"] == "buy"
+        assert f["qty"] == 1
+        assert Decimal(f["price"]) == Decimal("2925.00")
+        # realized_slippage_bps=None → 0
+        assert Decimal(f["slippage_bps"]) == Decimal("0")
+        # Phase 1 placeholder
+        assert Decimal(f["expected_price"]) == Decimal("0")
+
 
 class TestListAlerts:
     @pytest.mark.asyncio
