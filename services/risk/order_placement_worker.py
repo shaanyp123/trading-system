@@ -71,6 +71,7 @@ Phase 1 retry_n=0.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -153,6 +154,14 @@ class ApprovedSignalRow:
     ``sizing_trace["stage_0_universe"]["strategy_inputs"][market]["stop_price"]``
     (V1 strategy's canonical position). Bracket-order extension 2026-05-17."""
 
+    signal_type: Literal["entry", "exit"] = "entry"
+    """Exit-pipeline PR-C (2026-05-27). Discriminator carried on every
+    signal row. ``'entry'`` → the existing bracket-order entry path.
+    ``'exit'`` → the new bracket-cancel + close-order path (see
+    :func:`plan_exit_close_placement` + :func:`apply_exit_close_placement`).
+    Default 'entry' preserves backwards compat for any historical test
+    fixture or call site that doesn't construct the field explicitly."""
+
 
 @dataclass(frozen=True, slots=True)
 class OrderPlacementPlan:
@@ -222,7 +231,175 @@ class OrderPlacementError(Exception):
     Distinct from :class:`services.execution.types.IbkrPlacementError`
     (which is a broker-side error). This is for our-side issues:
     invalid signal row shape, audit write failure, etc.
+
+    Exit-pipeline PR-C (2026-05-27): adds optional ``error_code`` +
+    ``details`` so the worker's exit branch can flag specific
+    recoverable states (``POSITION_ALREADY_FLAT`` →
+    signals.status='cancelled' flip) without string-matching the
+    message. Backwards compat: positional message-only construction
+    still works for the pre-PR-C call sites.
     """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.message = message
+        self.error_code = error_code
+        self.details = details or {}
+
+
+@dataclass(frozen=True, slots=True)
+class BracketStopRow:
+    """Snapshot of the OPEN bracket-stop ``orders`` row associated with
+    an entry signal — the row PR-C exit branch CANCELS before placing
+    the close order.
+
+    Resolved by :func:`fetch_open_bracket_stop_for_entry` from the
+    entry signal_id derived via the open trade lookup. All fields are
+    sourced from the ``orders`` row.
+    """
+
+    order_id: UUID
+    order_created_at: datetime
+    client_order_id: str
+    broker_order_id: str | None
+    """May be ``None`` only in the unlikely race where the bracket stop
+    was pre-INSERTed but the IBKR ``placeOrder`` ack hadn't returned
+    yet. Cancel by client_order_id in that case (ibkr_client supports
+    that lookup via the internal client_order_id → order map)."""
+
+    stop_price: Decimal
+    parent_order_id: UUID
+    """The original entry orders.id. The close order pre-INSERT uses
+    this as its ``parent_order_id`` so the audit chain links cleanly
+    (entry → bracket-stop → close) without inventing a new graph edge."""
+
+
+@dataclass(frozen=True, slots=True)
+class ExitClosePlan:
+    """Pure-policy plan for an exit-close placement.
+
+    Built by :func:`plan_exit_close_placement` from an
+    :class:`ApprovedSignalRow` (signal_type='exit') + the
+    :class:`BracketStopRow` resolved at I/O time + a FRESH
+    ``positions_current`` read.
+
+    Mirrors :class:`OrderPlacementPlan` for the entry path but carries
+    extra fields the exit branch needs: the bracket-stop linkage (so
+    apply can CANCEL it pre-place) and the prior-position snapshot
+    (for the audit payload + POSITION_UNPROTECTED descriptor).
+
+    Direction-sanity: ``close_side`` is computed from the FRESH
+    position direction (sign of ``prior_position_quantity_signed``);
+    long position → sell close, short position → buy close.
+    """
+
+    signal_id: UUID
+    account_id: UUID
+    env: Environment
+    market: str
+    # Close-order fields
+    close_side: IbkrOrderSide
+    close_quantity: Decimal
+    """ALWAYS positive (magnitude). The direction is encoded in close_side."""
+
+    close_limit_price: Decimal
+    """Marketable-limit price — derived from signal.decision_price
+    (the last close at signal-emit time). Tick-rounded."""
+
+    close_client_order_id: str
+    """``<strategy>-<param>-<sig>-<retry>-close`` suffix to distinguish
+    from the original entry's CID."""
+
+    # Bracket-stop linkage (the row apply will CANCEL pre-place)
+    bracket_stop_order_id: UUID
+    bracket_stop_order_created_at: datetime
+    bracket_stop_client_order_id: str
+    bracket_stop_broker_order_id: str | None
+    bracket_stop_stop_price: Decimal
+    parent_entry_order_id: UUID
+    """The original entry orders.id — used as the close orders row's
+    ``parent_order_id`` so the audit chain links cleanly."""
+
+    # Prior position snapshot (audit-trail + POSITION_UNPROTECTED payload)
+    prior_position_direction: Literal["long", "short"]
+    prior_position_quantity: int
+    """Signed magnitude. Long = positive, short = negative. The close
+    quantity is ``abs()`` of this value."""
+
+    strategy_hash: str
+    parameter_set_hash: str
+    decision_price: Decimal
+    """Echoed from the signal row for symmetry with the entry
+    :class:`OrderPlacementPlan` — same audit-payload conventions."""
+
+
+@dataclass(frozen=True, slots=True)
+class PositionUnprotectedAlertDescriptor:
+    """Inputs the exit-failure handler hands to the alert dispatch hook.
+
+    Worker constructs this from the in-scope plan + the audit row that
+    JUST landed (``POSITION_UNPROTECTED``). Hook implementer (in
+    ``services/api/main.py``) opens an httpx.AsyncClient, INSERTs the
+    ``alerts`` row with category='position_unprotected', severity='P0',
+    then invokes
+    :func:`services.webhook_pusher.dispatcher.dispatch_alert` for the
+    Discord #alerts + #critical + Resend email fan-out.
+
+    A02 note: the hook lives in ``services/api/main.py`` (hot-fix
+    whitelist), so wiring + signature changes don't require
+    risk-review-approved. The worker only needs the hook *type* + an
+    optional constructor arg.
+    """
+
+    account_id: UUID
+    env: Environment
+    signal_id: UUID
+    """The EXIT signal_id. Hook embeds this in the Discord deep-link so
+    the operator can navigate to /signals?id=... to see the original
+    ``exit_reason`` (in the SIGNAL_EMITTED audit payload) without the
+    worker needing to JOIN the audit_log JCS-bytes payload."""
+
+    market: str
+    prior_position_direction: Literal["long", "short"]
+    prior_position_quantity: int
+    """Signed magnitude from the FRESH positions_current read at the
+    place-order attempt (NOT the signal's audit-trail value). This is
+    the position that is now NAKED — the absolute value is the size the
+    operator needs to protect."""
+
+    last_known_stop_price: Decimal
+    """Stop price from the bracket-stop orders row JUST cancelled.
+    Operator uses this to place a replacement stop at the same level
+    via TWS or ``replace_protective_stop.py`` (deferred PR)."""
+
+    close_client_order_id: str
+    """The close order's client_order_id that we attempted to place.
+    Operator can search IBKR/TWS by this CID to confirm the broker
+    side didn't accept it."""
+
+    close_failure_reason: str
+    """Human-readable reason — typically an IBKR rejection_detail or
+    a TimeoutError message. The Discord embed surfaces this."""
+
+    triggering_audit_event_uuid: UUID
+    """The POSITION_UNPROTECTED audit row's event_uuid — links the
+    alerts row to the audit chain via the ``triggering_audit_event_uuid``
+    column (alembic 0004 schema)."""
+
+
+#: Callback type the worker invokes from the cancel-success-place-fail
+#: failure path. Hook MUST be idempotent on
+#: ``descriptor.triggering_audit_event_uuid`` so a retry doesn't
+#: double-fire the Discord embed. Returns ``None`` (hook fails open —
+#: any exception is caught + logged at ERROR by the worker; the
+#: audit + alerts rows remain durable for operator-side recovery).
+PositionUnprotectedAlertHook = Callable[[PositionUnprotectedAlertDescriptor], Awaitable[None]]
 
 
 def _build_client_order_id(
@@ -449,6 +626,7 @@ async def fetch_approved_signals(
                       s.env,
                       s.market,
                       s.direction,
+                      s.signal_type,
                       s.target_contracts,
                       s.decision_price,
                       s.strategy_hash,
@@ -467,22 +645,691 @@ async def fetch_approved_signals(
                 {"acct": account_id, "env": env, "limit": limit},
             )
         ).fetchall()
-    return [
-        ApprovedSignalRow(
-            signal_id=r.signal_id,
-            account_id=r.account_id,
-            env=r.env,
-            market=r.market,
-            direction=r.direction,
-            target_contracts=r.target_contracts,
-            decision_price=r.decision_price,
-            strategy_hash=r.strategy_hash,
-            parameter_set_hash=r.parameter_set_hash,
-            # asyncpg returns JSONB as a Python dict already (no json.loads needed).
-            sizing_trace=dict(r.sizing_trace) if r.sizing_trace is not None else {},
+    rows_out: list[ApprovedSignalRow] = []
+    for r in rows:
+        # Narrow signal_type literal — DB column is free TEXT; treat
+        # unknown values as 'entry' for forwards-compat (the entry path
+        # then raises a descriptive error if the shape is wrong).
+        sig_type_raw = str(r.signal_type) if r.signal_type is not None else "entry"
+        sig_type: Literal["entry", "exit"] = "exit" if sig_type_raw == "exit" else "entry"
+        rows_out.append(
+            ApprovedSignalRow(
+                signal_id=r.signal_id,
+                account_id=r.account_id,
+                env=r.env,
+                market=r.market,
+                direction=r.direction,
+                target_contracts=r.target_contracts,
+                decision_price=r.decision_price,
+                strategy_hash=r.strategy_hash,
+                parameter_set_hash=r.parameter_set_hash,
+                # asyncpg returns JSONB as a Python dict already (no json.loads needed).
+                sizing_trace=dict(r.sizing_trace) if r.sizing_trace is not None else {},
+                signal_type=sig_type,
+            )
         )
-        for r in rows
-    ]
+    return rows_out
+
+
+# ---------------------------------------------------------------------------
+# Exit-pipeline PR-C — bracket-stop + position lookups
+# ---------------------------------------------------------------------------
+
+
+async def fetch_entry_signal_id_for_open_trade(
+    session_factory: async_sessionmaker[Any],
+    *,
+    account_id: UUID,
+    market: str,
+) -> UUID | None:
+    """Resolve the entry signal_id for the currently-open trade in
+    ``(account_id, market)``.
+
+    Returns ``None`` when no open trade row exists — the operator
+    flattened via TWS, a prior exit already filled, or the strategy
+    emitted an exit for a position that no longer exists. The exit
+    branch treats ``None`` as "nothing to close" and flips
+    signals.status='cancelled' without placing an order or cancelling
+    a bracket.
+
+    Phase 1 invariant: ``trades.state = 'open_position'`` is unique per
+    ``(account_id, market)`` (the fill_processor maintains this — entry
+    fills INSERT; exit-close fills UPDATE state='closed'). If two rows
+    exist the lookup picks the newest by ``created_at`` defensively.
+    """
+    async with session_factory() as session:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT entry_signal_id FROM trades "
+                    "WHERE account_id = :acct AND market = :market "
+                    "  AND state = 'open_position' "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ),
+                {"acct": account_id, "market": market},
+            )
+        ).fetchone()
+    if row is None:
+        return None
+    return UUID(str(row.entry_signal_id))
+
+
+async def fetch_open_bracket_stop_for_entry(
+    session_factory: async_sessionmaker[Any],
+    *,
+    entry_signal_id: UUID,
+) -> BracketStopRow | None:
+    """SELECT the open bracket-stop ``orders`` row for an entry signal.
+
+    Returns ``None`` when no row matches — either the bracket already
+    fired (fill_processor flipped status='filled') or the bracket was
+    never placed (entry rejected at the broker; design §11 R3
+    edge case). The exit branch treats ``None`` as a no-op for the
+    cancel step and proceeds straight to the close placement (with a
+    structured log so the operator can audit).
+
+    The lookup keys on the bracket-order Option B contract documented
+    in :mod:`services.risk.fill_processor`: the stop reuses the entry
+    signal_id; ``order_type='stop_market'``; ``status='working'``;
+    ``parent_order_id IS NOT NULL``. There is at most one such row per
+    entry signal in the current model.
+    """
+    async with session_factory() as session:
+        row = (
+            await session.execute(
+                text(
+                    """
+                    SELECT id, created_at, client_order_id, broker_order_id,
+                           stop_price, parent_order_id
+                    FROM orders
+                    WHERE signal_id = :sid
+                      AND order_type = 'stop_market'
+                      AND status = 'working'
+                      AND parent_order_id IS NOT NULL
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """
+                ),
+                {"sid": entry_signal_id},
+            )
+        ).fetchone()
+    if row is None:
+        return None
+    return BracketStopRow(
+        order_id=row.id,
+        order_created_at=row.created_at,
+        client_order_id=row.client_order_id,
+        broker_order_id=str(row.broker_order_id) if row.broker_order_id is not None else None,
+        stop_price=Decimal(str(row.stop_price)),
+        parent_order_id=row.parent_order_id,
+    )
+
+
+async def fetch_current_position_quantity(
+    session_factory: async_sessionmaker[Any],
+    *,
+    account_id: UUID,
+    market: str,
+) -> int:
+    """Read FRESH ``positions_current.quantity`` for the (account, market)
+    tuple.
+
+    Returns ``0`` when no row exists (position already flat — the
+    bracket fired between exit signal emission and operator approval,
+    or the operator flattened manually). The exit planner uses this
+    value DIRECTLY (per design §Q3 — dispatcher-side sizing); the
+    signal's ``prior_position_quantity`` is for audit-trail only.
+
+    Phase 1 invariant: at most one positions_current row per
+    (account_id, market, contract_id) — but the bracket-order Option B
+    contract puts contract_id on a NULL→FK boundary, so we sum across
+    contract_id to handle both ETF (contract_id NULL) + futures
+    (contract_id set) cleanly without the caller needing the contract
+    map. Phase 2+ multi-leg positions would need a more nuanced view.
+    """
+    async with session_factory() as session:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT COALESCE(SUM(quantity), 0) AS total_quantity "
+                    "FROM positions_current "
+                    "WHERE account_id = :acct AND market = :market"
+                ),
+                {"acct": account_id, "market": market},
+            )
+        ).fetchone()
+    if row is None:
+        return 0
+    return int(row.total_quantity)
+
+
+# Note: ``exit_reason`` is NOT looked up here for the POSITION_UNPROTECTED
+# alert payload. PR-B persists exit_reason in the SIGNAL_EMITTED audit
+# payload only (no signals-table column, no audit_event_uuid back-pointer
+# on signals.id). The audit_log table stores payload as ``payload_jcs
+# BYTEA`` (not JSONB) per alembic 0001 — so a clean post-hoc lookup
+# requires either an expensive ``convert_from(payload_jcs, 'UTF8')::jsonb``
+# cast or a follow-up migration adding a signal_emitted_audit_event_uuid
+# column to signals. Neither is justified for the rare POSITION_UNPROTECTED
+# path. The Discord embed includes the exit signal_id; the operator
+# deep-links to /signals to see the original exit_reason in context.
+
+
+# ---------------------------------------------------------------------------
+# Exit-pipeline PR-C — plan + apply
+# ---------------------------------------------------------------------------
+
+
+def plan_exit_close_placement(
+    signal: ApprovedSignalRow,
+    *,
+    bracket_stop: BracketStopRow,
+    current_position_quantity: int,
+    env: Environment,
+) -> ExitClosePlan:
+    """Build the close-placement plan for an approved exit signal.
+
+    Pure policy — no I/O, no clock, no random. Same inputs always
+    produce the same plan, so the close order's client_order_id is
+    deterministic per signal (necessary for IBKR retry idempotency).
+
+    :param signal: the approved ``signal_type='exit'`` row. The signal's
+        ``decision_price`` is the marketable limit; ``direction`` is
+        ``'flat'`` (the strategy emits flat for exits per design §5.2)
+        and ``target_contracts`` is ``0`` (dispatcher-side sizing per
+        §Q3 — the *real* quantity comes from
+        ``current_position_quantity``).
+    :param bracket_stop: the OPEN bracket-stop orders row to cancel
+        (resolved by :func:`fetch_open_bracket_stop_for_entry`). Its
+        ``parent_order_id`` is the original entry orders.id — the
+        close orders row chains its own ``parent_order_id`` here so
+        the audit graph links entry → bracket-stop → close.
+    :param current_position_quantity: signed quantity from the FRESH
+        ``positions_current`` read (long > 0, short < 0). The close
+        direction + magnitude derive from the sign + absolute value.
+
+    Raises:
+      * :class:`OrderPlacementError` (``error_code='POSITION_ALREADY_FLAT'``)
+        when ``current_position_quantity == 0``. The worker's exit
+        branch catches + flips signals.status='cancelled' (per operator
+        decision 2026-05-27 — reuse 'cancelled' rather than add a new
+        signals.status CHECK value). No close order placed; the bracket
+        stop is NOT cancelled (caller's responsibility to gate the
+        cancel on this check).
+      * :class:`OrderPlacementError` when the signal shape is
+        malformed (zero direction with non-zero target_contracts, etc.).
+    """
+    if signal.signal_type != "exit":
+        raise OrderPlacementError(
+            f"plan_exit_close_placement called with signal_type={signal.signal_type!r}; "
+            "expected 'exit'.",
+            error_code="WRONG_SIGNAL_TYPE",
+        )
+    if current_position_quantity == 0:
+        raise OrderPlacementError(
+            "POSITION_ALREADY_FLAT: positions_current.quantity is 0 at place-order time; "
+            "either the bracket stop fired between exit-signal emit + approval, or the "
+            "operator manually flattened via TWS.",
+            error_code="POSITION_ALREADY_FLAT",
+            details={
+                "signal_id": str(signal.signal_id),
+                "market": signal.market,
+            },
+        )
+
+    # Direction + magnitude derive from the FRESH read (design §Q3).
+    direction: Literal["long", "short"] = "long" if current_position_quantity > 0 else "short"
+    close_side: IbkrOrderSide = "sell" if current_position_quantity > 0 else "buy"
+    close_qty = Decimal(abs(current_position_quantity))
+
+    # Client_order_id: reuse the entry-path generator with a ``-close``
+    # suffix so it's distinguishable from the original entry CID + the
+    # bracket-stop's ``-stop`` CID.
+    entry_cid = _build_client_order_id(
+        strategy_hash=signal.strategy_hash,
+        parameter_set_hash=signal.parameter_set_hash,
+        signal_id=signal.signal_id,
+        retry_n=RETRY_N_PHASE_1,
+    )
+    close_cid = f"{entry_cid}-close"
+
+    # Tick-rounding (mirrors entry path). Marketable-limit at the
+    # signal's decision_price — for V1, this is the last close at
+    # signal-emit time. Stale by up to ~24h by approval time but the
+    # ``limit_marketable`` order type means IBKR fills at the prevailing
+    # marketable side anyway; the limit is a slippage ceiling.
+    try:
+        close_limit_price = round_to_tick(signal.decision_price, market=signal.market)
+    except KeyError as exc:
+        raise OrderPlacementError(
+            f"market {signal.market!r} not in PHASE1_TICK_SIZES; "
+            "see services.execution.ibkr_adapter for the Phase 1 universe map.",
+            error_code="UNKNOWN_MARKET_TICK",
+        ) from exc
+
+    return ExitClosePlan(
+        signal_id=signal.signal_id,
+        account_id=signal.account_id,
+        env=env,
+        market=signal.market,
+        close_side=close_side,
+        close_quantity=close_qty,
+        close_limit_price=close_limit_price,
+        close_client_order_id=close_cid,
+        bracket_stop_order_id=bracket_stop.order_id,
+        bracket_stop_order_created_at=bracket_stop.order_created_at,
+        bracket_stop_client_order_id=bracket_stop.client_order_id,
+        bracket_stop_broker_order_id=bracket_stop.broker_order_id,
+        bracket_stop_stop_price=bracket_stop.stop_price,
+        parent_entry_order_id=bracket_stop.parent_order_id,
+        prior_position_direction=direction,
+        prior_position_quantity=current_position_quantity,
+        strategy_hash=signal.strategy_hash,
+        parameter_set_hash=signal.parameter_set_hash,
+        decision_price=signal.decision_price,
+    )
+
+
+async def apply_exit_close_placement(
+    plan: ExitClosePlan,
+    *,
+    ibkr_client: IbkrClient,
+    contract: IbkrContractRef,
+    session_factory: async_sessionmaker[Any],
+    phase_at_emit: PhaseAtEmit = 1,
+    alert_dispatch_hook: PositionUnprotectedAlertHook | None = None,
+    ibkr_call_timeout_seconds: float = DEFAULT_IBKR_CALL_TIMEOUT_SECONDS,
+) -> OrderPlacementResult:
+    """Execute an exit-close plan with audit-first ordering.
+
+    Step sequence (design §Q4 + §Q5, with audit-first reordering per
+    backend-spec §2.10.1):
+
+      1. ``ORDER_CANCELLED`` audit (intent) for the bracket stop,
+         reason ``'bracket_stop_replaced_by_exit_signal'``. Audit-first
+         per §2.10.1 — records intent, THEN acts.
+      2. ``ibkr_client.cancel_order(bracket_stop.client_order_id)``.
+         Bounded by ``ibkr_call_timeout_seconds``. On
+         :class:`IbkrPlacementError`: re-raise + the worker treats as
+         "broker down" + retries next cycle (the cancel-intent audit
+         row is durable; a retry is idempotent if the bracket already
+         cancelled on the broker side).
+      3. ``UPDATE orders SET status='cancelled'`` for the bracket-stop
+         row.
+      4. INSERT close orders row (PR-ζ pattern — pre-INSERT closes the
+         orderStatusEvent race with the fill_processor).
+         ``parent_order_id = plan.parent_entry_order_id`` so the audit
+         chain links entry → close.
+      5. ``ibkr_client.place_order(close)`` — limit-marketable, NO
+         bracket (position is going to zero; no protective stop
+         needed). Bounded by ``ibkr_call_timeout_seconds``.
+      6. **POSITION_UNPROTECTED branch**: on place failure (broker
+         rejection OR :class:`IbkrPlacementError` from the timeout
+         wrapper), write a ``POSITION_UNPROTECTED`` audit row + invoke
+         the alert dispatch hook (P0 Discord #alerts + #critical +
+         Resend email) + raise :class:`OrderPlacementError`
+         (``error_code='CLOSE_PLACEMENT_FAILED'``). The pre-placed
+         close orders row stays in ``status='pending'`` for operator
+         reconciliation.
+      7. On place success: ``ORDER_PLACED`` audit for the close +
+         UPDATE close orders row with broker_order_id + status +
+         UPDATE ``signals.status='working'``.
+
+    Returns the close order's :class:`OrderPlacementResult` (analogous
+    to the entry path's return shape).
+    """
+    placed_at = datetime.now(tz=UTC)
+    log_bound = log.bind(
+        signal_id=str(plan.signal_id),
+        market=plan.market,
+        bracket_stop_client_order_id=plan.bracket_stop_client_order_id,
+        close_client_order_id=plan.close_client_order_id,
+        exit_path=True,
+    )
+
+    # Step 1: audit-first ORDER_CANCELLED for the bracket stop.
+    cancel_audit_payload: dict[str, Any] = {
+        "signal_id": str(plan.signal_id),
+        "account_id": str(plan.account_id),
+        "order_id": str(plan.bracket_stop_order_id),
+        "client_order_id": plan.bracket_stop_client_order_id,
+        "broker_order_id": plan.bracket_stop_broker_order_id,
+        "market": plan.market,
+        "stop_price": str(plan.bracket_stop_stop_price),
+        "reason": "bracket_stop_replaced_by_exit_signal",
+        "cancelled_at_utc": placed_at.isoformat(),
+        "leg": "bracket_stop",
+    }
+    async with session_factory() as audit_session:
+        cancel_audit_record = await append_audit_event(
+            audit_session,
+            AuditEventType.ORDER_CANCELLED,
+            cancel_audit_payload,
+            account_id=plan.account_id,
+            env=plan.env,
+            phase_at_emit=phase_at_emit,
+            source_clock_ts=placed_at,
+        )
+    log_bound.info(
+        "order_placement_exit_bracket_cancel_audit_written",
+        cancel_audit_event_uuid=str(cancel_audit_record.event_uuid),
+    )
+
+    # Step 2: cancel the bracket at IBKR. Bounded by the wall-clock
+    # ceiling so a hung cancel doesn't trap the worker.
+    try:
+        await _await_ibkr_with_timeout(
+            ibkr_client.cancel_order(plan.bracket_stop_client_order_id),
+            operation="cancelOrder.bracket_stop_replaced_by_exit",
+            timeout_seconds=ibkr_call_timeout_seconds,
+        )
+    except IbkrPlacementError:
+        # Broker-side cancel failed/timed out. The audit row is durable
+        # (records our intent). Re-raise so the worker treats this as
+        # "broker down" + retries next cycle. The bracket stop stays
+        # 'working' in our orders row until the next cycle's recon or
+        # a successful re-cancel observes the IBKR-side state.
+        log_bound.exception("order_placement_exit_bracket_cancel_failed")
+        raise
+
+    # Step 3: UPDATE the bracket-stop orders row to status='cancelled'.
+    # Partition addressed via (id, created_at) per alembic 0002 schema.
+    async with session_factory() as session:
+        async with session.begin():
+            await session.execute(
+                text(
+                    "UPDATE orders SET status = 'cancelled', "
+                    "    rejection_reason = 'bracket_stop_replaced_by_exit_signal' "
+                    "WHERE id = :oid AND created_at = :created"
+                ),
+                {
+                    "oid": plan.bracket_stop_order_id,
+                    "created": plan.bracket_stop_order_created_at,
+                },
+            )
+    log_bound.info("order_placement_exit_bracket_cancel_row_updated")
+
+    # Step 4: PR-ζ pre-INSERT the close orders row before the IBKR call.
+    # ``parent_order_id = plan.parent_entry_order_id`` — the close is
+    # graph-child of the ORIGINAL entry (NOT the bracket stop) so the
+    # audit chain reads cleanly: entry → bracket_stop (now cancelled) +
+    # entry → close (now in flight). The bracket and the close are
+    # siblings parented at the entry.
+    async with session_factory() as session:
+        async with session.begin():
+            close_row = (
+                await session.execute(
+                    text(
+                        """
+                        INSERT INTO orders (
+                            account_id, env, signal_id, client_order_id, broker_order_id,
+                            market, direction, order_type, quantity, limit_price,
+                            placed_at_utc, status, rejection_reason, retry_n,
+                            parent_order_id, strategy_hash, parameter_set_hash
+                        ) VALUES (
+                            :acct, :env, :sig, :cid, NULL,
+                            :market, :side, 'limit_marketable', :qty, :lim,
+                            :placed_at, 'pending', NULL, :retry_n,
+                            :parent_id, :strat, :param
+                        )
+                        RETURNING id
+                        """
+                    ),
+                    {
+                        "acct": plan.account_id,
+                        "env": plan.env,
+                        "sig": plan.signal_id,
+                        "cid": plan.close_client_order_id,
+                        "market": plan.market,
+                        "side": plan.close_side,
+                        "qty": int(plan.close_quantity),
+                        "lim": plan.close_limit_price,
+                        "placed_at": placed_at,
+                        "retry_n": RETRY_N_PHASE_1,
+                        "parent_id": plan.parent_entry_order_id,
+                        "strat": plan.strategy_hash,
+                        "param": plan.parameter_set_hash,
+                    },
+                )
+            ).fetchone()
+            assert close_row is not None
+            close_order_id: UUID = close_row.id
+    log_bound.info(
+        "order_placement_exit_close_row_pre_inserted",
+        close_order_id=str(close_order_id),
+    )
+
+    # Step 5: place the close order at IBKR.
+    close_request = IbkrPlaceOrderRequest(
+        client_order_id=plan.close_client_order_id,
+        contract=contract,
+        side=plan.close_side,
+        quantity=plan.close_quantity,
+        order_type="limit_marketable",
+        limit_price=plan.close_limit_price,
+        time_in_force="DAY",
+        # No bracket — position is going to zero, no protective stop
+        # needed. transmit=True is the dataclass default; explicit here
+        # so the contract is unambiguous for the close leg.
+        transmit=True,
+    )
+    close_failure_reason: str | None = None
+    close_broker_result: Any = None
+    try:
+        close_broker_result = await _await_ibkr_with_timeout(
+            ibkr_client.place_order(close_request),
+            operation="placeOrder.exit_close",
+            timeout_seconds=ibkr_call_timeout_seconds,
+        )
+        # Treat broker-side rejection same as a placement error for
+        # the POSITION_UNPROTECTED gate — a rejected close is
+        # operationally equivalent to a failed place (no working
+        # close order exists).
+        close_db_status = _broker_status_to_orders_status(close_broker_result.status)
+        if close_db_status == "rejected":
+            close_failure_reason = (
+                f"broker rejection: {getattr(close_broker_result, 'rejection_detail', 'unknown')}"
+            )
+    except IbkrPlacementError as exc:
+        close_failure_reason = f"IbkrPlacementError: {exc!r}"
+        close_broker_result = None
+        close_db_status = "pending"
+
+    # Step 6: POSITION_UNPROTECTED branch. The cancel succeeded (step 2
+    # didn't raise + step 3 UPDATE landed) so the bracket is OFF; if
+    # the close didn't establish a working order at the broker, the
+    # position is now NAKED.
+    if close_failure_reason is not None:
+        unprotected_payload: dict[str, Any] = {
+            "signal_id": str(plan.signal_id),
+            "account_id": str(plan.account_id),
+            "market": plan.market,
+            "prior_position_direction": plan.prior_position_direction,
+            "prior_position_quantity": plan.prior_position_quantity,
+            "cancelled_stop_client_order_id": plan.bracket_stop_client_order_id,
+            "cancelled_stop_broker_order_id": plan.bracket_stop_broker_order_id,
+            "last_known_stop_price": str(plan.bracket_stop_stop_price),
+            "close_client_order_id": plan.close_client_order_id,
+            "close_failure_reason": close_failure_reason,
+            "linked_cancel_audit_event_uuid": str(cancel_audit_record.event_uuid),
+            "observed_at_utc": placed_at.isoformat(),
+        }
+        async with session_factory() as unprotected_audit_session:
+            unprotected_audit_record = await append_audit_event(
+                unprotected_audit_session,
+                AuditEventType.POSITION_UNPROTECTED,
+                unprotected_payload,
+                account_id=plan.account_id,
+                env=plan.env,
+                phase_at_emit=phase_at_emit,
+                source_clock_ts=placed_at,
+            )
+        log_bound.error(
+            "order_placement_exit_position_unprotected",
+            close_failure_reason=close_failure_reason,
+            unprotected_audit_event_uuid=str(unprotected_audit_record.event_uuid),
+        )
+
+        # Invoke the alert dispatch hook (best-effort; never blocks the
+        # raise back to the worker since the audit row is the durable
+        # record). The hook owns alerts-row INSERT + dispatch_alert.
+        if alert_dispatch_hook is not None:
+            descriptor = PositionUnprotectedAlertDescriptor(
+                account_id=plan.account_id,
+                env=plan.env,
+                signal_id=plan.signal_id,
+                market=plan.market,
+                prior_position_direction=plan.prior_position_direction,
+                prior_position_quantity=plan.prior_position_quantity,
+                last_known_stop_price=plan.bracket_stop_stop_price,
+                close_client_order_id=plan.close_client_order_id,
+                close_failure_reason=close_failure_reason,
+                triggering_audit_event_uuid=unprotected_audit_record.event_uuid,
+            )
+            try:
+                await alert_dispatch_hook(descriptor)
+            except Exception:
+                log_bound.exception("order_placement_exit_alert_dispatch_hook_failed")
+        else:
+            log_bound.warning(
+                "order_placement_exit_alert_dispatch_hook_unwired",
+                note=(
+                    "POSITION_UNPROTECTED audit row is durable, but no P0 "
+                    "Discord/email push was sent — operator should monitor "
+                    "audit page directly until the hook is wired in api/main.py."
+                ),
+            )
+
+        # The pre-placed close orders row stays in 'pending' so the
+        # operator can reconcile via TWS / replay tooling. Raise so
+        # the worker logs the failure + stops trying this signal.
+        raise OrderPlacementError(
+            f"CLOSE_PLACEMENT_FAILED signal_id={plan.signal_id} "
+            f"market={plan.market} reason={close_failure_reason}",
+            error_code="CLOSE_PLACEMENT_FAILED",
+            details={
+                "signal_id": str(plan.signal_id),
+                "market": plan.market,
+                "close_failure_reason": close_failure_reason,
+                "unprotected_audit_event_uuid": str(unprotected_audit_record.event_uuid),
+            },
+        )
+
+    # ---- Place succeeded ----
+    assert close_broker_result is not None  # narrow for type-check
+    close_broker_order_id = close_broker_result.broker_order_id
+    close_broker_status = close_broker_result.status
+    close_rejection_detail = getattr(close_broker_result, "rejection_detail", None)
+
+    # Step 7a: ORDER_PLACED audit for the close.
+    placed_audit_payload: dict[str, Any] = {
+        "signal_id": str(plan.signal_id),
+        "account_id": str(plan.account_id),
+        "client_order_id": plan.close_client_order_id,
+        "broker_order_id": (
+            str(close_broker_order_id) if close_broker_order_id is not None else None
+        ),
+        "market": plan.market,
+        "side": plan.close_side,
+        "quantity": str(plan.close_quantity),
+        "order_type": "limit_marketable",
+        "limit_price": str(plan.close_limit_price),
+        "time_in_force": "DAY",
+        "broker_status": close_broker_status,
+        "rejection_category": getattr(close_broker_result, "rejection_category", None),
+        "rejection_detail": close_rejection_detail,
+        "placed_at_utc": placed_at.isoformat(),
+        "leg": "exit_close",
+        "linked_cancel_audit_event_uuid": str(cancel_audit_record.event_uuid),
+    }
+    async with session_factory() as placed_audit_session:
+        placed_audit_record = await append_audit_event(
+            placed_audit_session,
+            AuditEventType.ORDER_PLACED,
+            placed_audit_payload,
+            account_id=plan.account_id,
+            env=plan.env,
+            phase_at_emit=phase_at_emit,
+            source_clock_ts=placed_at,
+        )
+
+    # Step 7b: UPDATE close orders row + signals.status='working'.
+    async with session_factory() as session:
+        async with session.begin():
+            await session.execute(
+                text(
+                    "UPDATE orders SET broker_order_id = :bid, status = :status, "
+                    "    rejection_reason = :rej_reason "
+                    "WHERE id = :oid"
+                ),
+                {
+                    "bid": (
+                        str(close_broker_order_id) if close_broker_order_id is not None else None
+                    ),
+                    "status": close_db_status,
+                    "rej_reason": close_rejection_detail,
+                    "oid": close_order_id,
+                },
+            )
+            await session.execute(
+                text("UPDATE signals SET status = 'working' WHERE id = :sid"),
+                {"sid": plan.signal_id},
+            )
+
+    log_bound.info(
+        "order_placement_exit_completed",
+        close_order_id=str(close_order_id),
+        close_broker_order_id=(
+            str(close_broker_order_id) if close_broker_order_id is not None else None
+        ),
+        close_broker_status=close_broker_status,
+        close_db_status=close_db_status,
+        cancel_audit_event_uuid=str(cancel_audit_record.event_uuid),
+        placed_audit_event_uuid=str(placed_audit_record.event_uuid),
+    )
+
+    # Best-effort SSE emit so the web /signals page + Discord webhook
+    # pusher observe the close placement. Mirror of the entry path's
+    # signal-placed SSE.
+    try:
+        from services.api.sse import emit_sse
+
+        await emit_sse(
+            "signal",
+            {
+                "action": "placed",
+                "signal_id": str(plan.signal_id),
+                "market": plan.market,
+                "direction": plan.prior_position_direction,  # the CLOSING direction
+                "side": plan.close_side,
+                "quantity": str(plan.close_quantity),
+                "order_id": str(close_order_id),
+                "client_order_id": plan.close_client_order_id,
+                "broker_order_id": (
+                    str(close_broker_order_id) if close_broker_order_id is not None else None
+                ),
+                "broker_status": close_broker_status,
+                "db_status": close_db_status,
+                "rejection_category": getattr(close_broker_result, "rejection_category", None),
+                "rejection_detail": close_rejection_detail,
+                "placed_at_utc": placed_at.isoformat(),
+                "environment": plan.env,
+                "audit_event_uuid": str(placed_audit_record.event_uuid),
+                "exit_close": True,
+                "cancel_audit_event_uuid": str(cancel_audit_record.event_uuid),
+                "cancelled_stop_client_order_id": plan.bracket_stop_client_order_id,
+            },
+        )
+    except Exception:
+        log_bound.exception("order_placement_exit_sse_emit_failed")
+
+    return OrderPlacementResult(
+        signal_id=plan.signal_id,
+        order_id=close_order_id,
+        audit_event_uuid=placed_audit_record.event_uuid,
+        broker_order_id=(str(close_broker_order_id) if close_broker_order_id is not None else None),
+        status=close_db_status,
+    )
 
 
 async def _await_ibkr_with_timeout(
@@ -1084,6 +1931,7 @@ class OrderPlacementWorker:
         env: Environment,
         poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
         ibkr_call_timeout_seconds: float = DEFAULT_IBKR_CALL_TIMEOUT_SECONDS,
+        position_unprotected_alert_hook: PositionUnprotectedAlertHook | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._ibkr_client = ibkr_client
@@ -1097,6 +1945,13 @@ class OrderPlacementWorker:
         # DEFAULT_IBKR_CALL_TIMEOUT_SECONDS constant docstring above for
         # the silent-worker context this protects against.
         self._ibkr_call_timeout_seconds = ibkr_call_timeout_seconds
+        # Exit-pipeline PR-C (2026-05-27): optional callback the
+        # exit-branch invokes when bracket-cancel succeeds + close-place
+        # fails (POSITION_UNPROTECTED P0 alert path). When unwired the
+        # audit row still lands; only the Discord/email fan-out is
+        # skipped (with a structured WARNING in the worker log). Hook
+        # owner: ``services/api/main.py`` lifespan startup.
+        self._position_unprotected_alert_hook = position_unprotected_alert_hook
         self._stop_event = asyncio.Event()
         self._order_status_subscribed = False
         # Tracks broker_order_ids we've already emitted a "fill" SSE for
@@ -1159,33 +2014,10 @@ class OrderPlacementWorker:
         placed = 0
         for signal in signals:
             try:
-                plan = plan_order_placement(signal, env=self._env)
-                # Bound the IBKR contract-qualification call. ib-async's
-                # qualifyContractsAsync can hang indefinitely under
-                # broker-side sluggishness (silent-worker pattern from
-                # the 2026-05-17 drill 2). 30s default is the same
-                # ceiling apply_order_placement uses for placeOrder.
-                contract = await _await_ibkr_with_timeout(
-                    self._ibkr_client.resolve_contract(plan.market),
-                    operation="resolveContract",
-                    timeout_seconds=self._ibkr_call_timeout_seconds,
-                )
-                await apply_order_placement(
-                    plan,
-                    ibkr_client=self._ibkr_client,
-                    contract=contract,
-                    session_factory=self._session_factory,
-                    ibkr_call_timeout_seconds=self._ibkr_call_timeout_seconds,
-                )
-                placed += 1
-            except OrderPlacementError as exc:
-                # Pure-policy planner error — the signal shape is wrong.
-                # Log + skip; an operator-side correction is needed.
-                self._log.error(
-                    "order_placement_plan_error",
-                    signal_id=str(signal.signal_id),
-                    error=str(exc),
-                )
+                if signal.signal_type == "exit":
+                    placed += await self._dispatch_exit_signal(signal)
+                else:
+                    placed += await self._dispatch_entry_signal(signal)
             except IbkrPlacementError as exc:
                 # Broker connectivity error — log, leave the signal in
                 # 'approved' for the next poll cycle to retry. This also
@@ -1194,11 +2026,247 @@ class OrderPlacementWorker:
                 self._log.error(
                     "order_placement_broker_unavailable",
                     signal_id=str(signal.signal_id),
+                    signal_type=signal.signal_type,
                     error=str(exc),
                 )
                 # Don't continue iterating — broker is down, fail fast.
                 break
         return placed
+
+    async def _dispatch_entry_signal(self, signal: ApprovedSignalRow) -> int:
+        """Original (pre-PR-C) entry-path dispatch. Returns 1 on success,
+        0 on a planner-side error.
+
+        Extracted to a helper so the new exit branch (added 2026-05-27)
+        sits beside it cleanly + run_once stays readable.
+        """
+        try:
+            plan = plan_order_placement(signal, env=self._env)
+            # Bound the IBKR contract-qualification call. ib-async's
+            # qualifyContractsAsync can hang indefinitely under
+            # broker-side sluggishness (silent-worker pattern from
+            # the 2026-05-17 drill 2). 30s default is the same
+            # ceiling apply_order_placement uses for placeOrder.
+            contract = await _await_ibkr_with_timeout(
+                self._ibkr_client.resolve_contract(plan.market),
+                operation="resolveContract",
+                timeout_seconds=self._ibkr_call_timeout_seconds,
+            )
+            await apply_order_placement(
+                plan,
+                ibkr_client=self._ibkr_client,
+                contract=contract,
+                session_factory=self._session_factory,
+                ibkr_call_timeout_seconds=self._ibkr_call_timeout_seconds,
+            )
+            return 1
+        except OrderPlacementError as exc:
+            # Pure-policy planner error — the signal shape is wrong.
+            # Log + skip; an operator-side correction is needed.
+            self._log.error(
+                "order_placement_plan_error",
+                signal_id=str(signal.signal_id),
+                signal_type="entry",
+                error=str(exc),
+            )
+            return 0
+
+    async def _dispatch_exit_signal(self, signal: ApprovedSignalRow) -> int:
+        """Exit-pipeline PR-C (2026-05-27): dispatch an approved
+        ``signal_type='exit'`` signal.
+
+        Sequence:
+
+          1. Look up the open trade for ``(account_id, market)`` to
+             resolve the ENTRY signal_id. If absent → log + flip
+             signals.status='cancelled' (the position was already
+             closed by some other path; nothing to do).
+          2. Look up the bracket-stop orders row for the entry. If
+             absent → log + flip signals.status='cancelled' (the
+             bracket already fired or was never placed; either way
+             we have no stop to cancel + no need to close).
+          3. Read FRESH positions_current.quantity. If 0 →
+             flip signals.status='cancelled' WITHOUT cancelling the
+             bracket (because if positions=0, the bracket already
+             closed on its own).
+          4. Call :func:`plan_exit_close_placement` + then
+             :func:`apply_exit_close_placement`. The apply step is
+             where audit-first ORDER_CANCELLED + ibkr_client.cancel +
+             pre-place + place + POSITION_UNPROTECTED branch all
+             land.
+
+        Returns 1 on a successful close placement (even if the broker
+        accepted-but-pending), 0 on the no-op or recoverable-failure
+        paths. IbkrPlacementError propagates back to ``run_once``
+        which treats it as "broker down" + fails fast.
+        """
+        log_bound = self._log.bind(
+            signal_id=str(signal.signal_id),
+            market=signal.market,
+            signal_type="exit",
+        )
+
+        # Step 1: resolve the entry signal_id via the open trade.
+        entry_signal_id = await fetch_entry_signal_id_for_open_trade(
+            self._session_factory,
+            account_id=signal.account_id,
+            market=signal.market,
+        )
+        if entry_signal_id is None:
+            log_bound.warning(
+                "order_placement_exit_no_open_trade",
+                note=(
+                    "No open_position trade row for this (account, market). "
+                    "Position may have already closed (bracket fired or "
+                    "operator-flatten). Flipping signals.status='cancelled' "
+                    "without placing a close order."
+                ),
+            )
+            await self._flip_signal_to_cancelled(
+                signal.signal_id,
+                reason="exit_no_open_trade",
+            )
+            return 0
+
+        # Step 2: resolve the bracket-stop orders row.
+        bracket_stop = await fetch_open_bracket_stop_for_entry(
+            self._session_factory,
+            entry_signal_id=entry_signal_id,
+        )
+        if bracket_stop is None:
+            log_bound.warning(
+                "order_placement_exit_no_open_bracket_stop",
+                entry_signal_id=str(entry_signal_id),
+                note=(
+                    "No working bracket-stop orders row for the entry signal. "
+                    "Bracket may have already fired or was never placed. "
+                    "Flipping signals.status='cancelled'."
+                ),
+            )
+            await self._flip_signal_to_cancelled(
+                signal.signal_id,
+                reason="exit_no_open_bracket_stop",
+            )
+            return 0
+
+        # Step 3: FRESH positions_current read.
+        current_qty = await fetch_current_position_quantity(
+            self._session_factory,
+            account_id=signal.account_id,
+            market=signal.market,
+        )
+        if current_qty == 0:
+            # Position already flat — don't cancel the bracket (if it
+            # still exists, it'll close on its own or the next cycle's
+            # recon will reconcile). Flip status='cancelled' per the
+            # operator-locked decision (no new signals.status value
+            # required; no audit row required either, just a structured
+            # log entry the operator can grep).
+            log_bound.warning(
+                "order_placement_exit_position_already_flat",
+                entry_signal_id=str(entry_signal_id),
+                bracket_stop_order_id=str(bracket_stop.order_id),
+                note=(
+                    "positions_current.quantity is 0 at place-order time; "
+                    "skipping bracket cancel + close placement. "
+                    "Signal flips to status='cancelled'."
+                ),
+            )
+            await self._flip_signal_to_cancelled(
+                signal.signal_id,
+                reason="exit_position_already_flat",
+            )
+            return 0
+
+        # Step 4: plan + apply the close placement.
+        try:
+            plan = plan_exit_close_placement(
+                signal,
+                bracket_stop=bracket_stop,
+                current_position_quantity=current_qty,
+                env=self._env,
+            )
+        except OrderPlacementError as exc:
+            # POSITION_ALREADY_FLAT is guarded above so this path is
+            # for genuine planner shape errors (unknown market tick,
+            # wrong signal_type slipping through, etc.). Log + skip;
+            # the signal stays 'approved' for the operator to
+            # investigate. They can manually flip status='cancelled'
+            # via psql if it's a known dead-end.
+            log_bound.error(
+                "order_placement_exit_plan_error",
+                entry_signal_id=str(entry_signal_id),
+                error_code=exc.error_code,
+                error=str(exc),
+            )
+            return 0
+
+        contract = await _await_ibkr_with_timeout(
+            self._ibkr_client.resolve_contract(plan.market),
+            operation="resolveContract.exit",
+            timeout_seconds=self._ibkr_call_timeout_seconds,
+        )
+
+        try:
+            await apply_exit_close_placement(
+                plan,
+                ibkr_client=self._ibkr_client,
+                contract=contract,
+                session_factory=self._session_factory,
+                alert_dispatch_hook=self._position_unprotected_alert_hook,
+                ibkr_call_timeout_seconds=self._ibkr_call_timeout_seconds,
+            )
+            return 1
+        except OrderPlacementError as exc:
+            # CLOSE_PLACEMENT_FAILED already emitted the
+            # POSITION_UNPROTECTED audit + alert (in apply); the
+            # pre-placed close orders row is in 'pending'; operator
+            # must reconcile. Log here is the worker-side breadcrumb
+            # that the iteration completed (even though the close
+            # didn't get to 'working'). Signal stays at
+            # 'approved'-but-orders-row-exists; the LEFT JOIN in
+            # fetch_approved_signals means this signal will NOT be
+            # re-polled (orders row INSERTed pre-place excludes it).
+            # Operator has to intervene manually.
+            log_bound.error(
+                "order_placement_exit_apply_error",
+                entry_signal_id=str(entry_signal_id),
+                error_code=exc.error_code,
+                error=str(exc),
+            )
+            return 0
+
+    async def _flip_signal_to_cancelled(self, signal_id: UUID, *, reason: str) -> None:
+        """Flip ``signals.status`` to 'cancelled' for an exit signal we
+        cannot dispatch (no open trade, no open bracket, or position
+        already flat).
+
+        Per operator decision 2026-05-27: reuse the existing
+        'cancelled' status value rather than add a new
+        'position_already_flat' value via alembic CHECK migration.
+        The forensic distinction lives in the structured log entry
+        (``reason`` kwarg).
+
+        No audit event is emitted — the SIGNAL_EMITTED row from the
+        original emit is durable + the operator can correlate via
+        signal_id. Adding an "ORDER_DROPPED" audit type would require
+        an A02 enum extension + tests; deferred unless operational
+        experience surfaces a forensic need.
+        """
+        async with self._session_factory() as session:
+            async with session.begin():
+                await session.execute(
+                    text(
+                        "UPDATE signals SET status = 'cancelled' "
+                        "WHERE id = :sid AND status = 'approved'"
+                    ),
+                    {"sid": signal_id},
+                )
+        self._log.info(
+            "order_placement_exit_signal_cancelled",
+            signal_id=str(signal_id),
+            reason=reason,
+        )
 
     async def run_forever(self) -> None:
         """Supervisor entry point — poll-dispatch loop until request_stop."""
@@ -1574,11 +2642,20 @@ __all__ = [
     "DEFAULT_POLL_INTERVAL_SECONDS",
     "RETRY_N_PHASE_1",
     "ApprovedSignalRow",
+    "BracketStopRow",
+    "ExitClosePlan",
     "OrderPlacementError",
     "OrderPlacementPlan",
     "OrderPlacementResult",
     "OrderPlacementWorker",
+    "PositionUnprotectedAlertDescriptor",
+    "PositionUnprotectedAlertHook",
+    "apply_exit_close_placement",
     "apply_order_placement",
     "fetch_approved_signals",
+    "fetch_current_position_quantity",
+    "fetch_entry_signal_id_for_open_trade",
+    "fetch_open_bracket_stop_for_entry",
+    "plan_exit_close_placement",
     "plan_order_placement",
 ]

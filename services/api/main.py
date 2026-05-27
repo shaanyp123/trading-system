@@ -30,7 +30,7 @@ import logging
 import secrets
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import UUID
 
 if TYPE_CHECKING:
@@ -195,6 +195,26 @@ async def _start_order_placement_worker(settings: APISettings) -> tuple[object, 
             ),
         )
 
+    # Exit-pipeline PR-C (2026-05-27): build the POSITION_UNPROTECTED
+    # P0 alert dispatch hook from sops Discord URLs + Resend identity.
+    # When sops isn't populated the hook stays None — the worker still
+    # writes the audit row + structured WARNING in logs; only the
+    # Discord/email push is skipped (operator should monitor the
+    # /audit page until the hook is wired).
+    #
+    # ``_build_position_unprotected_alert_hook`` returns ``object | None``
+    # for the same circular-import dodge as the recon + monitor hook
+    # builders (see their docstrings). The runtime type IS
+    # ``PositionUnprotectedAlertHook | None``; cast for mypy.
+    from typing import cast as _cast
+
+    from services.risk.order_placement_worker import PositionUnprotectedAlertHook
+
+    position_unprotected_hook = _cast(
+        "PositionUnprotectedAlertHook | None",
+        _build_position_unprotected_alert_hook(settings),
+    )
+
     worker = OrderPlacementWorker(
         session_factory=api_db.get_session_factory(),
         ibkr_client=ibkr_client,
@@ -202,6 +222,7 @@ async def _start_order_placement_worker(settings: APISettings) -> tuple[object, 
         env=_audit_env_from_settings(settings),
         poll_interval_seconds=settings.order_placement_poll_interval_seconds,
         ibkr_call_timeout_seconds=settings.ibkr_call_timeout_seconds,
+        position_unprotected_alert_hook=position_unprotected_hook,
     )
     task = asyncio.create_task(worker.run_forever(), name="order_placement_worker.run_forever")
     log.info(
@@ -375,6 +396,173 @@ def _build_alert_dispatch_hook(
                 )
         log.info(
             "reconciliation_alert_dispatched",
+            alert_id=str(alert_id),
+            short_circuited=report.short_circuited,
+            delivery_status=dict(report.delivery_status),
+        )
+
+    return _hook
+
+
+def _build_position_unprotected_alert_hook(
+    settings: APISettings,
+) -> object | None:
+    """Construct the order_placement_worker's POSITION_UNPROTECTED P0
+    alert dispatch hook or return None.
+
+    Exit-pipeline PR-C (2026-05-27). The worker's exit branch invokes
+    this hook from the cancel-success+place-fail failure path; the hook
+    INSERTs an ``alerts`` row of category='position_unprotected' +
+    severity='P0' (linked via ``triggering_audit_event_uuid`` to the
+    POSITION_UNPROTECTED audit row that JUST landed), then invokes
+    :func:`services.webhook_pusher.dispatcher.dispatch_alert` for the
+    Discord #alerts + #critical + Resend email fan-out per
+    SEVERITY_TO_CHANNELS[P0].
+
+    Returns ``None`` when sops Discord URLs aren't populated (same
+    degradation contract as the recon + monitor hooks). The worker
+    still writes the audit row + a structured WARNING in logs so the
+    operator can monitor /audit until the hook is wired.
+
+    Pattern mirror of ``_build_alert_dispatch_hook`` but the hook
+    signature is ``PositionUnprotectedAlertHook`` taking a
+    :class:`PositionUnprotectedAlertDescriptor`. P0 routing requires
+    all of ``discord.webhook_urls.alerts``, ``discord.webhook_urls.critical``,
+    and the Resend identity fields; missing any → the
+    :func:`dispatch_alert` planner raises at fan-out time, the
+    worker's exception handler swallows + logs (failure-of-failure
+    handler tolerated since the audit row already records the durable
+    state). Recommend wiring ALL three before live cutover.
+
+    Returns ``object | None`` to dodge a circular import on the worker
+    side (same crutch as the other two hooks).
+    """
+    from services.risk.order_placement_worker import (
+        PositionUnprotectedAlertDescriptor,
+    )
+    from services.webhook_pusher.dispatcher import dispatch_alert
+    from services.webhook_pusher.payloads import (
+        AlertCategory,
+        AlertSeverity,
+        ChannelName,
+        EmailIdentity,
+    )
+
+    if settings.discord_webhook_url_alerts is None:
+        log.warning(
+            "position_unprotected_alert_hook_skipped_no_webhook_url",
+            note=(
+                "discord.webhook_urls.alerts not in sops; the exit-pipeline "
+                "POSITION_UNPROTECTED audit row will still land, but no "
+                "P0 Discord push will fire. Wire the sops field + restart "
+                "api to enable. THIS IS A LIVE-CUTOVER BLOCKER per "
+                "Docs/exit-pipeline-design.md §11 R3."
+            ),
+        )
+        return None
+
+    webhook_urls: dict[ChannelName, str] = {
+        ChannelName.DISCORD_ALERTS: settings.discord_webhook_url_alerts.get_secret_value(),
+    }
+    if settings.discord_webhook_url_critical is not None:
+        webhook_urls[ChannelName.DISCORD_CRITICAL] = (
+            settings.discord_webhook_url_critical.get_secret_value()
+        )
+    else:
+        log.warning(
+            "position_unprotected_alert_hook_missing_critical_channel",
+            note=(
+                "discord.webhook_urls.critical not in sops; P0 alerts will "
+                "fall back to #alerts only. The dispatcher's planner WILL "
+                "raise at fan-out time when SEVERITY_TO_CHANNELS[P0] "
+                "expects #critical. Wire before live cutover."
+            ),
+        )
+
+    email_identity: EmailIdentity | None = None
+    if (
+        settings.resend_api_key is not None
+        and settings.resend_from_address is not None
+        and settings.resend_to_address is not None
+    ):
+        email_identity = EmailIdentity(
+            from_address=settings.resend_from_address,
+            to_address=settings.resend_to_address,
+            resend_api_key=settings.resend_api_key.get_secret_value(),
+        )
+
+    log.info(
+        "position_unprotected_alert_hook_constructed",
+        channels=[c.value for c in webhook_urls],
+        email_wired=email_identity is not None,
+    )
+
+    async def _hook(descriptor: PositionUnprotectedAlertDescriptor) -> None:
+        """Per-failure: INSERT alerts row + dispatch P0 fan-out."""
+        session_factory = api_db.get_session_factory()
+        message_text = (
+            f"POSITION_UNPROTECTED · {descriptor.market} "
+            f"({descriptor.prior_position_direction} "
+            f"qty={abs(descriptor.prior_position_quantity)}) — bracket-stop "
+            f"cancel succeeded, close placement FAILED. "
+            f"close_failure_reason={descriptor.close_failure_reason}. "
+            f"last_known_stop_price={descriptor.last_known_stop_price}."
+        )
+        detail_payload: dict[str, Any] = {
+            "signal_id": str(descriptor.signal_id),
+            "market": descriptor.market,
+            "prior_position_direction": descriptor.prior_position_direction,
+            "prior_position_quantity": descriptor.prior_position_quantity,
+            "last_known_stop_price": str(descriptor.last_known_stop_price),
+            "close_client_order_id": descriptor.close_client_order_id,
+            "close_failure_reason": descriptor.close_failure_reason,
+        }
+        async with session_factory() as ins_session:
+            row = (
+                await ins_session.execute(
+                    text(
+                        "INSERT INTO alerts ("
+                        "    account_id, severity, category, message, detail, "
+                        "    triggering_audit_event_uuid"
+                        ") VALUES ("
+                        "    :acct, :sev, :cat, :msg, CAST(:detail AS JSONB), :tau"
+                        ") RETURNING id"
+                    ),
+                    {
+                        "acct": descriptor.account_id,
+                        "sev": AlertSeverity.P0.value,
+                        "cat": AlertCategory.POSITION_UNPROTECTED.value,
+                        "msg": message_text,
+                        "detail": json.dumps(detail_payload),
+                        "tau": descriptor.triggering_audit_event_uuid,
+                    },
+                )
+            ).fetchone()
+            assert row is not None
+            alert_id = UUID(str(row.id))
+            await ins_session.commit()
+
+        log.error(
+            "position_unprotected_alert_inserted",
+            alert_id=str(alert_id),
+            account_id=str(descriptor.account_id),
+            signal_id=str(descriptor.signal_id),
+            market=descriptor.market,
+            env=descriptor.env,
+            close_failure_reason=descriptor.close_failure_reason,
+        )
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as http_client:
+            async with session_factory() as disp_session:
+                report = await dispatch_alert(
+                    session=disp_session,
+                    alert_id=alert_id,
+                    http_client=http_client,
+                    webhook_urls=webhook_urls,
+                    email_identity=email_identity,
+                )
+        log.error(
+            "position_unprotected_alert_dispatched",
             alert_id=str(alert_id),
             short_circuited=report.short_circuited,
             delivery_status=dict(report.delivery_status),
