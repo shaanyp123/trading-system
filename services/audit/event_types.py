@@ -204,14 +204,18 @@ class AuditEventType(StrEnum):
     # close-order PLACE fails. The position is NAKED (no protective stop)
     # until the operator intervenes — the worst failure mode in the exit
     # pipeline (R3 in ``Docs/exit-pipeline-design.md`` §11). Payload carries
-    # ``signal_id`` (the exit signal), ``market``,
+    # ``signal_id`` (the exit signal), ``account_id``, ``market``,
     # ``prior_position_direction`` ('long'/'short' — derived from the FRESH
     # positions_current read), ``prior_position_quantity`` (signed magnitude
-    # from positions_current at fail-time), ``exit_reason``
-    # ('reversal'/'trend_flip'/'decommission' — JOINed from the SIGNAL_EMITTED
-    # audit row's payload), ``cancelled_stop_client_order_id``,
+    # from positions_current at fail-time), ``cancelled_stop_client_order_id``,
     # ``cancelled_stop_broker_order_id``, ``last_known_stop_price`` (the
-    # bracket stop's price right before cancel), ``close_failure_reason``.
+    # bracket stop's price right before cancel), ``close_client_order_id``,
+    # ``close_failure_reason``, ``linked_cancel_audit_event_uuid``, and
+    # ``observed_at_utc``. Note: ``exit_reason`` is DELIBERATELY omitted
+    # because PR-B persists it only in the SIGNAL_EMITTED audit payload
+    # (audit_log.payload_jcs is BYTEA, not JSONB; signals has no
+    # audit_event_uuid back-pointer) — operator deep-links from the
+    # Discord embed's signal_id to /signals for full context.
     # Pairs with an ``alerts`` row of category ``position_unprotected``
     # severity ``P0`` → Discord #alerts + #critical + Resend email.
     # Operator-runbook: ``scripts/operator_tools/replace_protective_stop.py``
