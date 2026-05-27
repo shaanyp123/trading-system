@@ -17,6 +17,39 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ## Entries
 
+### 2026-05-27 (afternoon) — Punch-list session shipped: HALT_NEW exit bypass + Master Client ID wiring + replace_protective_stop integration tests
+
+**Trigger:** continuation of the 2026-05-27 morning's PR #262/#263/#264 cluster. Yesterday's session-end punch list enumerated 4 follow-ups (Task A through D); this session shipped all four as 3 PRs.
+
+**Spec reference:** `Docs/exit-pipeline-design.md` §1 L5 + `Docs/backend-spec.md` §2.5 (HALT_NEW behavior); `Docs/decisions-log.md` 2026-05-27 entry "Cross-clientId IBKR cancellation" (Mitigation A research).
+
+**Shipped:**
+
+* **PR [#265](https://github.com/shaanyp123/trading-system/pull/265) (DRAFT, A02; needs `risk-review-approved` label + `/ultrareview` before merge)** — `feat(risk): split HALT_NEW gate — exits bypass per design L5`. Worker `run_once` now always fetches the approved-signal queue then filters to `signal_type='exit'` under HALT_NEW. Closes the design-vs-code gap PR #264 explicitly flagged in its module docstring ("Test for this behavior is intentionally omitted; documented in the PR description as a worker-vs-design gap for follow-up"). Tests: 5 unit (rewrote `TestHaltGuard::test_halt_new_skips_drain` → `test_halt_new_with_only_entries_dispatches_nothing` + added `test_halt_new_dispatches_exit_skips_entry`; existing NORMAL/CONVALESCENT/None cases unchanged) + 1 integration (`test_run_once_dispatches_exit_under_halt_new_bypass` end-to-end against real schema with HALT_NEW risk_state seeded).
+
+* **PR [#266](https://github.com/shaanyp123/trading-system/pull/266) (hot-fix scope; no A02 trip)** — `feat(deploy): wire TWS_MASTER_CLIENT_ID + cross-clientId probe tool`. Mitigation A wiring per the morning's decisions-log entry. `docker-compose.yml` ib_gateway service gets `TWS_MASTER_CLIENT_ID: ${IBKR_MASTER_CLIENT_ID:-}` (default empty = pre-mitigation behavior preserved); `deploy/.env.example` documents the new `IBKR_MASTER_CLIENT_ID` variable + operator-coordinated deploy ceremony; new `scripts/operator_tools/master_client_id_probe.py` empirically validates post-deploy. 10 unit tests on the argparse validation surface. Operator action required: pick `IBKR_MASTER_CLIENT_ID` value (1 vs 2 reconciliation), schedule gateway restart outside 20:55-22:35 UTC abort window, run probe, append empirical result HERE.
+
+* **PR [#267](https://github.com/shaanyp123/trading-system/pull/267) (tests-only)** — `test(integration,execution): replace_protective_stop e2e + PR #262 advisories`. Completes Task 3 from yesterday's punch list (integration test mirroring the PR #264 testcontainers pattern; 3 cases: happy path, idempotency guard, HALT_NEW bypass) + the two test-only follow-ups from PR #262's risk-review approval (post-loop race-window in `_await_cancel_terminal_status` + 4 defensive-branch tests for `_contract_from_ib` multiplier coercion).
+
+**Verification:**
+* `make lint` clean on all branches.
+* `make typecheck` clean (156-157 source files across branches).
+* Full `pytest tests/unit tests/integration` = 2529 passing on the Task C branch (broadest scope).
+* /M2K state unchanged: 1 long @ $2925.00; bracket-stop `b5237aed-b07925a7-019e66d3-stop-replace-0` (broker_order_id=4) still PreSubmitted at IBKR.
+
+**Open operator decisions deferred to the post-merge ceremony:**
+1. Worker clientId reconciliation — keep `API_IBKR_CLIENT_ID=2` override OR drop the override + reconcile to code default 1. Whichever value chosen goes into `IBKR_MASTER_CLIENT_ID`.
+2. Gateway restart timing — outside 20:55-22:35 UTC; CME 02:00-04:00 UTC trough recommended.
+3. Empirical probe — run post-restart; append result to THIS entry's table.
+
+**Cost / scope impact:**
+* Code: net +44 lines in `services/risk/order_placement_worker.py` (run_once filter); +405 lines new tooling/tests (`scripts/operator_tools/master_client_id_probe.py` + `tests/unit/test_master_client_id_probe.py` + `tests/integration/test_replace_protective_stop_end_to_end.py`); +128 lines `tests/unit/test_execution_ibkr_adapter.py` (race-window + defensive-branch tests); +19 lines `docker-compose.yml` (TWS_MASTER_CLIENT_ID env block).
+* Live-money cutover blockers remaining: empirical Master Client ID validation (operator-coordinated post-deploy) is the gating one; everything else from yesterday's punch list is closed. See `Docs/live-money-cutover-plan.md` for the broader cutover scope.
+
+**File-index staleness noted:** `Docs/file-index.md` HEAD reference is `3c64f49` (2026-05-18); missing rows for `recovery_agent.py`, `trigger_v1_cycle.py`, `replace_protective_stop.py` (all from later sessions). This PR adds rows for the two NEW files from #266 and #267 (`master_client_id_probe.py` + the integration test) but does NOT backfill the prior gap. A broader file-index refresh is a candidate follow-up session.
+
+---
+
 ### 2026-05-27 — Cross-clientId IBKR cancellation: structural limitation, mitigation = Master Client ID
 
 **Trigger:** PR-5 (replace_protective_stop.py) placed a /M2K replacement bracket-stop on operator-tool clientId=99 (`b5237aed-b07925a7-019e66d3-stop-replace-0`, broker_order_id=4, status=PreSubmitted). Open question for live cutover: when the order-placement worker later wants to cancel that stop (e.g., normal exit-pipeline flow), does its `IbkrClient.cancel_order(client_order_id)` call succeed across clientIds?
