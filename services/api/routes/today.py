@@ -22,13 +22,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.api.config import APISettings, get_settings
 from services.api.db import get_session
+from services.api.exposure import compute_exposure_breakdown
 from services.api.repos.phase1 import Phase1QueryRepo, PostgresPhase1QueryRepo
 from services.api.schemas.health_score import (
     HealthScoreComponent,
     HealthScoreResponse,
 )
 from services.api.schemas.today import (
-    ExposureBreakdown,
     PnLSummary,
     TodayDigestResponse,
 )
@@ -129,8 +129,12 @@ async def today_digest(
         daily_pnl, weekly_pnl, monthly_pnl, yearly_pnl = await repo.fetch_realized_pnl_aggregates(
             account_id
         )
+        positions_rows = await repo.fetch_positions_current(account_id)
+        nav = await repo.fetch_latest_balance_nav(account_id)
     else:
         daily_pnl = weekly_pnl = monthly_pnl = yearly_pnl = Decimal("0")
+        positions_rows = []
+        nav = None
 
     return TodayDigestResponse(
         health_score=_build_phase0_health_score(now),
@@ -140,17 +144,7 @@ async def today_digest(
             monthly_pnl=monthly_pnl,
             yearly_pnl=yearly_pnl,
         ),
-        exposure=ExposureBreakdown(
-            by_cluster={
-                "equity_index": Decimal("0"),
-                "commodity": Decimal("0"),
-                "rates_bonds": Decimal("0"),
-                "crypto": Decimal("0"),
-                "fx": Decimal("0"),
-            },
-            gross_exposure_pct_nav=Decimal("0"),
-            net_exposure_pct_nav=Decimal("0"),
-        ),
+        exposure=compute_exposure_breakdown(positions_rows, nav),
         queued_signals_count=queued_signals,
         active_alerts_count_by_severity={
             "P0": alert_counts.p0 if alert_counts else 0,
