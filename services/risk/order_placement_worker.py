@@ -1973,10 +1973,15 @@ class OrderPlacementWorker:
     async def run_once(self) -> int:
         """Drain all currently-approved signals in one pass.
 
-        PR-H: Before draining, reads the current risk_state. If
-        ``HALT_NEW``, the cycle is a no-op + a structured WARNING fires
-        so the operator sees the gating in the api logs. NORMAL +
-        CONVALESCENT permit the drain.
+        Reads the current risk_state. Under HALT_NEW, entry signals are
+        filtered out + accumulate in the signals table until the
+        operator resumes via /system (HALT_NEW → CONVALESCENT). Exit
+        signals BYPASS HALT_NEW per ``Docs/exit-pipeline-design.md`` L5
+        + ``Docs/backend-spec.md`` §2.5 — so an approved-but-not-yet-
+        dispatched exit can drain during the halt window, restoring the
+        invariant that operator-approved exits are not stranded by a
+        risk-state transition. NORMAL + CONVALESCENT permit both
+        entries + exits.
 
         Returns the number of signals successfully dispatched to IBKR
         (regardless of broker-side acceptance vs rejection). Caller uses
@@ -1993,23 +1998,32 @@ class OrderPlacementWorker:
         risk_state = await fetch_current_risk_state(
             self._session_factory, account_id=self._account_id
         )
-        if risk_state is not None and risk_state not in RISK_STATES_PERMITTING_DISPATCH:
-            self._log.warning(
-                "order_placement_worker_skipped_by_halt",
-                risk_state=risk_state,
-                note=(
-                    "System is HALT_NEW; approved signals will accumulate "
-                    "in the signals table until the operator resumes via "
-                    "/system page (HALT_NEW → CONVALESCENT)."
-                ),
-            )
-            return 0
+        halted = risk_state is not None and risk_state not in RISK_STATES_PERMITTING_DISPATCH
 
         signals = await fetch_approved_signals(
             self._session_factory, account_id=self._account_id, env=self._env
         )
         if not signals:
             return 0
+
+        if halted:
+            entries_skipped = sum(1 for s in signals if s.signal_type != "exit")
+            signals = [s for s in signals if s.signal_type == "exit"]
+            if entries_skipped > 0:
+                self._log.warning(
+                    "order_placement_worker_entries_skipped_by_halt",
+                    risk_state=risk_state,
+                    entries_skipped=entries_skipped,
+                    exits_dispatching=len(signals),
+                    note=(
+                        "System is HALT_NEW; entry signals will accumulate "
+                        "in the signals table until the operator resumes "
+                        "via /system (HALT_NEW → CONVALESCENT). Exits "
+                        "bypass HALT_NEW per design L5 + backend-spec §2.5."
+                    ),
+                )
+            if not signals:
+                return 0
 
         placed = 0
         for signal in signals:
