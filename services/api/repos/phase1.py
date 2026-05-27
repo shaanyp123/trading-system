@@ -21,7 +21,7 @@ every table touched here per ``alembic/versions/0006_roles.py``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Literal, Protocol
 from uuid import UUID
@@ -207,6 +207,11 @@ class Phase1QueryRepo(Protocol):
     ) -> tuple[list[AuditLogRow], int | None, bool]: ...
 
     async def fetch_latest_balance_nav(self, account_id: UUID) -> Decimal | None: ...
+
+    async def fetch_realized_pnl_aggregates(
+        self,
+        account_id: UUID,
+    ) -> tuple[Decimal, Decimal, Decimal, Decimal]: ...
 
     async def fetch_signal_summary(
         self,
@@ -686,6 +691,83 @@ class PostgresPhase1QueryRepo:
             )
         ).fetchone()
         return Decimal(str(row.net_liquidation)) if row else None
+
+    async def fetch_realized_pnl_aggregates(
+        self,
+        account_id: UUID,
+    ) -> tuple[Decimal, Decimal, Decimal, Decimal]:
+        """Return (daily, weekly, monthly, yearly) realized-PnL sums.
+
+        Aggregates ``trades.realized_pnl_usd`` over UTC-calendar-aligned
+        windows ending at ``now()``:
+
+        * daily   — current UTC day (00:00 UTC to now)
+        * weekly  — current ISO week (Monday 00:00 UTC to now)
+        * monthly — current UTC calendar month (1st 00:00 UTC to now)
+        * yearly  — current UTC calendar year (Jan 1 00:00 UTC to now)
+
+        Phase 1 simplification: uses UTC-aligned calendar boundaries
+        rather than the spec's 17:00-ET-aligned session boundaries
+        (frontend-spec §2.2.2 B). The two interpretations diverge only
+        for trades closed between 00:00 UTC and 21:00 UTC of a calendar
+        day — a small population for now. A follow-up can swap to
+        session-aligned when the operator wants the exact spec match.
+
+        Only ``state='closed'`` trades with ``realized_pnl_usd IS NOT
+        NULL`` contribute. Open positions (unrealized PnL) are NOT
+        included — that surface lives on
+        :func:`PositionsResponse.unrealized_pnl_pct_of_nav` per
+        spec §4.1.5b.
+        """
+        now_utc = datetime.now(tz=UTC)
+        day_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+        week_start = day_start - timedelta(days=day_start.weekday())
+        month_start = day_start.replace(day=1)
+        year_start = day_start.replace(month=1, day=1)
+        row = (
+            await self._session.execute(
+                text(
+                    """
+                    SELECT
+                      COALESCE(SUM(
+                        CASE WHEN closed_at_utc >= :day_start
+                             THEN realized_pnl_usd ELSE 0 END
+                      ), 0) AS daily_pnl,
+                      COALESCE(SUM(
+                        CASE WHEN closed_at_utc >= :week_start
+                             THEN realized_pnl_usd ELSE 0 END
+                      ), 0) AS weekly_pnl,
+                      COALESCE(SUM(
+                        CASE WHEN closed_at_utc >= :month_start
+                             THEN realized_pnl_usd ELSE 0 END
+                      ), 0) AS monthly_pnl,
+                      COALESCE(SUM(
+                        CASE WHEN closed_at_utc >= :year_start
+                             THEN realized_pnl_usd ELSE 0 END
+                      ), 0) AS yearly_pnl
+                    FROM trades
+                    WHERE account_id = :acc
+                      AND state = 'closed'
+                      AND realized_pnl_usd IS NOT NULL
+                    """
+                ),
+                {
+                    "acc": account_id,
+                    "day_start": day_start,
+                    "week_start": week_start,
+                    "month_start": month_start,
+                    "year_start": year_start,
+                },
+            )
+        ).fetchone()
+        if row is None:
+            return (Decimal("0"), Decimal("0"), Decimal("0"), Decimal("0"))
+        return (
+            Decimal(str(row.daily_pnl)),
+            Decimal(str(row.weekly_pnl)),
+            Decimal(str(row.monthly_pnl)),
+            Decimal(str(row.yearly_pnl)),
+        )
 
     async def fetch_signal_summary(
         self,

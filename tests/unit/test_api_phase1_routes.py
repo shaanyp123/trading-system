@@ -126,6 +126,12 @@ class _StubRepo:
         False,
     )
     nav: Decimal | None = None
+    realized_pnl_aggregates: tuple[Decimal, Decimal, Decimal, Decimal] = (
+        Decimal("0"),
+        Decimal("0"),
+        Decimal("0"),
+        Decimal("0"),
+    )
     last_signals_filter: dict[str, Any] | None = None
     last_alerts_filter: dict[str, Any] | None = None
     last_orders_filter: dict[str, Any] | None = None
@@ -290,6 +296,12 @@ class _StubRepo:
 
     async def fetch_latest_balance_nav(self, account_id: UUID) -> Decimal | None:
         return self.nav
+
+    async def fetch_realized_pnl_aggregates(
+        self,
+        account_id: UUID,
+    ) -> tuple[Decimal, Decimal, Decimal, Decimal]:
+        return self.realized_pnl_aggregates
 
     async def fetch_signal_summary(
         self,
@@ -1436,6 +1448,152 @@ class TestPositionsCurrent:
         body = response.json()
         assert body["positions"] == []
         assert body["as_of"] is not None
+
+    @pytest.mark.asyncio
+    async def test_populated_positions_mapped_to_position_objects(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        """Post-2026-05-27 fix: route maps positions_current rows into
+        Position objects with Phase 1 field defaults (current_price=
+        avg_cost, cluster=None, contract_month=None)."""
+        account_id = uuid4()
+        contract_id = uuid4()
+        positions_rows = [
+            {
+                "id": uuid4(),
+                "market": "/M2K",
+                "contract_id": contract_id,  # futures
+                "quantity": 1,
+                "avg_cost": Decimal("2925.00"),
+                "margin_held": Decimal("500.00"),
+                "unrealized_pnl": None,  # MTM not run yet — Phase 1 fallback
+                "last_mark_ts": datetime(2026, 5, 27, 13, 31, tzinfo=UTC),
+                "managed_by_version": "b5237aed3f06288656a31510795a3ae3e76556ae",
+            },
+            {
+                "id": uuid4(),
+                "market": "TLT",
+                "contract_id": None,  # ETF
+                "quantity": 5,
+                "avg_cost": Decimal("83.72"),
+                "margin_held": Decimal("0"),
+                "unrealized_pnl": Decimal("12.50"),
+                "last_mark_ts": datetime(2026, 5, 27, 13, 31, tzinfo=UTC),
+                "managed_by_version": "c951158bdeadbeef" + "0" * 24,
+            },
+        ]
+        repo = _StubRepo(
+            account_id=account_id,
+            positions_rows=positions_rows,
+            nav=Decimal("100000"),
+        )
+        _bind_repo(override_dep, positions_route, repo)
+        response = await api_client.get("/api/positions/current")
+        assert response.status_code == 200
+        body = response.json()
+        assert len(body["positions"]) == 2
+
+        m2k = next(p for p in body["positions"] if p["symbol"] == "/M2K")
+        # Futures: instrument_id is the contract_id as a string
+        assert m2k["instrument_id"] == str(contract_id)
+        assert m2k["qty"] == 1
+        assert Decimal(m2k["avg_entry_price"]) == Decimal("2925.00")
+        # Phase 1 fallback: current_price == avg_entry_price when MTM not set
+        assert Decimal(m2k["current_price"]) == Decimal("2925.00")
+        # unrealized_pnl=None in DB → returned as 0
+        assert Decimal(m2k["unrealized_pnl"]) == Decimal("0")
+        assert Decimal(m2k["unrealized_pnl_pct_of_nav"]) == Decimal("0")
+        # Phase 1 fallback: contracts JOIN deferred
+        assert m2k["cluster"] is None
+        assert m2k["contract_month"] is None
+        # First 7 chars of managed_by_version per spec §4.1.5b
+        assert m2k["managed_by_strategy_version"] == "b5237ae"
+
+        tlt = next(p for p in body["positions"] if p["symbol"] == "TLT")
+        # ETF: instrument_id falls back to market symbol when contract_id IS NULL
+        assert tlt["instrument_id"] == "TLT"
+        assert Decimal(tlt["unrealized_pnl"]) == Decimal("12.50")
+        # unrealized_pnl / NAV = 12.50 / 100000 = 0.0001 (quantized)
+        assert Decimal(tlt["unrealized_pnl_pct_of_nav"]) == Decimal("0.0001")
+
+    @pytest.mark.asyncio
+    async def test_zero_nav_falls_back_to_zero_pct(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        """When NAV is unavailable / zero, the pct field returns 0
+        without raising a division error."""
+        account_id = uuid4()
+        positions_rows = [
+            {
+                "id": uuid4(),
+                "market": "/M2K",
+                "contract_id": uuid4(),
+                "quantity": 1,
+                "avg_cost": Decimal("2925.00"),
+                "margin_held": Decimal("500.00"),
+                "unrealized_pnl": Decimal("100"),
+                "last_mark_ts": datetime(2026, 5, 27, tzinfo=UTC),
+                "managed_by_version": "a" * 40,
+            }
+        ]
+        repo = _StubRepo(
+            account_id=account_id,
+            positions_rows=positions_rows,
+            nav=Decimal("0"),  # zero NAV — must NOT divide
+        )
+        _bind_repo(override_dep, positions_route, repo)
+        response = await api_client.get("/api/positions/current")
+        assert response.status_code == 200
+        body = response.json()
+        assert Decimal(body["positions"][0]["unrealized_pnl_pct_of_nav"]) == Decimal("0")
+
+
+class TestTodayDigestPnlAggregates:
+    """Post-2026-05-27 fix: PnL section computes real realized-PnL
+    aggregates instead of returning all zeros."""
+
+    @pytest.mark.asyncio
+    async def test_pnl_aggregates_propagated_from_repo(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        account_id = uuid4()
+        repo = _StubRepo(
+            account_id=account_id,
+            realized_pnl_aggregates=(
+                Decimal("12.34"),  # daily
+                Decimal("56.78"),  # weekly
+                Decimal("75.80"),  # monthly
+                Decimal("75.80"),  # yearly
+            ),
+        )
+        _bind_repo(override_dep, today_route, repo)
+        response = await api_client.get("/api/today/digest")
+        assert response.status_code == 200
+        body = response.json()
+        assert Decimal(body["pnl"]["daily_pnl"]) == Decimal("12.34")
+        assert Decimal(body["pnl"]["weekly_pnl"]) == Decimal("56.78")
+        assert Decimal(body["pnl"]["monthly_pnl"]) == Decimal("75.80")
+        assert Decimal(body["pnl"]["yearly_pnl"]) == Decimal("75.80")
+
+    @pytest.mark.asyncio
+    async def test_no_account_falls_back_to_zero_pnl(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(account_id=None)
+        _bind_repo(override_dep, today_route, repo)
+        response = await api_client.get("/api/today/digest")
+        assert response.status_code == 200
+        body = response.json()
+        assert Decimal(body["pnl"]["daily_pnl"]) == Decimal("0")
+        assert Decimal(body["pnl"]["yearly_pnl"]) == Decimal("0")
 
 
 class TestListOrders:

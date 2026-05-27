@@ -118,13 +118,27 @@ async def today_digest(
         state_value = "VACATION"
         state_severity = None
 
+    # Phase 1 (post-2026-05-27): real realized-PnL aggregates from the
+    # trades table. Spec §2.2.2 B asks for session-aligned (17:00 ET)
+    # boundaries; this query uses UTC-calendar-aligned boundaries as a
+    # pragmatic Phase 1 simplification — the two diverge only for
+    # trades closed between 00:00 UTC and 21:00 UTC. Unrealized PnL on
+    # open positions is NOT included here (lives on
+    # ``Position.unrealized_pnl_pct_of_nav``).
+    if account_id is not None:
+        daily_pnl, weekly_pnl, monthly_pnl, yearly_pnl = await repo.fetch_realized_pnl_aggregates(
+            account_id
+        )
+    else:
+        daily_pnl = weekly_pnl = monthly_pnl = yearly_pnl = Decimal("0")
+
     return TodayDigestResponse(
         health_score=_build_phase0_health_score(now),
         pnl=PnLSummary(
-            daily_pnl=Decimal("0"),
-            weekly_pnl=Decimal("0"),
-            monthly_pnl=Decimal("0"),
-            yearly_pnl=Decimal("0"),
+            daily_pnl=daily_pnl,
+            weekly_pnl=weekly_pnl,
+            monthly_pnl=monthly_pnl,
+            yearly_pnl=yearly_pnl,
         ),
         exposure=ExposureBreakdown(
             by_cluster={
