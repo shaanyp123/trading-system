@@ -11,9 +11,17 @@ Coverage matrix:
   YYYY-MM-DD validation on --session-date.
 * compute_active_universe (pure) — V1_CANDIDATE_UNIVERSE minus
   V1_SIDELINED_MARKETS; /MCL never appears in the result.
-* read_etf_bars_from_zip / read_futures_bars_from_zip — round-trip
-  against fixture zips that mirror bar_sync's on-disk layout (incl.
-  deci-cent scaling for ETFs + per-expiry CSV picking for futures).
+* read_etf_bars_from_zip — round-trip against fixture ETF zips that
+  mirror bar_sync's deci-cent integer-scaled equity-daily format.
+* _parse_universe_file_bar — parses one bar_sync universe file (header
+  + single data row) into a Bar; covers malformed-row / sentinel-close
+  / negative-volume edge cases.
+* read_futures_bars_from_universe_files — round-trip against fixture
+  per-day universe file directories that mirror bar_sync's
+  ``future/<market_dir>/universes/<lower>/<YYYYMMDD>.csv`` layout;
+  covers lookback-window filtering, ``as_of`` upper bound, missing
+  directory, non-CSV distractors, decimal precision, and the 200+ bar
+  invariant for MA_SLOW=200 to clear.
 * is_bar_series_stale (pure) — newest-bar-date vs threshold math.
 * build_v1_parameters_from_dict (pure) — JSONB → V1Parameters round-trip
   + V1_DEFAULTS fallback on empty input.
@@ -63,6 +71,7 @@ from scripts.operator_tools.trigger_v1_cycle import (
     _amain,
     _compute_exit_code,
     _parse_args,
+    _parse_universe_file_bar,
     _summarize,
     build_minimal_sizing_trace,
     build_position_from_row,
@@ -72,7 +81,7 @@ from scripts.operator_tools.trigger_v1_cycle import (
     emit_signal_with_dedup,
     is_bar_series_stale,
     read_etf_bars_from_zip,
-    read_futures_bars_from_zip,
+    read_futures_bars_from_universe_files,
 )
 from strategies.v1_trend_following.parameters import (
     V1_CANDIDATE_UNIVERSE,
@@ -146,39 +155,40 @@ def _write_etf_bar_zip(
         low_v = int((close - Decimal("1.00")) * scale)
         close_v = int(close * scale)
         lines.append(f"{d:%Y%m%d} 00:00,{open_v},{high_v},{low_v},{close_v},10000")
-    body = ("\n".join(lines) + "\n").encode("utf-8")
+    body = ("\n".join(lines) + "\n").encode()
     zip_path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr(f"{ticker.lower()}.csv", body)
 
 
-def _write_futures_bar_zip(
-    zip_path: Path,
+def _write_futures_universe_files(
+    universes_dir: Path,
     *,
-    ticker: str,
-    members: dict[str, list[tuple[date, Decimal]]],
+    bars: Iterable[tuple[date, Decimal]],
+    expiry: str = "202606",
 ) -> None:
-    """Write a futures-shaped zip with N per-expiry CSVs.
+    """Write one per-day universe file per (date, close) tuple.
 
-    ``members`` keys are YYYYMM strings (front-month + historical
-    expiries); values are the per-member bar lists. The reader function
-    picks the latest YYYYMM as the continuous-mapped series; tests use
-    this to verify the picker.
+    Mirrors ``services/data/bar_sync.py::build_futures_universe_csv``:
+
+        #expiry,open,high,low,close,volume,open_interest
+        <expiry>,<O>,<H>,<L>,<C>,<V>,<OI>
+
+    Each file lives at ``<universes_dir>/<YYYYMMDD>.csv``. The reader
+    picks the per-day file matching each session_date in its lookback
+    window. ``expiry`` is the front-month tag stamped into each row;
+    tests can vary it across calls to simulate roll boundaries.
     """
-    zip_path.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for yyyymm, bars in members.items():
-            lines = []
-            for d, close in bars:
-                lines.append(
-                    f"{d:%Y%m%d} 00:00,"
-                    f"{close - Decimal('0.50')},"
-                    f"{close + Decimal('0.50')},"
-                    f"{close - Decimal('1.00')},"
-                    f"{close},10000"
-                )
-            body = ("\n".join(lines) + "\n").encode("utf-8")
-            zf.writestr(f"{ticker.lower()}_trade_{yyyymm}.csv", body)
+    universes_dir.mkdir(parents=True, exist_ok=True)
+    for d, close in bars:
+        open_v = close - Decimal("0.50")
+        high_v = close + Decimal("0.50")
+        low_v = close - Decimal("1.00")
+        body = (
+            "#expiry,open,high,low,close,volume,open_interest\n"
+            f"{expiry},{open_v},{high_v},{low_v},{close},10000,200000\n"
+        ).encode()
+        (universes_dir / f"{d:%Y%m%d}.csv").write_bytes(body)
 
 
 # ---------------------------------------------------------------------------
@@ -314,56 +324,187 @@ class TestReadEtfBarsFromZip:
         assert bars == []
 
 
-class TestReadFuturesBarsFromZip:
-    def test_picks_latest_yyyymm_when_multiple_members_present(self, tmp_path: Path) -> None:
-        zip_path = tmp_path / "mes_trade.zip"
-        _write_futures_bar_zip(
-            zip_path,
-            ticker="MES",
-            members={
-                # Historical expiries (PR #229 backfill)
-                "202509": [(date(2025, 9, 1), Decimal("5800"))],
-                "202512": [(date(2025, 12, 1), Decimal("5900"))],
-                # Current front-month (continuous-mapped)
-                "202606": [
-                    (date(2026, 5, 24), Decimal("5234.50")),
-                    (date(2026, 5, 25), Decimal("5240.00")),
-                    (date(2026, 5, 26), Decimal("5245.25")),
-                ],
-            },
+class TestParseUniverseFileBar:
+    def test_well_formed_file_parses_to_bar(self) -> None:
+        body = (
+            b"#expiry,open,high,low,close,volume,open_interest\n"
+            b"202606,29450,29747.75,29437.5,29558.75,2008229,267668\n"
         )
-        bars = read_futures_bars_from_zip(zip_path, ticker="MES")
-        # Front-month (202606) wins; historical members are ignored
+        bar = _parse_universe_file_bar(body, session_date=date(2026, 5, 22))
+        assert bar is not None
+        assert bar.session_date == date(2026, 5, 22)
+        assert bar.open == Decimal("29450")
+        assert bar.high == Decimal("29747.75")
+        assert bar.low == Decimal("29437.5")
+        assert bar.close == Decimal("29558.75")
+        assert bar.volume == 2008229
+
+    def test_header_only_returns_none(self) -> None:
+        body = b"#expiry,open,high,low,close,volume,open_interest\n"
+        assert _parse_universe_file_bar(body, session_date=date(2026, 5, 22)) is None
+
+    def test_close_negative_one_sentinel_returns_none(self) -> None:
+        body = b"#expiry,open,high,low,close,volume,open_interest\n202606,100,101,99,-1,1000,0\n"
+        assert _parse_universe_file_bar(body, session_date=date(2026, 5, 22)) is None
+
+    def test_malformed_row_returns_none(self) -> None:
+        body = (
+            b"#expiry,open,high,low,close,volume,open_interest\n"
+            b"202606,not-a-number,29747.75,29437.5,29558.75,2008229,267668\n"
+        )
+        assert _parse_universe_file_bar(body, session_date=date(2026, 5, 22)) is None
+
+    def test_negative_volume_coerced_to_zero(self) -> None:
+        body = b"#expiry,open,high,low,close,volume,open_interest\n202606,100,101,99,100.5,-1,0\n"
+        bar = _parse_universe_file_bar(body, session_date=date(2026, 5, 22))
+        assert bar is not None
+        assert bar.volume == 0
+
+
+class TestReadFuturesBarsFromUniverseFiles:
+    def test_reads_all_files_in_lookback_window(self, tmp_path: Path) -> None:
+        universes_dir = tmp_path / "mnq"
+        _write_futures_universe_files(
+            universes_dir,
+            bars=[
+                (date(2026, 5, 24), Decimal("29400")),
+                (date(2026, 5, 25), Decimal("29500")),
+                (date(2026, 5, 26), Decimal("29558.75")),
+            ],
+        )
+        bars = read_futures_bars_from_universe_files(
+            universes_dir, ticker="MNQ", as_of=date(2026, 5, 26)
+        )
         assert len(bars) == 3
-        assert bars[0].session_date == date(2026, 5, 24)
-        assert bars[-1].close == Decimal("5245.25")
+        # Bars sorted ascending
+        assert [b.session_date for b in bars] == [
+            date(2026, 5, 24),
+            date(2026, 5, 25),
+            date(2026, 5, 26),
+        ]
+        assert bars[-1].close == Decimal("29558.75")
 
-    def test_returns_empty_when_no_trade_members_match_ticker(self, tmp_path: Path) -> None:
-        zip_path = tmp_path / "mes_trade.zip"
-        zip_path.parent.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(zip_path, "w") as zf:
-            # Different ticker's CSV mixed in (shouldn't happen in production
-            # but defends against corruption)
-            zf.writestr("foo_trade_202606.csv", b"20260524 00:00,1,2,0.5,1.5,100\n")
-        bars = read_futures_bars_from_zip(zip_path, ticker="MES")
-        assert bars == []
-
-    def test_missing_zip_returns_empty(self, tmp_path: Path) -> None:
-        bars = read_futures_bars_from_zip(tmp_path / "missing.zip", ticker="MES")
-        assert bars == []
-
-    def test_raw_prices_decoded_as_decimal_with_precision(self, tmp_path: Path) -> None:
-        zip_path = tmp_path / "mes_trade.zip"
-        _write_futures_bar_zip(
-            zip_path,
-            ticker="MES",
-            members={
-                "202606": [(date(2026, 5, 26), Decimal("5234.5678"))],
-            },
+    def test_filters_files_outside_lookback(self, tmp_path: Path) -> None:
+        universes_dir = tmp_path / "mnq"
+        _write_futures_universe_files(
+            universes_dir,
+            bars=[
+                # Older than as_of - 365 days → should be filtered out
+                (date(2024, 1, 1), Decimal("18000")),
+                # Inside window
+                (date(2025, 9, 1), Decimal("25000")),
+                (date(2026, 5, 26), Decimal("29558")),
+            ],
         )
-        bars = read_futures_bars_from_zip(zip_path, ticker="MES")
-        # Decimal preserves precision from the CSV; no float rounding
-        assert bars[0].close == Decimal("5234.5678")
+        bars = read_futures_bars_from_universe_files(
+            universes_dir,
+            ticker="MNQ",
+            as_of=date(2026, 5, 26),
+            lookback_days=365,
+        )
+        assert [b.session_date for b in bars] == [
+            date(2025, 9, 1),
+            date(2026, 5, 26),
+        ]
+
+    def test_filters_files_after_as_of(self, tmp_path: Path) -> None:
+        """Files dated AFTER session_date are excluded — replay must use
+        only what bar_sync would have seen by that date.
+        """
+        universes_dir = tmp_path / "mnq"
+        _write_futures_universe_files(
+            universes_dir,
+            bars=[
+                (date(2026, 5, 24), Decimal("29400")),
+                (date(2026, 5, 25), Decimal("29500")),
+                # Past as_of → should be excluded
+                (date(2026, 5, 26), Decimal("29558")),
+                (date(2026, 5, 27), Decimal("29600")),
+            ],
+        )
+        bars = read_futures_bars_from_universe_files(
+            universes_dir, ticker="MNQ", as_of=date(2026, 5, 25)
+        )
+        assert [b.session_date for b in bars] == [
+            date(2026, 5, 24),
+            date(2026, 5, 25),
+        ]
+
+    def test_missing_directory_returns_empty(self, tmp_path: Path) -> None:
+        bars = read_futures_bars_from_universe_files(
+            tmp_path / "does_not_exist",
+            ticker="MNQ",
+            as_of=date(2026, 5, 26),
+        )
+        assert bars == []
+
+    def test_non_csv_files_ignored(self, tmp_path: Path) -> None:
+        universes_dir = tmp_path / "mnq"
+        universes_dir.mkdir()
+        # Valid universe file
+        (universes_dir / "20260526.csv").write_bytes(
+            b"#expiry,open,high,low,close,volume,open_interest\n202606,100,101,99,100.5,1000,500\n"
+        )
+        # Distractor files that shouldn't be read
+        (universes_dir / "README.md").write_text("not a universe file")
+        (universes_dir / "20260526.txt").write_text("wrong extension")
+        (universes_dir / "garbage").write_text("no extension")
+        bars = read_futures_bars_from_universe_files(
+            universes_dir, ticker="MNQ", as_of=date(2026, 5, 26)
+        )
+        assert len(bars) == 1
+        assert bars[0].session_date == date(2026, 5, 26)
+
+    def test_unparseable_filename_skipped(self, tmp_path: Path) -> None:
+        universes_dir = tmp_path / "mnq"
+        universes_dir.mkdir()
+        # Valid filename
+        (universes_dir / "20260526.csv").write_bytes(
+            b"#expiry,open,high,low,close,volume,open_interest\n202606,100,101,99,100.5,1000,500\n"
+        )
+        # Unparseable filename pattern
+        (universes_dir / "not-a-date.csv").write_text("garbage")
+        (universes_dir / "2026-05-26.csv").write_text("wrong format")
+        bars = read_futures_bars_from_universe_files(
+            universes_dir, ticker="MNQ", as_of=date(2026, 5, 26)
+        )
+        assert len(bars) == 1
+        assert bars[0].session_date == date(2026, 5, 26)
+
+    def test_decimal_precision_preserved(self, tmp_path: Path) -> None:
+        universes_dir = tmp_path / "mnq"
+        _write_futures_universe_files(
+            universes_dir,
+            bars=[(date(2026, 5, 26), Decimal("29558.7525"))],
+        )
+        bars = read_futures_bars_from_universe_files(
+            universes_dir, ticker="MNQ", as_of=date(2026, 5, 26)
+        )
+        # Decimal precision preserved through the CSV write+read cycle
+        assert bars[0].close == Decimal("29558.7525")
+
+    def test_provides_enough_bars_for_ma_slow_200(self, tmp_path: Path) -> None:
+        """The whole point of the fix: 200+ bars available so MA_SLOW_DAYS=200
+        clears. v1 of this tool (PR #248) hit insufficient_bar_history because
+        the front-month zip member only had ~175 bars; universe files give us
+        the full continuous-mapped history.
+        """
+        universes_dir = tmp_path / "mes"
+        # 280 weekday session-date bars going back from 2026-05-26.
+        # Use a simple weekday-only iteration to mirror real CME data.
+        bars_to_write: list[tuple[date, Decimal]] = []
+        d = date(2026, 5, 26)
+        i = 0
+        while len(bars_to_write) < 280:
+            if d.weekday() < 5:  # Mon-Fri
+                bars_to_write.append((d, Decimal(str(5000 + i))))
+                i += 1
+            d -= timedelta(days=1)
+        _write_futures_universe_files(universes_dir, bars=bars_to_write)
+        bars = read_futures_bars_from_universe_files(
+            universes_dir, ticker="MES", as_of=date(2026, 5, 26)
+        )
+        assert len(bars) >= 200, f"Need >= 200 bars for MA_SLOW=200 to clear; got {len(bars)}"
 
 
 # ---------------------------------------------------------------------------
@@ -909,7 +1050,9 @@ def empty_data_root(tmp_path: Path) -> Path:
     fixtures that would actually fire a breakout.
     """
     (tmp_path / "equity" / "usa" / "daily").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "future" / "cme" / "daily").mkdir(parents=True, exist_ok=True)
+    # Universe-files dir (futures) — read by the new
+    # read_futures_bars_from_universe_files path.
+    (tmp_path / "future" / "cme" / "universes" / "mes").mkdir(parents=True, exist_ok=True)
     return tmp_path
 
 
@@ -1088,13 +1231,16 @@ def _emit_breakout_bars(start: date, n_bars: int) -> list[tuple[date, Decimal]]:
 
 @pytest.fixture
 def lean_data_root_with_breakout(tmp_path: Path) -> tuple[Path, date]:
-    """Lay down ETF + futures zips for the full active universe with
-    bars that will trigger LONG breakouts. Returns the data root + the
-    as_of session_date (= the last bar's date).
+    """Lay down ETF zips + futures universe-file directories for the
+    full active universe with bars that will trigger LONG breakouts.
+    Returns the data root + the as_of session_date (= the last bar's
+    date).
 
     Mirrors bar_sync's on-disk layout exactly:
       * ``equity/usa/daily/<lower>.zip`` for ETFs
-      * ``future/<market_dir>/daily/<lower>_trade.zip`` for futures
+      * ``future/<market_dir>/universes/<lower>/<YYYYMMDD>.csv`` for futures
+        (one universe file per session_date, replicating LEAN's
+        DataMappingMode.OPEN_INTEREST resolver input)
     """
     n_bars = 250
     start = date(2025, 9, 1)
@@ -1108,7 +1254,7 @@ def lean_data_root_with_breakout(tmp_path: Path) -> tuple[Path, date]:
             ticker=ticker,
             bars=bars,
         )
-    # Futures bundles — keys + market_dir mirror PHASE1_UNIVERSE_METADATA
+    # Futures: per-day universe files (keys + market_dir mirror PHASE1_UNIVERSE_METADATA)
     futures = [
         ("MES", "cme"),
         ("MNQ", "cme"),
@@ -1118,10 +1264,9 @@ def lean_data_root_with_breakout(tmp_path: Path) -> tuple[Path, date]:
         ("MBT", "cme"),
     ]
     for ticker, market_dir in futures:
-        _write_futures_bar_zip(
-            tmp_path / "future" / market_dir / "daily" / f"{ticker.lower()}_trade.zip",
-            ticker=ticker,
-            members={"202606": bars},
+        _write_futures_universe_files(
+            tmp_path / "future" / market_dir / "universes" / ticker.lower(),
+            bars=bars,
         )
     return tmp_path, as_of
 
