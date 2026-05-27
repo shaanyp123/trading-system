@@ -547,7 +547,10 @@ async def test_exit_dispatch_happy_path_writes_two_audit_rows_and_state_transiti
             {"sig": state["exit_signal_id"]},
         ).one()
     assert close_row.broker_order_id == "3"
-    assert close_row.status == "submitted"
+    # IbkrPlaceOrderResult.status="submitted" maps to orders.status="working"
+    # per services.risk.order_placement_worker._broker_status_to_orders_status
+    # (the IBKR-side enum is richer than the orders.status CHECK constraint).
+    assert close_row.status == "working"
     # parent_order_id wires the close back to the ORIGINAL entry per
     # PR-C contract — NOT the bracket stop.
     assert close_row.parent_order_id == state["entry_order_id"]
