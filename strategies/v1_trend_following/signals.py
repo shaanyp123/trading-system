@@ -36,6 +36,14 @@ class RejectionReason(StrEnum):
     HURST_BELOW_THRESHOLD = "hurst_below_threshold"
     NO_BREAKOUT = "no_breakout"
     MIN_HOLDING_DAYS_NOT_SATISFIED = "min_holding_days_not_satisfied"
+    # Same-direction breakout while we already hold the position. V1 treats
+    # each breakout as ONE entry; subsequent same-direction breakouts are
+    # NOT additional entries (V1 has no explicit pyramiding rules — no add-on
+    # thresholds in ATR units, no max-units cap). Without this gate, every
+    # day a trend continues would emit another candidate that the operator
+    # manually rejects in /signals; in production that becomes accidental
+    # scaling. See ``strategy.py::_evaluate_market`` step 5.
+    POSITION_ALREADY_SAME_DIRECTION = "position_already_same_direction"
     DATA_QUALITY_QUARANTINE = "data_quality_quarantine"
 
 
