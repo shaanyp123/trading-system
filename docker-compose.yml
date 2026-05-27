@@ -474,6 +474,25 @@ services:
       # manually after each gateway restart. Documented tradeoff in
       # `deploy/ibkr/README.md` "Existing session collisions" section.
       EXISTING_SESSION_DETECTED_ACTION: 'primary'
+      # TWS_MASTER_CLIENT_ID populates IBC's `IbLoginId` / `MasterClientId`
+      # in the rendered config.ini. When set, IBKR Gateway permits the
+      # named clientId to cancel orders placed by ANY clientId on this
+      # session; without it, cross-clientId cancellation returns
+      # `Error 10147 "OrderId not found"` even though the order is
+      # visible in the cancelling client's local ib-async trade cache.
+      # See `Docs/decisions-log.md` 2026-05-27 entry "Cross-clientId
+      # IBKR cancellation: structural limitation, mitigation = Master
+      # Client ID" for the full chain. Mitigation B (worker post-cancel
+      # verification, PR #262) is the belt-and-suspenders for whatever
+      # is configured here.
+      #
+      # Empty default → IBC renders no Master designation; gateway runs
+      # in pre-mitigation mode. To opt in, set IBKR_MASTER_CLIENT_ID in
+      # deploy/.env to the worker's clientId (typically 1 or 2 per
+      # API_IBKR_CLIENT_ID), then `docker compose up -d --force-recreate
+      # ib_gateway`. Operator-coordinated; restart outside the
+      # 20:55-22:35 UTC abort window.
+      TWS_MASTER_CLIENT_ID: ${IBKR_MASTER_CLIENT_ID:-}
     healthcheck:
       # Probe BOTH the externally-published socat port (4004 paper / 4003
       # live) AND the internal IBKR Gateway Java port (4002 paper / 4001

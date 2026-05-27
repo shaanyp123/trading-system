@@ -13,6 +13,7 @@ service-side write paths (never raw SQL).
 | `recovery_agent.py` | Poll `alerts` for `worker_failure` events and decide whether to invoke `replay_executions.py` (transient) or alert-only (hard crash) | Yes — writes `RECOVERY_ACTION_TAKEN` audit + UPDATEs alerts row + may invoke replay subprocess |
 | `trigger_v1_cycle.py` | On-demand V1 strategy cycle trigger (mirrors what LEAN does at 21:30 UTC); reads bars from disk + POSTs to `/api/internal/lean/signals` | Yes (when `--no-dry-run`) — POSTs signal_emitted events which become audit rows + signals INSERTs via the api endpoint. **--dry-run default = ON.** |
 | `replace_protective_stop.py` | POSITION_UNPROTECTED recovery: places a fresh bracket-stop for a position whose protective stop was cancelled but never replaced (PR-C exit-pipeline failure mode) | Yes (when `--no-dry-run --confirm`) — writes ORDER_PLACED audit + INSERTs orders row + places stop_market at IBKR. **--dry-run default = ON; two-flag gate.** |
+| `master_client_id_probe.py` | Empirical validation of the IBKR Master Client ID configuration (`TWS_MASTER_CLIENT_ID`). Three sequential stages on distinct clientIds: place a safe stop at `$1` on /MES from clientId=86, cancel via the master clientId, `reqGlobalCancel` cleanup from clientId=87. | Yes — places a single safe (stop=$1, DAY TIF, /MES) order at IBKR. Cancels itself end-to-end on success. No DB writes; no audit chain. **Operator-coordinated; runs post `docker compose up -d --force-recreate ib_gateway`.** |
 
 ---
 
