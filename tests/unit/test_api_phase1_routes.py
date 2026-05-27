@@ -1596,6 +1596,137 @@ class TestTodayDigestPnlAggregates:
         assert Decimal(body["pnl"]["yearly_pnl"]) == Decimal("0")
 
 
+class TestTodayDigestExposureBreakdown:
+    """Post-2026-05-27 (Task 1): exposure section computes per-cluster
+    notional + gross/net NAV percentages from positions_current rather
+    than returning all zeros. Wired via ``services.api.exposure``."""
+
+    @pytest.mark.asyncio
+    async def test_no_account_returns_all_zero_exposure(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(account_id=None)
+        _bind_repo(override_dep, today_route, repo)
+        response = await api_client.get("/api/today/digest")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["exposure"]["by_cluster"] == {
+            "equity_index": "0",
+            "commodity": "0",
+            "rates_bonds": "0",
+            "crypto": "0",
+            "fx": "0",
+        }
+        assert Decimal(body["exposure"]["gross_exposure_pct_nav"]) == Decimal("0")
+        assert Decimal(body["exposure"]["net_exposure_pct_nav"]) == Decimal("0")
+
+    @pytest.mark.asyncio
+    async def test_mixed_cluster_exposure_aggregated_correctly(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        """Three-position mix exercises long futures (/M2K), short futures
+        (/MGC short), and ETF long (TLT). Verifies cluster bucketing,
+        gross sum, and signed net sum."""
+        account_id = uuid4()
+        now = datetime(2026, 5, 27, 13, 31, tzinfo=UTC)
+        positions_rows = [
+            # /M2K LONG: 1 contract * $2925 * $5/pt = $14,625 notional, equity_index
+            {
+                "id": uuid4(),
+                "market": "/M2K",
+                "contract_id": uuid4(),
+                "quantity": 1,
+                "avg_cost": Decimal("2925.00"),
+                "margin_held": Decimal("500"),
+                "unrealized_pnl": None,
+                "last_mark_ts": now,
+                "managed_by_version": "a" * 40,
+            },
+            # /MGC SHORT: -1 contract * $2400 * $10/pt = $24,000 notional, commodity
+            {
+                "id": uuid4(),
+                "market": "/MGC",
+                "contract_id": uuid4(),
+                "quantity": -1,
+                "avg_cost": Decimal("2400.00"),
+                "margin_held": Decimal("500"),
+                "unrealized_pnl": None,
+                "last_mark_ts": now,
+                "managed_by_version": "a" * 40,
+            },
+            # TLT LONG: 100 shares * $83.72 * 1 = $8,372 notional, rates_bonds
+            {
+                "id": uuid4(),
+                "market": "TLT",
+                "contract_id": None,
+                "quantity": 100,
+                "avg_cost": Decimal("83.72"),
+                "margin_held": Decimal("0"),
+                "unrealized_pnl": None,
+                "last_mark_ts": now,
+                "managed_by_version": "a" * 40,
+            },
+        ]
+        repo = _StubRepo(
+            account_id=account_id,
+            positions_rows=positions_rows,
+            nav=Decimal("100000"),
+        )
+        _bind_repo(override_dep, today_route, repo)
+        response = await api_client.get("/api/today/digest")
+        assert response.status_code == 200
+        body = response.json()
+        by_cluster = body["exposure"]["by_cluster"]
+        assert Decimal(by_cluster["equity_index"]) == Decimal("14625.00")
+        assert Decimal(by_cluster["commodity"]) == Decimal("24000.00")
+        assert Decimal(by_cluster["rates_bonds"]) == Decimal("8372.00")
+        assert Decimal(by_cluster["crypto"]) == Decimal("0")
+        assert Decimal(by_cluster["fx"]) == Decimal("0")
+        # Gross = sum of absolute notionals / NAV = 46997 / 100000 = 0.4700 (quantized)
+        assert Decimal(body["exposure"]["gross_exposure_pct_nav"]) == Decimal("0.4700")
+        # Net = signed sum / NAV = (14625 - 24000 + 8372) / 100000 = -1003/100000 ≈ -0.0100
+        assert Decimal(body["exposure"]["net_exposure_pct_nav"]) == Decimal("-0.0100")
+
+    @pytest.mark.asyncio
+    async def test_zero_nav_returns_zero_pct_with_cluster_amounts_intact(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        """NAV=0 (or NAV unavailable) → pct fields zero but cluster
+        breakdown still reflects underlying notionals."""
+        account_id = uuid4()
+        positions_rows = [
+            {
+                "id": uuid4(),
+                "market": "/M2K",
+                "contract_id": uuid4(),
+                "quantity": 1,
+                "avg_cost": Decimal("2925"),
+                "margin_held": Decimal("0"),
+                "unrealized_pnl": None,
+                "last_mark_ts": datetime(2026, 5, 27, tzinfo=UTC),
+                "managed_by_version": "a" * 40,
+            },
+        ]
+        repo = _StubRepo(
+            account_id=account_id,
+            positions_rows=positions_rows,
+            nav=Decimal("0"),
+        )
+        _bind_repo(override_dep, today_route, repo)
+        response = await api_client.get("/api/today/digest")
+        assert response.status_code == 200
+        body = response.json()
+        assert Decimal(body["exposure"]["by_cluster"]["equity_index"]) == Decimal("14625")
+        assert Decimal(body["exposure"]["gross_exposure_pct_nav"]) == Decimal("0")
+        assert Decimal(body["exposure"]["net_exposure_pct_nav"]) == Decimal("0")
+
+
 class TestListOrders:
     @pytest.mark.asyncio
     async def test_no_account_returns_empty_envelope(
