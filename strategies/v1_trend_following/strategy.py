@@ -188,11 +188,14 @@ class V1TrendFollowing:
         passing all filters, or a RejectionReason on failure.
 
         Order of checks matches backend-spec §2.3:
-          1. enough history?              -> INSUFFICIENT_BAR_HISTORY
-          2. Donchian breakout?           -> NO_BREAKOUT
-          3. trend filter passes?         -> TREND_FILTER_FAILED
-          4. Hurst >= threshold?          -> HURST_BELOW_THRESHOLD
-          5. min-holding-days satisfied?  -> MIN_HOLDING_DAYS_NOT_SATISFIED
+          1. enough history?               -> INSUFFICIENT_BAR_HISTORY
+          2. Donchian breakout?            -> NO_BREAKOUT
+          3. trend filter passes?          -> TREND_FILTER_FAILED
+          4. Hurst >= threshold?           -> HURST_BELOW_THRESHOLD
+          5. position-aware gates:
+             - same-direction position?    -> POSITION_ALREADY_SAME_DIRECTION
+             - opposite-direction position + held < MIN_HOLDING_DAYS
+                                          -> MIN_HOLDING_DAYS_NOT_SATISFIED
         """
         bars = series.bars
         if len(bars) < self._min_required_bars:
@@ -224,12 +227,30 @@ class V1TrendFollowing:
         if snapshot.hurst < self._params.hurst_threshold:
             return RejectionReason.HURST_BELOW_THRESHOLD
 
-        # Step 5: MIN_HOLDING_DAYS check — only matters if the market has an
-        # OPEN position in the OPPOSITE direction (a reversal). Same-direction
-        # already-long signals are dedup'd by the signal service, not here.
+        # Step 5: position-aware rejections.
+        #
+        # Same-direction breakout while we already hold the position →
+        # POSITION_ALREADY_SAME_DIRECTION. V1 treats each breakout as ONE
+        # entry; subsequent same-direction breakouts are NOT additional
+        # entries because V1 has no explicit pyramiding rules (no add-on
+        # thresholds in ATR units, no max-units cap). Without this gate
+        # every continuation day would emit another candidate that the
+        # operator manually rejects in /signals, and in production that
+        # becomes accidental scaling. Exit the existing position via
+        # stop / reversal / MIN_HOLDING_DAYS-satisfied trend-flip — not
+        # via this signal pipeline.
+        #
+        # Opposite-direction breakout (a reversal) while we hold a position
+        # → MIN_HOLDING_DAYS_NOT_SATISFIED if held duration < the
+        # configured floor. Otherwise fall through and emit the reversal
+        # candidate (the existing position will be closed downstream via
+        # the dispatch / fill / reversal-handler chain — out of scope for
+        # this entry pipeline).
         if position is not None and position.direction is not Direction.FLAT:
             same_direction = position.direction is breakout
-            if not same_direction and position.opened_at_session_date is not None:
+            if same_direction:
+                return RejectionReason.POSITION_ALREADY_SAME_DIRECTION
+            if position.opened_at_session_date is not None:
                 held = (as_of_session_date - position.opened_at_session_date).days
                 if held < self._params.min_holding_days:
                     return RejectionReason.MIN_HOLDING_DAYS_NOT_SATISFIED

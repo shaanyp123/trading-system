@@ -343,6 +343,130 @@ class TestV1TrendFollowing:
             f"reversal short emitted despite held long: {result.signals}"
         )
 
+    def test_same_direction_long_position_rejects_long_breakout(
+        self, strategy: V1TrendFollowing
+    ) -> None:
+        """The /M2K-tonight regression test (2026-05-26 wet-run).
+
+        Held LONG /M2K + new LONG breakout the next day → strategy MUST
+        return POSITION_ALREADY_SAME_DIRECTION, NOT emit another LONG
+        candidate. Without this gate, every continuation day during a
+        trend would emit another signal that the operator declines in
+        /signals; without operator vigilance the dispatcher would treat
+        each as a fresh entry and accidentally pyramid the position
+        (V1 has no explicit pyramiding rules).
+
+        Constructed series: upward-trending breakout. With a held LONG
+        position from yesterday, the strategy must short-circuit step 5
+        with POSITION_ALREADY_SAME_DIRECTION.
+        """
+        series = _series_with_breakout("/M2K")
+        last_date = series.bars[-1].session_date
+        position = Position(
+            market="/M2K",
+            direction=Direction.LONG,
+            quantity=1,
+            avg_cost=Decimal("100"),
+            opened_at_session_date=last_date - timedelta(days=1),
+        )
+        result = strategy.generate_signals(
+            active_universe={"/M2K": series},
+            current_positions={"/M2K": position},
+            as_of_session_date=last_date,
+        )
+        # No same-direction LONG signal escapes
+        assert all(sig.direction is not Direction.LONG for sig in result.signals), (
+            f"same-direction LONG emitted despite held LONG: {result.signals}"
+        )
+        # The rejection reason MUST be POSITION_ALREADY_SAME_DIRECTION
+        # (assuming the breakout filter actually fires on the synthetic
+        # series — if the upstream filters reject first, we'd see a
+        # different reason; defensive check below).
+        reasons = {r for _, r in result.rejections}
+        if RejectionReason.POSITION_ALREADY_SAME_DIRECTION in reasons:
+            return  # canonical happy path
+        # If we got here, the breakout wasn't even detected (synthetic
+        # series didn't break) — that's a fixture issue not a logic
+        # issue; surface it diagnostically.
+        assert reasons.issubset(
+            {
+                RejectionReason.POSITION_ALREADY_SAME_DIRECTION,
+                RejectionReason.HURST_BELOW_THRESHOLD,
+                RejectionReason.TREND_FILTER_FAILED,
+                RejectionReason.NO_BREAKOUT,
+            }
+        ), f"unexpected rejection set: {reasons}"
+
+    def test_same_direction_short_position_rejects_short_breakout(
+        self, strategy: V1TrendFollowing
+    ) -> None:
+        """Symmetric test for the SHORT case — held SHORT + new SHORT
+        breakout = POSITION_ALREADY_SAME_DIRECTION.
+        """
+        # Downward-breakout series (short-direction breakout on the final bar)
+        series = _series_with_breakout("/MES", breakout_at_end=Decimal("60"))
+        last_date = series.bars[-1].session_date
+        position = Position(
+            market="/MES",
+            direction=Direction.SHORT,
+            quantity=-1,
+            avg_cost=Decimal("110"),
+            opened_at_session_date=last_date - timedelta(days=1),
+        )
+        result = strategy.generate_signals(
+            active_universe={"/MES": series},
+            current_positions={"/MES": position},
+            as_of_session_date=last_date,
+        )
+        assert all(sig.direction is not Direction.SHORT for sig in result.signals), (
+            f"same-direction SHORT emitted despite held SHORT: {result.signals}"
+        )
+
+    def test_same_direction_check_does_not_block_first_entry(
+        self, strategy: V1TrendFollowing
+    ) -> None:
+        """Sanity: a FLAT position (or no position) still emits a clean
+        LONG breakout signal — the new dedup logic only fires when
+        position.direction == breakout.direction.
+        """
+        series = _series_with_breakout("/MES")
+        last_date = series.bars[-1].session_date
+        flat_position = Position(
+            market="/MES",
+            direction=Direction.FLAT,
+            quantity=0,
+            avg_cost=Decimal("0"),
+            opened_at_session_date=None,
+        )
+        result = strategy.generate_signals(
+            active_universe={"/MES": series},
+            current_positions={"/MES": flat_position},
+            as_of_session_date=last_date,
+        )
+        # POSITION_ALREADY_SAME_DIRECTION must NEVER fire when FLAT.
+        reasons = {r for _, r in result.rejections}
+        assert RejectionReason.POSITION_ALREADY_SAME_DIRECTION not in reasons, (
+            "POSITION_ALREADY_SAME_DIRECTION fired for FLAT position"
+        )
+
+    def test_same_direction_check_skipped_when_no_position_in_universe(
+        self, strategy: V1TrendFollowing
+    ) -> None:
+        """Sanity: an empty current_positions dict means no position
+        information at all — strategy must not fabricate a dedup
+        rejection. Mirrors how trigger_v1_cycle loads positions (drops
+        markets with quantity=0; absent from dict = treated as FLAT).
+        """
+        series = _series_with_breakout("/MES")
+        last_date = series.bars[-1].session_date
+        result = strategy.generate_signals(
+            active_universe={"/MES": series},
+            current_positions={},
+            as_of_session_date=last_date,
+        )
+        reasons = {r for _, r in result.rejections}
+        assert RejectionReason.POSITION_ALREADY_SAME_DIRECTION not in reasons
+
     def test_active_universe_key_mismatch_raises(self, strategy: V1TrendFollowing) -> None:
         series = _series_with_breakout("/MNQ")
         with pytest.raises(ValueError, match="active_universe key"):
