@@ -85,7 +85,18 @@ class IbkrContractRef:
     market: str  # e.g., "/MES" or "TLT" — matches strategies parameters.py
     ibkr_local_symbol: str  # IBKR-side instrument symbol (resolves contract)
     ibkr_con_id: int | None = None  # IBKR contract ID; cached after first resolve
-    multiplier: int = 1  # futures point multiplier (e.g., 5 for /MES)
+    #: Futures point/unit multiplier. Most CME micros are integer ($5/pt for
+    #: /MES, $10/pt for /MGC) but two are fractional: /MYM is $0.50/pt and
+    #: /MBT is 0.1 BTC per contract. Pre-2026-05-27 this field was typed
+    #: ``int`` which silently truncated /MYM → 0 and /MBT → 1 in the
+    #: adapter's static resolve dict and in ``_contract_from_ib`` (which
+    #: cast IBKR's incoming string multiplier via ``int(...)``). The
+    #: notional/PnL paths that actually consume the multiplier numerically
+    #: source it from the ``contracts.multiplier`` DB column (Decimal)
+    #: + ``services/api/exposure.py``'s static Decimal lookup, so the
+    #: silent truncation was informational-only — but enough to fail an
+    #: audit of the adapter's reported contract spec.
+    multiplier: Decimal = Decimal(1)
     exchange: str = "CME"  # CME for futures; SMART for ETFs
 
 

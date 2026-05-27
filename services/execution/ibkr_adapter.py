@@ -152,6 +152,31 @@ IbkrErrorStateProvider = Callable[[], "IbkrErrorState | None"]
 DEFAULT_CLIENT_ID: Final[int] = 1
 
 
+#: Hard wall-clock budget for verifying that ``ib.cancelOrder`` actually
+#: drove the trade to a terminal cancel status (``Cancelled`` or
+#: ``Inactive``). ib-async's ``cancelOrder`` is fire-and-forget — IBKR
+#: acknowledges async via ``errorEvent``/``orderStatusEvent``. For
+#: cross-clientId cancels without Master Client ID, IBKR async-rejects
+#: with ``Error 10147 "OrderId not found"`` and the local trade cache
+#: stays in PreSubmitted/Submitted indefinitely. We wait this long, then
+#: raise :class:`IbkrPlacementError` so the exit pipeline routes the
+#: failure through ``POSITION_UNPROTECTED`` instead of silently no-op'ing.
+#: See ``Docs/decisions-log.md`` 2026-05-27 cross-clientId entry.
+CANCEL_VERIFY_TIMEOUT_SECONDS: Final[float] = 2.0
+
+#: Poll interval inside the cancel-verify wait loop. 50ms gives ~40 polls
+#: in the 2s budget — far below ib-async's typical orderStatusEvent
+#: latency (low single-digit ms in-process) so a successful cancel is
+#: observed within 1-2 polls.
+CANCEL_VERIFY_POLL_INTERVAL_SECONDS: Final[float] = 0.05
+
+#: Terminal cancel statuses per IBKR's order-status state machine. A
+#: trade landing in either of these means the cancel reached IBKR and
+#: was applied. Anything else (PreSubmitted, Submitted, PendingCancel,
+#: ...) is non-terminal.
+CANCEL_TERMINAL_STATUSES: Final[frozenset[str]] = frozenset({"Cancelled", "Inactive"})
+
+
 #: Per-market minimum price variation (tick size) for the Phase 1 universe.
 #:
 #: IBKR rejects orders whose ``lmtPrice`` or ``auxPrice`` is not aligned to
@@ -765,6 +790,17 @@ class IbAsyncIbkrClient:
                         client_order_id=client_order_id,
                         broker_order_id=trade.order.orderId,
                     )
+                    final_status = await self._await_cancel_terminal_status(
+                        trade=trade,
+                        client_order_id=client_order_id,
+                        submitted_at_utc=submitted_at,
+                    )
+                    log.info(
+                        "ibkr_order_cancel_confirmed",
+                        client_order_id=client_order_id,
+                        broker_order_id=trade.order.orderId,
+                        final_status=final_status,
+                    )
                     return IbkrCancelOrderResult(
                         client_order_id=client_order_id,
                         broker_order_id=trade.order.orderId,
@@ -788,6 +824,56 @@ class IbAsyncIbkrClient:
                 underlying_exception_class=type(exc).__name__,
                 occurred_at_utc=submitted_at,
             ) from exc
+
+    async def _await_cancel_terminal_status(
+        self,
+        *,
+        trade: Any,
+        client_order_id: str,
+        submitted_at_utc: datetime,
+    ) -> str:
+        """Poll ``trade.orderStatus.status`` until it reaches a terminal
+        cancel state (``{"Cancelled", "Inactive"}``) or the timeout
+        elapses.
+
+        On timeout, raise :class:`IbkrPlacementError` with
+        ``operation="cancelOrder"`` so the upstream exit pipeline routes
+        through ``POSITION_UNPROTECTED`` instead of silently no-op'ing
+        on a cross-clientId IBKR ``Error 10147 "OrderId not found"``.
+        See ``Docs/decisions-log.md`` 2026-05-27 cross-clientId entry.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + CANCEL_VERIFY_TIMEOUT_SECONDS
+        while loop.time() < deadline:
+            status = getattr(trade.orderStatus, "status", "")
+            if isinstance(status, str) and status in CANCEL_TERMINAL_STATUSES:
+                return status
+            await asyncio.sleep(CANCEL_VERIFY_POLL_INTERVAL_SECONDS)
+
+        # Final post-loop probe — avoids missing a transition that
+        # happened during the last sleep window.
+        final_status = getattr(trade.orderStatus, "status", "")
+        if isinstance(final_status, str) and final_status in CANCEL_TERMINAL_STATUSES:
+            return final_status
+
+        log.warning(
+            "ibkr_order_cancel_verification_timeout",
+            client_order_id=client_order_id,
+            broker_order_id=getattr(trade.order, "orderId", None),
+            observed_status=str(final_status),
+            timeout_seconds=CANCEL_VERIFY_TIMEOUT_SECONDS,
+        )
+        raise IbkrPlacementError(
+            operation="cancelOrder",
+            detail=(
+                f"cancelOrder submitted but trade.orderStatus.status remained "
+                f"{final_status!r} (not in {sorted(CANCEL_TERMINAL_STATUSES)!r}) "
+                f"after {CANCEL_VERIFY_TIMEOUT_SECONDS}s — IBKR may have "
+                f"async-rejected (e.g., Error 10147 for cross-clientId cancel)."
+            ),
+            underlying_exception_class="CancelVerificationTimeout",
+            occurred_at_utc=submitted_at_utc,
+        )
 
     async def cancel_all_orders(self) -> int:
         ib = await self._ensure_connected()
@@ -887,19 +973,24 @@ class IbAsyncIbkrClient:
             # treats this as "Pivot-PR-C will fix" and falls back to a
             # market-aware lookup elsewhere if needed).
             local_symbol = ""
+            #: Per-market futures multiplier. Most are integer dollar-per-point
+            #: but /MYM is $0.50/pt and /MBT is 0.1 BTC per contract — must
+            #: be ``Decimal`` to preserve the fractional value. Pre-2026-05-27
+            #: this dict used ``int`` literals which truncated /MYM → 0 and
+            #: silently lost /MBT's 0.1 (set to 1 with a TODO).
             multiplier = {
-                "/MES": 5,
-                "/MNQ": 2,
-                "/MYM": 0,
-                "/M2K": 5,
-                "/MGC": 10,
-                "/MCL": 100,
-                "/MBT": 1,
-            }.get(market, 1)
+                "/MES": Decimal("5"),
+                "/MNQ": Decimal("2"),
+                "/MYM": Decimal("0.5"),
+                "/M2K": Decimal("5"),
+                "/MGC": Decimal("10"),
+                "/MCL": Decimal("100"),
+                "/MBT": Decimal("0.1"),
+            }.get(market, Decimal("1"))
         elif market in phase1_etfs:
             exchange = "SMART"
             local_symbol = market
-            multiplier = 1
+            multiplier = Decimal("1")
         else:
             raise KeyError(
                 f"market {market!r} not in Phase 1 universe; "
@@ -1146,11 +1237,23 @@ class IbAsyncIbkrClient:
             market = f"/{symbol}"
         else:
             market = symbol
+        # IBKR's Contract.multiplier is a string field (e.g., "5", "0.1"
+        # for /MBT, "0.5" for /MYM). Coerce via Decimal(str(...)) to
+        # preserve fractional precision. Pre-2026-05-27 this cast to int
+        # silently truncated /MBT's "0.1" to 0 and /MYM's "0.5" to 0.
+        ib_mult_raw = getattr(ib_contract, "multiplier", "")
+        if ib_mult_raw in ("", None):
+            mult_dec = Decimal("1")
+        else:
+            try:
+                mult_dec = Decimal(str(ib_mult_raw))
+            except (ValueError, ArithmeticError):
+                mult_dec = Decimal("1")
         return IbkrContractRef(
             market=market,
             ibkr_local_symbol=local_symbol,
             ibkr_con_id=con_id if isinstance(con_id, int) else None,
-            multiplier=int(getattr(ib_contract, "multiplier", 1) or 1),
+            multiplier=mult_dec,
             exchange=exchange,
         )
 

@@ -109,7 +109,7 @@ def _basic_contract() -> IbkrContractRef:
         market="/MES",
         ibkr_local_symbol="MESH26",
         ibkr_con_id=12345,
-        multiplier=5,
+        multiplier=Decimal("5"),
         exchange="CME",
     )
 
@@ -278,7 +278,7 @@ class TestBuildIbContractFutures:
             market="/MNQ",
             ibkr_local_symbol="",
             ibkr_con_id=None,
-            multiplier=2,
+            multiplier=Decimal("2"),
             exchange="CME",
         )
         contract = client._build_ib_contract(ref)
@@ -296,7 +296,7 @@ class TestBuildIbContractFutures:
             market="TLT",
             ibkr_local_symbol="TLT",
             ibkr_con_id=None,
-            multiplier=1,
+            multiplier=Decimal("1"),
             exchange="SMART",
         )
         contract = client._build_ib_contract(ref)
@@ -659,22 +659,99 @@ class TestPlaceOrderTransmit:
 
 class TestCancelOrder:
     async def test_cancel_existing(self) -> None:
+        """Happy path: cancelOrder is submitted and ib-async's local
+        trade cache transitions ``orderStatus.status`` to ``Cancelled``
+        synchronously (simulated via cancelOrder side_effect)."""
         trade = MagicMock()
         trade.order.orderId = 12345
         trade.order.orderRef = "9d2f7a1c-b54e83a1-4d9e7c1b2f0a-1"
+        trade.orderStatus.status = "Submitted"
+
         fake = _fake_ib_class(open_trades=[trade])
         client = IbAsyncIbkrClient(ib_factory=fake)
+        await client.connect()
+
+        def _mark_cancelled(_order: Any) -> None:
+            trade.orderStatus.status = "Cancelled"
+
+        assert client._ib is not None
+        client._ib.cancelOrder.side_effect = _mark_cancelled
+
         result = await client.cancel_order("9d2f7a1c-b54e83a1-4d9e7c1b2f0a-1")
         assert result.broker_order_id == 12345
         assert result.client_order_id == "9d2f7a1c-b54e83a1-4d9e7c1b2f0a-1"
-        # cancelOrder was called with the order
-        client._ib.cancelOrder.assert_called_once_with(trade.order)  # type: ignore[union-attr]
+        client._ib.cancelOrder.assert_called_once_with(trade.order)
 
     async def test_cancel_missing_raises_key_error(self) -> None:
         fake = _fake_ib_class(open_trades=[])
         client = IbAsyncIbkrClient(ib_factory=fake)
         with pytest.raises(KeyError, match="not found"):
             await client.cancel_order("nonexistent-id")
+
+    async def test_cancel_verification_status_terminal_returns_success(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Verification returns the observed terminal status (``Inactive``
+        — the alternate accepted terminal state alongside ``Cancelled``)
+        after a couple of poll cycles."""
+        import services.execution.ibkr_adapter as adapter_mod
+
+        monkeypatch.setattr(adapter_mod, "CANCEL_VERIFY_TIMEOUT_SECONDS", 0.5)
+        monkeypatch.setattr(adapter_mod, "CANCEL_VERIFY_POLL_INTERVAL_SECONDS", 0.01)
+
+        trade = MagicMock()
+        trade.order.orderId = 7
+        trade.order.orderRef = "cid-7"
+        trade.orderStatus.status = "Submitted"
+
+        fake = _fake_ib_class(open_trades=[trade])
+        client = IbAsyncIbkrClient(ib_factory=fake)
+        await client.connect()
+
+        async def _flip_after_delay() -> None:
+            await asyncio.sleep(0.05)
+            trade.orderStatus.status = "Inactive"
+
+        def _schedule_flip(_order: Any) -> None:
+            asyncio.get_running_loop().create_task(_flip_after_delay())
+
+        assert client._ib is not None
+        client._ib.cancelOrder.side_effect = _schedule_flip
+
+        result = await client.cancel_order("cid-7")
+        assert result.broker_order_id == 7
+        assert trade.orderStatus.status == "Inactive"
+
+    async def test_cancel_verification_timeout_raises_placement_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When ``orderStatus.status`` stays in a non-terminal state past
+        the timeout, ``cancel_order`` raises ``IbkrPlacementError`` with
+        ``operation="cancelOrder"`` and the underlying cause encoded in
+        ``detail``. Mirrors the cross-clientId Error 10147 failure mode
+        (Docs/decisions-log.md 2026-05-27)."""
+        import services.execution.ibkr_adapter as adapter_mod
+
+        monkeypatch.setattr(adapter_mod, "CANCEL_VERIFY_TIMEOUT_SECONDS", 0.1)
+        monkeypatch.setattr(adapter_mod, "CANCEL_VERIFY_POLL_INTERVAL_SECONDS", 0.01)
+
+        trade = MagicMock()
+        trade.order.orderId = 4
+        trade.order.orderRef = "b5237aed-stop-replace-0"
+        trade.orderStatus.status = "PreSubmitted"  # stays stuck — async-reject case
+
+        fake = _fake_ib_class(open_trades=[trade])
+        client = IbAsyncIbkrClient(ib_factory=fake)
+
+        with pytest.raises(IbkrPlacementError) as exc_info:
+            await client.cancel_order("b5237aed-stop-replace-0")
+
+        err = exc_info.value
+        assert err.operation == "cancelOrder"
+        assert "PreSubmitted" in err.detail
+        assert "Cancelled" in err.detail
+        assert "Error 10147" in err.detail
+        assert err.underlying_exception_class == "CancelVerificationTimeout"
 
 
 # ---------------------------------------------------------------------------
@@ -777,6 +854,23 @@ class TestResolveContract:
         assert ref.market == "TLT"
         assert ref.exchange == "SMART"
         assert ref.multiplier == 1
+
+    async def test_resolve_mym_has_half_dollar_multiplier(self) -> None:
+        """/MYM is $0.50 per point — pre-2026-05-27 the static resolve dict
+        used ``int`` literals which silently truncated this to ``0``."""
+        client = IbAsyncIbkrClient(ib_factory=_fake_ib_class())
+        ref = await client.resolve_contract("/MYM")
+        assert ref.market == "/MYM"
+        assert ref.multiplier == Decimal("0.5")
+
+    async def test_resolve_mbt_has_fractional_btc_multiplier(self) -> None:
+        """/MBT is 0.1 BTC per contract — pre-2026-05-27 the static resolve
+        dict stored ``1`` because ``int`` couldn't carry the fractional
+        value (notional = qty * 0.1 * spot, so int=1 over-scales 10x)."""
+        client = IbAsyncIbkrClient(ib_factory=_fake_ib_class())
+        ref = await client.resolve_contract("/MBT")
+        assert ref.market == "/MBT"
+        assert ref.multiplier == Decimal("0.1")
 
     async def test_resolve_out_of_universe_raises_key_error(self) -> None:
         client = IbAsyncIbkrClient(ib_factory=_fake_ib_class())
