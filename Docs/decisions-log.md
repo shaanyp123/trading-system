@@ -17,6 +17,59 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ## Entries
 
+### 2026-05-27 — Cross-clientId IBKR cancellation: structural limitation, mitigation = Master Client ID
+
+**Trigger:** PR-5 (replace_protective_stop.py) placed a /M2K replacement bracket-stop on operator-tool clientId=99 (`b5237aed-b07925a7-019e66d3-stop-replace-0`, broker_order_id=4, status=PreSubmitted). Open question for live cutover: when the order-placement worker later wants to cancel that stop (e.g., normal exit-pipeline flow), does its `IbkrClient.cancel_order(client_order_id)` call succeed across clientIds?
+
+**Spec reference:** `Docs/claude-dev-guide.md` §1.5 IBKR clientId allocation; `services/execution/ibkr_adapter.py::cancel_order`.
+
+**Investigation (2026-05-27 session, read-only):**
+
+1. **Code path read.** `cancel_order(client_order_id)` iterates `ib.openTrades()`, matches `trade.order.orderRef == client_order_id`, calls `ib.cancelOrder(trade.order)`. ib-async's `cancelOrder` is synchronous (sends `cancelOrder(orderId)` over the API socket and returns immediately) — any IBKR-side rejection arrives asynchronously via `errorEvent`. The current implementation does NOT wait for the trade's `orderStatus` to transition to `Cancelled` before returning success.
+
+2. **Live read-only probe (clientId=87 against production ib_gateway, 2026-05-27 15:24 UTC).** Confirmed:
+   - `ib.connectAsync()` followed by `ib.reqAllOpenOrdersAsync()` returns 1 working trade
+   - `ib.openTrades()` contains the operator-tool-placed bracket: `orderId=4, clientId=99, orderRef='b5237aed-...-stop-replace-0', action=SELL, type=STP, qty=1.0, stop=2770.2, status=PreSubmitted, symbol=M2K, secType=FUT`
+   - `ib.trades()` full cache also contains the original entry (clientId=0, Filled) and the original orphaned stop (clientId=0, Cancelled)
+
+   **Finding: ib-async DOES populate the local trade cache with cross-client orders via `reqAllOpenOrdersAsync` at connect.** The worker's lookup-by-orderRef would find the operator-tool-placed order.
+
+3. **IBKR-side restriction (from IBKR API docs + yesterday's empirical evidence).** Cancellation at IBKR is restricted to the placing client UNLESS the cancelling client is configured as Master in IBKR Gateway / TWS Global Configuration → API → Settings → "Master Client ID". Without master designation, IBKR responds with `Error 10147 "OrderId not found"` even though the order is visible in the cancelling client's local cache (this exact error fired 2026-05-26 when operator-tool clientId=95 attempted to cancel orderId=6 placed by worker clientId=1).
+
+**Conclusion — failure mode is WORSE than just "cancel fails":**
+
+The worker's `cancel_order` would:
+1. Find the operator-tool-placed order in `ib.openTrades()` (snapshot has it)
+2. Call `ib.cancelOrder(trade.order)` — returns synchronously WITHOUT raising
+3. Log `ibkr_order_cancel_submitted` + return success
+4. IBKR fires `Error 10147` asynchronously via `errorEvent`
+5. The actual cancellation never lands at IBKR; the order remains working
+
+**Downstream blast radius:** the exit-pipeline worker (PR-C, #253) calls `cancel_order(protective_stop_cid)` BEFORE placing the closing market order. If the cancel silently no-ops (per above) and the close fills, the position closes BUT the stop remains live at IBKR — next opposite-side fill (a new entry) would trip the still-armed stop, creating an unintended double-fire. Or in the simpler case the stop fires after the close-out leaving a phantom short.
+
+**Mitigation candidates:**
+
+* **(A) RECOMMENDED. IBKR Gateway Master Client ID = worker's clientId.** Set in `jts.ini` (gnzsnz/ib-gateway exposes this via the IBC config template; needs to be set in the container's config volume or via env var passthrough). When master, the worker can cancel orders placed by any clientId. The operator-tool side (clientIds 80-99) becomes "non-master" — it can still place orders, but `reqGlobalCancel` remains the emergency clear-all primitive. Pros: smallest behavioral change; matches IBKR's intended model. Cons: requires gateway config change + re-deploy + re-verification. Only ONE master client per gateway session, so future multi-strategy workers would need to share or designate one of them as master.
+
+* **(B) Worker `cancel_order` post-cancel verification.** Wait briefly (≤2s) after `ib.cancelOrder()` and assert `trade.orderStatus.status in {"Cancelled", "Inactive"}` before returning success. Fails loudly via `IbkrPlacementError` on async-reject. Doesn't fix the underlying issue but makes the failure observable + chained correctly through the exit pipeline (POSITION_UNPROTECTED with clear root cause).
+
+* **(C) Synthesize fake approved signal for operator-tool orders.** Restructures `replace_protective_stop` to insert an approved signal row that the worker then places via its normal entry path. Worker owns the resulting order's clientId. Pros: clean ownership story end-to-end. Cons: pollutes the signals table with operator-tool-originated rows; non-trivial change to the entry path which expects entry semantics not "place this stop directly."
+
+* **(D) Operator runbook: manually cancel via TWS before any exit-pipeline cycle that would touch the operator-tool-placed stop.** Pragmatic short-term but every `replace_protective_stop` invocation creates a manual-recovery liability.
+
+**Live cutover blocker assessment:** This IS a real blocker for cross-clientId-clean live-money operation. Acceptable for paper today because the operator owns intervention if anything misfires. Before `live-small` cutover, EITHER:
+   * (A) is configured + verified empirically with a second probe (place a test order on clientId=85, attempt cancel from clientId=86 with master set — confirm cancel succeeds), OR
+   * (B) is implemented (services/execution/** — needs risk-review-approved label) as belt-and-suspenders even if (A) is also done.
+
+**Cost / scope impact:**
+* (A) — 1-2h: jts.ini config change + redeploy + re-probe.
+* (B) — half-day PR (services/execution/** + risk-review label + tests covering both happy + reject paths).
+* Recommendation: stack (B) on top of (A) so the worker fails loudly if the master-client config drifts or is unset.
+
+**Current state (2026-05-27):** the /M2K replacement bracket from PR-5 is the FIRST production exemplar of an operator-tool-placed working order. It stays as the active protection. Operator should be aware that if a /M2K exit signal fires before mitigation lands, the worker's cancel will silently no-op and the exit pipeline will leave the stop armed.
+
+---
+
 ### 2026-05-25 — ib_gateway stuck-at-login recurrence + recovery (drill 6)
 
 **Trigger:** the natural 2026-05-25 21:00 UTC bar_sync cycle FAILED with `TimeoutError` on `connectAsync` to `ib_gateway:4004`:
