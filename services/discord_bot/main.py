@@ -54,6 +54,7 @@ from discord import app_commands
 from services.discord_bot.api_client import ApiClient
 from services.discord_bot.commands import (
     register_approve,
+    register_capital_event_commands,
     register_halt,
     register_positions,
     register_status,
@@ -143,6 +144,12 @@ class TradingBotClient(discord.Client):
             guild=self._guild,
         )
         register_approve(
+            self._tree,
+            api_client=self._api_client,
+            environment=self._settings.environment,
+            guild=self._guild,
+        )
+        register_capital_event_commands(
             self._tree,
             api_client=self._api_client,
             environment=self._settings.environment,

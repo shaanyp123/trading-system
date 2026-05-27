@@ -147,6 +147,35 @@ class KillSwitchInvokePayload(BaseModel):
     reason: str
 
 
+class CapitalEventInvokePayload(BaseModel):
+    """``POST /api/system/capital-event`` request body.
+
+    Mirrors :class:`services.api.schemas.capital_events.CapitalEventInvokeRequest`.
+    ``amount_usd`` is a string on the wire (A05 — Decimal-as-string).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    event_type: Literal["deposit", "withdrawal"]
+    amount_usd: str
+    reason: str
+    current_session_no: int = 0
+
+
+class CapitalEventInvokeResponse(BaseModel):
+    """``POST /api/system/capital-event`` 200 response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    capital_event_id: str
+    event_type: Literal["deposit", "withdrawal"]
+    amount_usd: str
+    threshold_met: bool
+    post_event_equity: str
+    capital_event_audit_event_uuid: str
+    mode_started_audit_event_uuid: str | None = None
+
+
 class KillSwitchInvokeResponse(BaseModel):
     """``POST /api/system/kill-switch/invoke`` 200 response (post-Week-4-Wed).
 
@@ -363,6 +392,35 @@ class ApiClient:
             self._raise_for_response(response)
         return KillSwitchInvokeResponse.model_validate(response.json())
 
+    async def invoke_capital_event(
+        self,
+        *,
+        event_type: Literal["deposit", "withdrawal"],
+        amount_usd: str,
+        reason: str,
+        current_session_no: int = 0,
+    ) -> CapitalEventInvokeResponse:
+        """``POST /api/system/capital-event``.
+
+        Records a deposit or withdrawal event per cutover plan §7 +
+        backend-spec §3.20. Threshold-met events (>= 5% of pre-event
+        equity, or any first-deposit-from-zero) activate the 30-session
+        capital-event mode. Raises :class:`ApiClientHTTPError` on non-2xx.
+        """
+        payload = CapitalEventInvokePayload(
+            event_type=event_type,
+            amount_usd=amount_usd,
+            reason=reason,
+            current_session_no=current_session_no,
+        )
+        response = await self._client.post(
+            "/api/system/capital-event",
+            json=payload.model_dump(),
+        )
+        if response.status_code != 200:
+            self._raise_for_response(response)
+        return CapitalEventInvokeResponse.model_validate(response.json())
+
     # ---- internals ----------------------------------------------------------
 
     def _raise_for_response(self, response: httpx.Response) -> None:
@@ -403,6 +461,8 @@ __all__ = [
     "ApiClient",
     "ApiClientError",
     "ApiClientHTTPError",
+    "CapitalEventInvokePayload",
+    "CapitalEventInvokeResponse",
     "HealthCheck",
     "HealthResponse",
     "KillSwitchInvokePayload",
