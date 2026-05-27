@@ -68,6 +68,43 @@ The worker's `cancel_order` would:
 
 **Current state (2026-05-27):** the /M2K replacement bracket from PR-5 is the FIRST production exemplar of an operator-tool-placed working order. It stays as the active protection. Operator should be aware that if a /M2K exit signal fires before mitigation lands, the worker's cancel will silently no-op and the exit pipeline will leave the stop armed.
 
+**Mitigation B status (2026-05-27 afternoon):** Mitigation (B) — worker post-cancel verification — IS IMPLEMENTED in PR [#262 (DRAFT)](https://github.com/shaanyp123/trading-system/pull/262). Pending operator `/ultrareview` + `risk-review-approved` label + merge. Once merged, the worker raises `IbkrPlacementError(operation="cancelOrder", underlying_exception_class="CancelVerificationTimeout")` after a 2s wait if the trade's `orderStatus.status` doesn't transition to `{"Cancelled", "Inactive"}`. The exit pipeline then routes through `POSITION_UNPROTECTED` instead of silently no-op'ing.
+
+**Mitigation A research (2026-05-27 afternoon):** The `gnzsnz/ib-gateway:stable` image (line 426 of `docker-compose.yml`) exposes a `TWS_MASTER_CLIENT_ID` environment variable that IBC renders into `config.ini` at boot. From the upstream gnzsnz/ib-gateway-docker README: "TWS_MASTER_CLIENT_ID: See IBC documentation". Setting this to the worker's `clientId` would unlock cross-clientId cancellation per IBKR's intended model (operator-tool clientIds 80-99 stay non-master, worker becomes master).
+
+**Open operator decision for mitigation A:**
+
+1. **Worker clientId reconciliation.** Current state: `deploy/.env` on the VPS has `API_IBKR_CLIENT_ID=2` (override put in place 2026-05-17 to work around an Error 326 session-wedge); code default is `1`. The code default + dev-guide §1.5 LOCKED both say 1. Operator must decide:
+   * **(1a) Keep override.** Worker stays at clientId=2; set `TWS_MASTER_CLIENT_ID=2` so the master matches the deploy reality. Pros: no worker disruption, no risk of re-triggering Error 326. Cons: code default + deploy reality stay out of sync (existing footgun).
+   * **(1b) Reconcile to code default.** Drop the `API_IBKR_CLIENT_ID=2` override from `deploy/.env`; set `TWS_MASTER_CLIENT_ID=1`. Pros: code + reality re-aligned. Cons: small risk that IBKR's server-side session table still holds clientId=1 from a prior unclean disconnect — would surface as Error 326 on the next worker boot. Recommend operator do this AFTER setting up TWS_MASTER_CLIENT_ID + an emergency `reqGlobalCancel` runbook so any wedged state is recoverable.
+
+2. **Gateway restart coordination.** Adding the env var requires `docker compose up -d --force-recreate ib_gateway`. CME futures trade 23h/day; pick a low-activity hour (typically 22:00 ET / 02:00 UTC trough). Outside the daily ceremony window (20:55-22:35 UTC abort).
+
+**Deploy sequence (when operator schedules):**
+
+```bash
+# On VPS:
+# 1. Edit deploy/.env (set IBKR_MASTER_CLIENT_ID=<chosen value>;
+#    optionally drop API_IBKR_CLIENT_ID override per decision 1b)
+# 2. Edit docker-compose.yml ib_gateway env block (add line):
+#    TWS_MASTER_CLIENT_ID: ${IBKR_MASTER_CLIENT_ID:-}
+#    (or land this via a regular PR before the deploy)
+# 3. Restart ib_gateway (NOT the api — api preserves its socket;
+#    if the api is restarted simultaneously, the master designation
+#    won't be re-asserted until the next worker reconnect):
+docker compose --env-file deploy/.env up -d --force-recreate ib_gateway
+
+# 4. Verify via cross-clientId probe (separate clientId places test
+#    order on /MES with safe stop, worker-clientId cancels — confirm
+#    cancel succeeds where it previously got Error 10147).
+```
+
+**Cross-clientId probe (operator-coordinated empirical verification):**
+
+Place a /MES test order on clientId=86 via a one-off `scripts/operator_tools/` probe (mirror `replay_executions.py:99` pattern). Then via worker-clientId (1 or 2 per decision), call `ibkr_client.cancel_order(probe_cid)`. Expected post-mitigation: cancel completes; `trade.orderStatus.status` transitions to `Cancelled` within 1-2 poll ticks; no Error 10147. Pre-mitigation reproducer was the 2026-05-26 wedge documented at the top of this entry. If probe FAILS, the master designation didn't take — most likely TWS_MASTER_CLIENT_ID empty-string passed through to IBC as a no-op; recheck `docker compose exec ib_gateway cat /home/ibgateway/ibc/config.ini` for the rendered `IbLoginId`/`MasterClientId` line.
+
+**Out-of-scope for this entry:** the empirical probe + actual restart. This research lands the deploy-time recipe but defers execution to the operator. Mitigation (B) — already in PR #262 — is the belt-and-suspenders for whatever the operator chooses on (A).
+
 ---
 
 ### 2026-05-25 — ib_gateway stuck-at-login recurrence + recovery (drill 6)
