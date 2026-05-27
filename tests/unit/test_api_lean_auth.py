@@ -282,6 +282,168 @@ class TestValidBearer:
 
 
 # ---------------------------------------------------------------------------
+# TestExitSignalRouteValidation (PR-B, 2026-05-26)
+#
+# Route-side validation tests for the signal_type='exit' branch. We don't
+# go all the way through ingest_signal_emitted here (that needs a real DB +
+# is covered by tests/integration/test_qc_adapter_ingestion.py + the
+# extended signal_ingestion unit tests). These tests live at the
+# /api/internal/lean/signals boundary because the cross-field invariants
+# (direction='flat' for exits, paired_entry_market reversal-only, etc.)
+# are enforced there per design §6.1.
+# ---------------------------------------------------------------------------
+
+
+def _exit_signal_body() -> dict[str, object]:
+    """Construct a minimal-valid PR-B exit-signal POST body."""
+    return {
+        "event_type": "signal_emitted",
+        "ts_utc": "2026-05-26T21:30:00.000+00:00",
+        "algorithm_id": "v1_trend_following",
+        "session_date_et": "2026-05-26",
+        "equity_usd": "100000.00",
+        "live_mode": True,
+        "market": "/MES",
+        "direction": "flat",
+        "target_contracts": 0,
+        "decision_price": "5234.75",
+        "sizing_trace": {"schema_version": 1},
+        "strategy_version": "v1_trend_following@abc1234",
+        "signal_type": "exit",
+        "exit_reason": "trend_flip",
+        "prior_position_direction": "long",
+        "prior_position_quantity": 3,
+    }
+
+
+class TestExitSignalRouteValidation:
+    """PR-B: exit-signal cross-field gate at the /signals route boundary."""
+
+    async def test_exit_missing_exit_reason_rejected(
+        self,
+        client_with_lean_token: AsyncClient,
+    ) -> None:
+        body = _exit_signal_body()
+        del body["exit_reason"]
+        resp = await client_with_lean_token.post(
+            _LEAN_PATH,
+            headers={"Authorization": _LEAN_AUTH_HEADER},
+            json=body,
+        )
+        assert resp.status_code == 422
+        envelope = resp.json()
+        assert envelope["error_code"] == "LEAN_SIGNAL_PAYLOAD_INCOMPLETE"
+        assert "exit_reason" in envelope["details"]["missing"]
+        assert envelope["details"]["signal_type"] == "exit"
+
+    async def test_exit_missing_prior_position_direction_rejected(
+        self,
+        client_with_lean_token: AsyncClient,
+    ) -> None:
+        body = _exit_signal_body()
+        del body["prior_position_direction"]
+        resp = await client_with_lean_token.post(
+            _LEAN_PATH,
+            headers={"Authorization": _LEAN_AUTH_HEADER},
+            json=body,
+        )
+        assert resp.status_code == 422
+        envelope = resp.json()
+        assert envelope["error_code"] == "LEAN_SIGNAL_PAYLOAD_INCOMPLETE"
+        assert "prior_position_direction" in envelope["details"]["missing"]
+
+    async def test_exit_missing_prior_position_quantity_rejected(
+        self,
+        client_with_lean_token: AsyncClient,
+    ) -> None:
+        body = _exit_signal_body()
+        del body["prior_position_quantity"]
+        resp = await client_with_lean_token.post(
+            _LEAN_PATH,
+            headers={"Authorization": _LEAN_AUTH_HEADER},
+            json=body,
+        )
+        assert resp.status_code == 422
+        envelope = resp.json()
+        assert envelope["error_code"] == "LEAN_SIGNAL_PAYLOAD_INCOMPLETE"
+        assert "prior_position_quantity" in envelope["details"]["missing"]
+
+    async def test_exit_target_contracts_optional_when_omitted(
+        self,
+        client_with_lean_token: AsyncClient,
+    ) -> None:
+        """Exit body without target_contracts should NOT trigger the
+        required-field gate (dispatcher computes it at place-order time
+        per design §Q3). The route then proceeds past the gate and the
+        test harness crashes on db init (no real DB wired) — the absence
+        of 422 LEAN_SIGNAL_PAYLOAD_INCOMPLETE is what we're verifying.
+
+        Schema-side coverage of target_contracts optionality for exits
+        lives in tests/unit/test_api_lean_schema.py::TestExitPayloadAccepted.
+        """
+        body = _exit_signal_body()
+        del body["target_contracts"]
+        # The route passes the exit-branch field gate then crashes on
+        # db init (the test harness doesn't wire a real DB). The
+        # RuntimeError surfaces back through Starlette as an unhandled
+        # exception — pytest catches it here. The fact that we DON'T
+        # get a 422 LEAN_SIGNAL_PAYLOAD_INCOMPLETE response proves the
+        # field gate did not list target_contracts as missing for exits.
+        with pytest.raises(RuntimeError, match="DB pool not initialized"):
+            await client_with_lean_token.post(
+                _LEAN_PATH,
+                headers={"Authorization": _LEAN_AUTH_HEADER},
+                json=body,
+            )
+
+    async def test_exit_direction_not_flat_rejected(
+        self,
+        client_with_lean_token: AsyncClient,
+    ) -> None:
+        body = _exit_signal_body()
+        body["direction"] = "long"
+        resp = await client_with_lean_token.post(
+            _LEAN_PATH,
+            headers={"Authorization": _LEAN_AUTH_HEADER},
+            json=body,
+        )
+        assert resp.status_code == 422
+        envelope = resp.json()
+        assert envelope["error_code"] == "LEAN_SIGNAL_EXIT_DIRECTION_INVALID"
+
+    async def test_exit_prior_position_direction_flat_rejected(
+        self,
+        client_with_lean_token: AsyncClient,
+    ) -> None:
+        body = _exit_signal_body()
+        body["prior_position_direction"] = "flat"
+        resp = await client_with_lean_token.post(
+            _LEAN_PATH,
+            headers={"Authorization": _LEAN_AUTH_HEADER},
+            json=body,
+        )
+        assert resp.status_code == 422
+        envelope = resp.json()
+        assert envelope["error_code"] == "LEAN_SIGNAL_EXIT_PRIOR_DIRECTION_INVALID"
+
+    async def test_paired_entry_market_on_trend_flip_rejected(
+        self,
+        client_with_lean_token: AsyncClient,
+    ) -> None:
+        """paired_entry_market is reversal-only per design §Q1."""
+        body = _exit_signal_body()
+        body["paired_entry_market"] = "/MES"  # but exit_reason='trend_flip'
+        resp = await client_with_lean_token.post(
+            _LEAN_PATH,
+            headers={"Authorization": _LEAN_AUTH_HEADER},
+            json=body,
+        )
+        assert resp.status_code == 422
+        envelope = resp.json()
+        assert envelope["error_code"] == "LEAN_SIGNAL_EXIT_PAIRED_ENTRY_INVALID"
+
+
+# ---------------------------------------------------------------------------
 # TestNoLeanConfigured
 # ---------------------------------------------------------------------------
 

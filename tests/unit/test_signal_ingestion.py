@@ -552,6 +552,8 @@ class TestHappyPath:
         fake_db: dict[str, AsyncMock],
         fake_session_factory: MagicMock,
     ) -> None:
+        """PR-B (2026-05-26): payload without signal_type falls back to 'entry'
+        for backwards compat with pre-PR-B emitters."""
         await ingest_signal_emitted(
             fake_session_factory,
             account_id=_ACCOUNT,
@@ -561,6 +563,35 @@ class TestHappyPath:
         )
         insert_row = fake_db["insert"].await_args.args[1]
         assert insert_row.signal_type == "entry"
+
+    @pytest.mark.asyncio
+    async def test_signal_type_explicit_entry_round_trips(
+        self,
+        fake_audit_append: AsyncMock,
+        fake_db: dict[str, AsyncMock],
+        fake_session_factory: MagicMock,
+    ) -> None:
+        event = _make_event(
+            payload={
+                "market": "MES",
+                "direction": "long",
+                "target_contracts": 1,
+                "decision_price": 5234.50,
+                "sizing_trace": {"stage_0": "passed"},
+                "signal_type": "entry",
+            }
+        )
+        await ingest_signal_emitted(
+            fake_session_factory,
+            account_id=_ACCOUNT,
+            env="paper",
+            phase_at_emit=0,
+            event=event,
+        )
+        insert_row = fake_db["insert"].await_args.args[1]
+        assert insert_row.signal_type == "entry"
+        audit_payload = fake_audit_append.await_args.args[2]
+        assert audit_payload["signal_type"] == "entry"
 
     @pytest.mark.asyncio
     async def test_audit_payload_has_decimal_decision_price(
@@ -581,5 +612,312 @@ class TestHappyPath:
         )
         audit_payload = fake_audit_append.await_args.args[2]
         # If any float remained, jcs_serialize raises TypeError per A05.
+        canonical = jcs_serialize(audit_payload)
+        assert isinstance(canonical, bytes)
+
+
+# ---------------------------------------------------------------------------
+# TestExitSignalIngestion (PR-B, 2026-05-26)
+# ---------------------------------------------------------------------------
+
+
+def _make_exit_payload(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "market": "MES",
+        "direction": "flat",
+        "target_contracts": 0,
+        "decision_price": 5234.50,
+        "sizing_trace": {"schema_version": 1},
+        "signal_type": "exit",
+        "exit_reason": "trend_flip",
+        "prior_position_direction": "long",
+        "prior_position_quantity": 3,
+    }
+    payload.update(overrides)
+    return payload
+
+
+class TestExitSignalIngestion:
+    """Exit-path discriminator + companion-field validation per design §Q2."""
+
+    @pytest.mark.asyncio
+    async def test_exit_payload_lands_with_signal_type_exit(
+        self,
+        fake_audit_append: AsyncMock,
+        fake_db: dict[str, AsyncMock],
+        fake_session_factory: MagicMock,
+    ) -> None:
+        event = _make_event(payload=_make_exit_payload())
+        await ingest_signal_emitted(
+            fake_session_factory,
+            account_id=_ACCOUNT,
+            env="paper",
+            phase_at_emit=0,
+            event=event,
+        )
+        insert_row = fake_db["insert"].await_args.args[1]
+        assert insert_row.signal_type == "exit"
+        assert insert_row.direction == "flat"
+        audit_payload = fake_audit_append.await_args.args[2]
+        assert audit_payload["signal_type"] == "exit"
+        assert audit_payload["exit_reason"] == "trend_flip"
+        assert audit_payload["prior_position_direction"] == "long"
+        assert audit_payload["prior_position_quantity"] == 3
+        # paired_entry_market not set for trend_flip
+        assert "paired_entry_market" not in audit_payload
+
+    @pytest.mark.asyncio
+    async def test_reversal_exit_with_paired_entry_market(
+        self,
+        fake_audit_append: AsyncMock,
+        fake_db: dict[str, AsyncMock],
+        fake_session_factory: MagicMock,
+    ) -> None:
+        event = _make_event(
+            payload=_make_exit_payload(
+                exit_reason="reversal",
+                paired_entry_market="MES",
+            )
+        )
+        await ingest_signal_emitted(
+            fake_session_factory,
+            account_id=_ACCOUNT,
+            env="paper",
+            phase_at_emit=0,
+            event=event,
+        )
+        audit_payload = fake_audit_append.await_args.args[2]
+        assert audit_payload["exit_reason"] == "reversal"
+        assert audit_payload["paired_entry_market"] == "MES"
+
+    @pytest.mark.asyncio
+    async def test_decommission_exit_short_position(
+        self,
+        fake_audit_append: AsyncMock,
+        fake_db: dict[str, AsyncMock],
+        fake_session_factory: MagicMock,
+    ) -> None:
+        event = _make_event(
+            payload=_make_exit_payload(
+                exit_reason="decommission",
+                prior_position_direction="short",
+                prior_position_quantity=-5,
+            )
+        )
+        await ingest_signal_emitted(
+            fake_session_factory,
+            account_id=_ACCOUNT,
+            env="paper",
+            phase_at_emit=0,
+            event=event,
+        )
+        audit_payload = fake_audit_append.await_args.args[2]
+        assert audit_payload["exit_reason"] == "decommission"
+        assert audit_payload["prior_position_direction"] == "short"
+        assert audit_payload["prior_position_quantity"] == -5
+
+    @pytest.mark.asyncio
+    async def test_invalid_signal_type_rejected(
+        self,
+        fake_audit_append: AsyncMock,
+        fake_db: dict[str, AsyncMock],
+        fake_session_factory: MagicMock,
+    ) -> None:
+        event = _make_event(
+            payload={
+                "market": "MES",
+                "direction": "long",
+                "target_contracts": 1,
+                "decision_price": 5234.50,
+                "sizing_trace": {},
+                "signal_type": "bogus",
+            }
+        )
+        with pytest.raises(SignalIngestError, match="signal_type"):
+            await ingest_signal_emitted(
+                fake_session_factory,
+                account_id=_ACCOUNT,
+                env="paper",
+                phase_at_emit=0,
+                event=event,
+            )
+        fake_audit_append.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_exit_missing_exit_reason_rejected(
+        self,
+        fake_audit_append: AsyncMock,
+        fake_db: dict[str, AsyncMock],
+        fake_session_factory: MagicMock,
+    ) -> None:
+        payload = _make_exit_payload()
+        del payload["exit_reason"]
+        event = _make_event(payload=payload)
+        with pytest.raises(SignalIngestError, match="exit_reason"):
+            await ingest_signal_emitted(
+                fake_session_factory,
+                account_id=_ACCOUNT,
+                env="paper",
+                phase_at_emit=0,
+                event=event,
+            )
+        fake_audit_append.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_exit_invalid_exit_reason_rejected(
+        self,
+        fake_audit_append: AsyncMock,
+        fake_db: dict[str, AsyncMock],
+        fake_session_factory: MagicMock,
+    ) -> None:
+        event = _make_event(payload=_make_exit_payload(exit_reason="bogus"))
+        with pytest.raises(SignalIngestError, match="exit_reason"):
+            await ingest_signal_emitted(
+                fake_session_factory,
+                account_id=_ACCOUNT,
+                env="paper",
+                phase_at_emit=0,
+                event=event,
+            )
+
+    @pytest.mark.asyncio
+    async def test_exit_missing_prior_position_direction_rejected(
+        self,
+        fake_audit_append: AsyncMock,
+        fake_db: dict[str, AsyncMock],
+        fake_session_factory: MagicMock,
+    ) -> None:
+        payload = _make_exit_payload()
+        del payload["prior_position_direction"]
+        event = _make_event(payload=payload)
+        with pytest.raises(SignalIngestError, match="prior_position_direction"):
+            await ingest_signal_emitted(
+                fake_session_factory,
+                account_id=_ACCOUNT,
+                env="paper",
+                phase_at_emit=0,
+                event=event,
+            )
+
+    @pytest.mark.asyncio
+    async def test_exit_prior_position_direction_flat_rejected(
+        self,
+        fake_audit_append: AsyncMock,
+        fake_db: dict[str, AsyncMock],
+        fake_session_factory: MagicMock,
+    ) -> None:
+        """Exits against a FLAT prior position are nonsensical — reject."""
+        event = _make_event(payload=_make_exit_payload(prior_position_direction="flat"))
+        with pytest.raises(SignalIngestError, match="prior_position_direction"):
+            await ingest_signal_emitted(
+                fake_session_factory,
+                account_id=_ACCOUNT,
+                env="paper",
+                phase_at_emit=0,
+                event=event,
+            )
+
+    @pytest.mark.asyncio
+    async def test_exit_missing_prior_position_quantity_rejected(
+        self,
+        fake_audit_append: AsyncMock,
+        fake_db: dict[str, AsyncMock],
+        fake_session_factory: MagicMock,
+    ) -> None:
+        payload = _make_exit_payload()
+        del payload["prior_position_quantity"]
+        event = _make_event(payload=payload)
+        with pytest.raises(SignalIngestError, match="prior_position_quantity"):
+            await ingest_signal_emitted(
+                fake_session_factory,
+                account_id=_ACCOUNT,
+                env="paper",
+                phase_at_emit=0,
+                event=event,
+            )
+
+    @pytest.mark.asyncio
+    async def test_exit_prior_position_quantity_zero_rejected(
+        self,
+        fake_audit_append: AsyncMock,
+        fake_db: dict[str, AsyncMock],
+        fake_session_factory: MagicMock,
+    ) -> None:
+        event = _make_event(payload=_make_exit_payload(prior_position_quantity=0))
+        with pytest.raises(SignalIngestError, match="prior_position_quantity"):
+            await ingest_signal_emitted(
+                fake_session_factory,
+                account_id=_ACCOUNT,
+                env="paper",
+                phase_at_emit=0,
+                event=event,
+            )
+
+    @pytest.mark.asyncio
+    async def test_exit_paired_entry_on_trend_flip_rejected(
+        self,
+        fake_audit_append: AsyncMock,
+        fake_db: dict[str, AsyncMock],
+        fake_session_factory: MagicMock,
+    ) -> None:
+        """paired_entry_market is reversal-only per design §Q1."""
+        event = _make_event(payload=_make_exit_payload(paired_entry_market="MES"))
+        with pytest.raises(SignalIngestError, match="reversal"):
+            await ingest_signal_emitted(
+                fake_session_factory,
+                account_id=_ACCOUNT,
+                env="paper",
+                phase_at_emit=0,
+                event=event,
+            )
+
+    @pytest.mark.asyncio
+    async def test_entry_payload_with_exit_field_rejected(
+        self,
+        fake_audit_append: AsyncMock,
+        fake_db: dict[str, AsyncMock],
+        fake_session_factory: MagicMock,
+    ) -> None:
+        """Entry payloads must not carry exit_reason / prior_position_*. Defensive
+        against emitter bugs that copy fields between paths."""
+        event = _make_event(
+            payload={
+                "market": "MES",
+                "direction": "long",
+                "target_contracts": 1,
+                "decision_price": 5234.50,
+                "sizing_trace": {},
+                "signal_type": "entry",
+                "exit_reason": "trend_flip",
+            }
+        )
+        with pytest.raises(SignalIngestError, match="exit_reason"):
+            await ingest_signal_emitted(
+                fake_session_factory,
+                account_id=_ACCOUNT,
+                env="paper",
+                phase_at_emit=0,
+                event=event,
+            )
+
+    @pytest.mark.asyncio
+    async def test_exit_audit_payload_jcs_serializable(
+        self,
+        fake_audit_append: AsyncMock,
+        fake_db: dict[str, AsyncMock],
+        fake_session_factory: MagicMock,
+    ) -> None:
+        """Exit audit payload must satisfy A05 — JCS rejects floats."""
+        from services.audit.chain import jcs_serialize
+
+        event = _make_event(payload=_make_exit_payload())
+        await ingest_signal_emitted(
+            fake_session_factory,
+            account_id=_ACCOUNT,
+            env="paper",
+            phase_at_emit=0,
+            event=event,
+        )
+        audit_payload = fake_audit_append.await_args.args[2]
         canonical = jcs_serialize(audit_payload)
         assert isinstance(canonical, bytes)

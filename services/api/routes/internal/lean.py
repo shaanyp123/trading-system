@@ -155,30 +155,125 @@ async def post_lean_signal(
         # FastAPI's RequestValidationError handler fails to JSON-serialize
         # cleanly. A boundary check at the route layer produces a clean
         # canonical AppError envelope without ctx-serialization issues.
-        required = {
-            "market": body.market,
-            "direction": body.direction,
-            "target_contracts": body.target_contracts,
-            "decision_price": body.decision_price,
-            "sizing_trace": body.sizing_trace,
-            "strategy_version": body.strategy_version,
-        }
+        #
+        # PR-B (2026-05-26): required-field set differs by signal_type per
+        # exit-pipeline-design.md §6.1. Entries need target_contracts; exits
+        # need exit_reason + prior_position_direction + prior_position_quantity
+        # and reject target_contracts as REQUIRED (dispatcher computes it).
+        # See exit-pipeline-design.md §Q3 (dispatcher-side sizing).
+        if body.signal_type == "exit":
+            required: dict[str, object | None] = {
+                "market": body.market,
+                "direction": body.direction,
+                "decision_price": body.decision_price,
+                "sizing_trace": body.sizing_trace,
+                "strategy_version": body.strategy_version,
+                "exit_reason": body.exit_reason,
+                "prior_position_direction": body.prior_position_direction,
+                "prior_position_quantity": body.prior_position_quantity,
+            }
+        else:
+            required = {
+                "market": body.market,
+                "direction": body.direction,
+                "target_contracts": body.target_contracts,
+                "decision_price": body.decision_price,
+                "sizing_trace": body.sizing_trace,
+                "strategy_version": body.strategy_version,
+            }
         missing = sorted(name for name, value in required.items() if value is None)
         if missing:
-            log.warning("lean_signal_emitted_missing_fields", missing=missing, **log_kwargs)
+            log.warning(
+                "lean_signal_emitted_missing_fields",
+                missing=missing,
+                signal_type=body.signal_type,
+                **log_kwargs,
+            )
             raise AppError(
                 error_code="LEAN_SIGNAL_PAYLOAD_INCOMPLETE",
-                message=(f"signal_emitted event_type requires fields: {missing}"),
+                message=(
+                    f"signal_emitted event_type (signal_type={body.signal_type!r}) "
+                    f"requires fields: {missing}"
+                ),
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                details={"missing": missing},
+                details={"missing": missing, "signal_type": body.signal_type},
             )
-        # mypy narrowing — all values are non-None after the gate above.
+
+        # Cross-field invariants for exits.
+        if body.signal_type == "exit":
+            # The strategy emits direction='flat' as the sentinel "target
+            # ending position is flat"; any other direction would tell the
+            # dispatcher to OPEN a new position. Reject loudly to surface
+            # an emitter bug rather than silently flow through.
+            if body.direction != "flat":
+                log.warning(
+                    "lean_signal_emitted_exit_direction_not_flat",
+                    direction=body.direction,
+                    **log_kwargs,
+                )
+                raise AppError(
+                    error_code="LEAN_SIGNAL_EXIT_DIRECTION_INVALID",
+                    message=(
+                        "signal_type='exit' requires direction='flat' (sentinel "
+                        "for target ending position). The dispatcher computes "
+                        "the actual buy/sell side from the prior position; the "
+                        "emit-time direction must be 'flat'."
+                    ),
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    details={"direction": body.direction},
+                )
+            # prior_position_direction must indicate a held position; flat
+            # makes no sense for an exit and would surface a bug in the
+            # emitter's position snapshot.
+            if body.prior_position_direction == "flat":
+                log.warning("lean_signal_emitted_exit_prior_flat", **log_kwargs)
+                raise AppError(
+                    error_code="LEAN_SIGNAL_EXIT_PRIOR_DIRECTION_INVALID",
+                    message=(
+                        "signal_type='exit' requires prior_position_direction "
+                        "to be 'long' or 'short'; 'flat' implies nothing to "
+                        "exit and indicates an emitter bug."
+                    ),
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    details={"prior_position_direction": body.prior_position_direction},
+                )
+            # paired_entry_market is reversal-only.
+            if body.paired_entry_market is not None and body.exit_reason != "reversal":
+                log.warning(
+                    "lean_signal_emitted_paired_entry_on_non_reversal",
+                    exit_reason=body.exit_reason,
+                    paired_entry_market=body.paired_entry_market,
+                    **log_kwargs,
+                )
+                raise AppError(
+                    error_code="LEAN_SIGNAL_EXIT_PAIRED_ENTRY_INVALID",
+                    message=(
+                        "paired_entry_market may only be set when "
+                        "exit_reason='reversal' (design §Q1)."
+                    ),
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    details={
+                        "exit_reason": body.exit_reason,
+                        "paired_entry_market": body.paired_entry_market,
+                    },
+                )
+
+        # mypy narrowing — all required-set values are non-None after the
+        # branch-specific gate above. target_contracts is only narrowed for
+        # the entry branch; the exit branch defaults it to 0 below when
+        # constructing the ingestion payload (the dispatcher computes the
+        # actual close qty at place-order time).
         assert body.market is not None
         assert body.direction is not None
-        assert body.target_contracts is not None
         assert body.decision_price is not None
         assert body.sizing_trace is not None
         assert body.strategy_version is not None
+        if body.signal_type == "entry":
+            assert body.target_contracts is not None
+        else:
+            assert body.exit_reason is not None
+            assert body.prior_position_direction is not None
+            assert body.prior_position_quantity is not None
 
         session_factory = api_db.get_session_factory()
 
@@ -215,18 +310,36 @@ async def post_lean_signal(
         # qc_adapter uses it for cursor tracking against QC's ObjectStore;
         # the LEAN path has no equivalent cursor, so 0 is the sentinel for
         # "not from QC".
+        #
+        # PR-B (2026-05-26): forward signal_type + exit fields into the
+        # payload. For exits, target_contracts defaults to 0 — the dispatcher
+        # computes the actual close qty from a fresh positions_current read
+        # at place-order time per design §Q3, but signal_ingestion still
+        # needs an int for the signals row. 0 is the sentinel; the
+        # dispatcher MUST treat signal_type='exit' as authoritative and
+        # ignore target_contracts. Exit fields land in the audit payload +
+        # signals row via ingest_signal_emitted (PR-B section 5 of the
+        # ingestion file).
+        signal_payload: dict[str, object] = {
+            "market": body.market,
+            "direction": body.direction,
+            "target_contracts": body.target_contracts if body.target_contracts is not None else 0,
+            "decision_price": str(body.decision_price),
+            "sizing_trace": body.sizing_trace,
+            "signal_type": body.signal_type,
+        }
+        if body.signal_type == "exit":
+            signal_payload["exit_reason"] = body.exit_reason
+            signal_payload["prior_position_direction"] = body.prior_position_direction
+            signal_payload["prior_position_quantity"] = body.prior_position_quantity
+            if body.paired_entry_market is not None:
+                signal_payload["paired_entry_market"] = body.paired_entry_market
         synthesized_event = QCEvent(
             sequence_no=0,
             event_type=AuditEventType.SIGNAL_EMITTED.value,
             source_clock_ts=body.ts_utc,
             qc_algorithm_version=body.strategy_version,
-            payload={
-                "market": body.market,
-                "direction": body.direction,
-                "target_contracts": body.target_contracts,
-                "decision_price": str(body.decision_price),
-                "sizing_trace": body.sizing_trace,
-            },
+            payload=signal_payload,
         )
 
         try:
@@ -257,6 +370,8 @@ async def post_lean_signal(
             market=body.market,
             direction=body.direction,
             target_contracts=body.target_contracts,
+            signal_type=body.signal_type,
+            exit_reason=body.exit_reason,
             **log_kwargs,
         )
 
@@ -267,20 +382,27 @@ async def post_lean_signal(
         # any reconnect-with-Last-Event-ID consumer will catch up via
         # the replay buffer.
         try:
+            sse_payload: dict[str, object | None] = {
+                "action": "emitted",
+                "signal_id": str(result.signal_id),
+                "market": body.market,
+                "direction": body.direction,
+                "target_contracts": body.target_contracts,
+                "decision_price": str(body.decision_price),
+                "emitted_at_utc": body.ts_utc.isoformat(),
+                "environment": env,
+                "strategy_version": body.strategy_version,
+                "audit_event_uuid": str(result.audit_event_uuid),
+                "signal_type": body.signal_type,
+            }
+            if body.signal_type == "exit":
+                sse_payload["exit_reason"] = body.exit_reason
+                sse_payload["prior_position_direction"] = body.prior_position_direction
+                sse_payload["prior_position_quantity"] = body.prior_position_quantity
+                sse_payload["paired_entry_market"] = body.paired_entry_market
             await emit_sse(
                 "signal",
-                {
-                    "action": "emitted",
-                    "signal_id": str(result.signal_id),
-                    "market": body.market,
-                    "direction": body.direction,
-                    "target_contracts": body.target_contracts,
-                    "decision_price": str(body.decision_price),
-                    "emitted_at_utc": body.ts_utc.isoformat(),
-                    "environment": env,
-                    "strategy_version": body.strategy_version,
-                    "audit_event_uuid": str(result.audit_event_uuid),
-                },
+                sse_payload,
             )
         except Exception:
             log.exception(

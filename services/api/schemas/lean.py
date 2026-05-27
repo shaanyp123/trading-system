@@ -19,8 +19,25 @@ full market / direction / target_contracts / decision_price / sizing_trace
 payload. The dispatcher then routes the approved signal to the risk
 engine + execution layer.
 
+**PR-B (exit-pipeline) extension (2026-05-26 design lock).** A
+``signal_type`` discriminator differentiates entry vs exit ``signal_emitted``
+events on the same endpoint:
+
+* ``signal_type='entry'`` (default for backwards compat with pre-PR-B LEAN
+  images): requires the original PR-D field set
+  (market / direction / target_contracts / decision_price / sizing_trace /
+  strategy_version) and lands as ``signals.signal_type='entry'``.
+* ``signal_type='exit'``: requires market / direction / exit_reason /
+  prior_position_direction / prior_position_quantity / sizing_trace /
+  strategy_version. target_contracts is OPTIONAL (the dispatcher computes
+  the close qty from a fresh ``positions_current`` read at place-order
+  time per design §Q3); decision_price is REQUIRED (the close used for the
+  exit decision at signal-emit time). ``paired_entry_market`` is OPTIONAL
+  and populated only when ``exit_reason='reversal'``.
+
 See backend-spec §2.3 (Signal Engine post-pivot) + Docs/decisions-log.md
-2026-05-12 entry for the full design rationale.
+2026-05-12 entry for the full pivot rationale; see
+Docs/exit-pipeline-design.md §Q2 / §6.1 for the discriminator decision.
 """
 
 from __future__ import annotations
@@ -110,13 +127,21 @@ class LeanEventRequest(BaseModel):
     )
     direction: Literal["long", "short", "flat"] | None = Field(
         default=None,
-        description="Position-direction enum. Required for signal_emitted.",
+        description=(
+            "Position-direction enum. Required for signal_emitted. Exits "
+            "emit ``direction='flat'`` (sentinel = target ending position is "
+            "flat); the dispatcher computes the actual buy/sell side from "
+            "the prior position at place-order time."
+        ),
     )
     target_contracts: int | None = Field(
         default=None,
         description=(
             "Integer contract count from the V1 sizing pipeline. Required for "
-            "signal_emitted. May be 0 for a 'flat' direction signal."
+            "entry signal_emitted; OPTIONAL for exits (the dispatcher computes "
+            "the close qty from a fresh positions_current read at place-order "
+            "time per exit-pipeline-design §Q3). May be 0 for a 'flat' direction "
+            "signal."
         ),
     )
     decision_price: Decimal | None = Field(
@@ -141,6 +166,60 @@ class LeanEventRequest(BaseModel):
             "LEAN-side strategy version identifier — analog of QC's "
             "`qc_algorithm_version`. Required for signal_emitted. Phase 1: "
             "'v1_trend_following@<git-sha>'."
+        ),
+    )
+    # PR-B exit-pipeline discriminator + companion fields. ``signal_type``
+    # defaults to ``'entry'`` so pre-PR-B LEAN images (and any other emitter
+    # that hasn't been updated) keep working unmodified. See
+    # exit-pipeline-design.md §Q2 (discriminator over new audit event type)
+    # and §5.2 (CandidateSignal widening).
+    signal_type: Literal["entry", "exit"] = Field(
+        default="entry",
+        description=(
+            "Discriminator persisted to ``signals.signal_type``. ``'entry'`` "
+            "for the default donchian-breakout path; ``'exit'`` for an "
+            "explicit close emitted by ``generate_exit_candidates``. Defaults "
+            "to ``'entry'`` so pre-PR-B emitters keep working without code "
+            "changes."
+        ),
+    )
+    exit_reason: Literal["reversal", "trend_flip", "decommission"] | None = Field(
+        default=None,
+        description=(
+            "Which exit condition tripped. REQUIRED for signal_type='exit'; "
+            "REJECTED for signal_type='entry'. Mirrors the values populated "
+            "by ``V1TrendFollowing.generate_exit_candidates``."
+        ),
+    )
+    prior_position_direction: Literal["long", "short", "flat"] | None = Field(
+        default=None,
+        description=(
+            "Snapshot of the held position's direction at signal-emit time. "
+            "REQUIRED for signal_type='exit' (the dispatcher uses a fresh "
+            "positions_current read at place-order time per §Q3, but the "
+            "emit-time snapshot is preserved for audit-trail comparison). "
+            "REJECTED for signal_type='entry'. Use 'long' or 'short' — "
+            "'flat' is rejected because exits only fire against held positions."
+        ),
+    )
+    prior_position_quantity: int | None = Field(
+        default=None,
+        description=(
+            "Signed quantity of the held position at signal-emit time. "
+            "REQUIRED for signal_type='exit'. Sign matches "
+            "prior_position_direction (positive=long, negative=short, "
+            "non-zero). REJECTED for signal_type='entry'."
+        ),
+    )
+    paired_entry_market: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=32,
+        description=(
+            "Reversal-only — the market whose opposite-direction entry "
+            "candidate triggered this exit. Set ONLY when "
+            "exit_reason='reversal'. Used by the dispatcher to serialize "
+            "the paired EXIT-then-ENTRY sequence (design §Q1 + §11 R2)."
         ),
     )
     # Heartbeat-extra fields — LEAN's `_post_event("lean_cycle_heartbeat",

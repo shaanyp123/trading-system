@@ -141,3 +141,142 @@ class TestSignalEmittedPathStillWorks:
         assert request.market == "/MES"
         assert request.target_contracts == 1
         assert request.decision_price == Decimal("5234.75")
+
+
+# ---------------------------------------------------------------------------
+# PR-B exit-pipeline fields (added 2026-05-26 per exit-pipeline-design.md §5.2)
+# ---------------------------------------------------------------------------
+
+
+def _base_entry_signal_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "event_type": "signal_emitted",
+        "ts_utc": datetime(2026, 5, 26, 21, 30, tzinfo=UTC).isoformat(),
+        "algorithm_id": "v1_trend_following",
+        "session_date_et": "2026-05-26",
+        "equity_usd": "100000.00",
+        "live_mode": True,
+        "market": "/MES",
+        "direction": "long",
+        "target_contracts": 1,
+        "decision_price": "5234.75",
+        "sizing_trace": {"gross_dollars": "5234.75"},
+        "strategy_version": "v1_trend_following@abc1234",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _base_exit_signal_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "event_type": "signal_emitted",
+        "ts_utc": datetime(2026, 5, 26, 21, 30, tzinfo=UTC).isoformat(),
+        "algorithm_id": "v1_trend_following",
+        "session_date_et": "2026-05-26",
+        "equity_usd": "100000.00",
+        "live_mode": True,
+        "market": "/MES",
+        "direction": "flat",
+        "target_contracts": 0,
+        "decision_price": "5234.75",
+        "sizing_trace": {"schema_version": 1},
+        "strategy_version": "v1_trend_following@abc1234",
+        "signal_type": "exit",
+        "exit_reason": "trend_flip",
+        "prior_position_direction": "long",
+        "prior_position_quantity": 3,
+    }
+    payload.update(overrides)
+    return payload
+
+
+class TestSignalTypeDefaultsToEntry:
+    """Backwards compat: pre-PR-B payloads without signal_type still parse."""
+
+    def test_signal_type_omitted_defaults_to_entry(self) -> None:
+        request = LeanEventRequest.model_validate(_base_entry_signal_payload())
+        assert request.signal_type == "entry"
+        assert request.exit_reason is None
+        assert request.prior_position_direction is None
+        assert request.prior_position_quantity is None
+        assert request.paired_entry_market is None
+
+    def test_signal_type_explicit_entry_parses(self) -> None:
+        request = LeanEventRequest.model_validate(_base_entry_signal_payload(signal_type="entry"))
+        assert request.signal_type == "entry"
+
+    def test_invalid_signal_type_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            LeanEventRequest.model_validate(_base_entry_signal_payload(signal_type="bogus"))
+
+
+class TestExitPayloadAccepted:
+    """Exit payloads with the full PR-B field set parse cleanly."""
+
+    def test_trend_flip_exit_payload_parses(self) -> None:
+        request = LeanEventRequest.model_validate(_base_exit_signal_payload())
+        assert request.signal_type == "exit"
+        assert request.exit_reason == "trend_flip"
+        assert request.prior_position_direction == "long"
+        assert request.prior_position_quantity == 3
+        assert request.paired_entry_market is None
+        # direction is the sentinel 'flat' for exits
+        assert request.direction == "flat"
+
+    def test_reversal_exit_with_paired_entry_market(self) -> None:
+        request = LeanEventRequest.model_validate(
+            _base_exit_signal_payload(
+                exit_reason="reversal",
+                paired_entry_market="/MES",
+            )
+        )
+        assert request.exit_reason == "reversal"
+        assert request.paired_entry_market == "/MES"
+
+    def test_decommission_exit(self) -> None:
+        request = LeanEventRequest.model_validate(
+            _base_exit_signal_payload(exit_reason="decommission")
+        )
+        assert request.exit_reason == "decommission"
+
+    def test_short_prior_position_accepted(self) -> None:
+        request = LeanEventRequest.model_validate(
+            _base_exit_signal_payload(
+                prior_position_direction="short",
+                prior_position_quantity=-5,
+            )
+        )
+        assert request.prior_position_direction == "short"
+        assert request.prior_position_quantity == -5
+
+
+class TestExitFieldValidation:
+    """Per-field bounds + type checks for the new exit fields."""
+
+    def test_invalid_exit_reason_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            LeanEventRequest.model_validate(_base_exit_signal_payload(exit_reason="bogus"))
+
+    def test_invalid_prior_position_direction_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            LeanEventRequest.model_validate(
+                _base_exit_signal_payload(prior_position_direction="sideways")
+            )
+
+    def test_paired_entry_market_empty_string_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            LeanEventRequest.model_validate(
+                _base_exit_signal_payload(
+                    exit_reason="reversal",
+                    paired_entry_market="",
+                )
+            )
+
+    def test_paired_entry_market_over_32_chars_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            LeanEventRequest.model_validate(
+                _base_exit_signal_payload(
+                    exit_reason="reversal",
+                    paired_entry_market="x" * 33,
+                )
+            )
