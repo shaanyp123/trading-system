@@ -704,9 +704,9 @@ class PostgresPhase1QueryRepo:
         row = (
             await self._session.execute(
                 text(
-                    "SELECT market, direction, target_contracts, decision_price, "
-                    "       strategy_hash, parameter_set_hash, emitted_at_utc, "
-                    "       env, status "
+                    "SELECT market, direction, signal_type, target_contracts, "
+                    "       decision_price, strategy_hash, parameter_set_hash, "
+                    "       emitted_at_utc, env, status "
                     "FROM signals "
                     "WHERE id = :sid AND account_id = :acc"
                 ),
@@ -718,6 +718,9 @@ class PostgresPhase1QueryRepo:
         return {
             "market": row.market,
             "direction": row.direction,
+            # Exit-pipeline PR-C (2026-05-27): plumbed through to the
+            # dispatcher's HALT_NEW gate (L5 — exits bypass).
+            "signal_type": row.signal_type,
             "target_contracts": int(row.target_contracts),
             "decision_price": Decimal(str(row.decision_price)),
             "strategy_hash": row.strategy_hash,
