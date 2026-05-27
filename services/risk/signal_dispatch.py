@@ -105,6 +105,14 @@ async def fetch_current_risk_state(
 
 SignalDispatchAction = Literal["approve", "reject", "defer"]
 
+#: Discriminator carried on every signal + plumbed through to the dispatcher
+#: gate per ``Docs/exit-pipeline-design.md`` §6.1. Values mirror
+#: ``services.qc_adapter.signal_ingestion._VALID_SIGNAL_TYPES`` (the API
+#: ingestion guard) and ``signals.signal_type`` TEXT column values; the
+#: planner accepts the discriminator as an input so the I/O orchestrator
+#: can branch the HALT_NEW gate (L5: exits bypass; entries blocked).
+SignalType = Literal["entry", "exit"]
+
 
 @dataclass(frozen=True, slots=True)
 class DecisionDiaryEntryInput:
@@ -138,6 +146,13 @@ class SignalDispatchPlan:
     audit_payload: dict[str, Any]
     decided_at_utc: datetime
     decided_by_user_id: str
+    # Exit-pipeline PR-C (2026-05-27). Discriminates entry vs exit signals
+    # at the I/O gate per ``Docs/exit-pipeline-design.md`` §6.1 + L5.
+    # Caller (route handler) MUST read the value from the signals row
+    # before constructing the plan; defaults to 'entry' for backwards
+    # compat with pre-PR-B call sites + tests that don't care about
+    # the discriminator.
+    signal_type: SignalType = "entry"
     # When the action is approve, the dispatcher records an
     # `intent_to_place_order` flag. A separate worker / route follow-up
     # in PR-E or post-pivot Phase 1+ picks up approved signals + places
@@ -213,6 +228,7 @@ def plan_signal_approve(
     decided_by_user_id: str,
     override_size: int | None,
     decided_at_utc: datetime | None = None,
+    signal_type: SignalType = "entry",
 ) -> SignalDispatchPlan:
     """Build the dispatch plan for an approve action.
 
@@ -222,6 +238,10 @@ def plan_signal_approve(
         backend-spec §4.1.2 (operator may downsize the recommended
         allocation; upsizing is rejected by the route schema validation
         before reaching here).
+    :param signal_type: 'entry' (default) or 'exit'. The route handler
+        reads this from the signals row before planning per exit-
+        pipeline design §6.1; the I/O orchestrator gates HALT_NEW on
+        ``signal_type != 'exit'`` (L5 — exits bypass).
 
     Approve never requires a diary entry — the approval IS the operator's
     affirmative signal.
@@ -245,9 +265,11 @@ def plan_signal_approve(
             "decided_by_user_id": decided_by_user_id,
             "decided_at_utc": decided_at_utc.isoformat(),
             "override_size": override_size,
+            "signal_type": signal_type,
         },
         decided_at_utc=decided_at_utc,
         decided_by_user_id=decided_by_user_id,
+        signal_type=signal_type,
         intent_to_place_order=True,
         diary_entry=None,
     )
@@ -260,8 +282,15 @@ def plan_signal_reject(
     decided_by_user_id: str,
     diary_entry: DecisionDiaryEntryInput | None,
     decided_at_utc: datetime | None = None,
+    signal_type: SignalType = "entry",
 ) -> SignalDispatchPlan:
-    """Build the dispatch plan for a reject action."""
+    """Build the dispatch plan for a reject action.
+
+    :param signal_type: 'entry' (default) or 'exit'. Reject + defer are
+        not gated by HALT_NEW (operator must always be able to record a
+        rejection); signal_type is propagated to the plan + audit row
+        purely for forensic visibility.
+    """
     _validate_diary(diary_entry, "reject")
     if decided_at_utc is None:
         decided_at_utc = datetime.now(tz=UTC)
@@ -277,6 +306,7 @@ def plan_signal_reject(
             "account_id": str(account_id),
             "decided_by_user_id": decided_by_user_id,
             "decided_at_utc": decided_at_utc.isoformat(),
+            "signal_type": signal_type,
             "diary_entry": {
                 "entry_class": diary_entry.entry_class,
                 "tag": diary_entry.tag,
@@ -285,6 +315,7 @@ def plan_signal_reject(
         },
         decided_at_utc=decided_at_utc,
         decided_by_user_id=decided_by_user_id,
+        signal_type=signal_type,
         intent_to_place_order=False,
         diary_entry=diary_entry,
     )
@@ -297,8 +328,14 @@ def plan_signal_defer(
     decided_by_user_id: str,
     diary_entry: DecisionDiaryEntryInput | None,
     decided_at_utc: datetime | None = None,
+    signal_type: SignalType = "entry",
 ) -> SignalDispatchPlan:
-    """Build the dispatch plan for a defer action."""
+    """Build the dispatch plan for a defer action.
+
+    :param signal_type: 'entry' (default) or 'exit'. Same semantics as
+        :func:`plan_signal_reject` — propagated for forensics, not for
+        gating.
+    """
     _validate_diary(diary_entry, "defer")
     if decided_at_utc is None:
         decided_at_utc = datetime.now(tz=UTC)
@@ -314,6 +351,7 @@ def plan_signal_defer(
             "account_id": str(account_id),
             "decided_by_user_id": decided_by_user_id,
             "decided_at_utc": decided_at_utc.isoformat(),
+            "signal_type": signal_type,
             "diary_entry": {
                 "entry_class": diary_entry.entry_class,
                 "tag": diary_entry.tag,
@@ -322,6 +360,7 @@ def plan_signal_defer(
         },
         decided_at_utc=decided_at_utc,
         decided_by_user_id=decided_by_user_id,
+        signal_type=signal_type,
         intent_to_place_order=False,
         diary_entry=diary_entry,
     )
@@ -373,10 +412,18 @@ async def apply_signal_dispatch(
         proceed so the operator can clear out pending signals during
         a halt.
     """
-    # Step 0: PR-H risk-state gate. Only the approve path is gated;
-    # reject/defer always proceed (operators need to record decisions
-    # during a halt + the diary entry IS the audit-traceable rationale).
-    if plan.action == "approve" and current_risk_state == "HALT_NEW":
+    # Step 0: PR-H risk-state gate, exit-pipeline PR-C variant (2026-05-27).
+    # Only the approve path is gated; reject/defer always proceed
+    # (operators need to record decisions during a halt + the diary entry
+    # IS the audit-traceable rationale).
+    #
+    # Exit-pipeline L5 (``Docs/exit-pipeline-design.md`` §7 +
+    # ``Docs/backend-spec.md`` §2.5): exit signals BYPASS the HALT_NEW
+    # gate. HALT_NEW blocks NEW exposure but must still allow exits so
+    # the operator can flatten or rebalance the book during a halt.
+    # Entry approvals stay blocked under HALT_NEW per the original PR-H
+    # contract.
+    if plan.action == "approve" and current_risk_state == "HALT_NEW" and plan.signal_type != "exit":
         raise SignalDispatchError(
             error_code="SIGNAL_BLOCKED_BY_HALT",
             message=(
@@ -386,16 +433,23 @@ async def apply_signal_dispatch(
             details={
                 "signal_id": str(plan.signal_id),
                 "current_risk_state": current_risk_state,
+                "signal_type": plan.signal_type,
             },
         )
 
     # Step 1: validate. The signals table PK column is `id`, not
     # `signal_id` — `signal_id` is the column name on `orders` (the FK
     # back to signals.id). Pivot-PR-D 2026-05-12 fixup.
+    #
+    # Exit-pipeline PR-C (2026-05-27): also pull ``signal_type`` for a
+    # defensive cross-check against ``plan.signal_type``. Defense in
+    # depth — the route handler reads signal_type from the same row
+    # before constructing the plan, so a mismatch here surfaces a
+    # programmer-side bug (race, refactor accident) rather than a TOCTOU.
     async with session_factory() as session:
         row = (
             await session.execute(
-                text("SELECT status FROM signals WHERE id = :sid"),
+                text("SELECT status, signal_type FROM signals WHERE id = :sid"),
                 {"sid": plan.signal_id},
             )
         ).fetchone()
@@ -413,6 +467,25 @@ async def apply_signal_dispatch(
                     "only pending signals can be approved / rejected / deferred."
                 ),
                 details={"signal_id": str(plan.signal_id), "current_status": row.status},
+            )
+        if row.signal_type != plan.signal_type:
+            # Defensive: the route handler should have read this from the
+            # same row, so a mismatch is a coding bug, not a TOCTOU. Log
+            # the divergence + use the DB value as authoritative; do NOT
+            # mutate the frozen plan (the audit row still records
+            # plan.signal_type for forensic accuracy). The gate decision
+            # in Step 0 already fired, so a 'flat'-leaning DB value
+            # arriving here AFTER an entry-gated approve is impossible —
+            # we'd raise above. A 'flat'/'exit' DB value with an
+            # 'entry'-typed plan would have already been HALT_NEW-blocked
+            # if the system was halted; the worst case is an audit row
+            # whose payload mislabels the signal. Operator-visible warning
+            # in logs is sufficient.
+            log.warning(
+                "signal_dispatch_signal_type_mismatch",
+                signal_id=str(plan.signal_id),
+                plan_signal_type=plan.signal_type,
+                db_signal_type=row.signal_type,
             )
 
     # Step 2: audit-first. session_factory pattern from Day 28 PR-A
@@ -506,6 +579,7 @@ __all__ = [
     "SignalDispatchError",
     "SignalDispatchPlan",
     "SignalDispatchResult",
+    "SignalType",
     "apply_signal_dispatch",
     "fetch_current_risk_state",
     "plan_signal_approve",

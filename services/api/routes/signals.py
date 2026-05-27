@@ -224,23 +224,32 @@ async def approve_signal(
 
     account_id = await _resolve_account_id(repo)
     env, phase = await _resolve_env_settings()
-    # Snapshot market+direction BEFORE dispatch so the SSE payload is
-    # complete even if a concurrent UPDATE flips fields after dispatch.
-    # Bypassed cleanly when the signal doesn't exist — the dispatcher
-    # surfaces SIGNAL_NOT_FOUND with a clearer error than a partial
-    # SSE emit would.
+    # Snapshot market+direction+signal_type BEFORE dispatch so the SSE
+    # payload is complete even if a concurrent UPDATE flips fields after
+    # dispatch + so the planner receives the discriminator for L5
+    # HALT_NEW bypass. Bypassed cleanly when the signal doesn't exist —
+    # the dispatcher surfaces SIGNAL_NOT_FOUND with a clearer error than
+    # a partial SSE emit would.
     summary = await repo.fetch_signal_summary(account_id, signal_id)
     # PR-H: read the current risk_state BEFORE dispatch. If the system
     # is HALT_NEW, the dispatcher raises SIGNAL_BLOCKED_BY_HALT which
-    # maps to HTTP 409 below. NORMAL + CONVALESCENT permit.
+    # maps to HTTP 409 below. NORMAL + CONVALESCENT permit. Exit-pipeline
+    # PR-C (2026-05-27): exit signals BYPASS HALT_NEW per L5; the
+    # dispatcher reads ``plan.signal_type`` to gate accordingly.
     risk_state = await fetch_current_risk_state(get_session_factory(), account_id=account_id)
     decided_at_utc = datetime.now(tz=UTC)
+    # Default to 'entry' when summary missing (signal-not-found path
+    # already 404s below via the dispatcher's validator); the literal
+    # narrow keeps mypy strict happy.
+    signal_type_raw = str(summary.get("signal_type", "entry")) if summary else "entry"
+    signal_type: Literal["entry", "exit"] = "exit" if signal_type_raw == "exit" else "entry"
     plan = plan_signal_approve(
         signal_id=signal_id,
         account_id=account_id,
         decided_by_user_id=session.user_id,
         override_size=body.override_size,
         decided_at_utc=decided_at_utc,
+        signal_type=signal_type,
     )
     try:
         result = await apply_signal_dispatch(
@@ -318,12 +327,18 @@ async def reject_signal(
         tag=body.decision_diary_entry.tag,
         reasoning_text=body.decision_diary_entry.reasoning_text,
     )
+    # Exit-pipeline PR-C (2026-05-27): plumb signal_type for forensic
+    # audit visibility. Reject is not gated by HALT_NEW; the
+    # discriminator just flows into the audit payload.
+    signal_type_raw = str(summary.get("signal_type", "entry")) if summary else "entry"
+    signal_type: Literal["entry", "exit"] = "exit" if signal_type_raw == "exit" else "entry"
     plan = plan_signal_reject(
         signal_id=signal_id,
         account_id=account_id,
         decided_by_user_id=session.user_id,
         diary_entry=diary,
         decided_at_utc=decided_at_utc,
+        signal_type=signal_type,
     )
     try:
         result = await apply_signal_dispatch(
@@ -392,12 +407,17 @@ async def defer_signal(
         tag=body.decision_diary_entry.tag,
         reasoning_text=body.decision_diary_entry.reasoning_text,
     )
+    # Exit-pipeline PR-C (2026-05-27): plumb signal_type — defer is not
+    # HALT_NEW-gated; discriminator flows into the audit payload.
+    signal_type_raw = str(summary.get("signal_type", "entry")) if summary else "entry"
+    signal_type: Literal["entry", "exit"] = "exit" if signal_type_raw == "exit" else "entry"
     plan = plan_signal_defer(
         signal_id=signal_id,
         account_id=account_id,
         decided_by_user_id=session.user_id,
         diary_entry=diary,
         decided_at_utc=decided_at_utc,
+        signal_type=signal_type,
     )
     try:
         result = await apply_signal_dispatch(
