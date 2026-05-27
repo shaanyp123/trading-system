@@ -1,0 +1,526 @@
+"""scripts/operator_tools/bootstrap_live_account.py — idempotent live-DB
+account bootstrap.
+
+Runs once during the live-money cutover ceremony (per
+``Docs/live-money-cutover-plan.md`` §10 steps 16-18) against a freshly
+``alembic upgrade head``-migrated live Postgres. Writes three rows:
+
+  1. ``accounts`` — the live IBKR account row (default external_account_id
+     ``U25655583`` per operator memory + cutover plan §10 step 1).
+  2. ``risk_state`` — bootstrap row at state=``NORMAL``, severity=NULL,
+     reason=``live_cutover``, is_current=TRUE. The audit_event_uuid slot
+     is filled with a fresh UUID4 — matches the test-fixture pattern in
+     ``tests/integration/test_kill_switch_end_to_end.py``. The
+     ``risk_state`` row is what the api's ``fetch_current_risk_state``
+     reads at startup to gate dispatching.
+  3. ``parameter_sets`` (OPTIONAL) — when ``--parameter-set-json`` is
+     supplied, INSERTs the row with the supplied ``parameter_set_hash``
+     + ``parameters`` JSONB so the live signal pipeline finds the active
+     set on first cycle. Operator pre-extracts this from paper's DB.
+
+**Idempotency.** Each INSERT uses ``ON CONFLICT DO NOTHING`` against the
+relevant unique constraint (accounts.external_account_id UNIQUE,
+risk_state's ``account_id, is_current=TRUE`` partial unique index,
+parameter_sets PRIMARY KEY = parameter_set_hash). Re-runs are no-ops.
+
+**Why an operator script vs an alembic migration.** Account bootstrap
+data is environment-specific (the live IBKR account ID is operator-side
+state, not schema). Alembic migrations would couple schema to operator
+identity. The script keeps the schema-vs-data split clean.
+
+**Forbidden-paths check.** ``scripts/operator_tools/**`` is NOT on the
+dev-guide §11 anti-pattern [A02] forbidden-modification whitelist nor
+on the §2.3 hot-fix whitelist. Pure tooling — no ``services/risk/**``
+modifications. The INSERT into ``risk_state`` crosses into risk-state
+semantics, but only at bootstrap (no transition logic; canonical
+``NORMAL`` initial value). Regular PR review applies.
+
+**A-gates:**
+
+* **A01 N/A** — no audit writes via this path. The risk_state row's
+  ``audit_event_uuid`` is a synthesized UUID4 (no upstream audit row
+  exists yet in a fresh live DB). Subsequent state transitions go
+  through ``services.risk.dispatch.plan_invoke_kill_switch`` /
+  ``apply_state_transition`` which DO write audit rows.
+* **A05 N/A** — no Decimal handling in bootstrap.
+* **A06 enforced** — every datetime tz-aware UTC.
+* **A22 N/A** — testcontainers not needed; unit tests cover the
+  argparse + idempotency + parameter_sets-loading surfaces with mocks.
+
+Exit codes (load-bearing for the operator-runbook contract):
+
+* ``0`` — success: all rows landed (or were already present; idempotent)
+* ``1`` — invalid parameter-set JSON (missing ``parameter_set_hash`` or
+  ``parameters`` keys; malformed JSON)
+* ``5`` — DB init failure (DATABASE_URL missing / wrong / Postgres
+  unreachable)
+* ``6`` — Invalid CLI args (caught early)
+* ``99`` — Unexpected exception (logged with traceback)
+
+Usage::
+
+    # Stage 1 — minimum: account row + risk_state row.
+    python -m scripts.operator_tools.bootstrap_live_account \\
+        --external-account-id U25655583 \\
+        --env live-small \\
+        --allow-non-paper \\
+        --no-dry-run --confirm
+
+    # Stage 2 — also seed parameter_sets head row from paper extract:
+    python -m scripts.operator_tools.bootstrap_live_account \\
+        --external-account-id U25655583 \\
+        --env live-small \\
+        --parameter-set-json /tmp/paper_param_set_head.json \\
+        --allow-non-paper \\
+        --no-dry-run --confirm
+
+The parameter-set JSON file shape::
+
+    {
+        "parameter_set_hash": "<64-char-hex>",
+        "parameters": {"VOL_TARGET_PCT_ANNUAL": 0.15, ...}
+    }
+
+Operator extracts via paper VPS::
+
+    docker compose exec postgres psql -U postgres -d trading -t -A -c "
+      SELECT json_build_object(
+        'parameter_set_hash', parameter_set_hash,
+        'parameters', parameters
+      ) FROM parameter_sets
+      ORDER BY first_active_at DESC LIMIT 1;
+    " > /tmp/paper_param_set_head.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+import traceback
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, Final, Literal
+from uuid import UUID, uuid4
+
+import structlog
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+log = structlog.get_logger()
+
+
+# ---------------------------------------------------------------------------
+# Exit code contract (locked; documented in module docstring)
+# ---------------------------------------------------------------------------
+
+EXIT_OK: Final[int] = 0
+EXIT_BAD_PARAM_SET_JSON: Final[int] = 1
+EXIT_DB_INIT_FAILED: Final[int] = 5
+EXIT_BAD_ARGS: Final[int] = 6
+EXIT_UNEXPECTED: Final[int] = 99
+
+
+# ---------------------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------------------
+
+#: Env values accepted on the CLI. Mirrors ``audit_log.env`` CHECK constraint.
+_ALLOWED_ENVS: Final[tuple[str, ...]] = ("paper", "live-small", "live-scale")
+EnvName = Literal["paper", "live-small", "live-scale"]
+
+#: Operator's live IBKR account number per memory + cutover plan §10 step 1.
+DEFAULT_LIVE_EXTERNAL_ACCOUNT_ID: Final[str] = "U25655583"
+
+#: DB connection env var. Mirrors other operator_tools scripts.
+DATABASE_URL_ENV: Final[str] = "DATABASE_URL"
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedArgs:
+    """Normalized CLI args. Tests use this surface directly without going
+    through argparse so they don't have to fight stderr capture.
+    """
+
+    external_account_id: str
+    env: EnvName
+    parameter_set_json: Path | None
+    dry_run: bool
+    confirm: bool
+    allow_non_paper: bool
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="scripts.operator_tools.bootstrap_live_account",
+        description=(
+            "Idempotent live-DB account bootstrap. Runs once during the "
+            "cutover ceremony per Docs/live-money-cutover-plan.md §10 "
+            "steps 16-18. Re-runs are safe (no-op)."
+        ),
+    )
+    parser.add_argument(
+        "--external-account-id",
+        default=DEFAULT_LIVE_EXTERNAL_ACCOUNT_ID,
+        help=(
+            f"IBKR account number (default: {DEFAULT_LIVE_EXTERNAL_ACCOUNT_ID!r}). "
+            "Persisted to accounts.external_account_id."
+        ),
+    )
+    parser.add_argument(
+        "--env",
+        required=True,
+        choices=_ALLOWED_ENVS,
+        help=(
+            "Audit env tag — mirrors audit_log.env CHECK. Live envs "
+            "require --allow-non-paper safety gate."
+        ),
+    )
+    parser.add_argument(
+        "--parameter-set-json",
+        type=Path,
+        default=None,
+        help=(
+            "Optional path to a JSON file containing "
+            '{"parameter_set_hash": "<64-hex>", "parameters": {...}}. '
+            "When supplied, INSERTs a parameter_sets row idempotently. "
+            "Operator pre-extracts from paper's DB."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "If set (default), log what WOULD be INSERTed without writing. "
+            "Operator must pass --no-dry-run AND --confirm to actually "
+            "write."
+        ),
+    )
+    parser.add_argument(
+        "--confirm",
+        action="store_true",
+        default=False,
+        help=(
+            "Explicit confirmation for --no-dry-run. Two-flag gate per the "
+            "replace_protective_stop.py convention. Fails closed otherwise."
+        ),
+    )
+    parser.add_argument(
+        "--allow-non-paper",
+        action="store_true",
+        help=(
+            "Required to run with --env in {live-small, live-scale}. The "
+            "script mutates the live database; operator must opt in "
+            "explicitly to acknowledge."
+        ),
+    )
+    return parser
+
+
+def parse_args(argv: list[str]) -> ParsedArgs:
+    parsed = _build_parser().parse_args(argv)
+    if parsed.env != "paper" and not parsed.allow_non_paper:
+        raise ValueError(
+            f"--env={parsed.env} requires --allow-non-paper to acknowledge the live-DB mutation"
+        )
+    if not parsed.dry_run and not parsed.confirm:
+        raise ValueError(
+            "--no-dry-run requires --confirm. Two-flag gate prevents an accidental wet run."
+        )
+    return ParsedArgs(
+        external_account_id=str(parsed.external_account_id),
+        env=parsed.env,
+        parameter_set_json=parsed.parameter_set_json,
+        dry_run=bool(parsed.dry_run),
+        confirm=bool(parsed.confirm),
+        allow_non_paper=bool(parsed.allow_non_paper),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ParameterSetPayload:
+    """Validated parameter_sets row to insert."""
+
+    parameter_set_hash: str
+    parameters: dict[str, Any]
+
+
+def load_parameter_set_json(path: Path) -> ParameterSetPayload:
+    """Read + validate the parameter-set JSON file.
+
+    Raises ValueError on missing keys or malformed JSON; caller maps to
+    EXIT_BAD_PARAM_SET_JSON.
+    """
+    try:
+        raw = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        raise ValueError(f"failed to read/parse {path}: {exc!s}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path}: top-level must be a JSON object")
+    if "parameter_set_hash" not in raw:
+        raise ValueError(f"{path}: missing 'parameter_set_hash' key")
+    if "parameters" not in raw:
+        raise ValueError(f"{path}: missing 'parameters' key")
+    psh = raw["parameter_set_hash"]
+    params = raw["parameters"]
+    if not isinstance(psh, str):
+        raise ValueError(f"{path}: 'parameter_set_hash' must be a string")
+    if len(psh) != 64:
+        raise ValueError(f"{path}: 'parameter_set_hash' must be 64 hex chars; got {len(psh)}")
+    if not isinstance(params, dict):
+        raise ValueError(f"{path}: 'parameters' must be a JSON object")
+    return ParameterSetPayload(parameter_set_hash=psh, parameters=params)
+
+
+# ---------------------------------------------------------------------------
+# I/O orchestration
+# ---------------------------------------------------------------------------
+
+
+async def _insert_account_idempotent(
+    session_factory: async_sessionmaker[Any], *, external_account_id: str
+) -> tuple[UUID, bool]:
+    """INSERT the accounts row. Returns (account_id, created).
+
+    ``created=True`` when the row was actually INSERTed; False when an
+    existing row was found (idempotent re-run).
+    """
+    now = datetime.now(tz=UTC)
+    async with session_factory() as session:
+        async with session.begin():
+            result = (
+                await session.execute(
+                    text(
+                        "INSERT INTO accounts ("
+                        "    external_account_id, account_type, base_currency, "
+                        "    role, active_from"
+                        ") VALUES ("
+                        "    :ext, 'individual', 'USD', 'owner', :now"
+                        ") "
+                        "ON CONFLICT (external_account_id) "
+                        "WHERE active_to IS NULL DO NOTHING "
+                        "RETURNING id"
+                    ),
+                    {"ext": external_account_id, "now": now},
+                )
+            ).fetchone()
+            if result is not None:
+                return UUID(str(result.id)), True
+
+        # Idempotent path — row already exists; look it up.
+        existing = (
+            await session.execute(
+                text(
+                    "SELECT id FROM accounts "
+                    "WHERE external_account_id = :ext AND active_to IS NULL "
+                    "LIMIT 1"
+                ),
+                {"ext": external_account_id},
+            )
+        ).fetchone()
+    if existing is None:
+        # Shouldn't reach here — ON CONFLICT matched + RETURNING was empty,
+        # so a row must exist. Defensive fail-loudly.
+        raise RuntimeError(
+            f"ON CONFLICT path took but no existing accounts row for "
+            f"external_account_id={external_account_id!r}"
+        )
+    return UUID(str(existing.id)), False
+
+
+async def _insert_risk_state_idempotent(
+    session_factory: async_sessionmaker[Any], *, account_id: UUID
+) -> bool:
+    """INSERT the risk_state bootstrap row. Returns ``created`` flag.
+
+    The risk_state_current partial unique index (``account_id, is_current``
+    WHERE ``is_current = TRUE``) gives us the idempotency primitive.
+    """
+    now = datetime.now(tz=UTC)
+    async with session_factory() as session:
+        async with session.begin():
+            result = (
+                await session.execute(
+                    text(
+                        "INSERT INTO risk_state ("
+                        "    account_id, state, severity, reason, "
+                        "    entered_at_utc, convalescent_session_count, "
+                        "    vacation_active, audit_event_uuid, is_current"
+                        ") VALUES ("
+                        "    :acc, 'NORMAL', NULL, 'live_cutover', "
+                        "    :now, 0, FALSE, :audit_uuid, TRUE"
+                        ") "
+                        # Column-based inference of the partial unique index
+                        # `risk_state_current` (account_id, is_current) WHERE
+                        # is_current = TRUE. CREATE UNIQUE INDEX makes an
+                        # index, not a constraint — ON CONSTRAINT syntax
+                        # won't match. The trailing WHERE clause picks the
+                        # partial index unambiguously.
+                        "ON CONFLICT (account_id, is_current) "
+                        "WHERE is_current = TRUE "
+                        "DO NOTHING "
+                        "RETURNING id"
+                    ),
+                    {"acc": account_id, "now": now, "audit_uuid": uuid4()},
+                )
+            ).fetchone()
+    return result is not None
+
+
+async def _insert_parameter_set_idempotent(
+    session_factory: async_sessionmaker[Any], *, payload: ParameterSetPayload
+) -> bool:
+    """INSERT the parameter_sets row. Returns ``created`` flag.
+
+    parameter_sets is content-addressable (PK = hash); ON CONFLICT DO
+    NOTHING is the idempotency primitive.
+    """
+    now = datetime.now(tz=UTC)
+    async with session_factory() as session:
+        async with session.begin():
+            result = (
+                await session.execute(
+                    text(
+                        "INSERT INTO parameter_sets ("
+                        "    parameter_set_hash, parameters, first_active_at"
+                        ") VALUES ("
+                        "    :psh, CAST(:params AS JSONB), :now"
+                        ") "
+                        "ON CONFLICT (parameter_set_hash) DO NOTHING "
+                        "RETURNING parameter_set_hash"
+                    ),
+                    {
+                        "psh": payload.parameter_set_hash,
+                        "params": json.dumps(payload.parameters),
+                        "now": now,
+                    },
+                )
+            ).fetchone()
+    return result is not None
+
+
+async def _amain(args: ParsedArgs) -> int:
+    log_bound = log.bind(
+        external_account_id=args.external_account_id,
+        env=args.env,
+        dry_run=args.dry_run,
+        param_set_json=str(args.parameter_set_json) if args.parameter_set_json else None,
+    )
+    log_bound.info("bootstrap_live_account_started")
+
+    payload: ParameterSetPayload | None = None
+    if args.parameter_set_json is not None:
+        try:
+            payload = load_parameter_set_json(args.parameter_set_json)
+        except ValueError as exc:
+            log_bound.error("bootstrap_live_account_bad_param_set_json", error=str(exc))
+            return EXIT_BAD_PARAM_SET_JSON
+
+    if args.dry_run:
+        log_bound.info(
+            "bootstrap_live_account_dry_run_complete",
+            would_insert_account=True,
+            would_insert_risk_state=True,
+            would_insert_parameter_set=payload is not None,
+            note="no DB writes; re-run with --no-dry-run --confirm to apply.",
+        )
+        return EXIT_OK
+
+    database_url = os.environ.get(DATABASE_URL_ENV)
+    if database_url is None or not database_url.strip():
+        log_bound.error(
+            "bootstrap_live_account_db_url_missing",
+            note=f"set {DATABASE_URL_ENV} env var before invocation",
+        )
+        return EXIT_DB_INIT_FAILED
+
+    engine = None
+    try:
+        engine = create_async_engine(database_url, future=True)
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    except Exception as exc:
+        log_bound.error("bootstrap_live_account_db_init_failed", error=str(exc))
+        return EXIT_DB_INIT_FAILED
+
+    try:
+        account_id, account_created = await _insert_account_idempotent(
+            session_factory, external_account_id=args.external_account_id
+        )
+        log_bound = log_bound.bind(account_id=str(account_id))
+        log_bound.info(
+            "bootstrap_live_account_accounts_row",
+            created=account_created,
+            note=("inserted new row" if account_created else "idempotent no-op"),
+        )
+
+        risk_state_created = await _insert_risk_state_idempotent(
+            session_factory, account_id=account_id
+        )
+        log_bound.info(
+            "bootstrap_live_account_risk_state_row",
+            created=risk_state_created,
+            note=("inserted NORMAL row" if risk_state_created else "idempotent no-op"),
+        )
+
+        if payload is not None:
+            param_created = await _insert_parameter_set_idempotent(session_factory, payload=payload)
+            log_bound.info(
+                "bootstrap_live_account_parameter_set_row",
+                parameter_set_hash=payload.parameter_set_hash,
+                created=param_created,
+                note=("inserted new row" if param_created else "idempotent no-op"),
+            )
+
+        log_bound.info("bootstrap_live_account_completed")
+        return EXIT_OK
+    finally:
+        if engine is not None:
+            try:
+                await engine.dispose()
+            except Exception as exc:
+                log_bound.warning("bootstrap_live_account_db_dispose_error", error=str(exc))
+
+
+def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    try:
+        args = parse_args(argv)
+    except (ValueError, SystemExit) as exc:
+        if isinstance(exc, SystemExit):
+            return exc.code if isinstance(exc.code, int) else EXIT_BAD_ARGS
+        log.error("bootstrap_live_account_bad_args", error=str(exc))
+        return EXIT_BAD_ARGS
+    try:
+        return asyncio.run(_amain(args))
+    except Exception as exc:  # pragma: no cover - terminal safety net
+        log.error(
+            "bootstrap_live_account_unexpected",
+            error=str(exc),
+            traceback=traceback.format_exc(),
+        )
+        return EXIT_UNEXPECTED
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+__all__ = [
+    "DATABASE_URL_ENV",
+    "DEFAULT_LIVE_EXTERNAL_ACCOUNT_ID",
+    "EXIT_BAD_ARGS",
+    "EXIT_BAD_PARAM_SET_JSON",
+    "EXIT_DB_INIT_FAILED",
+    "EXIT_OK",
+    "EXIT_UNEXPECTED",
+    "ParameterSetPayload",
+    "ParsedArgs",
+    "load_parameter_set_json",
+    "main",
+    "parse_args",
+]

@@ -1,52 +1,64 @@
-# live.template.yaml — Hetzner Ashburn live environment (Phase 1+).
+# live.template.yaml — Hetzner Ashburn live environment.
 #
-# Copy to `secrets/live.enc.yaml` and encrypt with sops on Day 8 (per
-# secrets/README.md — `live.enc.yaml` is created Day 8; live values added
-# at Week 8 IBKR cutover).
+# Copy to `secrets/live.enc.yaml` and encrypt with sops at cutover (per
+# Docs/live-money-cutover-plan.md §10 step 7). `live.enc.yaml` is populated
+# pre-cutover during the readiness window.
 #
-# `live` matches `paper` schema-wise. The ONLY differences are:
-#   - account_number (live vs paper)
-#   - flex_query_token (different IBKR token for live data)
-#   - quantconnect user_id (live trading node — may be same QC User ID as paper)
-#   - rp_id/origin (apex spratcapital.com vs paper.spratcapital.com)
-#   - bearer tokens (independently generated; do not share with paper)
+# `live` matches `paper` schema-wise — see deploy/sops/secret_schemas/
+# paper.template.yaml for the canonical reference. Per cutover plan §9
+# (Live-vs-Paper Config Matrix), live differs only on:
+#   - ibkr.live_account + ibkr.live_username + ibkr.live_password (vs paper)
+#   - ibkr.flex_query_id + ibkr.flex_query_token (separate live FlexQuery
+#     template the operator creates pre-cutover in the IBKR portal)
+#   - rp_id / origin (live.spratcapital.com per O1; paper stays at apex)
+#   - bearer tokens (independently generated; do not share with paper):
+#       internal.watchdog_bearer_token, internal.ipc_bearer_token,
+#       discord.api_bearer_token, lean.api_bearer_token,
+#       totp.encryption_key
+#   - postgres.app_service_password + postgres.app_owner_password (fresh)
 #
-# All other values (Discord channels, Resend, S3, GitHub App) ARE shared
-# with paper — same Discord server, same Resend account, same S3 bucket,
-# same GitHub App. Only the broker-facing and auth-facing surfaces fork.
+# All other values (Discord channels, Resend account, S3 bucket, GitHub
+# App, Anthropic workspace) ARE SHARED with paper per cutover plan L11 +
+# §8 audit. Only the broker-facing + auth-facing + intra-stack-bearer
+# surfaces fork.
+#
+# 2026-05-27 hygiene per cutover plan §8.3 + Appendix A row A12:
+# REMOVED vendor-cancelled keys (databento, tiingo, quantconnect) +
+# ADDED post-Day-21/23 keys (discord.api_bearer_token, totp.encryption_key,
+# resend.to_address).
 
 postgres:
-  # Generated Week 8 via `openssl rand -hex 32` on the live VPS.
-  # MUST be different from paper passwords; live VPS isolation is critical.
-  app_service_password: <TODO_FROM_WEEK_8_POSTGRES_BOOTSTRAP>
-  app_owner_password: <TODO_FROM_WEEK_8_POSTGRES_BOOTSTRAP>
+  # Generated pre-cutover via `openssl rand -hex 32` on the live VPS.
+  # MUST be different from paper passwords — live postgres is a separate
+  # container (own data volume); password isolation is critical.
+  app_service_password: <TODO_FROM_LIVE_CUTOVER_POSTGRES_BOOTSTRAP>
+  app_owner_password: <TODO_FROM_LIVE_CUTOVER_POSTGRES_BOOTSTRAP>
 
 ibkr:
-  account_number: <TODO_FROM_WEEK_8_IBKR_LIVE_ACCOUNT>
-  flex_query_token: <TODO_FROM_WEEK_8_IBKR_FLEX_LIVE>
-
-quantconnect:
-  # Live algorithm runs on QC's live trading node (Researcher tier; one node
-  # included). Token MAY be shared with paper if same QC organization holds
-  # both backtest and live algos; spec is silent. Default: same token, single org.
-  api_token: <TODO_FROM_DAY_3_QC_TOKEN_REGEN>
-  # Numeric QC User ID (avatar -> My Account on quantconnect.com).
-  # NOT the organization slug — QC's REST API rejects the slug with
-  # "UserID not valid" (DP-023 from PR-A carryover).
-  user_id: <TODO_FROM_DAY_3_QC_USER_ID>
+  # Operator's live IBKR account (per cutover plan §10 step 1).
+  live_account: <TODO_FROM_LIVE_CUTOVER_IBKR_ACCOUNT>
+  live_username: <TODO_FROM_LIVE_CUTOVER_IBKR_LOGIN>
+  live_password: <TODO_FROM_LIVE_CUTOVER_IBKR_LOGIN>
+  # Operator creates a SEPARATE FlexQuery template for live in the IBKR
+  # portal pre-cutover (cutover plan §10 step 3 + Open decision O3).
+  flex_query_id: <TODO_FROM_LIVE_CUTOVER_FLEX_TEMPLATE>
+  flex_query_token: <TODO_FROM_LIVE_CUTOVER_FLEX_TEMPLATE>
 
 anthropic:
-  # Same Anthropic workspace as paper; agent operates against both envs.
-  api_key: <TODO_FROM_WEEK_5_AGENT_BRINGUP>
-  workspace_id: <TODO_FROM_WEEK_5_AGENT_BRINGUP>
+  # SHARED with paper — same Anthropic workspace; the agent operates against
+  # both envs from the same workspace_id (env tag distinguishes downstream).
+  api_key: <TODO_FROM_DAY_5_AGENT_BRINGUP>
+  workspace_id: <TODO_FROM_DAY_5_AGENT_BRINGUP>
 
 discord:
-  # Same Discord server as paper. The bot posts to the same channels in both
-  # envs but tags the embed with env=paper or env=live so the operator can
-  # tell at a glance (frontend-spec §1.5: cross-environment segregation).
+  # SHARED with paper per cutover plan L11 (Discord channels shared across
+  # envs; embed `env=` tag distinguishes paper vs live).
   bot_token: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
   guild_id: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
-  api_bearer_token: <TODO_FROM_DAY_23_DISCORD_BOT_BRINGUP>  # Day 23
+  # DISTINCT from paper's api_bearer_token. 32-byte URL-safe base64.
+  # Live bot ↔ live api auth; same shared-bearer auth pattern as paper.
+  # See deploy/discord_bot/README.md.
+  api_bearer_token: <TODO_FROM_LIVE_CUTOVER_BEARER_GENERATE>
   webhook_urls:
     daily_brief: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
     signals: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
@@ -57,37 +69,60 @@ discord:
     audit: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
 
 lean:
-  # Pivot-PR-A (post-pivot 2026-05-12) — see deploy/lean_local/README.md.
-  # Distinct from discord.api_bearer_token. 32-byte URL-safe base64.
-  api_bearer_token: <TODO_FROM_PIVOT_PR_A_BRINGUP>
+  # DISTINCT from paper. 32-byte URL-safe base64. Live LEAN ↔ live api
+  # POST /api/internal/lean/signals auth per backend-spec §6 +
+  # deploy/lean_local/README.md.
+  api_bearer_token: <TODO_FROM_LIVE_CUTOVER_BEARER_GENERATE>
 
 forex_factory:
   api_token: null
 trading_economics:
-  api_token: <TODO_FROM_WEEK_2_CALENDAR_IMPORT>
+  # SHARED with paper.
+  api_token: <TODO_FROM_DAY_3_CALENDAR_IMPORT>
 fred:
   api_key: null
 
 s3:
+  # SHARED with paper. Backup bucket holds audit chain exports for both envs
+  # under env-prefixed key prefixes (e.g., live-small/audit/...).
   access_key_id: <TODO_FROM_DAY_5_S3_PROVISION>
   secret_access_key: <TODO_FROM_DAY_5_S3_PROVISION>
   bucket: <TODO_FROM_DAY_5_S3_PROVISION>
 
 github:
+  # SHARED with paper. GitHub App used for CI + deploy hooks; same App
+  # serves both env's deploy automation.
   app_id: <TODO_FROM_DAY_2_GITHUB_APP_RUNBOOK>
   installation_id: <TODO_FROM_DAY_2_GITHUB_APP_RUNBOOK>
   app_private_key: <TODO_FROM_DAY_2_GITHUB_APP_RUNBOOK>
 
 internal:
-  # MUST be regenerated independently from paper. Watchdog calls live VPS at
-  # the live `<your-domain>` apex with this bearer.
-  watchdog_bearer_token: <TODO_FROM_WEEK_8_BEARER_GENERATE>
-  ipc_bearer_token: <TODO_FROM_WEEK_8_BEARER_GENERATE>
+  # DISTINCT from paper. Each bearer is independently generated via
+  # `python3 -c "import secrets; print(secrets.token_urlsafe(32))"`.
+  # Watchdog calls live's <DOMAIN> apex with this bearer; mismatch = 401.
+  watchdog_bearer_token: <TODO_FROM_LIVE_CUTOVER_BEARER_GENERATE>
+  ipc_bearer_token: <TODO_FROM_LIVE_CUTOVER_BEARER_GENERATE>
 
 webauthn:
-  rp_id: spratcapital.com                   # apex (NOT paper subdomain)
-  origin: https://spratcapital.com
+  # Per O1 (cutover plan §10 step 6) — live takes `live.spratcapital.com`;
+  # paper stays at the apex. rp_id MUST match the apex domain the operator
+  # authenticates against; cross-domain credentials don't work.
+  rp_id: live.spratcapital.com
+  origin: https://live.spratcapital.com
 
 resend:
+  # SHARED with paper — same Resend account.
   api_key: <TODO_FROM_DAY_3_RESEND_PROVISION>
   from_address: shaanrpatel2@gmail.com
+  # The to_address field landed post-Day-21 (operator's verified Resend
+  # recipient address). Mirrors paper.
+  to_address: shaanrpatel2@gmail.com
+
+totp:
+  # DISTINCT from paper. AES-256-GCM key for column-level TOTP-secret
+  # encryption (backend-spec §8.5.2). Generate via:
+  #   python3 -c "import secrets, base64; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b'=').decode())"
+  # MUST be a fresh 32-byte key for live; reusing paper's key would let a
+  # paper-DB-compromise decrypt live TOTP secrets. See services/api/auth/
+  # totp.py for the encryption wrapper.
+  encryption_key: <TODO_FROM_LIVE_CUTOVER_TOTP_KEY_GENERATE>
