@@ -55,6 +55,33 @@ Hard constraints
   ``Docs/claude-dev-guide.md`` §1.5). The worker's clientId=1 + bar
   sync's clientId=3 must not collide with this.
 
+.. warning::
+   **Cross-clientId cancellation limitation (2026-05-27).** Bracket
+   stops placed by this tool will NOT be cancellable by the
+   order-placement worker (clientId=1/2) until IBKR Gateway's
+   "Master Client ID" is configured to the worker's clientId.
+   Without that config, the worker's :func:`cancel_order` finds the
+   trade in its local cache (via ``reqAllOpenOrders`` snapshot) and
+   calls ``ib.cancelOrder()`` which returns SUCCESS synchronously,
+   but IBKR rejects asynchronously with ``Error 10147 "OrderId not
+   found"`` — the cancel never lands at the broker. Downstream blast
+   radius in the exit-pipeline: the worker thinks the protective
+   stop was cancelled, places the closing order, the close fills,
+   AND the operator-tool stop remains armed at IBKR — recipe for an
+   unintended double-fire or phantom-position scenario.
+
+   **Operator workaround until mitigation lands:** If an exit signal
+   fires for a position whose protective stop was placed by this
+   tool, manually cancel the operator-tool stop via TWS BEFORE the
+   worker's exit cycle runs. The exit pipeline's halted-at-cancel
+   step then runs cleanly because the stop is already gone at IBKR.
+
+   See ``Docs/decisions-log.md`` 2026-05-27 entry "Cross-clientId
+   IBKR cancellation: structural limitation, mitigation = Master
+   Client ID" for the full investigation + the live-cutover
+   mitigation candidates (A: Master Client ID; B: post-cancel
+   verification in :func:`services.execution.ibkr_adapter.cancel_order`).
+
 Stop-price derivation
 =====================
 
