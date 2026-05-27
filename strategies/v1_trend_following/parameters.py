@@ -2,18 +2,20 @@
 
 Locked vs agent-mutable per `Docs/backend-spec.md §12.3` (`tighten_parameter` enum):
 
-| Parameter                      | Class           | Tighten direction |
-| ------------------------------ | --------------- | ----------------- |
-| `LOOKBACK_DAYS_DONCHIAN`       | agent-mutable   | up   (longer lookback = fewer signals = tighter) |
-| `MA_FAST_DAYS`                 | agent-mutable   | up   (slower = fewer crossovers) |
-| `MA_SLOW_DAYS`                 | agent-mutable   | up   (slower = stricter trend filter) |
-| `HURST_THRESHOLD`              | agent-mutable   | up   (more selective on persistence) |
-| `STOP_DISTANCE_ATR_MULT`       | agent-mutable   | down (tighter stop) |
-| `VOL_TARGET_PCT_ANNUAL`        | agent-mutable   | down (lower target = smaller positions) |
-| `ROLL_DAYS_BEFORE_EXPIRY`      | agent-mutable   | up   (roll earlier = more conservative) |
-| `INSTRUMENT_VOL_LOOKBACK_DAYS` | agent-mutable   | n/a  (no tighten direction) |
-| `MIN_HOLDING_DAYS`             | **LOCKED**      | PR-only           |
-| `ATR_LOOKBACK_DAYS`            | **LOCKED**      | PR-only           |
+| Parameter                      | Class                | Tighten direction |
+| ------------------------------ | -------------------- | ----------------- |
+| `LOOKBACK_DAYS_DONCHIAN`       | agent-mutable        | up   (longer lookback = fewer signals = tighter) |
+| `MA_FAST_DAYS`                 | agent-mutable        | up   (slower = fewer crossovers) |
+| `MA_SLOW_DAYS`                 | agent-mutable        | up   (slower = stricter trend filter) |
+| `HURST_THRESHOLD`              | agent-mutable        | up   (more selective on persistence) |
+| `STOP_DISTANCE_ATR_MULT`       | agent-mutable        | down (tighter stop) |
+| `VOL_TARGET_PCT_ANNUAL`        | agent-mutable        | down (lower target = smaller positions) |
+| `ROLL_DAYS_BEFORE_EXPIRY`      | agent-mutable        | up   (roll earlier = more conservative) |
+| `INSTRUMENT_VOL_LOOKBACK_DAYS` | agent-mutable        | n/a  (no tighten direction) |
+| `MIN_HOLDING_DAYS`             | **LOCKED**           | PR-only           |
+| `ATR_LOOKBACK_DAYS`            | **LOCKED**           | PR-only           |
+| `STRATEGY_DECOMMISSIONED`      | **OPERATOR-ONLY**    | n/a — boolean kill-switch; flipping True drives the exit pipeline to CLOSE every held position regardless of indicator state (see exit-pipeline-design.md §L6, §11 R6). Agent cannot set; PR required to change the default. |
+| `EXIT_AUTO_APPROVE`            | half-agent-mutable   | False is safer than True. Agent may flip True→False (tighten risk control); only operator may flip False→True. Default False at launch; enable post-cutover after 10+ clean operator-approved exits (see design §L4, §6.2). |
 
 `V1_DEFAULTS` below is the source-of-truth for skeleton tests and the initial
 parameter set persisted to the `parameter_sets` table on first deploy. In
@@ -31,7 +33,7 @@ from typing import Final
 # the param-name strings persisted to `parameter_sets.parameters` JSONB. These
 # string keys are CANONICAL — do not rename without a migration of every existing
 # parameter_sets row + an audit `parameter_change_applied` event for each.
-V1_DEFAULTS: Final[dict[str, int | str]] = {
+V1_DEFAULTS: Final[dict[str, int | str | bool]] = {
     # Entry signal.
     "LOOKBACK_DAYS_DONCHIAN": 60,
     "MA_FAST_DAYS": 50,
@@ -53,6 +55,11 @@ V1_DEFAULTS: Final[dict[str, int | str]] = {
     "INSTRUMENT_VOL_LOOKBACK_DAYS": 60,
     # Contract roll (consumed by services/scheduler/calendar.py).
     "ROLL_DAYS_BEFORE_EXPIRY": 5,
+    # Exit-pipeline parameters (added PR-A of exit-pipeline-design.md).
+    # Both default to the SAFE value at launch and are widened over the cutover
+    # horizon per the design's operator decisions L4 + L6.
+    "STRATEGY_DECOMMISSIONED": False,
+    "EXIT_AUTO_APPROVE": False,
 }
 
 # Phase 1 candidate sub-universe — LOCKED on 2026-05-05 per Docs/decisions-log.md.
@@ -165,6 +172,20 @@ class V1Parameters:
     # --- Contract roll ------------------------------------------------------
     roll_days_before_expiry: int
 
+    # --- Exit pipeline (PR-A of exit-pipeline-design.md) -------------------
+    # ``strategy_decommissioned``: operator-only kill switch. When True, the
+    # entry pipeline short-circuits with the STRATEGY_DECOMMISSIONED rejection
+    # reason for every market, and the exit pipeline emits an
+    # ``exit_reason='decommission'`` CLOSE candidate for every held position
+    # regardless of indicator state (see design §L6 + §7 interaction table).
+    # ``exit_auto_approve``: when True, exit signals bypass the operator queue
+    # and auto-approve at signal_ingestion time. Default False at launch;
+    # enable post-cutover after 10+ clean operator-approved exits (see design
+    # §L4 + §6.2). Server-side automation lives in PR-D; this flag is the
+    # operator-visible toggle.
+    strategy_decommissioned: bool = False
+    exit_auto_approve: bool = False
+
     def __post_init__(self) -> None:
         # Range validation. The agent's `tighten_parameter` tool also enforces
         # these at the API surface; duplicating the floor here catches direct
@@ -218,6 +239,8 @@ class V1Parameters:
             "vol_target_pct_annual": "VOL_TARGET_PCT_ANNUAL",
             "instrument_vol_lookback_days": "INSTRUMENT_VOL_LOOKBACK_DAYS",
             "roll_days_before_expiry": "ROLL_DAYS_BEFORE_EXPIRY",
+            "strategy_decommissioned": "STRATEGY_DECOMMISSIONED",
+            "exit_auto_approve": "EXIT_AUTO_APPROVE",
         }
         return {canonical_keys[k]: str(v) for k, v in snake.items()}
 
@@ -236,4 +259,6 @@ def default_v1_parameters() -> V1Parameters:
         vol_target_pct_annual=Decimal(str(raw["VOL_TARGET_PCT_ANNUAL"])),
         instrument_vol_lookback_days=int(raw["INSTRUMENT_VOL_LOOKBACK_DAYS"]),
         roll_days_before_expiry=int(raw["ROLL_DAYS_BEFORE_EXPIRY"]),
+        strategy_decommissioned=bool(raw["STRATEGY_DECOMMISSIONED"]),
+        exit_auto_approve=bool(raw["EXIT_AUTO_APPROVE"]),
     )

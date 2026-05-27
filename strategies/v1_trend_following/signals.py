@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import Final
+from typing import Final, Literal
 
 
 class Direction(StrEnum):
@@ -45,6 +45,25 @@ class RejectionReason(StrEnum):
     # scaling. See ``strategy.py::_evaluate_market`` step 5.
     POSITION_ALREADY_SAME_DIRECTION = "position_already_same_direction"
     DATA_QUALITY_QUARANTINE = "data_quality_quarantine"
+
+    # ------------------------------------------------------------------
+    # Exit-pipeline rejection reasons (see exit-pipeline-design.md §5.1).
+    # ------------------------------------------------------------------
+    # Held position where ``close`` is still on the same side of ``MA_FAST``
+    # as the position direction: long with close > ma_fast, or short with
+    # close < ma_fast. The trend has not flipped, so no trend_flip exit.
+    TREND_HOLDS = "trend_holds"
+    # Held position where the trend HAS flipped (close < MA_FAST for LONG
+    # or close > MA_FAST for SHORT) but held duration < MIN_HOLDING_DAYS.
+    # Exit is deferred until the floor is met to avoid whipsaw exits.
+    MIN_HOLDING_NOT_REACHED = "min_holding_not_reached"
+    # Entry-side short-circuit when ``V1Parameters.strategy_decommissioned``
+    # is True. Under decommission the entry pipeline emits no candidates;
+    # the exit pipeline emits a CLOSE for every held position regardless
+    # of indicator state (exit_reason='decommission'). Recording this on
+    # the entry side prevents the "candidate emitted that can never fill"
+    # anti-pattern (see design doc §7).
+    STRATEGY_DECOMMISSIONED = "strategy_decommissioned"
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,22 +134,58 @@ class CandidateSignal:
        canonical payload shape (see `audit_events.SignalEmittedPayload`)
 
     The strategy contributes:
-    - `signal_type` — discriminator persisted to `signals.signal_type`
+    - `signal_type` — discriminator persisted to `signals.signal_type`. Widened
+      from a free string to a 2-value Literal in 2026-05-26 PR-A of the exit
+      pipeline (see exit-pipeline-design.md §5.2). Exits use ``"exit"``;
+      entries keep ``"donchian_breakout"``. No DB migration required — the
+      ``signals.signal_type`` column is free TEXT.
     - `decision_price` — close used for the breakout check (basis for slippage
-      calibration a/β regression in `services/calibration/ols.py`)
-    - `stop_price` — ATR-based stop (used by execution to place stop-market)
+      calibration a/β regression in `services/calibration/ols.py`). For an
+      exit candidate it is the close that triggered the exit decision
+      (last bar's close, or the position's avg_cost as a fallback when the
+      market has dropped out of the active universe entirely).
+    - `stop_price` — ATR-based stop (used by execution to place stop-market).
+      ``Decimal("0")`` for exit candidates: the dispatcher does NOT place a
+      new bracket stop on an explicit close because the position is going
+      to zero.
     - `indicators_snapshot` — the per-market indicator values that justified
       the signal, for inclusion in `sizing_trace.strategy_inputs` (and operator
-      review in the in-app PR review surface)
+      review in the in-app PR review surface). For decommission exits this is
+      an empty dict (no indicator state participated in the decision).
+
+    Exit-only fields (all default ``None`` for entries):
+
+    - `exit_reason` — which of (b) reversal, (c) trend_flip, (d) decommission
+      tripped. None for entries. The dispatcher reads this for the audit
+      payload.
+    - `prior_position_direction`, `prior_position_quantity` — snapshot of
+      ``Position`` state at signal-emit time. The dispatcher computes the
+      ACTUAL close side and qty from a FRESH ``positions_current`` read at
+      place-order time (see design doc §Q3 / dispatcher-side sizing); these
+      fields are recorded for audit-trail comparison only.
+    - `paired_entry_market` — populated only when ``exit_reason='reversal'``.
+      Points at the entry-side market whose opposite-direction breakout
+      triggered the reversal. The dispatcher uses this to serialize the
+      paired EXIT-then-ENTRY sequence (see §Q1 + §11 R2). For an entry
+      signal generated as the other half of a reversal it remains None;
+      the linkage flows from exit → entry via the dispatcher's lookup, not
+      the other direction.
     """
 
     market: str
     direction: Direction
-    signal_type: str  # 'donchian_breakout' for V1; future strategies add their own
+    signal_type: Literal["donchian_breakout", "exit"]
     session_date: date
     decision_price: Decimal
     stop_price: Decimal
     indicators_snapshot: dict[str, Decimal | int]
+    # Exit-only fields. All default None so existing entry-side construction
+    # keeps working positionally and by kwarg. Field ordering is constrained
+    # by Python dataclasses: fields with defaults must follow fields without.
+    exit_reason: Literal["reversal", "trend_flip", "decommission"] | None = None
+    prior_position_direction: Direction | None = None
+    prior_position_quantity: int | None = None
+    paired_entry_market: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,6 +203,24 @@ class SignalGenerationResult:
     rejections: tuple[tuple[str, RejectionReason], ...]
     as_of_emitted_at_utc: datetime
     strategy_hash_short: str = field(default="")  # populated by signal service post-call
+
+
+@dataclass(frozen=True, slots=True)
+class ExitGenerationResult:
+    """Aggregate output of `V1TrendFollowing.generate_exit_candidates()`.
+
+    Mirrors `SignalGenerationResult` so the LEAN wrapper + trigger_v1_cycle
+    consume entries and exits with the same fan-out shape. ``signals`` are
+    CandidateSignals with ``signal_type='exit'`` and a populated ``exit_reason``;
+    ``rejections`` capture the per-market reasons no exit fired (e.g.
+    TREND_HOLDS, MIN_HOLDING_NOT_REACHED, INSUFFICIENT_BAR_HISTORY).
+
+    See exit-pipeline-design.md §5.3.
+    """
+
+    signals: tuple[CandidateSignal, ...]
+    rejections: tuple[tuple[str, RejectionReason], ...]
+    as_of_emitted_at_utc: datetime
 
 
 # Strategy-emitted audit event types (subset of canonical AuditEventType enum
