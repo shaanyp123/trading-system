@@ -1694,9 +1694,12 @@ class TestTodayDigestPnlAggregates:
 
 
 class TestTodayDigestExposureBreakdown:
-    """Post-2026-05-27 (Task 1): exposure section computes per-cluster
-    notional + gross/net NAV percentages from positions_current rather
-    than returning all zeros. Wired via ``services.api.exposure``."""
+    """Post-2026-05-27: exposure section computes per-cluster
+    percent-of-NAV + gross/net NAV percentages from positions_current
+    rather than returning all zeros. All three fields share the same
+    percent-units (0-100) scale so the frontend's ExposureBar math
+    (current / limit * 100, with limits like 60 for equity-index)
+    renders correctly. Wired via ``services.api.exposure``."""
 
     @pytest.mark.asyncio
     async def test_no_account_returns_all_zero_exposure(
@@ -1778,24 +1781,29 @@ class TestTodayDigestExposureBreakdown:
         assert response.status_code == 200
         body = response.json()
         by_cluster = body["exposure"]["by_cluster"]
-        assert Decimal(by_cluster["equity_index"]) == Decimal("14625.00")
-        assert Decimal(by_cluster["commodity"]) == Decimal("24000.00")
-        assert Decimal(by_cluster["rates_bonds"]) == Decimal("8372.00")
+        # /M2K: 14625 / 100000 * 100 = 14.625 → 14.62 (ROUND_HALF_EVEN on .X25)
+        assert Decimal(by_cluster["equity_index"]) == Decimal("14.62")
+        # /MGC abs: 24000 / 100000 * 100 = 24.00
+        assert Decimal(by_cluster["commodity"]) == Decimal("24.00")
+        # TLT: 8372 / 100000 * 100 = 8.372 → 8.37
+        assert Decimal(by_cluster["rates_bonds"]) == Decimal("8.37")
         assert Decimal(by_cluster["crypto"]) == Decimal("0")
         assert Decimal(by_cluster["fx"]) == Decimal("0")
-        # Gross = sum of absolute notionals / NAV = 46997 / 100000 = 0.4700 (quantized)
-        assert Decimal(body["exposure"]["gross_exposure_pct_nav"]) == Decimal("0.4700")
-        # Net = signed sum / NAV = (14625 - 24000 + 8372) / 100000 = -1003/100000 ≈ -0.0100
-        assert Decimal(body["exposure"]["net_exposure_pct_nav"]) == Decimal("-0.0100")
+        # Gross = sum of absolute notionals / NAV * 100 = 46997 / 100000 * 100 = 46.997 → 47.00
+        assert Decimal(body["exposure"]["gross_exposure_pct_nav"]) == Decimal("47.00")
+        # Net = signed sum / NAV * 100 = (14625 - 24000 + 8372) / 100000 * 100 = -1.003 → -1.00
+        assert Decimal(body["exposure"]["net_exposure_pct_nav"]) == Decimal("-1.00")
 
     @pytest.mark.asyncio
-    async def test_zero_nav_returns_zero_pct_with_cluster_amounts_intact(
+    async def test_zero_nav_returns_all_zero_exposure(
         self,
         api_client: AsyncClient,
         override_dep: Any,
     ) -> None:
-        """NAV=0 (or NAV unavailable) → pct fields zero but cluster
-        breakdown still reflects underlying notionals."""
+        """NAV=0 (or NAV unavailable) → ALL three fields zero. Because
+        by_cluster is now a fraction of NAV (percent units), the
+        cluster breakdown is undefined when NAV is unavailable; we
+        zero it for the same reason gross/net are zeroed."""
         account_id = uuid4()
         positions_rows = [
             {
@@ -1819,7 +1827,7 @@ class TestTodayDigestExposureBreakdown:
         response = await api_client.get("/api/today/digest")
         assert response.status_code == 200
         body = response.json()
-        assert Decimal(body["exposure"]["by_cluster"]["equity_index"]) == Decimal("14625")
+        assert Decimal(body["exposure"]["by_cluster"]["equity_index"]) == Decimal("0")
         assert Decimal(body["exposure"]["gross_exposure_pct_nav"]) == Decimal("0")
         assert Decimal(body["exposure"]["net_exposure_pct_nav"]) == Decimal("0")
 
