@@ -171,7 +171,9 @@ class TestPositionsEmbed:
     def test_empty_state_footer_includes_environment(self) -> None:
         embed = build_positions_embed(_empty_positions(self.AS_OF), environment="paper")
         assert embed.footer.text is not None
-        assert "paper" in embed.footer.text
+        # N2 — env=PAPER tag per cutover plan §9 line 360 for cross-env
+        # disambiguation (Discord channels shared paper+live per L11).
+        assert "env=PAPER" in embed.footer.text
 
     def test_populated_state_title_count(self) -> None:
         embed = build_positions_embed(_populated_positions(self.AS_OF), environment="paper")
@@ -241,7 +243,7 @@ class TestHaltConfirmEmbed:
     def test_footer_includes_environment(self) -> None:
         embed = build_halt_confirm_embed(reason="x", environment="paper")
         assert embed.footer.text is not None
-        assert "paper" in embed.footer.text
+        assert "env=PAPER" in embed.footer.text
 
 
 # ---------------------------------------------------------------------------
@@ -506,7 +508,9 @@ class TestApproveConfirmEmbed:
         embed = build_approve_confirm_embed(
             signal_id=_VALID_UUID_FOR_EMBEDS, environment="live-small"
         )
-        assert "live-small" in (embed.footer.text or "")
+        # N2 — live-small (and live-scale) both map to env=LIVE per cutover
+        # plan §9 line 360. Binary visual cue for the operator.
+        assert "env=LIVE" in (embed.footer.text or "")
 
 
 class TestApproveSuccessEmbed:
@@ -577,3 +581,52 @@ class TestApproveErrorEmbed:
         assert "SERVICE_UNAVAILABLE" in (embed.title or "")
         assert "db down" in (embed.description or "")
         assert embed.color.value == EMBED_COLOR_CRITICAL  # type: ignore[union-attr]
+
+
+# ---------------------------------------------------------------------------
+# env_tag — N2 per cutover plan §9 line 360
+# ---------------------------------------------------------------------------
+
+
+class TestEnvTag:
+    """``env_tag()`` produces the cross-env disambiguator chip rendered in
+    every embed footer (cutover plan §9 line 360 + L11 — Discord channels
+    are shared between paper + live; the tag is the operator's primary
+    visual disambiguator)."""
+
+    def test_paper_maps_to_env_PAPER(self) -> None:
+        from services.discord_bot.embeds import env_tag
+
+        assert env_tag("paper") == "env=PAPER"
+
+    def test_live_small_maps_to_env_LIVE(self) -> None:
+        from services.discord_bot.embeds import env_tag
+
+        assert env_tag("live-small") == "env=LIVE"
+
+    def test_live_scale_maps_to_env_LIVE(self) -> None:
+        """Both live tiers (live-small Day-1 cutover + live-scale post-$100k)
+        map to the same `LIVE` visual cue — operator decision is binary at
+        the embed layer; granular tier info stays in api logs + audit chain."""
+        from services.discord_bot.embeds import env_tag
+
+        assert env_tag("live-scale") == "env=LIVE"
+
+    def test_dev_falls_through_to_uppercased(self) -> None:
+        """`dev` is not a production tier; uppercase fallback ensures the
+        operator never sees a paper/live mismatch but does see SOMETHING
+        meaningful when running against dev locally."""
+        from services.discord_bot.embeds import env_tag
+
+        assert env_tag("dev") == "env=DEV"
+
+    def test_empty_string_renders_empty_tag(self) -> None:
+        from services.discord_bot.embeds import env_tag
+
+        assert env_tag("") == "env="
+
+    def test_whitespace_normalized(self) -> None:
+        from services.discord_bot.embeds import env_tag
+
+        assert env_tag("  paper  ") == "env=PAPER"
+        assert env_tag("  live-small  ") == "env=LIVE"

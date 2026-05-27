@@ -108,6 +108,33 @@ def _env_pill(environment: str) -> str:
     return environment
 
 
+def env_tag(environment: str) -> str:
+    """Format the env identifier for the footer chip per cutover plan §9
+    line 360 (``env=PAPER`` / ``env=LIVE``).
+
+    Map:
+      * ``"paper"`` → ``"env=PAPER"``
+      * ``"live-small"`` → ``"env=LIVE"``
+      * ``"live-scale"`` → ``"env=LIVE"``
+      * other (e.g., ``"dev"``) → ``"env=<UPPERCASED>"``
+
+    Both live tiers (live-small for the Day-1 $25k cutover; live-scale
+    post-$100k tier graduation per cutover plan §2) map to ``LIVE`` so
+    the operator's at-a-glance visual cue is binary: PAPER vs LIVE.
+    The granular tier info stays in the api logs + audit chain.
+
+    Per cutover plan L11, Discord channels (signals, fills, alerts,
+    critical, ops, audit) are SHARED between paper + live; this tag is
+    the operator's primary disambiguator at the bot embed layer.
+    """
+    normalized = (environment or "").strip().lower()
+    if normalized in {"live-small", "live-scale"}:
+        return "env=LIVE"
+    if normalized == "paper":
+        return "env=PAPER"
+    return f"env={normalized.upper()}"
+
+
 def _format_signed_decimal(value: Decimal) -> str:
     """Render a Decimal with sign prefix (``+1.25`` / ``-3.40``).
 
@@ -154,7 +181,7 @@ def build_positions_embed(
         title=title,
         color=EMBED_COLOR_INFO,
     )
-    embed.set_footer(text=f"trading-system bot · {environment}")
+    embed.set_footer(text=f"trading-system bot · {env_tag(environment)}")
 
     if not response.positions:
         embed.description = (
@@ -227,7 +254,9 @@ def build_halt_confirm_embed(
         inline=False,
     )
     embed.add_field(name="Reason", value=f"```\n{reason}\n```", inline=False)
-    embed.set_footer(text=f"trading-system bot · {environment} · click ✓ to confirm or ✗ to cancel")
+    embed.set_footer(
+        text=f"trading-system bot · {env_tag(environment)} · click ✓ to confirm or ✗ to cancel"
+    )
     return embed
 
 
@@ -257,7 +286,7 @@ def build_halt_invoke_success_embed(
         ),
         inline=False,
     )
-    embed.set_footer(text=f"trading-system bot · {environment}")
+    embed.set_footer(text=f"trading-system bot · {env_tag(environment)}")
     return embed
 
 
@@ -293,7 +322,7 @@ def build_halt_invoke_error_embed(
             description=format_kill_switch_invoke_failure(error),
             color=EMBED_COLOR_CRITICAL,
         )
-    embed.set_footer(text=f"trading-system bot · {environment}")
+    embed.set_footer(text=f"trading-system bot · {env_tag(environment)}")
     return embed
 
 
@@ -334,7 +363,9 @@ def build_capital_event_confirm_embed(
     embed.add_field(name="Event type", value=f"`{event_type}`", inline=True)
     embed.add_field(name="Amount USD", value=f"`{amount_usd}`", inline=True)
     embed.add_field(name="Reason", value=f"```\n{truncated_reason}\n```", inline=False)
-    embed.set_footer(text=f"trading-system bot · {environment} · click ✓ to confirm or ✗ to cancel")
+    embed.set_footer(
+        text=f"trading-system bot · {env_tag(environment)} · click ✓ to confirm or ✗ to cancel"
+    )
     return embed
 
 
@@ -367,7 +398,7 @@ def build_capital_event_success_embed(
             value=f"`{mode_started_audit_event_uuid}`",
             inline=False,
         )
-    embed.set_footer(text=f"trading-system bot · {environment}")
+    embed.set_footer(text=f"trading-system bot · {env_tag(environment)}")
     return embed
 
 
@@ -383,7 +414,7 @@ def build_capital_event_error_embed(
         description=format_kill_switch_invoke_failure(error),
         color=EMBED_COLOR_CRITICAL,
     )
-    embed.set_footer(text=f"trading-system bot · {environment}")
+    embed.set_footer(text=f"trading-system bot · {env_tag(environment)}")
     return embed
 
 
@@ -454,7 +485,7 @@ def build_status_embed(
             detail_str = f" — {c.detail}" if c.detail else ""
             check_lines.append(f"{ok_glyph} `{c.name}`{latency_str}{detail_str}")
         embed.add_field(name="Checks", value="\n".join(check_lines), inline=False)
-    embed.set_footer(text=f"trading-system bot · {response.environment}")
+    embed.set_footer(text=f"trading-system bot · {env_tag(response.environment)}")
     return embed
 
 
@@ -520,7 +551,9 @@ def build_approve_confirm_embed(
         value=f"`{signal_id}`",
         inline=False,
     )
-    embed.set_footer(text=f"trading-system bot · {environment} · click ✓ to approve or ✗ to cancel")
+    embed.set_footer(
+        text=f"trading-system bot · {env_tag(environment)} · click ✓ to approve or ✗ to cancel"
+    )
     return embed
 
 
@@ -546,7 +579,7 @@ def build_approve_success_embed(
         ),
         color=EMBED_COLOR_OK,
     )
-    embed.set_footer(text=f"trading-system bot · {environment}")
+    embed.set_footer(text=f"trading-system bot · {env_tag(environment)}")
     return embed
 
 
@@ -598,7 +631,7 @@ def build_approve_error_embed(
             description=format_kill_switch_invoke_failure(error),
             color=EMBED_COLOR_CRITICAL,
         )
-    embed.set_footer(text=f"trading-system bot · {environment}")
+    embed.set_footer(text=f"trading-system bot · {env_tag(environment)}")
     return embed
 
 
