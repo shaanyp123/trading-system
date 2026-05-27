@@ -788,6 +788,14 @@ def build_v1_parameters_from_dict(raw: dict[str, object]) -> V1Parameters:
     # int / str depending on driver), but the canonical V1_DEFAULTS keys
     # are all int-or-Decimal-string-able. ``int(str(...))`` round-trips
     # both shapes cleanly while keeping mypy --strict happy.
+    # TODO PR-B: read STRATEGY_DECOMMISSIONED + EXIT_AUTO_APPROVE from raw
+    # so an operator UPDATE to parameter_sets.parameters propagates here.
+    # Until then both fall back to V1Parameters dataclass defaults (False/False)
+    # and the kill-switch ceremony documented in Docs/exit-pipeline-design.md §11 R6
+    # is silently inert via this entrypoint. Exit-emission wiring lands with PR-B
+    # so the half-fix (read the flag here only) would be even more confusing
+    # than the current "fully inert until PR-B" state — keeping the bug
+    # explicit instead.
     return V1Parameters(
         lookback_days_donchian=int(str(raw["LOOKBACK_DAYS_DONCHIAN"])),
         ma_fast_days=int(str(raw["MA_FAST_DAYS"])),
