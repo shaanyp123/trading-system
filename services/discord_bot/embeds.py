@@ -297,6 +297,96 @@ def build_halt_invoke_error_embed(
     return embed
 
 
+# ---------------------------------------------------------------------------
+# /capital-deposit + /capital-withdraw
+# ---------------------------------------------------------------------------
+
+
+_CAPITAL_EVENT_CONFIRM_BODY = (
+    "**Confirm capital event.** This will INSERT a `capital_events` row + "
+    "an audit-chain entry. When the event clears the 5%-of-equity threshold, "
+    "the 30-session capital_event mode activates "
+    "(m_capital_event=0.5 for sessions 1-5, then 1.0 for sessions 6-30).\n\n"
+    "Deposits also reset the trailing-drawdown baseline; withdrawals leave "
+    "the baseline unchanged."
+)
+
+
+def build_capital_event_confirm_embed(
+    *,
+    event_type: str,
+    amount_usd: str,
+    reason: str,
+    environment: str,
+) -> discord.Embed:
+    """Confirmation embed for ``/capital-deposit`` + ``/capital-withdraw``.
+
+    Operator clicks ✓ → api invokes the capital event. Same confirm
+    pattern as ``/halt`` (60s timeout, invoker-only, single-use).
+    """
+    truncated_reason = reason if len(reason) <= 100 else reason[:97] + "..."
+    title_prefix = "💰" if event_type == "deposit" else "💸"
+    embed = discord.Embed(
+        title=f"{title_prefix} Confirm capital {event_type} — ${amount_usd}",
+        description=_CAPITAL_EVENT_CONFIRM_BODY,
+        color=EMBED_COLOR_WARNING,
+    )
+    embed.add_field(name="Event type", value=f"`{event_type}`", inline=True)
+    embed.add_field(name="Amount USD", value=f"`{amount_usd}`", inline=True)
+    embed.add_field(name="Reason", value=f"```\n{truncated_reason}\n```", inline=False)
+    embed.set_footer(text=f"trading-system bot · {environment} · click ✓ to confirm or ✗ to cancel")
+    return embed
+
+
+def build_capital_event_success_embed(
+    *,
+    environment: str,
+    event_type: str,
+    amount_usd: str,
+    threshold_met: bool,
+    post_event_equity: str,
+    capital_event_audit_event_uuid: str,
+    mode_started_audit_event_uuid: str | None,
+) -> discord.Embed:
+    """Post-confirm success embed for a recorded capital event."""
+    title_prefix = "💰" if event_type == "deposit" else "💸"
+    color = EMBED_COLOR_OK if threshold_met else EMBED_COLOR_INFO
+    embed = discord.Embed(
+        title=f"{title_prefix} Capital {event_type} recorded — ${amount_usd}",
+        description=(
+            f"Post-event equity: `${post_event_equity}`\n"
+            f"Threshold met: `{threshold_met}` "
+            f"({'30-session mode activated' if threshold_met else 'no mode activation'})\n"
+            f"Audit: `{capital_event_audit_event_uuid}`"
+        ),
+        color=color,
+    )
+    if mode_started_audit_event_uuid is not None:
+        embed.add_field(
+            name="Mode started audit",
+            value=f"`{mode_started_audit_event_uuid}`",
+            inline=False,
+        )
+    embed.set_footer(text=f"trading-system bot · {environment}")
+    return embed
+
+
+def build_capital_event_error_embed(
+    *,
+    environment: str,
+    event_type: str,
+    error: ApiClientHTTPError,
+) -> discord.Embed:
+    """Post-confirm error embed for a failed capital event invocation."""
+    embed = discord.Embed(
+        title=f"❌ Capital {event_type} failed",
+        description=format_kill_switch_invoke_failure(error),
+        color=EMBED_COLOR_CRITICAL,
+    )
+    embed.set_footer(text=f"trading-system bot · {environment}")
+    return embed
+
+
 def format_kill_switch_invoke_failure(error: ApiClientHTTPError) -> str:
     """Format an :class:`ApiClientHTTPError` as embed-body text.
 

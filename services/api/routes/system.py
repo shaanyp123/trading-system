@@ -85,6 +85,10 @@ from services.api.repos.phase1 import (
     PostgresPhase1QueryRepo,
     RiskStateRow,
 )
+from services.api.schemas.capital_events import (
+    CapitalEventInvokeRequest,
+    CapitalEventInvokeResponse,
+)
 from services.api.schemas.common import EPOCH_SENTINEL_UTC
 from services.api.schemas.system import (
     AuditLogEntry,
@@ -104,6 +108,11 @@ from services.api.schemas.system import (
 from services.api.session import SessionContext, get_session_context
 from services.api.sse import emit_sse
 from services.audit.writer import Environment
+from services.risk.capital_events import (
+    CapitalEventError,
+    apply_capital_event,
+    plan_capital_event,
+)
 from services.risk.dispatch import apply_state_transition
 from services.risk.state_machine import (
     HaltSeverity,
@@ -401,6 +410,124 @@ async def invoke_kill_switch(
         halt_reason=plan.reason,
         audit_event_uuid=str(applied.state_transition_audit_event_uuid),
         sse_sequence_no=sequence_no,
+    )
+
+
+@router.post(
+    "/api/system/capital-event",
+    tags=["system"],
+    response_model=CapitalEventInvokeResponse,
+)
+async def invoke_capital_event(
+    body: CapitalEventInvokeRequest,
+    session: SessionContext = Depends(get_session_context),
+    db: AsyncSession = Depends(get_session),
+    repo: Phase1QueryRepo = Depends(_get_repo),
+    settings: APISettings = Depends(get_settings),
+) -> CapitalEventInvokeResponse:
+    """Record a deposit or withdrawal capital event.
+
+    Per cutover plan §7 + backend-spec §3.20 + §2.4.4. Reads the latest
+    ``balances.net_liquidation`` as ``pre_event_equity`` (or 0 on a fresh
+    live DB — the bootstrap-deposit case). Delegates to
+    :mod:`services.risk.capital_events` for the plan + apply.
+
+    Errors:
+
+    * ``NO_ACTIVE_ACCOUNT`` (409) — no accounts row; run
+      ``scripts/operator_tools/bootstrap_live_account.py`` first.
+    * ``AMOUNT_INVALID`` (422) — amount_usd is not a valid Decimal or
+      is non-positive.
+    * ``PRE_EVENT_EQUITY_NEGATIVE`` (422) — defensive; should be
+      impossible since the route clamps to 0.
+    * ``WITHDRAWAL_EXCEEDS_EQUITY`` (422) — withdrawal > current
+      balance; operator clamps at the available balance.
+    """
+    now = datetime.now(tz=UTC)
+    account_id = await repo.fetch_active_account_id()
+    if account_id is None:
+        raise AppError(
+            error_code="NO_ACTIVE_ACCOUNT",
+            message=(
+                "No active account is registered. Run "
+                "scripts/operator_tools/bootstrap_live_account.py "
+                "before invoking a capital event."
+            ),
+            status_code=409,
+        )
+
+    try:
+        amount_usd = Decimal(body.amount_usd)
+    except (ArithmeticError, ValueError) as exc:
+        raise AppError(
+            error_code="AMOUNT_INVALID",
+            message=f"amount_usd is not a valid Decimal: {exc}",
+            status_code=422,
+        ) from exc
+
+    # pre_event_equity from the latest balances snapshot. Bootstrap case
+    # (no balances row yet — fresh live DB): treat as 0; the planner
+    # short-circuits to threshold_met=True per cutover plan §7 step 4.
+    pre_event_equity = await repo.fetch_latest_balance_nav(account_id)
+    if pre_event_equity is None:
+        pre_event_equity = Decimal("0")
+
+    try:
+        plan = plan_capital_event(
+            account_id=account_id,
+            event_type=body.event_type,
+            amount_usd=amount_usd,
+            pre_event_equity=pre_event_equity,
+            current_session_no=body.current_session_no,
+            operator_reason=body.reason,
+            now_utc=now,
+        )
+    except CapitalEventError as exc:
+        raise AppError(
+            error_code=exc.error_code,
+            message=str(exc),
+            status_code=422,
+        ) from exc
+
+    # DP-021 (Day 25 carryover) — same pattern as invoke_kill_switch: close
+    # the implicit read-side transaction before the audit writer opens its
+    # own SERIALIZABLE block.
+    await db.commit()
+
+    applied = await apply_capital_event(
+        plan=plan,
+        db=db,
+        env=_env_for_audit(settings.environment),
+        phase_at_emit=_PHASE_AT_EMIT_PHASE_0,
+    )
+
+    log.info(
+        "capital_event_invoked",
+        event_type=body.event_type,
+        amount_usd=body.amount_usd,
+        operator_reason=body.reason,
+        capital_event_id=str(applied.capital_event_id),
+        threshold_met=applied.threshold_met,
+        capital_event_audit_event_uuid=str(applied.capital_event_audit_event_uuid),
+        mode_started_audit_event_uuid=(
+            str(applied.mode_started_audit_event_uuid)
+            if applied.mode_started_audit_event_uuid
+            else None
+        ),
+    )
+
+    return CapitalEventInvokeResponse(
+        capital_event_id=str(applied.capital_event_id),
+        event_type=applied.event_type,
+        amount_usd=str(applied.amount_usd),
+        threshold_met=applied.threshold_met,
+        post_event_equity=str(applied.post_event_equity),
+        capital_event_audit_event_uuid=str(applied.capital_event_audit_event_uuid),
+        mode_started_audit_event_uuid=(
+            str(applied.mode_started_audit_event_uuid)
+            if applied.mode_started_audit_event_uuid
+            else None
+        ),
     )
 
 
