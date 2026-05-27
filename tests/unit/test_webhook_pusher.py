@@ -902,8 +902,11 @@ class TestAlertCategoryEnumMirror:
         # 2026-05-17_heartbeat_stale_category migration adds 1
         # (`heartbeat_stale` for the staleness probe);
         # 2026-05-26_worker_failure_alert_category migration adds 1 more
-        # (`worker_failure` for the recovery-agent task-death hook).
-        assert len(list(AlertCategory)) == 31
+        # (`worker_failure` for the recovery-agent task-death hook);
+        # 2026-05-27_position_unprotected migration adds 1 more
+        # (`position_unprotected` for the exit-pipeline PR-C
+        # cancel-success+place-fail failure mode).
+        assert len(list(AlertCategory)) == 32
 
     def test_canonical_values_present(self) -> None:
         # Sentinel check; full set in alembic 0004 + spec §3.27.

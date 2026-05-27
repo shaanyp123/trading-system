@@ -199,6 +199,27 @@ class AuditEventType(StrEnum):
     # actions; the replay subprocess itself emits its own audit chain via
     # ``process_fill_event``.
     RECOVERY_ACTION_TAKEN = "recovery_action_taken"
+    # Exit-pipeline PR-C (2026-05-27). Emitted by the order_placement_worker
+    # exit branch when the bracket-stop CANCEL succeeds but the subsequent
+    # close-order PLACE fails. The position is NAKED (no protective stop)
+    # until the operator intervenes — the worst failure mode in the exit
+    # pipeline (R3 in ``Docs/exit-pipeline-design.md`` §11). Payload carries
+    # ``signal_id`` (the exit signal), ``market``,
+    # ``prior_position_direction`` ('long'/'short' — derived from the FRESH
+    # positions_current read), ``prior_position_quantity`` (signed magnitude
+    # from positions_current at fail-time), ``exit_reason``
+    # ('reversal'/'trend_flip'/'decommission' — JOINed from the SIGNAL_EMITTED
+    # audit row's payload), ``cancelled_stop_client_order_id``,
+    # ``cancelled_stop_broker_order_id``, ``last_known_stop_price`` (the
+    # bracket stop's price right before cancel), ``close_failure_reason``.
+    # Pairs with an ``alerts`` row of category ``position_unprotected``
+    # severity ``P0`` → Discord #alerts + #critical + Resend email.
+    # Operator-runbook: ``scripts/operator_tools/replace_protective_stop.py``
+    # (deferred PR per design §Q5) places a fresh bracket-stop at the same
+    # ATR-derived level until the next cycle re-emits the exit. Until that
+    # tool lands, the operator manually flattens or places a stop via TWS
+    # + writes a manual audit row through the agent-actions surface.
+    POSITION_UNPROTECTED = "position_unprotected"
 
 
 __all__ = ["AuditEventType"]

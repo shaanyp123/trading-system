@@ -149,6 +149,16 @@ class AlertCategory(StrEnum):
     # ``scripts/operator_tools/recovery_agent.py`` polls
     # ``alerts WHERE category = 'worker_failure'`` for unhandled events.
     WORKER_FAILURE = "worker_failure"
+    # Exit-pipeline PR-C (2026-05-27). INSERTed by the
+    # order_placement_worker's exit branch when the bracket-stop cancel
+    # succeeds but the subsequent close-order placement fails. The
+    # position is NAKED (no protective stop) — worst failure mode in
+    # the exit pipeline (R3 in ``Docs/exit-pipeline-design.md`` §11).
+    # P0-severity routing — fans out to ``#alerts`` + ``#critical`` +
+    # email backup. Paired with audit event type
+    # ``AuditEventType.POSITION_UNPROTECTED``. Operator's runbook is
+    # ``scripts/operator_tools/replace_protective_stop.py`` (deferred PR).
+    POSITION_UNPROTECTED = "position_unprotected"
 
 
 class ChannelName(StrEnum):
