@@ -1456,8 +1456,14 @@ class TestPositionsCurrent:
         override_dep: Any,
     ) -> None:
         """Post-2026-05-27 fix: route maps positions_current rows into
-        Position objects with Phase 1 field defaults (current_price=
-        avg_cost, cluster=None, contract_month=None)."""
+        Position objects with Phase 1 field defaults (cluster=None,
+        contract_month=None). current_price + unrealized_pnl are
+        computed on-read via the MTM helper (post-Task-3); when the
+        LEAN data zip is not present in the default settings.bar_sync_data_root
+        the helper falls back to (avg_cost, unrealized_pnl=0). The
+        positions_current.unrealized_pnl column is IGNORED (no MTM
+        writer populates it today — see services.api.position_mtm
+        docstring)."""
         account_id = uuid4()
         contract_id = uuid4()
         positions_rows = [
@@ -1468,7 +1474,7 @@ class TestPositionsCurrent:
                 "quantity": 1,
                 "avg_cost": Decimal("2925.00"),
                 "margin_held": Decimal("500.00"),
-                "unrealized_pnl": None,  # MTM not run yet — Phase 1 fallback
+                "unrealized_pnl": None,
                 "last_mark_ts": datetime(2026, 5, 27, 13, 31, tzinfo=UTC),
                 "managed_by_version": "b5237aed3f06288656a31510795a3ae3e76556ae",
             },
@@ -1479,6 +1485,7 @@ class TestPositionsCurrent:
                 "quantity": 5,
                 "avg_cost": Decimal("83.72"),
                 "margin_held": Decimal("0"),
+                # Stale legacy column; route ignores it post-Task-3.
                 "unrealized_pnl": Decimal("12.50"),
                 "last_mark_ts": datetime(2026, 5, 27, 13, 31, tzinfo=UTC),
                 "managed_by_version": "c951158bdeadbeef" + "0" * 24,
@@ -1500,9 +1507,9 @@ class TestPositionsCurrent:
         assert m2k["instrument_id"] == str(contract_id)
         assert m2k["qty"] == 1
         assert Decimal(m2k["avg_entry_price"]) == Decimal("2925.00")
-        # Phase 1 fallback: current_price == avg_entry_price when MTM not set
+        # MTM helper falls back to avg_cost + unrealized_pnl=0 because the
+        # default data_root in the test env has no fixture zips.
         assert Decimal(m2k["current_price"]) == Decimal("2925.00")
-        # unrealized_pnl=None in DB → returned as 0
         assert Decimal(m2k["unrealized_pnl"]) == Decimal("0")
         assert Decimal(m2k["unrealized_pnl_pct_of_nav"]) == Decimal("0")
         # Phase 1 fallback: contracts JOIN deferred
@@ -1514,18 +1521,35 @@ class TestPositionsCurrent:
         tlt = next(p for p in body["positions"] if p["symbol"] == "TLT")
         # ETF: instrument_id falls back to market symbol when contract_id IS NULL
         assert tlt["instrument_id"] == "TLT"
-        assert Decimal(tlt["unrealized_pnl"]) == Decimal("12.50")
-        # unrealized_pnl / NAV = 12.50 / 100000 = 0.0001 (quantized)
-        assert Decimal(tlt["unrealized_pnl_pct_of_nav"]) == Decimal("0.0001")
+        # No MTM data on disk → fallback. positions_current.unrealized_pnl
+        # is intentionally ignored.
+        assert Decimal(tlt["current_price"]) == Decimal("83.72")
+        assert Decimal(tlt["unrealized_pnl"]) == Decimal("0")
+        assert Decimal(tlt["unrealized_pnl_pct_of_nav"]) == Decimal("0")
 
     @pytest.mark.asyncio
-    async def test_zero_nav_falls_back_to_zero_pct(
+    async def test_mtm_populated_when_lean_data_present(
         self,
         api_client: AsyncClient,
         override_dep: Any,
+        tmp_path: Any,
     ) -> None:
-        """When NAV is unavailable / zero, the pct field returns 0
-        without raising a division error."""
+        """When the LEAN on-disk zip carries a current bar, current_price
+        comes from it and unrealized_pnl is computed via multiplier.
+        Mirrors the production path post-Task-3 for the /M2K position."""
+        import zipfile
+
+        from services.api.config import APISettings, get_settings
+
+        # Write a minimal /M2K front-month CSV with last close = 2931.2
+        m2k_zip = tmp_path / "future" / "cme" / "daily" / "m2k_trade.zip"
+        m2k_zip.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(m2k_zip, "w") as zf:
+            zf.writestr(
+                "m2k_trade_202606.csv",
+                "20260527 00:00,2926.5,2933.5,2920.8,2931.2,4075\n",
+            )
+
         account_id = uuid4()
         positions_rows = [
             {
@@ -1535,7 +1559,69 @@ class TestPositionsCurrent:
                 "quantity": 1,
                 "avg_cost": Decimal("2925.00"),
                 "margin_held": Decimal("500.00"),
-                "unrealized_pnl": Decimal("100"),
+                "unrealized_pnl": None,
+                "last_mark_ts": datetime(2026, 5, 27, 13, 31, tzinfo=UTC),
+                "managed_by_version": "a" * 40,
+            }
+        ]
+        repo = _StubRepo(
+            account_id=account_id,
+            positions_rows=positions_rows,
+            nav=Decimal("100000"),
+        )
+        _bind_repo(override_dep, positions_route, repo)
+
+        original_settings = get_settings()
+        override_settings = APISettings(
+            **{
+                **original_settings.model_dump(),
+                "bar_sync_data_root": str(tmp_path),
+            }
+        )
+        override_dep(get_settings, lambda: override_settings)
+        response = await api_client.get("/api/positions/current")
+        assert response.status_code == 200
+        body = response.json()
+        m2k = body["positions"][0]
+        # 2931.2 from the fixture CSV
+        assert Decimal(m2k["current_price"]) == Decimal("2931.2000")
+        # (2931.2 - 2925) * 1 * 5 = 31.00 (Decimal multiplier=5 for /M2K)
+        assert Decimal(m2k["unrealized_pnl"]) == Decimal("31.00")
+        # 31.00 / 100000 = 0.0003 (rounded to 4dp)
+        assert Decimal(m2k["unrealized_pnl_pct_of_nav"]) == Decimal("0.0003")
+
+    @pytest.mark.asyncio
+    async def test_zero_nav_falls_back_to_zero_pct(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+        tmp_path: Any,
+    ) -> None:
+        """When NAV is unavailable / zero, the pct field returns 0
+        without raising a division error. Uses an on-disk MTM fixture
+        so unrealized_pnl is non-zero — only the pct path falls back."""
+        import zipfile
+
+        from services.api.config import APISettings, get_settings
+
+        m2k_zip = tmp_path / "future" / "cme" / "daily" / "m2k_trade.zip"
+        m2k_zip.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(m2k_zip, "w") as zf:
+            zf.writestr(
+                "m2k_trade_202606.csv",
+                "20260527 00:00,2926.5,2933.5,2920.8,2931.2,4075\n",
+            )
+
+        account_id = uuid4()
+        positions_rows = [
+            {
+                "id": uuid4(),
+                "market": "/M2K",
+                "contract_id": uuid4(),
+                "quantity": 1,
+                "avg_cost": Decimal("2925.00"),
+                "margin_held": Decimal("500.00"),
+                "unrealized_pnl": None,
                 "last_mark_ts": datetime(2026, 5, 27, tzinfo=UTC),
                 "managed_by_version": "a" * 40,
             }
@@ -1546,9 +1632,20 @@ class TestPositionsCurrent:
             nav=Decimal("0"),  # zero NAV — must NOT divide
         )
         _bind_repo(override_dep, positions_route, repo)
+
+        original_settings = get_settings()
+        override_settings = APISettings(
+            **{
+                **original_settings.model_dump(),
+                "bar_sync_data_root": str(tmp_path),
+            }
+        )
+        override_dep(get_settings, lambda: override_settings)
         response = await api_client.get("/api/positions/current")
         assert response.status_code == 200
         body = response.json()
+        # Real unrealized_pnl from MTM ($31), but NAV=0 → pct guard returns 0.
+        assert Decimal(body["positions"][0]["unrealized_pnl"]) == Decimal("31.00")
         assert Decimal(body["positions"][0]["unrealized_pnl_pct_of_nav"]) == Decimal("0")
 
 

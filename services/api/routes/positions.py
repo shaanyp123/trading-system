@@ -30,12 +30,15 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 
 import structlog
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from services.api.config import APISettings, get_settings
 from services.api.db import get_session
+from services.api.position_mtm import compute_position_mtm
 from services.api.repos.phase1 import Phase1QueryRepo, PostgresPhase1QueryRepo
 from services.api.schemas.positions import Position, PositionsResponse
 from services.api.session import SessionContext, get_session_context
@@ -73,6 +76,7 @@ def _to_int(value: object) -> int:
 async def positions_current(
     session: SessionContext = Depends(get_session_context),
     repo: Phase1QueryRepo = Depends(_get_repo),
+    settings: APISettings = Depends(get_settings),
 ) -> PositionsResponse:
     now = datetime.now(tz=UTC)
     account_id = await repo.fetch_active_account_id()
@@ -88,6 +92,7 @@ async def positions_current(
     # day-1 may have NAV=0 if no balance snapshot landed yet — use None
     # to signal "unavailable" so the pct field defaults to 0.
     nav_for_pct: Decimal | None = nav if (nav is not None and nav > 0) else None
+    data_root = Path(settings.bar_sync_data_root)
 
     positions: list[Position] = []
     for r in rows:
@@ -95,7 +100,17 @@ async def positions_current(
         contract_id_raw = r.get("contract_id")
         qty = _to_int(r["quantity"])
         avg_cost = _to_decimal(r["avg_cost"])
-        unrealized_pnl = _to_decimal(r.get("unrealized_pnl"))
+        # Phase 1 (post-2026-05-27 Task 3): compute current_price +
+        # unrealized_pnl on-read from the LEAN on-disk daily zips
+        # (services/api/position_mtm.py). Falls back to avg_cost +
+        # unrealized_pnl=0 when the zip is missing or the market is
+        # outside V1_EXPOSURE_METADATA. We DO NOT consult the
+        # positions_current.unrealized_pnl column today — no periodic
+        # MTM job writes it; a future PR can swap that in once a
+        # writer exists.
+        mtm = compute_position_mtm(market, qty, avg_cost, data_root)
+        current_price = mtm.current_price
+        unrealized_pnl = mtm.unrealized_pnl
         if nav_for_pct is None or unrealized_pnl == 0:
             unrealized_pct = Decimal("0")
         else:
@@ -113,9 +128,7 @@ async def positions_current(
                 contract_month=None,  # Phase 1: contracts JOIN deferred
                 qty=qty,
                 avg_entry_price=avg_cost,
-                # Phase 1 fallback per schemas/positions.py docstring:
-                # ``current_price`` = ``avg_cost`` until the MTM job lands.
-                current_price=avg_cost,
+                current_price=current_price,
                 unrealized_pnl=unrealized_pnl,
                 unrealized_pnl_pct_of_nav=unrealized_pct,
                 cluster=None,  # Phase 1: contracts JOIN deferred
