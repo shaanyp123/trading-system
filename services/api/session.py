@@ -27,6 +27,7 @@ contract, even by accident.
 
 from __future__ import annotations
 
+import secrets
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -130,13 +131,36 @@ class SessionStubMiddleware(BaseHTTPMiddleware):
 
     Production-mode (``live-*``) requests fail closed with HTTP 401 because
     the stub is explicitly Phase-0 only — see module docstring.
+
+    CSRF cookie bootstrap (2026-05-28 fix):
+      Real auth flows (``services/api/routes/auth.py::_set_session_cookies``)
+      mint the ``__Host-csrf_token`` cookie alongside the session cookie on
+      every WebAuthn/TOTP login. The Phase-0 stub has no equivalent ceremony
+      — pre-fix, an operator who visited a non-auth page (e.g. ``/system``)
+      in a fresh browser session never received a CSRF cookie. The first
+      state-changing POST (Resume kill switch, regenerate backup codes,
+      etc.) was then rejected by :class:`CSRFMiddleware` with
+      ``CSRF_REJECTED``. This middleware now piggybacks a server-minted
+      CSRF token onto the response of every stub-injected request that
+      arrived without one. The cookie attributes mirror
+      ``_set_session_cookies`` exactly (Secure outside dev, SameSite=Strict,
+      Path=/, Max-Age=session_absolute_seconds, no Domain) so the
+      ``__Host-`` prefix browser invariants hold. See
+      ``Docs/decisions-log.md`` 2026-05-28 entry for the late-evening
+      manual-override incident that surfaced this gap.
     """
 
     def __init__(self, app: FastAPI, *, settings: APISettings) -> None:
         super().__init__(app)
         self._cookie_name = settings.session_cookie_name
+        self._csrf_cookie_name = settings.csrf_cookie_name
         self._idle_seconds = settings.session_idle_seconds
+        self._csrf_max_age = settings.session_absolute_seconds
         self._is_production = settings.environment in ("live-small", "live-scale")
+        # Match ``_set_session_cookies`` semantics: Secure flag everywhere
+        # except ``dev`` env. Required for the ``__Host-`` cookie-name prefix
+        # to survive browser-side validation on https origins.
+        self._cookie_secure = settings.environment != "dev"
 
     async def dispatch(
         self,
@@ -172,13 +196,71 @@ class SessionStubMiddleware(BaseHTTPMiddleware):
 
         session = _build_phase0_stub_session(self._idle_seconds)
         request.state.session = session
+        csrf_cookie_present = self._csrf_cookie_name in request.cookies
         log.debug(
             "session_stub_injected",
             user_id=session.user_id,
             auth_strength=session.auth_strength,
             cookie_present=self._cookie_name in request.cookies,
+            csrf_cookie_present=csrf_cookie_present,
         )
-        return await call_next(request)
+        response = await call_next(request)
+        if not csrf_cookie_present:
+            _mint_csrf_cookie_on_response(
+                response,
+                csrf_cookie_name=self._csrf_cookie_name,
+                max_age_seconds=self._csrf_max_age,
+                secure=self._cookie_secure,
+            )
+            log.debug(
+                "session_stub_csrf_cookie_bootstrapped",
+                path=request.url.path,
+            )
+        return response
+
+
+def _mint_csrf_cookie_on_response(
+    response: Response,
+    *,
+    csrf_cookie_name: str,
+    max_age_seconds: int,
+    secure: bool,
+) -> None:
+    """Attach a fresh ``__Host-csrf_token`` cookie to the response.
+
+    Helper extracted from :class:`SessionStubMiddleware` so the same
+    cookie-attribute set lives in one place (this module) rather than
+    being duplicated between session.py and routes/auth.py. The real
+    auth flow's ``_set_session_cookies`` in routes/auth.py mints the
+    same cookie shape — when real session middleware lands Week 6+,
+    that callsite can move to this helper too.
+
+    The value is 256 bits of cryptographic randomness via
+    :func:`secrets.token_urlsafe` — matches the format used by
+    ``_set_session_cookies``. The CSRF middleware only does a
+    constant-time compare against the ``X-CSRF-Token`` header so the
+    value is opaque to the server, but consistency keeps audit-log
+    payloads uniform.
+
+    Attribute rationale (must keep these aligned with the ``__Host-``
+    cookie-name prefix browser invariants):
+      * ``secure=True`` outside dev — required for ``__Host-`` prefix
+      * ``httponly=False`` — frontend JS reads it via ``document.cookie``
+        to populate the ``X-CSRF-Token`` request header (double-submit
+        pattern per backend-spec §8.5.4)
+      * ``samesite="strict"`` — CSRF defence at the cookie layer
+      * ``path="/"`` — required for ``__Host-`` prefix
+      * no Domain attribute — required for ``__Host-`` prefix
+    """
+    response.set_cookie(
+        key=csrf_cookie_name,
+        value=secrets.token_urlsafe(32),
+        max_age=max_age_seconds,
+        secure=secure,
+        httponly=False,
+        samesite="strict",
+        path="/",
+    )
 
 
 def get_session_context(request: Request) -> SessionContext:
