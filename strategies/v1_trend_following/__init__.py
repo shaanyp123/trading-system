@@ -23,6 +23,15 @@ from strategies.v1_trend_following.parameters import (
     V1Parameters,
     default_v1_parameters,
 )
+from strategies.v1_trend_following.proximity import (
+    DONCHIAN_CLOSE_BAND_PCT,
+    HURST_CLOSE_BAND,
+    TREND_CLOSE_BAND_PCT,
+    GateProximity,
+    GateState,
+    MarketProximity,
+    compute_market_proximity,
+)
 from strategies.v1_trend_following.signals import (
     Bar,
     BarSeries,
@@ -37,7 +46,10 @@ from strategies.v1_trend_following.sizing_trace import SizingTraceV1, Stage0Trac
 from strategies.v1_trend_following.strategy import STRATEGY_NAME, V1TrendFollowing
 
 __all__ = [
+    "DONCHIAN_CLOSE_BAND_PCT",
+    "HURST_CLOSE_BAND",
     "STRATEGY_NAME",
+    "TREND_CLOSE_BAND_PCT",
     "V1_CANDIDATE_UNIVERSE",
     "V1_DEFAULTS",
     "V1_SIDELINED_MARKETS",
@@ -46,6 +58,9 @@ __all__ = [
     "CandidateSignal",
     "Direction",
     "ExitGenerationResult",
+    "GateProximity",
+    "GateState",
+    "MarketProximity",
     "Position",
     "RejectionReason",
     "SignalEmittedPayload",
@@ -58,5 +73,6 @@ __all__ = [
     "UniverseInclusionPayload",
     "V1Parameters",
     "V1TrendFollowing",
+    "compute_market_proximity",
     "default_v1_parameters",
 ]

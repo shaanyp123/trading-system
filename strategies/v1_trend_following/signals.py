@@ -15,6 +15,8 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Final, Literal
 
+from strategies.v1_trend_following.proximity import MarketProximity
+
 
 class Direction(StrEnum):
     LONG = "long"
@@ -197,12 +199,19 @@ class SignalGenerationResult:
     service emits `signal_rejected` audit events for these.
     `as_of_emitted_at_utc` is the wall-clock when the strategy ran (not the
     session_date — that's the close used for the breakout check).
+    `market_evaluations` (PR-A of ``Docs/signal-proximity-design.md``) is the
+    per-market proximity record for the /signals "Watching" view. Observation-
+    only; populated for every market in ``active_universe`` regardless of
+    whether the market emitted a signal or a rejection. Backwards-compatible
+    with consumers that ignore it — the field is APPENDED to the dataclass
+    so positional ordering of existing fields is preserved.
     """
 
     signals: tuple[CandidateSignal, ...]
     rejections: tuple[tuple[str, RejectionReason], ...]
     as_of_emitted_at_utc: datetime
     strategy_hash_short: str = field(default="")  # populated by signal service post-call
+    market_evaluations: tuple[MarketProximity, ...] = field(default=())
 
 
 @dataclass(frozen=True, slots=True)

@@ -547,6 +547,11 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
 
         # Step 6: heartbeat with per-cycle summary (always emitted so
         # liveness_probes sees the algorithm alive even when no signals).
+        # PR-A of signal-proximity-design.md attaches the per-market
+        # proximity records to the heartbeat extra. The api accepts them as
+        # an optional field; PR-B will persist them. Observation-only —
+        # this does NOT influence which signals fire.
+        proximity_payload = self._build_market_evaluations_payload(result)
         self._post_event(
             "lean_cycle_heartbeat",
             extra={
@@ -555,6 +560,7 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
                 "live_mode": bool(self.live_mode),
                 "signals_emitted_count": signals_count,
                 "rejections_count": rejections_count,
+                "market_evaluations": proximity_payload,
             },
         )
 
@@ -671,6 +677,53 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
                 equity=equity,
             )
             self._post_event("signal_emitted", extra=payload)
+
+    def _build_market_evaluations_payload(self, result) -> list:  # noqa: ANN001 -- SignalGenerationResult; LEAN runtime
+        """Serialize ``result.market_evaluations`` into the heartbeat payload.
+
+        Per PR-A of ``Docs/signal-proximity-design.md`` §5: each market in
+        the active universe contributes one entry; gate states are emitted
+        as strings, Decimals as strings (Decimal-as-string per A05), and
+        None survives unchanged so the api can deserialize cleanly.
+        Best-effort: if ``market_evaluations`` is empty (pre-PR-A strategy
+        builds) or any per-market serialization raises, return whatever
+        was built so far + log. Heartbeat must NEVER be blocked by
+        proximity emission.
+        """
+        evaluations = getattr(result, "market_evaluations", ()) or ()
+        out: list = []
+        for evaluation in evaluations:
+            try:
+                out.append(self._serialize_market_proximity(evaluation))
+            except Exception as exc:  # noqa: BLE001 -- log + skip; per-market isolation
+                self.log(
+                    f"v1_market_proximity_serialize_failed "
+                    f"market={getattr(evaluation, 'market', '?')} exc={exc!r}"
+                )
+        return out
+
+    def _serialize_market_proximity(self, evaluation) -> dict:  # noqa: ANN001 -- MarketProximity; LEAN runtime
+        """Convert one MarketProximity dataclass to a wire-shape dict."""
+        def _gate(gate) -> dict:  # noqa: ANN001 -- GateProximity; LEAN runtime
+            return {
+                "state": gate.state.value,
+                "headroom": str(gate.headroom) if gate.headroom is not None else None,
+                "detail": gate.detail,
+            }
+
+        last_close = evaluation.last_close
+        return {
+            "market": evaluation.market,
+            "long_donchian": _gate(evaluation.long_donchian),
+            "short_donchian": _gate(evaluation.short_donchian),
+            "long_trend": _gate(evaluation.long_trend),
+            "short_trend": _gate(evaluation.short_trend),
+            "hurst": _gate(evaluation.hurst),
+            "last_close": str(last_close) if last_close is not None else None,
+            "overall_state": evaluation.overall_state.value,
+            "closest_gate": evaluation.closest_gate,
+            "gate_status": evaluation.gate_status,
+        }
 
     def _build_exit_signal_payload(
         self,

@@ -139,6 +139,18 @@ async def post_lean_signal(
             # Registry failure must NOT fail the heartbeat POST: this is a
             # passive observability surface, not a critical path. Log + drop.
             log.exception("lean_heartbeat_registry_record_failed", **log_kwargs)
+        # PR-A of Docs/signal-proximity-design.md: log the proximity-row
+        # count as a sanity check so the operator can confirm LEAN is
+        # emitting the new field after deploy. Persistence wires in PR-B.
+        if body.event_type == "lean_cycle_heartbeat":
+            market_evaluations_count = (
+                len(body.market_evaluations) if body.market_evaluations is not None else 0
+            )
+            log.info(
+                "lean_proximity_received",
+                market_count=market_evaluations_count,
+                **log_kwargs,
+            )
         log.info("lean_event_received", **log_kwargs)
         return LeanEventAccepted(
             received_at_utc=received_at,
