@@ -31,7 +31,12 @@ from services.api.repos.phase1 import (
     Phase1QueryRepo,
     PostgresPhase1QueryRepo,
 )
+from services.api.repos.signal_proximity import fetch_latest_per_market
 from services.api.routes._pagination import clamp_limit
+from services.api.schemas.signal_proximity import (
+    SignalProximityResponse,
+    row_to_view,
+)
 from services.api.schemas.signals import (
     SignalApproveRequest,
     SignalDeferRequest,
@@ -156,6 +161,43 @@ async def list_signals(
         items=[],
         next_cursor=next_cursor,
         has_more=has_more,
+    )
+
+
+@router.get(
+    "/api/signals/proximity",
+    tags=["signals"],
+    response_model=SignalProximityResponse,
+)
+async def list_signal_proximity(
+    session: SessionContext = Depends(get_session_context),
+    db: AsyncSession = Depends(get_session),
+) -> SignalProximityResponse:
+    """Return latest-per-market proximity for the /signals "Watching" view.
+
+    PR-B of ``Docs/signal-proximity-design.md`` (signed off 2026-05-28).
+    Daily-resolution data: each row is the most recent ``signal_proximity``
+    entry for the named market, written by the LEAN cycle heartbeat
+    handler (``services/api/routes/internal/lean.py``).
+
+    **Auth.** Mirrors ``GET /api/signals`` — the same
+    ``Depends(get_session_context)`` dependency enforces the operator
+    session cookie / bearer. No special service-account or role check.
+
+    **Empty-state contract.** When the table has no rows (pre-first-cycle
+    or post-truncate), returns ``{"as_of_cycle_ts_utc": null, "markets": []}``
+    so the frontend can render the "Waiting for first LEAN cycle today"
+    empty state cleanly per design §7.3.
+
+    The session variable is unused; binding it keeps the auth dependency
+    in the function signature (FastAPI resolves dependencies for side
+    effects even when the result isn't used).
+    """
+    _ = session  # auth enforced via the dependency above; result unused
+    as_of, rows = await fetch_latest_per_market(db)
+    return SignalProximityResponse(
+        as_of_cycle_ts_utc=as_of,
+        markets=[row_to_view(row) for row in rows],
     )
 
 

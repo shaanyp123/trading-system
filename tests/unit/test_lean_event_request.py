@@ -11,6 +11,7 @@ accept a well-formed array (so the PR-A LEAN deploy doesn't 422).
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
@@ -64,8 +65,17 @@ def test_heartbeat_with_market_evaluations_parses() -> None:
     )
     assert request.market_evaluations is not None
     assert len(request.market_evaluations) == 2
-    assert request.market_evaluations[0]["market"] == "/MES"
-    assert request.market_evaluations[1]["market"] == "/MNQ"
+    # PR-B tightened the type from list[dict[str, Any]] to a typed
+    # MarketEvaluationItem — access fields via attribute (the route
+    # handler in lean.py walks the same attributes when persisting).
+    assert request.market_evaluations[0].market == "/MES"
+    assert request.market_evaluations[1].market == "/MNQ"
+    assert request.market_evaluations[0].overall_state == "close"
+    assert request.market_evaluations[0].closest_gate == "donchian"
+    assert request.market_evaluations[0].gate_status == "ok"
+    # Per-gate sub-objects round-trip as typed GateProximityItem.
+    assert request.market_evaluations[0].long_donchian.state == "close"
+    assert request.market_evaluations[0].long_donchian.headroom == Decimal("0.008")
 
 
 def test_heartbeat_with_empty_market_evaluations_parses() -> None:
@@ -155,3 +165,96 @@ def test_extra_unknown_field_still_forbidden() -> None:
     """
     with pytest.raises(ValidationError):
         LeanEventRequest.model_validate(_base_heartbeat(this_does_not_exist=1))
+
+
+# ---------------------------------------------------------------------------
+# PR-B tightening — the per-market shape is now a typed nested model
+# ---------------------------------------------------------------------------
+
+
+def test_market_evaluation_invalid_gate_state_rejected() -> None:
+    """A gate state not in ('pass','close','fail') must 422.
+
+    Guards against drift between the LEAN serializer's ``GateState`` enum
+    and the api's tightened model. A new state value MUST land here + in
+    the migration's CHECK constraint together, or the api rejects.
+    """
+    row = _proximity_row("/MES")
+    row["long_donchian"] = {
+        "state": "maybe",  # not a valid GateState
+        "headroom": "0.005",
+        "detail": None,
+    }
+    with pytest.raises(ValidationError):
+        LeanEventRequest.model_validate(_base_heartbeat(market_evaluations=[row]))
+
+
+def test_market_evaluation_invalid_overall_state_rejected() -> None:
+    """The overall_state literal is enforced separately from per-gate state."""
+    row = _proximity_row("/MES")
+    row["overall_state"] = "almost"
+    with pytest.raises(ValidationError):
+        LeanEventRequest.model_validate(_base_heartbeat(market_evaluations=[row]))
+
+
+def test_market_evaluation_invalid_closest_gate_rejected() -> None:
+    """closest_gate must be one of donchian / trend / hurst / history."""
+    row = _proximity_row("/MES")
+    row["closest_gate"] = "donchian_high"  # close to a real value but wrong
+    with pytest.raises(ValidationError):
+        LeanEventRequest.model_validate(_base_heartbeat(market_evaluations=[row]))
+
+
+def test_market_evaluation_invalid_gate_status_rejected() -> None:
+    """gate_status must match the GateStatus literal in proximity.py.
+
+    This is the carry-over watch-out from PR-A's risk-review — the API
+    schema's gate_status alphabet MUST equal the migration's CHECK
+    constraint alphabet MUST equal proximity.GateStatus.
+    """
+    row = _proximity_row("/MES")
+    row["gate_status"] = "paused"  # not in {ok, warming_up, decommissioned}
+    with pytest.raises(ValidationError):
+        LeanEventRequest.model_validate(_base_heartbeat(market_evaluations=[row]))
+
+
+def test_market_evaluation_unknown_per_gate_key_rejected() -> None:
+    """The per-gate sub-object is extra='forbid' too.
+
+    An unexpected key on a gate sub-object (e.g., a stale field name from
+    a future strategy iteration) must 422 rather than be silently dropped.
+    """
+    row = _proximity_row("/MES")
+    row["long_donchian"] = {
+        "state": "pass",
+        "headroom": "0.005",
+        "detail": None,
+        "extra_thing": True,
+    }
+    with pytest.raises(ValidationError):
+        LeanEventRequest.model_validate(_base_heartbeat(market_evaluations=[row]))
+
+
+def test_market_evaluation_warming_up_with_none_numerics_parses() -> None:
+    """Warming-up markets emit state='fail' + headroom=None for every gate.
+
+    The api must accept the None values on the wire — this is the
+    canonical "no data yet" shape per design §3.4.
+    """
+    row = {
+        "market": "/MGC",
+        "long_donchian": {"state": "fail", "headroom": None, "detail": "warming_up"},
+        "short_donchian": {"state": "fail", "headroom": None, "detail": "warming_up"},
+        "long_trend": {"state": "fail", "headroom": None, "detail": "warming_up"},
+        "short_trend": {"state": "fail", "headroom": None, "detail": "warming_up"},
+        "hurst": {"state": "fail", "headroom": None, "detail": "warming_up"},
+        "last_close": None,
+        "overall_state": "fail",
+        "closest_gate": "history",
+        "gate_status": "warming_up",
+    }
+    request = LeanEventRequest.model_validate(_base_heartbeat(market_evaluations=[row]))
+    assert request.market_evaluations is not None
+    assert request.market_evaluations[0].gate_status == "warming_up"
+    assert request.market_evaluations[0].last_close is None
+    assert request.market_evaluations[0].long_donchian.headroom is None
