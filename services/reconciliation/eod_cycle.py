@@ -252,8 +252,31 @@ def build_broker_view(snapshot: ReconciliationSnapshot) -> BrokerView:
     cash balances; we sum the USD balance (Phase 1 universe is USD-
     denominated, so non-USD balances would be a data-quality concern
     surfaced separately). Positions are SUM-aggregated by market with
-    the futures ``/`` prefix applied to the FlexQuery ``symbol`` so the
-    backend's ``/MES`` matches the broker's ``MES`` ``assetCategory=FUT``.
+    the futures ``/`` prefix applied to the FlexQuery root ticker so the
+    backend's ``/M2K`` matches the broker's ``M2K`` ``assetCategory=FUT``.
+
+    **Futures symbol normalization (post-2026-05-27 fix):** the FlexQuery
+    XML reports two attributes that can identify a FUT position:
+
+    * ``symbol`` — what the template is configured to print; can be
+      EITHER the root (``"M2K"``) or the contract-month form
+      (``"M2KM6"``, where ``M6`` = June 2026 expiry).
+    * ``underlyingSymbol`` — IBKR's root ticker, populated unconditionally
+      on derivative rows in standard templates. Parsed into
+      :attr:`FlexPosition.underlying_symbol`.
+
+    The backend's ``positions_current.market`` convention is root-only
+    with a leading slash (``"/M2K"``). When the FlexQuery template uses
+    contract-month symbols (the common configuration), comparing
+    ``f"/{symbol}"`` (= ``"/M2KM6"``) against backend's ``"/M2K"`` produces
+    a false-positive break every cycle (the EOD recon at 2026-05-27 22:30
+    UTC fired this exact failure mode: broker view showed market
+    ``"/M2K"`` qty 0, backend showed qty 1, a routine break landed).
+
+    Fix: for FUT (and OPT) positions, prefer ``pos.underlying_symbol``
+    when populated; fall back to ``pos.symbol`` when it's None. For
+    non-derivative rows (STK / CASH / FUND) the ``symbol`` is already
+    the canonical identifier so the underlying_symbol field is ignored.
 
     Zero-quantity positions are dropped (matches ``build_backend_view``)
     so the recon's symmetric-difference comparison doesn't generate
@@ -290,7 +313,9 @@ def build_broker_view(snapshot: ReconciliationSnapshot) -> BrokerView:
     for pos in snapshot.positions:
         if pos.quantity == 0:
             continue
-        market = f"/{pos.symbol}" if pos.sec_type in _FUTURES_ASSET_CATEGORIES else pos.symbol
+        market = _market_from_flex_symbol(
+            pos.symbol, pos.sec_type, underlying_symbol=pos.underlying_symbol
+        )
         positions[market] = positions.get(market, Decimal(0)) + pos.quantity
 
     cash_usd = Decimal(0)
@@ -424,12 +449,31 @@ class BackendRefreshResult:
     [BALANCE_SNAPSHOT_RECORDED, POSITION_MARK_TO_MARKET x N]."""
 
 
-def _market_from_flex_symbol(symbol: str, sec_type: str) -> str:
-    """Map a FlexQuery ``symbol`` + ``sec_type`` to the backend's
-    ``positions_current.market`` convention. Futures get a leading ``/``;
-    everything else passes through as-is. Mirrors the convention used
-    by :func:`build_broker_view`."""
-    return f"/{symbol}" if sec_type in _FUTURES_ASSET_CATEGORIES else symbol
+def _market_from_flex_symbol(
+    symbol: str, sec_type: str, *, underlying_symbol: str | None = None
+) -> str:
+    """Map a FlexQuery ``symbol`` + ``sec_type`` (+ optional
+    ``underlying_symbol``) to the backend's ``positions_current.market``
+    convention.
+
+    For FUT (and OPT-like derivative categories in ``_FUTURES_ASSET_CATEGORIES``),
+    prefer ``underlying_symbol`` when populated — IBKR's FlexQuery reports
+    the contract-month form (``"M2KM6"``) in ``symbol`` when the template
+    is configured that way, while ``underlyingSymbol`` carries the root
+    ticker (``"M2K"``). Falls back to ``symbol`` when ``underlying_symbol``
+    is None (older templates / parser samples that pre-date the
+    underlyingSymbol field).
+
+    Futures get a leading ``/`` (matches the backend's
+    ``positions_current.market`` convention + the
+    ``V1_CANDIDATE_UNIVERSE`` strings). Everything else (STK / FUND /
+    CASH) passes through as-is. Mirrors the convention used by
+    :func:`build_broker_view`.
+    """
+    if sec_type in _FUTURES_ASSET_CATEGORIES:
+        root = underlying_symbol if underlying_symbol else symbol
+        return f"/{root}"
+    return symbol
 
 
 async def refresh_backend_from_broker_snapshot(
@@ -539,7 +583,9 @@ async def refresh_backend_from_broker_snapshot(
         if pos.quantity == 0:
             continue  # closed; recon ignores zero-qty rows anyway
 
-        market = _market_from_flex_symbol(pos.symbol, pos.sec_type)
+        market = _market_from_flex_symbol(
+            pos.symbol, pos.sec_type, underlying_symbol=pos.underlying_symbol
+        )
 
         # Phase 1 contract_id=NULL match. If/when contract resolution
         # lands (Phase 2+), this query expands to take a contract_id.
@@ -725,6 +771,38 @@ async def run_eod_cycle(
 
     backend_view = await build_backend_view(session_factory, account_id=config.account_id)
     broker_view = build_broker_view(snapshot)
+
+    # Resilience signal: when backend has futures positions but the broker
+    # view returned ZERO futures positions, the FlexQuery template is
+    # almost certainly missing the OpenPositions FUT section (or it
+    # filtered FUT rows out). Without this warning, the recon planner
+    # silently emits one position_qty break per backend FUT market every
+    # cycle — operator sees "false break" with no clear pointer at the
+    # template config. This warning is non-blocking: the planner still
+    # runs + the breaks still land in audit + reconciliation_breaks (the
+    # operator may want to investigate via psql / Audit page), but the
+    # log line names the suspected root cause so triage is faster.
+    backend_fut_markets = {m for m in backend_view.positions if m.startswith("/")}
+    broker_fut_markets = {m for m in broker_view.positions if m.startswith("/")}
+    if backend_fut_markets and not broker_fut_markets:
+        log.warning(
+            "reconciliation_eod_cycle_broker_view_missing_futures",
+            account_id=str(config.account_id),
+            env=config.env,
+            backend_futures_markets=sorted(backend_fut_markets),
+            backend_futures_count=len(backend_fut_markets),
+            broker_position_count=len(broker_view.positions),
+            hint=(
+                "Backend has open FUT positions but the broker view returned "
+                "zero FUT rows. Likely root cause: the FlexQuery template is "
+                "missing the OpenPositions section for futures, or the "
+                "section is configured to filter out FUT rows. Update the "
+                "template in IBKR portal (Reports → Flex Queries) to include "
+                "OpenPositions for Futures. Recon will continue to flag a "
+                "position_qty break per backend FUT market until fixed."
+            ),
+        )
+
     prior_breaks = await fetch_prior_breaks_within_grace_window(
         session_factory, account_id=config.account_id
     )

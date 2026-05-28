@@ -84,16 +84,34 @@ _RETRYABLE_ERROR_CODES: Final[frozenset[int]] = frozenset({1019, 1020})
 
 @dataclass(frozen=True, slots=True)
 class FlexPosition:
-    """One open-position row from the FlexQuery `OpenPositions` element."""
+    """One open-position row from the FlexQuery `OpenPositions` element.
+
+    ``symbol`` carries IBKR's reported symbol — for futures this can be
+    EITHER the root ticker (e.g., ``"M2K"``, when the FlexQuery template
+    is configured to report root) OR the contract-month form (e.g.,
+    ``"M2KM6"``, when the template reports the full contract symbol).
+    The backend's ``positions_current.market`` convention is root-only with
+    a leading ``/`` (e.g., ``"/M2K"``); see `build_broker_view` for the
+    normalization that picks ``underlying_symbol`` over ``symbol`` when
+    populated.
+
+    ``underlying_symbol`` is IBKR's root ticker for derivatives (futures,
+    options). Populated unconditionally for FUT positions in standard
+    FlexQuery templates, but defensively typed Optional[str] because the
+    historic XML samples in our test corpus (pre-2026-05-27 fix) did not
+    carry it; the parser tolerates its absence and the downstream view
+    builder falls back to ``symbol`` in that case.
+    """
 
     account_id: str
-    symbol: str  # IBKR's symbol; e.g., "MES" for futures, "TLT" for ETFs
+    symbol: str  # IBKR's symbol; root ("MES") OR contract-month ("MESM6")
     sec_type: str  # FUT / STK / OPT / CASH
     quantity: Decimal  # signed: positive=long, negative=short
     avg_cost_usd: Decimal
     market_price_usd: Decimal | None
     market_value_usd: Decimal | None
     unrealized_pnl_usd: Decimal | None
+    underlying_symbol: str | None = None  # FUT/OPT root ticker; None when absent
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,6 +280,16 @@ def parse_flex_xml(xml_text: str) -> ReconciliationSnapshot:
     # OpenPositions — zero+ rows.
     positions: list[FlexPosition] = []
     for pos_elem in statement.findall(".//OpenPosition"):
+        # IBKR's FlexQuery emits `underlyingSymbol` as the root ticker for
+        # derivatives (FUT / OPT). When absent (older templates / CASH
+        # rows / certain XML samples), default to None and let the
+        # downstream view builder fall back to `symbol`.
+        underlying_raw = pos_elem.get("underlyingSymbol")
+        underlying = (
+            underlying_raw.strip()
+            if underlying_raw is not None and underlying_raw.strip() != ""
+            else None
+        )
         positions.append(
             FlexPosition(
                 account_id=account_id,
@@ -274,6 +302,7 @@ def parse_flex_xml(xml_text: str) -> ReconciliationSnapshot:
                 market_price_usd=_parse_decimal(pos_elem.get("markPrice")),
                 market_value_usd=_parse_decimal(pos_elem.get("positionValue")),
                 unrealized_pnl_usd=_parse_decimal(pos_elem.get("fifoPnlUnrealized")),
+                underlying_symbol=underlying,
             )
         )
 
