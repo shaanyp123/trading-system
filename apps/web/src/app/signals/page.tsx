@@ -25,6 +25,7 @@
 import Link from 'next/link';
 
 import { QueuedSignals } from '@/components/today/queued-signals';
+import { WatchingSection } from '@/components/signals/WatchingSection';
 
 export default function SignalsPage(): JSX.Element {
   return (
@@ -38,6 +39,7 @@ export default function SignalsPage(): JSX.Element {
           page&apos;s Queued Signals tile.
         </p>
       </div>
+      <WatchingSection />
       <QueuedSignals />
     </div>
   );
