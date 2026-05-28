@@ -52,12 +52,26 @@ volumes:
   postgres_data:
   lean_data:
 
+# Persistent log retention — see docker-compose.yml `x-journald-logging`
+# block for the full rationale (2026-05-27 incident: 17:09 UTC api recreate
+# destroyed pre-restart json-file logs). journald driver pipes container
+# stdout/stderr to host systemd journal (`/var/log/journal/`), which
+# survives container recreate trivially. `docker logs <container>` still
+# works; `journalctl CONTAINER_NAME=trading-live-api-1 --since "1h ago"`
+# adds forensic queryability. Pre-deploy operator steps documented in the
+# PR description.
+x-journald-logging: &journald-logging
+  driver: journald
+  options:
+    tag: "{{.Name}}"
+
 services:
 
   # ---- API (FastAPI + uvicorn + workers) -------------------------------
   api:
     image: ghcr.io/${GHCR_OWNER:?set GHCR_OWNER in deploy/.env.live}/trading-api:${RELEASE_SHA:-latest}
     restart: unless-stopped
+    logging: *journald-logging
     networks: [internal, egress]
     environment:
       API_ENVIRONMENT: ${ENVIRONMENT:-live-small}
@@ -96,6 +110,7 @@ services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    logging: *journald-logging
     networks: [internal]
     environment:
       POSTGRES_USER: postgres
@@ -121,6 +136,7 @@ services:
   ib_gateway:
     image: ghcr.io/gnzsnz/ib-gateway:stable
     restart: unless-stopped
+    logging: *journald-logging
     networks: [internal, egress]
     labels:
       autoheal: 'true'
@@ -161,6 +177,7 @@ services:
   autoheal:
     image: willfarrell/autoheal:latest
     restart: unless-stopped
+    logging: *journald-logging
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
