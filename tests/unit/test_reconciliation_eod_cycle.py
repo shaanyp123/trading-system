@@ -96,6 +96,7 @@ def _flex_pos(
     symbol: str = "MES",
     sec_type: str = "FUT",
     quantity: str = "1",
+    underlying_symbol: str | None = None,
 ) -> FlexPosition:
     return FlexPosition(
         account_id="DUQ825170",
@@ -106,6 +107,7 @@ def _flex_pos(
         market_price_usd=Decimal("5234"),
         market_value_usd=Decimal("26170"),
         unrealized_pnl_usd=Decimal("20"),
+        underlying_symbol=underlying_symbol,
     )
 
 
@@ -186,6 +188,104 @@ class TestBuildBrokerView:
         snap = _build_snapshot(positions=(_flex_pos(symbol="MES", quantity="-1"),))
         view = build_broker_view(snap)
         assert view.positions == {"/MES": Decimal("-1")}
+
+
+class TestBuildBrokerViewFuturesNormalization:
+    """Tests for the 2026-05-27 fix: prefer ``underlying_symbol`` over
+    ``symbol`` for FUT positions so the broker view's market key matches
+    the backend's root-ticker convention.
+
+    Failure mode this locks down: pre-fix, a FlexQuery template emitting
+    ``symbol="M2KM6"`` (contract-month form, June 2026 micro Russell
+    2000) produced a broker-view market of ``"/M2KM6"``, which never
+    matched backend's ``"/M2K"`` → false-positive ``position_qty`` break
+    every EOD cycle. The 2026-05-27 22:30 UTC recon fired this exact case.
+    """
+
+    def test_fut_with_underlying_symbol_uses_underlying(self) -> None:
+        # The production-shape XML: symbol=M2KM6 (contract month),
+        # underlyingSymbol=M2K (root ticker). The broker view's market
+        # MUST normalize to /M2K so it matches backend's positions_current.
+        snap = _build_snapshot(
+            positions=(
+                _flex_pos(
+                    symbol="M2KM6",
+                    sec_type="FUT",
+                    quantity="1",
+                    underlying_symbol="M2K",
+                ),
+            )
+        )
+        view = build_broker_view(snap)
+        assert view.positions == {"/M2K": Decimal("1")}
+
+    def test_fut_without_underlying_symbol_falls_back_to_symbol(self) -> None:
+        # Older templates (and the sample XML in our test corpus) emit
+        # symbol=MES (root) with no underlyingSymbol attribute → parser
+        # defaults underlying_symbol to None → view builder falls back to
+        # symbol. Backwards-compat contract.
+        snap = _build_snapshot(
+            positions=(
+                _flex_pos(symbol="MES", sec_type="FUT", quantity="1", underlying_symbol=None),
+            )
+        )
+        view = build_broker_view(snap)
+        assert view.positions == {"/MES": Decimal("1")}
+
+    def test_fut_with_empty_underlying_symbol_falls_back_to_symbol(self) -> None:
+        # The parser converts empty-string underlyingSymbol to None, so
+        # this case shouldn't reach the view builder in practice. But
+        # the view builder is defensive: an empty/falsy underlying_symbol
+        # also falls back to ``symbol``.
+        snap = _build_snapshot(
+            positions=(_flex_pos(symbol="MES", sec_type="FUT", quantity="1", underlying_symbol=""),)
+        )
+        view = build_broker_view(snap)
+        assert view.positions == {"/MES": Decimal("1")}
+
+    def test_stk_ignores_underlying_symbol(self) -> None:
+        # STK rows (ETFs / equities) have no derivative root; their
+        # ``symbol`` IS the canonical identifier. Even if the FlexQuery
+        # template somehow populates underlyingSymbol on a STK row, the
+        # view builder must NOT prepend the slash + must NOT use
+        # underlyingSymbol (that would silently break ETF reconciliation).
+        snap = _build_snapshot(
+            positions=(
+                _flex_pos(
+                    symbol="TLT",
+                    sec_type="STK",
+                    quantity="100",
+                    underlying_symbol="NOT_USED",
+                ),
+            )
+        )
+        view = build_broker_view(snap)
+        assert view.positions == {"TLT": Decimal("100")}
+
+    def test_fut_contract_month_rows_aggregate_on_root(self) -> None:
+        # A roll-window snapshot could carry both M2KM6 + M2KU6 (June +
+        # September 2026 contracts) — both underlyingSymbol=M2K. After
+        # normalization, both rows aggregate onto the single ``/M2K``
+        # market. Mirrors the test_same_market_sum_aggregates contract
+        # but exercises the normalization path.
+        snap = _build_snapshot(
+            positions=(
+                _flex_pos(
+                    symbol="M2KM6",
+                    sec_type="FUT",
+                    quantity="1",
+                    underlying_symbol="M2K",
+                ),
+                _flex_pos(
+                    symbol="M2KU6",
+                    sec_type="FUT",
+                    quantity="2",
+                    underlying_symbol="M2K",
+                ),
+            )
+        )
+        view = build_broker_view(snap)
+        assert view.positions == {"/M2K": Decimal("3")}
 
 
 class TestBuildBrokerViewCashFallback:
@@ -454,6 +554,163 @@ class TestRunEodCycleOrchestrator:
         # (delta > tolerance since equity_baseline=0 means bps tolerance=0).
         plan = captured["plan"]
         assert any(b.metric.value == "cash_usd" for b in plan.breaks_detected)
+
+
+class TestRunEodCycleBrokerMissingFuturesWarning:
+    """Tests for the 2026-05-27 resilience signal: when backend has open
+    FUT positions but the broker view returned ZERO FUT rows, emit a
+    structured warning naming the suspected root cause (FlexQuery template
+    missing OpenPositions FUT section).
+
+    Without this signal, the recon planner emits a position_qty break per
+    backend FUT market every cycle + the operator sees "false break" with
+    no pointer at the underlying template-config issue. The 2026-05-27
+    22:30 UTC false-positive landed in audit + reconciliation_breaks with
+    no log line naming the suspected cause — operator had to read the
+    flex_query_fetcher source to triage.
+    """
+
+    async def test_warning_fires_when_backend_fut_but_no_broker_fut(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import structlog
+
+        config = EodCycleConfig(
+            account_id=uuid4(),
+            env="paper",
+            flex_query_id=1,
+            flex_query_token="t",
+        )
+        # Broker snapshot: ZERO positions (template missing FUT section).
+        snap = _build_snapshot(
+            cash_balances=(FlexCashBalance(currency="USD", balance=Decimal("100000")),),
+        )
+        client = MagicMock()
+        client.fetch_snapshot = AsyncMock(return_value=snap)
+
+        # Backend: one /M2K futures position (mirrors the 2026-05-27 EOD
+        # break shape exactly).
+        factory = _stub_session_factory(
+            positions=[{"market": "/M2K", "qty": 1}],
+            balance={"cash_usd": Decimal("100000"), "net_liquidation": Decimal("105000")},
+        )
+
+        async def fake_apply(plan: Any, **kwargs: Any) -> MagicMock:
+            mock_result = MagicMock()
+            mock_result.kill_switch_invoked = False
+            return mock_result
+
+        monkeypatch.setattr(
+            "services.reconciliation.eod_cycle.apply_reconciliation_plan", fake_apply
+        )
+
+        with structlog.testing.capture_logs() as captured:
+            await run_eod_cycle(
+                config=config, session_factory=factory, flex_client_factory=lambda: client
+            )
+
+        events = [c.get("event") for c in captured]
+        assert "reconciliation_eod_cycle_broker_view_missing_futures" in events
+        warning = next(
+            c
+            for c in captured
+            if c.get("event") == "reconciliation_eod_cycle_broker_view_missing_futures"
+        )
+        assert warning["backend_futures_markets"] == ["/M2K"]
+        assert warning["backend_futures_count"] == 1
+        assert warning["broker_position_count"] == 0
+        assert warning["log_level"] == "warning"
+        # The hint string should name the suspected root cause so triage
+        # is fast — operator can read structlog output + immediately know
+        # to check the FlexQuery template config in IBKR portal.
+        assert "FlexQuery template" in warning["hint"]
+        assert "OpenPositions" in warning["hint"]
+
+    async def test_warning_silent_when_broker_has_fut(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Happy path: broker view has FUT rows (M2K), so the resilience
+        # signal stays silent. We must not log on every healthy cycle.
+        import structlog
+
+        config = EodCycleConfig(
+            account_id=uuid4(),
+            env="paper",
+            flex_query_id=1,
+            flex_query_token="t",
+        )
+        snap = _build_snapshot(
+            positions=(
+                _flex_pos(symbol="M2KM6", sec_type="FUT", quantity="1", underlying_symbol="M2K"),
+            ),
+            cash_balances=(FlexCashBalance(currency="USD", balance=Decimal("100000")),),
+        )
+        client = MagicMock()
+        client.fetch_snapshot = AsyncMock(return_value=snap)
+        factory = _stub_session_factory(
+            positions=[{"market": "/M2K", "qty": 1}],
+            balance={"cash_usd": Decimal("100000"), "net_liquidation": Decimal("105000")},
+        )
+
+        async def fake_apply(plan: Any, **kwargs: Any) -> MagicMock:
+            mock_result = MagicMock()
+            mock_result.kill_switch_invoked = False
+            return mock_result
+
+        monkeypatch.setattr(
+            "services.reconciliation.eod_cycle.apply_reconciliation_plan", fake_apply
+        )
+
+        with structlog.testing.capture_logs() as captured:
+            await run_eod_cycle(
+                config=config, session_factory=factory, flex_client_factory=lambda: client
+            )
+
+        events = [c.get("event") for c in captured]
+        assert "reconciliation_eod_cycle_broker_view_missing_futures" not in events
+
+    async def test_warning_silent_when_backend_has_no_fut(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # When backend has only ETFs (no FUT), the warning must NOT fire
+        # even if broker view also has no FUT. (Backend has no FUT means
+        # there's nothing for the FlexQuery template to omit; absence is
+        # the correct behavior, not a misconfig.)
+        import structlog
+
+        config = EodCycleConfig(
+            account_id=uuid4(),
+            env="paper",
+            flex_query_id=1,
+            flex_query_token="t",
+        )
+        snap = _build_snapshot(
+            positions=(_flex_pos(symbol="TLT", sec_type="STK", quantity="50"),),
+            cash_balances=(FlexCashBalance(currency="USD", balance=Decimal("5000")),),
+        )
+        client = MagicMock()
+        client.fetch_snapshot = AsyncMock(return_value=snap)
+        factory = _stub_session_factory(
+            positions=[{"market": "TLT", "qty": 50}],
+            balance={"cash_usd": Decimal("5000"), "net_liquidation": Decimal("10000")},
+        )
+
+        async def fake_apply(plan: Any, **kwargs: Any) -> MagicMock:
+            mock_result = MagicMock()
+            mock_result.kill_switch_invoked = False
+            return mock_result
+
+        monkeypatch.setattr(
+            "services.reconciliation.eod_cycle.apply_reconciliation_plan", fake_apply
+        )
+
+        with structlog.testing.capture_logs() as captured:
+            await run_eod_cycle(
+                config=config, session_factory=factory, flex_client_factory=lambda: client
+            )
+
+        events = [c.get("event") for c in captured]
+        assert "reconciliation_eod_cycle_broker_view_missing_futures" not in events
 
 
 class TestMakeCycleCallback:
