@@ -33,12 +33,104 @@ volumes:
   # (slower first cycle but no operator-side prep needed).
   lean_data:
 
+# ---- Persistent log retention -----------------------------------------------
+# Forensic-data preservation across container recreate (2026-05-27).
+#
+# **Why this exists.** Today's incident lost the pre-restart api logs: api was
+# redeployed at 17:09 UTC and the old container's `json-file` log
+# (/var/lib/docker/containers/<old-id>/<old-id>-json.log) was destroyed with
+# the container. The M2K orderStatus events were impossible to reconstruct
+# after the fact. Default Docker behavior is to delete a container's log file
+# when the container itself is removed — which `docker compose up -d` does
+# every time the image tag changes (i.e., every release).
+#
+# **Mechanism — journald log driver.** Docker's `journald` driver pipes
+# container stdout/stderr to the host's systemd journal
+# (`/var/log/journal/`), NOT to per-container directories under
+# `/var/lib/docker/containers/`. The journal is host-owned, so it survives
+# container recreate trivially. `docker logs <container>` still works
+# (Docker reads from journald transparently when the driver is journald);
+# `journalctl` adds forensic queryability across container generations.
+#
+# **Why not the literal "json-file with bind-mount" pattern.** Docker's
+# `json-file` driver writes to `/var/lib/docker/containers/<id>/<id>-json.log`
+# and provides no per-service `path` option in compose — you cannot relocate
+# its output to a bind-mounted `/var/log/trading/<service>/` without
+# modifying application behavior (e.g., teeing stdout via a wrapper). The
+# `local` driver has the same constraint. Adding `max-size` + `max-file`
+# to json-file gives intra-container rotation but does NOT survive
+# container recreate — the directory is removed with the container.
+# journald is the canonical Docker-supported answer for "logs survive
+# container recreate, no app changes, queryable from host."
+#
+# **Retention bounds.** journald rotation is host-configured via
+# `/etc/systemd/journald.conf` (defaults: `SystemMaxUse=4G` or 10% of disk,
+# whichever is smaller; persistent storage at `/var/log/journal/`). The
+# operator pre-deploy step (see PR description) bumps these to keep ~7
+# days of all-container output, which exceeds the 24h forensic window
+# we need for incidents like today's. Per-service caps via `journald`
+# driver options are NOT supported — bounding is global at the journald
+# level, which is fine because the goal is host-level retention, not
+# per-container.
+#
+# **Operator query patterns.** All journald entries from compose-managed
+# containers carry `CONTAINER_NAME=trading-<service>-<n>` and the `tag`
+# below populates `SYSLOG_IDENTIFIER`/`CONTAINER_TAG`:
+#   journalctl CONTAINER_NAME=trading-api-1 --since "1 hour ago"
+#   journalctl CONTAINER_TAG=trading-api-1 --since "2026-05-27 17:00"
+#   journalctl -u docker --since "1 hour ago"  # all docker output
+# Forensic exports for incident packets:
+#   journalctl CONTAINER_NAME=trading-api-1 --since "@<unix-ts>" \
+#       --until "@<unix-ts>" --output=json > /tmp/incident-api.jsonl
+#
+# **Trade-offs.**
+#   - `docker logs --since` works but is bounded by journald's retention,
+#     not the (now-gone) per-container file. After today, that's an
+#     improvement (more retention, not less).
+#   - journald format is not the same as raw json-file. Tools that grep
+#     `/var/lib/docker/containers/.../-json.log` directly will need to
+#     migrate to `journalctl` — verified no in-repo scripts do this.
+#   - Disk usage moves from `/var/lib/docker/containers/` to
+#     `/var/log/journal/`. Both are on the root volume on Hetzner; net
+#     disk impact is roughly neutral.
+#
+# **Pre-deploy operator steps** (one-time on the VPS; documented in PR):
+#   1. Ensure persistent journal: `sudo mkdir -p /var/log/journal &&
+#      sudo systemctl restart systemd-journald` (idempotent — directory
+#      may already exist on modern systemd).
+#   2. Bump retention if desired: edit /etc/systemd/journald.conf,
+#      set `SystemMaxUse=8G` (or appropriate cap), then
+#      `sudo systemctl restart systemd-journald`.
+#   3. `docker compose up -d` (normal flow) — new containers pick up the
+#      journald driver. Old containers continue with their existing
+#      driver until next recreate; force-recreate if immediate cutover
+#      is needed: `docker compose up -d --force-recreate`.
+#
+# **Applied to.** All stateful services that emit forensically useful
+# diagnostics in the default + phase2 profile (today's operational
+# surface): caddy, api, postgres, nextjs, discord_bot, webhook_pusher,
+# ib_gateway, lean_local, autoheal. Profile-gated `phase1` services
+# (signal, risk, execution, reconciliation, audit, calibration,
+# scheduler, monitoring, agent, prometheus, grafana, gitea) and the
+# dormant qc_adapter are skipped — they don't run on the active stack
+# today, so adding the driver field there is noise. They can adopt the
+# same pattern when their Dockerfiles land.
+x-journald-logging: &journald-logging
+  driver: journald
+  options:
+    # tag populates journald's SYSLOG_IDENTIFIER + CONTAINER_TAG. Using
+    # `{{.Name}}` (compose service name) gives a stable, predictable
+    # identifier independent of container ID, so
+    # `journalctl CONTAINER_TAG=trading-api` works across recreates.
+    tag: "{{.Name}}"
+
 services:
 
   # ---- Reverse proxy / TLS ----------------------------------------------
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
+    logging: *journald-logging
     networks: [internal, egress]
     ports:
       - '80:80'
@@ -84,6 +176,7 @@ services:
       context: .
       dockerfile: services/api/Dockerfile
     restart: unless-stopped
+    logging: *journald-logging
     # The api needs egress in addition to internal to reach IBKR's
     # FlexQuery REST endpoint at ndcdyn.interactivebrokers.com (used
     # by the reconciliation scheduler at services/reconciliation/**).
@@ -145,6 +238,7 @@ services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    logging: *journald-logging
     networks: [internal]
     environment:
       POSTGRES_USER: postgres
@@ -267,6 +361,7 @@ services:
       context: .
       dockerfile: services/discord_bot/Dockerfile
     restart: unless-stopped
+    logging: *journald-logging
     networks: [internal, egress]
     environment:
       ENVIRONMENT: ${ENVIRONMENT:-paper}
@@ -307,6 +402,7 @@ services:
       context: .
       dockerfile: services/webhook_pusher/Dockerfile
     restart: unless-stopped
+    logging: *journald-logging
     networks: [internal, egress]
     environment:
       WEBHOOK_PUSHER_LOG_LEVEL: ${WEBHOOK_PUSHER_LOG_LEVEL:-INFO}
@@ -341,6 +437,7 @@ services:
       context: apps/web
       dockerfile: Dockerfile
     restart: unless-stopped
+    logging: *journald-logging
     networks: [internal]
     environment:
       NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:-http://api:8000}
@@ -425,6 +522,7 @@ services:
   ib_gateway:
     image: ghcr.io/gnzsnz/ib-gateway:stable
     restart: unless-stopped
+    logging: *journald-logging
     networks: [internal, egress]
     labels:
       # Mark this container as a target for the autoheal sidecar (see
@@ -553,6 +651,7 @@ services:
   autoheal:
     image: willfarrell/autoheal:latest
     restart: unless-stopped
+    logging: *journald-logging
     # No networks needed — autoheal only uses the Docker socket
     # (mounted below) to query container health + invoke restarts.
     # Joining `internal` for consistency with other internal-only
@@ -620,6 +719,7 @@ services:
       context: .
       dockerfile: infrastructure/lean_local/Dockerfile
     restart: unless-stopped
+    logging: *journald-logging
     # Internal-only network (post data-layer-pivot-v2 2026-05-20 evening;
     # Option C). The v1 attempt at the 2026-05-20 sub-pivot added `egress`
     # so the QC IBKR plugin could hit www.quantconnect.com:443 for
