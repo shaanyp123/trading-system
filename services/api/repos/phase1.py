@@ -348,11 +348,23 @@ class PostgresPhase1QueryRepo:
         cursor: str | None,
         limit: int,
     ) -> tuple[list[dict[str, object]], str | None, bool]:
-        # Phase 0: signals table is empty; query runs but returns 0 rows.
-        # Status filter is applied as a parametrized clause when set.
+        # 2026-05-28 fix: previously this query SELECTed only 6 columns and
+        # the route handler discarded ``_rows`` entirely + returned items=[].
+        # Now selects the full 14-column projection needed by SignalSummary +
+        # the route handler maps each row to the Pydantic model. expires_at_utc
+        # is COALESCEd to emitted_at_utc + 24h because the qc_adapter INSERT
+        # path doesn't set it (see services/qc_adapter/db.py::insert_signal_row);
+        # the synthesized value matches the strategy's session-cycle cadence
+        # — a new emission on the next 21:30 UTC cycle supersedes this signal,
+        # so 24h is an upper bound on "still actionable".
         params: dict[str, object] = {"acc": account_id, "lim": limit}
         sql = (
-            "SELECT id, market, direction, status, emitted_at_utc, expires_at_utc "
+            "SELECT id, market, direction, target_contracts, "
+            "       decision_price, expected_fill_price, expected_slippage_bps, "
+            "       unsettled, anomaly_reasons, status, emitted_at_utc, "
+            "       COALESCE(expires_at_utc, emitted_at_utc + INTERVAL '24 hours') "
+            "         AS expires_at_utc, "
+            "       strategy_hash, parameter_set_hash "
             "FROM signals WHERE account_id = :acc"
         )
         if status:
@@ -361,8 +373,10 @@ class PostgresPhase1QueryRepo:
         sql += " ORDER BY emitted_at_utc DESC LIMIT :lim"
         rows = (await self._session.execute(text(sql), params)).fetchall()
         items = [dict(r._mapping) for r in rows]
-        # Phase 0 always returns has_more=False because no data exists; the
-        # cursor stays None. Real cursor encoding lands when signals populate.
+        # Cursor encoding still deferred — Phase 0 strategies emit at most 11
+        # signals per session and the limit defaults to 50, so the first page
+        # always contains every row currently in the table. When the cursor
+        # truly matters (Phase 1+ multi-strategy), revisit.
         return items, None, False
 
     # --- positions_current -------------------------------------------------

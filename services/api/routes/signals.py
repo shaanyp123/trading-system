@@ -18,7 +18,7 @@ PR-D scope; a follow-up consumes approved signals + places orders.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any, Final, Literal
 from uuid import UUID
 
 import structlog
@@ -42,6 +42,7 @@ from services.api.schemas.signals import (
     SignalDeferRequest,
     SignalListResponse,
     SignalRejectRequest,
+    SignalSummary,
 )
 from services.api.session import SessionContext, get_session_context
 from services.api.sse import emit_sse
@@ -147,20 +148,74 @@ async def list_signals(
         # account materializes.
         return SignalListResponse(items=[], next_cursor=None, has_more=False)
 
-    _rows, next_cursor, has_more = await repo.fetch_signals_page(
+    rows, next_cursor, has_more = await repo.fetch_signals_page(
         account_id,
         status=status,
         cursor=cursor,
         limit=clamp_limit(limit),
     )
-    # Phase 0: signals table is empty, so _rows is always []. The deliberate
-    # empty-list return is the spec's scaffold-only shape; the row-to-
-    # SignalSummary mapper lands when the dispatcher PR (Week 4 Wed) wires
-    # signal emission and we have real data to map.
+    # 2026-05-28 fix: previously this returned items=[] unconditionally. The
+    # original Day-15 comment noted "the row-to-SignalSummary mapper lands when
+    # the dispatcher PR (Week 4 Wed) wires signal emission" — the dispatcher
+    # PR shipped (signals ARE emitted nightly by LEAN now), but the mapper
+    # never landed. Tonight (2026-05-28 21:30 UTC) the first real signal that
+    # required UI interaction surfaced the gap. See `Docs/decisions-log.md`
+    # 2026-05-28 entry. The repo query at services/api/repos/phase1.py was
+    # also updated to select the full SignalSummary projection +
+    # COALESCE(expires_at_utc, emitted_at_utc + 24h) since the lean-ingest
+    # path doesn't set the column.
     return SignalListResponse(
-        items=[],
+        items=[_row_to_signal_summary(r) for r in rows],
         next_cursor=next_cursor,
         has_more=has_more,
+    )
+
+
+# Both signals table hashes are stored full-length (CHAR(40) for strategy_hash
+# = SHA-1 hex; CHAR(64) for parameter_set_hash = SHA-256 hex). The frontend
+# only renders a short prefix in the queued-signals tile (frontend-spec
+# §2.2.2). The 8-char window is the git-short-hash convention — enough entropy
+# (32 bits) that a session's 11 markets x Phase 1 universe never collide.
+_SHORT_HASH_CHARS: Final[int] = 8
+
+
+def _row_to_signal_summary(row: dict[str, Any]) -> SignalSummary:
+    """Map a `signals` table row dict to the wire-shape Pydantic model.
+
+    Field deltas vs. the raw row:
+    * ``id``: Pydantic accepts the row's ``id`` UUID directly.
+    * ``strategy_hash`` (40 chars) → ``strategy_short_hash`` (first 8 chars).
+    * ``parameter_set_hash`` (64 chars) → ``parameter_set_short_hash``
+      (first 8 chars).
+    * ``anomaly_reasons``: Postgres returns the TEXT[] column as a Python
+      ``list[str]``. Pydantic validates each entry against the
+      ``SignalAnomalyReason`` Literal union — an unknown reason would 422.
+      Phase 0 the column defaults to ``'{}'`` (empty list) on insert.
+    * ``expires_at_utc``: the repo query COALESCEs this to ``emitted_at_utc +
+      24h`` when the column is NULL, so the wire shape is always non-null
+      and the frontend's ``string`` typing holds.
+    All other fields pass through unchanged.
+    """
+    strategy_hash = str(row["strategy_hash"])
+    parameter_set_hash = str(row["parameter_set_hash"])
+    # Pydantic v2 validates Literal unions on construction so direction +
+    # status pass through as ``Any``; mypy can't see the Literal narrowing
+    # but the schema guarantees a 422 on any unknown value at runtime.
+    return SignalSummary(
+        id=row["id"],
+        market=str(row["market"]),
+        direction=row["direction"],
+        target_contracts=int(row["target_contracts"]),
+        decision_price=row["decision_price"],
+        expected_fill_price=row["expected_fill_price"],
+        expected_slippage_bps=row["expected_slippage_bps"],
+        unsettled=bool(row["unsettled"]),
+        anomaly_reasons=row["anomaly_reasons"] or [],
+        status=row["status"],
+        emitted_at_utc=row["emitted_at_utc"],
+        expires_at_utc=row["expires_at_utc"],
+        strategy_short_hash=strategy_hash[:_SHORT_HASH_CHARS],
+        parameter_set_short_hash=parameter_set_hash[:_SHORT_HASH_CHARS],
     )
 
 

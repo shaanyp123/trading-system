@@ -547,6 +547,124 @@ class TestListSignals:
             "limit": 25,
         }
 
+    @pytest.mark.asyncio
+    async def test_repo_rows_are_mapped_to_signal_summary(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        """2026-05-28 regression — pre-fix this route returned items=[]
+        unconditionally even when the repo returned rows. See
+        ``Docs/decisions-log.md`` 2026-05-28 entry for the gap.
+
+        Exercises the row-to-SignalSummary mapper end-to-end: a single
+        pending /MES long entry row (modeled on the actual 21:30 UTC
+        signal that surfaced the bug) round-trips through the route +
+        Pydantic validation + JSON serialization with every SignalSummary
+        field present + correctly typed.
+        """
+        signal_id = uuid4()
+        emitted_at = datetime(2026, 5, 28, 21, 30, 1, tzinfo=UTC)
+        expires_at = datetime(2026, 5, 29, 21, 30, 1, tzinfo=UTC)
+        repo = _StubRepo(
+            account_id=uuid4(),
+            signals_page=(
+                [
+                    {
+                        "id": signal_id,
+                        "market": "/MES",
+                        "direction": "long",
+                        "target_contracts": 1,
+                        "decision_price": Decimal("7587.75"),
+                        "expected_fill_price": None,
+                        "expected_slippage_bps": None,
+                        "unsettled": False,
+                        "anomaly_reasons": [],
+                        "status": "pending",
+                        "emitted_at_utc": emitted_at,
+                        "expires_at_utc": expires_at,
+                        # CHAR(40) SHA-1 hex for strategy_hash
+                        "strategy_hash": "a" * 40,
+                        # CHAR(64) SHA-256 hex for parameter_set_hash
+                        "parameter_set_hash": "b" * 64,
+                    }
+                ],
+                None,
+                False,
+            ),
+        )
+        _bind_repo(override_dep, signals_route, repo)
+        response = await api_client.get("/api/signals?status=pending")
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["next_cursor"] is None
+        assert body["has_more"] is False
+        assert len(body["items"]) == 1
+        item = body["items"][0]
+        assert item["id"] == str(signal_id)
+        assert item["market"] == "/MES"
+        assert item["direction"] == "long"
+        assert item["target_contracts"] == 1
+        # Decimal serialises as string per dev-guide §3.8 wire contract
+        assert item["decision_price"] == "7587.75"
+        assert item["expected_fill_price"] is None
+        assert item["expected_slippage_bps"] is None
+        assert item["unsettled"] is False
+        assert item["anomaly_reasons"] == []
+        assert item["status"] == "pending"
+        # 8-char git-short-hash convention truncation
+        assert item["strategy_short_hash"] == "aaaaaaaa"
+        assert item["parameter_set_short_hash"] == "bbbbbbbb"
+
+    @pytest.mark.asyncio
+    async def test_anomaly_reasons_pass_through_unchanged(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        """The Postgres TEXT[] column comes back as ``list[str]``; each
+        entry is validated against the ``SignalAnomalyReason`` Literal
+        union by Pydantic. Two valid reasons survive; an empty list
+        survives unchanged (the default DB value).
+        """
+        repo = _StubRepo(
+            account_id=uuid4(),
+            signals_page=(
+                [
+                    {
+                        "id": uuid4(),
+                        "market": "/MES",
+                        "direction": "long",
+                        "target_contracts": 1,
+                        "decision_price": Decimal("7587.75"),
+                        "expected_fill_price": None,
+                        "expected_slippage_bps": None,
+                        "unsettled": True,
+                        "anomaly_reasons": [
+                            "vol_regime_z_high",
+                            "slippage_outlier_recent",
+                        ],
+                        "status": "pending",
+                        "emitted_at_utc": datetime(2026, 5, 28, 21, 30, 1, tzinfo=UTC),
+                        "expires_at_utc": datetime(2026, 5, 29, 21, 30, 1, tzinfo=UTC),
+                        "strategy_hash": "c" * 40,
+                        "parameter_set_hash": "d" * 64,
+                    }
+                ],
+                None,
+                False,
+            ),
+        )
+        _bind_repo(override_dep, signals_route, repo)
+        response = await api_client.get("/api/signals?status=pending")
+        assert response.status_code == 200, response.text
+        item = response.json()["items"][0]
+        assert item["unsettled"] is True
+        assert item["anomaly_reasons"] == [
+            "vol_regime_z_high",
+            "slippage_outlier_recent",
+        ]
+
 
 class TestSignalApprove:
     """Pivot-PR-D (post-pivot 2026-05-12): the 501 stub is replaced by a real
