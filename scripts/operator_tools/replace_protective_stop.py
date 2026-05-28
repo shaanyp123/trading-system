@@ -49,6 +49,21 @@ Hard constraints
   ``ibkr_client.place_order`` so the intent is durable even if the
   broker call hangs. Mirrors the contract in
   ``services/risk/order_placement_worker.apply_exit_close_placement``.
+* **One-shot ack observation.** The tool's IBKR clientId is one-shot
+  (dedicated 80-99 lane disconnected on exit). Unlike the long-lived
+  :class:`services.risk.order_placement_worker.OrderPlacementWorker`,
+  there is no background ``subscribe_order_status`` consumer that
+  will eventually observe the PendingSubmit → PreSubmitted/Submitted
+  transition and propagate it into the ``orders`` row. The tool
+  therefore subscribes to broker order-status events on its OWN
+  clientId BEFORE calling ``place_order`` + waits briefly
+  (``ACK_WAIT_TIMEOUT_SECONDS``) for the first transition to land,
+  then UPDATEs the orders row with the observed status +
+  ``acknowledged_at_utc``. On timeout, the row stays
+  ``status='pending'`` (pre-fix behavior preserved; reconciliation
+  closes the gap). See the 2026-05-27 /M2K incident
+  (client_order_id=b5237aed-b07925a7-019e66d3-stop-replace-0) for
+  the failure mode that motivated this code path.
 * **Operator-tool clientId range.** Defaults to 99 (same as
   ``replay_executions.py``); operator passes ``--client-id`` to use a
   different lane (80-99 reserved per
@@ -181,7 +196,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from services.audit.event_types import AuditEventType
 from services.audit.writer import Environment, append_audit_event
 from services.execution.ibkr_adapter import PHASE1_TICK_SIZES, round_to_tick
-from services.execution.types import IbkrOrderSide, IbkrPlacementError, IbkrPlaceOrderRequest
+from services.execution.types import (
+    IbkrOrderSide,
+    IbkrPlacementError,
+    IbkrPlaceOrderRequest,
+    OrderStatusUpdate,
+)
 
 log = structlog.get_logger()
 
@@ -227,6 +247,29 @@ CONNECT_TIMEOUT_SECONDS: Final[float] = 30.0
 #: pattern from 2026-05-17 drill 2 also applies here (ib-async can
 #: hang indefinitely under broker-side sluggishness).
 PLACE_ORDER_TIMEOUT_SECONDS: Final[float] = 30.0
+
+#: Maximum wall-clock budget to wait for the broker's initial
+#: ``orderStatus`` event after ``place_order`` returns. The tool's
+#: dedicated clientId is one-shot — unlike the long-lived
+#: order_placement_worker, we have no background subscription that
+#: will eventually observe the PendingSubmit → PreSubmitted / Submitted
+#: transition. Without this wait, the DB row stays
+#: ``status='pending'`` + ``acknowledged_at_utc=NULL`` forever even
+#: though the order is live at IBKR. 2026-05-27 /M2K replacement
+#: stop incident: client_order_id=b5237aed-b07925a7-019e66d3-stop-replace-0
+#: placed cleanly on clientId=99 (PreSubmitted at IBKR per
+#: reqAllOpenOrdersAsync) but the DB row showed status='pending'
+#: because the tool disconnected before the status event arrived.
+#: ib-async typically delivers the first transition within 50-200ms;
+#: 2s gives a generous head-room without bloating the dry-run / happy-
+#: path runtime.
+ACK_WAIT_TIMEOUT_SECONDS: Final[float] = 2.0
+
+#: Poll interval inside the ack-wait loop. Same shape as
+#: ``CANCEL_VERIFY_POLL_INTERVAL_SECONDS`` in ``ibkr_adapter`` (50ms ⇒
+#: ~40 polls in the 2s budget, far below ib-async's typical
+#: orderStatusEvent latency).
+ACK_WAIT_POLL_INTERVAL_SECONDS: Final[float] = 0.05
 
 #: Env var the operator stages before invocation.
 DATABASE_URL_ENV: Final[str] = "DATABASE_URL"
@@ -847,6 +890,98 @@ async def fetch_existing_working_bracket_stop(
 # ---------------------------------------------------------------------------
 
 
+class _AckWaiter:
+    """Captures the FIRST ``OrderStatusUpdate`` matching ``target_cid`` so the
+    ack-wait loop can transition the DB row out of ``status='pending'`` +
+    populate ``acknowledged_at_utc``.
+
+    The operator-tool's IBKR adapter is one-shot — unlike the long-lived
+    :class:`services.risk.order_placement_worker.OrderPlacementWorker` which
+    subscribes once at startup and observes EVERY transition for the
+    process lifetime, we need a per-invocation observer that resolves
+    quickly after :meth:`IbkrClient.place_order` returns. Without it the
+    tool's clientId disconnects before IBKR's first ``orderStatusEvent``
+    fires + the DB row sits at ``status='pending'`` indefinitely (2026-05-27
+    /M2K incident, b5237aed-b07925a7-019e66d3-stop-replace-0).
+
+    Why a class vs. a free function holding a closure: the IBKR adapter's
+    :meth:`subscribe_order_status` API takes an async callback; holding
+    state on a class lets the callback be a bound method (introspectable
+    in tests, predictable identity for the adapter's idempotency guard).
+
+    The class is module-private (``_`` prefix) because operator-tool
+    internals don't carry the same forwards-compat surface guarantees
+    as the public planner / apply functions.
+    """
+
+    def __init__(self, *, target_client_order_id: str) -> None:
+        self._target = target_client_order_id
+        self._update: OrderStatusUpdate | None = None
+        self._event = asyncio.Event()
+
+    async def __call__(self, update: OrderStatusUpdate) -> None:
+        """Callback signature matching ``OrderStatusCallback``."""
+        if update.client_order_id != self._target:
+            # Another order's transition; ignore. The operator-tool
+            # clientId may observe orders from prior runs of itself
+            # (rare — usually disconnected by now) but never from
+            # the worker's clientId=1 (different TWS API sessions).
+            return
+        if self._event.is_set():
+            # Already captured the first transition; the IBKR side may
+            # emit follow-up status events (Submitted → Filled, etc.).
+            # Keep them logged in the latest snapshot so the UPDATE
+            # reflects the freshest state we observed.
+            self._update = update
+            return
+        self._update = update
+        self._event.set()
+
+    async def wait(self, *, timeout_seconds: float) -> OrderStatusUpdate | None:
+        """Wait up to ``timeout_seconds`` for the first matching update.
+
+        Returns the captured :class:`OrderStatusUpdate` or ``None`` on
+        timeout. Caller logs a warning + falls back to the pre-place
+        ``IbkrPlaceOrderResult.status`` on ``None`` — the same behavior
+        the tool exhibited pre-fix (no regression for the
+        no-transition-observed path).
+        """
+        try:
+            await asyncio.wait_for(self._event.wait(), timeout=timeout_seconds)
+        except TimeoutError:
+            return None
+        return self._update
+
+
+def _order_status_kind_to_db_status(kind: str) -> str:
+    """Map :data:`services.execution.types.OrderStatusKind` → ``orders.status``.
+
+    Mirrors :func:`_broker_status_to_orders_status`'s shape but operates
+    on the ``OrderStatusKind`` enum surfaced via ``subscribe_order_status``
+    (which collapses ``PendingSubmit`` / ``PreSubmitted`` / ``Submitted``
+    into the single ``"submitted"`` bucket because consumers care about
+    "is it live at the broker?" — see ``_ORDER_STATUS_KIND_MAP`` in
+    ``services/execution/ibkr_adapter.py``).
+    """
+    if kind == "submitted":
+        return "working"
+    if kind == "partially_filled":
+        return "partially_filled"
+    if kind == "filled":
+        return "filled"
+    if kind == "cancelled":
+        return "cancelled"
+    if kind == "rejected":
+        return "rejected"
+    if kind == "inactive":
+        # IBKR's "Inactive" terminal — treat as a rejection for the
+        # operator-tool surface (matches order_terminal_status_processor's
+        # classification path).
+        return "rejected"
+    log.warning("replace_protective_stop_unknown_order_status_kind", kind=kind)
+    return "pending"
+
+
 async def apply_replace_protective_stop(
     plan: ReplaceProtectiveStopPlan,
     *,
@@ -861,8 +996,19 @@ async def apply_replace_protective_stop(
     1. ORDER_PLACED audit (intent — commits before the IBKR call)
     2. PR-ζ pre-INSERT orders row (status='pending', broker_order_id=NULL,
        parent_order_id = the ORIGINAL entry order id)
-    3. ibkr_client.place_order(stop_request)
-    4. UPDATE orders row with broker_order_id + status
+    3. Subscribe to broker order-status events (so the next step's
+       ``orderStatusEvent`` doesn't fire into the void; required because
+       the operator-tool's one-shot clientId has no other subscriber)
+    4. ibkr_client.place_order(stop_request)
+    5. Wait briefly for the first matching ``OrderStatusUpdate`` to
+       observe the PendingSubmit → PreSubmitted/Submitted transition
+       (broker ack). Falls back to the pre-place
+       ``IbkrPlaceOrderResult.status`` on timeout (no regression).
+    6. UPDATE orders row with broker_order_id + status +
+       ``acknowledged_at_utc`` (the ack timestamp, mirroring
+       ``services.risk.fill_processor._update_order_status``'s
+       ``COALESCE(acknowledged_at_utc, NOW())`` shape so a re-run
+       doesn't clobber an earlier ack).
 
     Returns a dict suitable for structlog observability + the operator's
     runbook ack.
@@ -941,7 +1087,32 @@ async def apply_replace_protective_stop(
             assert inserted is not None
             new_order_id: UUID = inserted.id
 
-    # Step 3: IBKR place_order
+    # Step 3: subscribe to broker order-status events BEFORE the place
+    # call so the first orderStatusEvent (which IBKR fires as soon as
+    # the gateway echoes back our order) doesn't fire into the void.
+    # Subscription is idempotent at the adapter level — re-running this
+    # tool reuses the registration without double-firing.
+    ack_waiter = _AckWaiter(target_client_order_id=plan.stop_client_order_id)
+    try:
+        await ibkr_client.subscribe_order_status(ack_waiter)
+    except Exception as exc:
+        # The subscribe call shouldn't fail in practice (the adapter
+        # raises only when the underlying ib_async event accessor is
+        # missing — never seen in production). Defense-in-depth: if
+        # it does fail, fall through to the pre-fix behavior of
+        # writing the ack-less row + warning. The order would still
+        # be live at IBKR; the operator would catch the ack-less row
+        # on their next reconciliation pass.
+        log.warning(
+            "replace_protective_stop_subscribe_failed",
+            error=str(exc),
+            note=(
+                "falling back to pre-place status only; orders row "
+                "may show status='pending' until next reconciliation"
+            ),
+        )
+
+    # Step 4: IBKR place_order
     stop_request = IbkrPlaceOrderRequest(
         client_order_id=plan.stop_client_order_id,
         contract=contract,
@@ -973,18 +1144,88 @@ async def apply_replace_protective_stop(
     rejection_detail = getattr(broker_result, "rejection_detail", None)
     db_status = _broker_status_to_orders_status(broker_status)
 
-    # Step 4: UPDATE orders row
+    # Step 5: wait briefly for the broker's first orderStatusEvent so the
+    # DB row reflects the ack (PendingSubmit → PreSubmitted/Submitted)
+    # rather than the still-pending snapshot from ``place_order``'s
+    # immediate return. Skipped if the broker already returned a
+    # terminal-rejected result (no transition will arrive); also
+    # skipped if ``place_order`` happened to return a non-pending
+    # status (the place_order method's 2s internal wait already
+    # observed the transition — rare but possible).
+    ack_observed_at: datetime | None = None
+    ack_status_kind: str | None = None
+    if broker_status == "pending_submit":
+        observed = await ack_waiter.wait(timeout_seconds=ACK_WAIT_TIMEOUT_SECONDS)
+        if observed is not None:
+            ack_observed_at = observed.observed_at_utc
+            ack_status_kind = observed.status
+            # Re-derive db_status from the observed transition. For the
+            # common case ("submitted"), this maps "pending" → "working"
+            # which is exactly the fix for the /M2K incident. Terminal
+            # observations (rejected / filled / cancelled / inactive)
+            # propagate through too, so a fast-rejecting broker still
+            # lands the right row state. The fresher broker_order_id
+            # from the orderStatusEvent overrides the pre-place value
+            # only when populated — ib-async sometimes fills it on the
+            # initial Trade and sometimes not until the first event.
+            db_status = _order_status_kind_to_db_status(observed.status)
+            if observed.broker_order_id:
+                broker_order_id = observed.broker_order_id
+            # Capture the broker's rejection reason if the first event
+            # is terminal-reject. This mirrors the order_terminal_
+            # status_processor's path so the operator sees the same
+            # rejection_reason string in both places.
+            if observed.rejection_reason is not None and observed.status in (
+                "rejected",
+                "cancelled",
+                "inactive",
+            ):
+                rejection_detail = observed.rejection_reason
+            log.info(
+                "replace_protective_stop_ack_observed",
+                client_order_id=plan.stop_client_order_id,
+                broker_order_id=broker_order_id,
+                observed_kind=observed.status,
+                db_status_after_ack=db_status,
+                observed_at_utc=observed.observed_at_utc.isoformat(),
+            )
+        else:
+            # No event in ACK_WAIT_TIMEOUT_SECONDS. Keep status='pending'
+            # and leave acknowledged_at_utc NULL — exactly the pre-fix
+            # behavior (no regression). The operator's next
+            # reconciliation pass will close the gap.
+            log.warning(
+                "replace_protective_stop_ack_wait_timeout",
+                client_order_id=plan.stop_client_order_id,
+                broker_order_id=broker_order_id,
+                broker_status=broker_status,
+                timeout_seconds=ACK_WAIT_TIMEOUT_SECONDS,
+                note=(
+                    "no orderStatusEvent observed before the operator-tool "
+                    "disconnect; orders row stays status='pending' "
+                    "(reconciliation will close the gap)"
+                ),
+            )
+
+    # Step 6: UPDATE orders row. Set acknowledged_at_utc only when we
+    # actually observed an ack (don't synthesize a timestamp from a
+    # missing transition). The COALESCE mirrors fill_processor's
+    # _update_order_status pattern: a re-run of this tool against an
+    # already-ack'd order won't overwrite the original ack timestamp.
     async with session_factory() as session:
         async with session.begin():
             await session.execute(
                 text(
                     "UPDATE orders SET broker_order_id = :bid, status = :status, "
-                    "    rejection_reason = :rej_reason WHERE id = :oid"
+                    "    rejection_reason = :rej_reason, "
+                    "    acknowledged_at_utc = COALESCE(acknowledged_at_utc, :ack_ts) "
+                    "WHERE id = :oid"
                 ),
                 {
                     "bid": str(broker_order_id) if broker_order_id is not None else None,
                     "status": db_status,
                     "rej_reason": rejection_detail,
+                    "ack_ts": ack_observed_at,
                     "oid": new_order_id,
                 },
             )
@@ -997,6 +1238,8 @@ async def apply_replace_protective_stop(
         broker_status=broker_status,
         db_status=db_status,
         rejection_detail=rejection_detail,
+        ack_observed_at_utc=ack_observed_at.isoformat() if ack_observed_at is not None else None,
+        ack_status_kind=ack_status_kind,
         audit_event_uuid=str(audit_record.event_uuid),
         market=plan.market,
         side=plan.stop_side,
@@ -1012,6 +1255,10 @@ async def apply_replace_protective_stop(
         "db_status": db_status,
         "audit_event_uuid": str(audit_record.event_uuid),
         "rejection_detail": rejection_detail,
+        "ack_observed_at_utc": (
+            ack_observed_at.isoformat() if ack_observed_at is not None else None
+        ),
+        "ack_status_kind": ack_status_kind,
     }
 
 
@@ -1292,6 +1539,8 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "ACK_WAIT_POLL_INTERVAL_SECONDS",
+    "ACK_WAIT_TIMEOUT_SECONDS",
     "CONNECT_TIMEOUT_SECONDS",
     "DATABASE_URL_ENV",
     "DEFAULT_CLIENT_ID",
@@ -1313,11 +1562,13 @@ __all__ = [
     "ParsedArgs",
     "ReplaceProtectiveStopError",
     "ReplaceProtectiveStopPlan",
+    "_AckWaiter",
     "_amain",
     "_broker_status_to_orders_status",
     "_build_parser",
     "_build_replace_stop_client_order_id",
     "_extract_stop_price_from_sizing_trace",
+    "_order_status_kind_to_db_status",
     "_parse_args",
     "apply_replace_protective_stop",
     "fetch_active_account_id",

@@ -16,18 +16,22 @@ A06 enforced (tz-aware UTC for the few datetime references).
 from __future__ import annotations
 
 from decimal import Decimal
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
 
 from scripts.operator_tools.replace_protective_stop import (
+    ACK_WAIT_TIMEOUT_SECONDS,
     EXIT_BAD_ARGS,
     OpenPositionSnapshot,
     OpenTradeSnapshot,
     ReplaceProtectiveStopError,
+    _AckWaiter,
     _broker_status_to_orders_status,
     _build_replace_stop_client_order_id,
     _extract_stop_price_from_sizing_trace,
+    _order_status_kind_to_db_status,
     _parse_args,
     main,
     plan_replace_protective_stop,
@@ -482,6 +486,150 @@ class TestMainExitCodes:
         # Help text was printed
         captured = capsys.readouterr()
         assert "replace_protective_stop" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# _order_status_kind_to_db_status (PR fix: ack-wait DB status mapping)
+# ---------------------------------------------------------------------------
+
+
+class TestOrderStatusKindToDbStatus:
+    """The post-ack status-kind → orders.status mapping. Mirrors the
+    broker-status mapper above but operates on the broker-agnostic
+    ``OrderStatusKind`` enum surfaced via ``subscribe_order_status``,
+    which collapses PendingSubmit/PreSubmitted/Submitted into a
+    single ``"submitted"`` bucket.
+    """
+
+    @pytest.mark.parametrize(
+        "kind,expected_db",
+        [
+            ("submitted", "working"),
+            ("partially_filled", "partially_filled"),
+            ("filled", "filled"),
+            ("cancelled", "cancelled"),
+            ("rejected", "rejected"),
+            # IBKR's "Inactive" terminal classified as a rejection by
+            # the operator-tool surface so the row converges on a
+            # named terminal state (matches order_terminal_status_
+            # processor's path).
+            ("inactive", "rejected"),
+            # Unknown kinds fall back to 'pending' + log a warning;
+            # belt-and-suspenders for forward-compat with new IBKR
+            # enums the adapter map hasn't been updated for.
+            ("some_future_kind", "pending"),
+        ],
+    )
+    def test_mapping(self, kind: str, expected_db: str) -> None:
+        assert _order_status_kind_to_db_status(kind) == expected_db
+
+
+# ---------------------------------------------------------------------------
+# _AckWaiter (PR fix: per-invocation ack observation)
+# ---------------------------------------------------------------------------
+
+
+def _make_update(cid: str, *, kind: str = "submitted", broker_id: int = 5) -> Any:
+    """Minimal :class:`OrderStatusUpdate`-like object for the AckWaiter
+    tests. Using a duck-typed dataclass instance keeps the test pure-
+    Python (no import-time IBKR dep)."""
+    from services.execution.types import OrderStatusUpdate
+
+    return OrderStatusUpdate(
+        client_order_id=cid,
+        broker_order_id=broker_id,
+        status=kind,  # type: ignore[arg-type]
+        market="TLT",
+        side="sell",
+        cumulative_filled_quantity=Decimal(0),
+        remaining_quantity=Decimal(1),
+        avg_fill_price=None,
+        total_commission_usd=Decimal(0),
+        last_fill_at_utc=None,
+        observed_at_utc=__import__("datetime").datetime(
+            2026, 5, 27, 21, 30, tzinfo=__import__("datetime").UTC
+        ),
+        rejection_reason=None,
+    )
+
+
+class TestAckWaiter:
+    @pytest.mark.asyncio
+    async def test_resolves_on_matching_event(self) -> None:
+        waiter = _AckWaiter(target_client_order_id="cid-1")
+        update = _make_update("cid-1")
+        # Fire the event BEFORE wait — the Event-based design must
+        # tolerate ordering both ways (callback-first AND wait-first).
+        await waiter(update)
+        observed = await waiter.wait(timeout_seconds=0.5)
+        assert observed is update
+
+    @pytest.mark.asyncio
+    async def test_callback_after_wait_starts(self) -> None:
+        """Order reversed: wait_for the Event, callback fires later."""
+        import asyncio
+
+        waiter = _AckWaiter(target_client_order_id="cid-1")
+        update = _make_update("cid-1")
+
+        async def _drive() -> None:
+            await asyncio.sleep(0.01)
+            await waiter(update)
+
+        # Keep a reference per RUF006; gather to ensure the task completes
+        # before the test exits so pytest-asyncio doesn't warn about
+        # leaked tasks.
+        drive_task = asyncio.create_task(_drive())
+        observed = await waiter.wait(timeout_seconds=0.5)
+        assert observed is update
+        await drive_task
+
+    @pytest.mark.asyncio
+    async def test_ignores_other_client_order_ids(self) -> None:
+        waiter = _AckWaiter(target_client_order_id="cid-target")
+        # An event for a different CID arrives — should NOT set the
+        # event or capture the update.
+        await waiter(_make_update("cid-other"))
+        observed = await waiter.wait(timeout_seconds=0.05)
+        assert observed is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_timeout(self) -> None:
+        waiter = _AckWaiter(target_client_order_id="cid-1")
+        observed = await waiter.wait(timeout_seconds=0.05)
+        assert observed is None
+
+    @pytest.mark.asyncio
+    async def test_keeps_latest_after_first_match(self) -> None:
+        """After the first match resolves the event, subsequent matching
+        events on the same CID overwrite the captured update so the
+        caller sees the freshest observed state (e.g., Submitted →
+        Filled within the ack-wait window)."""
+        waiter = _AckWaiter(target_client_order_id="cid-1")
+        first = _make_update("cid-1", kind="submitted", broker_id=5)
+        second = _make_update("cid-1", kind="filled", broker_id=5)
+        await waiter(first)
+        observed_first = await waiter.wait(timeout_seconds=0.5)
+        assert observed_first is first
+        await waiter(second)
+        # wait() returns the latest stored update on subsequent calls
+        # (the Event stays set after the first resolution).
+        observed_second = await waiter.wait(timeout_seconds=0.05)
+        assert observed_second is second
+
+
+# ---------------------------------------------------------------------------
+# Ack wait constant sanity
+# ---------------------------------------------------------------------------
+
+
+class TestAckWaitConstants:
+    def test_timeout_is_positive_and_short(self) -> None:
+        assert ACK_WAIT_TIMEOUT_SECONDS > 0
+        # Operator-runbook guarantee: the ack-wait can't bloat the
+        # overall tool runtime by more than a few seconds even when
+        # the broker is silent. 10s is a generous upper bound.
+        assert ACK_WAIT_TIMEOUT_SECONDS <= 10.0
 
 
 # ---------------------------------------------------------------------------
