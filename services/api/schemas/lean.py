@@ -71,6 +71,88 @@ LeanEventType = Literal[
 ]
 
 
+# ---------------------------------------------------------------------------
+# Signal-proximity heartbeat payload (PR-B of signal-proximity-design.md)
+#
+# Mirrors the wire shape emitted by
+# ``lean/v1_strategy.py::_serialize_market_proximity`` and the canonical
+# enums in ``strategies/v1_trend_following/proximity.py``. The api
+# persists each item as one row in ``signal_proximity`` via
+# ``services/api/repos/signal_proximity.py``.
+# ---------------------------------------------------------------------------
+
+#: Per-gate categorical state. Matches ``proximity.GateState`` (line 50).
+GateStateLiteral = Literal["pass", "close", "fail"]
+
+#: The strategy-side ``GateStatus`` literal (proximity.py line 72) — names
+#: the per-market discriminator between "evaluated normally", "warming up",
+#: and "decommissioned". Pinned to the same set as the migration's CHECK
+#: constraint so a future addition fails at both layers in lockstep.
+GateStatusLiteral = Literal["ok", "warming_up", "decommissioned"]
+
+#: The per-market "which gate is driving the worst state" label. Matches
+#: the four values ``proximity.compute_market_proximity`` can emit
+#: (proximity.py lines 91-92 + 276-281).
+ClosestGateLiteral = Literal["donchian", "trend", "hurst", "history"]
+
+
+class GateProximityItem(BaseModel):
+    """One gate's wire-shape record.
+
+    LEAN serializes ``GateProximity`` as ``{state, headroom, detail}`` with
+    Decimal-as-string per A05. ``headroom`` is None when warming up;
+    ``detail`` is an optional free-text tag (e.g., the literal
+    ``"warming_up"`` returned by ``proximity._warming_up_gate``).
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    state: GateStateLiteral = Field(
+        ...,
+        description="Categorical gate state. One of 'pass', 'close', 'fail'.",
+    )
+    headroom: Decimal | None = Field(
+        default=None,
+        description=(
+            "Numeric headroom value (Decimal-as-string on the wire per A05). "
+            "None when the market is warming up."
+        ),
+    )
+    detail: str | None = Field(
+        default=None,
+        max_length=64,
+        description=(
+            "Optional free-text qualifier (e.g., 'warming_up'). Short by "
+            "design — the api stores it implicitly via gate_status, not a "
+            "dedicated column."
+        ),
+    )
+
+
+class MarketEvaluationItem(BaseModel):
+    """One market's full proximity record on a single heartbeat.
+
+    Wire shape: every field aligns 1:1 with the corresponding column on
+    ``signal_proximity`` (with the per-gate sub-objects flattened into
+    state + headroom columns at persistence time). Decimal-as-string per
+    A05; absent numeric snapshot fields (last_close, etc.) survive as
+    None to support the warming-up branch.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    market: str = Field(..., min_length=1, max_length=32)
+    long_donchian: GateProximityItem
+    short_donchian: GateProximityItem
+    long_trend: GateProximityItem
+    short_trend: GateProximityItem
+    hurst: GateProximityItem
+    last_close: Decimal | None = Field(default=None)
+    overall_state: GateStateLiteral
+    closest_gate: ClosestGateLiteral
+    gate_status: GateStatusLiteral
+
+
 class LeanEventRequest(BaseModel):
     """POST body shape for ``POST /api/internal/lean/signals``.
 
@@ -258,20 +340,23 @@ class LeanEventRequest(BaseModel):
     # PR-A of Docs/signal-proximity-design.md — per-market gate-proximity
     # records attached to the heartbeat. Optional: older LEAN deploys (pre-
     # PR-A) MUST keep validating, so absence is acceptable and the API
-    # treats missing/None as "no proximity data this cycle." Each item is
-    # a dict per design §5; we accept dict[str, Any] for now and structurally
-    # validate at the route handler when persistence lands in PR-B. PR-B
-    # introduces a typed nested model + writes rows into ``signal_proximity``;
-    # PR-A leaves the field shape loose so iteration on the per-market dict
-    # in PR-B does not force a Pydantic-model migration here.
-    market_evaluations: list[dict[str, Any]] | None = Field(
+    # treats missing/None as "no proximity data this cycle."
+    #
+    # PR-B (this PR) tightens the field from ``list[dict[str, Any]]`` to a
+    # typed nested model so the persistence handler can rely on field
+    # presence + type without re-validating in Python. The wire shape is
+    # the output of ``lean/v1_strategy.py::_serialize_market_proximity``;
+    # any drift between that serializer and this model causes a 422 at
+    # the api boundary, which is preferable to a silently-malformed row
+    # landing in ``signal_proximity``. Per the PR-A risk-review carry-
+    # over watch-out: the tightened shape is structurally enforced here.
+    market_evaluations: list[MarketEvaluationItem] | None = Field(
         default=None,
         description=(
             "Heartbeat-only: per-market proximity records for the /signals "
-            "Watching view (PR-A of signal-proximity-design.md). Optional — "
-            "absence is accepted so older LEAN deploys remain compatible. "
-            "PR-A logs the count + ignores the payload; PR-B persists each "
-            "row in ``signal_proximity``."
+            "Watching view. Optional — absence is accepted so older LEAN "
+            "deploys remain compatible. PR-A logged the count; PR-B "
+            "persists each row in ``signal_proximity``."
         ),
     )
 

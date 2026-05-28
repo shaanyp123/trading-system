@@ -30,7 +30,7 @@ with operational liveness pings). signal_emitted DOES write to audit_log
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
 import structlog
@@ -40,6 +40,7 @@ from services.api import db as api_db
 from services.api.errors import AppError
 from services.api.heartbeats import get_heartbeat_registry
 from services.api.repos.phase1 import PostgresPhase1QueryRepo
+from services.api.repos.signal_proximity import insert_rows as insert_signal_proximity_rows
 from services.api.schemas.lean import LeanEventAccepted, LeanEventRequest
 from services.api.sse import emit_sse
 from services.audit.event_types import AuditEventType
@@ -53,6 +54,26 @@ from services.qc_adapter.signal_ingestion import (
 log = structlog.get_logger()
 
 router = APIRouter(prefix="/api/internal/lean", tags=["internal-lean"])
+
+
+def _et_session_date(ts_utc: datetime) -> str:
+    """Derive the CME-style ET session date from a UTC timestamp.
+
+    Used as a fallback for the signal_proximity insert when
+    ``LeanEventRequest.session_date_et`` is absent (legacy emitter path).
+    The CME daily cycle runs at 17:30 ET; rather than carry a tzdata
+    dep just for this fallback, we use a fixed -05:00 offset which is
+    correct for the 17:30 ET cycle's overlap with the session_date in
+    every month of the year (CME's session_date convention is unaffected
+    by DST since the cycle is "ET wall clock at 17:30"). Cycles emitted
+    by current LEAN images always carry session_date_et explicitly;
+    this path is defense-in-depth.
+    """
+    # 17:30 ET = 21:30 UTC (winter) or 22:30 UTC (summer DST). Use a
+    # -5h shift so any cycle close to the 17:30 ET window resolves to
+    # the correct date even when sent in summer (when -5h leaves the
+    # date in afternoon ET — still the right session_date).
+    return (ts_utc - timedelta(hours=5)).date().isoformat()
 
 
 def _require_lean_authenticated(request: Request) -> None:
@@ -139,9 +160,18 @@ async def post_lean_signal(
             # Registry failure must NOT fail the heartbeat POST: this is a
             # passive observability surface, not a critical path. Log + drop.
             log.exception("lean_heartbeat_registry_record_failed", **log_kwargs)
-        # PR-A of Docs/signal-proximity-design.md: log the proximity-row
-        # count as a sanity check so the operator can confirm LEAN is
-        # emitting the new field after deploy. Persistence wires in PR-B.
+        # Docs/signal-proximity-design.md:
+        #   PR-A: log the proximity-row count as a sanity check.
+        #   PR-B (this commit): when market_evaluations is present on a
+        #     heartbeat, INSERT one row per market into signal_proximity.
+        #
+        # Best-effort writes per §6.3 — a DB hiccup MUST NOT 5xx the
+        # heartbeat. The liveness signal (registry.record above + the
+        # 202 response) is more important than the proximity snapshot;
+        # a missed snapshot is backfilled on the next cycle (next day),
+        # while a 5xx on the heartbeat would make LEAN's cron retry +
+        # potentially trigger the watchdog "no heartbeat in N minutes"
+        # alert spuriously.
         if body.event_type == "lean_cycle_heartbeat":
             market_evaluations_count = (
                 len(body.market_evaluations) if body.market_evaluations is not None else 0
@@ -151,6 +181,44 @@ async def post_lean_signal(
                 market_count=market_evaluations_count,
                 **log_kwargs,
             )
+            if body.market_evaluations:
+                # The handler's own session would otherwise stay open for
+                # the entire request; for the proximity INSERT we open a
+                # short-lived session via the module-level factory so a
+                # commit failure is isolated from any downstream work +
+                # the connection returns to the pool immediately. session_
+                # date_et is optional on the heartbeat schema but required
+                # on signal_proximity — when missing, derive it from
+                # ts_utc's date in ET. (The 17:30 ET cycle is always
+                # well-defined; this fallback only fires for a future
+                # emitter that drops the field.)
+                session_date_et = body.session_date_et or _et_session_date(body.ts_utc)
+                try:
+                    session_factory = api_db.get_session_factory()
+                    async with session_factory() as proximity_session:
+                        rows_inserted = await insert_signal_proximity_rows(
+                            proximity_session,
+                            cycle_ts_utc=body.ts_utc,
+                            session_date_et=session_date_et,
+                            evaluations=list(body.market_evaluations),
+                        )
+                        await proximity_session.commit()
+                    log.info(
+                        "lean_proximity_persisted",
+                        rows_inserted=rows_inserted,
+                        **log_kwargs,
+                    )
+                except Exception:
+                    # Per design §6.3 + the PR-A risk-review carry-over
+                    # watch-out: log + swallow. The 202 still ships;
+                    # the liveness signal stays clean. The next cycle's
+                    # heartbeat will re-emit the (refreshed) snapshot,
+                    # so a single failure self-heals within a day.
+                    log.exception(
+                        "lean_proximity_persist_failed",
+                        market_count=market_evaluations_count,
+                        **log_kwargs,
+                    )
         log.info("lean_event_received", **log_kwargs)
         return LeanEventAccepted(
             received_at_utc=received_at,
