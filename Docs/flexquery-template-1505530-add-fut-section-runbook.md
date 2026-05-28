@@ -87,7 +87,7 @@ The FlexQuery template configuration is an IBKR-account-side artifact. There's n
 15. Wait for the next 22:30 UTC EOD reconciliation cycle (could be the same day if you did Phase 2-3 in the morning, or the next day if you did it overnight).
 16. Confirm the cycle is clean. Two ways to verify:
     - **Logs:** `ssh root@178.156.239.84 'docker logs api --since 1h 2>&1 | grep -E "reconciliation_eod|broker_view_missing_futures"'` — you should see the cycle's success log and NO `broker_view_missing_futures` warning.
-    - **DB:** `ssh root@178.156.239.84 'docker compose --env-file deploy/.env exec postgres psql -U trading -d trading -c "SELECT id, break_type, expected_qty, actual_qty, created_at_utc, resolved_at_utc FROM reconciliation_breaks ORDER BY created_at_utc DESC LIMIT 5"'` — the stale unresolved rows (`019e6b8f-…` and `019e6c83-…` from the 2026-05-27 + earlier cycles) should have `resolved_at_utc IS NOT NULL` set by the post-fix cycle's `_resolve_prior_breaks` call.
+    - **DB:** `ssh root@178.156.239.84 'docker compose --env-file deploy/.env exec postgres psql -U trading -d trading -c "SELECT id, metric, market, expected_value, actual_value, created_at_utc, resolved_at_utc FROM reconciliation_breaks WHERE metric=\'position_qty\' ORDER BY created_at_utc DESC LIMIT 10"'` — filter on `metric='position_qty'` so unrelated breaks don't scroll the rows of interest off the page. The stale unresolved /M2K rows (per the 2026-05-28 morning handoff: `019e6b8f-55de-7e6a-b72f-556efc3e125d` and `019e6c83-cb5c-7863-8fb3-d6ffc930b35c`) should have `resolved_at_utc IS NOT NULL` after the post-fix cycle's `_resolve_prior_breaks` call in `services/reconciliation/apply.py`.
 
 ### Phase 5 — Document outcome
 
@@ -103,7 +103,7 @@ The FlexQuery template configuration is an IBKR-account-side artifact. There's n
 
 ## Rollback / fallback
 
-If the template edit produces unexpected XML changes that break parsing in `services/reconciliation/flex_query_fetcher.py::_parse_open_positions` (defensive check: parsing errors would surface as `FlexQueryFetchError` with `error_code=PARSE_FAILED`):
+If the template edit produces unexpected XML changes that break parsing in `services/reconciliation/flex_query_fetcher.py` (the inline `OpenPosition` parse loop around line 282 of that file; parsing errors surface as `FlexQueryFetchError`):
 
 1. Revert the template by editing back through the IBKR portal — remove the FUT asset class from the Open Positions section.
 2. The system reverts to the pre-fix behavior: PR #275 still downgrades the false-positive break, the only loss is the P2 alert noise stays.
@@ -111,11 +111,12 @@ If the template edit produces unexpected XML changes that break parsing in `serv
 
 ## Why not just add a smaller XML field set?
 
-You could theoretically add only `Symbol` + `Quantity` to the FUT rows and skip Conid / underlyingSymbol / currency. **Don't.** The PR #275 recon planner normalization keys off `underlyingSymbol` to map IBKR's contract-month symbol (`M2KM6`) back to the strategy's root ticker (`M2K`). Without it the planner can't reconcile and will treat the FUT row as a phantom position, re-triggering breaks. Match the equity column set as much as possible.
+You could theoretically add only `Symbol` + `Quantity` to the FUT rows and skip Conid / underlyingSymbol / currency. **Don't.** The PR #275 reconciliation normalization in `services/reconciliation/eod_cycle.py` keys off `underlyingSymbol` to map IBKR's contract-month symbol (`M2KM6`) back to the strategy's root ticker (`M2K`). Without it the recon planner can't reconcile and will treat the FUT row as a phantom position, re-triggering breaks. Match the equity column set as much as possible.
 
 ## See also
 
 - `Docs/decisions-log.md` 2026-05-27 (late evening) — original incident, root-cause confirmation
-- `services/reconciliation/flex_query_fetcher.py` — parsing contract + sample XML element shapes
-- `services/reconciliation/planner.py` — PR #275 FUT-symbol normalization via `underlyingSymbol`
+- `services/reconciliation/flex_query_fetcher.py` — parsing contract + sample XML element shapes (`OpenPosition` parse loop at ~line 282)
+- `services/reconciliation/eod_cycle.py` — PR #275 FUT-symbol normalization via `underlyingSymbol` (the `_FUTURES_ASSET_CATEGORIES` filter at line 112; broker-view-missing-futures warning emission)
+- `services/reconciliation/apply.py` — `_resolve_prior_breaks` mechanism that auto-clears the stale rows on the first clean cycle
 - PR #275 — `fix(reconciliation): normalize FUT symbols via underlyingSymbol + warn on missing-FUT template`
