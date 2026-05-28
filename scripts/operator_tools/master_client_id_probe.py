@@ -32,6 +32,51 @@ a no-op; recheck the rendered config.ini per the decisions-log entry.
   verify cleanup in TWS, but the system-side fallback is the daily
   expiry.
 
+**Worker-collision gate (2026-05-28 refactor).**
+
+The probe's Stage 2 connects to ``ib_gateway`` as ``--master-client-id``.
+In the production allocation that clientId IS the long-lived order worker
+(``api`` container, ``clientId=1`` per dev-guide §1.5 LOCKED — or ``2``
+under the VPS ``API_IBKR_CLIENT_ID`` override). IBKR refuses a second
+connection on a clientId that's already in use; if the worker is up, the
+Stage 2 connect fails with ``Error 162`` and wedges the colliding client
+for ~30 min.
+
+To avoid this, the operator MUST stop the api worker before running the
+probe. The ``--worker-offline-confirmed`` flag is the explicit
+acknowledgment — without it the probe refuses to run when
+``--master-client-id`` is in the worker-allocation range {1, 2} per
+dev-guide §1.5. The gate exits with ``EXIT_BAD_ARGS=6`` and the operator
+runbook in the error message.
+
+**Operator runbook — worker-offline probe ceremony.**
+
+Run during the CME 02:00-04:00 UTC trough so the worker outage is
+invisible to any scheduled cycle::
+
+    # 1. Stop the worker (clientId=1 frees up)
+    ssh root@<vps> 'docker compose --env-file deploy/.env stop api'
+
+    # 2. Wait for clean disconnect (~5 s)
+    sleep 5
+
+    # 3. Run the probe
+    python -m scripts.operator_tools.master_client_id_probe \\
+        --master-client-id 1 \\
+        --env paper \\
+        --worker-offline-confirmed
+
+    # 4. Restart the worker (it reclaims clientId=1)
+    ssh root@<vps> 'docker compose --env-file deploy/.env start api'
+
+    # 5. Verify worker reconnects + heartbeats resume
+    ssh root@<vps> 'docker logs api --since 2m 2>&1 | grep -E "ibkr_connected|bar_sync_worker_spawned"'
+
+Empirical results from each run should be appended to
+``Docs/decisions-log.md`` 2026-05-27 entry "Cross-clientId IBKR
+cancellation: structural limitation, mitigation = Master Client ID"
+in the operator-decisions deferred subsection.
+
 **Forbidden-paths check.** ``scripts/operator_tools/**`` is NOT on the
 dev-guide §11 anti-pattern [A02] forbidden-modification whitelist nor
 on the §2.3 hot-fix whitelist. Pure tooling — no ``services/risk/**``
@@ -149,6 +194,15 @@ CONNECT_TIMEOUT_SECONDS: Final[float] = 30.0
 #: window plus IBKR's own ack latency.
 BROKER_CALL_TIMEOUT_SECONDS: Final[float] = 15.0
 
+#: ClientIds reserved for the long-lived api order worker per dev-guide
+#: §1.5 LOCKED — ``1`` is the code default + ``2`` is the VPS deploy
+#: override. The probe's Stage 2 connects as the master clientId; if the
+#: worker holds it concurrently IBKR returns Error 162 + wedges the
+#: caller for ~30 min. ``--worker-offline-confirmed`` is the operator's
+#: explicit acknowledgment that the api container is stopped for the
+#: probe window. See module docstring "Worker-collision gate" subsection.
+_WORKER_CLIENT_ID_RANGE: Final[frozenset[int]] = frozenset({1, 2})
+
 
 @dataclass(frozen=True, slots=True)
 class ParsedArgs:
@@ -164,6 +218,7 @@ class ParsedArgs:
     ibkr_host: str
     ibkr_port: int
     allow_non_paper: bool
+    worker_offline_confirmed: bool
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -250,6 +305,19 @@ def _build_parser() -> argparse.ArgumentParser:
             "explicitly to acknowledge."
         ),
     )
+    parser.add_argument(
+        "--worker-offline-confirmed",
+        action="store_true",
+        help=(
+            "Required when --master-client-id is in the worker-allocation "
+            "range {1, 2} per dev-guide §1.5. Acknowledges that the api "
+            "container is currently stopped — without this, the probe's "
+            "Stage 2 connect would collide with the running worker and "
+            "wedge clientId at IBKR for ~30 min. See module docstring "
+            "'Operator runbook — worker-offline probe ceremony' for the "
+            "full stop/run/start sequence."
+        ),
+    )
     return parser
 
 
@@ -273,6 +341,21 @@ def parse_args(argv: list[str]) -> ParsedArgs:
             f"--env={parsed.env} requires --allow-non-paper to acknowledge "
             "that a real order will hit the broker"
         )
+    if master_cid in _WORKER_CLIENT_ID_RANGE and not parsed.worker_offline_confirmed:
+        raise ValueError(
+            f"--master-client-id={master_cid} is in the worker-allocation range "
+            f"{{1, 2}} per dev-guide §1.5; the api order worker holds this "
+            "clientId in normal operation and IBKR refuses a concurrent "
+            "second connection on it. Stop the worker first and pass "
+            "--worker-offline-confirmed:\n"
+            "  ssh root@<vps> 'docker compose --env-file deploy/.env stop api'\n"
+            "  python -m scripts.operator_tools.master_client_id_probe \\\n"
+            f"      --master-client-id {master_cid} --env {parsed.env} "
+            "--worker-offline-confirmed\n"
+            "  ssh root@<vps> 'docker compose --env-file deploy/.env start api'\n"
+            "Run during the CME 02:00-04:00 UTC trough so the worker outage "
+            "is invisible to scheduled cycles."
+        )
     return ParsedArgs(
         master_client_id=master_cid,
         place_client_id=place_cid,
@@ -282,6 +365,7 @@ def parse_args(argv: list[str]) -> ParsedArgs:
         ibkr_host=str(parsed.ibkr_host),
         ibkr_port=int(parsed.ibkr_port),
         allow_non_paper=bool(parsed.allow_non_paper),
+        worker_offline_confirmed=bool(parsed.worker_offline_confirmed),
     )
 
 
