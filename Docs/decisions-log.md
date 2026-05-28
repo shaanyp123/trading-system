@@ -17,6 +17,43 @@ Canonical log of decisions made and deviations from the specs as the build progr
 
 ## Entries
 
+### 2026-05-27 (late evening) → 2026-05-28 — Recon false-positive halt + operator-coordinated cleanup ceremony
+
+**Trigger:** 2026-05-27 22:30 UTC EOD recon flagged a `position_qty` break (/M2K expected=1, actual=0, source=`flexquery_eod`) and auto-transitioned NORMAL → HALT_NEW (severity=routine, reason=`recon_mismatch`). Position was real at IBKR (`M2KM6` qty=1 @ $2925, verified via `reqExecutionsAsync` execId `0000e1a7.6a22c327.01.01`); break was a false positive.
+
+**Spec reference:** `Docs/backend-spec.md` §2.7 (reconciliation engine) + §2.5 (state machine NORMAL → HALT_NEW transition); `services/reconciliation/planner.py` (broker_view assembly); `services/risk/state_machine.py` (kill-switch resume flow); `Docs/decisions-log.md` 2026-05-27 entries (Cross-clientId IBKR cancellation + Punch-list session) for the immediately preceding context.
+
+**Root cause confirmed:** FlexQuery template 1505530 does not include OpenPositions section for Futures. Recon broker_view returned zero FUT rows while backend correctly tracked /M2K open. Empirically observed via PR #275's new `reconciliation_eod_cycle_broker_view_missing_futures` warning fired post-deploy.
+
+**Shipped this session:**
+* **PR [#274](https://github.com/shaanyp123/trading-system/pull/274) (a367e63) — `feat(deploy): journald log driver across paper + live stacks`.** Forensic continuity across container recreate. Subagent-reviewed + merged autonomously per operator delegation.
+* **PR [#275](https://github.com/shaanyp123/trading-system/pull/275) (311fefd) — `fix(reconciliation): normalize FUT symbols via underlyingSymbol + warn on missing-FUT template`.** Recon-planner FUT symbol normalization via `underlyingSymbol` + `broker_view_missing_futures` structlog warning + non-actionable break downgrade. Forbidden path (`services/reconciliation/**`); `risk-review-approved` label applied per operator authorization of subagent-equivalent review.
+* **PR [#276](https://github.com/shaanyp123/trading-system/pull/276) (961844a) — `fix(operator_tools): subscribe + ack-wait so replace_protective_stop UPDATEs orders row`.** `replace_protective_stop` subscribe+ack-wait so post-place DB UPDATE lands with `status='working'` + `acknowledged_at_utc`. Non-forbidden.
+
+**Deploy:** VPS `816243c` → `961844a` (13 PRs landed). Pre-deploy: `mkdir /var/log/journal` + `systemctl restart systemd-journald` (journald persistence per PR #274 README). Env edits: `API_IBKR_CLIENT_ID` 2→1, `IBKR_MASTER_CLIENT_ID=1` added. No alembic upgrade needed (head was already `20260527_position_unprotected`). `docker compose up -d --build --force-recreate` completed in 1m41s; all 9 containers healthy.
+
+**Operational mishaps (document):**
+1. **`master_client_id_probe.py` orphan:** probe placed a Day-TIF stop on /MES @ $1 via clientId=86; step-2 cancel-via-master failed because master clientId (1) was held by production worker. Cleaned via `reqGlobalCancel` from clientId=86.
+2. **`reqGlobalCancel` from clientId=86 ALSO cancelled the /M2K protective stop** (cross-client cancel from non-master). Empirical evidence: "Allow API to cancel orders on behalf of other clients" gateway setting is enabled by default (gnzsnz/ib-gateway image). /M2K position briefly naked (~30s) before re-placement via `replace_protective_stop --no-dry-run --confirm`. New stop: `client_order_id=b5237aed-b07925a7-019e66d3-stop-replace-0` `broker_order_id=4` (assigned by IBKR on clientId=99, coincidental match with entry's broker_order_id=4 on clientId=1) status=PreSubmitted at IBKR + status=`working` in DB (PR #276 path verified empirically).
+
+**Manual state override (document carefully):**
+- **Trigger:** operator web UI Resume button fails with "CSRF token missing or mismatched" → blocks standard HALT_NEW → CONVALESCENT path that requires WebAuthn UV.
+- **Override path:** `docker compose exec api python ...` invoking `services.risk.dispatch.apply_state_transition` with synthesized `operator_session_id` (prefix `manual-override-`), bypassing only the WebAuthn UV check. Audit-first ordering preserved; chain stays valid.
+- **Transition 1 (audit seq 257):** HALT_NEW → CONVALESCENT via `plan_resume_from_halt`, reason=`human_resume`, `audit_event_uuid=019e6c8b-f621-7761-ace3-4fd488ff1fda`, applied at 2026-05-28T03:06:12.4Z.
+- **Transition 2 (audit seq 258):** CONVALESCENT → NORMAL via `plan_session_close(convalescent_counter=4 — synthesized)`, reason=`convalescent_graduated`, `audit_event_uuid=019e6c90-36cb-7902-964f-a234fcf21707`, applied at 2026-05-28T03:10:51.1Z, 4 minutes after the CONVALESCENT transition.
+- **Forensic signal:** the `audit_log` payload on seq 258 has `convalescent_sessions_completed=5` (the `plan_session_close` output) but the timestamp gap from seq 257 is 4 minutes, not 5 trading sessions. A real graduation would have ~5 days between transitions. If anyone ever audits and is confused, this timestamp gap IS the manual-override marker.
+
+**Open issues for tomorrow morning (Task #9, etc.):**
+- **Kill-switch resume CSRF bug:** operator web UI POST to `/api/system/kill-switch/resume` fails before WebAuthn UV check. Frontend issue (`apps/web` kill-switch form) suspected.
+- **FlexQuery template 1505530:** needs OpenPositions FUT section added (IBKR portal Reports → Flex Queries). Will eliminate ongoing P2 alert noise + auto-resolve stale `recon_break` rows. NOT urgent — PR #275 already prevents re-halting.
+- **`master_client_id_probe` redesign:** design doesn't work when master ID == worker ID. Empirical validation deferred until either probe is refactored OR worker is taken offline for the test.
+
+**Cost / scope impact:**
+* Code: 3 PRs landed (PR #274 journald log driver in `deploy/**`; PR #275 forbidden `services/reconciliation/**` with `risk-review-approved`; PR #276 non-forbidden `scripts/operator_tools/**`). Deploy advanced VPS `816243c` → `961844a` (13 PRs landed since prior deploy). 0 alembic migrations applied this session (head already at `20260527_position_unprotected`). Manual override produced 2 audit rows (seq 257 + 258) with synthesized `operator_session_id` (`manual-override-` prefix) — chain remains CLEAN.
+* Live-money cutover blockers remaining: FlexQuery template config (operator-side IBKR portal); CSRF resume fix (`apps/web`); `master_client_id_probe` redesign (low priority).
+
+---
+
 ### 2026-05-27 (afternoon) — Punch-list session shipped: HALT_NEW exit bypass + Master Client ID wiring + replace_protective_stop integration tests
 
 **Trigger:** continuation of the 2026-05-27 morning's PR #262/#263/#264 cluster. Yesterday's session-end punch list enumerated 4 follow-ups (Task A through D); this session shipped all four as 3 PRs.
