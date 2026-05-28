@@ -72,6 +72,7 @@ from services.audit.chain import verify_chain
 from services.execution.types import (
     IbkrContractRef,
     IbkrPlaceOrderResult,
+    OrderStatusUpdate,
 )
 
 pytestmark = pytest.mark.integration
@@ -379,11 +380,17 @@ def _fake_ibkr_client(
     *,
     place_returns: IbkrPlaceOrderResult | None = None,
     place_raises: BaseException | None = None,
+    ack_update: OrderStatusUpdate | None = None,
 ) -> MagicMock:
     """Construct a MagicMock IbkrClient with controllable async returns.
 
-    The replace-stop happy path needs ``resolve_contract`` + ``place_order``;
-    no cancel call is involved.
+    The replace-stop happy path needs ``resolve_contract`` + ``place_order``
+    + ``subscribe_order_status``. When ``ack_update`` is provided, the
+    subscribe-side firmware fires the supplied :class:`OrderStatusUpdate`
+    into the registered callback shortly after subscription, simulating
+    the broker's PendingSubmit → PreSubmitted transition. When None,
+    no transition fires + the apply path's ack-wait loop times out
+    (exercising the no-regression fallback).
     """
     contract = IbkrContractRef(
         market="TLT",
@@ -401,12 +408,49 @@ def _fake_ibkr_client(
             place_returns = IbkrPlaceOrderResult(
                 client_order_id="0000000100000000-00000001-019e0000-stop-replace-0",
                 broker_order_id=5,
-                status="submitted",
+                status="pending_submit",
                 submitted_at_utc=datetime.now(tz=UTC),
                 rejection_category=None,
                 rejection_detail=None,
             )
         client.place_order = AsyncMock(return_value=place_returns)
+
+    # Wire subscribe_order_status — capture the callback so the test
+    # firmware can drive it. Default: synthesize a "submitted" transition
+    # so the happy-path tests observe the ack.
+    captured_callbacks: list[Any] = []
+    drive_tasks: list[Any] = []
+
+    async def _subscribe(callback: Any) -> None:
+        captured_callbacks.append(callback)
+        # Mirror the real adapter's contract: subscribing while a place
+        # is in flight means the next orderStatusEvent will fire into
+        # this callback. For tests, fire a synthetic event shortly so
+        # the apply-path's ack_waiter.wait resolves before its timeout.
+        if ack_update is not None:
+            # Use a short delay so the callback fires AFTER place_order
+            # returns (mimicking real IBKR latency). The apply path
+            # awaits ack_waiter.wait AFTER place_order, so the order
+            # of operations doesn't matter — but a tiny delay keeps
+            # the test closer to the production sequence.
+            import asyncio as _aio
+
+            async def _drive() -> None:
+                # Yield to the event loop so the place_order coroutine
+                # gets to return + the apply-path's ack-wait code runs
+                # before we fire.
+                await _aio.sleep(0)
+                await callback(ack_update)
+
+            # Retain the task reference on the client so RUF006 is
+            # satisfied + so pytest-asyncio doesn't warn about a
+            # leaked task. The list is mock-attached so any test that
+            # wants to `await` completion can do so via
+            # ``ibkr._drive_tasks``.
+            drive_tasks.append(_aio.create_task(_drive()))
+
+    client.subscribe_order_status = AsyncMock(side_effect=_subscribe)
+    client._drive_tasks = drive_tasks  # type: ignore[attr-defined]
     return client
 
 
@@ -426,7 +470,11 @@ async def test_apply_replace_protective_stop_happy_path(
       * New orders row INSERTed with parent_order_id pointing at the
         ORIGINAL entry_order_id.
       * After broker ack, status='working' + broker_order_id='5'.
+      * orders.acknowledged_at_utc populated from the broker's
+        orderStatusEvent (fix for 2026-05-27 /M2K incident).
       * IbkrClient.resolve_contract + place_order each called exactly once.
+      * subscribe_order_status invoked before place_order so the ack
+        event isn't lost.
       * Audit chain still verifies clean.
     """
     state = _seed_open_position_for_replace_stop(
@@ -472,7 +520,26 @@ async def test_apply_replace_protective_stop_happy_path(
     assert plan.stop_source == "sizing_trace"
     assert plan.entry_order_id == state["entry_order_id"]
 
-    ibkr = _fake_ibkr_client()
+    # Simulate the broker's PendingSubmit → Submitted transition. The
+    # synthetic OrderStatusUpdate fires from inside the test's
+    # subscribe_order_status side-effect; the apply path observes it
+    # via _AckWaiter.wait + transitions the DB row out of 'pending'.
+    ack_ts = datetime(2026, 5, 27, 21, 30, tzinfo=UTC)
+    ack_update = OrderStatusUpdate(
+        client_order_id=plan.stop_client_order_id,
+        broker_order_id=5,
+        status="submitted",
+        market=state["market"],
+        side="sell",
+        cumulative_filled_quantity=Decimal(0),
+        remaining_quantity=Decimal(state["quantity"]),
+        avg_fill_price=None,
+        total_commission_usd=Decimal(0),
+        last_fill_at_utc=None,
+        observed_at_utc=ack_ts,
+        rejection_reason=None,
+    )
+    ibkr = _fake_ibkr_client(ack_update=ack_update)
     contract = await ibkr.resolve_contract(state["market"])
 
     result = await apply_replace_protective_stop(
@@ -483,8 +550,11 @@ async def test_apply_replace_protective_stop_happy_path(
     )
     assert result["db_status"] == "working"
     assert result["broker_order_id"] == "5"
+    assert result["ack_observed_at_utc"] == ack_ts.isoformat()
+    assert result["ack_status_kind"] == "submitted"
 
     ibkr.place_order.assert_awaited_once()
+    ibkr.subscribe_order_status.assert_awaited_once()
     place_call = ibkr.place_order.await_args
     assert place_call is not None
     placed_request = place_call.args[0]
@@ -520,7 +590,8 @@ async def test_apply_replace_protective_stop_happy_path(
         new_stop_row = conn.execute(
             text(
                 "SELECT id, status, broker_order_id, parent_order_id, "
-                "       client_order_id, direction, stop_price "
+                "       client_order_id, direction, stop_price, "
+                "       acknowledged_at_utc "
                 "FROM orders "
                 "WHERE account_id = :acct AND order_type = 'stop_market' "
                 "  AND client_order_id LIKE '%-stop-replace-0'"
@@ -533,6 +604,10 @@ async def test_apply_replace_protective_stop_happy_path(
     assert new_stop_row.parent_order_id == state["entry_order_id"]
     assert new_stop_row.direction == "sell"
     assert new_stop_row.stop_price == state["stop_price"]
+    # Fix for /M2K incident: ack timestamp populated from the
+    # orderStatusEvent's observed_at_utc.
+    assert new_stop_row.acknowledged_at_utc is not None
+    assert new_stop_row.acknowledged_at_utc == ack_ts
 
     # ----- Chain still verifies clean -----
     async with async_session_factory() as session:
@@ -540,6 +615,88 @@ async def test_apply_replace_protective_stop_happy_path(
     assert verify_result[0] is True, (
         f"Chain broken at sequence_no={verify_result[1]} after {verify_result[2]} rows"
     )
+
+
+@pytest.mark.asyncio
+async def test_apply_replace_protective_stop_ack_timeout_falls_back_to_pending(
+    async_session_factory: async_sessionmaker[AsyncSession],
+    sync_engine: Engine,
+    fresh_account_id: UUID,
+    slippage_head_version_id: UUID,
+) -> None:
+    """No-regression case: when the broker's orderStatusEvent never
+    arrives within ACK_WAIT_TIMEOUT_SECONDS, the orders row stays
+    status='pending' + acknowledged_at_utc=NULL (matching the pre-fix
+    behavior so the operator's reconciliation pass can still close
+    the gap manually).
+
+    Drives the fake by NOT supplying ``ack_update`` — the subscribe-
+    side firmware captures the callback but never fires it.
+    """
+    state = _seed_open_position_for_replace_stop(
+        sync_engine,
+        account_id=fresh_account_id,
+        slip_id=slippage_head_version_id,
+        seed_existing_working_bracket=False,
+    )
+
+    position = await fetch_open_position(
+        async_session_factory, account_id=fresh_account_id, market=state["market"]
+    )
+    assert position is not None
+    trade = await fetch_open_trade(
+        async_session_factory, account_id=fresh_account_id, market=state["market"]
+    )
+    assert trade is not None
+    plan = plan_replace_protective_stop(
+        position=position,
+        trade=trade,
+        sizing_trace={
+            "stage_0_universe": {
+                "strategy_inputs": {state["market"]: {"stop_price": str(state["stop_price"])}}
+            }
+        },
+        stop_price_override=None,
+        env="paper",
+    )
+
+    # Tighten the ack-wait budget so the test doesn't pay the full 2s.
+    # The monkeypatch shape mirrors the worker-suite's similar tactic.
+    import scripts.operator_tools.replace_protective_stop as rps
+
+    original_timeout = rps.ACK_WAIT_TIMEOUT_SECONDS
+    rps.ACK_WAIT_TIMEOUT_SECONDS = 0.1  # type: ignore[misc]
+    try:
+        ibkr = _fake_ibkr_client(ack_update=None)
+        contract = await ibkr.resolve_contract(state["market"])
+        result = await apply_replace_protective_stop(
+            plan,
+            ibkr_client=ibkr,
+            contract=contract,
+            session_factory=async_session_factory,
+        )
+    finally:
+        rps.ACK_WAIT_TIMEOUT_SECONDS = original_timeout  # type: ignore[misc]
+
+    # The place_order fake returns status='pending_submit' by default;
+    # without an ack event, the row stays at status='pending' (pre-fix
+    # behavior, no regression).
+    assert result["db_status"] == "pending"
+    assert result["ack_observed_at_utc"] is None
+    assert result["ack_status_kind"] is None
+
+    with sync_engine.connect() as conn:
+        new_stop_row = conn.execute(
+            text(
+                "SELECT status, acknowledged_at_utc "
+                "FROM orders "
+                "WHERE account_id = :acct AND order_type = 'stop_market' "
+                "  AND client_order_id LIKE '%-stop-replace-0'"
+            ),
+            {"acct": fresh_account_id},
+        ).one()
+    assert new_stop_row.status == "pending"
+    assert new_stop_row.acknowledged_at_utc is None
 
 
 @pytest.mark.asyncio
@@ -668,7 +825,24 @@ async def test_apply_replace_protective_stop_succeeds_under_halt_new(
         env="paper",
     )
 
-    ibkr = _fake_ibkr_client()
+    # Drive the ack so the row lands at status='working' (same path
+    # the happy-path test exercises; HALT_NEW does not affect the
+    # broker side of the round-trip).
+    ack_update = OrderStatusUpdate(
+        client_order_id=plan.stop_client_order_id,
+        broker_order_id=5,
+        status="submitted",
+        market=state["market"],
+        side="sell",
+        cumulative_filled_quantity=Decimal(0),
+        remaining_quantity=Decimal(state["quantity"]),
+        avg_fill_price=None,
+        total_commission_usd=Decimal(0),
+        last_fill_at_utc=None,
+        observed_at_utc=datetime(2026, 5, 27, 21, 30, tzinfo=UTC),
+        rejection_reason=None,
+    )
+    ibkr = _fake_ibkr_client(ack_update=ack_update)
     contract = await ibkr.resolve_contract(state["market"])
 
     result = await apply_replace_protective_stop(
