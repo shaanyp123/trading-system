@@ -111,7 +111,23 @@ export async function apiCall<T>(
  * server uses it ONLY for the constant-time comparison; replacing it on the
  * server response defends against a fixated value persisting beyond the
  * authentication boundary.
+ *
+ * 2026-05-28 fix: previously only the /login, /setup, /recover pages called
+ * this. Operators visiting /system (or any post-auth page) directly in a
+ * fresh browser session had no CSRF cookie, so the first state-changing POST
+ * (Resume kill switch, regenerate backup codes) failed with `CSRF_REJECTED`.
+ * The function is now also invoked from `<Providers>` so every page mounts
+ * with a CSRF cookie. The backend `SessionStubMiddleware` independently
+ * mints a server-issued cookie on the first response — the two defences
+ * are belt-and-braces; either alone closes the bug.
+ *
+ * Max-Age: 24h (86400s) — matches the server's `session_absolute_seconds`
+ * so the bootstrap cookie persists across browser restarts the same way a
+ * server-issued cookie would. Pre-fix the cookie was a session cookie
+ * (no Max-Age), so closing the browser deleted it.
  */
+const CSRF_BOOTSTRAP_MAX_AGE_SECONDS = 86400;
+
 export function ensureBootstrapCsrfCookie(): void {
   if (typeof document === 'undefined') return;
   if (readCookie(CSRF_COOKIE) !== null) return;
@@ -122,5 +138,7 @@ export function ensureBootstrapCsrfCookie(): void {
     .replace(/\//g, '_')
     .replace(/=+$/, '');
   const secure = location.protocol === 'https:' ? '; Secure' : '';
-  document.cookie = `${CSRF_COOKIE}=${b64}; path=/; SameSite=Strict${secure}`;
+  document.cookie =
+    `${CSRF_COOKIE}=${b64}; path=/; SameSite=Strict; ` +
+    `Max-Age=${CSRF_BOOTSTRAP_MAX_AGE_SECONDS}${secure}`;
 }

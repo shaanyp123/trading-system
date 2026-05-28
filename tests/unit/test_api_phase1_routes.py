@@ -403,6 +403,115 @@ class TestSessionStub:
         assert response.status_code == 200
 
 
+class TestSessionStubCsrfBootstrap:
+    """Regression tests for the 2026-05-28 CSRF-resume bug.
+
+    Pre-fix repro: operator visits ``/system`` in a fresh browser without
+    going through ``/login`` first; the SessionStub injects a strong
+    session but never mints a CSRF cookie; the first state-changing POST
+    (Resume kill switch) is rejected by :class:`CSRFMiddleware` with
+    ``CSRF_REJECTED``. See ``Docs/decisions-log.md`` 2026-05-28 entry.
+
+    Post-fix invariant: every Phase-0 stub-injected response that arrived
+    without a CSRF cookie carries a server-minted one in the response's
+    ``Set-Cookie`` header. The next request can then send the cookie value
+    back as both cookie + ``X-CSRF-Token`` and pass the double-submit gate.
+    """
+
+    @pytest.mark.asyncio
+    async def test_response_sets_csrf_cookie_when_request_lacked_one(
+        self,
+        api_client: AsyncClient,
+    ) -> None:
+        # Fresh client → no cookies in the request. The stub should attach a
+        # Set-Cookie for __Host-csrf_token on the response.
+        response = await api_client.get("/api/auth/me")
+        assert response.status_code == 200
+        # httpx normalises Set-Cookie into response.cookies (the cookie jar);
+        # the raw header is also available via response.headers.get_list.
+        set_cookie_headers = response.headers.get_list("set-cookie")
+        csrf_set_cookies = [h for h in set_cookie_headers if "__Host-csrf_token=" in h]
+        assert len(csrf_set_cookies) == 1, (
+            f"Expected exactly one Set-Cookie for __Host-csrf_token, got: {set_cookie_headers!r}"
+        )
+        raw = csrf_set_cookies[0]
+        # Required attributes for the __Host- prefix (browser-side invariants).
+        # Note: in this test the env is "dev" so Secure is absent; in paper/live
+        # the Secure flag is set (covered by test below).
+        assert "Path=/" in raw or "path=/" in raw
+        assert "SameSite=strict" in raw or "samesite=strict" in raw.lower()
+        # Max-Age matches session_absolute_seconds (24h default) so the cookie
+        # survives browser restarts the same way a server-issued cookie would.
+        assert "Max-Age=86400" in raw or "max-age=86400" in raw.lower()
+
+    @pytest.mark.asyncio
+    async def test_response_does_not_set_csrf_cookie_when_request_had_one(
+        self,
+        api_client: AsyncClient,
+    ) -> None:
+        # Pre-existing cookie → the stub should NOT churn the value by minting
+        # a new one. Idempotency matters: a long-lived browser session would
+        # otherwise get its CSRF cookie reset on every page load, which is
+        # both wasteful and would invalidate any in-flight double-submit
+        # token currently held by the frontend.
+        response = await api_client.get(
+            "/api/auth/me",
+            cookies={"__Host-csrf_token": "preexisting-value-from-prior-login"},
+        )
+        assert response.status_code == 200
+        set_cookie_headers = response.headers.get_list("set-cookie")
+        csrf_set_cookies = [h for h in set_cookie_headers if "__Host-csrf_token=" in h]
+        assert csrf_set_cookies == [], (
+            f"Stub minted a CSRF cookie when one was already present: {set_cookie_headers!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_bootstrapped_csrf_cookie_unlocks_state_changing_post(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        # End-to-end repro of the operator's broken flow:
+        #   1. Fresh browser → GET /api/auth/me (mounts /system page).
+        #   2. Server bootstraps CSRF cookie via Set-Cookie.
+        #   3. Frontend reads document.cookie + sends value as X-CSRF-Token.
+        #   4. POST to a CSRF-gated endpoint passes the double-submit check.
+        # Without the fix, step 2 wouldn't happen and step 4 would 403 with
+        # CSRF_REJECTED. We use /api/signals/<id>/approve as the canary —
+        # same Depends(_get_repo) pattern as kill-switch/resume but with no
+        # `Depends(get_session)` DB dependency (the unit-test conftest skips
+        # the lifespan, so the real DB pool isn't initialised). The route
+        # handler returns 409 NO_ACTIVE_ACCOUNT cleanly with a stub repo —
+        # any response other than 403 CSRF_REJECTED proves the gate passed.
+        bootstrap_response = await api_client.get("/api/auth/me")
+        assert bootstrap_response.status_code == 200
+        csrf_cookie_value = bootstrap_response.cookies.get("__Host-csrf_token")
+        assert csrf_cookie_value is not None, (
+            "Stub did not bootstrap a CSRF cookie on the GET response"
+        )
+        # Wire a no-account stub repo so the handler bails at 409 instead of
+        # touching DB-backed code paths.
+        repo = _StubRepo(account_id=None)
+        _bind_repo(override_dep, signals_route, repo)
+        follow_up = await api_client.post(
+            f"/api/signals/{uuid4()}/approve",
+            json={"override_size": 1},
+            cookies={"__Host-csrf_token": csrf_cookie_value},
+            headers={"X-CSRF-Token": csrf_cookie_value},
+        )
+        # Specific assertion: the request passed CSRF and reached the route
+        # handler. The handler then returns 409 NO_ACTIVE_ACCOUNT per the
+        # stub repo's account_id=None.
+        assert follow_up.status_code == 409, (
+            f"Expected 409 (NO_ACTIVE_ACCOUNT) after CSRF passed; "
+            f"got status={follow_up.status_code} body={follow_up.text!r}"
+        )
+        body = follow_up.json()
+        assert body["error_code"] == "NO_ACTIVE_ACCOUNT", (
+            f"Expected NO_ACTIVE_ACCOUNT after CSRF passed; got {body!r}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Signals
 # ---------------------------------------------------------------------------
