@@ -120,6 +120,100 @@ class TestParseFlexXml:
         assert exc_info.value.details["ibkr_error_code"] == "1003"
 
 
+class TestParseFlexXmlUnderlyingSymbol:
+    """Tests for the 2026-05-27 fix: parse the ``underlyingSymbol``
+    attribute on ``<OpenPosition>`` so the broker view normalizes
+    contract-month-form FUT rows (``"M2KM6"``) onto the root ticker
+    (``"M2K"``) the backend's ``positions_current.market`` uses.
+
+    See the false-positive break that fired EOD 2026-05-27: broker view
+    showed market ``"/M2K"`` qty 0, backend showed ``/M2K`` qty 1 (correct
+    per IBKR live broker state). Root cause hypothesis: FlexQuery template
+    emitted FUT rows with ``symbol="M2KM6"`` + ``underlyingSymbol="M2K"``,
+    pre-fix parser dropped underlyingSymbol on the floor + the view
+    builder used ``f"/{symbol}"`` = ``"/M2KM6"`` which doesn't match
+    backend's ``"/M2K"``.
+    """
+
+    def test_underlying_symbol_parsed_when_present(self) -> None:
+        # M2KM6 = micro Russell 2000 June 2026; underlyingSymbol is the
+        # root ticker M2K. This is the production-shape XML that the
+        # 2026-05-27 EOD recon was processing.
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+<FlexQueryResponse>
+  <FlexStatements count="1">
+    <FlexStatement accountId="U25655583" fromDate="2026-05-27" toDate="2026-05-27">
+      <AccountInformation accountId="U25655583" currency="USD" type="MARGIN"/>
+      <EquitySummaryByReportDateInBase accountId="U25655583" reportDate="2026-05-27"
+        cash="15000.00" stock="0.00" bond="0.00" futuresPNL="0.00" total="15000.00"/>
+      <OpenPositions>
+        <OpenPosition accountId="U25655583" symbol="M2KM6" underlyingSymbol="M2K"
+          assetCategory="FUT" position="1" costBasisPrice="14625.62"
+          markPrice="14700.00" positionValue="14700.00" fifoPnlUnrealized="74.38"/>
+      </OpenPositions>
+    </FlexStatement>
+  </FlexStatements>
+</FlexQueryResponse>"""
+        snapshot = parse_flex_xml(xml)
+        assert len(snapshot.positions) == 1
+        pos = snapshot.positions[0]
+        assert pos.symbol == "M2KM6"
+        assert pos.underlying_symbol == "M2K"
+        assert pos.sec_type == "FUT"
+
+    def test_underlying_symbol_none_when_attribute_absent(self) -> None:
+        # Backwards-compat: the existing sample XML in this test file
+        # never carried underlyingSymbol, so the parser must default to
+        # None when the attribute is missing entirely. This locks the
+        # backwards-compat contract for older FlexQuery templates.
+        snapshot = parse_flex_xml(_SAMPLE_FLEX_XML)
+        for pos in snapshot.positions:
+            # Neither MES nor TLT in the sample carries the attribute.
+            assert pos.underlying_symbol is None
+
+    def test_underlying_symbol_none_when_attribute_empty(self) -> None:
+        # Defensive: an empty-string underlyingSymbol attribute (which
+        # IBKR doesn't currently emit, but which a future template change
+        # could produce) is treated as absent. The downstream view
+        # builder falls back to ``symbol``.
+        xml = """<?xml version="1.0"?>
+<FlexQueryResponse>
+  <FlexStatements>
+    <FlexStatement accountId="U1" fromDate="2026-05-27" toDate="2026-05-27">
+      <AccountInformation accountId="U1" currency="USD" type="MARGIN"/>
+      <EquitySummaryByReportDateInBase accountId="U1" reportDate="2026-05-27"
+        cash="100" stock="0" bond="0" futuresPNL="0" total="100"/>
+      <OpenPositions>
+        <OpenPosition accountId="U1" symbol="MES" underlyingSymbol=""
+          assetCategory="FUT" position="1" costBasisPrice="5230"/>
+      </OpenPositions>
+    </FlexStatement>
+  </FlexStatements>
+</FlexQueryResponse>"""
+        snapshot = parse_flex_xml(xml)
+        assert snapshot.positions[0].underlying_symbol is None
+
+    def test_underlying_symbol_strip_whitespace(self) -> None:
+        # Defensive: any surrounding whitespace is stripped so a template
+        # that emits ``" M2K "`` doesn't break the normalization.
+        xml = """<?xml version="1.0"?>
+<FlexQueryResponse>
+  <FlexStatements>
+    <FlexStatement accountId="U1" fromDate="2026-05-27" toDate="2026-05-27">
+      <AccountInformation accountId="U1" currency="USD" type="MARGIN"/>
+      <EquitySummaryByReportDateInBase accountId="U1" reportDate="2026-05-27"
+        cash="100" stock="0" bond="0" futuresPNL="0" total="100"/>
+      <OpenPositions>
+        <OpenPosition accountId="U1" symbol="M2KM6" underlyingSymbol="  M2K  "
+          assetCategory="FUT" position="1" costBasisPrice="14625.62"/>
+      </OpenPositions>
+    </FlexStatement>
+  </FlexStatements>
+</FlexQueryResponse>"""
+        snapshot = parse_flex_xml(xml)
+        assert snapshot.positions[0].underlying_symbol == "M2K"
+
+
 class TestIbkrFlexQueryClient:
     def test_constructor_rejects_invalid_id(self) -> None:
         with pytest.raises(ValueError, match="flex_query_id"):
