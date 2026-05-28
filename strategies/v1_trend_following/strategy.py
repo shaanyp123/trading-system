@@ -47,6 +47,10 @@ from strategies.v1_trend_following.indicators import (
     simple_moving_average,
 )
 from strategies.v1_trend_following.parameters import V1Parameters
+from strategies.v1_trend_following.proximity import (
+    MarketProximity,
+    compute_market_proximity,
+)
 from strategies.v1_trend_following.signals import (
     Bar,
     BarSeries,
@@ -74,6 +78,24 @@ class _IndicatorSnapshot:
     hurst: Decimal
     atr: Decimal
     last_close: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class _EvaluationResult:
+    """Internal return wrapper for ``_evaluate_market``.
+
+    ``outcome`` is the unchanged ``CandidateSignal | RejectionReason`` that
+    the gate-evaluation logic produces. ``snapshot`` is the indicator snapshot
+    used in the evaluation, exposed up to ``generate_signals`` so the
+    proximity record (Docs/signal-proximity-design.md §4.3) can be built
+    without re-computing indicators. ``snapshot`` is None when the gate
+    pipeline short-circuited BEFORE computing the snapshot (decommission or
+    insufficient bars). The gate logic itself is bit-identical to the pre-
+    proximity implementation; only the return shape changed.
+    """
+
+    outcome: CandidateSignal | RejectionReason
+    snapshot: _IndicatorSnapshot | None
 
 
 class V1TrendFollowing:
@@ -135,6 +157,7 @@ class V1TrendFollowing:
         emitted_at = as_of_emitted_at_utc or datetime.now(tz=UTC)
         signals: list[CandidateSignal] = []
         rejections: list[tuple[str, RejectionReason]] = []
+        market_evaluations: list[MarketProximity] = []
 
         for market, series in active_universe.items():
             if series.market != market:
@@ -143,8 +166,9 @@ class V1TrendFollowing:
                 raise ValueError(
                     f"active_universe key {market!r} != BarSeries.market {series.market!r}"
                 )
+            snapshot_for_proximity: _IndicatorSnapshot | None
             try:
-                signal_or_reject = self._evaluate_market(
+                eval_result = self._evaluate_market(
                     market=market,
                     series=series,
                     position=current_positions.get(market),
@@ -162,17 +186,77 @@ class V1TrendFollowing:
                     error=str(exc),
                 )
                 rejections.append((market, RejectionReason.INSUFFICIENT_BAR_HISTORY))
-                continue
-
-            if isinstance(signal_or_reject, CandidateSignal):
-                signals.append(signal_or_reject)
+                snapshot_for_proximity = None
             else:
-                rejections.append((market, signal_or_reject))
+                if isinstance(eval_result.outcome, CandidateSignal):
+                    signals.append(eval_result.outcome)
+                else:
+                    rejections.append((market, eval_result.outcome))
+                snapshot_for_proximity = eval_result.snapshot
+
+            # Proximity emission (PR-A of Docs/signal-proximity-design.md).
+            # Observation-only — does NOT influence what fires. Per Q4 of the
+            # design doc, decommissioned rows still surface what the gates
+            # WOULD have said; if the regular flow didn't compute a snapshot
+            # because of the decommission short-circuit, compute one best-
+            # effort here for display. Insufficient-bars paths still surface
+            # a warming_up record with NULL fields.
+            if snapshot_for_proximity is None and self._params.strategy_decommissioned:
+                if len(series.bars) >= self._min_required_bars:
+                    try:
+                        snapshot_for_proximity = self._compute_snapshot(series.bars)
+                    except ValueError:
+                        snapshot_for_proximity = None
+            market_evaluations.append(
+                self._build_market_proximity(
+                    market=market,
+                    snapshot=snapshot_for_proximity,
+                )
+            )
 
         return SignalGenerationResult(
             signals=tuple(signals),
             rejections=tuple(rejections),
             as_of_emitted_at_utc=emitted_at,
+            market_evaluations=tuple(market_evaluations),
+        )
+
+    def _build_market_proximity(
+        self,
+        *,
+        market: str,
+        snapshot: _IndicatorSnapshot | None,
+    ) -> MarketProximity:
+        """Adapter that hands snapshot fields off to ``compute_market_proximity``.
+
+        Pure observation-only — does not feed back into entry-signal logic.
+        Lives on the strategy class only so it can read ``self._params`` for
+        the Hurst threshold and the decommission flag without leaking those
+        into the pure-Python proximity module.
+        """
+        decommissioned = self._params.strategy_decommissioned
+        if snapshot is None:
+            return compute_market_proximity(
+                market=market,
+                last_close=None,
+                donchian_high=None,
+                donchian_low=None,
+                ma_fast=None,
+                ma_slow=None,
+                hurst_value=None,
+                hurst_threshold=self._params.hurst_threshold,
+                decommissioned=decommissioned,
+            )
+        return compute_market_proximity(
+            market=market,
+            last_close=snapshot.last_close,
+            donchian_high=snapshot.donchian_high,
+            donchian_low=snapshot.donchian_low,
+            ma_fast=snapshot.ma_fast,
+            ma_slow=snapshot.ma_slow,
+            hurst_value=snapshot.hurst,
+            hurst_threshold=self._params.hurst_threshold,
+            decommissioned=decommissioned,
         )
 
     def _evaluate_market(
@@ -182,9 +266,15 @@ class V1TrendFollowing:
         series: BarSeries,
         position: Position | None,
         as_of_session_date: date,
-    ) -> CandidateSignal | RejectionReason:
-        """Per-market entry-signal evaluation. Returns a CandidateSignal on
-        passing all filters, or a RejectionReason on failure.
+    ) -> _EvaluationResult:
+        """Per-market entry-signal evaluation. Returns an ``_EvaluationResult``
+        with ``outcome`` (CandidateSignal | RejectionReason) and ``snapshot``
+        (the computed indicator snapshot, or None when the gate pipeline
+        short-circuited before computing it). PR-A of
+        ``Docs/signal-proximity-design.md`` exposes ``snapshot`` so the
+        caller can build a proximity record without recomputing indicators;
+        the gate-evaluation logic itself is bit-identical to the prior
+        implementation.
 
         Order of checks matches backend-spec §2.3 (with the decommission
         short-circuit prepended per exit-pipeline-design.md §7):
@@ -207,11 +297,13 @@ class V1TrendFollowing:
         # table). Rejection is recorded so the audit log shows the
         # short-circuit decision per market.
         if self._params.strategy_decommissioned:
-            return RejectionReason.STRATEGY_DECOMMISSIONED
+            return _EvaluationResult(outcome=RejectionReason.STRATEGY_DECOMMISSIONED, snapshot=None)
 
         bars = series.bars
         if len(bars) < self._min_required_bars:
-            return RejectionReason.INSUFFICIENT_BAR_HISTORY
+            return _EvaluationResult(
+                outcome=RejectionReason.INSUFFICIENT_BAR_HISTORY, snapshot=None
+            )
 
         snapshot = self._compute_snapshot(bars)
         last_close = snapshot.last_close
@@ -223,21 +315,27 @@ class V1TrendFollowing:
         elif last_close < snapshot.donchian_low:
             breakout = Direction.SHORT
         else:
-            return RejectionReason.NO_BREAKOUT
+            return _EvaluationResult(outcome=RejectionReason.NO_BREAKOUT, snapshot=snapshot)
 
         # Step 3: trend filter — close above (long) or below (short) the MA pair,
         # with MA_FAST also above (long) or below (short) MA_SLOW.
         if breakout is Direction.LONG:
             if not (last_close > snapshot.ma_fast > snapshot.ma_slow):
-                return RejectionReason.TREND_FILTER_FAILED
+                return _EvaluationResult(
+                    outcome=RejectionReason.TREND_FILTER_FAILED, snapshot=snapshot
+                )
         else:  # SHORT
             if not (last_close < snapshot.ma_fast < snapshot.ma_slow):
-                return RejectionReason.TREND_FILTER_FAILED
+                return _EvaluationResult(
+                    outcome=RejectionReason.TREND_FILTER_FAILED, snapshot=snapshot
+                )
 
         # Step 4: Hurst persistence threshold (same direction-agnostic check —
         # Hurst measures persistence regardless of sign).
         if snapshot.hurst < self._params.hurst_threshold:
-            return RejectionReason.HURST_BELOW_THRESHOLD
+            return _EvaluationResult(
+                outcome=RejectionReason.HURST_BELOW_THRESHOLD, snapshot=snapshot
+            )
 
         # Step 5: position-aware rejections.
         #
@@ -261,32 +359,40 @@ class V1TrendFollowing:
         if position is not None and position.direction is not Direction.FLAT:
             same_direction = position.direction is breakout
             if same_direction:
-                return RejectionReason.POSITION_ALREADY_SAME_DIRECTION
+                return _EvaluationResult(
+                    outcome=RejectionReason.POSITION_ALREADY_SAME_DIRECTION, snapshot=snapshot
+                )
             if position.opened_at_session_date is not None:
                 held = (as_of_session_date - position.opened_at_session_date).days
                 if held < self._params.min_holding_days:
-                    return RejectionReason.MIN_HOLDING_DAYS_NOT_SATISFIED
+                    return _EvaluationResult(
+                        outcome=RejectionReason.MIN_HOLDING_DAYS_NOT_SATISFIED,
+                        snapshot=snapshot,
+                    )
 
         # All filters passed. Compute stop and emit candidate.
         stop_price = self._compute_stop_price(
             direction=breakout, decision_price=last_close, atr=snapshot.atr
         )
-        return CandidateSignal(
-            market=market,
-            direction=breakout,
-            signal_type="donchian_breakout",
-            session_date=as_of_session_date,
-            decision_price=last_close,
-            stop_price=stop_price,
-            indicators_snapshot={
-                "donchian_high": snapshot.donchian_high,
-                "donchian_low": snapshot.donchian_low,
-                "ma_fast": snapshot.ma_fast,
-                "ma_slow": snapshot.ma_slow,
-                "hurst": snapshot.hurst,
-                "atr": snapshot.atr,
-                "lookback_days_donchian": self._params.lookback_days_donchian,
-            },
+        return _EvaluationResult(
+            outcome=CandidateSignal(
+                market=market,
+                direction=breakout,
+                signal_type="donchian_breakout",
+                session_date=as_of_session_date,
+                decision_price=last_close,
+                stop_price=stop_price,
+                indicators_snapshot={
+                    "donchian_high": snapshot.donchian_high,
+                    "donchian_low": snapshot.donchian_low,
+                    "ma_fast": snapshot.ma_fast,
+                    "ma_slow": snapshot.ma_slow,
+                    "hurst": snapshot.hurst,
+                    "atr": snapshot.atr,
+                    "lookback_days_donchian": self._params.lookback_days_donchian,
+                },
+            ),
+            snapshot=snapshot,
         )
 
     def _compute_snapshot(self, bars: tuple[Bar, ...]) -> _IndicatorSnapshot:

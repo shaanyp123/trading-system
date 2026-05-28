@@ -255,6 +255,25 @@ class LeanEventRequest(BaseModel):
             "container log; this is a short tag for cross-reference."
         ),
     )
+    # PR-A of Docs/signal-proximity-design.md — per-market gate-proximity
+    # records attached to the heartbeat. Optional: older LEAN deploys (pre-
+    # PR-A) MUST keep validating, so absence is acceptable and the API
+    # treats missing/None as "no proximity data this cycle." Each item is
+    # a dict per design §5; we accept dict[str, Any] for now and structurally
+    # validate at the route handler when persistence lands in PR-B. PR-B
+    # introduces a typed nested model + writes rows into ``signal_proximity``;
+    # PR-A leaves the field shape loose so iteration on the per-market dict
+    # in PR-B does not force a Pydantic-model migration here.
+    market_evaluations: list[dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "Heartbeat-only: per-market proximity records for the /signals "
+            "Watching view (PR-A of signal-proximity-design.md). Optional — "
+            "absence is accepted so older LEAN deploys remain compatible. "
+            "PR-A logs the count + ignores the payload; PR-B persists each "
+            "row in ``signal_proximity``."
+        ),
+    )
 
 
 class LeanEventAccepted(BaseModel):
