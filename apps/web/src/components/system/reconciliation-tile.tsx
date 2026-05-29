@@ -3,14 +3,13 @@
 /**
  * Reconciliation tile -- frontend-spec §2.6.5.
  *
- * Reads `/api/system/status.reconciliation_summary`. Phase 0:
- * reconciliation_breaks table is empty so `last_check_utc` is the epoch
- * sentinel and the tile renders "No checks yet" instead of a stale
- * timestamp.
+ * Reads `/api/system/status.reconciliation_summary`. `last_check_utc` is the
+ * latest EOD-recon balance snapshot, so a passing cycle (which writes no break
+ * row) still advances it; the epoch sentinel renders "No checks yet" only
+ * before recon has ever run.
  *
- * On a real break (Phase 1+ via the recon cron + dispatcher wire-up) the
- * red banner surfaces `open_breaks` count. The link to break detail
- * lands when the per-break detail surface is built (Phase 1+).
+ * `open_breaks` surfaces the red "requires operator review" banner. The link
+ * to break detail lands when the per-break detail surface is built (Phase 1+).
  */
 
 import { useSystemStatus } from '@/lib/api/queries';
