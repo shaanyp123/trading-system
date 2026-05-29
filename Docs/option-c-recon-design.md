@@ -587,6 +587,16 @@ This first post-deploy cycle still uses FlexQuery (flag default unchanged). It M
 
 ### Step 5 — Flip the env var (still without merging PR-C)
 
+> **Prerequisite (added 2026-05-29):** the api service in `docker-compose.yml`
+> must pass `API_EOD_RECON_POSITION_SOURCE` through to the container
+> (`API_EOD_RECON_POSITION_SOURCE: ${API_EOD_RECON_POSITION_SOURCE:-flexquery}`
+> in its `environment:` block). `config.py` uses `env_file=None`, so a value
+> in `deploy/.env` reaches the container ONLY via that mapping — `--env-file`
+> alone feeds compose interpolation, not the container env. PR-B (#290)
+> shipped the config field but not the passthrough; it was added in a
+> follow-up. Without it, the `echo >> deploy/.env` below silently no-ops and
+> the cycle stays on FlexQuery.
+
 ```bash
 # On VPS
 echo "API_EOD_RECON_POSITION_SOURCE=reqpositions" >> deploy/.env
