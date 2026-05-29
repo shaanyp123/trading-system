@@ -1,9 +1,11 @@
 """scripts/operator_tools/bootstrap_live_account.py — idempotent live-DB
 account bootstrap.
 
-Runs once during the live-money cutover ceremony (per
+Runs during the live-money cutover ceremony (per
 ``Docs/live-money-cutover-plan.md`` §10 steps 16-18) against a freshly
-``alembic upgrade head``-migrated live Postgres. Writes three rows:
+``alembic upgrade head``-migrated live Postgres, and — via
+``--mint-from-defaults`` — to seed paper's baseline ``parameter_sets`` head row
+(``Docs/parameter-sets-bootstrap-design.md`` §7 PR-A). Writes up to three rows:
 
   1. ``accounts`` — the live IBKR account row (default external_account_id
      ``U25655583`` per operator memory + cutover plan §10 step 1).
@@ -13,10 +15,19 @@ Runs once during the live-money cutover ceremony (per
      ``tests/integration/test_kill_switch_end_to_end.py``. The
      ``risk_state`` row is what the api's ``fetch_current_risk_state``
      reads at startup to gate dispatching.
-  3. ``parameter_sets`` (OPTIONAL) — when ``--parameter-set-json`` is
-     supplied, INSERTs the row with the supplied ``parameter_set_hash``
-     + ``parameters`` JSONB so the live signal pipeline finds the active
-     set on first cycle. Operator pre-extracts this from paper's DB.
+  3. ``parameter_sets`` (OPTIONAL) — supply the row one of two ways:
+       * ``--parameter-set-json`` — INSERT a pre-extracted row with the
+         supplied ``parameter_set_hash`` + ``parameters`` JSONB (the
+         live-cutover "copy paper's head" path; operator extracts from
+         paper's DB).
+       * ``--mint-from-defaults`` — build the baseline V1 row from the
+         canonical defaults and MINT its ``parameter_set_hash`` via
+         ``services/version/composite_hash.py`` (the paper-seed path; no
+         JSON file needed). Stored ``parameters`` carries all canonical keys
+         including ``STRATEGY_DECOMMISSIONED`` + ``EXIT_AUTO_APPROVE`` =
+         False; the hash EXCLUDES those two flags (design §11 Q1-A) so a
+         later decommission flip is a PK-stable in-place UPDATE.
+     The two are mutually exclusive.
 
 **Idempotency.** Each INSERT uses ``ON CONFLICT DO NOTHING`` against the
 relevant unique constraint (accounts.external_account_id UNIQUE,
@@ -74,6 +85,15 @@ Usage::
         --allow-non-paper \\
         --no-dry-run --confirm
 
+    # Paper seed — mint the baseline parameter_sets head row from the
+    # canonical V1 defaults (no JSON file; the hash is computed in-tool).
+    # Default --dry-run prints the minted hash without writing; add
+    # --no-dry-run --confirm to apply. --env paper needs no --allow-non-paper.
+    python -m scripts.operator_tools.bootstrap_live_account \\
+        --env paper \\
+        --mint-from-defaults \\
+        --no-dry-run --confirm
+
 The parameter-set JSON file shape::
 
     {
@@ -109,6 +129,9 @@ from uuid import UUID, uuid4
 import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+from services.version.composite_hash import OPERATOR_ONLY_FLAG_KEYS, compute_parameter_set_hash
+from strategies.v1_trend_following.parameters import default_v1_parameters
 
 log = structlog.get_logger()
 
@@ -148,6 +171,7 @@ class ParsedArgs:
     external_account_id: str
     env: EnvName
     parameter_set_json: Path | None
+    mint_from_defaults: bool
     dry_run: bool
     confirm: bool
     allow_non_paper: bool
@@ -191,6 +215,20 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--mint-from-defaults",
+        action="store_true",
+        default=False,
+        help=(
+            "Build the baseline V1 parameter_sets row from the canonical V1 "
+            "defaults (strategies/v1_trend_following) and mint its "
+            "parameter_set_hash via services/version/composite_hash.py, then "
+            "INSERT idempotently. The stored 'parameters' carries all canonical "
+            "keys including STRATEGY_DECOMMISSIONED + EXIT_AUTO_APPROVE = False; "
+            "the hash EXCLUDES those two flags (design §11 Q1-A). Mutually "
+            "exclusive with --parameter-set-json. Used to seed paper's head row."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -231,10 +269,17 @@ def parse_args(argv: list[str]) -> ParsedArgs:
         raise ValueError(
             "--no-dry-run requires --confirm. Two-flag gate prevents an accidental wet run."
         )
+    if parsed.mint_from_defaults and parsed.parameter_set_json is not None:
+        raise ValueError(
+            "--mint-from-defaults and --parameter-set-json are mutually exclusive: "
+            "mint builds the row from canonical defaults, --parameter-set-json loads "
+            "a pre-extracted row. Pick one."
+        )
     return ParsedArgs(
         external_account_id=str(parsed.external_account_id),
         env=parsed.env,
         parameter_set_json=parsed.parameter_set_json,
+        mint_from_defaults=bool(parsed.mint_from_defaults),
         dry_run=bool(parsed.dry_run),
         confirm=bool(parsed.confirm),
         allow_non_paper=bool(parsed.allow_non_paper),
@@ -274,6 +319,29 @@ def load_parameter_set_json(path: Path) -> ParameterSetPayload:
     if not isinstance(params, dict):
         raise ValueError(f"{path}: 'parameters' must be a JSON object")
     return ParameterSetPayload(parameter_set_hash=psh, parameters=params)
+
+
+def build_baseline_parameter_set_payload() -> ParameterSetPayload:
+    """Mint the baseline V1 ``parameter_sets`` row from the canonical defaults.
+
+    Used by ``--mint-from-defaults`` to seed paper's head row (design §7 PR-A,
+    §11 Q5-A). Two load-bearing invariants:
+
+    * **Stored ``parameters`` carries ALL canonical keys** — the
+      ``V1Parameters.to_canonical_dict()`` shape (UPPER_CASE keys,
+      decimals-as-strings) including both operator-only flags at their SAFE
+      default ``False`` (locked L2). They render as the string ``"False"`` and
+      round-trip to ``False`` via the trigger_v1_cycle / lean ``_coerce_bool_param``
+      readers (``str(value).strip().lower() == "true"``).
+    * **The hash EXCLUDES the two flags** —
+      :func:`services.version.composite_hash.compute_parameter_set_hash` hashes
+      only the Parameter-Ranges-Table subset (design §11 Q1-A). This is what lets
+      the §10.3 decommission ceremony flip ``STRATEGY_DECOMMISSIONED`` with an
+      in-place ``parameters`` UPDATE that does NOT change the content-hash PK.
+    """
+    canonical = default_v1_parameters().to_canonical_dict()
+    parameter_set_hash = compute_parameter_set_hash(canonical)
+    return ParameterSetPayload(parameter_set_hash=parameter_set_hash, parameters=dict(canonical))
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +476,7 @@ async def _amain(args: ParsedArgs) -> int:
         external_account_id=args.external_account_id,
         env=args.env,
         dry_run=args.dry_run,
+        mint_from_defaults=args.mint_from_defaults,
         param_set_json=str(args.parameter_set_json) if args.parameter_set_json else None,
     )
     log_bound.info("bootstrap_live_account_started")
@@ -419,6 +488,19 @@ async def _amain(args: ParsedArgs) -> int:
         except ValueError as exc:
             log_bound.error("bootstrap_live_account_bad_param_set_json", error=str(exc))
             return EXIT_BAD_PARAM_SET_JSON
+    elif args.mint_from_defaults:
+        payload = build_baseline_parameter_set_payload()
+        log_bound.info(
+            "bootstrap_live_account_minted_baseline_parameter_set",
+            parameter_set_hash=payload.parameter_set_hash,
+            stored_key_count=len(payload.parameters),
+            hashed_key_count=len(payload.parameters) - len(OPERATOR_ONLY_FLAG_KEYS),
+            excluded_flags=sorted(OPERATOR_ONLY_FLAG_KEYS),
+            note=(
+                "stored parameters carry the 2 operator-only flags = False; "
+                "the hash excludes them so a decommission flip is PK-stable."
+            ),
+        )
 
     if args.dry_run:
         log_bound.info(
@@ -520,6 +602,7 @@ __all__ = [
     "EXIT_UNEXPECTED",
     "ParameterSetPayload",
     "ParsedArgs",
+    "build_baseline_parameter_set_payload",
     "load_parameter_set_json",
     "main",
     "parse_args",

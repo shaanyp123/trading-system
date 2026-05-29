@@ -20,6 +20,8 @@ Coverage matrix:
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -31,10 +33,16 @@ from scripts.operator_tools.bootstrap_live_account import (
     EXIT_OK,
     ParameterSetPayload,
     ParsedArgs,
+    _insert_parameter_set_idempotent,
+    build_baseline_parameter_set_payload,
     load_parameter_set_json,
     main,
     parse_args,
 )
+from services.version.composite_hash import compute_parameter_set_hash
+from strategies.v1_trend_following.parameters import default_v1_parameters
+
+_HEX = set("0123456789abcdef")
 
 
 class TestParseArgs:
@@ -47,6 +55,7 @@ class TestParseArgs:
         assert result.confirm is False
         assert result.allow_non_paper is False
         assert result.parameter_set_json is None
+        assert result.mint_from_defaults is False
 
     def test_live_small_without_allow_non_paper_rejected(self) -> None:
         with pytest.raises(ValueError, match="requires --allow-non-paper"):
@@ -87,6 +96,25 @@ class TestParseArgs:
         path.write_text('{"x": 1}')
         result = parse_args(["--env", "paper", "--parameter-set-json", str(path)])
         assert result.parameter_set_json == path
+
+    def test_mint_from_defaults_flag(self) -> None:
+        result = parse_args(["--env", "paper", "--mint-from-defaults"])
+        assert result.mint_from_defaults is True
+        assert result.parameter_set_json is None
+
+    def test_mint_and_parameter_set_json_mutually_exclusive(self, tmp_path: Path) -> None:
+        path = tmp_path / "ps.json"
+        path.write_text('{"parameter_set_hash": "a", "parameters": {}}')
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            parse_args(
+                [
+                    "--env",
+                    "paper",
+                    "--mint-from-defaults",
+                    "--parameter-set-json",
+                    str(path),
+                ]
+            )
 
 
 class TestLoadParameterSetJson:
@@ -162,6 +190,19 @@ class TestMainExits:
         result = main(["--env", "paper"])
         assert result == EXIT_OK
 
+    def test_mint_from_defaults_dry_run_returns_ok_without_db(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """--mint-from-defaults respects the dry-run default: no DB write.
+
+        DATABASE_URL unset → reaching the DB-init path would return
+        EXIT_DB_INIT_FAILED (=5). EXIT_OK proves minting happens (hash computed
+        + logged) but the dry-run short-circuit fires before any DB write.
+        """
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        result = main(["--env", "paper", "--mint-from-defaults"])
+        assert result == EXIT_OK
+
     def test_bad_param_set_json_returns_exit_1(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -183,3 +224,139 @@ class TestMainExits:
         """--env live-small WITHOUT --allow-non-paper returns EXIT_BAD_ARGS."""
         result = main(["--env", "live-small"])
         assert result == EXIT_BAD_ARGS
+
+
+# ---------------------------------------------------------------------------
+# --mint-from-defaults: baseline payload minting
+# ---------------------------------------------------------------------------
+
+_CANONICAL_KEYS = {
+    "LOOKBACK_DAYS_DONCHIAN",
+    "MA_FAST_DAYS",
+    "MA_SLOW_DAYS",
+    "HURST_THRESHOLD",
+    "STOP_DISTANCE_ATR_MULT",
+    "ATR_LOOKBACK_DAYS",
+    "MIN_HOLDING_DAYS",
+    "VOL_TARGET_PCT_ANNUAL",
+    "INSTRUMENT_VOL_LOOKBACK_DAYS",
+    "ROLL_DAYS_BEFORE_EXPIRY",
+    "STRATEGY_DECOMMISSIONED",
+    "EXIT_AUTO_APPROVE",
+}
+
+
+class TestBuildBaselineParameterSetPayload:
+    def test_returns_validated_payload_with_64_hex_hash(self) -> None:
+        payload = build_baseline_parameter_set_payload()
+        assert isinstance(payload, ParameterSetPayload)
+        assert len(payload.parameter_set_hash) == 64
+        assert set(payload.parameter_set_hash) <= _HEX
+
+    def test_stored_parameters_carry_all_twelve_canonical_keys(self) -> None:
+        payload = build_baseline_parameter_set_payload()
+        assert set(payload.parameters) == _CANONICAL_KEYS
+        assert len(payload.parameters) == 12
+
+    def test_both_flags_stored_false(self) -> None:
+        """Stored as the to_canonical_dict() string shape; round-trips to False
+        via the trigger_v1_cycle _coerce_bool_param reader
+        (str("False").lower() != "true")."""
+        payload = build_baseline_parameter_set_payload()
+        assert payload.parameters["STRATEGY_DECOMMISSIONED"] == "False"
+        assert payload.parameters["EXIT_AUTO_APPROVE"] == "False"
+
+    def test_hash_matches_composite_hash_of_canonical_defaults(self) -> None:
+        payload = build_baseline_parameter_set_payload()
+        expected = compute_parameter_set_hash(default_v1_parameters().to_canonical_dict())
+        assert payload.parameter_set_hash == expected
+
+    def test_hash_unchanged_when_strategy_decommissioned_flips(self) -> None:
+        """The load-bearing invariant: the seed row's PK survives the §10.3
+        in-place decommission UPDATE because the hash excludes the flag."""
+        payload = build_baseline_parameter_set_payload()
+        flipped = replace(default_v1_parameters(), strategy_decommissioned=True).to_canonical_dict()
+        assert flipped["STRATEGY_DECOMMISSIONED"] == "True"
+        assert compute_parameter_set_hash(flipped) == payload.parameter_set_hash
+
+
+# ---------------------------------------------------------------------------
+# Idempotent INSERT contract (stub session — no real DB; A22 N/A)
+# ---------------------------------------------------------------------------
+
+
+class _StubResult:
+    def __init__(self, row: object) -> None:
+        self._row = row
+
+    def fetchone(self) -> object:
+        return self._row
+
+
+class _StubTxn:
+    async def __aenter__(self) -> _StubTxn:
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+
+class _StubSession:
+    def __init__(self, fetch_result: object, captured: list[tuple[str, object]]) -> None:
+        self._fetch_result = fetch_result
+        self._captured = captured
+
+    async def __aenter__(self) -> _StubSession:
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+    def begin(self) -> _StubTxn:
+        return _StubTxn()
+
+    async def execute(self, statement: object, params: object = None) -> _StubResult:
+        self._captured.append((str(statement), params))
+        return _StubResult(self._fetch_result)
+
+
+def _make_session_factory(
+    fetch_result: object, captured: list[tuple[str, object]]
+) -> Callable[[], _StubSession]:
+    def factory() -> _StubSession:
+        return _StubSession(fetch_result, captured)
+
+    return factory
+
+
+class TestInsertParameterSetIdempotent:
+    async def test_returns_created_true_when_row_inserted(self) -> None:
+        captured: list[tuple[str, object]] = []
+        factory = _make_session_factory(("deadbeef",), captured)
+        created = await _insert_parameter_set_idempotent(
+            factory, payload=build_baseline_parameter_set_payload()
+        )
+        assert created is True
+
+    async def test_returns_created_false_on_conflict(self) -> None:
+        """ON CONFLICT DO NOTHING → RETURNING empty → created False (idempotent)."""
+        captured: list[tuple[str, object]] = []
+        factory = _make_session_factory(None, captured)
+        created = await _insert_parameter_set_idempotent(
+            factory, payload=build_baseline_parameter_set_payload()
+        )
+        assert created is False
+
+    async def test_uses_on_conflict_do_nothing_and_binds_minted_row(self) -> None:
+        captured: list[tuple[str, object]] = []
+        factory = _make_session_factory(("deadbeef",), captured)
+        payload = build_baseline_parameter_set_payload()
+        await _insert_parameter_set_idempotent(factory, payload=payload)
+
+        sql, params = captured[0]
+        assert "ON CONFLICT (parameter_set_hash) DO NOTHING" in sql
+        assert isinstance(params, dict)
+        assert params["psh"] == payload.parameter_set_hash
+        stored = json.loads(params["params"])
+        assert stored["STRATEGY_DECOMMISSIONED"] == "False"
+        assert stored["EXIT_AUTO_APPROVE"] == "False"
