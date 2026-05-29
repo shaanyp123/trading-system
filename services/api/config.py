@@ -395,6 +395,34 @@ class APISettings(BaseSettings):
             "reconciliation scheduler does not start."
         ),
     )
+    # Option C (2026-05-28) — EOD recon position-source feature flag.
+    #
+    # Selects where the EOD reconciliation cycle's position-quantity
+    # check reads the broker position list from:
+    #
+    #   - "flexquery" (default): the IBKR FlexQuery XML snapshot. Only
+    #     reports settlement-cleared positions, so same-day fills land
+    #     after the clearing cutoff and trigger false-positive halts.
+    #   - "reqpositions": IBKR's real-time TWS API view via reqPositions
+    #     (clientId=4, per-cycle connect; see
+    #     services/reconciliation/ibkr_intraday.py). No clearing lag.
+    #
+    # Cash / NAV / position MTM stay on FlexQuery either way. This is the
+    # PR-B half of the rollout: the default is "flexquery" so merging +
+    # deploying PR-B changes nothing in production; PR-C flips the default
+    # to "reqpositions" after the operator observes clean cycles with
+    # API_EOD_RECON_POSITION_SOURCE=reqpositions set explicitly in
+    # deploy/.env. Full plan: Docs/ Option-C recon-fix design guide.
+    eod_recon_position_source: Literal["flexquery", "reqpositions"] = Field(
+        default="flexquery",
+        description=(
+            "EOD reconciliation position-quantity source. 'flexquery' "
+            "(default) uses the FlexQuery XML snapshot; 'reqpositions' "
+            "uses IBKR's real-time TWS API view (clientId=4). PR-B ships "
+            "the 'flexquery' default; PR-C flips it after cycle "
+            "observation. Set via API_EOD_RECON_POSITION_SOURCE."
+        ),
+    )
 
     # --- Bar-sync worker (Option C of the 2026-05-20 data-layer v2) --------
     #

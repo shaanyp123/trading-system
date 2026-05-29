@@ -40,6 +40,10 @@ from services.reconciliation.flex_query_fetcher import (
     FlexQueryFetchError,
     ReconciliationSnapshot,
 )
+from services.reconciliation.ibkr_intraday import (
+    ReconPosition,
+    ReconPositionsFetchError,
+)
 from services.reconciliation.recon import BrokerSource, PriorBreak, ReconciliationMetric
 
 
@@ -711,6 +715,223 @@ class TestRunEodCycleBrokerMissingFuturesWarning:
 
         events = [c.get("event") for c in captured]
         assert "reconciliation_eod_cycle_broker_view_missing_futures" not in events
+
+
+class TestRunEodCycleReqPositionsSource:
+    """Option C (2026-05-28) PR-B: the EOD cycle's position-quantity source
+    is flag-selectable. ``position_source="reqpositions"`` swaps the broker
+    view's positions from the FlexQuery XML snapshot (settlement-cleared, so
+    same-day fills land after the clearing cutoff and trigger false-positive
+    halts) onto IBKR's real-time ``reqPositions`` view, tagged
+    ``BrokerSource.TWS_API``. Cash / NAV still come from FlexQuery. On a
+    terminal ``reqPositions`` fetch failure the cycle falls back to FlexQuery
+    positions and logs at ERROR — recon coverage is preserved, not skipped.
+    """
+
+    async def test_happy_path_with_reqpositions_source(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import services.reconciliation.eod_cycle as eod_cycle_mod
+
+        config = EodCycleConfig(
+            account_id=uuid4(),
+            env="paper",
+            flex_query_id=1,
+            flex_query_token="t",
+            position_source="reqpositions",
+            ibkr_account_id="U25655583",
+        )
+        # FlexQuery snapshot DISAGREES on positions (/M2K qty 5) but agrees
+        # on cash. reqPositions AGREES with backend (/M2K qty 1). If the
+        # cycle had used FlexQuery for the position check we'd see a
+        # position_qty break; the reqPositions override means we don't —
+        # that's the Option C false-halt fix.
+        snap = _build_snapshot(
+            positions=(
+                _flex_pos(symbol="M2KM6", sec_type="FUT", quantity="5", underlying_symbol="M2K"),
+            ),
+            cash_balances=(FlexCashBalance(currency="USD", balance=Decimal("100000")),),
+        )
+        client = MagicMock()
+        client.fetch_snapshot = AsyncMock(return_value=snap)
+
+        factory = _stub_session_factory(
+            positions=[{"market": "/M2K", "qty": 1}],
+            balance={"cash_usd": Decimal("100000"), "net_liquidation": Decimal("105000")},
+        )
+
+        captured: dict[str, Any] = {}
+
+        async def fake_fetch(**kwargs: Any) -> tuple[ReconPosition, ...]:
+            captured["fetch_kwargs"] = kwargs
+            return (ReconPosition(market="/M2K", quantity=Decimal("1")),)
+
+        monkeypatch.setattr("services.reconciliation.eod_cycle.fetch_recon_positions", fake_fetch)
+
+        # Wrap the real planner so we can inspect the broker_view it was
+        # handed (source + positions) while still exercising real break
+        # detection — the "no false break" assertion below is the point.
+        real_plan = eod_cycle_mod.plan_reconciliation_check
+
+        def capturing_plan(**kwargs: Any) -> Any:
+            captured["broker_view"] = kwargs["broker_view"]
+            return real_plan(**kwargs)
+
+        monkeypatch.setattr(eod_cycle_mod, "plan_reconciliation_check", capturing_plan)
+
+        async def fake_apply(plan: Any, **kwargs: Any) -> MagicMock:
+            captured["plan"] = plan
+            mock_result = MagicMock()
+            mock_result.kill_switch_invoked = False
+            return mock_result
+
+        monkeypatch.setattr(
+            "services.reconciliation.eod_cycle.apply_reconciliation_plan", fake_apply
+        )
+
+        result = await run_eod_cycle(
+            config=config, session_factory=factory, flex_client_factory=lambda: client
+        )
+        assert result is not None
+
+        broker_view = captured["broker_view"]
+        # reqPositions was the source → broker view tagged TWS_API.
+        assert broker_view.source == BrokerSource.TWS_API
+        # Positions came from reqPositions (/M2K qty 1), NOT the FlexQuery
+        # snapshot (/M2K qty 5) — the override won.
+        assert broker_view.positions == {"/M2K": Decimal("1")}
+        # → no position_qty break despite FlexQuery disagreeing.
+        assert len(captured["plan"].breaks_detected) == 0
+        # fetch_recon_positions received the IBKR account NUMBER + gateway
+        # params threaded through EodCycleConfig (not the backend UUID).
+        assert captured["fetch_kwargs"]["account_id"] == "U25655583"
+        assert captured["fetch_kwargs"]["host"] == "ib_gateway"
+        assert captured["fetch_kwargs"]["port"] == 4004
+
+    async def test_reqpositions_failure_logs_and_falls_back_to_flexquery(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import structlog
+
+        import services.reconciliation.eod_cycle as eod_cycle_mod
+
+        config = EodCycleConfig(
+            account_id=uuid4(),
+            env="paper",
+            flex_query_id=1,
+            flex_query_token="t",
+            position_source="reqpositions",
+            ibkr_account_id="U25655583",
+        )
+        # FlexQuery snapshot AGREES with backend (/M2K qty 1) so the
+        # fallback path produces a clean, break-free cycle — proving recon
+        # coverage is preserved when reqPositions is unavailable.
+        snap = _build_snapshot(
+            positions=(
+                _flex_pos(symbol="M2KM6", sec_type="FUT", quantity="1", underlying_symbol="M2K"),
+            ),
+            cash_balances=(FlexCashBalance(currency="USD", balance=Decimal("100000")),),
+        )
+        client = MagicMock()
+        client.fetch_snapshot = AsyncMock(return_value=snap)
+
+        factory = _stub_session_factory(
+            positions=[{"market": "/M2K", "qty": 1}],
+            balance={"cash_usd": Decimal("100000"), "net_liquidation": Decimal("105000")},
+        )
+
+        captured: dict[str, Any] = {}
+
+        async def fake_fetch(**kwargs: Any) -> tuple[ReconPosition, ...]:
+            raise ReconPositionsFetchError(
+                operation="connect",
+                detail="recon ib_gateway connect failed: gateway down",
+                underlying_exception_class="IbkrPlacementError",
+            )
+
+        monkeypatch.setattr("services.reconciliation.eod_cycle.fetch_recon_positions", fake_fetch)
+
+        real_plan = eod_cycle_mod.plan_reconciliation_check
+
+        def capturing_plan(**kwargs: Any) -> Any:
+            captured["broker_view"] = kwargs["broker_view"]
+            return real_plan(**kwargs)
+
+        monkeypatch.setattr(eod_cycle_mod, "plan_reconciliation_check", capturing_plan)
+
+        async def fake_apply(plan: Any, **kwargs: Any) -> MagicMock:
+            captured["plan"] = plan
+            mock_result = MagicMock()
+            mock_result.kill_switch_invoked = False
+            return mock_result
+
+        monkeypatch.setattr(
+            "services.reconciliation.eod_cycle.apply_reconciliation_plan", fake_apply
+        )
+
+        with structlog.testing.capture_logs() as logs:
+            result = await run_eod_cycle(
+                config=config, session_factory=factory, flex_client_factory=lambda: client
+            )
+
+        assert result is not None
+        broker_view = captured["broker_view"]
+        # Fell back to FlexQuery positions → broker view tagged FLEXQUERY_EOD.
+        assert broker_view.source == BrokerSource.FLEXQUERY_EOD
+        assert broker_view.positions == {"/M2K": Decimal("1")}
+        # FlexQuery agreed with backend → no break (recon coverage preserved).
+        assert len(captured["plan"].breaks_detected) == 0
+        # The failure is surfaced at ERROR with the underlying cause + the
+        # fact that we reverted to the known-broken source.
+        failed = next(c for c in logs if c.get("event") == "eod_cycle_reqpositions_failed")
+        assert failed["log_level"] == "error"
+        assert failed["operation"] == "connect"
+        assert failed["reason"] == "recon ib_gateway connect failed: gateway down"
+        assert failed["underlying_exception_class"] == "IbkrPlacementError"
+        assert failed["fallback"] == "flexquery"
+
+    async def test_position_source_selected_log_line_present(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import structlog
+
+        # Default config → source "flexquery". The selection log fires at
+        # cycle start on every run so the operator can confirm which source
+        # produced the position check from the structlog stream alone.
+        config = EodCycleConfig(
+            account_id=uuid4(),
+            env="paper",
+            flex_query_id=1,
+            flex_query_token="t",
+        )
+        snap = _build_snapshot(
+            positions=(_flex_pos(symbol="MES", quantity="1"),),
+            cash_balances=(FlexCashBalance(currency="USD", balance=Decimal("100000")),),
+        )
+        client = MagicMock()
+        client.fetch_snapshot = AsyncMock(return_value=snap)
+        factory = _stub_session_factory(
+            positions=[{"market": "/MES", "qty": 1}],
+            balance={"cash_usd": Decimal("100000"), "net_liquidation": Decimal("105000")},
+        )
+
+        async def fake_apply(plan: Any, **kwargs: Any) -> MagicMock:
+            mock_result = MagicMock()
+            mock_result.kill_switch_invoked = False
+            return mock_result
+
+        monkeypatch.setattr(
+            "services.reconciliation.eod_cycle.apply_reconciliation_plan", fake_apply
+        )
+
+        with structlog.testing.capture_logs() as logs:
+            await run_eod_cycle(
+                config=config, session_factory=factory, flex_client_factory=lambda: client
+            )
+
+        selected = next(c for c in logs if c.get("event") == "eod_cycle_position_source_selected")
+        assert selected["source"] == "flexquery"
+        assert selected["env"] == "paper"
 
 
 class TestMakeCycleCallback:

@@ -71,7 +71,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import ROUND_HALF_EVEN, Decimal
-from typing import Any, Final
+from typing import Any, Final, Literal
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -91,6 +91,11 @@ from services.reconciliation.flex_query_fetcher import (
     FlexQueryFetchError,
     IbkrFlexQueryClient,
     ReconciliationSnapshot,
+)
+from services.reconciliation.ibkr_intraday import (
+    ReconPosition,
+    ReconPositionsFetchError,
+    fetch_recon_positions,
 )
 from services.reconciliation.recon import (
     BackendView,
@@ -170,6 +175,24 @@ class EodCycleConfig:
     * ``flex_query_id`` / ``flex_query_token`` — IBKR-portal template
       credentials (operator pre-creates the template + records both into
       sops as ``ibkr.flex_query_id`` + ``ibkr.flex_query_token``).
+    * ``position_source`` — Option C (2026-05-28) feature flag. ``"flexquery"``
+      (default) keeps the position-quantity check on the FlexQuery XML
+      snapshot. ``"reqpositions"`` sources the broker position list from
+      IBKR's real-time TWS API (``reqPositions`` via clientId=4) instead,
+      eliminating the same-day-fill settlement-lag false positives. Cash /
+      NAV / position MTM stay on FlexQuery either way. PR-B ships the
+      ``"flexquery"`` default (merging changes nothing in prod); PR-C flips
+      it after empirical cycle observation.
+    * ``ibkr_host`` / ``ibkr_port`` / ``ibkr_account_id`` — ib_gateway
+      connection params for the ``"reqpositions"`` source. Mirror the
+      order worker's settings (``API_IBKR_HOST`` / ``API_IBKR_PORT`` /
+      ``API_IBKR_ACCOUNT``) so recon talks to the SAME gateway + account,
+      isolated only by clientId (recon claims the reserved ``clientId=4``
+      per dev-guide §1.5, distinct from the worker's 1 + bar_sync's 3).
+      ``ibkr_account_id`` is the IBKR account NUMBER (e.g. ``"U25655583"``),
+      distinct from ``account_id`` (the backend accounts-row UUID); ``None``
+      lets the adapter use the default account on the single-account login.
+      Unused when ``position_source="flexquery"``.
     """
 
     account_id: UUID
@@ -177,6 +200,10 @@ class EodCycleConfig:
     flex_query_id: int
     flex_query_token: str
     phase_at_emit: PhaseAtEmit = 1
+    position_source: Literal["flexquery", "reqpositions"] = "flexquery"
+    ibkr_host: str = "ib_gateway"
+    ibkr_port: int = 4004
+    ibkr_account_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +272,12 @@ async def build_backend_view(
     )
 
 
-def build_broker_view(snapshot: ReconciliationSnapshot) -> BrokerView:
+def build_broker_view(
+    snapshot: ReconciliationSnapshot,
+    *,
+    positions_override: tuple[ReconPosition, ...] | None = None,
+    source: BrokerSource = BrokerSource.FLEXQUERY_EOD,
+) -> BrokerView:
     """Map a :class:`ReconciliationSnapshot` to a :class:`BrokerView`.
 
     Pure policy — no I/O. The FlexQuery snapshot carries per-currency
@@ -254,6 +286,22 @@ def build_broker_view(snapshot: ReconciliationSnapshot) -> BrokerView:
     surfaced separately). Positions are SUM-aggregated by market with
     the futures ``/`` prefix applied to the FlexQuery root ticker so the
     backend's ``/M2K`` matches the broker's ``M2K`` ``assetCategory=FUT``.
+
+    **Position source (Option C 2026-05-28).** When ``positions_override``
+    is ``None`` (the default), the position dict is built from the
+    FlexQuery snapshot's ``OpenPositions`` rows as described above. When
+    a tuple of :class:`ReconPosition` is supplied (the
+    ``position_source="reqpositions"`` path in :func:`run_eod_cycle`),
+    THOSE positions populate the dict instead — their ``market`` is
+    already canonical (the adapter's ``_contract_from_ib`` applied the
+    ``/`` prefix), so no FlexQuery symbol normalization runs. Cash is
+    ALWAYS sourced from the FlexQuery snapshot regardless of the position
+    source (``reqPositions`` doesn't carry cash). ``source`` stamps the
+    resulting :class:`BrokerView.source` — callers pass
+    :attr:`BrokerSource.TWS_API` alongside an override so the audit
+    payload records the hybrid reality (positions from TWS, cash from
+    FlexQuery); it defaults to :attr:`BrokerSource.FLEXQUERY_EOD` for the
+    unoverridden FlexQuery path.
 
     **Futures symbol normalization (post-2026-05-27 fix):** the FlexQuery
     XML reports two attributes that can identify a FUT position:
@@ -310,13 +358,25 @@ def build_broker_view(snapshot: ReconciliationSnapshot) -> BrokerView:
     even with a partially-configured FlexQuery template.
     """
     positions: dict[str, Decimal] = {}
-    for pos in snapshot.positions:
-        if pos.quantity == 0:
-            continue
-        market = _market_from_flex_symbol(
-            pos.symbol, pos.sec_type, underlying_symbol=pos.underlying_symbol
-        )
-        positions[market] = positions.get(market, Decimal(0)) + pos.quantity
+    if positions_override is None:
+        for pos in snapshot.positions:
+            if pos.quantity == 0:
+                continue
+            market = _market_from_flex_symbol(
+                pos.symbol, pos.sec_type, underlying_symbol=pos.underlying_symbol
+            )
+            positions[market] = positions.get(market, Decimal(0)) + pos.quantity
+    else:
+        # reqPositions path: markets are already canonical (the adapter
+        # prefixed FUT roots with "/"); zero-qty rows are already dropped
+        # by fetch_recon_positions but we re-guard for symmetry with the
+        # FlexQuery branch + build_backend_view.
+        for recon_pos in positions_override:
+            if recon_pos.quantity == 0:
+                continue
+            positions[recon_pos.market] = (
+                positions.get(recon_pos.market, Decimal(0)) + recon_pos.quantity
+            )
 
     cash_usd = Decimal(0)
     cash_balances_had_usd_row = False
@@ -347,7 +407,7 @@ def build_broker_view(snapshot: ReconciliationSnapshot) -> BrokerView:
     return BrokerView(
         positions=positions,
         cash_usd=cash_usd,
-        source=BrokerSource.FLEXQUERY_EOD,
+        source=source,
     )
 
 
@@ -692,6 +752,18 @@ async def refresh_backend_from_broker_snapshot(
 # ---------------------------------------------------------------------------
 
 
+def _select_position_source(config: EodCycleConfig) -> str:
+    """Return the active position-source label for this cycle.
+
+    Thin, named indirection so the ``eod_cycle_position_source_selected``
+    log line and the source-branch in :func:`run_eod_cycle` read the
+    selection from one place. Today it's a straight field read; a future
+    cycle that needs an env-gated or kill-switch-forced fallback would
+    centralize that logic here without touching the call sites.
+    """
+    return config.position_source
+
+
 async def run_eod_cycle(
     *,
     config: EodCycleConfig,
@@ -718,6 +790,14 @@ async def run_eod_cycle(
         account_id=str(config.account_id),
         env=config.env,
         flex_query_id=config.flex_query_id,
+    )
+
+    position_source = _select_position_source(config)
+    log.info(
+        "eod_cycle_position_source_selected",
+        account_id=str(config.account_id),
+        env=config.env,
+        source=position_source,
     )
 
     if flex_client_factory is None:
@@ -770,7 +850,45 @@ async def run_eod_cycle(
     )
 
     backend_view = await build_backend_view(session_factory, account_id=config.account_id)
-    broker_view = build_broker_view(snapshot)
+    if position_source == "reqpositions":
+        try:
+            recon_positions = await fetch_recon_positions(
+                account_id=config.ibkr_account_id,
+                host=config.ibkr_host,
+                port=config.ibkr_port,
+            )
+        except ReconPositionsFetchError as exc:
+            # The real-time TWS view is unavailable this cycle. Fall back
+            # to the FlexQuery position list (today's behavior) so the
+            # cycle still runs cash/NAV + position checks rather than
+            # skipping reconciliation entirely — the settlement-lag false
+            # positive may reappear for this one cycle, but recon coverage
+            # is preserved. Logged at ERROR (not WARNING) because we've
+            # silently reverted to the known-broken source and the
+            # operator should catch it on a log scan. A Discord/email push
+            # is deliberately NOT emitted here: it would require a new
+            # audit event type + alert category (both alembic / forbidden-
+            # path, out of PR-B scope), and the downstream effect of the
+            # fallback (a re-appeared position break) already fans out
+            # through the existing reconciliation-break alert path.
+            log.error(
+                "eod_cycle_reqpositions_failed",
+                account_id=str(config.account_id),
+                env=config.env,
+                operation=exc.operation,
+                reason=exc.detail,
+                underlying_exception_class=exc.underlying_exception_class,
+                fallback="flexquery",
+            )
+            broker_view = build_broker_view(snapshot)
+        else:
+            broker_view = build_broker_view(
+                snapshot,
+                positions_override=recon_positions,
+                source=BrokerSource.TWS_API,
+            )
+    else:
+        broker_view = build_broker_view(snapshot)
 
     # Resilience signal: when backend has futures positions but the broker
     # view returned ZERO futures positions, the FlexQuery template is
