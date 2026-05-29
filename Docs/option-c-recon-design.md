@@ -263,8 +263,10 @@ The work is split into **3 PRs in dependency order**. PR-A is the smallest possi
 **Reasoning.** `reqPositions` failures should be rare (the adapter `connect()` already raises a structured `IbkrPlacementError`; gateway downtime is the most likely cause). The recurring false-positive problem we're solving is the FlexQuery settlement-lag, so falling back to FlexQuery on a reqPositions failure puts us in "the same broken state we were in yesterday" — which is fine for a one-off and the P1 alert ensures the operator notices.
 
 **Operator input required.** Two sub-decisions:
-1. Confirm P1 alert severity (P1 → `#alerts` + email per `services.webhook_pusher.payloads.SEVERITY_TO_CHANNELS`). Alternative: P2 (Discord only). Recommendation: P1 because a recon-source failure is operationally important.
+1. Confirm P1 alert severity (P1 → `#alerts` **only** per `services.webhook_pusher.payloads.SEVERITY_TO_CHANNELS` — **only P0 fans out to email**; the earlier draft of this line incorrectly said "P1 → #alerts + email"). Alternative: P2 (also `#alerts` only). Recommendation: P1 because a recon-source failure is operationally important.
 2. Confirm the fallback policy (use FlexQuery as the safety net). Alternative: hard-skip position checks entirely. Recommendation: FlexQuery fallback because it preserves the existing post-PR #275 behavior (false-positive may re-appear, but operator already has the manual-override runbook for it).
+
+> **RESOLVED (2026-05-29, PR-B follow-up).** Operator confirmed **P1** (`#alerts` only, no email). Implemented in `services/reconciliation/eod_cycle.py::run_eod_cycle`: on a terminal `ReconPositionsFetchError` the cycle writes a `RECONCILIATION_DATA_SOURCE_DEGRADED` audit row (audit-first, §2.10.1) then dispatches a P1 `reconciliation_data_source_degraded` alert via the existing `alert_dispatch_hook` seam, then falls back to FlexQuery. The emit is fully defensive — audit-write or dispatch failure is swallowed (logged ERROR) so the FlexQuery fallback always runs. New `alert_category` value added via `alembic/versions/2026-05-29_recon_src_degraded.py`; the audit `event_type` column is free-text TEXT so it needed no migration.
 
 ---
 

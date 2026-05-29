@@ -20,6 +20,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from services.audit.event_types import AuditEventType
 from services.reconciliation.apply import AlertDispatchContext
 from services.reconciliation.eod_cycle import (
     DEFAULT_PRIOR_BREAKS_WINDOW_HOURS,
@@ -851,6 +852,18 @@ class TestRunEodCycleReqPositionsSource:
 
         monkeypatch.setattr("services.reconciliation.eod_cycle.fetch_recon_positions", fake_fetch)
 
+        # Option C recon-fix follow-up (2026-05-29): the fallback path now
+        # writes a RECONCILIATION_DATA_SOURCE_DEGRADED audit row via the
+        # degraded-source alert helper. Stub the writer so this test stays
+        # focused on the fallback + ERROR-log contract (the audit/alert
+        # contract is covered by TestRunEodCycleDataSourceDegradedAlert).
+        # No alert_dispatch_hook is passed → the helper logs
+        # ``eod_cycle_data_source_degraded_alert_skipped_no_hook`` + returns.
+        monkeypatch.setattr(
+            "services.reconciliation.eod_cycle.append_audit_event",
+            AsyncMock(side_effect=lambda *a, **k: _audit_record_mock()),
+        )
+
         real_plan = eod_cycle_mod.plan_reconciliation_check
 
         def capturing_plan(**kwargs: Any) -> Any:
@@ -932,6 +945,252 @@ class TestRunEodCycleReqPositionsSource:
         selected = next(c for c in logs if c.get("event") == "eod_cycle_position_source_selected")
         assert selected["source"] == "flexquery"
         assert selected["env"] == "paper"
+
+
+def _degraded_inputs(monkeypatch: pytest.MonkeyPatch) -> tuple[EodCycleConfig, MagicMock, Any]:
+    """Common fixtures for the degraded-source alert tests.
+
+    A ``reqpositions`` cycle whose reqPositions fetch fails terminally, with
+    a FlexQuery snapshot that AGREES with backend (/M2K qty 1) so the
+    fallback produces a clean, break-free cycle. ``apply_reconciliation_plan``
+    is stubbed (no real DB writes, no break alerts) so the ONLY alert-hook
+    invocation under test is the degraded-source push. The real
+    ``plan_reconciliation_check`` runs (pure policy). Returns
+    ``(config, client, factory)``.
+    """
+
+    config = EodCycleConfig(
+        account_id=uuid4(),
+        env="paper",
+        flex_query_id=1,
+        flex_query_token="t",
+        position_source="reqpositions",
+        ibkr_account_id="U25655583",
+    )
+    snap = _build_snapshot(
+        positions=(
+            _flex_pos(symbol="M2KM6", sec_type="FUT", quantity="1", underlying_symbol="M2K"),
+        ),
+        cash_balances=(FlexCashBalance(currency="USD", balance=Decimal("100000")),),
+    )
+    client = MagicMock()
+    client.fetch_snapshot = AsyncMock(return_value=snap)
+    factory = _stub_session_factory(
+        positions=[{"market": "/M2K", "qty": 1}],
+        balance={"cash_usd": Decimal("100000"), "net_liquidation": Decimal("105000")},
+    )
+
+    async def fake_fetch(**kwargs: Any) -> tuple[ReconPosition, ...]:
+        raise ReconPositionsFetchError(
+            operation="connect",
+            detail="recon ib_gateway connect failed: gateway down",
+            underlying_exception_class="IbkrPlacementError",
+        )
+
+    monkeypatch.setattr("services.reconciliation.eod_cycle.fetch_recon_positions", fake_fetch)
+
+    async def fake_apply(plan: Any, **kwargs: Any) -> MagicMock:
+        mock_result = MagicMock()
+        mock_result.kill_switch_invoked = False
+        return mock_result
+
+    monkeypatch.setattr("services.reconciliation.eod_cycle.apply_reconciliation_plan", fake_apply)
+
+    return config, client, factory
+
+
+class TestRunEodCycleDataSourceDegradedAlert:
+    """Option C recon-fix follow-up (2026-05-29): a terminal reqPositions
+    fetch failure now pages the operator instead of only landing in the
+    structlog stream. ``run_eod_cycle`` writes a
+    ``RECONCILIATION_DATA_SOURCE_DEGRADED`` audit row (audit-first per
+    backend-spec §2.10.1) then dispatches a ``P1`` alert (Discord #alerts,
+    category ``reconciliation_data_source_degraded``) through the existing
+    :class:`AlertDispatchContext` seam. The emit is fully defensive — the
+    FlexQuery fallback runs regardless of audit / alert outcome.
+    """
+
+    async def test_emits_audit_and_p1_alert_on_reqpositions_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config, client, factory = _degraded_inputs(monkeypatch)
+
+        audit_uuid = uuid4()
+        audit_calls: list[tuple[Any, dict[str, Any], dict[str, Any]]] = []
+
+        async def fake_audit(
+            session: Any, event_type: Any, payload: dict[str, Any], **kwargs: Any
+        ) -> MagicMock:
+            audit_calls.append((event_type, payload, kwargs))
+            return _audit_record_mock(event_uuid=audit_uuid)
+
+        monkeypatch.setattr("services.reconciliation.eod_cycle.append_audit_event", fake_audit)
+
+        hook_calls: list[AlertDispatchContext] = []
+
+        async def hook(ctx: AlertDispatchContext) -> None:
+            hook_calls.append(ctx)
+
+        result = await run_eod_cycle(
+            config=config,
+            session_factory=factory,
+            flex_client_factory=lambda: client,
+            alert_dispatch_hook=hook,
+        )
+        # FlexQuery fallback still produced a result.
+        assert result is not None
+
+        # Exactly one audit row, with the new event type + structured payload.
+        assert len(audit_calls) == 1
+        event_type, payload, kwargs = audit_calls[0]
+        assert event_type == AuditEventType.RECONCILIATION_DATA_SOURCE_DEGRADED
+        assert payload == {
+            "degraded_source": "reqpositions",
+            "fallback_source": "flexquery",
+            "operation": "connect",
+            "reason": "recon ib_gateway connect failed: gateway down",
+            "underlying_exception_class": "IbkrPlacementError",
+        }
+        assert kwargs["account_id"] == config.account_id
+        assert kwargs["env"] == "paper"
+        assert kwargs["phase_at_emit"] == config.phase_at_emit
+
+        # Exactly one alert: P1, new category, pointing at the audit row.
+        assert len(hook_calls) == 1
+        ctx = hook_calls[0]
+        assert isinstance(ctx, AlertDispatchContext)
+        assert ctx.descriptor.severity == "P1"
+        assert ctx.descriptor.category == "reconciliation_data_source_degraded"
+        assert ctx.descriptor.triggering_break_index == -1
+        assert ctx.descriptor.payload == payload
+        assert ctx.triggering_audit_event_uuid == audit_uuid
+        assert ctx.account_id == config.account_id
+        assert ctx.env == "paper"
+
+    async def test_audit_written_before_alert_dispatched(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config, client, factory = _degraded_inputs(monkeypatch)
+        order: list[str] = []
+
+        async def fake_audit(session: Any, *a: Any, **k: Any) -> MagicMock:
+            order.append("audit")
+            return _audit_record_mock()
+
+        monkeypatch.setattr("services.reconciliation.eod_cycle.append_audit_event", fake_audit)
+
+        async def hook(ctx: AlertDispatchContext) -> None:
+            order.append("alert")
+
+        await run_eod_cycle(
+            config=config,
+            session_factory=factory,
+            flex_client_factory=lambda: client,
+            alert_dispatch_hook=hook,
+        )
+        # Audit-first per backend-spec §2.10.1.
+        assert order == ["audit", "alert"]
+
+    async def test_no_hook_still_writes_audit_and_logs_skip(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import structlog
+
+        config, client, factory = _degraded_inputs(monkeypatch)
+        audit_calls: list[Any] = []
+
+        async def fake_audit(session: Any, event_type: Any, *a: Any, **k: Any) -> MagicMock:
+            audit_calls.append(event_type)
+            return _audit_record_mock()
+
+        monkeypatch.setattr("services.reconciliation.eod_cycle.append_audit_event", fake_audit)
+
+        with structlog.testing.capture_logs() as logs:
+            result = await run_eod_cycle(
+                config=config,
+                session_factory=factory,
+                flex_client_factory=lambda: client,
+            )  # no alert_dispatch_hook wired
+
+        assert result is not None
+        # The durable audit breadcrumb still lands even with no hook.
+        assert audit_calls == [AuditEventType.RECONCILIATION_DATA_SOURCE_DEGRADED]
+        skip = next(
+            c
+            for c in logs
+            if c.get("event") == "eod_cycle_data_source_degraded_alert_skipped_no_hook"
+        )
+        assert skip["log_level"] == "warning"
+
+    async def test_audit_write_failure_swallowed_fallback_proceeds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import structlog
+
+        config, client, factory = _degraded_inputs(monkeypatch)
+
+        async def boom_audit(*a: Any, **k: Any) -> MagicMock:
+            raise RuntimeError("audit chain advisory lock timeout")
+
+        monkeypatch.setattr("services.reconciliation.eod_cycle.append_audit_event", boom_audit)
+
+        hook_calls: list[AlertDispatchContext] = []
+
+        async def hook(ctx: AlertDispatchContext) -> None:
+            hook_calls.append(ctx)
+
+        with structlog.testing.capture_logs() as logs:
+            result = await run_eod_cycle(
+                config=config,
+                session_factory=factory,
+                flex_client_factory=lambda: client,
+                alert_dispatch_hook=hook,
+            )
+
+        # Fallback still ran → cycle completed.
+        assert result is not None
+        # Audit write failed → no alert dispatched (no triggering uuid to stamp).
+        assert hook_calls == []
+        failed = next(
+            c for c in logs if c.get("event") == "eod_cycle_data_source_degraded_audit_write_failed"
+        )
+        assert failed["log_level"] == "error"
+        # The original reqpositions-failure ERROR log is still present.
+        assert any(c.get("event") == "eod_cycle_reqpositions_failed" for c in logs)
+
+    async def test_alert_dispatch_failure_swallowed_fallback_proceeds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import structlog
+
+        config, client, factory = _degraded_inputs(monkeypatch)
+        audit_uuid = uuid4()
+
+        async def fake_audit(*a: Any, **k: Any) -> MagicMock:
+            return _audit_record_mock(event_uuid=audit_uuid)
+
+        monkeypatch.setattr("services.reconciliation.eod_cycle.append_audit_event", fake_audit)
+
+        async def boom_hook(ctx: AlertDispatchContext) -> None:
+            raise RuntimeError("discord webhook 503")
+
+        with structlog.testing.capture_logs() as logs:
+            result = await run_eod_cycle(
+                config=config,
+                session_factory=factory,
+                flex_client_factory=lambda: client,
+                alert_dispatch_hook=boom_hook,
+            )
+
+        # A Discord outage MUST NOT take down the cycle — fallback completed.
+        assert result is not None
+        failed = next(
+            c
+            for c in logs
+            if c.get("event") == "eod_cycle_data_source_degraded_alert_dispatch_failed"
+        )
+        assert failed["log_level"] == "error"
+        assert failed["audit_event_uuid"] == str(audit_uuid)
 
 
 class TestMakeCycleCallback:

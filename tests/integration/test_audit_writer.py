@@ -250,6 +250,49 @@ async def test_single_insert_computes_correct_hash_chain(
 
 
 @pytest.mark.asyncio
+async def test_reconciliation_data_source_degraded_round_trips(
+    async_session_factory: async_sessionmaker[AsyncSession],
+    sync_engine: Engine,
+    fresh_account_id: UUID,
+) -> None:
+    """A04: the new ``RECONCILIATION_DATA_SOURCE_DEGRADED`` event type emits
+    and reads back cleanly (Option C recon-fix follow-up 2026-05-29).
+
+    ``audit_log.event_type`` is a TEXT column (alembic 0001:73) with no
+    CHECK / Postgres enum, so the new taxonomy value needs NO alembic
+    migration on the audit side — but anti-pattern A04 still requires at
+    least one test that emits the new type and reads it back. This locks
+    the stable wire string round-trip through a real append + SELECT.
+    """
+    payload = {
+        "degraded_source": "reqpositions",
+        "fallback_source": "flexquery",
+        "operation": "connect",
+        "reason": "recon ib_gateway connect failed: gateway down",
+        "underlying_exception_class": "IbkrPlacementError",
+    }
+    async with async_session_factory() as session:
+        record = await append_audit_event(
+            session,
+            AuditEventType.RECONCILIATION_DATA_SOURCE_DEGRADED,
+            payload,
+            account_id=fresh_account_id,
+            env="paper",
+            phase_at_emit=1,
+        )
+
+    assert record.event_type == AuditEventType.RECONCILIATION_DATA_SOURCE_DEGRADED
+
+    persisted = _read_row_by_uuid(sync_engine, record.event_uuid)
+    # The stable wire string round-trips through the TEXT column.
+    assert persisted["event_type"] == "reconciliation_data_source_degraded"
+    assert persisted["payload_jcs"] == jcs_serialize(payload)
+    assert persisted["account_id"] == fresh_account_id
+    assert persisted["env"] == "paper"
+    assert persisted["phase_at_emit"] == 1
+
+
+@pytest.mark.asyncio
 async def test_first_row_genesis_prev_hash_is_all_zeros(
     async_session_factory: async_sessionmaker[AsyncSession],
     sync_engine: Engine,

@@ -890,7 +890,7 @@ class TestDeliveryStatusValues:
 
 
 class TestAlertCategoryEnumMirror:
-    """31 values per backend-spec §3.27 + alembic 0004 alert_category enum.
+    """33 values per backend-spec §3.27 + alembic 0004 alert_category enum.
 
     If alembic adds a new value without updating the Python enum here,
     ``_parse_category`` raises at dispatch time. This test catches the
@@ -905,8 +905,11 @@ class TestAlertCategoryEnumMirror:
         # (`worker_failure` for the recovery-agent task-death hook);
         # 2026-05-27_position_unprotected migration adds 1 more
         # (`position_unprotected` for the exit-pipeline PR-C
-        # cancel-success+place-fail failure mode).
-        assert len(list(AlertCategory)) == 32
+        # cancel-success+place-fail failure mode);
+        # 2026-05-29_reconciliation_data_source_degraded migration adds 1
+        # more (`reconciliation_data_source_degraded` for the Option C
+        # recon-fix reqPositions→FlexQuery fallback push).
+        assert len(list(AlertCategory)) == 33
 
     def test_canonical_values_present(self) -> None:
         # Sentinel check; full set in alembic 0004 + spec §3.27.
@@ -914,6 +917,7 @@ class TestAlertCategoryEnumMirror:
             "kill_switch_invoked",
             "audit_chain_break",
             "reconciliation_break",
+            "reconciliation_data_source_degraded",
             "external_watchdog_alert",
             "maintenance_window",
         ):

@@ -82,6 +82,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from services.audit.event_types import AuditEventType
 from services.audit.writer import Environment, PhaseAtEmit, append_audit_event
 from services.reconciliation.apply import (
+    AlertDispatchContext,
     AlertDispatchHook,
     ReconciliationApplyResult,
     StateTransitionHook,
@@ -98,6 +99,7 @@ from services.reconciliation.ibkr_intraday import (
     fetch_recon_positions,
 )
 from services.reconciliation.recon import (
+    AlertDescriptor,
     BackendView,
     BrokerSource,
     BrokerView,
@@ -143,6 +145,16 @@ BALANCE_SOURCE_FROM_FLEX: Final[str] = "flexquery_eod"
 #: Quantization for the ``positions_current.unrealized_pnl`` UPDATE.
 #: Schema is NUMERIC(20, 4); round half-even to match.
 PNL_QUANTIZER: Final[Decimal] = Decimal("0.0001")
+
+
+#: Sentinel ``triggering_break_index`` for an :class:`AlertDescriptor` that is
+#: NOT tied to a reconciliation break. The api-side alert hook ignores this
+#: field (it stamps ``alerts.triggering_audit_event_uuid`` from the
+#: AlertDispatchContext, not from positional break alignment), so ``-1`` is a
+#: harmless "not a break" marker. Mirrors the heartbeat probe + async-task
+#: monitor precedents that route non-break alerts through the same recon
+#: AlertDispatchContext seam.
+_NO_TRIGGERING_BREAK_INDEX: Final[int] = -1
 
 
 # Reverse map from the schema's TEXT ``metric`` column → the planner's
@@ -764,6 +776,142 @@ def _select_position_source(config: EodCycleConfig) -> str:
     return config.position_source
 
 
+async def _emit_data_source_degraded_alert(
+    *,
+    session_factory: async_sessionmaker[Any],
+    account_id: UUID,
+    env: Environment,
+    phase_at_emit: PhaseAtEmit,
+    exc: ReconPositionsFetchError,
+    alert_dispatch_hook: AlertDispatchHook | None,
+) -> None:
+    """Page the operator when the reqPositions source degraded to FlexQuery.
+
+    Option C recon-fix follow-up (2026-05-29). When the
+    ``position_source="reqpositions"`` per-cycle reqPositions fetch fails
+    terminally, ``run_eod_cycle`` falls back to the FlexQuery position list
+    (preserving recon coverage) but the fallback silently reintroduces the
+    same-day-fill settlement-lag false-break behavior for one cycle. This
+    helper turns that previously log-only event into an active operator
+    push:
+
+      1. Writes a durable :data:`AuditEventType.RECONCILIATION_DATA_SOURCE_DEGRADED`
+         audit row (audit-first per backend-spec §2.10.1).
+      2. Dispatches a ``P1`` alert (category
+         ``reconciliation_data_source_degraded`` → Discord #alerts only;
+         NO #critical / email — a single-cycle coverage downgrade, not
+         money at risk) through the existing ``alert_dispatch_hook`` /
+         :class:`AlertDispatchContext` seam, reusing the
+         heartbeat-probe / async-task-monitor precedent for non-break
+         alerts.
+
+    **This helper NEVER raises.** The Option C design (Q3) policy is
+    "degrade, don't skip recon" — the caller's FlexQuery fallback MUST run
+    regardless of whether the audit write or the alert dispatch succeeds.
+    Failure modes:
+
+      * Audit write fails → log ERROR + return WITHOUT dispatching (an
+        :class:`AlertDispatchContext` requires a
+        ``triggering_audit_event_uuid``, which we cannot supply). The
+        caller still falls back to FlexQuery.
+      * No hook wired (Phase 1 day-1 boot before sops Discord URLs land)
+        → log WARNING + return; the audit row is still the durable record.
+      * Hook raises (Discord outage) → log ERROR + return; the audit row
+        already landed.
+    """
+    payload: dict[str, Any] = {
+        "degraded_source": "reqpositions",
+        "fallback_source": "flexquery",
+        "operation": exc.operation,
+        "reason": exc.detail,
+        "underlying_exception_class": exc.underlying_exception_class,
+    }
+
+    # Audit-first (backend-spec §2.10.1): the durable breadcrumb lands
+    # BEFORE the operator-visible push. A21: the writer opens its own
+    # transaction, so we hand it a fresh session.
+    try:
+        async with session_factory() as audit_session:
+            record = await append_audit_event(
+                audit_session,
+                AuditEventType.RECONCILIATION_DATA_SOURCE_DEGRADED,
+                payload,
+                account_id=account_id,
+                env=env,
+                phase_at_emit=phase_at_emit,
+            )
+    except Exception:
+        log.error(
+            "eod_cycle_data_source_degraded_audit_write_failed",
+            account_id=str(account_id),
+            env=env,
+            operation=exc.operation,
+            reason=exc.detail,
+            exc_info=True,
+        )
+        return
+
+    audit_uuid = record.event_uuid
+
+    if alert_dispatch_hook is None:
+        log.warning(
+            "eod_cycle_data_source_degraded_alert_skipped_no_hook",
+            account_id=str(account_id),
+            env=env,
+            audit_event_uuid=str(audit_uuid),
+        )
+        return
+
+    try:
+        title = "Reconciliation position source degraded"
+        body = (
+            "The per-cycle reqPositions (real-time TWS, clientId=4) fetch "
+            "failed; EOD reconciliation fell back to the FlexQuery position "
+            "list for this cycle. Cash / NAV / position checks still ran, but "
+            "same-day-fill settlement-lag false breaks may reappear until the "
+            "next cycle restores the real-time source. "
+            f"Failed operation: {exc.operation}. Reason: {exc.detail}."
+        )
+        # ``severity="P1"`` is a valid AlertSeverityLiteral member; only
+        # ``category`` needs the type-ignore because AlertCategoryLiteral is
+        # locked to "reconciliation_break" in the pure planner (recon.py).
+        # We deliberately do NOT widen that literal — recon.py stays pure;
+        # the api-side hook accepts any AlertCategory enum value. Mirrors
+        # the heartbeat-probe precedent.
+        descriptor = AlertDescriptor(
+            triggering_break_index=_NO_TRIGGERING_BREAK_INDEX,
+            severity="P1",
+            category="reconciliation_data_source_degraded",  # type: ignore[arg-type]
+            title=title,
+            body=body,
+            payload=payload,
+        )
+        ctx = AlertDispatchContext(
+            descriptor=descriptor,
+            triggering_audit_event_uuid=audit_uuid,
+            account_id=account_id,
+            env=env,
+        )
+        await alert_dispatch_hook(ctx)
+    except Exception:
+        log.error(
+            "eod_cycle_data_source_degraded_alert_dispatch_failed",
+            account_id=str(account_id),
+            env=env,
+            audit_event_uuid=str(audit_uuid),
+            exc_info=True,
+        )
+        return
+
+    log.info(
+        "eod_cycle_data_source_degraded_alert_emitted",
+        account_id=str(account_id),
+        env=env,
+        audit_event_uuid=str(audit_uuid),
+        operation=exc.operation,
+    )
+
+
 async def run_eod_cycle(
     *,
     config: EodCycleConfig,
@@ -864,13 +1012,7 @@ async def run_eod_cycle(
             # skipping reconciliation entirely — the settlement-lag false
             # positive may reappear for this one cycle, but recon coverage
             # is preserved. Logged at ERROR (not WARNING) because we've
-            # silently reverted to the known-broken source and the
-            # operator should catch it on a log scan. A Discord/email push
-            # is deliberately NOT emitted here: it would require a new
-            # audit event type + alert category (both alembic / forbidden-
-            # path, out of PR-B scope), and the downstream effect of the
-            # fallback (a re-appeared position break) already fans out
-            # through the existing reconciliation-break alert path.
+            # silently reverted to the known-broken source.
             log.error(
                 "eod_cycle_reqpositions_failed",
                 account_id=str(config.account_id),
@@ -879,6 +1021,20 @@ async def run_eod_cycle(
                 reason=exc.detail,
                 underlying_exception_class=exc.underlying_exception_class,
                 fallback="flexquery",
+            )
+            # Option C recon-fix follow-up (2026-05-29): turn the silent
+            # fallback into an active operator push. Writes a
+            # RECONCILIATION_DATA_SOURCE_DEGRADED audit row (audit-first)
+            # then dispatches a P1 alert (Discord #alerts). Fully defensive
+            # — it NEVER raises, so the FlexQuery fallback below always runs
+            # regardless of the audit / alert outcome.
+            await _emit_data_source_degraded_alert(
+                session_factory=session_factory,
+                account_id=config.account_id,
+                env=config.env,
+                phase_at_emit=config.phase_at_emit,
+                exc=exc,
+                alert_dispatch_hook=alert_dispatch_hook,
             )
             broker_view = build_broker_view(snapshot)
         else:
