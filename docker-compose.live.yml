@@ -90,6 +90,11 @@ services:
       # is fully isolated from paper's clientId=1.
       API_IBKR_CLIENT_ID: ${API_IBKR_CLIENT_ID:-1}
       API_BAR_SYNC_CLIENT_ID: ${API_BAR_SYNC_CLIENT_ID:-2}
+      # EOD reconciliation position source (Option C). REQUIRED passthrough
+      # (config.py uses env_file=None); mirrors docker-compose.yml. Default
+      # "flexquery"; set API_EOD_RECON_POSITION_SOURCE=reqpositions in
+      # deploy/.env.live to use the real-time TWS view (reqPositions).
+      API_EOD_RECON_POSITION_SOURCE: ${API_EOD_RECON_POSITION_SOURCE:-flexquery}
     volumes:
       # Live secrets-decrypted dir is DISTINCT from paper's so a paper-side
       # sops accident can't bleed into live's runtime. Operator's pre-cutover

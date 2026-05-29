@@ -208,6 +208,14 @@ services:
       # bar_sync cycle. The api boot logs explicitly call out the
       # configured value via `bar_sync_worker_spawned ibkr_client_id=N`.
       API_BAR_SYNC_CLIENT_ID: ${API_BAR_SYNC_CLIENT_ID:-2}
+      # EOD reconciliation position-quantity source (Option C recon-fix).
+      # Default "flexquery" preserves prod behavior; set
+      # API_EOD_RECON_POSITION_SOURCE=reqpositions in deploy/.env to cut
+      # over to IBKR's real-time TWS view (reqPositions on clientId=4).
+      # This passthrough is REQUIRED: config.py uses env_file=None, so a
+      # value in deploy/.env only reaches the container via this mapping
+      # (--env-file alone feeds compose interpolation, not the container env).
+      API_EOD_RECON_POSITION_SOURCE: ${API_EOD_RECON_POSITION_SOURCE:-flexquery}
     # Bind-mount the host-decrypted secrets directory. `deploy/day5-bringup.sh`
     # runs `sops -d` on the host and writes /opt/trading/secrets-decrypted/
     # decrypted.yaml — the api entrypoint reads it at /run/secrets/decrypted.yaml.
