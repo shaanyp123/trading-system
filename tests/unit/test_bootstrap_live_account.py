@@ -103,8 +103,10 @@ class TestParseArgs:
         assert result.parameter_set_json is None
 
     def test_mint_and_parameter_set_json_mutually_exclusive(self, tmp_path: Path) -> None:
+        # Valid-shaped stub (64-hex) so the test exercises the mutual-exclusion
+        # gate on its own merits, not as a side effect of file-validation order.
         path = tmp_path / "ps.json"
-        path.write_text('{"parameter_set_hash": "a", "parameters": {}}')
+        path.write_text(json.dumps({"parameter_set_hash": "a" * 64, "parameters": {}}))
         with pytest.raises(ValueError, match="mutually exclusive"):
             parse_args(
                 [
