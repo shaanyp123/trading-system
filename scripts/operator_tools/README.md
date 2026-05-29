@@ -14,6 +14,7 @@ service-side write paths (never raw SQL).
 | `trigger_v1_cycle.py` | On-demand V1 strategy cycle trigger (mirrors what LEAN does at 21:30 UTC); reads bars from disk + POSTs to `/api/internal/lean/signals` | Yes (when `--no-dry-run`) — POSTs signal_emitted events which become audit rows + signals INSERTs via the api endpoint. **--dry-run default = ON.** |
 | `replace_protective_stop.py` | POSITION_UNPROTECTED recovery: places a fresh bracket-stop for a position whose protective stop was cancelled but never replaced (PR-C exit-pipeline failure mode) | Yes (when `--no-dry-run --confirm`) — writes ORDER_PLACED audit + INSERTs orders row + places stop_market at IBKR. **--dry-run default = ON; two-flag gate.** |
 | `master_client_id_probe.py` | Empirical validation of the IBKR Master Client ID configuration (`TWS_MASTER_CLIENT_ID`). Three sequential stages on distinct clientIds: place a safe stop at `$1` on /MES from clientId=86, cancel via the master clientId, `reqGlobalCancel` cleanup from clientId=87. | Yes — places a single safe (stop=$1, DAY TIF, /MES) order at IBKR. Cancels itself end-to-end on success. No DB writes; no audit chain. **Operator-coordinated; runs post `docker compose up -d --force-recreate ib_gateway`.** |
+| `bootstrap_live_account.py` | Idempotent DB bootstrap: `accounts` + `risk_state` (live cutover) and — via `--mint-from-defaults` — seeds the baseline `parameter_sets` head row from the canonical V1 defaults, minting the `parameter_set_hash` (PR #294). See the **parameter-set seeding** + **decommission ceremony** sections below. | Yes (when `--no-dry-run --confirm`) — parameterized INSERTs via `ON CONFLICT DO NOTHING`. **--dry-run default = ON; two-flag gate; idempotent re-runs are no-ops.** |
 
 ---
 
@@ -630,3 +631,296 @@ Two-flag gate (`--no-dry-run` AND `--confirm`) is DELIBERATELY stricter than `tr
 ### Lineage
 
 Designed in `Docs/exit-pipeline-design.md` §Q5 as the operator-side bridge for the POSITION_UNPROTECTED failure mode introduced by exit-pipeline PR-C (services/risk/order_placement_worker.py's exit-close path). Shape mirrors `replay_executions.py` (one-shot IBKR tool with audit-first writes) rather than `trigger_v1_cycle.py` (HTTP POST to api).
+
+---
+
+## `bootstrap_live_account.py` — parameter-set seeding (paper)
+
+> Seeds paper's **empty** `parameter_sets` head row from the canonical V1
+> defaults via `--mint-from-defaults` (PR-A, #294). This is distinct from the
+> tool's live-cutover role (the `accounts` + `risk_state` rows + the
+> `--parameter-set-json` "copy paper's head" path); see the module docstring
+> for cutover usage.
+
+### When to use
+
+- The `parameter_sets` table is empty (0 rows) and you need a head row so that
+  (a) the `/system` risk-envelope UI shows real values instead of spec defaults,
+  and (b) the **decommission ceremony** below has a row to flip.
+- One-time per environment. Idempotent — safe to re-run
+  (`ON CONFLICT (parameter_set_hash) DO NOTHING`).
+
+### What `--mint-from-defaults` does
+
+1. Builds the baseline row from `default_v1_parameters().to_canonical_dict()` —
+   all **12** canonical UPPER_CASE keys, decimals-as-strings, both operator-only
+   flags (`STRATEGY_DECOMMISSIONED`, `EXIT_AUTO_APPROVE`) stored as the string
+   `"False"`.
+2. Mints `parameter_set_hash` via
+   `services/version/composite_hash.py::compute_parameter_set_hash`, which hashes
+   only the **10** Parameter-Ranges-Table params — the two flags are EXCLUDED
+   (backend-spec §3.11 / design Q1-A). That exclusion is what makes the later
+   decommission flip PK-stable (see the ceremony).
+3. INSERTs the `parameter_sets` row idempotently.
+4. Also runs the idempotent `accounts` + `risk_state` INSERTs. **On the
+   already-bootstrapped paper DB these are no-ops** (account `U25655583` + the
+   current `risk_state` row already exist) — you will see `created=false …
+   idempotent no-op` log lines; that is expected, not a bug.
+
+### Pre-flight (Q6 — confirm 0 rows first)
+
+```bash
+ssh root@178.156.239.84 -- 'set -euo pipefail
+  cd /opt/trading
+  (
+    export SOPS_AGE_KEY_FILE=/etc/credstore.encrypted/age_key
+    PG_PASS=$(sops -d secrets/paper.enc.yaml | yq -r .postgres.app_service_password)
+    docker compose --env-file deploy/.env exec -T \
+      -e PGPASSWORD="$PG_PASS" \
+      postgres \
+      psql -U app_service -d trading -h postgres -c "
+SELECT count(*) AS total,
+       count(*) FILTER (WHERE last_active_at IS NULL) AS active
+FROM parameter_sets;
+"
+  )
+'
+# Expected: total=0, active=0. If a row already exists, SKIP the INSERT below
+# (it would no-op anyway) and go straight to the ceremony's UPDATE.
+```
+
+### Run command (paper env, dry-run — REQUIRED FIRST)
+
+Default is `--dry-run`; the minted hash is logged without any write.
+
+```bash
+ssh root@178.156.239.84 -- 'set -euo pipefail
+  cd /opt/trading
+  (
+    export SOPS_AGE_KEY_FILE=/etc/credstore.encrypted/age_key
+    PG_PASS=$(sops -d secrets/paper.enc.yaml | yq -r .postgres.app_service_password)
+    docker compose --env-file deploy/.env exec -T \
+      -w /app \
+      -e PYTHONPATH=/app \
+      -e DATABASE_URL="postgresql+asyncpg://app_service:${PG_PASS}@postgres:5432/trading" \
+      api \
+      /opt/venv/bin/python -m scripts.operator_tools.bootstrap_live_account \
+        --env paper \
+        --mint-from-defaults
+  )
+'
+```
+
+Inspect the log for `bootstrap_live_account_minted_baseline_parameter_set` —
+note the `parameter_set_hash` (`stored_key_count=12`, `hashed_key_count=10`).
+**Record the hash**; the wet run must produce the **same** hash (determinism).
+
+### Run command (paper env, wet — committing)
+
+Same invocation plus the two-flag gate (`--no-dry-run --confirm`). `--env paper`
+needs **no** `--allow-non-paper`.
+
+```bash
+ssh root@178.156.239.84 -- 'set -euo pipefail
+  cd /opt/trading
+  (
+    export SOPS_AGE_KEY_FILE=/etc/credstore.encrypted/age_key
+    PG_PASS=$(sops -d secrets/paper.enc.yaml | yq -r .postgres.app_service_password)
+    docker compose --env-file deploy/.env exec -T \
+      -w /app \
+      -e PYTHONPATH=/app \
+      -e DATABASE_URL="postgresql+asyncpg://app_service:${PG_PASS}@postgres:5432/trading" \
+      api \
+      /opt/venv/bin/python -m scripts.operator_tools.bootstrap_live_account \
+        --env paper \
+        --mint-from-defaults \
+        --no-dry-run --confirm
+  )
+'
+```
+
+### Verification (post-success)
+
+```bash
+# Head row exists; flags stored as "False"; hash matches the dry-run.
+... (same ssh + subshell + PG_PASS wrapper) ...
+      psql -U app_service -d trading -h postgres -c "
+SELECT parameter_set_hash,
+       parameters->>'STRATEGY_DECOMMISSIONED' AS decom,
+       parameters->>'EXIT_AUTO_APPROVE'        AS auto_approve,
+       last_active_at
+FROM parameter_sets
+ORDER BY first_active_at DESC LIMIT 1;
+"
+# Expected: 1 row; decom='False'; auto_approve='False'; last_active_at=NULL (head).
+```
+
+Also load `/system` in the web UI — the risk-envelope tile now reflects the
+seeded values rather than spec defaults.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Success (row inserted, idempotent no-op, or dry-run plan printed) |
+| 1 | Invalid `--parameter-set-json` (N/A for `--mint-from-defaults`) |
+| 5 | DB init failure — verify `DATABASE_URL` staged |
+| 6 | Invalid CLI args (e.g. `--mint-from-defaults` + `--parameter-set-json` together) |
+| 99 | Unexpected exception |
+
+### Architecture note
+
+The seed INSERT is **parameterized SQL** (`ON CONFLICT (parameter_set_hash) DO
+NOTHING`), not a service-side write path — an intentional bootstrap exception to
+the "never raw SQL" norm at the top of this file. `parameter_sets` is
+content-addressed and has no operator-facing write endpoint (design F10/L1); no
+audit row is written (A01 N/A). `services/version/**` and
+`scripts/operator_tools/**` are NOT on the [A02] forbidden whitelist — regular
+PR review, no `risk-review-approved` label (PR #294).
+
+---
+
+## Decommission ceremony (exit-pipeline §10.3 smoke)
+
+Proves the `STRATEGY_DECOMMISSIONED` kill-switch end-to-end on paper: flip the
+flag → `trigger_v1_cycle` emits an `exit_reason='decommission'` CLOSE for every
+held position → operator approves → bracket-stop cancel + close place →
+`TRADE_CLOSED`. This is `Docs/exit-pipeline-design.md` §10.3 step 3, unblocked by
+the seed tooling above.
+
+> **⚠️ SCOPE — this stops the manual `trigger_v1_cycle` path ONLY, NOT the live
+> nightly cycle.** The 21:30 UTC LEAN cycle reads its parameters from
+> `lean/lean.json` (NOT the DB), and `lean.json` does not even carry the
+> `STRATEGY_DECOMMISSIONED` key — so flipping the DB flag does **nothing** to the
+> nightly strategy. **A green smoke here is NOT evidence that the kill-switch
+> stops live trading.** Wiring the DB flag (or `lean.json`) into the nightly
+> cycle is **parameter-sets-bootstrap-design PR-C (Q3-C)** — not yet shipped.
+> (Distinct from exit-pipeline-design's own PR-C #253, which is done.)
+
+> **⚠️ AUDIT — the flag-flip below is a raw `UPDATE` with NO
+> `parameter_change_applied` audit event.** That is the signed-off smoke
+> mechanism (design Q4-A). The event-sourced audit ceremony is
+> **parameter-sets-bootstrap-design PR-D, and is REQUIRED before any *live*
+> decommission.** Until then this ceremony is **paper-smoke-only.**
+
+### Pre-conditions
+
+- A seeded `parameter_sets` head row (run the seeding section above first).
+- At least one held position (e.g. tonight's /M2K LONG).
+- `risk_state.state == 'NORMAL'` (`trigger_v1_cycle` fails closed otherwise).
+
+All `psql` / tool steps below run inside the same `ssh … 'set -euo pipefail; cd
+/opt/trading; ( export SOPS_AGE_KEY_FILE=…; PG_PASS=$(sops …); … )'` wrapper
+shown in the seeding section — only the `-c "…"` SQL / the module invocation
+changes. Secrets stay subshell-scoped and are never echoed
+(`feedback_secret_handling.md`).
+
+### Sequence
+
+**1 — Capture the head hash (it must NOT change across the flip).**
+
+```sql
+SELECT parameter_set_hash, parameters->>'STRATEGY_DECOMMISSIONED' AS decom
+FROM parameter_sets WHERE last_active_at IS NULL;
+-- Record parameter_set_hash. Expect decom='False'.
+```
+
+**2 — Flip the flag to True (in-place; PK-stable).**
+
+```sql
+UPDATE parameter_sets
+SET parameters = jsonb_set(parameters, '{STRATEGY_DECOMMISSIONED}', to_jsonb('True'::text))
+WHERE last_active_at IS NULL;
+```
+
+`to_jsonb('True'::text)` writes the JSON string `"True"` (matching the seeded
+string shape; the readers coerce it via `str(value).strip().lower() == "true"`).
+Re-run the step-1 SELECT and verify: `decom` flips to `'True'` **AND**
+`parameter_set_hash` is **unchanged** — the hash excludes the flag (design Q1-A);
+that stability is the entire point of the in-place UPDATE.
+
+**3 — Run the trigger (exits only, decommission reason only).**
+
+```bash
+/opt/venv/bin/python -m scripts.operator_tools.trigger_v1_cycle \
+  --env paper \
+  --exits-only \
+  --reason-filter=decommission \
+  --no-dry-run
+```
+
+Wet run, so stage `LEAN_LOCAL_BEARER_TOKEN` in the subshell exactly as the
+`trigger_v1_cycle` wet-run command does above. Expect one `signal_emitted`
+(`signal_type='exit'`, `exit_reason='decommission'`) per held position; the tool
+logs each emitted market + reason and a `trigger_v1_cycle_completed` summary.
+`--exits-only` keeps the run surgical (the entry pipeline is short-circuited by
+the flag anyway).
+
+**4 — Approve + observe.** At `/signals`, approve the decommission exit(s).
+Observe bracket-stop cancel + close placement; confirm `TRADE_CLOSED` (the trade
+closes in the `/positions` + `/signals` surfaces and the audit chain extends).
+
+**5 — REVERT (HARD GATE — do not skip).**
+
+```sql
+UPDATE parameter_sets
+SET parameters = jsonb_set(parameters, '{STRATEGY_DECOMMISSIONED}', to_jsonb('False'::text))
+WHERE last_active_at IS NULL;
+-- Verify decom='False' again; parameter_set_hash still unchanged.
+```
+
+> **If you skip the revert, the flag stays `True` and the *next*
+> `trigger_v1_cycle` run will re-emit decommission exits for everything held.**
+> (The nightly cycle is unaffected either way — it never reads this flag.) The
+> revert is a checklist gate, not a suggestion.
+
+### Verification
+
+Both run inside the same `ssh + subshell + PG_PASS` wrapper as the seeding
+section (only the container + command change):
+
+```bash
+# 1. Audit chain still verifies after the ceremony (api container):
+/opt/venv/bin/python -m services.audit.verify_chain --env paper
+# Expected: CHAIN OK: <N> rows verified
+
+# 2. The decommission exit signals landed (postgres container). exit_reason is
+#    visible in the trigger tool's per-signal log + the /signals UI; it is NOT a
+#    top-level signals column, so filter on signal_type here:
+psql -U app_service -d trading -h postgres -c "
+SELECT id, market, direction, signal_type, status, emitted_at_utc
+FROM signals
+WHERE signal_type = 'exit'
+  AND emitted_at_utc > NOW() - INTERVAL '1 hour'
+ORDER BY emitted_at_utc DESC;
+"
+```
+
+Plus confirm: `TRADE_CLOSED` for each approved exit; the flag is reverted to
+`'False'`; and `parameter_set_hash` was stable throughout (steps 1, 2, 5).
+
+### If something goes wrong
+
+- **Accidental / premature decommission:** run step 5 (flip to `False`)
+  immediately, and **reject** any pending decommission exits at `/signals`
+  **before** approving them — nothing flattens until you approve. The nightly
+  cycle will not flatten the book on its own (it never reads the flag).
+- **Hash changed across the flip:** STOP. That means something hashed the flag
+  (a regression against design Q1-A / PR #294). Do not proceed; investigate
+  `services/version/composite_hash.py`.
+
+### Architecture note
+
+The flag-flip is a raw `UPDATE` (design Q4-A) — the one deliberate exception to
+this file's "service-side write paths only" norm, scoped to the paper smoke and
+gated behind the two ⚠️ caveats above. No audit event is written for the flip
+until PR-D. `Docs/parameter-sets-bootstrap-design.md` is on the `Docs/**` path
+(not forbidden); `scripts/operator_tools/**` is hot-fix scope — no
+`risk-review-approved` label.
+
+### Lineage
+
+`Docs/parameter-sets-bootstrap-design.md` PR-B. Unblocked by PR-A (#294), which
+built the hash minter + `--mint-from-defaults`. The L3/§2 caveat (trigger path
+only) and Q4-A (raw UPDATE, audit deferred to PR-D) are signed off in that
+design's §11.
