@@ -30,6 +30,21 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # ---------------------------------------------------------------------------
+# Module constants
+# ---------------------------------------------------------------------------
+
+#: ``balances.source`` written by the EOD-recon per-cycle balance snapshot
+#: (mirrors ``services/reconciliation/eod_cycle.py::BALANCE_SOURCE_FROM_FLEX``).
+#: The reconciliation summary derives ``last_check_utc`` from the latest
+#: balances row carrying THIS source: every recon cycle writes one BEFORE the
+#: planner runs, so it lands whether or not the cycle finds a break — making it
+#: a faithful "when did recon last run" signal. The fill processor writes
+#: ``'tws_api'`` balances on every fill; filtering by this source keeps a fill
+#: from masquerading as a recon check.
+_RECON_BALANCE_SOURCE: str = "flexquery_eod"
+
+
+# ---------------------------------------------------------------------------
 # Row-shape dataclasses
 # ---------------------------------------------------------------------------
 
@@ -55,7 +70,9 @@ class RiskStateRow:
 
 @dataclass(frozen=True, slots=True)
 class ReconciliationSummaryRow:
-    """Aggregate over ``reconciliation_breaks`` for the §4.1.3 summary block."""
+    """§4.1.3 summary block. ``open_breaks`` / ``breaks_24h`` aggregate
+    ``reconciliation_breaks``; ``last_check_utc`` is the latest recon-cycle
+    balance snapshot (see :data:`_RECON_BALANCE_SOURCE`)."""
 
     last_check_utc: datetime | None
     last_check_passed: bool
@@ -281,16 +298,22 @@ class PostgresPhase1QueryRepo:
     # --- reconciliation_breaks ---------------------------------------------
 
     async def fetch_reconciliation_summary(self, account_id: UUID) -> ReconciliationSummaryRow:
-        # ``last_check_utc`` is intentionally MAX(detected_at_utc) NOT MAX(now())
-        # — the spec wants the last time the recon process produced output, and
-        # detected_at_utc fires whether the row is a break or a passed check.
-        # When the table is empty (Phase 0), all aggregates are 0/NULL and the
-        # caller substitutes the EPOCH_SENTINEL.
+        # ``last_check_utc`` is the timestamp of the latest EOD-recon balance
+        # snapshot (``balances.source = 'flexquery_eod'``), NOT
+        # MAX(detected_at_utc) over breaks. Every recon cycle writes that
+        # snapshot BEFORE the planner runs, so a clean cycle — which inserts NO
+        # reconciliation_breaks row — still advances ``last_check_utc``. The
+        # prior break-derived value froze on the last detected break, so the
+        # /system tile looked stale (and "never checked") after a passing run.
+        # ``open_breaks`` / ``breaks_24h`` stay break-derived. When recon has
+        # never run the subquery is NULL and the caller substitutes EPOCH_SENTINEL.
         row = (
             await self._session.execute(
                 text(
                     "SELECT "
-                    "  MAX(detected_at_utc) AS last_check_utc, "
+                    "  (SELECT MAX(snapshot_ts) FROM balances "
+                    "     WHERE account_id = :acc AND source = :recon_source"
+                    "  ) AS last_check_utc, "
                     "  COUNT(*) FILTER ("
                     "    WHERE resolved_at_utc IS NULL"
                     "  ) AS open_breaks, "
@@ -300,10 +323,11 @@ class PostgresPhase1QueryRepo:
                     "FROM reconciliation_breaks "
                     "WHERE account_id = :acc"
                 ),
-                {"acc": account_id},
+                {"acc": account_id, "recon_source": _RECON_BALANCE_SOURCE},
             )
         ).fetchone()
-        # COUNT(*) is non-NULL even on empty tables; MAX() is NULL when empty.
+        # COUNT(*) is non-NULL even on empty tables; the last_check_utc subquery
+        # is NULL until the first recon cycle writes a balance snapshot.
         return ReconciliationSummaryRow(
             last_check_utc=row.last_check_utc if row else None,
             last_check_passed=(row.open_breaks == 0) if row else True,
