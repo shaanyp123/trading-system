@@ -1371,6 +1371,15 @@ async def _start_reconciliation_scheduler(
         env=_audit_env_from_settings(settings),
         flex_query_id=settings.flex_query_id,
         flex_query_token=settings.flex_query_token.get_secret_value(),
+        # Option C (2026-05-28): EOD position source + the ib_gateway
+        # connection params the reqPositions path needs. Recon reuses the
+        # worker's host/port/account (same gateway + account) but on its
+        # own clientId=4 (the ibkr_intraday default), so it stays isolated
+        # from the order worker (clientId=1) and bar_sync (clientId=3).
+        position_source=settings.eod_recon_position_source,
+        ibkr_host=settings.ibkr_host,
+        ibkr_port=settings.ibkr_port,
+        ibkr_account_id=settings.ibkr_account,
     )
     alert_dispatch_hook = _build_alert_dispatch_hook(settings)
     state_transition_hook = _build_state_transition_hook(settings)
@@ -1387,6 +1396,7 @@ async def _start_reconciliation_scheduler(
         account_id=str(account_id),
         env=_audit_env_from_settings(settings),
         flex_query_id=settings.flex_query_id,
+        position_source=settings.eod_recon_position_source,
         alert_dispatch_hook_wired=alert_dispatch_hook is not None,
         state_transition_hook_wired=state_transition_hook is not None,
     )
