@@ -1378,6 +1378,23 @@ CREATE TABLE parameter_sets (
 );
 ```
 
+> **Hash input scope — operator-only flags excluded (clarified 2026-05-29,
+> `Docs/parameter-sets-bootstrap-design.md` §11 Q1-A).** The "Parameter Ranges
+> Table" params hashed above are the 10 agent/PR-tunable strategy parameters:
+> `LOOKBACK_DAYS_DONCHIAN`, `MA_FAST_DAYS`, `MA_SLOW_DAYS`, `HURST_THRESHOLD`,
+> `STOP_DISTANCE_ATR_MULT`, `ATR_LOOKBACK_DAYS`, `MIN_HOLDING_DAYS`,
+> `VOL_TARGET_PCT_ANNUAL`, `INSTRUMENT_VOL_LOOKBACK_DAYS`,
+> `ROLL_DAYS_BEFORE_EXPIRY` (the PR-locked `ATR_LOOKBACK_DAYS` /
+> `MIN_HOLDING_DAYS` ARE included). The two operator-only boolean kill-switch
+> flags added 2026-05-26 — `STRATEGY_DECOMMISSIONED` and `EXIT_AUTO_APPROVE` —
+> are **stored in the `parameters` JSONB but EXCLUDED from the hash input.** This
+> keeps `parameter_set_hash` stable across a decommission flip, so the
+> kill-switch can be toggled with an in-place `parameters` UPDATE that leaves the
+> content-addressable primary key unchanged (no PK churn). The canonical minter
+> is `services/version/composite_hash.py::compute_parameter_set_hash`, which
+> delegates JCS canonicalization to `services/audit/chain.py::jcs_serialize` (the
+> single in-tree canonicalizer).
+
 ## 3.12 `slippage_calibration_versions`
 
 ```sql
