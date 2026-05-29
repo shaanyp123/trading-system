@@ -1724,6 +1724,15 @@ CREATE INDEX alerts_severity_unack ON alerts(severity, acknowledged) WHERE NOT a
 
 -- Migration note: when retrofitting an existing alerts table:
 --   ALTER TABLE alerts ALTER COLUMN category TYPE alert_category USING category::alert_category;
+--
+-- NOTE: `ALTER TYPE alert_category ADD VALUE` migrations append members AFTER
+-- creation; those are NOT reflected in the CREATE TYPE list above. As of
+-- 2026-05-29 the live enum additionally contains, in append order:
+--   heartbeat_stale                      (PR #154 follow-up, 2026-05-16)
+--   worker_failure                       (recovery-agent, 2026-05-26)
+--   position_unprotected                 (exit-pipeline PR-C #253, 2026-05-27)
+--   reconciliation_data_source_degraded  (Option C recon-fix, 2026-05-29; P1 → #alerts only)
+-- alembic/versions/ is the source of truth for current enum membership.
 ```
 
 ## 3.28 `macro_events`
@@ -1832,6 +1841,10 @@ class AuditEventType(str, Enum):
     RECONCILIATION_CHECK_PASSED = "reconciliation_check_passed"
     RECONCILIATION_BREAK_DETECTED = "reconciliation_break_detected"
     RECONCILIATION_BREAK_RESOLVED = "reconciliation_break_resolved"
+    # Option C recon-fix (2026-05-29): reqPositions per-cycle fetch failed
+    # terminally; recon fell back to the FlexQuery position list. Audit-first
+    # breadcrumb paired with the `reconciliation_data_source_degraded` alert.
+    RECONCILIATION_DATA_SOURCE_DEGRADED = "reconciliation_data_source_degraded"
     DATA_QUALITY_REJECT = "data_quality_reject"
     DATA_QUALITY_QUARANTINE = "data_quality_quarantine"
     PSD_REPAIR_APPLIED = "psd_repair_applied"
@@ -2237,6 +2250,12 @@ AlertCategory = Literal[
     "incident_review_required",
     "phase_cutover_started",
     "maintenance_window",
+    # Appended post-2026-05-16 via `ALTER TYPE alert_category ADD VALUE`
+    # migrations (kept here so the Literal stays a faithful mirror of §3.27):
+    "heartbeat_stale",
+    "worker_failure",
+    "position_unprotected",
+    "reconciliation_data_source_degraded",
 ]
 
 class Alert(BaseModel):
