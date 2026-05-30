@@ -30,14 +30,20 @@ with operational liveness pings). signal_emitted DOES write to audit_log
 
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Final
+from uuid import UUID
 
+import httpx
 import structlog
 from fastapi import APIRouter, Depends, Request, status
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.api import db as api_db
+from services.api.config import get_settings
 from services.api.errors import AppError
 from services.api.heartbeats import get_heartbeat_registry
 from services.api.repos.phase1 import Phase1QueryRepo, PostgresPhase1QueryRepo
@@ -106,6 +112,239 @@ def _require_lean_authenticated(request: Request) -> None:
             ),
             status_code=status.HTTP_403_FORBIDDEN,
         )
+
+
+# ---------------------------------------------------------------------------
+# Nightly kill-switch fail-open observability
+# (parameter-sets-bootstrap-design §12.4 — compensating control).
+#
+# PR-C (#302) made the nightly LEAN cycle FAIL OPEN when it can't read
+# ``STRATEGY_DECOMMISSIONED`` from ``GET /api/internal/lean/parameters``: it
+# keeps the ``lean.json`` default (``False`` = keep trading) and tags the
+# ``lean_cycle_heartbeat`` it POSTs here with ``error="parameters_fetch_failed"``.
+# Fail-open is only SAFE while every signal is operator-gated (``EXIT_AUTO_APPROVE``
+# is unbuilt + ``False``); the loud alert below is the *compensating control* so a
+# silent api outage during an *intended-decommission* window is noticed and the
+# operator can fall back to the manual decommission path (PR-B). See design §12.4
+# (fail-open + forward-guard) + ``lean/v1_strategy.py`` (the heartbeat ``error``
+# tag emitter, which already flags this can "escalate to a P1 Discord alert").
+# ---------------------------------------------------------------------------
+
+#: The heartbeat ``error`` tag LEAN sets when the nightly kill-switch parameter
+#: fetch failed and the cycle fail-opened (design §12.4). Matched verbatim; other
+#: ``error`` tags (``generate_signals_failed`` etc.) are out of scope here.
+_PARAMETERS_FETCH_FAILED_ERROR_TAG: Final[str] = "parameters_fetch_failed"
+
+#: Severity for the escalation. P1 routes to ``#alerts`` only per
+#: ``webhook_pusher.payloads.SEVERITY_TO_CHANNELS`` (``#critical`` + Resend email
+#: are P0). Locked to P1 per design §12.4 ("loud P1-grade alert") + the operator's
+#: routing decision: the fail-open degradation is operator-gated (nothing
+#: auto-executes today), so it is degraded-telemetry, not money-at-risk — the same
+#: tier as ``RECONCILIATION_DATA_SOURCE_DEGRADED``. **Forward-guard:** if/when
+#: ``EXIT_AUTO_APPROVE`` auto-approval ships, design §12.4 requires re-evaluating
+#: both the fail-open default AND this loudness (consider P0).
+_PARAMETERS_FETCH_FAILED_ALERT_SEVERITY: Final[str] = "P1"
+
+#: Reused canonical ``AlertCategory`` value — no new enum value (A02/A04: a new
+#: category needs an ``alembic/**`` migration). ``incident_review_required`` is the
+#: honest fit ("a human must review this"); ``kill_switch_invoked`` would falsely
+#: imply the switch *fired* — it did not, the *read* of it failed.
+_PARAMETERS_FETCH_FAILED_ALERT_CATEGORY: Final[str] = "incident_review_required"
+
+
+def _build_parameters_fetch_failed_message(body: LeanEventRequest) -> str:
+    """Pure: operator-facing ``alerts.message`` (Discord embed description)."""
+    session_date = body.session_date_et or _et_session_date(body.ts_utc)
+    return (
+        "LEAN nightly kill-switch parameter fetch FAILED — cycle fail-opened to "
+        "the lean.json STRATEGY_DECOMMISSIONED default.\n\n"
+        "The nightly LEAN cycle could not read the active parameter set from "
+        "GET /api/internal/lean/parameters (api unreachable / timeout / non-2xx / "
+        "malformed) and proceeded with the lean.json default (keep trading). If you "
+        "INTENDED to decommission the strategy, the nightly cycle did NOT honor it "
+        "this cycle.\n\n"
+        "Recourse: (a) the operator-approval gate still holds every signal — nothing "
+        "executes without you; (b) use the manual decommission path (trigger_v1_cycle "
+        "/ parameter_sets head flip, PR-B) for immediate effect; (c) check api health "
+        "for the nightly GET window.\n\n"
+        f"session_date_et={session_date}"
+    )
+
+
+async def _maybe_alert_parameters_fetch_failed(
+    body: LeanEventRequest,
+    *,
+    received_at: datetime,
+    log_kwargs: Mapping[str, object],
+) -> None:
+    """Best-effort: raise a P1 ``#alerts`` escalation when a heartbeat reports the
+    nightly kill-switch parameter fetch failed (design §12.4 compensating control).
+
+    Gate: fires only for ``error == "parameters_fetch_failed"``. Callers scope this
+    to the ``lean_cycle_heartbeat`` branch (the only event that carries ``error``).
+
+    **Best-effort by contract — this MUST NOT raise.** A heartbeat 5xx would make
+    LEAN's cron retry + could spuriously trip the no-heartbeat watchdog; the
+    liveness 202 matters more than the escalation (mirrors the registry-record +
+    proximity-persist swallow paths in the handler). Every failure mode here is
+    logged + swallowed. The loud structured WARNING fires BEFORE any I/O, so the
+    fail-open is grep-able even when Discord isn't wired or no account exists — this
+    is the structured-log half of design §12.4.
+
+    Reuses the canonical alerts-INSERT + ``webhook_pusher.dispatch_alert`` seam
+    (``services/data/bar_sync_alerts.py`` + the lifespan hooks in
+    ``services/api/main.py``). Unlike those lifespan-built hooks, the route can't
+    capture ``settings`` at boot, so webhook URLs are resolved from
+    ``get_settings()`` at call time.
+    """
+    if body.error != _PARAMETERS_FETCH_FAILED_ERROR_TAG:
+        return
+
+    # Loud + always-on: even if Discord isn't wired / no account exists, the
+    # operator can grep this. (Pre-this PR the ``error`` tag landed nowhere —
+    # it was not in the heartbeat log_kwargs.)
+    log.warning(
+        "lean_heartbeat_parameters_fetch_failed",
+        error=body.error,
+        note=(
+            "nightly LEAN cycle fail-opened to the lean.json "
+            "STRATEGY_DECOMMISSIONED default; escalating P1 to #alerts"
+        ),
+        **log_kwargs,
+    )
+
+    try:
+        # Lazy imports mirror the lifespan hooks + let tests monkeypatch
+        # ``dispatcher.dispatch_alert`` (the name is re-read here at call time).
+        from services.webhook_pusher.dispatcher import dispatch_alert
+        from services.webhook_pusher.payloads import (
+            AlertCategory,
+            AlertSeverity,
+            ChannelName,
+            EmailIdentity,
+        )
+
+        settings = get_settings()
+        if settings.discord_webhook_url_alerts is None:
+            log.warning(
+                "lean_param_fetch_alert_skipped_no_webhook_url",
+                note=(
+                    "discord.webhook_urls.alerts not in sops; the WARNING above is "
+                    "the only record. Wire the sops field + restart api to enable "
+                    "the #alerts escalation."
+                ),
+                **log_kwargs,
+            )
+            return
+
+        webhook_urls: dict[ChannelName, str] = {
+            ChannelName.DISCORD_ALERTS: settings.discord_webhook_url_alerts.get_secret_value(),
+        }
+        # P1 routes to #alerts only, but mirror the bar_sync hook's
+        # wire-what's-available shape so a future severity change needs no edit.
+        if settings.discord_webhook_url_critical is not None:
+            webhook_urls[ChannelName.DISCORD_CRITICAL] = (
+                settings.discord_webhook_url_critical.get_secret_value()
+            )
+        email_identity: EmailIdentity | None = None
+        if (
+            settings.resend_api_key is not None
+            and settings.resend_from_address is not None
+            and settings.resend_to_address is not None
+        ):
+            email_identity = EmailIdentity(
+                from_address=settings.resend_from_address,
+                to_address=settings.resend_to_address,
+                resend_api_key=settings.resend_api_key.get_secret_value(),
+            )
+
+        # alerts.account_id is NOT NULL FK → accounts. Resolve at fire time; skip
+        # (log) if the account isn't provisioned yet (pre-/setup boot). Mirrors the
+        # bar_sync + monitor hooks' fire-time resolution.
+        session_factory = api_db.get_session_factory()
+        async with session_factory() as repo_session:
+            repo = PostgresPhase1QueryRepo(repo_session)
+            account_id = await repo.fetch_active_account_id()
+        if account_id is None:
+            log.warning(
+                "lean_param_fetch_alert_skipped_no_account",
+                note=(
+                    "no active accounts row; alerts INSERT would violate the NOT "
+                    "NULL FK. Run /setup + restart api."
+                ),
+                **log_kwargs,
+            )
+            return
+
+        # Defense-in-depth: validate the locked enums before any DB I/O (matches
+        # the recon + bar_sync hooks' cross-check).
+        AlertSeverity(_PARAMETERS_FETCH_FAILED_ALERT_SEVERITY)
+        AlertCategory(_PARAMETERS_FETCH_FAILED_ALERT_CATEGORY)
+
+        message_text = _build_parameters_fetch_failed_message(body)
+        detail_payload: dict[str, object] = {
+            "alert_kind": "lean_parameters_fetch_failed",
+            "error_tag": body.error,
+            "session_date_et": body.session_date_et,
+            "source_ts_utc": body.ts_utc.isoformat(),
+            "received_at_utc": received_at.isoformat(),
+            "algorithm_id": body.algorithm_id,
+            "fail_open_default": "STRATEGY_DECOMMISSIONED=False (lean.json)",
+        }
+        async with session_factory() as ins_session:
+            row = (
+                await ins_session.execute(
+                    text(
+                        "INSERT INTO alerts ("
+                        "    account_id, severity, category, message, detail"
+                        ") VALUES ("
+                        "    :acct, :sev, :cat, :msg, CAST(:detail AS JSONB)"
+                        ") RETURNING id"
+                    ),
+                    {
+                        "acct": account_id,
+                        "sev": _PARAMETERS_FETCH_FAILED_ALERT_SEVERITY,
+                        "cat": _PARAMETERS_FETCH_FAILED_ALERT_CATEGORY,
+                        "msg": message_text,
+                        "detail": json.dumps(detail_payload),
+                    },
+                )
+            ).fetchone()
+            assert row is not None
+            alert_id = UUID(str(row.id))
+            await ins_session.commit()
+
+        log.info(
+            "lean_param_fetch_alert_inserted",
+            alert_id=str(alert_id),
+            severity=_PARAMETERS_FETCH_FAILED_ALERT_SEVERITY,
+            category=_PARAMETERS_FETCH_FAILED_ALERT_CATEGORY,
+            account_id=str(account_id),
+            **log_kwargs,
+        )
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as http_client:
+            async with session_factory() as disp_session:
+                report = await dispatch_alert(
+                    session=disp_session,
+                    alert_id=alert_id,
+                    http_client=http_client,
+                    webhook_urls=webhook_urls,
+                    email_identity=email_identity,
+                )
+        log.info(
+            "lean_param_fetch_alert_dispatched",
+            alert_id=str(alert_id),
+            short_circuited=report.short_circuited,
+            delivery_status=dict(report.delivery_status),
+            **log_kwargs,
+        )
+    except Exception:
+        # Best-effort: a Discord 5xx / DB hiccup / settings issue MUST NOT 5xx the
+        # heartbeat. The WARNING above already recorded the fail-open; if the
+        # INSERT landed but dispatch failed, the alerts row is still durable for
+        # the operator + recovery agent.
+        log.exception("lean_param_fetch_alert_failed", **log_kwargs)
 
 
 @router.post(
@@ -224,6 +463,16 @@ async def post_lean_signal(
                         market_count=market_evaluations_count,
                         **log_kwargs,
                     )
+            # PR-C §12.4 compensating control: escalate a nightly kill-switch
+            # parameter-fetch failure (fail-open) to a P1 #alerts row + Discord
+            # push so a silent api outage during an intended-decommission window
+            # is noticed. Best-effort by contract — the helper logs + swallows all
+            # failures, so it can never 5xx the heartbeat.
+            await _maybe_alert_parameters_fetch_failed(
+                body,
+                received_at=received_at,
+                log_kwargs=log_kwargs,
+            )
         log.info("lean_event_received", **log_kwargs)
         return LeanEventAccepted(
             received_at_utc=received_at,
