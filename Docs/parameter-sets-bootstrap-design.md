@@ -362,10 +362,16 @@ collapses to "UPDATE the existing head," skipping the INSERT.
   sequence, with the **L3/§2 caveat that this exercises the trigger path only.**
   No code beyond docs + possibly the optional `trigger_v1_cycle` convenience
   override from (b) if Q5/Q3 want it.
-- **PR-C (follow-up, gated on Q3) — Nightly LEAN kill-switch.** Either add
-  `STRATEGY_DECOMMISSIONED` to `lean.json` (Q3-B) or build the DB→param-map sync
-  (Q3-C). **Likely touches `lean/**`; scope + review path depend on the Q3
-  answer.** Tracked, not committed in this design.
+- **PR-C (follow-up, gated on Q3) — Nightly LEAN kill-switch. → DESIGN LOCKED
+  2026-05-29; see §12.** Resolved to **Q3-C via api-fetch**: a new bearer-authed
+  `GET /api/internal/lean/parameters` that `lean/v1_strategy.py` calls at the
+  start of each daily cycle to override `STRATEGY_DECOMMISSIONED` from the DB
+  head row (reusing the urllib + bearer plumbing v1_strategy already has).
+  Fail-**open** to the lean.json default + loud alert on fetch failure; flag-only
+  scope. Touches `services/api/**` + `lean/**` (both hot-fix scope — no
+  `risk-review-approved` label) but is high-stakes → mandatory risk-review +
+  tests + LEAN↔api smoke. **Implementation is a future session; merged code is
+  inert until `lean_local` is rebuilt + restarted.**
 - **PR-D (follow-up, gated on Q4) — Event-sourced audit ceremony.** Wire
   `parameter_change_applied` audit + `parameters`-table row for operator-driven
   parameter changes. **Touches forbidden paths (`services/audit/**` and/or
@@ -455,3 +461,151 @@ living, content-hashed, environment-divergent value — an operational concern,
 not a schema one. The only real cost of the operator-script approach (a forgotten
 seed after a DB restore silently reverts to code-defaults) is mitigated by adding
 the seed step to the DB-restore runbook (folded into PR-A/PR-B docs).
+
+**PR-A + PR-B shipped 2026-05-29** (PR #294 minter + `--mint-from-defaults`; PR
+#295 runbook + §10.3 wiring). **PR-C design locked 2026-05-29** — see §12
+(operator delegated: "do whatever you recommend" on the open questions).
+
+---
+
+## 12. PR-C design — nightly LEAN kill-switch (resolves Q3 / Q3-C)
+
+> **Status: DESIGN — locked 2026-05-29 to the recommended answers (operator
+> delegated the open questions). Implementation is a future session; merged code
+> is INERT until `lean_local` is rebuilt + restarted on the VPS.**
+
+### 12.1 Problem (restated)
+
+The live 21:30 UTC nightly LEAN cycle reads its parameters from `lean/lean.json`,
+which omits `STRATEGY_DECOMMISSIONED` — so flipping the DB flag does nothing to it
+(F2/F3/F8). PR-A/PR-B made the **manual** `trigger_v1_cycle` decommission path
+work; PR-C makes the **automatic** nightly cycle honor the same DB flag, closing
+the L3/§2 "trigger-path-only" caveat the PR-B runbook calls out in bold.
+
+### 12.2 Grounding facts (verified 2026-05-29)
+
+- **`lean/lean.json` is mounted read-only** from the repo
+  (`./lean:/Lean/Algorithm:ro`, `docker-compose.yml`) and rendered at boot by
+  `infrastructure/lean_local/entrypoint.sh` (env-var substitution). It is not
+  baked into the image and not writable by a sync job without dirtying the repo
+  checkout on the VPS.
+- **`lean/v1_strategy.py` already speaks HTTP to the api**: it imports
+  `urllib.request`/`urllib.error`, holds the api base URL (`http://api:8000`) +
+  the shared bearer (`lean.api_bearer_token`) read at `initialize()`, and POSTs
+  every signal to `POST /api/internal/lean/signals` (`v1_strategy.py:11-17,
+  86-92,162-215`). It already hard-fails closed at `initialize()` if the bearer
+  is missing.
+- **`lean_local` has the bearer + internal-network reach to api, but no DB
+  credentials** (by design — it is a pure consumer).
+
+### 12.3 Chosen mechanic (Q1) — api-fetch in the daily cycle
+
+A new bearer-authed **`GET /api/internal/lean/parameters`** returns the active
+`parameter_sets` head row's `parameters` (the same head-pointer query
+`trigger_v1_cycle` + `/system` use; spec defaults when the table is empty).
+`v1_strategy.py` calls it **at the start of each daily signal cycle** — reusing
+the urllib + base-URL + bearer plumbing it already has — and overrides
+`STRATEGY_DECOMMISSIONED` for that cycle via the existing `_coerce_bool_param`.
+
+Rejected alternatives:
+
+- **Q3-B (add the key to `lean.json`):** creates a **two-source consistency
+  hazard** — the DB flag (manual path + `/system`) and a `lean.json` flag
+  (nightly) could silently disagree on a *safety* lever. The worst failure mode
+  for a kill-switch is "I flipped it but only one source saw it." Rejected.
+- **Entrypoint shell-injection into the rendered `lean.json`:** fiddly JSON
+  manipulation in shell; less testable than Python; still a boot-time fetch.
+- **Direct DB read from `lean_local`:** would add DB credentials to a
+  pure-consumer container — new credential surface. Rejected.
+- **Fetch only at `initialize()`:** honored only as of the 21:10 UTC restart; a
+  mid-day flip wouldn't be seen until a restart. Per-cycle fetch is strictly more
+  responsive at negligible cost (one GET/day). Chosen over initialize-only — the
+  operator can still force immediate pickup with `docker compose restart
+  lean_local`, but won't need to for the next nightly cycle.
+
+### 12.4 Fail-safe (Q2) — fail-OPEN to the lean.json default + loud alert
+
+If the GET fails (api unreachable / timeout / non-2xx / malformed), the cycle
+proceeds with the **`lean.json`/default value (`False`)** and emits a **loud
+P1-grade alert + structured log** (`lean_parameters_fetch_failed`). Rationale:
+
+- **The operator-approval gate is the real interlock.** V1 approves every signal
+  before any order, so "keep trading on a transient blip" never auto-executes —
+  the operator sees the normal signals (and the alert) and decides.
+- **Hard-failing the LEAN boot/cycle on a param-fetch error would be worse** — it
+  would take down the whole nightly cycle, not just the kill-switch.
+- **The manual path (PR-B) is the immediate recourse** if the operator intended
+  to decommission and sees the alert.
+- Distinct from the existing **missing-bearer → hard fail-close** at
+  `initialize()` (a config error), which stays as-is.
+
+> **Load-bearing dependency — fail-open is only safe while `EXIT_AUTO_APPROVE`
+> auto-approval is unbuilt + `False`.** Precise mechanism (verified): when
+> `STRATEGY_DECOMMISSIONED=True` the strategy *emits* decommission exit signals;
+> those are not orders. What actually prevents fail-open from auto-executing is
+> that **every signal — entries AND exits — is operator-gated today**: entries are
+> always `pending`→operator-`approved` before `order_placement_worker` claims
+> them, and exit auto-approval (`EXIT_AUTO_APPROVE`) **is not implemented** (no
+> auto-approve worker exists; default `False`; deferred to a post-cutover PR). So
+> a fail-open cycle that wrongly reads `False` emits normal signals that all still
+> require approval — nothing executes without the operator.
+>
+> **Forward-guard (must hold before any `EXIT_AUTO_APPROVE` auto-approval ships):**
+> the moment exits can auto-approve, fail-open becomes dangerous — a nightly cycle
+> that fail-opens to `False` while the operator intended to decommission would keep
+> a *live* book auto-executing exits with no operator in the loop, silently
+> defeating the kill-switch. Before that worker is built/enabled, this decision
+> MUST be re-evaluated — either flip the nightly cycle to **fail-closed for exits**,
+> or couple the auto-approve worker to a *healthy* kill-switch read (refuse to
+> auto-approve when the most recent param fetch failed). The PR-C implementation
+> must add a test that pins `EXIT_AUTO_APPROVE=False` as a precondition of the
+> fail-open path and a pointer to this guard.
+
+> ⚠️ **Highest-stakes decision in PR-C — the nightly kill-switch FAILS OPEN.** If
+> you would rather it fail-*closed* (flatten the book on a fetch error), override
+> this before implementation. Note: the approval gate already prevents
+> auto-execution either way, and fail-closed would flood `/signals` with
+> decommission exits on any transient api blip — which is why fail-open + a loud
+> alert is the recommendation.
+
+### 12.5 Scope (Q3) — flag-only
+
+PR-C consumes **only `STRATEGY_DECOMMISSIONED`** from the fetched param set. The
+endpoint returns the **full** active param set so a follow-up can make the
+nightly cycle fully DB-driven (closing F8) without a new endpoint — but PR-C does
+**not** change entry/sizing param sourcing (a larger behavioral change to signal
+generation, out of scope here).
+
+### 12.6 Review path (Q4)
+
+`services/api/**` and `lean/**` are §2.3 hot-fix scope → **no
+`risk-review-approved` label required**. But this rewires the live kill-switch, so
+the implementation PR MUST: (a) carry unit tests for the endpoint + the
+fetch/override + the fail-open path; (b) include a smoke-test fixture or
+operator-runbook checklist for the LEAN↔api boundary (dev-guide §6.8 / `[A27]` —
+third-party platform contract); (c) get a full `risk-review` subagent pass; (d)
+be merged but **NOT deployed** until the operator explicitly runs the `lean_local`
+rebuild + restart.
+
+### 12.7 Implementation sketch (for the future session)
+
+1. **api:** add `GET /api/internal/lean/parameters` to
+   `services/api/routes/internal/lean.py` (bearer-auth via the existing
+   `LeanAuthMiddleware`); return the active head row's `parameters`, or spec
+   defaults when the table is empty (mirror `/system`'s fallback).
+2. **lean:** in `v1_strategy.py`, at the top of the daily signal cycle, GET the
+   param set, coerce `STRATEGY_DECOMMISSIONED` via `_coerce_bool_param`, override
+   the cycle's `V1Parameters`; on any failure, keep the `lean.json` default +
+   emit `lean_parameters_fetch_failed`.
+3. **tests:** endpoint (empty table → defaults; seeded → value); v1_strategy
+   fetch-success → override; fetch-failure → fail-open + alert; bearer-missing
+   path unchanged.
+
+### 12.8 Interaction with PR-A/PR-B/PR-D
+
+PR-C makes the **same DB flag** the seed (PR-A) + ceremony (PR-B) operate on also
+drive the nightly cycle. After PR-C ships **and deploys**, the PR-B runbook +
+exit-pipeline §10.3 scope caveats are lifted (flipping the DB flag stops both the
+manual path AND the live nightly cycle) — update those docs at that point
+(tracked). PR-C does **not** add the `parameter_change_applied` audit event for
+the flip; that remains **PR-D**, still required before any *live* decommission.
