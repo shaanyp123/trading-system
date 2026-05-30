@@ -399,3 +399,46 @@ class LeanEventAccepted(BaseModel):
             "when event_type=signal_emitted."
         ),
     )
+
+
+class LeanParametersResponse(BaseModel):
+    """Response body for ``GET /api/internal/lean/parameters`` (PR-C, design §12).
+
+    Returns the active ``parameter_sets`` head row's ``parameters`` so the nightly
+    LEAN cycle can honor the operator's runtime ``STRATEGY_DECOMMISSIONED`` flip
+    (parameter-sets-bootstrap-design §12.3). When the table is empty, returns the
+    SAFE operator-only-flag defaults (both ``"False"``); LEAN falls back to its
+    ``lean.json`` values for every non-flag parameter (design §12.5 flag-only
+    scope).
+
+    All values are strings (the canonical ``to_canonical_dict()`` shape); the
+    consumer coerces ``STRATEGY_DECOMMISSIONED`` via ``v1_strategy._coerce_bool_param``.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    parameters: dict[str, str] = Field(
+        ...,
+        description=(
+            "Active parameter set — UPPER_CASE keys, string values. The nightly "
+            "cycle consumes STRATEGY_DECOMMISSIONED today; the full set is "
+            "returned so a future fully-DB-driven follow-up needs no new endpoint."
+        ),
+    )
+    parameter_set_hash: str | None = Field(
+        default=None,
+        description=(
+            "Content hash of the active head row; null when the table is empty (source='defaults')."
+        ),
+    )
+    source: Literal["db_head", "defaults"] = Field(
+        ...,
+        description=(
+            "'db_head' when a parameter_sets head row exists; 'defaults' when the "
+            "table is empty and the SAFE flag defaults are returned."
+        ),
+    )
+    server_now: datetime = Field(
+        ...,
+        description="Server-clock timestamp at response build (tz-aware UTC).",
+    )
