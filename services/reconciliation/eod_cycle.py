@@ -782,18 +782,30 @@ async def _emit_data_source_degraded_alert(
     account_id: UUID,
     env: Environment,
     phase_at_emit: PhaseAtEmit,
-    exc: ReconPositionsFetchError,
+    operation: str,
+    detail: str,
+    underlying_exception_class: str,
+    degrade_kind: Literal["fetch_failed", "empty_with_backend_futures"],
     alert_dispatch_hook: AlertDispatchHook | None,
 ) -> None:
     """Page the operator when the reqPositions source degraded to FlexQuery.
 
-    Option C recon-fix follow-up (2026-05-29). When the
-    ``position_source="reqpositions"`` per-cycle reqPositions fetch fails
-    terminally, ``run_eod_cycle`` falls back to the FlexQuery position list
-    (preserving recon coverage) but the fallback silently reintroduces the
-    same-day-fill settlement-lag false-break behavior for one cycle. This
-    helper turns that previously log-only event into an active operator
-    push:
+    Option C recon-fix follow-up (2026-05-29). The
+    ``position_source="reqpositions"`` per-cycle fetch can degrade two ways,
+    both of which make ``run_eod_cycle`` fall back to the FlexQuery position
+    list (preserving recon coverage) rather than trust a suspect broker view:
+
+    * ``degrade_kind="fetch_failed"`` — the fetch raised
+      :class:`ReconPositionsFetchError` (gateway down / TWS session dropped).
+    * ``degrade_kind="empty_with_backend_futures"`` — the fetch SUCCEEDED but
+      returned zero positions while the backend holds open futures (the
+      cache-timing race / a genuine broker-vs-backend divergence). Treating
+      that empty as a valid broker-flat view would trip a false ``HALT_NEW``
+      (the 2026-05-29 recurrence), so we degrade instead of auto-halting.
+
+    Either way the FlexQuery fallback reintroduces same-day-fill settlement-lag
+    risk for one cycle. This helper turns that previously log-only event into
+    an active operator push:
 
       1. Writes a durable :data:`AuditEventType.RECONCILIATION_DATA_SOURCE_DEGRADED`
          audit row (audit-first per backend-spec §2.10.1).
@@ -822,9 +834,10 @@ async def _emit_data_source_degraded_alert(
     payload: dict[str, Any] = {
         "degraded_source": "reqpositions",
         "fallback_source": "flexquery",
-        "operation": exc.operation,
-        "reason": exc.detail,
-        "underlying_exception_class": exc.underlying_exception_class,
+        "degrade_kind": degrade_kind,
+        "operation": operation,
+        "reason": detail,
+        "underlying_exception_class": underlying_exception_class,
     }
 
     # Audit-first (backend-spec §2.10.1): the durable breadcrumb lands
@@ -845,8 +858,9 @@ async def _emit_data_source_degraded_alert(
             "eod_cycle_data_source_degraded_audit_write_failed",
             account_id=str(account_id),
             env=env,
-            operation=exc.operation,
-            reason=exc.detail,
+            degrade_kind=degrade_kind,
+            operation=operation,
+            reason=detail,
             exc_info=True,
         )
         return
@@ -863,15 +877,28 @@ async def _emit_data_source_degraded_alert(
         return
 
     try:
-        title = "Reconciliation position source degraded"
-        body = (
-            "The per-cycle reqPositions (real-time TWS, clientId=4) fetch "
-            "failed; EOD reconciliation fell back to the FlexQuery position "
-            "list for this cycle. Cash / NAV / position checks still ran, but "
-            "same-day-fill settlement-lag false breaks may reappear until the "
-            "next cycle restores the real-time source. "
-            f"Failed operation: {exc.operation}. Reason: {exc.detail}."
-        )
+        if degrade_kind == "empty_with_backend_futures":
+            title = "Reconciliation position source degraded (empty reqPositions)"
+            body = (
+                "The per-cycle reqPositions (real-time TWS, clientId=4) fetch "
+                "SUCCEEDED but returned ZERO positions while the backend holds "
+                "open futures. EOD reconciliation treated this as a degraded / "
+                "cache-timing result (NOT a valid broker-flat view), fell back "
+                "to the FlexQuery position list for this cycle, and did NOT "
+                "auto-halt. If the broker is genuinely flat the backend may be "
+                "stale — investigate positions_current. "
+                f"Detail: {detail}."
+            )
+        else:
+            title = "Reconciliation position source degraded"
+            body = (
+                "The per-cycle reqPositions (real-time TWS, clientId=4) fetch "
+                "failed; EOD reconciliation fell back to the FlexQuery position "
+                "list for this cycle. Cash / NAV / position checks still ran, but "
+                "same-day-fill settlement-lag false breaks may reappear until the "
+                "next cycle restores the real-time source. "
+                f"Failed operation: {operation}. Reason: {detail}."
+            )
         # ``severity="P1"`` is a valid AlertSeverityLiteral member; only
         # ``category`` needs the type-ignore because AlertCategoryLiteral is
         # locked to "reconciliation_break" in the pure planner (recon.py).
@@ -908,7 +935,8 @@ async def _emit_data_source_degraded_alert(
         account_id=str(account_id),
         env=env,
         audit_event_uuid=str(audit_uuid),
-        operation=exc.operation,
+        degrade_kind=degrade_kind,
+        operation=operation,
     )
 
 
@@ -998,6 +1026,11 @@ async def run_eod_cycle(
     )
 
     backend_view = await build_backend_view(session_factory, account_id=config.account_id)
+    # Track which source the FINAL broker_view used so the missing-futures hint
+    # below names the right remediation: a zero-FUT reqPositions view is
+    # degraded to FlexQuery by the empty-result guard, after which the
+    # FlexQuery-template hint is the correct one.
+    broker_view_source: Literal["flexquery", "reqpositions"] = "flexquery"
     if position_source == "reqpositions":
         try:
             recon_positions = await fetch_recon_positions(
@@ -1033,40 +1066,84 @@ async def run_eod_cycle(
                 account_id=config.account_id,
                 env=config.env,
                 phase_at_emit=config.phase_at_emit,
-                exc=exc,
+                operation=exc.operation,
+                detail=exc.detail,
+                underlying_exception_class=exc.underlying_exception_class,
+                degrade_kind="fetch_failed",
                 alert_dispatch_hook=alert_dispatch_hook,
             )
             broker_view = build_broker_view(snapshot)
         else:
-            broker_view = build_broker_view(
-                snapshot,
-                positions_override=recon_positions,
-                source=BrokerSource.TWS_API,
-            )
+            # Empty-result guard (Path B safety net, 2026-05-29). A
+            # SUCCESSFUL-but-empty reqPositions while the backend holds open
+            # futures is the cache-timing-race symptom — NOT a valid
+            # broker-flat view. fetch_recon_positions already retries the fresh
+            # fetch on empty; if it STILL came back empty here, do NOT let the
+            # planner trip a false position_qty halt (the 2026-05-29 recurrence
+            # that swapped FlexQuery's same-day blindness for a reqPositions
+            # cache race). Degrade to FlexQuery (+ P1 alert) exactly like a
+            # fetch failure. If the broker is genuinely flat and the backend is
+            # stale, FlexQuery's T+1 view still shows the position this cycle —
+            # so no break fires and the alert tells the operator to investigate.
+            backend_fut = {m for m in backend_view.positions if m.startswith("/")}
+            recon_fut = {p.market for p in recon_positions if p.market.startswith("/")}
+            if backend_fut and not recon_fut:
+                log.error(
+                    "eod_cycle_reqpositions_empty_with_backend_futures",
+                    account_id=str(config.account_id),
+                    env=config.env,
+                    backend_futures_markets=sorted(backend_fut),
+                    backend_futures_count=len(backend_fut),
+                    recon_positions_count=len(recon_positions),
+                    fallback="flexquery",
+                )
+                await _emit_data_source_degraded_alert(
+                    session_factory=session_factory,
+                    account_id=config.account_id,
+                    env=config.env,
+                    phase_at_emit=config.phase_at_emit,
+                    operation="reqPositions",
+                    detail=(
+                        "reqPositions returned 0 positions while backend holds "
+                        f"futures {sorted(backend_fut)} — treated as degraded "
+                        "(cache-timing race), not a valid broker-flat view"
+                    ),
+                    underlying_exception_class="ReconPositionsEmptyWithBackendFutures",
+                    degrade_kind="empty_with_backend_futures",
+                    alert_dispatch_hook=alert_dispatch_hook,
+                )
+                broker_view = build_broker_view(snapshot)
+            else:
+                broker_view = build_broker_view(
+                    snapshot,
+                    positions_override=recon_positions,
+                    source=BrokerSource.TWS_API,
+                )
+                broker_view_source = "reqpositions"
     else:
         broker_view = build_broker_view(snapshot)
 
-    # Resilience signal: when backend has futures positions but the broker
-    # view returned ZERO futures positions, the FlexQuery template is
-    # almost certainly missing the OpenPositions FUT section (or it
-    # filtered FUT rows out). Without this warning, the recon planner
-    # silently emits one position_qty break per backend FUT market every
-    # cycle — operator sees "false break" with no clear pointer at the
-    # template config. This warning is non-blocking: the planner still
-    # runs + the breaks still land in audit + reconciliation_breaks (the
-    # operator may want to investigate via psql / Audit page), but the
-    # log line names the suspected root cause so triage is faster.
+    # Resilience signal: backend has futures positions but the broker view
+    # returned ZERO futures positions. The remediation depends on the source
+    # that actually produced ``broker_view`` (the hardcoded FlexQuery-template
+    # hint was misleading once reqPositions became the source — fixed
+    # 2026-05-29). This warning is non-blocking: the planner still runs + the
+    # breaks still land in audit + reconciliation_breaks; the log line just
+    # names the suspected root cause so triage is faster.
     backend_fut_markets = {m for m in backend_view.positions if m.startswith("/")}
     broker_fut_markets = {m for m in broker_view.positions if m.startswith("/")}
     if backend_fut_markets and not broker_fut_markets:
-        log.warning(
-            "reconciliation_eod_cycle_broker_view_missing_futures",
-            account_id=str(config.account_id),
-            env=config.env,
-            backend_futures_markets=sorted(backend_fut_markets),
-            backend_futures_count=len(backend_fut_markets),
-            broker_position_count=len(broker_view.positions),
-            hint=(
+        if broker_view_source == "reqpositions":
+            missing_futures_hint = (
+                "Backend has open FUT positions but the reqPositions broker "
+                "view returned zero FUT rows AND the empty-result guard did "
+                "not degrade it — i.e. reqPositions returned non-FUT rows but "
+                "no futures. This is NOT a FlexQuery-template issue under "
+                "source=reqpositions; investigate fetch_recon_positions / IBKR "
+                "futures symbol mapping (_contract_from_ib)."
+            )
+        else:
+            missing_futures_hint = (
                 "Backend has open FUT positions but the broker view returned "
                 "zero FUT rows. Likely root cause: the FlexQuery template is "
                 "missing the OpenPositions section for futures, or the "
@@ -1074,7 +1151,16 @@ async def run_eod_cycle(
                 "template in IBKR portal (Reports → Flex Queries) to include "
                 "OpenPositions for Futures. Recon will continue to flag a "
                 "position_qty break per backend FUT market until fixed."
-            ),
+            )
+        log.warning(
+            "reconciliation_eod_cycle_broker_view_missing_futures",
+            account_id=str(config.account_id),
+            env=config.env,
+            broker_view_source=broker_view_source,
+            backend_futures_markets=sorted(backend_fut_markets),
+            backend_futures_count=len(backend_fut_markets),
+            broker_position_count=len(broker_view.positions),
+            hint=missing_futures_hint,
         )
 
     prior_breaks = await fetch_prior_breaks_within_grace_window(
