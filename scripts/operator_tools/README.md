@@ -15,6 +15,7 @@ service-side write paths (never raw SQL).
 | `replace_protective_stop.py` | POSITION_UNPROTECTED recovery: places a fresh bracket-stop for a position whose protective stop was cancelled but never replaced (PR-C exit-pipeline failure mode) | Yes (when `--no-dry-run --confirm`) — writes ORDER_PLACED audit + INSERTs orders row + places stop_market at IBKR. **--dry-run default = ON; two-flag gate.** |
 | `master_client_id_probe.py` | Empirical validation of the IBKR Master Client ID configuration (`TWS_MASTER_CLIENT_ID`). Three sequential stages on distinct clientIds: place a safe stop at `$1` on /MES from clientId=86, cancel via the master clientId, `reqGlobalCancel` cleanup from clientId=87. | Yes — places a single safe (stop=$1, DAY TIF, /MES) order at IBKR. Cancels itself end-to-end on success. No DB writes; no audit chain. **Operator-coordinated; runs post `docker compose up -d --force-recreate ib_gateway`.** |
 | `bootstrap_live_account.py` | Idempotent DB bootstrap: `accounts` + `risk_state` (live cutover) and — via `--mint-from-defaults` — seeds the baseline `parameter_sets` head row from the canonical V1 defaults, minting the `parameter_set_hash` (PR #294). See the **parameter-set seeding** + **decommission ceremony** sections below. | Yes (when `--no-dry-run --confirm`) — parameterized INSERTs via `ON CONFLICT DO NOTHING`. **--dry-run default = ON; two-flag gate; idempotent re-runs are no-ops.** |
+| `apply_parameter_change.py` | Operator-driven **audited** change to an operator-only flag (`STRATEGY_DECOMMISSIONED` / `EXIT_AUTO_APPROVE`): audit-first `parameter_change_applied`/`_reverted` event → `parameters` history row (`prev == hash`, hash-stable) → in-place `parameter_sets` flip (PR-D, design §13). Replaces the raw decommission UPDATE. | Yes (when `--no-dry-run --confirm`) — writes the audit chain + `parameters` + `parameter_sets`. **--dry-run default = ON; two-flag gate; no-op when already at value.** |
 
 ---
 
@@ -797,11 +798,13 @@ the seed tooling above.
 > cycle is **parameter-sets-bootstrap-design PR-C (Q3-C)** — not yet shipped.
 > (Distinct from exit-pipeline-design's own PR-C #253, which is done.)
 
-> **⚠️ AUDIT — the flag-flip below is a raw `UPDATE` with NO
-> `parameter_change_applied` audit event.** That is the signed-off smoke
-> mechanism (design Q4-A). The event-sourced audit ceremony is
-> **parameter-sets-bootstrap-design PR-D, and is REQUIRED before any *live*
-> decommission.** Until then this ceremony is **paper-smoke-only.**
+> **✅ AUDIT — PR-D shipped the audited ceremony.** Steps 2 + 5 below now use
+> `apply_parameter_change.py`, which writes a `parameter_change_applied` /
+> `parameter_change_reverted` audit event + a `parameters`-table row (audit-first)
+> before flipping the head. The legacy **raw `UPDATE`** (Q4-A smoke mechanism) is
+> retained ONLY as a fallback and writes **no audit trail** — do NOT use it for a
+> *live* decommission. (Note: making the flip stop the live *nightly* cycle is
+> PR-C, which must also be deployed — see the SCOPE caveat above.)
 
 ### Pre-conditions
 
@@ -825,19 +828,32 @@ FROM parameter_sets WHERE last_active_at IS NULL;
 -- Record parameter_set_hash. Expect decom='False'.
 ```
 
-**2 — Flip the flag to True (in-place; PK-stable).**
+**2 — Flip the flag to True (AUDITED ceremony — PR-D, preferred).**
 
-```sql
-UPDATE parameter_sets
-SET parameters = jsonb_set(parameters, '{STRATEGY_DECOMMISSIONED}', to_jsonb('True'::text))
-WHERE last_active_at IS NULL;
+Use the audited tool (PR #—, design §13): it writes a `parameter_change_applied`
+audit event FIRST, then a `parameters`-table history row + the in-place
+`parameter_sets` flip — all in one ceremony. Run inside the same `ssh + subshell`
+wrapper, with `DATABASE_URL` exported as in the seeding section (the tool reads
+`os.environ['DATABASE_URL']`):
+
+```bash
+/opt/venv/bin/python -m scripts.operator_tools.apply_parameter_change \
+  --env paper --parameter STRATEGY_DECOMMISSIONED --value true \
+  --reason "decommission smoke <date>" --no-dry-run --confirm
 ```
 
-`to_jsonb('True'::text)` writes the JSON string `"True"` (matching the seeded
-string shape; the readers coerce it via `str(value).strip().lower() == "true"`).
-Re-run the step-1 SELECT and verify: `decom` flips to `'True'` **AND**
-`parameter_set_hash` is **unchanged** — the hash excludes the flag (design Q1-A);
-that stability is the entire point of the in-place UPDATE.
+`--dry-run` is the default (prints the plan, no writes). The flip is PK-stable —
+`parameter_set_hash` is **unchanged** (the hash excludes the flag, design Q1-A),
+so the new `parameters` row carries `prev_parameter_set_hash == parameter_set_hash`.
+Re-run the step-1 SELECT to confirm `decom='True'` + the hash is unchanged.
+
+> **Fallback (only if PR-D's tool is unavailable):** the legacy raw UPDATE — which
+> writes **NO audit trail** and must NOT be used for a *live* decommission:
+> ```sql
+> UPDATE parameter_sets
+> SET parameters = jsonb_set(parameters, '{STRATEGY_DECOMMISSIONED}', to_jsonb('True'::text))
+> WHERE last_active_at IS NULL;
+> ```
 
 **3 — Run the trigger (exits only, decommission reason only).**
 
@@ -862,12 +878,22 @@ closes in the `/positions` + `/signals` surfaces and the audit chain extends).
 
 **5 — REVERT (HARD GATE — do not skip).**
 
-```sql
-UPDATE parameter_sets
-SET parameters = jsonb_set(parameters, '{STRATEGY_DECOMMISSIONED}', to_jsonb('False'::text))
-WHERE last_active_at IS NULL;
--- Verify decom='False' again; parameter_set_hash still unchanged.
+Same audited tool with `--value false` — emits `parameter_change_reverted`:
+
+```bash
+/opt/venv/bin/python -m scripts.operator_tools.apply_parameter_change \
+  --env paper --parameter STRATEGY_DECOMMISSIONED --value false \
+  --reason "revert decommission smoke <date>" --no-dry-run --confirm
 ```
+
+Verify `decom='False'` again; `parameter_set_hash` still unchanged.
+
+> **Fallback (only if PR-D's tool is unavailable; no audit trail):**
+> ```sql
+> UPDATE parameter_sets
+> SET parameters = jsonb_set(parameters, '{STRATEGY_DECOMMISSIONED}', to_jsonb('False'::text))
+> WHERE last_active_at IS NULL;
+> ```
 
 > **If you skip the revert, the flag stays `True` and the *next*
 > `trigger_v1_cycle` run will re-emit decommission exits for everything held.**
