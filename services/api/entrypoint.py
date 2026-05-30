@@ -197,30 +197,38 @@ def main(argv: list[str] | None = None) -> int:
         if origin and not _looks_like_placeholder(origin):
             os.environ["API_WEBAUTHN_ORIGIN"] = origin
 
-    # Worker-PR-1 follow-up (post-pivot 2026-05-12): IBKR account
-    # number for the api-resident OrderPlacementWorker. Sourced from
-    # sops; canonical key is ``ibkr.account_number`` (single field —
-    # the operator's IBKR Pro account is a single number across paper
-    # and live; the env-tag distinction is in IBKR's portal, not in
-    # the account number). Per-env fallback keys
-    # ``ibkr.paper_account`` / ``ibkr.live_account`` are accepted for
-    # forward-compat with possible future multi-account setups.
+    # Worker-PR-1 follow-up (post-pivot 2026-05-12): IBKR account number
+    # for the api-resident OrderPlacementWorker + EOD recon + bar_sync.
+    # Sourced from sops.
     #
-    # When unset / placeholder the worker still starts but the IBKR
-    # adapter falls back to the default account on the TWS session.
-    # That works for single-account setups; ``account_number`` makes
-    # the binding explicit for clearer audit logs + multi-account
-    # safety.
+    # CORRECTED 2026-05-29: IBKR PAPER accounts have a DISTINCT account id
+    # (e.g. ``DUQ825170``) from the live IBKR Pro account (e.g. ``U25655583``)
+    # — they are NOT "a single number across paper and live" as the prior
+    # comment claimed. The broker's ``reqPositions`` / account view is keyed
+    # on the env-specific number, so we must resolve the ENV-SPECIFIC key
+    # FIRST (``ibkr.paper_account`` for paper/dev, ``ibkr.live_account`` for
+    # live), falling back to the generic ``ibkr.account_number`` only when the
+    # env-specific key is unset/placeholder (single-account setups).
+    #
+    # The prior logic took ``account_number`` FIRST, which on the paper
+    # gateway silently mis-keyed every account-filtered ``get_positions()`` to
+    # the LIVE account number -> 0 broker positions -> nightly false-positive
+    # recon ``position_qty`` breaks + kill-switch halts, and a position-blind
+    # order-worker margin pre-check. See decisions-log 2026-05-29.
+    #
+    # When the resolved value is unset / placeholder the worker still starts
+    # but the IBKR adapter falls back to the default account on the TWS
+    # session.
     if "API_IBKR_ACCOUNT" not in os.environ:
         ibkr = secrets.get("ibkr") or {}
         env_tag = os.environ.get("API_ENVIRONMENT") or os.environ.get("ENVIRONMENT", "dev")
-        # Canonical first; env-specific fallback second.
-        acc: Any = ibkr.get("account_number")
-        if not acc or _looks_like_placeholder(acc):
-            if env_tag in ("paper", "dev"):
-                acc = ibkr.get("paper_account")
-            else:
-                acc = ibkr.get("live_account")
+        # Env-specific account FIRST; generic ``account_number`` as fallback.
+        if env_tag in ("paper", "dev"):
+            primary: Any = ibkr.get("paper_account")
+        else:
+            primary = ibkr.get("live_account")
+        fallback: Any = ibkr.get("account_number")
+        acc: Any = primary if (primary and not _looks_like_placeholder(primary)) else fallback
         if acc and not _looks_like_placeholder(acc):
             os.environ["API_IBKR_ACCOUNT"] = str(acc)
 

@@ -369,3 +369,102 @@ def test_main_skips_day21_env_vars_when_sops_key_placeholder(
     assert captured["rp_name"] == "trading-system"
     assert captured["origin"] is None
     assert captured["bot"] is None
+
+
+def test_main_resolves_paper_account_over_account_number(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Paper env MUST resolve API_IBKR_ACCOUNT from ibkr.paper_account (the
+    distinct paper account id), NOT the generic ibkr.account_number (the live
+    IBKR Pro account). Regression for the 2026-05-29 incident: the prior logic
+    took account_number first, mis-keying every account-filtered
+    get_positions() to the live account on the paper gateway -> 0 broker
+    positions -> nightly false recon halts."""
+    secrets_path = _write_yaml(
+        tmp_path,
+        """
+        postgres:
+          app_service_password: realhex123
+        ibkr:
+          account_number: U25655583
+          paper_account: DUQ825170
+        """,
+    )
+    monkeypatch.setenv("API_SECRETS_PATH", str(secrets_path))
+    monkeypatch.setenv("API_ENVIRONMENT", "paper")
+    monkeypatch.delenv("API_DATABASE_URL", raising=False)
+    monkeypatch.delenv("API_IBKR_ACCOUNT", raising=False)
+
+    captured: dict[str, str | None] = {}
+
+    def fake_exec(cmd: str, args: list[str]) -> None:
+        captured["acct"] = os.environ.get("API_IBKR_ACCOUNT")
+
+    monkeypatch.setattr(os, "execvp", fake_exec)
+    entrypoint.main(argv=["true"])
+
+    assert captured["acct"] == "DUQ825170"
+
+
+def test_main_falls_back_to_account_number_when_paper_account_placeholder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the env-specific paper_account is a placeholder/unset, fall back
+    to the generic account_number (single-account setups)."""
+    secrets_path = _write_yaml(
+        tmp_path,
+        """
+        postgres:
+          app_service_password: realhex123
+        ibkr:
+          account_number: U25655583
+          paper_account: <TODO_FROM_PIVOT_PR_F_BRINGUP>
+        """,
+    )
+    monkeypatch.setenv("API_SECRETS_PATH", str(secrets_path))
+    monkeypatch.setenv("API_ENVIRONMENT", "paper")
+    monkeypatch.delenv("API_DATABASE_URL", raising=False)
+    monkeypatch.delenv("API_IBKR_ACCOUNT", raising=False)
+
+    captured: dict[str, str | None] = {}
+
+    def fake_exec(cmd: str, args: list[str]) -> None:
+        captured["acct"] = os.environ.get("API_IBKR_ACCOUNT")
+
+    monkeypatch.setattr(os, "execvp", fake_exec)
+    entrypoint.main(argv=["true"])
+
+    assert captured["acct"] == "U25655583"
+
+
+def test_main_resolves_live_account_for_live_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live env resolves ibkr.live_account first (symmetric to paper)."""
+    secrets_path = _write_yaml(
+        tmp_path,
+        """
+        postgres:
+          app_service_password: realhex123
+        ibkr:
+          account_number: U25655583
+          live_account: U91234567
+        """,
+    )
+    monkeypatch.setenv("API_SECRETS_PATH", str(secrets_path))
+    monkeypatch.setenv("API_ENVIRONMENT", "live-small")
+    monkeypatch.delenv("API_DATABASE_URL", raising=False)
+    monkeypatch.delenv("API_IBKR_ACCOUNT", raising=False)
+
+    captured: dict[str, str | None] = {}
+
+    def fake_exec(cmd: str, args: list[str]) -> None:
+        captured["acct"] = os.environ.get("API_IBKR_ACCOUNT")
+
+    monkeypatch.setattr(os, "execvp", fake_exec)
+    entrypoint.main(argv=["true"])
+
+    assert captured["acct"] == "U91234567"
