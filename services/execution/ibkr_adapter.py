@@ -921,6 +921,62 @@ class IbAsyncIbkrClient:
                 occurred_at_utc=_ts_utc(),
             ) from exc
 
+    async def get_positions_fresh(self) -> list[IbkrPosition]:
+        """Snapshot positions via a FRESH ``reqPositions`` round-trip.
+
+        Unlike :meth:`get_positions` (which reads ib-async's local
+        ``IB.positions()`` cache), this issues ``reqPositionsAsync()`` and
+        AWAITS the ``positionEnd`` sentinel, so the result does not depend on
+        whether ``connectAsync()`` happened to finish the startup position
+        handshake before the read.
+
+        This is the deterministic view the per-cycle EOD reconciliation client
+        (clientId=4; connect → read → disconnect) needs. ``connectAsync()``
+        kicks off the ``reqPositions``/``positionEnd`` handshake but does NOT
+        await it, so a read issued immediately after connect can see an EMPTY
+        cache — the 2026-05-29 cache-timing race that returned ``raw_count=0``
+        and tripped a false ``NORMAL → HALT_NEW`` (see
+        ``services/reconciliation/ibkr_intraday.py`` Path B + decisions-log
+        2026-05-29). The long-lived order worker (clientId=1) is NOT affected:
+        by the time it runs a pre-trade margin check the cache is warm, so it
+        keeps using the cheaper :meth:`get_positions`.
+
+        Account scoping mirrors :meth:`get_positions`: when ``account_id`` is
+        set, rows for other accounts on the session are dropped; when ``None``
+        (single-account paper default) all rows are returned. MTM fields stay
+        ``None`` — ``reqPositions`` carries no marks, same as the cache path.
+        """
+        ib = await self._ensure_connected()
+        try:
+            raw_positions = await ib.reqPositionsAsync()
+            result: list[IbkrPosition] = []
+            for pos in raw_positions:
+                # ``reqPositions`` is session-wide (no account filter arg);
+                # scope to the configured account when one is set, matching
+                # ``get_positions``'s ``ib.positions(account=...)`` behavior.
+                if self._account_id and getattr(pos, "account", None) != self._account_id:
+                    continue
+                ref = self._contract_from_ib(pos.contract)
+                result.append(
+                    IbkrPosition(
+                        contract=ref,
+                        quantity=_to_decimal(pos.position),
+                        avg_cost_usd=_to_decimal(pos.avgCost),
+                        market_price_usd=None,  # reqPositions carries no marks
+                        unrealized_pnl_usd=None,
+                        realized_pnl_usd=Decimal(0),
+                    )
+                )
+            return result
+        except Exception as exc:
+            log.error("ibkr_get_positions_fresh_failed", error=str(exc))
+            raise IbkrPlacementError(
+                operation="reqPositions",
+                detail=f"reqPositionsAsync() failed: {exc!r}",
+                underlying_exception_class=type(exc).__name__,
+                occurred_at_utc=_ts_utc(),
+            ) from exc
+
     async def get_account_summary(self) -> IbkrAccountSummary:
         ib = await self._ensure_connected()
         snapshot_at = _ts_utc()

@@ -1,12 +1,14 @@
 """Unit tests for :mod:`services.reconciliation.ibkr_intraday`.
 
-PR-A of Option C (2026-05-28). Pure adapter-mocking — no IBKR gateway, no
-Postgres. The new ``fetch_recon_positions`` owns a per-cycle connect →
-``get_positions`` → disconnect against the ``IbkrClient`` Protocol; these tests
-inject a ``MagicMock`` client (the canonical shape from
+PR-A of Option C (2026-05-28); Path B fresh-fetch + settle/retry (2026-05-29).
+Pure adapter-mocking — no IBKR gateway, no Postgres. ``fetch_recon_positions``
+owns a per-cycle connect → ``get_positions_fresh`` (reqPositionsAsync; Path B)
+→ disconnect against the ``IbkrClient`` Protocol; these tests inject a
+``MagicMock`` client (the canonical shape from
 ``tests/integration/test_replace_protective_stop_end_to_end.py::_fake_ibkr_client``)
 to drive every branch: happy path, empty result, connect failure, mid-fetch
-failure, disconnect failure, symbol normalization, and the clientId=4 default.
+failure, disconnect failure, symbol normalization, the clientId=4 default, and
+the Path B retry-on-empty behavior.
 
 ``asyncio_mode = "auto"`` (pyproject) — async tests need no decorator.
 """
@@ -28,10 +30,20 @@ from services.execution.types import (
 )
 from services.reconciliation.ibkr_intraday import (
     DEFAULT_RECON_CLIENT_ID,
+    RECON_FRESH_FETCH_MAX_ATTEMPTS,
     ReconPosition,
     ReconPositionsFetchError,
     fetch_recon_positions,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_settle_delay(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Path B settles ``RECON_FRESH_FETCH_SETTLE_SECONDS`` between empty
+    fresh-fetch attempts; zero it so retry-path tests don't wall-clock-block."""
+    monkeypatch.setattr(
+        "services.reconciliation.ibkr_intraday.RECON_FRESH_FETCH_SETTLE_SECONDS", 0.0
+    )
 
 
 def _ibkr_position(*, market: str, quantity: Decimal) -> IbkrPosition:
@@ -95,9 +107,9 @@ def _fake_client(
             )
         )
     if get_positions_raises is not None:
-        client.get_positions = AsyncMock(side_effect=get_positions_raises)
+        client.get_positions_fresh = AsyncMock(side_effect=get_positions_raises)
     else:
-        client.get_positions = AsyncMock(return_value=positions or [])
+        client.get_positions_fresh = AsyncMock(return_value=positions or [])
     if disconnect_raises is not None:
         client.disconnect = AsyncMock(side_effect=disconnect_raises)
     else:
@@ -125,7 +137,8 @@ class TestFetchReconPositions:
         # Quantity preserved as Decimal (A05), not coerced to int/float.
         assert isinstance(result[0].quantity, Decimal)
         client.connect.assert_awaited_once()
-        client.get_positions.assert_awaited_once()
+        # Path B: the FRESH fetch (reqPositionsAsync), not the cache read.
+        client.get_positions_fresh.assert_awaited_once()
         client.disconnect.assert_awaited_once()
 
     async def test_returns_empty_tuple_when_no_positions(self) -> None:
@@ -149,7 +162,7 @@ class TestFetchReconPositions:
         # Original adapter exception preserved on the chain.
         assert exc_info.value.__cause__ is underlying
         # Never reached the fetch; nothing to disconnect (connect failed).
-        client.get_positions.assert_not_awaited()
+        client.get_positions_fresh.assert_not_awaited()
         client.disconnect.assert_not_awaited()
 
     async def test_get_positions_failure_raises_then_disconnects(self) -> None:
@@ -180,6 +193,55 @@ class TestFetchReconPositions:
         assert "recon_positions_disconnect_failed" in events
         # The disconnect failure is NOT re-raised as a fetch error.
         assert "recon_positions_fetch_completed" in events
+
+
+class TestPathBFreshFetchRetry:
+    """Path B (2026-05-29): fresh reqPositions with settle/retry on empty."""
+
+    async def test_no_retry_when_first_attempt_nonempty(self) -> None:
+        client = _fake_client(positions=[_ibkr_position(market="/MES", quantity=Decimal("1"))])
+
+        result = await fetch_recon_positions(client_factory=lambda: client)
+
+        assert result == (ReconPosition(market="/MES", quantity=Decimal("1")),)
+        # Authoritative on the first deterministic fetch — no retry.
+        assert client.get_positions_fresh.await_count == 1
+
+    async def test_retries_on_empty_then_succeeds(self) -> None:
+        # First fresh fetch loses the (already-unlikely) race + returns empty;
+        # the retry catches the populated snapshot.
+        client = MagicMock()
+        client.connect = AsyncMock(return_value=None)
+        client.disconnect = AsyncMock(return_value=None)
+        client.get_positions_fresh = AsyncMock(
+            side_effect=[[], [_ibkr_position(market="/M2K", quantity=Decimal("1"))]]
+        )
+
+        with capture_logs() as logs:
+            result = await fetch_recon_positions(client_factory=lambda: client)
+
+        assert result == (ReconPosition(market="/M2K", quantity=Decimal("1")),)
+        assert client.get_positions_fresh.await_count == 2
+        events = [e["event"] for e in logs]
+        assert events.count("recon_positions_fetch_empty_retrying") == 1
+        completed = next(e for e in logs if e["event"] == "recon_positions_fetch_completed")
+        assert completed["attempts"] == 2
+
+    async def test_returns_empty_after_exhausting_retries(self) -> None:
+        # A genuinely flat account: every fresh fetch returns empty. The loop
+        # stops at MAX_ATTEMPTS and returns () (the eod_cycle guard decides
+        # whether that empty is suspect against the backend view).
+        client = _fake_client(positions=[])
+
+        with capture_logs() as logs:
+            result = await fetch_recon_positions(client_factory=lambda: client)
+
+        assert result == ()
+        assert client.get_positions_fresh.await_count == RECON_FRESH_FETCH_MAX_ATTEMPTS
+        retry_logs = [e for e in logs if e["event"] == "recon_positions_fetch_empty_retrying"]
+        # One retry log per inter-attempt gap (no sleep after the last attempt).
+        assert len(retry_logs) == RECON_FRESH_FETCH_MAX_ATTEMPTS - 1
+        client.disconnect.assert_awaited_once()
 
 
 class TestSymbolNormalization:
@@ -273,7 +335,7 @@ class TestDefaultClientFactory:
             captured.update(kwargs)
             client = MagicMock()
             client.connect = AsyncMock()
-            client.get_positions = AsyncMock(return_value=[])
+            client.get_positions_fresh = AsyncMock(return_value=[])
             client.disconnect = AsyncMock()
             return client
 
