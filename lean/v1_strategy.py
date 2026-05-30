@@ -90,6 +90,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+from dataclasses import replace
 from datetime import date as _date
 from decimal import Decimal
 
@@ -379,6 +380,10 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
 
         self._params = params
         self._v1_parameters: V1Parameters | None = None  # built lazily on first cycle
+        # PR-C (design §12): set True for the current cycle when the DB
+        # parameter fetch fails (fail-OPEN); surfaced on the cycle heartbeat's
+        # ``error`` field so the api observes the kill-switch read failure.
+        self._parameters_fetch_failed: bool = False
         self.log(
             f"v1_strategy initialized (post-pivot 2026-05-12, Pivot-PR-D) "
             f"live_mode={self.live_mode} api_base={self._api_base_url} "
@@ -462,6 +467,39 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
                 },
             )
             return
+
+        # PR-C (parameter-sets-bootstrap-design §12): override
+        # STRATEGY_DECOMMISSIONED from the DB head row so the nightly cycle
+        # honors the operator's runtime kill-switch flip (the flag lives in the
+        # DB, not lean.json). The lean.json value built above is the per-cycle
+        # base; the DB flag wins when reachable. Fetched EVERY cycle (not just at
+        # initialize) so a flip is honored on the next nightly cycle without a
+        # restart.
+        #
+        # FAIL-OPEN (§12.4): on ANY fetch failure keep the lean.json default and
+        # flag it on the heartbeat — a transient api blip must NOT crash the
+        # cycle or silently flatten the book. SAFETY DEPENDENCY (§12.4
+        # forward-guard): fail-open is safe ONLY while EXIT_AUTO_APPROVE
+        # auto-approval is unbuilt + False — every emitted signal (entries AND
+        # decommission exits) is operator-gated today, so a wrong fail-open
+        # ``False`` cannot auto-execute. Re-evaluate (fail-closed for exits) if
+        # exit auto-approval ever ships.
+        fetched_decommission = self._fetch_active_decommission_flag()
+        if fetched_decommission is None:
+            self._parameters_fetch_failed = True
+            self.log(
+                f"lean_parameters_fetch_failed session_date={session_date} "
+                f"fail_open=True lean_json_default={v1_params.strategy_decommissioned}"
+            )
+        else:
+            self._parameters_fetch_failed = False
+            if fetched_decommission != v1_params.strategy_decommissioned:
+                self.log(
+                    f"lean_decommission_override session_date={session_date} "
+                    f"lean_json={v1_params.strategy_decommissioned} "
+                    f"db={fetched_decommission}"
+                )
+                v1_params = replace(v1_params, strategy_decommissioned=fetched_decommission)
 
         strategy = V1TrendFollowing(parameters=v1_params)
         self._strategy_min_bars = strategy.min_required_bars
@@ -552,17 +590,19 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         # an optional field; PR-B will persist them. Observation-only —
         # this does NOT influence which signals fire.
         proximity_payload = self._build_market_evaluations_payload(result)
-        self._post_event(
-            "lean_cycle_heartbeat",
-            extra={
-                "session_date_et": session_date.isoformat(),
-                "equity_usd": str(equity),
-                "live_mode": bool(self.live_mode),
-                "signals_emitted_count": signals_count,
-                "rejections_count": rejections_count,
-                "market_evaluations": proximity_payload,
-            },
-        )
+        heartbeat_extra: dict = {
+            "session_date_et": session_date.isoformat(),
+            "equity_usd": str(equity),
+            "live_mode": bool(self.live_mode),
+            "signals_emitted_count": signals_count,
+            "rejections_count": rejections_count,
+            "market_evaluations": proximity_payload,
+        }
+        # PR-C (§12.4): surface a kill-switch parameter-fetch failure so the api
+        # observes it (and a thin follow-up can escalate to a P1 Discord alert).
+        if self._parameters_fetch_failed:
+            heartbeat_extra["error"] = "parameters_fetch_failed"
+        self._post_event("lean_cycle_heartbeat", extra=heartbeat_extra)
 
         # Step 7: emit each entry signal.
         for signal in result.signals:
@@ -1182,6 +1222,52 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
     # ------------------------------------------------------------------
     # HTTP POST plumbing (Pivot-PR-A)
     # ------------------------------------------------------------------
+
+    def _fetch_active_decommission_flag(self) -> bool | None:
+        """GET the active ``STRATEGY_DECOMMISSIONED`` from the api (design §12.3).
+
+        Reuses the same base URL + bearer as :meth:`_post_event`. Returns the
+        coerced bool on success; returns ``None`` on ANY failure (HTTP error,
+        network error, non-2xx, malformed body) so the caller FAILS OPEN to the
+        ``lean.json`` default (design §12.4). Best-effort, short timeout — a
+        param-fetch error must never crash the signal cycle.
+        """
+        url = f"{self._api_base_url.rstrip('/')}/api/internal/lean/parameters"
+        try:
+            req = urllib.request.Request(
+                url=url,
+                method="GET",
+                headers={
+                    "Authorization": f"Bearer {self._api_bearer_token}",
+                    "User-Agent": "trading-lean-local/0.1",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=_API_TIMEOUT_SECONDS) as response:
+                if response.status >= 400:
+                    self.log(f"lean_parameters_fetch_failed http_status={response.status}")
+                    return None
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            self.log(f"lean_parameters_fetch_failed http_error status={exc.code} reason={exc.reason}")
+            return None
+        except urllib.error.URLError as exc:
+            self.log(f"lean_parameters_fetch_failed url_error reason={exc.reason}")
+            return None
+        except Exception as exc:  # noqa: BLE001  -- best-effort net I/O; fail-open on anything
+            self.log(f"lean_parameters_fetch_failed unexpected exc={exc!r}")
+            return None
+
+        if not isinstance(payload, dict):
+            self.log("lean_parameters_fetch_failed malformed_body_not_dict")
+            return None
+        params = payload.get("parameters")
+        if not isinstance(params, dict):
+            self.log("lean_parameters_fetch_failed malformed_body_no_parameters")
+            return None
+        # _coerce_bool_param collapses None / typos / non-"True" to False (the
+        # SAFE default) — so a present-but-garbage value reads as "not
+        # decommissioned" rather than tripping the kill-switch.
+        return _coerce_bool_param(params.get("STRATEGY_DECOMMISSIONED"))
 
     def _post_event(self, event_type: str, extra: dict | None = None) -> None:
         """POST a heartbeat or signal event to the backend.
