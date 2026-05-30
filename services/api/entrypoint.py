@@ -228,9 +228,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             primary = ibkr.get("live_account")
         fallback: Any = ibkr.get("account_number")
-        acc: Any = (
-            primary if (primary and not _looks_like_placeholder(primary)) else fallback
-        )
+        acc: Any = primary if (primary and not _looks_like_placeholder(primary)) else fallback
         if acc and not _looks_like_placeholder(acc):
             os.environ["API_IBKR_ACCOUNT"] = str(acc)
 

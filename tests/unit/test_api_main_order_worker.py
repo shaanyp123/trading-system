@@ -405,18 +405,23 @@ class TestEntrypointIbkrAccountMapping:
 
         assert "API_IBKR_ACCOUNT" not in os.environ
 
-    def test_account_number_canonical_takes_precedence(
+    def test_paper_account_takes_precedence_over_account_number(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
     ) -> None:
-        """`ibkr.account_number` is the canonical key — read it first."""
+        """Env-specific ``ibkr.paper_account`` takes precedence over the generic
+        ``account_number`` (the live IBKR Pro account) for the paper env.
+
+        Regression for the 2026-05-29 incident: account_number was read first,
+        mis-keying every account-filtered get_positions() to the live account on
+        the paper gateway -> 0 positions -> false recon halts."""
         from services.api import entrypoint
 
         yaml_text = (
             "postgres:\n"
             "  app_service_password: hexpwd\n"
             "ibkr:\n"
-            "  account_number: DUQ_CANONICAL\n"
-            "  paper_account: DUQ_LEGACY_PAPER\n"
+            "  account_number: U_LIVE_NUMBER\n"
+            "  paper_account: DUQ_PAPER\n"
         )
         secrets_path = tmp_path / "decrypted.yaml"
         secrets_path.write_text(yaml_text)
@@ -434,12 +439,13 @@ class TestEntrypointIbkrAccountMapping:
         entrypoint.main(["true"])
         import os
 
-        assert os.environ["API_IBKR_ACCOUNT"] == "DUQ_CANONICAL"
+        assert os.environ["API_IBKR_ACCOUNT"] == "DUQ_PAPER"
 
-    def test_account_number_works_for_live_env_too(
+    def test_account_number_is_fallback_for_live_when_live_account_absent(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
     ) -> None:
-        """Canonical key is env-agnostic — same field for paper + live."""
+        """``account_number`` is the FALLBACK for live when the env-specific
+        ``live_account`` is absent (single-account setups)."""
         from services.api import entrypoint
 
         yaml_text = (
@@ -463,10 +469,11 @@ class TestEntrypointIbkrAccountMapping:
 
         assert os.environ["API_IBKR_ACCOUNT"] == "U_CANONICAL"
 
-    def test_falls_back_to_paper_account_when_canonical_missing(
+    def test_paper_account_resolves_without_account_number(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
     ) -> None:
-        """When `account_number` is absent, fall back to per-env legacy keys."""
+        """Paper env resolves ``paper_account`` (the primary key for paper) even
+        when ``account_number`` is absent."""
         from services.api import entrypoint
 
         yaml_text = (
