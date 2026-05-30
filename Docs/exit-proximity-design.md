@@ -1,6 +1,6 @@
 # V1 Exit Proximity Design ("Watching → Exits")
 
-**Status:** DRAFT — awaiting operator sign-off (do NOT start PRs until §14 is checked)
+**Status:** SIGNED OFF 2026-05-30 — PR-A ready to kick off. Locked: **Q1 = (B) api-side stop join** (LEAN emits indicator dims only; the api joins the latest working `stop_market` order's `stop_price` at persist time; daily fidelity). **Q3 = Today page, beside Positions.** Q2/Q4/Q5/Q6/Q7 accepted at their recommended/PROPOSED values; NEAR-band defaults accepted (trend 0.5% / stop 1% / holding-days 3-day warn).
 **Created:** 2026-05-30
 **Owner:** operator (Shaan)
 **Implementer:** Claude Code (multi-session, one per PR)
@@ -264,17 +264,17 @@ Retention: keep all (~2 rows/day). If Q1 resolves to api-side stop join, the hea
 | host page (Today or `/signals`) | C | render section |
 | `Docs/decisions-log.md` / `Docs/file-index.md` | A,B,C | per-PR entries |
 
-## 14. Sign-off Checklist (operator — confirm before PR-A kickoff)
-- [ ] ED1–ED8 (§2) accepted (or changes noted).
-- [ ] **Q1 resolved** — stop-distance fidelity/source: (A) daily-close proxy / (B) api-side stop join [recommended] / (C) live mark.
-- [ ] Q2 reversal-derive accepted.
-- [ ] **Q3 render location** chosen: Today (beside Positions) [recommended] / `/signals` second section.
-- [ ] Q4 separate `ExitState` enum accepted.
-- [ ] Q5 new module vs extend accepted.
-- [ ] Q6 no-audit-log accepted.
-- [ ] Q7 decommission-chip-tracks-LEAN-config understood.
-- [ ] NEAR-band defaults accepted: trend 0.5% / stop 1% / holding-days 3-day warn.
-- [ ] PR-A/B/C split + `risk-review-approved` on A & B accepted.
+## 14. Sign-off Checklist — SIGNED OFF 2026-05-30
+- [x] ED1–ED8 (§2) accepted. **ED3 superseded by Q1=(B): stop level comes from the api-side `stop_market` join, NOT a LEAN daily-close-derived mark.**
+- [x] **Q1 resolved → (B) api-side stop join.** LEAN emits only the indicator dimensions (trend_flip holding-days + deterioration, decommission, derived reversal); the api enriches `stop_price`/`stop_state` from the latest working `stop_market` order at PR-B persist time. Daily fidelity. Live mark-to-stop (C) deferred.
+- [x] Q2 reversal-derive accepted (derive from entry `signal_proximity`).
+- [x] **Q3 render location → Today page, beside Positions.** Endpoint path → `/api/today/exit-proximity` (or `/api/positions/exit-proximity`); resolve at PR-B time.
+- [x] Q4 separate `ExitState` enum (HOLDING/NEAR/TRIGGERED) accepted.
+- [x] Q5 new module `exit_proximity.py` accepted.
+- [x] Q6 no-audit-log accepted (table is the trail).
+- [x] Q7 decommission-chip-tracks-LEAN-config understood (`lean.json`/code default, not the seeded DB row; see [[project_parameter_sets_empty]]).
+- [x] NEAR-band defaults accepted: trend 0.5% / stop 1% / holding-days 3-day warn.
+- [x] PR-A/B/C split + `risk-review-approved` on A & B accepted.
 
 ## 15. PR-A Kickoff Prompt (after sign-off)
 > Read `Docs/exit-proximity-design.md` end-to-end. Implement PR-A per §9. Constraints:
