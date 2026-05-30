@@ -539,6 +539,28 @@ P1-grade alert + structured log** (`lean_parameters_fetch_failed`). Rationale:
 - Distinct from the existing **missing-bearer → hard fail-close** at
   `initialize()` (a config error), which stays as-is.
 
+> **Load-bearing dependency — fail-open is only safe while `EXIT_AUTO_APPROVE`
+> auto-approval is unbuilt + `False`.** Precise mechanism (verified): when
+> `STRATEGY_DECOMMISSIONED=True` the strategy *emits* decommission exit signals;
+> those are not orders. What actually prevents fail-open from auto-executing is
+> that **every signal — entries AND exits — is operator-gated today**: entries are
+> always `pending`→operator-`approved` before `order_placement_worker` claims
+> them, and exit auto-approval (`EXIT_AUTO_APPROVE`) **is not implemented** (no
+> auto-approve worker exists; default `False`; deferred to a post-cutover PR). So
+> a fail-open cycle that wrongly reads `False` emits normal signals that all still
+> require approval — nothing executes without the operator.
+>
+> **Forward-guard (must hold before any `EXIT_AUTO_APPROVE` auto-approval ships):**
+> the moment exits can auto-approve, fail-open becomes dangerous — a nightly cycle
+> that fail-opens to `False` while the operator intended to decommission would keep
+> a *live* book auto-executing exits with no operator in the loop, silently
+> defeating the kill-switch. Before that worker is built/enabled, this decision
+> MUST be re-evaluated — either flip the nightly cycle to **fail-closed for exits**,
+> or couple the auto-approve worker to a *healthy* kill-switch read (refuse to
+> auto-approve when the most recent param fetch failed). The PR-C implementation
+> must add a test that pins `EXIT_AUTO_APPROVE=False` as a precondition of the
+> fail-open path and a pointer to this guard.
+
 > ⚠️ **Highest-stakes decision in PR-C — the nightly kill-switch FAILS OPEN.** If
 > you would rather it fail-*closed* (flatten the book on a fetch error), override
 > this before implementation. Note: the approval gate already prevents
