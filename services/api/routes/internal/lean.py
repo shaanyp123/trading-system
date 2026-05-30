@@ -31,17 +31,22 @@ with operational liveness pings). signal_emitted DOES write to audit_log
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from typing import Annotated
+from typing import Annotated, Final
 
 import structlog
 from fastapi import APIRouter, Depends, Request, status
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.api import db as api_db
 from services.api.errors import AppError
 from services.api.heartbeats import get_heartbeat_registry
-from services.api.repos.phase1 import PostgresPhase1QueryRepo
+from services.api.repos.phase1 import Phase1QueryRepo, PostgresPhase1QueryRepo
 from services.api.repos.signal_proximity import insert_rows as insert_signal_proximity_rows
-from services.api.schemas.lean import LeanEventAccepted, LeanEventRequest
+from services.api.schemas.lean import (
+    LeanEventAccepted,
+    LeanEventRequest,
+    LeanParametersResponse,
+)
 from services.api.sse import emit_sse
 from services.audit.event_types import AuditEventType
 from services.audit.writer import Environment, PhaseAtEmit
@@ -515,6 +520,79 @@ async def post_lean_signal(
         ),
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         details={"event_type": body.event_type},
+    )
+
+
+# ---------------------------------------------------------------------------
+# PR-C (parameter-sets-bootstrap-design §12) — nightly kill-switch read.
+# LEAN's daily cycle GETs the active parameter set so it can honor the
+# operator's runtime STRATEGY_DECOMMISSIONED flip (which lives in the DB, not
+# lean.json). Read-only, bearer-gated.
+# ---------------------------------------------------------------------------
+
+#: SAFE operator-only-flag defaults returned when ``parameter_sets`` is empty.
+#: The nightly cycle consumes only ``STRATEGY_DECOMMISSIONED`` today (design
+#: §12.5 flag-only scope); LEAN falls back to its ``lean.json`` values for every
+#: non-flag parameter. Both default ``"False"`` (the SAFE value — keep trading,
+#: don't auto-decommission on an empty table).
+_SAFE_DEFAULT_LEAN_PARAMETERS: Final[dict[str, str]] = {
+    "STRATEGY_DECOMMISSIONED": "False",
+    "EXIT_AUTO_APPROVE": "False",
+}
+
+
+def _get_lean_query_repo(
+    session: AsyncSession = Depends(api_db.get_session),
+) -> Phase1QueryRepo:
+    """Repo dependency for the read endpoint.
+
+    Separate from the POST path's ``get_session_factory`` use so tests can
+    override this with a stub repo (no live DB) via FastAPI's
+    ``app.dependency_overrides`` — the same pattern ``services/api/routes/system.py``
+    uses for its read endpoints.
+    """
+    return PostgresPhase1QueryRepo(session)
+
+
+@router.get(
+    "/parameters",
+    response_model=LeanParametersResponse,
+    summary="Return the active parameter set for the nightly LEAN cycle",
+    description=(
+        "Bearer-authed read of the active ``parameter_sets`` head row so the "
+        "nightly LEAN cycle can honor the operator's runtime "
+        "``STRATEGY_DECOMMISSIONED`` flip (parameter-sets-bootstrap-design §12). "
+        "Returns the SAFE flag defaults when the table is empty. Read-only; no "
+        "audit row."
+    ),
+)
+async def get_lean_parameters(
+    request: Request,
+    _: Annotated[None, Depends(_require_lean_authenticated)],
+    repo: Annotated[Phase1QueryRepo, Depends(_get_lean_query_repo)],
+) -> LeanParametersResponse:
+    """Return the active parameter set (DB head row) or SAFE defaults.
+
+    The consumer (``lean/v1_strategy.py``) calls this at the start of each daily
+    cycle and overrides ``STRATEGY_DECOMMISSIONED``; on any failure it fails OPEN
+    to the ``lean.json`` default (design §12.4). This endpoint therefore never
+    needs to fail-close — it just reports the current DB state.
+    """
+    now = datetime.now(tz=UTC)
+    row = await repo.fetch_active_parameter_set()
+    if row is not None:
+        return LeanParametersResponse(
+            parameters={str(k): str(v) for k, v in row.parameters.items()},
+            parameter_set_hash=row.parameter_set_hash,
+            source="db_head",
+            server_now=now,
+        )
+    log.info("lean_parameters_defaults_returned", reason="parameter_sets_empty")
+    return LeanParametersResponse(
+        parameters=dict(_SAFE_DEFAULT_LEAN_PARAMETERS),
+        parameter_set_hash=None,
+        source="defaults",
+        server_now=now,
     )
 
 
