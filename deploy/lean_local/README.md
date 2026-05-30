@@ -467,3 +467,39 @@ IBKR forces a password change). After an IBKR password change:
   distinct sockets per IBKR's multi-client-id design.
 - NuGet plugin: [QuantConnect.Brokerages.InteractiveBrokers](https://www.nuget.org/packages/QuantConnect.Brokerages.InteractiveBrokers)
   (pinned to v2.5.17699 in `infrastructure/lean_local/Dockerfile`).
+
+---
+
+## PR-C — nightly kill-switch smoke (LEAN↔api parameter fetch; A27)
+
+PR-C (parameter-sets-bootstrap-design §12) wires the nightly LEAN cycle to honor
+the DB `STRATEGY_DECOMMISSIONED` flag: `v1_strategy.py` GETs
+`/api/internal/lean/parameters` at the start of each daily cycle and overrides
+the flag (fail-OPEN to the lean.json default on any fetch failure). `v1_strategy.py`
+isn't unit-testable (LEAN runtime), so verify the boundary on the VPS **after the
+`lean_local` rebuild + restart** that activates this code:
+
+1. **api endpoint reachable + bearer-gated** (from inside the api container):
+   ```bash
+   docker compose --env-file deploy/.env exec -T api sh -lc '
+     B=$(python -c "import os;print(os.environ.get(\"LEAN_LOCAL_BEARER_TOKEN\",\"\"))");
+     curl -fsS -H "Authorization: Bearer $B" http://localhost:8000/api/internal/lean/parameters'
+   # Expect JSON: {"parameters":{...},"source":"defaults"|"db_head",...}.
+   # Without the header → 401/403 (bearer-gated).
+   ```
+   `source=defaults` until the parameter_sets seed runs; `db_head` after.
+2. **LEAN consumes it** — watch the next 21:30 UTC cycle's `lean_local` logs:
+   - No flip set → no override line; cycle runs normally.
+   - After flipping the DB flag to `True` (decommission ceremony) → expect
+     `lean_decommission_override … db=True` then decommission exits.
+   - Kill the api briefly before a manual cycle → expect
+     `lean_parameters_fetch_failed … fail_open=True` + the cycle still runs on
+     the lean.json default (NOT a crash, NOT a flatten) + an `error=parameters_fetch_failed`
+     marker on the cycle heartbeat.
+3. **Forward-guard reminder (§12.4):** fail-open is safe only while
+   `EXIT_AUTO_APPROVE` auto-approval is unbuilt + `False`. Do not enable exit
+   auto-approval without re-evaluating this (fail-closed for exits).
+
+A true P1 Discord escalation on `error=parameters_fetch_failed` is a thin
+follow-up on the api heartbeat handler — today the signal is the loud
+`lean_parameters_fetch_failed` log line + the heartbeat `error` field.
