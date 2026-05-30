@@ -49,10 +49,20 @@ semantics, but only at bootstrap (no transition logic; canonical
 **A-gates:**
 
 * **A01 N/A** — no audit writes via this path. The risk_state row's
-  ``audit_event_uuid`` is a synthesized UUID4 (no upstream audit row
-  exists yet in a fresh live DB). Subsequent state transitions go
-  through ``services.risk.dispatch.plan_invoke_kill_switch`` /
-  ``apply_state_transition`` which DO write audit rows.
+  ``audit_event_uuid`` is a synthesized UUID4 with NO matching ``audit_log``
+  row. This is intentional for the cutover scenario (a fresh live DB has no
+  upstream audit row yet) and is SAFE because ``risk_state.audit_event_uuid``
+  is ``NOT NULL`` but carries **no FK** to ``audit_log`` (verified
+  ``alembic/versions/0003_risk_tables.py``) — the synthesized UUID satisfies
+  the column without a chain entry, and ``verify_chain`` (which walks
+  ``audit_log`` only) is unaffected. Subsequent state transitions go through
+  ``services.risk.dispatch`` / ``apply_state_transition`` which DO write audit
+  rows. **Caveat (2026-05-30):** because this inserts a risk_state row WITHOUT
+  an audit entry, running the FULL bootstrap against an already-running env is
+  a state mutation that bypasses audit-first ordering (backend-spec §2.10.1) —
+  another reason ``--seed-params-only`` is the correct mode for an existing
+  account, and why the mismatch guard refuses the full path when an owner
+  account already exists.
 * **A05 N/A** — no Decimal handling in bootstrap.
 * **A06 enforced** — every datetime tz-aware UTC.
 * **A22 N/A** — testcontainers not needed; unit tests cover the
@@ -63,6 +73,10 @@ Exit codes (load-bearing for the operator-runbook contract):
 * ``0`` — success: all rows landed (or were already present; idempotent)
 * ``1`` — invalid parameter-set JSON (missing ``parameter_set_hash`` or
   ``parameters`` keys; malformed JSON)
+* ``4`` — existing-account mismatch: an active ``owner`` account already exists
+  with a different ``external_account_id`` than ``--external-account-id`` (full
+  bootstrap refuses; use ``--seed-params-only`` or fix the id). See the
+  ``--seed-params-only`` mode + the 2026-05-30 dup-account note below.
 * ``5`` — DB init failure (DATABASE_URL missing / wrong / Postgres
   unreachable)
 * ``6`` — Invalid CLI args (caught early)
@@ -85,13 +99,18 @@ Usage::
         --allow-non-paper \\
         --no-dry-run --confirm
 
-    # Paper seed — mint the baseline parameter_sets head row from the
-    # canonical V1 defaults (no JSON file; the hash is computed in-tool).
-    # Default --dry-run prints the minted hash without writing; add
-    # --no-dry-run --confirm to apply. --env paper needs no --allow-non-paper.
+    # Paper seed (CORRECT invocation) — seed ONLY the parameter_sets head row
+    # from the canonical V1 defaults, skipping the account + risk_state inserts.
+    # USE --seed-params-only on any already-bootstrapped env: the live paper
+    # account's external_account_id is 'operator', NOT the IBKR number, so a
+    # plain --mint-from-defaults run (without --seed-params-only) would create a
+    # DUPLICATE account + a second is_current risk_state row (the 2026-05-30
+    # footgun). Default --dry-run prints the minted hash; add --no-dry-run
+    # --confirm to apply. --env paper needs no --allow-non-paper.
     python -m scripts.operator_tools.bootstrap_live_account \\
         --env paper \\
         --mint-from-defaults \\
+        --seed-params-only \\
         --no-dry-run --confirm
 
 The parameter-set JSON file shape::
@@ -142,6 +161,7 @@ log = structlog.get_logger()
 
 EXIT_OK: Final[int] = 0
 EXIT_BAD_PARAM_SET_JSON: Final[int] = 1
+EXIT_ACCOUNT_MISMATCH: Final[int] = 4
 EXIT_DB_INIT_FAILED: Final[int] = 5
 EXIT_BAD_ARGS: Final[int] = 6
 EXIT_UNEXPECTED: Final[int] = 99
@@ -172,6 +192,7 @@ class ParsedArgs:
     env: EnvName
     parameter_set_json: Path | None
     mint_from_defaults: bool
+    seed_params_only: bool
     dry_run: bool
     confirm: bool
     allow_non_paper: bool
@@ -229,6 +250,20 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--seed-params-only",
+        action="store_true",
+        default=False,
+        help=(
+            "Seed ONLY the parameter_sets row; SKIP the accounts + risk_state "
+            "inserts entirely. Use this when the account already exists and you "
+            "just need to seed (or backfill) the parameter_sets head row — e.g. "
+            "the paper seed (the live paper account's external_account_id is "
+            "'operator', NOT the IBKR number, so the full bootstrap would create "
+            "a duplicate account + a second is_current risk_state row). Requires "
+            "a parameter-set source: --mint-from-defaults or --parameter-set-json."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -275,11 +310,21 @@ def parse_args(argv: list[str]) -> ParsedArgs:
             "mint builds the row from canonical defaults, --parameter-set-json loads "
             "a pre-extracted row. Pick one."
         )
+    if parsed.seed_params_only and not (
+        parsed.mint_from_defaults or parsed.parameter_set_json is not None
+    ):
+        raise ValueError(
+            "--seed-params-only requires a parameter-set source: pass "
+            "--mint-from-defaults (build from canonical V1 defaults) or "
+            "--parameter-set-json <file> (load a pre-extracted row). Without one "
+            "there is nothing to seed."
+        )
     return ParsedArgs(
         external_account_id=str(parsed.external_account_id),
         env=parsed.env,
         parameter_set_json=parsed.parameter_set_json,
         mint_from_defaults=bool(parsed.mint_from_defaults),
+        seed_params_only=bool(parsed.seed_params_only),
         dry_run=bool(parsed.dry_run),
         confirm=bool(parsed.confirm),
         allow_non_paper=bool(parsed.allow_non_paper),
@@ -400,6 +445,32 @@ async def _insert_account_idempotent(
     return UUID(str(existing.id)), False
 
 
+async def _fetch_active_owner_accounts(
+    session_factory: async_sessionmaker[Any],
+) -> list[tuple[UUID, str]]:
+    """Return all active (``active_to IS NULL``) ``owner`` accounts as
+    ``(id, external_account_id)`` tuples.
+
+    Used by the full-bootstrap mismatch guard: if an active owner account
+    already exists with a DIFFERENT ``external_account_id`` than the one this
+    run would insert, the account+risk_state bootstrap must NOT proceed (it
+    would create a duplicate account + a second ``is_current`` risk_state row —
+    the 2026-05-30 paper-seed footgun). The seed-params-only path skips this
+    entirely.
+    """
+    async with session_factory() as session:
+        rows = (
+            await session.execute(
+                text(
+                    "SELECT id, external_account_id FROM accounts "
+                    "WHERE role = 'owner' AND active_to IS NULL "
+                    "ORDER BY active_from ASC"
+                )
+            )
+        ).fetchall()
+    return [(UUID(str(r.id)), str(r.external_account_id)) for r in rows]
+
+
 async def _insert_risk_state_idempotent(
     session_factory: async_sessionmaker[Any], *, account_id: UUID
 ) -> bool:
@@ -477,6 +548,7 @@ async def _amain(args: ParsedArgs) -> int:
         env=args.env,
         dry_run=args.dry_run,
         mint_from_defaults=args.mint_from_defaults,
+        seed_params_only=args.seed_params_only,
         param_set_json=str(args.parameter_set_json) if args.parameter_set_json else None,
     )
     log_bound.info("bootstrap_live_account_started")
@@ -505,10 +577,15 @@ async def _amain(args: ParsedArgs) -> int:
     if args.dry_run:
         log_bound.info(
             "bootstrap_live_account_dry_run_complete",
-            would_insert_account=True,
-            would_insert_risk_state=True,
+            would_insert_account=not args.seed_params_only,
+            would_insert_risk_state=not args.seed_params_only,
             would_insert_parameter_set=payload is not None,
-            note="no DB writes; re-run with --no-dry-run --confirm to apply.",
+            note=(
+                "seed-params-only: account + risk_state inserts SKIPPED; "
+                if args.seed_params_only
+                else ""
+            )
+            + "no DB writes; re-run with --no-dry-run --confirm to apply.",
         )
         return EXIT_OK
 
@@ -529,24 +606,64 @@ async def _amain(args: ParsedArgs) -> int:
         return EXIT_DB_INIT_FAILED
 
     try:
-        account_id, account_created = await _insert_account_idempotent(
-            session_factory, external_account_id=args.external_account_id
-        )
-        log_bound = log_bound.bind(account_id=str(account_id))
-        log_bound.info(
-            "bootstrap_live_account_accounts_row",
-            created=account_created,
-            note=("inserted new row" if account_created else "idempotent no-op"),
-        )
+        if args.seed_params_only:
+            # Seed-params-only: SKIP the accounts + risk_state inserts entirely.
+            # The account already exists; we only (re)seed the global,
+            # account-independent parameter_sets head row. This is the correct
+            # mode for the paper seed — the live paper account's
+            # external_account_id is 'operator', not the IBKR number, so the
+            # full bootstrap would create a duplicate account + a second
+            # is_current risk_state row (the 2026-05-30 footgun).
+            log_bound.info(
+                "bootstrap_live_account_seed_params_only",
+                note="account + risk_state inserts SKIPPED; seeding parameter_sets only.",
+            )
+        else:
+            # Full bootstrap: guard against the existing-account mismatch that
+            # caused the 2026-05-30 dup-account bug. If an active owner account
+            # already exists with a DIFFERENT external_account_id than the one
+            # we'd insert, refuse — inserting would create a duplicate account
+            # + a second is_current risk_state row. The operator almost
+            # certainly wants --seed-params-only (already-bootstrapped env) or
+            # to pass --external-account-id matching the existing account.
+            existing_owners = await _fetch_active_owner_accounts(session_factory)
+            mismatched = [
+                (aid, ext) for aid, ext in existing_owners if ext != args.external_account_id
+            ]
+            if mismatched:
+                log_bound.error(
+                    "bootstrap_live_account_existing_account_mismatch",
+                    requested_external_account_id=args.external_account_id,
+                    existing_external_account_ids=[ext for _, ext in existing_owners],
+                    note=(
+                        "An active owner account already exists with a different "
+                        "external_account_id. Refusing to insert a duplicate account "
+                        "+ second is_current risk_state row. If you only need to seed "
+                        "the parameter_sets row, re-run with --seed-params-only. If "
+                        "you intend to bootstrap THIS account, pass "
+                        "--external-account-id matching the existing row."
+                    ),
+                )
+                return EXIT_ACCOUNT_MISMATCH
 
-        risk_state_created = await _insert_risk_state_idempotent(
-            session_factory, account_id=account_id
-        )
-        log_bound.info(
-            "bootstrap_live_account_risk_state_row",
-            created=risk_state_created,
-            note=("inserted NORMAL row" if risk_state_created else "idempotent no-op"),
-        )
+            account_id, account_created = await _insert_account_idempotent(
+                session_factory, external_account_id=args.external_account_id
+            )
+            log_bound = log_bound.bind(account_id=str(account_id))
+            log_bound.info(
+                "bootstrap_live_account_accounts_row",
+                created=account_created,
+                note=("inserted new row" if account_created else "idempotent no-op"),
+            )
+
+            risk_state_created = await _insert_risk_state_idempotent(
+                session_factory, account_id=account_id
+            )
+            log_bound.info(
+                "bootstrap_live_account_risk_state_row",
+                created=risk_state_created,
+                note=("inserted NORMAL row" if risk_state_created else "idempotent no-op"),
+            )
 
         if payload is not None:
             param_created = await _insert_parameter_set_idempotent(session_factory, payload=payload)
@@ -595,6 +712,7 @@ if __name__ == "__main__":
 __all__ = [
     "DATABASE_URL_ENV",
     "DEFAULT_LIVE_EXTERNAL_ACCOUNT_ID",
+    "EXIT_ACCOUNT_MISMATCH",
     "EXIT_BAD_ARGS",
     "EXIT_BAD_PARAM_SET_JSON",
     "EXIT_DB_INIT_FAILED",
