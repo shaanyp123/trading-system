@@ -78,7 +78,7 @@ to `main` at the session's HEAD.
 | F6 | The **`/system` risk-envelope UI also reads `parameter_sets`** (same head-pointer query) and falls back to spec defaults when empty. | `services/api/repos/phase1.py:618-641`, `services/api/routes/system.py:29-32`, decisions-log "Partial parameter_sets row falls back to spec defaults". |
 | F7 | The **signal `parameter_set_hash` is derived per-payload** by the api: `parameter_set_hash=_derive_parameter_set_hash(payload)` = `sha256(jcs(payload))`. It is **not** sourced from the `parameter_sets` head row. Seeding the table does **not** change what is stamped on signals/orders. | `services/qc_adapter/signal_ingestion.py:349,516-524`; corroborated by decisions-log: "`parameter_sets` (the table) is distinct from `parameter_set_hash` (the column other tables carry)." |
 | F8 | **No sync mechanism exists** that pushes `parameter_sets.parameters` → `lean.json`. (grep for `lean.json`/`get_parameter`/`set_parameter` across `services/` + `scripts/` returns nothing.) The `v1_strategy.py:139-141` comment claiming an operator UPDATE "propagates into the daily LEAN cycle" is **aspirational/misleading** — propagation would require a manual `lean.json` edit + `lean_local` restart. | grep; `lean/v1_strategy.py:139-141`. |
-| F9 | The **canonical hash module was never built.** `strategies/v1_trend_following/parameters.py:152-153` says the hash is computed "by `services/version/composite_hash.py`" — **that file and the `services/version/` directory do not exist.** The only hashing primitive available is `services.audit.chain.jcs_serialize`. | `find` (no `services/version/`); grep. |
+| F9 | The **canonical hash module was never built** *(at design time — **RESOLVED by PR-A #294 2026-05-29**: `services/version/composite_hash.py` now exists; see §11)*. `strategies/v1_trend_following/parameters.py:152-153` says the hash is computed "by `services/version/composite_hash.py`" — at authoring **that file and the `services/version/` directory did not exist.** The only hashing primitive available was `services.audit.chain.jcs_serialize` (which the shipped module now wraps). | `find` (no `services/version/`); grep. |
 | F10 | An **operator-script INSERT path for `parameter_sets` already exists**: `bootstrap_live_account.py::_insert_parameter_set_idempotent` (`INSERT ... ON CONFLICT (parameter_set_hash) DO NOTHING`). It takes a JSON file `{parameter_set_hash, parameters}` and validates the hash is 64 hex chars **but does not compute or verify the hash against the content.** | `scripts/operator_tools/bootstrap_live_account.py:374-403,252-276`. |
 | F11 | The live-cutover plan **already chose operator-script over migration** and **already chose "copy paper's head"** as live's provenance — which silently *assumes paper has a head row to copy*. | `Docs/live-money-cutover-plan.md` A2 (line 487: "Operator-script preferred (no schema change)"), O7 (line 522), §10 step 18 (line 405). |
 | F12 | `parameter_sets` DDL: `parameter_set_hash CHAR(64) PRIMARY KEY, parameters JSONB NOT NULL, first_active_at TIMESTAMPTZ NOT NULL, last_active_at TIMESTAMPTZ`. **No partial-unique index on `last_active_at IS NULL`** — multiple "active" rows would silently coexist; the head query relies on `ORDER BY first_active_at DESC LIMIT 1` to disambiguate. | `alembic/versions/0003_risk_tables.py:81-90`. |
@@ -372,10 +372,17 @@ collapses to "UPDATE the existing head," skipping the INSERT.
   `risk-review-approved` label) but is high-stakes → mandatory risk-review +
   tests + LEAN↔api smoke. **Implementation is a future session; merged code is
   inert until `lean_local` is rebuilt + restarted.**
-- **PR-D (follow-up, gated on Q4) — Event-sourced audit ceremony.** Wire
-  `parameter_change_applied` audit + `parameters`-table row for operator-driven
-  parameter changes. **Touches forbidden paths (`services/audit/**` and/or
-  `services/agent/parameter_changes/**`) → `risk-review-approved` required.**
+- **PR-D (follow-up, gated on Q4) — Event-sourced audit ceremony. → DESIGN
+  LOCKED 2026-05-29; see §13.** Wire `parameter_change_applied` audit +
+  `parameters`-table row for the operator-driven decommission flip/revert (R6).
+  **REVISED forbidden-path finding (§13.5):** structured as an **operator tool**
+  that CALLS the existing audit writer + uses the existing
+  `PARAMETER_CHANGE_APPLIED` event type (no `event_types.py` / `alembic`
+  changes), the diff lands in `scripts/operator_tools/**` only → **no
+  `risk-review-approved` label mechanically required.** Still high-stakes (writes
+  the audit chain) → voluntary `/ultrareview` + `risk-review` subagent at impl.
+  Implementation is a future session; REQUIRED before any *live* decommission,
+  not urgent on paper.
 
 ---
 
@@ -464,7 +471,11 @@ the seed step to the DB-restore runbook (folded into PR-A/PR-B docs).
 
 **PR-A + PR-B shipped 2026-05-29** (PR #294 minter + `--mint-from-defaults`; PR
 #295 runbook + §10.3 wiring). **PR-C design locked 2026-05-29** — see §12
-(operator delegated: "do whatever you recommend" on the open questions).
+(operator delegated: "do whatever you recommend" on the open questions). **PR-C
+IMPLEMENTED 2026-05-29** (PR #302 — api endpoint + nightly-cycle fetch + fail-open;
+inert until `lean_local` rebuild+restart). **PR-D design locked 2026-05-29** — see
+§13 (Q4-B: operator-tool audit ceremony; hash-stable `prev==hash`; no
+forbidden-path label, voluntary `/ultrareview`).
 
 ---
 
@@ -609,3 +620,153 @@ exit-pipeline §10.3 scope caveats are lifted (flipping the DB flag stops both t
 manual path AND the live nightly cycle) — update those docs at that point
 (tracked). PR-C does **not** add the `parameter_change_applied` audit event for
 the flip; that remains **PR-D**, still required before any *live* decommission.
+
+---
+
+## 13. PR-D design — operator-driven decommission audit ceremony (resolves Q4-B)
+
+> **Status: DESIGN — locked 2026-05-29 to the recommended answers. Implementation
+> is a future session. REQUIRED before any *live* decommission; NOT urgent on
+> paper.**
+
+### 13.1 Problem (restated)
+
+PR-B's decommission ceremony flips `STRATEGY_DECOMMISSIONED` with a **raw
+`UPDATE parameter_sets`** (signed-off Q4-A: minimal seed + raw UPDATE for the
+smoke; event-sourced ceremony deferred to PR-D). That raw UPDATE writes **no
+audit trail** — no `parameter_change_applied` event, no `parameters`-table row
+recording who flipped the kill-switch, when, or why. exit-pipeline-design R6
+requires a decommission UPDATE to carry "the same audit + `parameter_change_applied`
+event as any other locked parameter." PR-D wires that ceremony. It is **required
+before any *live* decommission** (flattening a live book with no audit record is
+unacceptable); on paper it is a correctness/observability upgrade, not a blocker.
+
+### 13.2 Grounding facts (verified 2026-05-29)
+
+- **`PARAMETER_CHANGE_APPLIED` already exists** as an audit event type
+  (`services/audit/event_types.py:116`) — **no new enum + no alembic migration**.
+  (Siblings `PARAMETER_CHANGE_PROPOSED` / `_REVERTED` also exist.)
+- **The `parameters` table already exists** (`alembic/versions/0003_risk_tables.py`):
+  `id, parameter_name, parameter_value JSONB, valid_from, valid_to, changed_by
+  CHECK('agent','operator','init','revert'), change_reason, parameter_set_hash
+  CHAR(64) NOT NULL, prev_parameter_set_hash CHAR(64) NULL, audit_event_uuid NOT
+  NULL, pr_url, created_at`. It is **per-parameter** (one row per
+  `parameter_name` change), NOT per-set. **No CHECK that
+  `parameter_set_hash != prev_parameter_set_hash`** — see §13.3.
+- **`services.audit.writer.append_audit_event(session, event_type, payload, *,
+  account_id, env, phase_at_emit, …) -> AuditLogRecord`** is the canonical audit
+  writer — owns the hash chain + `pg_advisory_xact_lock` + SERIALIZABLE + retries
+  internally; takes a session WITHOUT an open transaction. The returned
+  `AuditLogRecord.event_uuid` is the FK the `parameters` row carries.
+- **Precedent — an operator tool may CALL the audit writer.**
+  `scripts/operator_tools/recovery_agent.py` imports `append_audit_event` and
+  writes `RECOVERY_ACTION_TAKEN` audit-first. Importing the writer is a READ, not
+  a modification of `services/audit/**` — see §13.5.
+
+### 13.3 The hash-stable-vs-transitions resolution (the key design call)
+
+The `parameters` table records hash **transitions** (`prev_parameter_set_hash` →
+`parameter_set_hash`). But a decommission flip is **hash-STABLE** — Q1-A excludes
+`STRATEGY_DECOMMISSIONED` from the hash (the whole reason it is an in-place
+`parameter_sets` UPDATE, Q2). So for a decommission flip:
+
+> **`parameter_set_hash == prev_parameter_set_hash` (both = the unchanged head hash).**
+
+This is **internally consistent and schema-valid** (the column is NOT NULL, prev
+is nullable, there is no diff-CHECK):
+
+- The **`parameters` table tracks parameter-VALUE history** — and the value DOES
+  change (False→True). The row captures the flip + the `audit_event_uuid` +
+  `valid_from`/`valid_to` versioning.
+- The **`parameter_sets` table tracks parameter-SET IDENTITY** — which does NOT
+  change (the hash is stable). No new head row; the head's `parameters` JSONB is
+  UPDATEd in place (Q2).
+
+A hash-stable value change is exactly the case where the two tables diverge.
+**Lock: write the `parameters` row with `parameter_set_hash =
+prev_parameter_set_hash = <current head hash>`**, with a `change_reason` noting
+the hash is stable by Q1-A. (Contrast: a future agent change to a *ranges* param
+WOULD move the hash + mint a new `parameter_sets` head — the normal transition.)
+
+### 13.4 Ceremony mechanics (audit-first)
+
+Per the locked audit-first rule (`feedback_audit_first_ordering`; backend-spec
+§2.10.1 — the audit row commits BEFORE the state change):
+
+1. **Audit-first:** `append_audit_event(PARAMETER_CHANGE_APPLIED, payload={
+   parameter_name:'STRATEGY_DECOMMISSIONED', old_value, new_value,
+   parameter_set_hash:<h>, prev_parameter_set_hash:<h>, changed_by:'operator',
+   change_reason}, account_id, env, phase_at_emit)` → `event_uuid`.
+2. **State change (one atomic txn):**
+   a. Close the prior open `parameters` row for `STRATEGY_DECOMMISSIONED`
+      (`valid_to = now WHERE valid_to IS NULL`), if any.
+   b. INSERT the new `parameters` row (`parameter_value=<new>`,
+      `changed_by='operator'`, `valid_from=now`, `valid_to=NULL`,
+      `parameter_set_hash=<h>`, `prev_parameter_set_hash=<h>`,
+      `audit_event_uuid=<step 1>`).
+   c. UPDATE the `parameter_sets` head's `parameters` JSONB (the same `jsonb_set`
+      PR-B's runbook does, now inside the ceremony).
+3. **Revert** is the symmetric ceremony with `changed_by='revert'`,
+   `new_value=False`, a fresh `PARAMETER_CHANGE_REVERTED` audit event.
+
+**Atomicity trade-off (accepted, by audit-first design):** the audit row (step 1)
+commits before the state change (step 2). If step 2 fails, an audit row exists
+for a change that didn't apply — the *correct* audit-first behavior (the audit is
+the record of *intent*; a failed apply is itself diagnostically visible). Step 2's
+a/b/c are one all-or-nothing txn; the tool errors loudly + leaves the flag in a
+known state. A re-run is safe via the `valid_to IS NULL` guard; document it.
+
+### 13.5 Where it lives + forbidden-path reality (REVISED finding)
+
+> **Earlier (§7) this design said PR-D "touches forbidden paths →
+> `risk-review-approved` required." On grounding (§13.2), that is REVISED.**
+
+Structure PR-D as an **operator tool**
+(`scripts/operator_tools/apply_parameter_change.py`, or a `decommission` mode)
+that:
+- **CALLS** `services.audit.writer.append_audit_event` (import = READ, NOT a
+  modification of `services/audit/**`);
+- uses the **existing** `PARAMETER_CHANGE_APPLIED` event type (no
+  `event_types.py` edit, no enum migration);
+- INSERTs the `parameters` row + UPDATEs `parameter_sets` via **parameterized SQL**
+  (the bootstrap_live_account pattern), NOT by modifying
+  `services/agent/parameter_changes/**` (the agent's path — operator-driven
+  decommission is deliberately parallel to it).
+
+So the diff lands entirely in `scripts/operator_tools/**` → **NOT on the CI
+`forbidden-paths` regex → no `risk-review-approved` label mechanically required**
+(recovery_agent's tool body is likewise hot-fix scope; it needed the label only
+for its `event_types.py` ADDITIONS, which PR-D does not make).
+
+**HOWEVER** — PR-D writes the **audit chain** (the existential integrity
+property). Per dev-guide §11 ("operator MAY invoke `/ultrareview` ad-hoc for
+high-stakes hot-fix changes"), **the implementation PR should get a voluntary
+`/ultrareview` + the in-session `risk-review` subagent.** Treat as high-stakes
+despite the hot-fix path.
+
+### 13.6 Scope
+
+PR-D ships the **decommission flip + revert** ceremony (the R6 requirement). The
+tool is written to generalize (any operator-driven single-parameter change), but
+PR-D's *scope* is the kill-switch flag. The agent's `tighten_parameter` lifecycle
+is out of scope.
+
+### 13.7 Implementation sketch (future session)
+
+1. **tool:** `scripts/operator_tools/apply_parameter_change.py` — args `--env`,
+   `--parameter STRATEGY_DECOMMISSIONED`, `--value true|false`, `--reason`,
+   `--dry-run` (default), `--no-dry-run --confirm` (two-flag gate),
+   `--allow-non-paper`. Resolves account_id; runs the §13.4 ceremony.
+2. **runbook:** update the PR-B decommission ceremony (on main) to call this tool
+   INSTEAD of the raw `UPDATE` (the raw UPDATE becomes the "PR-D not yet shipped"
+   fallback).
+3. **tests:** audit-first ordering (audit row before state change); the
+   hash-stable `prev==hash` row shape; `valid_to` versioning (close prior + insert
+   new); dry-run no-write; idempotent re-run; revert symmetry.
+
+### 13.8 Interaction with PR-A/B/C
+
+PR-D replaces PR-B's raw UPDATE with an audited ceremony over the **same** DB flag
+PR-C's nightly cycle reads. Independent of the PR-C deploy; it can land + be
+exercised on paper any time. **Required before any *live* decommission** (R6 +
+Q4); not urgent on paper.
