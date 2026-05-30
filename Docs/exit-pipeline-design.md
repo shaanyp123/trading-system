@@ -922,12 +922,31 @@ Against tonight's live /M2K LONG position (`signal_id =
    emit a trend_flip exit since /M2K just opened (held days = 1 <
    MIN_HOLDING_DAYS=14). The strategy logs should show
    `MIN_HOLDING_NOT_REACHED` rejection for /M2K on the exit side.
-3. **Force decommission test (post PR-C, controlled)**: temporarily set
-   `strategy_decommissioned=True` via parameter UPDATE; observe one
-   `signal_emitted` audit row with `signal_type='exit'`,
-   `exit_reason='decommission'` for /M2K; operator approves; observe
-   bracket-stop cancel + close place; verify TRADE_CLOSED. Then revert
-   `strategy_decommissioned=False`.
+3. **Force decommission test (controlled)** — now runnable via the
+   **decommission ceremony runbook** in
+   `scripts/operator_tools/README.md` (unblocked by parameter-sets-bootstrap
+   PR-A, #294). The exact sequence: seed the `parameter_sets` head row
+   (`bootstrap_live_account.py --mint-from-defaults`) → flip the flag in place
+   (`UPDATE parameter_sets SET parameters = jsonb_set(parameters,
+   '{STRATEGY_DECOMMISSIONED}', to_jsonb('True'::text)) WHERE last_active_at IS
+   NULL` — the `parameter_set_hash` is **unchanged** because the hash excludes
+   the flag, per backend-spec §3.11 / design Q1-A) → `trigger_v1_cycle --env
+   paper --exits-only --reason-filter=decommission --no-dry-run` → observe one
+   `signal_emitted` (`signal_type='exit'`, `exit_reason='decommission'`) per
+   held position (e.g. /M2K); operator approves; observe bracket-stop cancel +
+   close place; verify TRADE_CLOSED. **Then revert** the flag to `False` (hard
+   gate — a stuck `True` re-emits decommission exits on the next manual cycle).
+
+   > **⚠️ This exercises the manual `trigger_v1_cycle` path ONLY — NOT the live
+   > 21:30 UTC nightly LEAN cycle.** The nightly cycle reads `lean/lean.json`
+   > (not the DB) and omits the `STRATEGY_DECOMMISSIONED` key entirely, so
+   > flipping the DB flag does nothing to it. A green smoke here is **not**
+   > proof that the kill-switch stops live trading; that requires
+   > **parameter-sets-bootstrap PR-C (Q3-C)**, not yet shipped (distinct from
+   > this design's own PR-C #253). And the flag-flip UPDATE writes **no**
+   > `parameter_change_applied` audit event yet (design Q4-A) — the event-sourced
+   > ceremony (parameter-sets-bootstrap PR-D) is required before any *live*
+   > decommission.
 4. **Manual reversal test (post PR-C, requires market conditions)**:
    not testable on demand; relies on the market actually firing a
    SHORT signal in /M2K while we hold LONG with MIN_HOLDING_DAYS
