@@ -1012,6 +1012,76 @@ class TestWriteFuturesBundle:
         content = futures_map_file_path(tmp_path, "MES", "cme").read_text()
         assert content == "18991230,mes\n20501231,mes,CME\n"
 
+    def test_universe_permission_error_skipped_not_fatal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Resilience (2026-05-30): a root-owned universe file (left by a
+        # pre-uid-1000 bar_sync run) makes ONE per-day write raise
+        # PermissionError. That must NOT fail the whole market — the trade +
+        # OI zips still write, the other universe files still write, and the
+        # bundle returns normally with a warning. Simulate by making
+        # write_bytes raise for exactly one target session_date.
+        bars = [
+            _make_bar(session_date=date(2026, 5, 27)),
+            _make_bar(session_date=date(2026, 5, 28)),  # <- the "root-owned" date
+            _make_bar(session_date=date(2026, 5, 29)),
+        ]
+        blocked = futures_universe_file_path(tmp_path, "MGC", "comex", date(2026, 5, 28))
+        real_write_bytes = Path.write_bytes
+
+        def fake_write_bytes(self: Path, data: bytes) -> int:
+            if self == blocked:
+                raise PermissionError(13, "Permission denied")
+            return real_write_bytes(self, data)
+
+        monkeypatch.setattr(Path, "write_bytes", fake_write_bytes)
+
+        with capture_logs() as logs:
+            size = write_futures_bundle(
+                data_root=tmp_path,
+                ticker="MGC",
+                market_dir="comex",
+                market_code="COMEX",
+                front_month_expiry_yyyymm="202606",
+                bars=bars,
+                open_interest=4636,
+            )
+
+        # Bundle completed (market NOT failed); trade zip written.
+        assert size > 0
+        trade_zip = futures_trade_zip_path(tmp_path, "MGC", "comex")
+        assert trade_zip.exists()
+        # The other two universe files were written; only the blocked one is absent.
+        universe_dir = blocked.parent
+        written = sorted(p.name for p in universe_dir.iterdir())
+        assert written == ["20260527.csv", "20260529.csv"]
+        # map_file still written after the skipped universe write.
+        assert futures_map_file_path(tmp_path, "MGC", "comex").exists()
+        # Per-skip + summary warnings emitted with the session date.
+        events = {e["event"] for e in logs}
+        assert "bar_sync_universe_write_permission_skipped" in events
+        summary = next(
+            e for e in logs if e["event"] == "bar_sync_universe_write_permission_summary"
+        )
+        assert summary["skipped_count"] == 1
+        assert summary["skipped_session_dates"] == ["20260528"]
+
+    def test_no_permission_warning_on_clean_write(self, tmp_path: Path) -> None:
+        # Happy path: no PermissionError → no skip warning emitted.
+        bars = [_make_bar(session_date=date(2026, 5, 19))]
+        with capture_logs() as logs:
+            write_futures_bundle(
+                data_root=tmp_path,
+                ticker="MES",
+                market_dir="cme",
+                market_code="CME",
+                front_month_expiry_yyyymm="202606",
+                bars=bars,
+            )
+        events = {e["event"] for e in logs}
+        assert "bar_sync_universe_write_permission_skipped" not in events
+        assert "bar_sync_universe_write_permission_summary" not in events
+
     def test_universe_file_pins_front_month_expiry(self, tmp_path: Path) -> None:
         # The universe file's data row must reference the SAME expiry the
         # trade zip is bucketed under (otherwise LEAN's resolver picks an
