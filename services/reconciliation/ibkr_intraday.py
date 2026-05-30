@@ -19,14 +19,24 @@ stuck-at-login). Pattern lifted from ``services/data/bar_sync.py::run_cycle``.
 from the order worker (clientId=1) and bar_sync (clientId=3) so a recon bug can
 never wedge order placement. See :data:`DEFAULT_RECON_CLIENT_ID`.
 
-**Cache-read assumption (Q4 Path A).** ``IbAsyncIbkrClient.get_positions()``
-reads ib-async's local position cache (``IB.positions()``), which ib-async
-populates during ``connectAsync()`` via the underlying ``reqPositions`` +
-``positionEnd`` handshake. We trust this — it has backed the order worker's
-clientId=1 margin pre-check for ~6 weeks. If a future smoke surfaces a
-per-cycle cache-timing gap, the follow-up is to add an explicit
-``reqPositionsAsync()`` call inside the adapter (Path B; a
-``services/execution/**`` change). Not needed today.
+**Fresh-fetch (Q4 Path B — adopted 2026-05-29).** This calls
+``IbkrClient.get_positions_fresh()`` (``reqPositionsAsync()`` → awaits
+``positionEnd``), NOT ``get_positions()`` (which reads ib-async's local
+``IB.positions()`` cache). Path A (trust the connect-time cache) was the
+original choice on the assumption it had backed the order worker's clientId=1
+margin pre-check for ~6 weeks — but that worker is LONG-LIVED, so its cache is
+warm by read time. This module's per-cycle ``connect → read → disconnect``
+client is a different regime: ``connectAsync()`` does not await the startup
+``reqPositions``/``positionEnd`` handshake, so a read issued immediately after
+connect can return an EMPTY cache. That race fired in production on 2026-05-29
+22:30 UTC (``raw_count=0`` while the account genuinely held /M2K + /MES,
+confirmed real by ``scripts/operator_tools/recon_positions_probe.py``) and
+tripped a false ``NORMAL → HALT_NEW``. Path B removes the dependence on connect
+timing. As belt-and-suspenders we retry the fresh fetch on an empty result (see
+:data:`RECON_FRESH_FETCH_MAX_ATTEMPTS`); a persistent empty while the backend
+holds futures is handled one layer up by the ``run_eod_cycle`` empty-result
+guard (degrade to FlexQuery + P1 alert, NOT auto-halt). See decisions-log
+2026-05-29 + ``Docs/option-c-recon-design.md``.
 
 **A02 BINDS** — this file is on the forbidden whitelist
 (``services/reconciliation/**``); `risk-review-approved` required for changes.
@@ -48,6 +58,7 @@ a real ``reqPositions`` cycle.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
@@ -57,7 +68,7 @@ import structlog
 
 from services.execution.ibkr_adapter import IbAsyncIbkrClient
 from services.execution.ibkr_client import IbkrClient
-from services.execution.types import IbkrPlacementError
+from services.execution.types import IbkrPlacementError, IbkrPosition
 
 log = structlog.get_logger()
 
@@ -69,6 +80,20 @@ log = structlog.get_logger()
 #: Error 162 + wedges the colliding client for ~30 min, so this value must not
 #: overlap any other IBKR-connecting code path. Documented in dev-guide §1.5.
 DEFAULT_RECON_CLIENT_ID: Final[int] = 4
+
+#: Path B (2026-05-29) retry budget for the fresh ``reqPositions`` fetch when
+#: it returns an EMPTY list. ``reqPositionsAsync()`` awaits ``positionEnd`` so
+#: the first attempt is normally authoritative; the retry exists only as
+#: belt-and-suspenders for any residual ib-async edge where ``positionEnd``
+#: races ahead of the position rows. A genuinely flat account costs
+#: ``(MAX_ATTEMPTS - 1) * SETTLE`` seconds of extra wall-clock — negligible at
+#: the once-daily recon cadence and far cheaper than a false halt. A persistent
+#: empty (backend holds futures) is caught by the ``run_eod_cycle``
+#: empty-result guard, which degrades to FlexQuery rather than auto-halting.
+RECON_FRESH_FETCH_MAX_ATTEMPTS: Final[int] = 3
+
+#: Seconds to settle between empty fresh-fetch attempts (see above).
+RECON_FRESH_FETCH_SETTLE_SECONDS: Final[float] = 1.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,20 +211,39 @@ async def fetch_recon_positions(
                 underlying_exception_class=exc.underlying_exception_class,
             ) from exc
 
-        try:
-            raw_positions = await client.get_positions()
-        except IbkrPlacementError as exc:
-            bound.error(
-                "recon_positions_fetch_failed",
-                operation="reqPositions",
-                detail=exc.detail,
-                underlying_exception_class=exc.underlying_exception_class,
+        # Path B (2026-05-29): a FRESH ``reqPositions`` round-trip (awaits
+        # ``positionEnd``), NOT the connect-time cache. Retry on an empty
+        # result as belt-and-suspenders for any residual ib-async timing edge;
+        # a persistent empty while the backend holds futures is handled by the
+        # ``run_eod_cycle`` empty-result guard (degrade, don't auto-halt). See
+        # the module docstring "Fresh-fetch (Q4 Path B)" section.
+        raw_positions: list[IbkrPosition] = []
+        attempts = 0
+        for attempt in range(1, RECON_FRESH_FETCH_MAX_ATTEMPTS + 1):
+            attempts = attempt
+            try:
+                raw_positions = await client.get_positions_fresh()
+            except IbkrPlacementError as exc:
+                bound.error(
+                    "recon_positions_fetch_failed",
+                    operation="reqPositions",
+                    detail=exc.detail,
+                    underlying_exception_class=exc.underlying_exception_class,
+                )
+                raise ReconPositionsFetchError(
+                    operation="reqPositions",
+                    detail=f"recon reqPositions failed: {exc.detail}",
+                    underlying_exception_class=exc.underlying_exception_class,
+                ) from exc
+            if raw_positions or attempt == RECON_FRESH_FETCH_MAX_ATTEMPTS:
+                break
+            bound.warning(
+                "recon_positions_fetch_empty_retrying",
+                attempt=attempt,
+                max_attempts=RECON_FRESH_FETCH_MAX_ATTEMPTS,
+                settle_seconds=RECON_FRESH_FETCH_SETTLE_SECONDS,
             )
-            raise ReconPositionsFetchError(
-                operation="reqPositions",
-                detail=f"recon reqPositions failed: {exc.detail}",
-                underlying_exception_class=exc.underlying_exception_class,
-            ) from exc
+            await asyncio.sleep(RECON_FRESH_FETCH_SETTLE_SECONDS)
 
         positions = tuple(
             ReconPosition(market=pos.contract.market, quantity=pos.quantity)
@@ -210,6 +254,7 @@ async def fetch_recon_positions(
             "recon_positions_fetch_completed",
             positions_count=len(positions),
             raw_count=len(raw_positions),
+            attempts=attempts,
         )
         return positions
     finally:

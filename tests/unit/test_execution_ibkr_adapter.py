@@ -69,6 +69,17 @@ def _fake_ib_class(**method_returns: Any) -> type:
             self.cancelOrder = MagicMock()
             self.openTrades = MagicMock(return_value=method_returns.get("open_trades", []))
             self.positions = MagicMock(return_value=method_returns.get("positions", []))
+            # Path B (2026-05-29): get_positions_fresh awaits reqPositionsAsync
+            # (deterministic; awaits positionEnd) instead of the .positions()
+            # cache. ``fresh_positions_raises`` injects a terminal failure.
+            if method_returns.get("fresh_positions_raises"):
+                self.reqPositionsAsync = AsyncMock(
+                    side_effect=method_returns["fresh_positions_raises"]
+                )
+            else:
+                self.reqPositionsAsync = AsyncMock(
+                    return_value=method_returns.get("fresh_positions", [])
+                )
 
         async def _mark_connected(self, **_kw: Any) -> None:
             if method_returns.get("connect_raises"):
@@ -854,6 +865,91 @@ class TestGetPositions:
         assert result[0].quantity == Decimal("1.5")
         assert result[0].avg_cost_usd == Decimal("4234.567")
         assert result[0].contract.market == "/MES"
+
+
+def _ib_position(
+    *,
+    symbol: str,
+    sec_type: str = "FUT",
+    position: float = 1.0,
+    avg_cost: float = 100.0,
+    account: str | None = None,
+) -> MagicMock:
+    """Build an ib_async ``Position``-shape mock for reqPositionsAsync."""
+    pos = MagicMock()
+    pos.position = position
+    pos.avgCost = avg_cost
+    pos.account = account
+    pos.contract.symbol = symbol
+    pos.contract.localSymbol = f"{symbol}H26"
+    pos.contract.conId = 111
+    pos.contract.secType = sec_type
+    pos.contract.exchange = "CME" if sec_type == "FUT" else "SMART"
+    pos.contract.multiplier = 5 if sec_type == "FUT" else ""
+    return pos
+
+
+# ---------------------------------------------------------------------------
+# TestGetPositionsFresh — Path B (reqPositionsAsync; awaits positionEnd)
+# ---------------------------------------------------------------------------
+
+
+class TestGetPositionsFresh:
+    """``get_positions_fresh`` issues ``reqPositionsAsync`` (deterministic)
+    rather than reading the ``IB.positions()`` cache — the fix for the
+    2026-05-29 EOD-recon cache-timing false halt. ``get_positions`` (the order
+    worker's cache read) is unchanged."""
+
+    async def test_uses_reqpositions_not_cache(self) -> None:
+        fake = _fake_ib_class(
+            fresh_positions=[_ib_position(symbol="MES", position=1.0, avg_cost=7587.75)],
+            positions=[],  # cache deliberately EMPTY — must be bypassed
+        )
+        client = IbAsyncIbkrClient(ib_factory=fake)
+        result = await client.get_positions_fresh()
+        assert len(result) == 1
+        assert result[0].contract.market == "/MES"
+        assert result[0].quantity == Decimal("1")
+        assert result[0].avg_cost_usd == Decimal("7587.75")
+        # The fresh round-trip was used; the cache accessor was NOT.
+        client._ib.reqPositionsAsync.assert_awaited_once()  # type: ignore[union-attr]
+        client._ib.positions.assert_not_called()  # type: ignore[union-attr]
+
+    async def test_empty_fresh_returns_empty(self) -> None:
+        fake = _fake_ib_class(fresh_positions=[])
+        client = IbAsyncIbkrClient(ib_factory=fake)
+        assert await client.get_positions_fresh() == []
+
+    async def test_account_scoping_filters_other_accounts(self) -> None:
+        fake = _fake_ib_class(
+            fresh_positions=[
+                _ib_position(symbol="MES", account="U25655583"),
+                _ib_position(symbol="M2K", account="U99999999"),  # other account
+            ]
+        )
+        client = IbAsyncIbkrClient(ib_factory=fake, account_id="U25655583")
+        result = await client.get_positions_fresh()
+        markets = [p.contract.market for p in result]
+        assert markets == ["/MES"]
+
+    async def test_no_account_id_returns_all(self) -> None:
+        fake = _fake_ib_class(
+            fresh_positions=[
+                _ib_position(symbol="MES", account="U25655583"),
+                _ib_position(symbol="M2K", account="U99999999"),
+            ]
+        )
+        client = IbAsyncIbkrClient(ib_factory=fake)  # account_id=None
+        result = await client.get_positions_fresh()
+        assert {p.contract.market for p in result} == {"/MES", "/M2K"}
+
+    async def test_reqpositions_failure_raises_placement_error(self) -> None:
+        fake = _fake_ib_class(fresh_positions_raises=RuntimeError("TWS dropped"))
+        client = IbAsyncIbkrClient(ib_factory=fake)
+        with pytest.raises(IbkrPlacementError) as exc_info:
+            await client.get_positions_fresh()
+        assert exc_info.value.operation == "reqPositions"
+        assert exc_info.value.underlying_exception_class == "RuntimeError"
 
 
 # ---------------------------------------------------------------------------

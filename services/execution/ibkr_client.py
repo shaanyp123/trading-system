@@ -126,11 +126,36 @@ class IbkrClient(Protocol):
         ...
 
     async def get_positions(self) -> list[IbkrPosition]:
-        """Snapshot all positions for the configured account.
+        """Snapshot positions for the configured account from the LOCAL CACHE.
 
-        Returns a fresh list (not cached) — calls ``IB.reqPositions()``
-        synchronously. Used by reconciliation (60s cadence during CME
-        session) + the dispatcher's pre-trade margin check.
+        Reads ib-async's ``IB.positions()`` cache, populated by the
+        ``reqPositions``/``positionEnd`` handshake that ``connectAsync()``
+        kicks off at connect. For a long-lived client — the order worker's
+        clientId=1 pre-trade margin check — the cache is warm by read time, so
+        this is the cheap, correct choice there.
+
+        **Not for connect→read→disconnect callers.** ``connectAsync()`` does
+        NOT await that startup handshake, so a read issued immediately after
+        connect can see an EMPTY cache. Per-cycle clients (EOD reconciliation,
+        clientId=4) must use :meth:`get_positions_fresh` instead, which awaits
+        ``positionEnd`` deterministically.
+
+        Historical note: this docstring previously claimed "fresh list (not
+        cached) — calls ``IB.reqPositions()``"; the adapter implementation has
+        always read the cache via ``IB.positions()``. The contract is now
+        documented to match reality (decisions-log 2026-05-29).
+        """
+        ...
+
+    async def get_positions_fresh(self) -> list[IbkrPosition]:
+        """Snapshot positions via a FRESH ``reqPositions`` round-trip.
+
+        Issues ``reqPositionsAsync()`` and awaits the ``positionEnd`` sentinel,
+        so the result is deterministic regardless of connect timing. Required
+        by per-cycle connect→read→disconnect callers (EOD reconciliation,
+        clientId=4) where :meth:`get_positions`'s connect-time cache can be
+        empty at read time — the 2026-05-29 cache-timing race that tripped a
+        false ``HALT_NEW``. Raises ``IbkrPlacementError`` on terminal failure.
         """
         ...
 
