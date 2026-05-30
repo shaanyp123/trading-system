@@ -968,6 +968,7 @@ def write_futures_bundle(
     # index quarterlies; 3rd-last business day for /MGC; etc.). No IBKR
     # call per bar.
     universe_oi = open_interest if open_interest > 0 else None
+    universe_permission_skips: list[str] = []
     for bar in bars:
         u_path = futures_universe_file_path(data_root, ticker, market_dir, bar.session_date)
         u_path.parent.mkdir(parents=True, exist_ok=True)
@@ -977,7 +978,46 @@ def write_futures_bundle(
             fallback=front_month_expiry_yyyymm,
         )
         u_body = build_futures_universe_csv(bar_front_month, bar, universe_oi)
-        u_path.write_bytes(u_body)
+        try:
+            u_path.write_bytes(u_body)
+        except PermissionError as exc:
+            # Resilience (2026-05-30): a single un-writable per-day universe
+            # file must NOT fail the whole market. This fires when a prior
+            # bar_sync run (executing as root, before the container switched to
+            # uid 1000) left a root-owned `-rw-r--r--` file for THAT session
+            # date — uid 1000 then can't rewrite it (EACCES). The trade + OI
+            # zips for this market have ALREADY been written above, and the
+            # per-day universe file already on disk holds the same content
+            # (the front-month + OHLCV for that historical session don't
+            # change), so skipping the rewrite is safe — LEAN reads the
+            # existing file. The systemic remedy is the one-time volume chown
+            # to uid 1000 (deploy/ops); this guard stops the daily cycle from
+            # marking the market failed until that lands + survives any future
+            # ownership drift. See decisions-log 2026-05-30.
+            universe_permission_skips.append(f"{bar.session_date:%Y%m%d}")
+            log.warning(
+                "bar_sync_universe_write_permission_skipped",
+                ticker=ticker,
+                market_dir=market_dir,
+                session_date=f"{bar.session_date:%Y%m%d}",
+                path=str(u_path),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+    if universe_permission_skips:
+        log.warning(
+            "bar_sync_universe_write_permission_summary",
+            ticker=ticker,
+            market_dir=market_dir,
+            skipped_count=len(universe_permission_skips),
+            total_bars=len(bars),
+            skipped_session_dates=universe_permission_skips,
+            hint=(
+                "Per-day universe rewrites were skipped due to PermissionError "
+                "(root-owned files from a pre-uid-1000 bar_sync run). The "
+                "existing on-disk files are reused. Remediate with a one-time "
+                "chown -R 1000:1000 /Lean/Data on the host volume."
+            ),
+        )
     # 2-row sentinel map_file.
     map_path = futures_map_file_path(data_root, ticker, market_dir)
     map_path.parent.mkdir(parents=True, exist_ok=True)
