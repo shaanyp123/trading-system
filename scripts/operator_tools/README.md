@@ -14,7 +14,7 @@ service-side write paths (never raw SQL).
 | `trigger_v1_cycle.py` | On-demand V1 strategy cycle trigger (mirrors what LEAN does at 21:30 UTC); reads bars from disk + POSTs to `/api/internal/lean/signals` | Yes (when `--no-dry-run`) — POSTs signal_emitted events which become audit rows + signals INSERTs via the api endpoint. **--dry-run default = ON.** |
 | `replace_protective_stop.py` | POSITION_UNPROTECTED recovery: places a fresh bracket-stop for a position whose protective stop was cancelled but never replaced (PR-C exit-pipeline failure mode) | Yes (when `--no-dry-run --confirm`) — writes ORDER_PLACED audit + INSERTs orders row + places stop_market at IBKR. **--dry-run default = ON; two-flag gate.** |
 | `master_client_id_probe.py` | Empirical validation of the IBKR Master Client ID configuration (`TWS_MASTER_CLIENT_ID`). Three sequential stages on distinct clientIds: place a safe stop at `$1` on /MES from clientId=86, cancel via the master clientId, `reqGlobalCancel` cleanup from clientId=87. | Yes — places a single safe (stop=$1, DAY TIF, /MES) order at IBKR. Cancels itself end-to-end on success. No DB writes; no audit chain. **Operator-coordinated; runs post `docker compose up -d --force-recreate ib_gateway`.** |
-| `bootstrap_live_account.py` | Idempotent DB bootstrap: `accounts` + `risk_state` (live cutover) and — via `--mint-from-defaults` — seeds the baseline `parameter_sets` head row from the canonical V1 defaults, minting the `parameter_set_hash` (PR #294). See the **parameter-set seeding** + **decommission ceremony** sections below. | Yes (when `--no-dry-run --confirm`) — parameterized INSERTs via `ON CONFLICT DO NOTHING`. **--dry-run default = ON; two-flag gate; idempotent re-runs are no-ops.** |
+| `bootstrap_live_account.py` | Idempotent DB bootstrap: `accounts` + `risk_state` (live cutover) and — via `--mint-from-defaults` — seeds the baseline `parameter_sets` head row from the canonical V1 defaults, minting the `parameter_set_hash` (PR #294). **For the paper seed (already-bootstrapped env) ALWAYS add `--seed-params-only`** to skip the account/risk_state inserts (without it the full bootstrap creates a duplicate account because paper's account id is `operator`, not the IBKR number — the 2026-05-30 incident; full path now refuses on mismatch). See the **parameter-set seeding** + **decommission ceremony** sections below. | Yes (when `--no-dry-run --confirm`) — parameterized INSERTs via `ON CONFLICT DO NOTHING`. **--dry-run default = ON; two-flag gate; idempotent re-runs are no-ops.** |
 | `apply_parameter_change.py` | Operator-driven **audited** change to an operator-only flag (`STRATEGY_DECOMMISSIONED` / `EXIT_AUTO_APPROVE`): audit-first `parameter_change_applied`/`_reverted` event → `parameters` history row (`prev == hash`, hash-stable) → in-place `parameter_sets` flip (PR-D, design §13). Replaces the raw decommission UPDATE. | Yes (when `--no-dry-run --confirm`) — writes the audit chain + `parameters` + `parameter_sets`. **--dry-run default = ON; two-flag gate; no-op when already at value.** |
 
 ---
@@ -651,7 +651,18 @@ Designed in `Docs/exit-pipeline-design.md` §Q5 as the operator-side bridge for 
 - One-time per environment. Idempotent — safe to re-run
   (`ON CONFLICT (parameter_set_hash) DO NOTHING`).
 
-### What `--mint-from-defaults` does
+### What `--mint-from-defaults --seed-params-only` does
+
+> **⚠️ ALWAYS pass `--seed-params-only` for the paper seed.** Without it the
+> tool ALSO runs the full `accounts` + `risk_state` bootstrap, and on paper that
+> is **NOT** a no-op: the live paper account's `external_account_id` is
+> **`operator`**, not the IBKR number `U25655583`, so the `ON CONFLICT
+> (external_account_id)` guard does NOT match — the tool inserts a **duplicate
+> account** + a **second `is_current=TRUE` risk_state** row (the 2026-05-30
+> incident; cleaned up manually). `--seed-params-only` skips those inserts
+> entirely. (Belt-and-suspenders: the full path now also REFUSES with
+> `EXIT_ACCOUNT_MISMATCH=4` when an active owner account with a different
+> `external_account_id` already exists.)
 
 1. Builds the baseline row from `default_v1_parameters().to_canonical_dict()` —
    all **12** canonical UPPER_CASE keys, decimals-as-strings, both operator-only
@@ -663,10 +674,10 @@ Designed in `Docs/exit-pipeline-design.md` §Q5 as the operator-side bridge for 
    (backend-spec §3.11 / design Q1-A). That exclusion is what makes the later
    decommission flip PK-stable (see the ceremony).
 3. INSERTs the `parameter_sets` row idempotently.
-4. Also runs the idempotent `accounts` + `risk_state` INSERTs. **On the
-   already-bootstrapped paper DB these are no-ops** (account `U25655583` + the
-   current `risk_state` row already exist) — you will see `created=false …
-   idempotent no-op` log lines; that is expected, not a bug.
+4. With `--seed-params-only`, the `accounts` + `risk_state` INSERTs are
+   **SKIPPED** (you'll see `bootstrap_live_account_seed_params_only` in the log).
+   The `parameter_sets` table is global/content-addressable (no `account_id`
+   column), so the seeded row is account-independent.
 
 ### Pre-flight (Q6 — confirm 0 rows first)
 
@@ -707,7 +718,8 @@ ssh root@178.156.239.84 -- 'set -euo pipefail
       api \
       /opt/venv/bin/python -m scripts.operator_tools.bootstrap_live_account \
         --env paper \
-        --mint-from-defaults
+        --mint-from-defaults \
+        --seed-params-only
   )
 '
 ```
@@ -735,6 +747,7 @@ ssh root@178.156.239.84 -- 'set -euo pipefail
       /opt/venv/bin/python -m scripts.operator_tools.bootstrap_live_account \
         --env paper \
         --mint-from-defaults \
+        --seed-params-only \
         --no-dry-run --confirm
   )
 '
@@ -765,8 +778,9 @@ seeded values rather than spec defaults.
 |---|---|
 | 0 | Success (row inserted, idempotent no-op, or dry-run plan printed) |
 | 1 | Invalid `--parameter-set-json` (N/A for `--mint-from-defaults`) |
+| 4 | Existing-account mismatch — an active `owner` account already exists with a different `external_account_id` than `--external-account-id`; the full bootstrap refuses. Use `--seed-params-only` (already-bootstrapped env) or pass a matching `--external-account-id`. |
 | 5 | DB init failure — verify `DATABASE_URL` staged |
-| 6 | Invalid CLI args (e.g. `--mint-from-defaults` + `--parameter-set-json` together) |
+| 6 | Invalid CLI args (e.g. `--mint-from-defaults` + `--parameter-set-json` together; or `--seed-params-only` without a param-set source) |
 | 99 | Unexpected exception |
 
 ### Architecture note

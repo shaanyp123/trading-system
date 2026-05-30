@@ -23,16 +23,20 @@ import json
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
+import scripts.operator_tools.bootstrap_live_account as boot
 from scripts.operator_tools.bootstrap_live_account import (
     DEFAULT_LIVE_EXTERNAL_ACCOUNT_ID,
+    EXIT_ACCOUNT_MISMATCH,
     EXIT_BAD_ARGS,
     EXIT_BAD_PARAM_SET_JSON,
     EXIT_OK,
     ParameterSetPayload,
     ParsedArgs,
+    _amain,
     _insert_parameter_set_idempotent,
     build_baseline_parameter_set_payload,
     load_parameter_set_json,
@@ -362,3 +366,149 @@ class TestInsertParameterSetIdempotent:
         stored = json.loads(params["params"])
         assert stored["STRATEGY_DECOMMISSIONED"] == "False"
         assert stored["EXIT_AUTO_APPROVE"] == "False"
+
+
+# ---------------------------------------------------------------------------
+# --seed-params-only (2026-05-30 dup-account fix)
+# ---------------------------------------------------------------------------
+
+
+class TestSeedParamsOnlyArgs:
+    def test_flag_defaults_false(self) -> None:
+        result = parse_args(["--env", "paper"])
+        assert result.seed_params_only is False
+
+    def test_seed_params_only_with_mint_accepted(self) -> None:
+        result = parse_args(["--env", "paper", "--seed-params-only", "--mint-from-defaults"])
+        assert result.seed_params_only is True
+        assert result.mint_from_defaults is True
+
+    def test_seed_params_only_with_json_accepted(self, tmp_path: Path) -> None:
+        path = tmp_path / "ps.json"
+        path.write_text(json.dumps({"parameter_set_hash": "a" * 64, "parameters": {"X": 1}}))
+        result = parse_args(
+            ["--env", "paper", "--seed-params-only", "--parameter-set-json", str(path)]
+        )
+        assert result.seed_params_only is True
+        assert result.parameter_set_json == path
+
+    def test_seed_params_only_without_source_rejected(self) -> None:
+        with pytest.raises(ValueError, match="requires a parameter-set source"):
+            parse_args(["--env", "paper", "--seed-params-only"])
+
+    def test_seed_params_only_dry_run_returns_ok_without_db(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Dry-run short-circuits before DB init (DATABASE_URL unset → would be 5)."""
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        result = main(["--env", "paper", "--seed-params-only", "--mint-from-defaults"])
+        assert result == EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# Wet-path orchestration: which inserts run? (monkeypatched engine + helpers)
+# ---------------------------------------------------------------------------
+
+
+def _patch_wet_db(monkeypatch: pytest.MonkeyPatch, *, existing_owners: list) -> dict:
+    """Stub the engine/sessionmaker + the three insert helpers + owner-fetch.
+
+    Returns a ``calls`` dict recording which orchestration steps ran, so a test
+    can assert seed-params-only SKIPS account/risk_state while the param insert
+    still fires.
+    """
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://stub/stub")
+    calls: dict[str, int] = {"account": 0, "risk_state": 0, "param": 0, "owners_fetch": 0}
+
+    class _StubEngine:
+        async def dispose(self) -> None:
+            return None
+
+    monkeypatch.setattr(boot, "create_async_engine", lambda *a, **k: _StubEngine())
+    monkeypatch.setattr(boot, "async_sessionmaker", lambda *a, **k: lambda: None)
+
+    async def _fake_fetch_owners(_factory: object) -> list:
+        calls["owners_fetch"] += 1
+        return list(existing_owners)
+
+    async def _fake_insert_account(_factory: object, *, external_account_id: str):
+        calls["account"] += 1
+        return uuid4(), True
+
+    async def _fake_insert_risk_state(_factory: object, *, account_id: object) -> bool:
+        calls["risk_state"] += 1
+        return True
+
+    async def _fake_insert_param(_factory: object, *, payload: object) -> bool:
+        calls["param"] += 1
+        return True
+
+    monkeypatch.setattr(boot, "_fetch_active_owner_accounts", _fake_fetch_owners)
+    monkeypatch.setattr(boot, "_insert_account_idempotent", _fake_insert_account)
+    monkeypatch.setattr(boot, "_insert_risk_state_idempotent", _fake_insert_risk_state)
+    monkeypatch.setattr(boot, "_insert_parameter_set_idempotent", _fake_insert_param)
+    return calls
+
+
+def _wet_args(**overrides: object) -> ParsedArgs:
+    base = {
+        "external_account_id": "U25655583",
+        "env": "paper",
+        "parameter_set_json": None,
+        "mint_from_defaults": True,
+        "seed_params_only": False,
+        "dry_run": False,
+        "confirm": True,
+        "allow_non_paper": False,
+    }
+    base.update(overrides)
+    return ParsedArgs(**base)  # type: ignore[arg-type]
+
+
+class TestWetOrchestration:
+    async def test_seed_params_only_skips_account_and_risk_state(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls = _patch_wet_db(monkeypatch, existing_owners=[(uuid4(), "operator")])
+        rc = await _amain(_wet_args(seed_params_only=True))
+        assert rc == EXIT_OK
+        # ONLY the param insert ran; account + risk_state SKIPPED; no owner guard.
+        assert calls["param"] == 1
+        assert calls["account"] == 0
+        assert calls["risk_state"] == 0
+        assert calls["owners_fetch"] == 0
+
+    async def test_full_path_refuses_on_existing_account_mismatch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Live paper account is 'operator'; requesting U25655583 → mismatch.
+        calls = _patch_wet_db(monkeypatch, existing_owners=[(uuid4(), "operator")])
+        rc = await _amain(_wet_args(external_account_id="U25655583", seed_params_only=False))
+        assert rc == EXIT_ACCOUNT_MISMATCH
+        # Guard fired; NO inserts happened (this was the 2026-05-30 footgun).
+        assert calls["owners_fetch"] == 1
+        assert calls["account"] == 0
+        assert calls["risk_state"] == 0
+        assert calls["param"] == 0
+
+    async def test_full_path_proceeds_when_no_existing_owner(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Fresh DB (live cutover): no owner accounts yet → full bootstrap runs.
+        calls = _patch_wet_db(monkeypatch, existing_owners=[])
+        rc = await _amain(_wet_args(seed_params_only=False))
+        assert rc == EXIT_OK
+        assert calls["account"] == 1
+        assert calls["risk_state"] == 1
+        assert calls["param"] == 1
+
+    async def test_full_path_proceeds_when_external_id_matches_existing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Idempotent re-run of a live bootstrap: existing owner has the SAME id.
+        calls = _patch_wet_db(monkeypatch, existing_owners=[(uuid4(), "U25655583")])
+        rc = await _amain(_wet_args(external_account_id="U25655583", seed_params_only=False))
+        assert rc == EXIT_OK
+        assert calls["account"] == 1
+        assert calls["risk_state"] == 1
+        assert calls["param"] == 1
