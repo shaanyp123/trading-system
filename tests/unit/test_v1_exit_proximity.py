@@ -35,8 +35,10 @@ from strategies.v1_trend_following.exit_proximity import (
     EXIT_STOP_NEAR_BAND_PCT,
     EXIT_TREND_NEAR_BAND_PCT,
     ExitState,
+    ExitTriggerProximity,
     classify_reversal,
     classify_stop,
+    combine_overall_exit,
     compute_position_exit_proximity,
     directional_reversal_entry_state,
 )
@@ -329,6 +331,84 @@ class TestOverallAndClosest:
             key=lambda s: rank[s],
         )
         assert rank[p.overall_state] == rank[worst]
+
+
+# ---------------------------------------------------------------------------
+# combine_overall_exit — the §3.3 combiner, shared by PR-A compute + PR-B
+# api-side stop enrichment. The "flip" cases are the load-bearing PR-B
+# invariant: re-deriving with the joined stop must move overall_state /
+# closest_exit away from LEAN's stop-blind (NULL-state stop) values.
+# ---------------------------------------------------------------------------
+class TestCombineOverallExit:
+    @staticmethod
+    def _holding() -> ExitTriggerProximity:
+        return ExitTriggerProximity(state=ExitState.HOLDING, headroom=None)
+
+    def test_decommission_triggered_wins_outright(self) -> None:
+        # Even with a more-breached stop, the kill switch takes precedence.
+        overall, closest = combine_overall_exit(
+            trend_flip=ExitTriggerProximity(state=ExitState.TRIGGERED, headroom=Decimal("-0.02")),
+            stop=ExitTriggerProximity(state=ExitState.TRIGGERED, headroom=Decimal("-0.05")),
+            reversal=self._holding(),
+            decommission=ExitTriggerProximity(state=ExitState.TRIGGERED, headroom=None),
+        )
+        assert overall is ExitState.TRIGGERED
+        assert closest == "decommission"
+
+    def test_joined_stop_triggered_flips_overall_from_holding(self) -> None:
+        # PR-B enrichment flip: LEAN emitted a NULL-state (HOLDING) stop and an
+        # all-HOLDING summary; the api joins a BREACHED stop (long mark below
+        # the stop) via classify_stop and re-derives → TRIGGERED / closest=stop.
+        stop = classify_stop(last_close=Decimal("100"), stop_price=Decimal("101"), direction="long")
+        assert stop.state is ExitState.TRIGGERED  # sanity: breach detected
+        overall, closest = combine_overall_exit(
+            trend_flip=self._holding(),
+            stop=stop,
+            reversal=self._holding(),
+            decommission=self._holding(),
+        )
+        assert overall is ExitState.TRIGGERED
+        assert closest == "stop"
+
+    def test_joined_stop_near_flips_overall_from_holding(self) -> None:
+        # A joined stop within the 1% band flips an otherwise-HOLDING row to NEAR.
+        stop = classify_stop(
+            last_close=Decimal("100"), stop_price=Decimal("99.5"), direction="long"
+        )
+        assert stop.state is ExitState.NEAR
+        overall, closest = combine_overall_exit(
+            trend_flip=self._holding(),
+            stop=stop,
+            reversal=self._holding(),
+            decommission=self._holding(),
+        )
+        assert overall is ExitState.NEAR
+        assert closest == "stop"
+
+    def test_no_joined_stop_stays_holding(self) -> None:
+        # No working stop on record → classify_stop NULL-state HOLDING; with all
+        # other triggers HOLDING the row stays HOLDING (closest is an indicator).
+        stop = classify_stop(last_close=Decimal("100"), stop_price=None, direction="long")
+        assert stop.state is ExitState.HOLDING
+        overall, closest = combine_overall_exit(
+            trend_flip=self._holding(),
+            stop=stop,
+            reversal=self._holding(),
+            decommission=self._holding(),
+        )
+        assert overall is ExitState.HOLDING
+        assert closest != "decommission"
+
+    def test_tie_break_by_smallest_headroom(self) -> None:
+        # trend_flip NEAR (0.004) vs stop NEAR (0.005) → trend_flip is closer.
+        overall, closest = combine_overall_exit(
+            trend_flip=ExitTriggerProximity(state=ExitState.NEAR, headroom=Decimal("0.004")),
+            stop=ExitTriggerProximity(state=ExitState.NEAR, headroom=Decimal("0.005")),
+            reversal=self._holding(),
+            decommission=self._holding(),
+        )
+        assert overall is ExitState.NEAR
+        assert closest == "trend_flip"
 
 
 # ---------------------------------------------------------------------------

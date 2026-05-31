@@ -20,6 +20,7 @@ from strategies.v1_trend_following.exit_proximity import (
     ExitState,
     ExitTriggerProximity,
     PositionExitProximity,
+    combine_overall_exit,
     compute_position_exit_proximity,
 )
 from strategies.v1_trend_following.parameters import (
@@ -82,6 +83,7 @@ __all__ = [
     "UniverseInclusionPayload",
     "V1Parameters",
     "V1TrendFollowing",
+    "combine_overall_exit",
     "compute_market_proximity",
     "compute_position_exit_proximity",
     "default_v1_parameters",

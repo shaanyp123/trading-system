@@ -46,6 +46,7 @@ from services.api import db as api_db
 from services.api.config import get_settings
 from services.api.errors import AppError
 from services.api.heartbeats import get_heartbeat_registry
+from services.api.repos.exit_proximity import insert_rows as insert_exit_proximity_rows
 from services.api.repos.phase1 import Phase1QueryRepo, PostgresPhase1QueryRepo
 from services.api.repos.signal_proximity import insert_rows as insert_signal_proximity_rows
 from services.api.schemas.lean import (
@@ -472,6 +473,38 @@ async def post_lean_signal(
                     log.exception(
                         "lean_proximity_persist_failed",
                         market_count=market_evaluations_count,
+                        **log_kwargs,
+                    )
+            if body.position_exit_evaluations:
+                # PR-B of exit-proximity-design.md: persist one row per open
+                # position into ``exit_proximity``. The repo enriches each
+                # row's stop dimension from the latest working ``stop_market``
+                # order (Q1 = (B)) + RE-DERIVES overall_state/closest_exit so
+                # the persisted row is consistent with the real stop. Same
+                # best-effort contract as the signal_proximity insert above:
+                # a DB hiccup logs + swallows; the 202 still ships — NEVER 5xx
+                # the liveness signal (a missed snapshot self-heals next cycle).
+                # session_date_et fallback is identical to the entry side.
+                exit_session_date_et = body.session_date_et or _et_session_date(body.ts_utc)
+                try:
+                    session_factory = api_db.get_session_factory()
+                    async with session_factory() as exit_proximity_session:
+                        exit_rows_inserted = await insert_exit_proximity_rows(
+                            exit_proximity_session,
+                            cycle_ts_utc=body.ts_utc,
+                            session_date_et=exit_session_date_et,
+                            evaluations=list(body.position_exit_evaluations),
+                        )
+                        await exit_proximity_session.commit()
+                    log.info(
+                        "lean_exit_proximity_persisted",
+                        rows_inserted=exit_rows_inserted,
+                        **log_kwargs,
+                    )
+                except Exception:
+                    log.exception(
+                        "lean_exit_proximity_persist_failed",
+                        position_exit_count=exit_evaluations_count,
                         **log_kwargs,
                     )
             # PR-C §12.4 compensating control: escalate a nightly kill-switch
