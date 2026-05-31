@@ -7221,7 +7221,7 @@ SSH to VPS, git push, gh pr create (NOT merge — explicit prompt safety rail), 
 
 ### 2026-05-31 — Exit-proximity PR-C (frontend "Exits" section; observation-only)
 
-**Topic:** Final PR of `Docs/exit-proximity-design.md`. Surfaces the per-position exit-proximity records served by PR-B at `GET /api/today/exit-proximity` as a new "Exits" section on the **Today page** (Q3). Frontend-only — no `services/**` touched, no `risk-review-approved` label (ED7), no new SSE event type (ED8). Completes the 3-PR plan.
+**Topic:** Final PR ([#310](https://github.com/shaanyp123/trading-system/pull/310)) of `Docs/exit-proximity-design.md`. Surfaces the per-position exit-proximity records served by PR-B at `GET /api/today/exit-proximity` as a new "Exits" section on the **Today page** (Q3). Frontend-only — no `services/**` touched, no `risk-review-approved` label (ED7), no new SSE event type (ED8). Completes the 3-PR plan.
 
 **Implementer decisions (where the build refined the design's literal text):**
 - **NO client-side sort — render in receipt order.** This is the load-bearing divergence from the entry-side precedent (signal-proximity PR-C #286 sorted client-side via `sortProximityMarkets`). PR-B already returns `positions` ordered closest-to-closing (TRIGGERED → NEAR-asc-by-headroom → HOLDING, server-side §3.3). `exit-proximity.ts` deliberately exports NO sort helper; the component maps `data.positions` as-is. Re-sorting here would risk silently disagreeing with the server's canonical order.
