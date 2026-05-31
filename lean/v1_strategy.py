@@ -536,9 +536,7 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
                 as_of_session_date=session_date,
             )
         except Exception as exc:  # noqa: BLE001 -- log + heartbeat-only fallback
-            self.log(
-                f"v1_generate_signals_failed session_date={session_date} exc={exc!r}"
-            )
+            self.log(f"v1_generate_signals_failed session_date={session_date} exc={exc!r}")
             self._post_event(
                 "lean_cycle_heartbeat",
                 extra={
@@ -567,9 +565,7 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         rejection_reason_counts: dict[str, int] = {}
         for rejected_market, reason in result.rejections:
             reason_str = reason.value
-            rejection_reason_counts[reason_str] = (
-                rejection_reason_counts.get(reason_str, 0) + 1
-            )
+            rejection_reason_counts[reason_str] = rejection_reason_counts.get(reason_str, 0) + 1
             self.log(
                 f"v1_signal_rejected session_date={session_date} "
                 f"market={rejected_market} reason={reason_str}"
@@ -583,6 +579,21 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
             f"reasons={rejection_reason_counts}"
         )
 
+        # Generate exit candidates BEFORE the heartbeat so the per-position
+        # exit-proximity records (PR-A of exit-proximity-design.md) ride the
+        # same lean_cycle_heartbeat as the entry proximity. Generation is pure
+        # (no POSTs); the exit signals are emitted after the heartbeat. A None
+        # result (generation raised) leaves exit proximity empty but never
+        # blocks the heartbeat or the entry emissions.
+        exit_result = self._generate_exits(
+            strategy=strategy,
+            active_universe=active_universe,
+            current_positions=current_positions,
+            entry_candidates=result.signals,
+            entry_evaluations=result.market_evaluations,
+            session_date=session_date,
+        )
+
         # Step 6: heartbeat with per-cycle summary (always emitted so
         # liveness_probes sees the algorithm alive even when no signals).
         # PR-A of signal-proximity-design.md attaches the per-market
@@ -590,6 +601,7 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         # an optional field; PR-B will persist them. Observation-only —
         # this does NOT influence which signals fire.
         proximity_payload = self._build_market_evaluations_payload(result)
+        exit_proximity_payload = self._build_position_exit_evaluations_payload(exit_result)
         heartbeat_extra: dict = {
             "session_date_et": session_date.isoformat(),
             "equity_usd": str(equity),
@@ -597,6 +609,7 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
             "signals_emitted_count": signals_count,
             "rejections_count": rejections_count,
             "market_evaluations": proximity_payload,
+            "position_exit_evaluations": exit_proximity_payload,
         }
         # PR-C (§12.4): surface a kill-switch parameter-fetch failure so the api
         # observes it (and a thin follow-up can escalate to a P1 Discord alert).
@@ -639,38 +652,42 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
                 },
             )
 
-        # Step 8 (PR-B): run the exit pipeline and emit each exit candidate.
-        # Independent try/except so an exit-side failure doesn't suppress
-        # already-emitted entry signals (and vice versa). The exit pipeline
-        # reads the entry-side result for reversal coupling (paired-emission
-        # per design §Q1).
-        self._run_and_emit_exits(
-            strategy=strategy,
-            active_universe=active_universe,
-            current_positions=current_positions,
-            entry_candidates=result.signals,
-            session_date=session_date,
-            equity=equity,
-        )
+        # Step 8: emit each exit candidate computed above (the exit pipeline
+        # ran before the heartbeat so its proximity rode along). Emission is
+        # independent of the entry path — a failure here does not roll back
+        # already-emitted entry signals. Reversal candidates carry
+        # ``paired_entry_market`` so the dispatcher serializes the paired
+        # EXIT-then-ENTRY sequence per §11 R2.
+        if exit_result is not None:
+            self._emit_exits(
+                exit_result=exit_result,
+                session_date=session_date,
+                equity=equity,
+            )
         return
 
-    def _run_and_emit_exits(
+    def _generate_exits(
         self,
         *,
         strategy: V1TrendFollowing,
         active_universe: dict,  # type: ignore[type-arg]  -- LEAN runtime; mypy excluded
         current_positions: dict,  # type: ignore[type-arg]
         entry_candidates: tuple,  # type: ignore[type-arg]  -- tuple[CandidateSignal,...]
+        entry_evaluations: tuple,  # type: ignore[type-arg]  -- tuple[MarketProximity,...]
         session_date,  # noqa: ANN001  -- date; LEAN runtime
-        equity,  # noqa: ANN001  -- Decimal; LEAN runtime
-    ) -> None:
-        """Run ``generate_exit_candidates`` and POST each exit per design §6.1.
+    ):  # noqa: ANN201  -- ExitGenerationResult | None; LEAN runtime
+        """Run ``generate_exit_candidates`` + log the per-cycle summary.
 
-        Independent of the entry path. Failure here does NOT roll back
-        entry POSTs (and vice versa) — each exit POST is best-effort via
-        ``_post_event`` so a single market's exit can't suppress others.
-        Reversal candidates carry ``paired_entry_market`` so the dispatcher
-        can serialize the paired EXIT-then-ENTRY sequence per §11 R2.
+        PURE — no POSTs. Split from emission (``_emit_exits``) so the result's
+        ``position_exit_evaluations`` can be folded into the heartbeat before
+        any exit signal is emitted (PR-A of exit-proximity-design.md). Returns
+        the ``ExitGenerationResult`` or ``None`` if generation raised (the
+        heartbeat still ships; entry POSTs are unaffected).
+
+        ``entry_evaluations`` is the entry result's ``market_evaluations`` —
+        observation-only, passed through so ``generate_exit_candidates`` can
+        derive the reversal exit-proximity dimension; it does NOT change which
+        exits fire.
         """
         try:
             exit_result = strategy.generate_exit_candidates(
@@ -678,12 +695,11 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
                 current_positions=current_positions,
                 as_of_session_date=session_date,
                 entry_candidates=entry_candidates,
+                entry_evaluations=entry_evaluations,
             )
         except Exception as exc:  # noqa: BLE001 -- log + skip; don't crash the algorithm
-            self.log(
-                f"v1_generate_exit_candidates_failed session_date={session_date} exc={exc!r}"
-            )
-            return
+            self.log(f"v1_generate_exit_candidates_failed session_date={session_date} exc={exc!r}")
+            return None
 
         # Per-rejection structured log lines for forensic visibility
         # (mirror the entry-side pattern earlier in this cycle). Each
@@ -709,7 +725,22 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
             f"exit_rejections_count={len(exit_result.rejections)} "
             f"exit_reasons={exit_rejection_reason_counts}"
         )
+        return exit_result
 
+    def _emit_exits(
+        self,
+        *,
+        exit_result,  # noqa: ANN001  -- ExitGenerationResult; LEAN runtime
+        session_date,  # noqa: ANN001  -- date; LEAN runtime
+        equity,  # noqa: ANN001  -- Decimal; LEAN runtime
+    ) -> None:
+        """POST each exit candidate computed by ``_generate_exits``.
+
+        Best-effort per-signal via ``_post_event`` so a single market's exit
+        can't suppress the others. Called after the heartbeat (and after the
+        entry POSTs) per the cycle ordering — generation already happened so
+        the proximity could ride the heartbeat.
+        """
         for exit_signal in exit_result.signals:
             payload = self._build_exit_signal_payload(
                 exit_signal=exit_signal,
@@ -744,6 +775,7 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
 
     def _serialize_market_proximity(self, evaluation) -> dict:  # noqa: ANN001 -- MarketProximity; LEAN runtime
         """Convert one MarketProximity dataclass to a wire-shape dict."""
+
         def _gate(gate) -> dict:  # noqa: ANN001 -- GateProximity; LEAN runtime
             return {
                 "state": gate.state.value,
@@ -762,6 +794,56 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
             "last_close": str(last_close) if last_close is not None else None,
             "overall_state": evaluation.overall_state.value,
             "closest_gate": evaluation.closest_gate,
+            "gate_status": evaluation.gate_status,
+        }
+
+    def _build_position_exit_evaluations_payload(self, exit_result) -> list:  # noqa: ANN001 -- ExitGenerationResult | None; LEAN runtime
+        """Serialize ``exit_result.position_exit_evaluations`` for the heartbeat.
+
+        Per PR-A of ``Docs/exit-proximity-design.md`` §5: one entry per held
+        position; trigger states as strings, Decimals as strings (A05), None
+        survives unchanged. Best-effort + per-position isolation, mirroring
+        ``_build_market_evaluations_payload``. A ``None`` exit_result (exit
+        generation raised) yields an empty list so the heartbeat still ships.
+        """
+        if exit_result is None:
+            return []
+        evaluations = getattr(exit_result, "position_exit_evaluations", ()) or ()
+        out: list = []
+        for evaluation in evaluations:
+            try:
+                out.append(self._serialize_position_exit_proximity(evaluation))
+            except Exception as exc:  # noqa: BLE001 -- log + skip; per-position isolation
+                self.log(
+                    f"v1_position_exit_proximity_serialize_failed "
+                    f"market={getattr(evaluation, 'market', '?')} exc={exc!r}"
+                )
+        return out
+
+    def _serialize_position_exit_proximity(self, evaluation) -> dict:  # noqa: ANN001 -- PositionExitProximity; LEAN runtime
+        """Convert one PositionExitProximity dataclass to a wire-shape dict."""
+
+        def _trigger(trigger) -> dict:  # noqa: ANN001 -- ExitTriggerProximity; LEAN runtime
+            return {
+                "state": trigger.state.value,
+                "headroom": str(trigger.headroom) if trigger.headroom is not None else None,
+                "detail": trigger.detail,
+            }
+
+        last_close = evaluation.last_close
+        stop_price = evaluation.stop_price
+        return {
+            "market": evaluation.market,
+            "direction": evaluation.direction,
+            "held_days": evaluation.held_days,
+            "trend_flip": _trigger(evaluation.trend_flip),
+            "stop": _trigger(evaluation.stop),
+            "reversal": _trigger(evaluation.reversal),
+            "decommission": _trigger(evaluation.decommission),
+            "last_close": str(last_close) if last_close is not None else None,
+            "stop_price": str(stop_price) if stop_price is not None else None,
+            "overall_state": evaluation.overall_state.value,
+            "closest_exit": evaluation.closest_exit,
             "gate_status": evaluation.gate_status,
         }
 
@@ -830,9 +912,7 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         # Coerce snapshot values to strings (Decimal → str per A05) so the
         # JSONB column doesn't carry mixed types. Empty snapshot stays as
         # an empty dict on the wire.
-        strategy_inputs: dict = {
-            exit_signal.market: {k: str(v) for k, v in snapshot.items()}
-        }
+        strategy_inputs: dict = {exit_signal.market: {k: str(v) for k, v in snapshot.items()}}
         prior_dir = exit_signal.prior_position_direction
         return {
             "schema_version": 1,
@@ -855,9 +935,7 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
                     "place-order time per exit-pipeline-design §Q3."
                 ),
                 "exit_reason": exit_signal.exit_reason,
-                "prior_position_direction": (
-                    prior_dir.value if prior_dir is not None else None
-                ),
+                "prior_position_direction": (prior_dir.value if prior_dir is not None else None),
                 "prior_position_quantity": exit_signal.prior_position_quantity,
                 "paired_entry_market": exit_signal.paired_entry_market,
             },
@@ -900,9 +978,7 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         )
         return self._v1_parameters
 
-    def _build_bar_series(
-        self, *, market_key: str, symbol: object, count: int
-    ) -> BarSeries | None:
+    def _build_bar_series(self, *, market_key: str, symbol: object, count: int) -> BarSeries | None:
         """Call `self.history(symbol, count, Resolution.DAILY)` → `BarSeries`.
 
         Returns None on any failure (insufficient history, history API
@@ -1199,9 +1275,7 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         # an independent line so log analyzers can grep for one without
         # parsing the others.
         if result.missing_markets:
-            self.log(
-                f"v1_universe_data_missing missing_markets={list(result.missing_markets)}"
-            )
+            self.log(f"v1_universe_data_missing missing_markets={list(result.missing_markets)}")
         if result.stale_markets:
             summary = ",".join(
                 f"{s.market}({s.days_stale}d/{s.last_file})" for s in result.stale_markets
@@ -1248,7 +1322,9 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
                     return None
                 payload = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            self.log(f"lean_parameters_fetch_failed http_error status={exc.code} reason={exc.reason}")
+            self.log(
+                f"lean_parameters_fetch_failed http_error status={exc.code} reason={exc.reason}"
+            )
             return None
         except urllib.error.URLError as exc:
             self.log(f"lean_parameters_fetch_failed url_error reason={exc.reason}")

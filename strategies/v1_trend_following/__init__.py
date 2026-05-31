@@ -16,6 +16,12 @@ from strategies.v1_trend_following.audit_events import (
     UniverseExclusionPayload,
     UniverseInclusionPayload,
 )
+from strategies.v1_trend_following.exit_proximity import (
+    ExitState,
+    ExitTriggerProximity,
+    PositionExitProximity,
+    compute_position_exit_proximity,
+)
 from strategies.v1_trend_following.parameters import (
     V1_CANDIDATE_UNIVERSE,
     V1_DEFAULTS,
@@ -58,10 +64,13 @@ __all__ = [
     "CandidateSignal",
     "Direction",
     "ExitGenerationResult",
+    "ExitState",
+    "ExitTriggerProximity",
     "GateProximity",
     "GateState",
     "MarketProximity",
     "Position",
+    "PositionExitProximity",
     "RejectionReason",
     "SignalEmittedPayload",
     "SignalGenerationResult",
@@ -74,5 +83,6 @@ __all__ = [
     "V1Parameters",
     "V1TrendFollowing",
     "compute_market_proximity",
+    "compute_position_exit_proximity",
     "default_v1_parameters",
 ]

@@ -40,6 +40,11 @@ from typing import Final, Literal
 
 import structlog
 
+from strategies.v1_trend_following.exit_proximity import (
+    PositionExitProximity,
+    compute_position_exit_proximity,
+    directional_reversal_entry_state,
+)
 from strategies.v1_trend_following.indicators import (
     average_true_range,
     donchian_channel,
@@ -48,6 +53,7 @@ from strategies.v1_trend_following.indicators import (
 )
 from strategies.v1_trend_following.parameters import V1Parameters
 from strategies.v1_trend_following.proximity import (
+    GateState,
     MarketProximity,
     compute_market_proximity,
 )
@@ -445,6 +451,7 @@ class V1TrendFollowing:
         as_of_session_date: date,
         as_of_emitted_at_utc: datetime | None = None,
         entry_candidates: tuple[CandidateSignal, ...] = (),
+        entry_evaluations: tuple[MarketProximity, ...] = (),
     ) -> ExitGenerationResult:
         """Run the exit-signal pipeline over the held positions.
 
@@ -478,6 +485,13 @@ class V1TrendFollowing:
         an empty tuple disables reversal detection (only (c) and (d) fire);
         useful for ``--exits-only`` forensic runs and for unit tests that
         exercise (c)/(d) in isolation.
+
+        ``entry_evaluations`` is the SAME cycle's ``generate_signals`` result's
+        ``market_evaluations``. It is observation-only — used solely to derive
+        the reversal dimension of the per-position exit proximity (PR-A of
+        ``Docs/exit-proximity-design.md``); it does NOT influence what closes.
+        Passing an empty tuple degrades the reversal proximity to HOLDING for
+        markets that did not fire an opposite-direction breakout this cycle.
 
         Returns an ``ExitGenerationResult``. ``signals`` are the emitted
         CLOSE candidates (each with ``signal_type='exit'`` and an
@@ -609,10 +623,99 @@ class V1TrendFollowing:
                 )
             )
 
+        # ----- Observation-only exit-proximity (PR-A of exit-proximity-design.md) -----
+        # Build one PositionExitProximity per held (non-FLAT) position for the
+        # Today "Exits" view. This is a SEPARATE pass over current_positions: the
+        # decision loop above is bit-identical to the prior implementation and
+        # nothing here feeds back into what closes. Reversal proximity reuses the
+        # opposite direction's ENTRY proximity (ED4); the stop dimension is left
+        # to the api-side ``stop_market`` join (Q1 = (B)), so stop_price is None.
+        entry_proximity_by_market = {mp.market: mp for mp in entry_evaluations}
+        position_exit_evaluations = [
+            self._build_position_exit_proximity(
+                market=market,
+                position=position,
+                series=active_universe.get(market),
+                as_of_session_date=as_of_session_date,
+                entry_proximity=entry_proximity_by_market.get(market),
+                reversal_fired=market in reversing_entries_by_market,
+            )
+            for market, position in current_positions.items()
+            if position.direction is not Direction.FLAT
+        ]
+
         return ExitGenerationResult(
             signals=tuple(exit_signals),
             rejections=tuple(exit_rejections),
             as_of_emitted_at_utc=emitted_at,
+            position_exit_evaluations=tuple(position_exit_evaluations),
+        )
+
+    def _build_position_exit_proximity(
+        self,
+        *,
+        market: str,
+        position: Position,
+        series: BarSeries | None,
+        as_of_session_date: date,
+        entry_proximity: MarketProximity | None,
+        reversal_fired: bool,
+    ) -> PositionExitProximity:
+        """Adapter handing per-position exit values to the pure
+        ``compute_position_exit_proximity``.
+
+        Observation-only (PR-A of ``Docs/exit-proximity-design.md``) — does NOT
+        feed back into the exit decision. Lives on the strategy class so it can
+        read ``self._params`` (MIN_HOLDING / decommission) and recompute the
+        indicator snapshot from the same bars the decision used, without leaking
+        strategy internals into the pure-Python proximity module.
+
+        Reversal proximity (ED4): an actually-emitted opposite-direction
+        breakout (``reversal_fired``) maps to a firing reversal (PASS → the
+        reversal exit WILL fire this cycle); otherwise the opposite direction's
+        entry-proximity readiness is derived from ``entry_proximity``. Stop
+        proximity is deferred to the api-side ``stop_market`` join (Q1 = (B)),
+        so ``stop_price`` is None here.
+        """
+        direction: Literal["long", "short"] = (
+            "long" if position.direction is Direction.LONG else "short"
+        )
+        held_days: int | None = None
+        if position.opened_at_session_date is not None:
+            held_days = (as_of_session_date - position.opened_at_session_date).days
+
+        last_close: Decimal | None = None
+        ma_fast: Decimal | None = None
+        if series is not None and len(series.bars) >= self._min_required_bars:
+            try:
+                snapshot = self._compute_snapshot(series.bars)
+            except ValueError:
+                # Warming-up / degenerate history → leave the indicator
+                # dimensions NULL; the position still surfaces with a
+                # ``warming_up`` gate_status.
+                pass
+            else:
+                last_close = snapshot.last_close
+                ma_fast = snapshot.ma_fast
+
+        if reversal_fired:
+            reversal_entry_state: GateState | None = GateState.PASS
+        else:
+            reversal_entry_state = directional_reversal_entry_state(
+                market_proximity=entry_proximity,
+                held_direction=direction,
+            )
+
+        return compute_position_exit_proximity(
+            market=market,
+            direction=direction,
+            held_days=held_days,
+            last_close=last_close,
+            ma_fast=ma_fast,
+            min_holding_days=self._params.min_holding_days,
+            decommissioned=self._params.strategy_decommissioned,
+            stop_price=None,
+            reversal_entry_state=reversal_entry_state,
         )
 
     @staticmethod

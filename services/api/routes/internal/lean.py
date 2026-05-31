@@ -420,9 +420,20 @@ async def post_lean_signal(
             market_evaluations_count = (
                 len(body.market_evaluations) if body.market_evaluations is not None else 0
             )
+            # PR-A of exit-proximity-design.md: log the per-position exit-
+            # proximity count as a sanity check. PR-B persists each item into
+            # ``exit_proximity`` (+ enriches the stop dimension from the latest
+            # working ``stop_market`` order per Q1 = (B)), mirroring the
+            # signal_proximity insert below.
+            exit_evaluations_count = (
+                len(body.position_exit_evaluations)
+                if body.position_exit_evaluations is not None
+                else 0
+            )
             log.info(
                 "lean_proximity_received",
                 market_count=market_evaluations_count,
+                position_exit_count=exit_evaluations_count,
                 **log_kwargs,
             )
             if body.market_evaluations:

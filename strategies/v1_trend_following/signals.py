@@ -15,6 +15,7 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Final, Literal
 
+from strategies.v1_trend_following.exit_proximity import PositionExitProximity
 from strategies.v1_trend_following.proximity import MarketProximity
 
 
@@ -223,13 +224,20 @@ class ExitGenerationResult:
     CandidateSignals with ``signal_type='exit'`` and a populated ``exit_reason``;
     ``rejections`` capture the per-market reasons no exit fired (e.g.
     TREND_HOLDS, MIN_HOLDING_NOT_REACHED, INSUFFICIENT_BAR_HISTORY).
+    ``position_exit_evaluations`` (PR-A of ``Docs/exit-proximity-design.md``)
+    is the per-position exit-proximity record for the Today "Exits" view —
+    observation-only, one entry per held (non-FLAT) position regardless of
+    whether an exit fired. Backwards-compatible: the field is APPENDED so
+    positional ordering of existing fields is preserved and pre-PR-A consumers
+    keep working.
 
-    See exit-pipeline-design.md §5.3.
+    See exit-pipeline-design.md §5.3 + exit-proximity-design.md §4-5.
     """
 
     signals: tuple[CandidateSignal, ...]
     rejections: tuple[tuple[str, RejectionReason], ...]
     as_of_emitted_at_utc: datetime
+    position_exit_evaluations: tuple[PositionExitProximity, ...] = field(default=())
 
 
 # Strategy-emitted audit event types (subset of canonical AuditEventType enum
