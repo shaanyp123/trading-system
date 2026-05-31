@@ -39,7 +39,7 @@ export function ActiveAlerts(): JSX.Element {
   );
 
   return (
-    <Card>
+    <Card id="active-alerts" className="scroll-mt-20">
       <CardHeader className="pb-3">
         <CardTitle className="text-base">
           Active Alerts <span className="text-text-muted">({alerts.length})</span>

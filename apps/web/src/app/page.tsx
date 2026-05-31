@@ -25,6 +25,7 @@
 
 import { useSSE } from '@/lib/sse';
 import { ActiveAlerts } from '@/components/today/active-alerts';
+import { ExitWatchingSection } from '@/components/today/ExitWatchingSection';
 import { ExposureBreakdown } from '@/components/today/exposure-breakdown';
 import { HealthScoreTile } from '@/components/today/health-score-tile';
 import { PnLSummary } from '@/components/today/pnl-summary';
@@ -60,6 +61,9 @@ export default function TodayPage(): JSX.Element {
         </div>
         <div className="lg:col-span-6">
           <RecentFills />
+        </div>
+        <div className="lg:col-span-12">
+          <ExitWatchingSection />
         </div>
         <div className="lg:col-span-12">
           <ActiveAlerts />
