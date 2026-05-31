@@ -7191,4 +7191,19 @@ No new event types this session. The PR #154 follow-up will add `HEARTBEAT_STALE
 
 SSH to VPS, git push, gh pr create (NOT merge — explicit prompt safety rail), branch creation off main, sops READ (not edit), curl against `/api/**` via LEAN bearer + bot bearer (already in sops).
 
+---
+
+### 2026-05-31 — Exit-proximity PR-A (strategy + LEAN emission; observation-only)
+
+**Topic:** First PR of the signed-off `Docs/exit-proximity-design.md` ("Watching → Exits"). Adds the strategy-side per-position exit-proximity classifier + LEAN heartbeat emission + api schema tolerance. Observation-only — zero change to what `generate_exit_candidates` closes.
+
+**Implementer decisions (where the build refined the design's literal text):**
+- **Pure-function signature uses bare values, not the §4 `position/snapshot/params` objects.** Mirrors the entry-side `proximity.py` precedent (bare `last_close`/`ma_fast`/`held_days`/...): avoids a circular import (`strategy.py` imports `exit_proximity.py`) and keeps the module pytest-friendly with `Decimal` literals. `compute_position_exit_proximity` takes `direction: Literal["long","short"]` like `proximity._classify_*`.
+- **`signals.py` was modified (not listed in the §13 files-touched table).** `ExitGenerationResult` gained a `position_exit_evaluations: tuple[PositionExitProximity, ...] = ()` field — the carrier mirrors `SignalGenerationResult.market_evaluations`. In-package, observation-only, covered by the PR's `risk-review-approved`.
+- **Decision logic untouched via a SEPARATE observation pass.** `generate_exit_candidates` keeps the prior decision loop bit-identical; a second loop over `current_positions` builds the proximity records. New optional `entry_evaluations` param (the entry result's `market_evaluations`) feeds the derived-reversal dimension (ED4) and never influences what fires. Locked by a drift test: every emitted exit ⇒ the matching trigger's state == TRIGGERED.
+- **`closest_exit` tie-break precedence reordered** so an all-HOLDING / no-numeric-headroom row (warming up) does not mislabel `closest_exit="decommission"`; decommission-armed is still handled by its own precedence branch.
+- **Q1 = (B):** LEAN passes `stop_price=None`; the pure function fully handles a supplied stop (unit-tested) so PR-B's api-side `stop_market` join reuses one classifier.
+
+**Verification:** `make lint` (287 files) + `make typecheck` (170 files) clean; 41 new unit tests in `test_v1_exit_proximity.py` + 9 new schema-tolerance tests in `test_lean_event_request.py`; the affected strategy/exit-pipeline suites stay green (156). Deployable independently — the heartbeat field flows to a count-log until PR-B persists it. `lean/v1_strategy.py` reorders the cycle so exits are GENERATED before the heartbeat (so `position_exit_evaluations` rides it) and EMITTED after (`_generate_exits` / `_emit_exits` split).
+
 

@@ -258,3 +258,141 @@ def test_market_evaluation_warming_up_with_none_numerics_parses() -> None:
     assert request.market_evaluations[0].gate_status == "warming_up"
     assert request.market_evaluations[0].last_close is None
     assert request.market_evaluations[0].long_donchian.headroom is None
+
+
+# ===========================================================================
+# position_exit_evaluations — PR-A of Docs/exit-proximity-design.md
+#
+# Same tolerance contract as market_evaluations: absence must NOT 422 (older
+# LEAN deploys), a well-formed array round-trips, and malformed shapes /
+# out-of-alphabet enum values are rejected at the schema boundary.
+# ===========================================================================
+
+
+def _exit_eval_row(market: str = "/MES", **overrides: object) -> dict[str, object]:
+    """A representative per-position exit-proximity row matching the LEAN wire
+    shape (``lean/v1_strategy.py::_serialize_position_exit_proximity``)."""
+    row: dict[str, object] = {
+        "market": market,
+        "direction": "long",
+        "held_days": 20,
+        "trend_flip": {"state": "holding", "headroom": "0.10", "detail": None},
+        "stop": {"state": "holding", "headroom": None, "detail": "no stop price on record"},
+        "reversal": {"state": "holding", "headroom": None, "detail": None},
+        "decommission": {"state": "holding", "headroom": None, "detail": None},
+        "last_close": "164.25",
+        "stop_price": None,
+        "overall_state": "holding",
+        "closest_exit": "trend_flip",
+        "gate_status": "active",
+    }
+    row.update(overrides)
+    return row
+
+
+def test_heartbeat_with_position_exit_evaluations_parses() -> None:
+    request = LeanEventRequest.model_validate(
+        _base_heartbeat(position_exit_evaluations=[_exit_eval_row("/MES"), _exit_eval_row("/M2K")])
+    )
+    assert request.position_exit_evaluations is not None
+    assert len(request.position_exit_evaluations) == 2
+    row = request.position_exit_evaluations[0]
+    assert row.market == "/MES"
+    assert row.direction == "long"
+    assert row.held_days == 20
+    assert row.trend_flip.state == "holding"
+    assert row.trend_flip.headroom == Decimal("0.10")
+    assert row.stop.headroom is None
+    assert row.overall_state == "holding"
+    assert row.closest_exit == "trend_flip"
+    assert row.gate_status == "active"
+
+
+def test_heartbeat_with_empty_position_exit_evaluations_parses() -> None:
+    request = LeanEventRequest.model_validate(_base_heartbeat(position_exit_evaluations=[]))
+    assert request.position_exit_evaluations == []
+
+
+def test_legacy_heartbeat_without_position_exit_evaluations_is_none() -> None:
+    """Pre-PR-A LEAN images don't send the field — must parse as None, not 422."""
+    request = LeanEventRequest.model_validate(_base_heartbeat())
+    assert request.position_exit_evaluations is None
+
+
+def test_heartbeat_with_both_proximity_arrays_parses() -> None:
+    """Entry + exit proximity ride the same heartbeat — both round-trip."""
+    request = LeanEventRequest.model_validate(
+        _base_heartbeat(
+            market_evaluations=[_proximity_row("/MES")],
+            position_exit_evaluations=[_exit_eval_row("/MES")],
+        )
+    )
+    assert request.market_evaluations is not None
+    assert request.position_exit_evaluations is not None
+    assert len(request.market_evaluations) == 1
+    assert len(request.position_exit_evaluations) == 1
+
+
+def test_position_exit_invalid_trigger_state_rejected() -> None:
+    """A trigger state not in ('holding','near','triggered') must 422."""
+    with pytest.raises(ValidationError):
+        LeanEventRequest.model_validate(
+            _base_heartbeat(
+                position_exit_evaluations=[
+                    _exit_eval_row(trend_flip={"state": "maybe", "headroom": None, "detail": None})
+                ]
+            )
+        )
+
+
+def test_position_exit_invalid_closest_exit_rejected() -> None:
+    """closest_exit must be one of stop / reversal / trend_flip / decommission."""
+    with pytest.raises(ValidationError):
+        LeanEventRequest.model_validate(
+            _base_heartbeat(position_exit_evaluations=[_exit_eval_row(closest_exit="stop_hit")])
+        )
+
+
+def test_position_exit_invalid_gate_status_rejected() -> None:
+    """gate_status alphabet MUST match exit_proximity.GateStatus (the migration
+    CHECK constraint in PR-B will be pinned to the same set)."""
+    with pytest.raises(ValidationError):
+        LeanEventRequest.model_validate(
+            _base_heartbeat(position_exit_evaluations=[_exit_eval_row(gate_status="paused")])
+        )
+
+
+def test_position_exit_invalid_direction_rejected() -> None:
+    """direction is long|short only (FLAT positions never produce a row)."""
+    with pytest.raises(ValidationError):
+        LeanEventRequest.model_validate(
+            _base_heartbeat(position_exit_evaluations=[_exit_eval_row(direction="flat")])
+        )
+
+
+def test_position_exit_unknown_trigger_key_rejected() -> None:
+    """The per-trigger sub-object is extra='forbid' too."""
+    with pytest.raises(ValidationError):
+        LeanEventRequest.model_validate(
+            _base_heartbeat(
+                position_exit_evaluations=[
+                    _exit_eval_row(
+                        stop={"state": "near", "headroom": "0.004", "detail": None, "oops": 1}
+                    )
+                ]
+            )
+        )
+
+
+def test_position_exit_warming_up_null_headrooms_parses() -> None:
+    """Warming-up / no-stop rows carry None headrooms + None snapshot fields."""
+    row = _exit_eval_row(
+        trend_flip={"state": "holding", "headroom": None, "detail": "warming_up"},
+        last_close=None,
+        gate_status="warming_up",
+    )
+    request = LeanEventRequest.model_validate(_base_heartbeat(position_exit_evaluations=[row]))
+    assert request.position_exit_evaluations is not None
+    assert request.position_exit_evaluations[0].gate_status == "warming_up"
+    assert request.position_exit_evaluations[0].last_close is None
+    assert request.position_exit_evaluations[0].trend_flip.headroom is None

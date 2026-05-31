@@ -96,6 +96,26 @@ GateStatusLiteral = Literal["ok", "warming_up", "decommissioned"]
 ClosestGateLiteral = Literal["donchian", "trend", "hurst", "history"]
 
 
+# ---------------------------------------------------------------------------
+# Exit-proximity heartbeat payload (PR-A of exit-proximity-design.md)
+#
+# Mirrors the wire shape emitted by
+# ``lean/v1_strategy.py::_serialize_position_exit_proximity`` and the canonical
+# enums in ``strategies/v1_trend_following/exit_proximity.py``. PR-A logs the
+# count; PR-B persists each item as one row in ``exit_proximity``.
+# ---------------------------------------------------------------------------
+
+#: Per-trigger exit state. Matches ``exit_proximity.ExitState``.
+ExitStateLiteral = Literal["holding", "near", "triggered"]
+
+#: Position-level exit discriminator. Matches ``exit_proximity.GateStatus``.
+ExitGateStatusLiteral = Literal["active", "warming_up", "min_holding_blocked", "decommissioned"]
+
+#: Which exit trigger drives the overall state. Matches the ``closest_exit``
+#: values ``compute_position_exit_proximity`` can return.
+ClosestExitLiteral = Literal["stop", "reversal", "trend_flip", "decommission"]
+
+
 class GateProximityItem(BaseModel):
     """One gate's wire-shape record.
 
@@ -151,6 +171,63 @@ class MarketEvaluationItem(BaseModel):
     overall_state: GateStateLiteral
     closest_gate: ClosestGateLiteral
     gate_status: GateStatusLiteral
+
+
+class ExitTriggerItem(BaseModel):
+    """One exit trigger's wire-shape record (trend_flip / stop / reversal /
+    decommission).
+
+    LEAN serializes ``ExitTriggerProximity`` as ``{state, headroom, detail}``
+    with Decimal-as-string per A05. ``headroom`` is None for the binary
+    triggers (reversal / decommission) and for warming-up / no-stop rows.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    state: ExitStateLiteral = Field(
+        ...,
+        description="Categorical exit state. One of 'holding', 'near', 'triggered'.",
+    )
+    headroom: Decimal | None = Field(
+        default=None,
+        description=(
+            "Numeric headroom (Decimal-as-string per A05). None for the binary "
+            "triggers or when not computable (warming up / no stop on record)."
+        ),
+    )
+    detail: str | None = Field(
+        default=None,
+        max_length=64,
+        description=(
+            "Optional free-text qualifier (e.g., 'warming_up', 'blocked by MIN_HOLDING (3d left)')."
+        ),
+    )
+
+
+class PositionExitEvaluationItem(BaseModel):
+    """One open position's full exit-proximity record on a single heartbeat.
+
+    Wire shape mirrors ``exit_proximity.PositionExitProximity``. Decimal-as-
+    string per A05; ``stop`` is a NULL-state record under Q1 = (B) (LEAN does
+    not know the working stop — the api joins it at PR-B persist time).
+    PR-A logs the count only; PR-B persists each item as one ``exit_proximity``
+    row.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    market: str = Field(..., min_length=1, max_length=32)
+    direction: Literal["long", "short"]
+    held_days: int | None = Field(default=None)
+    trend_flip: ExitTriggerItem
+    stop: ExitTriggerItem
+    reversal: ExitTriggerItem
+    decommission: ExitTriggerItem
+    last_close: Decimal | None = Field(default=None)
+    stop_price: Decimal | None = Field(default=None)
+    overall_state: ExitStateLiteral
+    closest_exit: ClosestExitLiteral
+    gate_status: ExitGateStatusLiteral
 
 
 class LeanEventRequest(BaseModel):
@@ -357,6 +434,23 @@ class LeanEventRequest(BaseModel):
             "Watching view. Optional — absence is accepted so older LEAN "
             "deploys remain compatible. PR-A logged the count; PR-B "
             "persists each row in ``signal_proximity``."
+        ),
+    )
+    # PR-A of Docs/exit-proximity-design.md — per-position exit-proximity
+    # records attached to the heartbeat. Optional: older LEAN deploys (pre-
+    # PR-A) MUST keep validating, so absence is acceptable and the api treats
+    # missing/None as "no exit-proximity data this cycle." PR-A (this PR) logs
+    # the count; PR-B persists each row in ``exit_proximity`` + enriches the
+    # stop dimension from the latest working ``stop_market`` order (Q1 = (B)).
+    # The wire shape is the output of
+    # ``lean/v1_strategy.py::_serialize_position_exit_proximity``.
+    position_exit_evaluations: list[PositionExitEvaluationItem] | None = Field(
+        default=None,
+        description=(
+            "Heartbeat-only: per-position exit-proximity records for the Today "
+            "'Exits' view. Optional — absence is accepted so older LEAN deploys "
+            "remain compatible. PR-A logs the count; PR-B persists + enriches "
+            "the stop dimension."
         ),
     )
 
