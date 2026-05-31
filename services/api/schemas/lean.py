@@ -536,3 +536,65 @@ class LeanParametersResponse(BaseModel):
         ...,
         description="Server-clock timestamp at response build (tz-aware UTC).",
     )
+
+
+class LeanPositionItem(BaseModel):
+    """One held position in the ``GET /api/internal/lean/positions`` response (PR-A2).
+
+    The nightly LEAN cycle maps each item to the strategy's ``Position``
+    dataclass (``strategies/v1_trend_following/signals.py``): ``quantity`` sign
+    → direction, ``avg_cost`` → cost basis, ``opened_at_session_date`` → the
+    MIN_HOLDING_DAYS gate. Sourced from ``positions_current`` LEFT-joined to the
+    open ``trades`` row for the open date.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    market: str = Field(..., description="Root market symbol ('/MES' futures, bare 'TLT' ETF).")
+    quantity: int = Field(
+        ...,
+        description="Signed contract/share count (positive = long, negative = short; never 0).",
+    )
+    avg_cost: str = Field(
+        ...,
+        description="Cost basis per contract/share, Decimal-as-string (A05).",
+    )
+    opened_at_session_date: str | None = Field(
+        default=None,
+        description=(
+            "ET (America/New_York) calendar date the position opened, ISO 'YYYY-MM-DD'. "
+            "Derived from the open trade's opened_at_utc, DST-aware, server-side. NULL when "
+            "no open trade is recorded — the strategy then conservatively skips MIN_HOLDING."
+        ),
+    )
+
+
+class LeanPositionsResponse(BaseModel):
+    """Response body for ``GET /api/internal/lean/positions`` (PR-A2).
+
+    The nightly LEAN cycle GETs this at cycle start (live mode only) and feeds
+    ``positions`` to BOTH ``generate_signals`` (so the anti-pyramiding
+    POSITION_ALREADY_SAME_DIRECTION guard works) and ``generate_exit_candidates``
+    (so indicator exits fire) — fixing the empty-``self.portfolio`` dormancy
+    documented in ``Docs/decisions-log.md`` 2026-05-31. ``exits_in_flight`` lists
+    markets that already have a non-terminal exit signal; LEAN skips re-emitting
+    an exit for those (idempotency). Read-only — no audit row, no state change.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    positions: list[LeanPositionItem] = Field(
+        default_factory=list,
+        description="Every held (non-zero-quantity) position for the active account.",
+    )
+    exits_in_flight: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Markets with a non-terminal exit signal (status NOT IN "
+            "rejected/cancelled/expired). LEAN suppresses exit re-emission for these."
+        ),
+    )
+    server_now: datetime = Field(
+        ...,
+        description="Server-clock timestamp at response build (tz-aware UTC).",
+    )

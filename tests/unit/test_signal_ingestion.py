@@ -35,6 +35,7 @@ from services.audit.models import AuditLogRecord
 from services.qc_adapter import signal_ingestion as si
 from services.qc_adapter.payloads import QCEvent
 from services.qc_adapter.signal_ingestion import (
+    DuplicateInFlightExitError,
     IngestResult,
     SignalIngestError,
     ingest_signal_emitted,
@@ -126,6 +127,13 @@ def fake_session_factory() -> MagicMock:
         begin.__aenter__ = AsyncMock(return_value=s)
         begin.__aexit__ = AsyncMock(return_value=None)
         s.begin = lambda: begin
+        # PR-A2: the in-flight-exit guard does ``await session.execute(...)`` →
+        # ``.fetchone()``. Default to "no duplicate" (fetchone → None) so exit
+        # ingests proceed past the guard; the dedup tests use a dedicated
+        # factory (`_factory_with_fetchone`) to exercise the duplicate branch.
+        _no_row_result = MagicMock()
+        _no_row_result.fetchone = MagicMock(return_value=None)
+        s.execute = AsyncMock(return_value=_no_row_result)
         return s
 
     factory = MagicMock(side_effect=_build_session)
@@ -921,3 +929,129 @@ class TestExitSignalIngestion:
         audit_payload = fake_audit_append.await_args.args[2]
         canonical = jcs_serialize(audit_payload)
         assert isinstance(canonical, bytes)
+
+
+# ---------------------------------------------------------------------------
+# TestInFlightExitDedup (PR-A2 server-side idempotency guard)
+# ---------------------------------------------------------------------------
+
+
+def _exit_payload() -> dict[str, Any]:
+    return {
+        "market": "MES",
+        "direction": "flat",
+        "target_contracts": 0,
+        "decision_price": 5234.50,
+        "sizing_trace": {},
+        "signal_type": "exit",
+        "exit_reason": "trend_flip",
+        "prior_position_direction": "long",
+        "prior_position_quantity": 3,
+    }
+
+
+def _factory_with_fetchone(row: object | None) -> MagicMock:
+    """session_factory whose session.execute(...).fetchone() returns ``row``."""
+
+    def _build() -> MagicMock:
+        s = MagicMock()
+        s.__aenter__ = AsyncMock(return_value=s)
+        s.__aexit__ = AsyncMock(return_value=None)
+        result = MagicMock()
+        result.fetchone = MagicMock(return_value=row)
+        s.execute = AsyncMock(return_value=result)
+        return s
+
+    return MagicMock(side_effect=_build)
+
+
+class TestInFlightExitDedup:
+    """The server-side chokepoint that rejects a duplicate in-flight exit before
+    the audit-first write (defense-in-depth alongside LEAN's exits_in_flight)."""
+
+    @pytest.mark.asyncio
+    async def test_duplicate_exit_raises_and_skips_audit_and_insert(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        fake_audit_append: AsyncMock,
+        fake_db: dict[str, AsyncMock],
+        fake_session_factory: MagicMock,
+    ) -> None:
+        monkeypatch.setattr(si, "_exit_in_flight_exists", AsyncMock(return_value=True))
+        with pytest.raises(DuplicateInFlightExitError) as exc:
+            await ingest_signal_emitted(
+                fake_session_factory,
+                account_id=_ACCOUNT,
+                env="paper",
+                phase_at_emit=1,
+                event=_make_event(payload=_exit_payload()),
+            )
+        assert exc.value.market == "MES"
+        assert exc.value.env == "paper"
+        # A duplicate lands NO audit row + NO signals row (runs before step 1).
+        fake_audit_append.assert_not_awaited()
+        fake_db["insert"].assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_first_exit_passes_the_guard(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        fake_audit_append: AsyncMock,
+        fake_db: dict[str, AsyncMock],
+        fake_session_factory: MagicMock,
+    ) -> None:
+        monkeypatch.setattr(si, "_exit_in_flight_exists", AsyncMock(return_value=False))
+        result = await ingest_signal_emitted(
+            fake_session_factory,
+            account_id=_ACCOUNT,
+            env="paper",
+            phase_at_emit=1,
+            event=_make_event(payload=_exit_payload()),
+        )
+        assert isinstance(result, IngestResult)
+        fake_audit_append.assert_awaited_once()
+        fake_db["insert"].assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_entry_does_not_consult_the_guard(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        fake_audit_append: AsyncMock,
+        fake_db: dict[str, AsyncMock],
+        fake_session_factory: MagicMock,
+    ) -> None:
+        guard = AsyncMock(return_value=True)  # would block IF (wrongly) consulted
+        monkeypatch.setattr(si, "_exit_in_flight_exists", guard)
+        result = await ingest_signal_emitted(
+            fake_session_factory,
+            account_id=_ACCOUNT,
+            env="paper",
+            phase_at_emit=1,
+            event=_make_event(),  # default entry payload
+        )
+        assert isinstance(result, IngestResult)
+        guard.assert_not_awaited()  # the guard is exit-only
+
+    @pytest.mark.asyncio
+    async def test_helper_true_when_row_exists(self) -> None:
+        assert (
+            await si._exit_in_flight_exists(
+                _factory_with_fetchone(object()),
+                account_id=_ACCOUNT,
+                env="paper",
+                market="MES",
+            )
+            is True
+        )
+
+    @pytest.mark.asyncio
+    async def test_helper_false_when_no_row(self) -> None:
+        assert (
+            await si._exit_in_flight_exists(
+                _factory_with_fetchone(None),
+                account_id=_ACCOUNT,
+                env="paper",
+                market="MES",
+            )
+            is False
+        )

@@ -35,6 +35,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Final
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import httpx
 import structlog
@@ -53,12 +54,15 @@ from services.api.schemas.lean import (
     LeanEventAccepted,
     LeanEventRequest,
     LeanParametersResponse,
+    LeanPositionItem,
+    LeanPositionsResponse,
 )
 from services.api.sse import emit_sse
 from services.audit.event_types import AuditEventType
 from services.audit.writer import Environment, PhaseAtEmit
 from services.qc_adapter.payloads import QCEvent
 from services.qc_adapter.signal_ingestion import (
+    DuplicateInFlightExitError,
     SignalIngestError,
     ingest_signal_emitted,
 )
@@ -66,6 +70,13 @@ from services.qc_adapter.signal_ingestion import (
 log = structlog.get_logger()
 
 router = APIRouter(prefix="/api/internal/lean", tags=["internal-lean"])
+
+#: ET zone for converting a position's open timestamp → CME session date
+#: (DST-aware). Matches ``services/qc_adapter/signal_ingestion._ET`` +
+#: the operator tool's ``_ET`` so opened_at maps to the same calendar date the
+#: strategy's MIN_HOLDING_DAYS gate expects. NOT the fixed-offset
+#: ``_et_session_date`` helper below (that is a session_date fallback only).
+_ET: Final[ZoneInfo] = ZoneInfo("America/New_York")
 
 
 def _et_session_date(ts_utc: datetime) -> str:
@@ -740,6 +751,27 @@ async def post_lean_signal(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 details={"event_type": body.event_type},
             ) from exc
+        except DuplicateInFlightExitError as exc:
+            # PR-A2 idempotency: a re-emitted exit for a market that already has
+            # a non-terminal exit is a benign no-op, NOT a payload error. Return
+            # accepted=False at the endpoint's 202 (no audit row, no signals row)
+            # so LEAN's best-effort POST logs a success and moves on — NOT a 422.
+            # LEAN normally suppresses these client-side via exits_in_flight; this
+            # catches races / the operator tool / any future emitter.
+            log.info(
+                "lean_exit_signal_duplicate_suppressed",
+                market=exc.market,
+                **log_kwargs,
+            )
+            return LeanEventAccepted(
+                received_at_utc=received_at,
+                event_type=body.event_type,
+                accepted=False,
+                note=(
+                    f"exit already in flight for {exc.market}; duplicate suppressed "
+                    "(no new signal row)."
+                ),
+            )
 
         log.info(
             "lean_signal_emitted_ingested",
@@ -885,6 +917,79 @@ async def get_lean_parameters(
         parameters=dict(_SAFE_DEFAULT_LEAN_PARAMETERS),
         parameter_set_hash=None,
         source="defaults",
+        server_now=now,
+    )
+
+
+# ---------------------------------------------------------------------------
+# PR-A2 — real-position sourcing for the nightly exit cycle.
+# LEAN's `self.portfolio` is empty under PaperBrokerage live-mode (the api owns
+# positions), so generate_exit_candidates saw 0 positions and indicator exits
+# were dormant (Docs/decisions-log.md 2026-05-31). The nightly cycle GETs this
+# endpoint in live mode and feeds the REAL positions to BOTH generate_signals
+# (anti-pyramiding) and generate_exit_candidates (exits). Read-only, bearer-gated.
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/positions",
+    response_model=LeanPositionsResponse,
+    summary="Held positions + in-flight exits for the nightly LEAN cycle",
+    description=(
+        "Bearer-authed read of the active account's open positions so the nightly "
+        "LEAN cycle can feed REAL positions to generate_signals + "
+        "generate_exit_candidates (PR-A2 — fixes the empty-self.portfolio dormancy "
+        "that left indicator exits inert; see decisions-log 2026-05-31). "
+        "``exits_in_flight`` lists markets with a non-terminal exit so LEAN "
+        "suppresses exit re-emission. Read-only; no audit row."
+    ),
+)
+async def get_lean_positions(
+    request: Request,
+    _: Annotated[None, Depends(_require_lean_authenticated)],
+    repo: Annotated[Phase1QueryRepo, Depends(_get_lean_query_repo)],
+) -> LeanPositionsResponse:
+    """Return held positions + in-flight-exit markets for the active account.
+
+    Mirrors the operator tool's sourcing (``positions_current`` LEFT JOIN open
+    ``trades``). The exit DECISION stays in the strategy module; this endpoint
+    only supplies the position inputs + the idempotency set, so
+    ``generate_exit_candidates`` stays bit-identical. Env is ``'paper'`` (Phase 1,
+    same as the signal-ingest path). ``opened_at_utc`` → ET session date here
+    (DST-aware) so LEAN needs no tzdata to build the strategy's ``Position``.
+    """
+    now = datetime.now(tz=UTC)
+    account_id = await repo.fetch_active_account_id()
+    if account_id is None:
+        log.warning("lean_positions_no_active_account")
+        return LeanPositionsResponse(positions=[], exits_in_flight=[], server_now=now)
+
+    env: Environment = "paper"
+    rows = await repo.fetch_positions_for_lean_cycle(account_id)
+    positions: list[LeanPositionItem] = []
+    for r in rows:
+        opened_at_utc = r.get("opened_at_utc")
+        opened_at_session_date: str | None = None
+        if isinstance(opened_at_utc, datetime):
+            opened_at_session_date = opened_at_utc.astimezone(_ET).date().isoformat()
+        positions.append(
+            LeanPositionItem(
+                market=str(r["market"]),
+                quantity=int(str(r["quantity"])),  # DB returns object-typed dict
+                avg_cost=str(r["avg_cost"]),
+                opened_at_session_date=opened_at_session_date,
+            )
+        )
+
+    exits_in_flight = sorted(await repo.fetch_inflight_exit_markets(account_id, env))
+    log.info(
+        "lean_positions_returned",
+        position_count=len(positions),
+        exits_in_flight_count=len(exits_in_flight),
+    )
+    return LeanPositionsResponse(
+        positions=positions,
+        exits_in_flight=exits_in_flight,
         server_now=now,
     )
 

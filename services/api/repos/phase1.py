@@ -164,6 +164,17 @@ class Phase1QueryRepo(Protocol):
         account_id: UUID,
     ) -> list[dict[str, object]]: ...
 
+    async def fetch_positions_for_lean_cycle(
+        self,
+        account_id: UUID,
+    ) -> list[dict[str, object]]: ...
+
+    async def fetch_inflight_exit_markets(
+        self,
+        account_id: UUID,
+        env: str,
+    ) -> set[str]: ...
+
     async def fetch_orders_page(
         self,
         account_id: UUID,
@@ -421,6 +432,73 @@ class PostgresPhase1QueryRepo:
             )
         ).fetchall()
         return [dict(r._mapping) for r in rows]
+
+    async def fetch_positions_for_lean_cycle(
+        self,
+        account_id: UUID,
+    ) -> list[dict[str, object]]:
+        """Held positions for the nightly LEAN exit cycle (PR-A2).
+
+        Every non-zero ``positions_current`` row for the account, LEFT-joined
+        to the open ``trades`` row so ``opened_at_utc`` can drive the strategy's
+        MIN_HOLDING_DAYS gate. The query MIRRORS the operator tool's reviewed
+        sourcing (``scripts/operator_tools/trigger_v1_cycle.py::fetch_positions_for_cycle``)
+        so the nightly LEAN cycle and the manual trigger see identical positions —
+        but without the universe filter: ALL held positions are returned so a
+        decommission close can fire even for a sidelined market.
+
+        ``opened_at_utc`` is the MIN open-trade timestamp (a market with two open
+        trade rows shares the earliest open date). NULL when no open trade is
+        recorded — the strategy then conservatively skips the MIN_HOLDING check
+        (per ``strategies/v1_trend_following/strategy.py::generate_exit_candidates``).
+        The endpoint converts ``opened_at_utc`` → ET session date for the response.
+        """
+        rows = (
+            await self._session.execute(
+                text(
+                    "SELECT p.market, p.quantity, p.avg_cost, "
+                    "       (SELECT MIN(t.opened_at_utc) FROM trades t "
+                    "          WHERE t.account_id = p.account_id "
+                    "            AND t.market = p.market "
+                    "            AND t.state = 'open_position') AS opened_at_utc "
+                    "FROM positions_current p "
+                    "WHERE p.account_id = :acc "
+                    "  AND p.quantity <> 0"
+                ),
+                {"acc": account_id},
+            )
+        ).fetchall()
+        return [dict(r._mapping) for r in rows]
+
+    async def fetch_inflight_exit_markets(
+        self,
+        account_id: UUID,
+        env: str,
+    ) -> set[str]:
+        """Markets with a non-terminal exit signal already in flight (PR-A2).
+
+        The idempotency key for the nightly exit cycle: once an indicator exit
+        is emitted, a trend_flip persists every cycle until the close fills, so
+        the strategy would re-emit the same exit each night. This set lets LEAN
+        suppress those re-emits (and the server-side ingest guard rejects any
+        that slip through). Status filter mirrors the operator tool's
+        ``fetch_already_emitted_exits`` (terminal-but-not-actionable =
+        rejected/cancelled/expired → re-emittable) but is intentionally NOT
+        session-scoped, so it dedups an exit across multiple nightly cycles.
+        """
+        rows = (
+            await self._session.execute(
+                text(
+                    "SELECT DISTINCT market FROM signals "
+                    "WHERE account_id = :acc "
+                    "  AND env = :env "
+                    "  AND signal_type = 'exit' "
+                    "  AND status NOT IN ('rejected','cancelled','expired')"
+                ),
+                {"acc": account_id, "env": env},
+            )
+        ).fetchall()
+        return {str(r.market) for r in rows}
 
     # --- orders ------------------------------------------------------------
 
