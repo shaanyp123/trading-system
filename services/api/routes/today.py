@@ -23,7 +23,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from services.api.config import APISettings, get_settings
 from services.api.db import get_session
 from services.api.exposure import compute_exposure_breakdown
+from services.api.repos.exit_proximity import fetch_latest_per_market
 from services.api.repos.phase1 import Phase1QueryRepo, PostgresPhase1QueryRepo
+from services.api.schemas.exit_proximity import ExitProximityResponse, row_to_view
 from services.api.schemas.health_score import (
     HealthScoreComponent,
     HealthScoreResponse,
@@ -161,6 +163,45 @@ async def today_digest(
         # has no length constraint. Production substitutes the build's SHA at
         # image-build time per services/api/Dockerfile.
         deployed_strategy_version=(settings.version or "0000000")[:7],
+    )
+
+
+@router.get(
+    "/api/today/exit-proximity",
+    tags=["today"],
+    response_model=ExitProximityResponse,
+)
+async def list_exit_proximity(
+    session: SessionContext = Depends(get_session_context),
+    db: AsyncSession = Depends(get_session),
+) -> ExitProximityResponse:
+    """Return latest-per-position exit proximity for the Today "Exits" view.
+
+    PR-B of ``Docs/exit-proximity-design.md`` (Q3 = Today page, beside
+    Positions). Daily-resolution data: each row is the most recent
+    ``exit_proximity`` entry for an open market, written by the LEAN cycle
+    heartbeat handler (``services/api/routes/internal/lean.py``) + enriched
+    with the working ``stop_market`` order's stop price (Q1 = (B)). Rows are
+    ordered closest-to-closing — TRIGGERED first, then NEAR ascending by
+    headroom, then HOLDING (design §3.3).
+
+    **Auth.** Mirrors the other Today endpoints + ``GET /api/signals/proximity``
+    — the same ``Depends(get_session_context)`` dependency enforces the
+    operator session cookie / bearer. No special service-account or role check.
+
+    **Empty-state contract.** When the table has no rows (no open positions, or
+    pre-first-cycle), returns ``{"as_of_cycle_ts_utc": null, "positions": []}``
+    so the frontend can render the "No open positions" empty state cleanly.
+
+    The session variable is unused; binding it keeps the auth dependency in the
+    function signature (FastAPI resolves dependencies for side effects even when
+    the result isn't used) — identical to ``list_signal_proximity``.
+    """
+    _ = session  # auth enforced via the dependency above; result unused
+    as_of, rows = await fetch_latest_per_market(db)
+    return ExitProximityResponse(
+        as_of_cycle_ts_utc=as_of,
+        positions=[row_to_view(row) for row in rows],
     )
 
 

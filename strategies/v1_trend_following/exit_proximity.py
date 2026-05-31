@@ -248,6 +248,54 @@ def _classify_decommission(*, decommissioned: bool) -> ExitTriggerProximity:
     )
 
 
+def combine_overall_exit(
+    *,
+    trend_flip: ExitTriggerProximity,
+    stop: ExitTriggerProximity,
+    reversal: ExitTriggerProximity,
+    decommission: ExitTriggerProximity,
+) -> tuple[ExitState, str]:
+    """Collapse the four per-trigger states into ``(overall_state, closest_exit)``.
+
+    The single source of truth for §3.3's "closest exit" rule, shared by
+    :func:`compute_position_exit_proximity` (PR-A, the LEAN-side compute) and
+    the api-side stop enrichment (PR-B of ``Docs/exit-proximity-design.md``).
+
+    PR-B MUST re-run this AFTER joining the working stop, because LEAN emits a
+    NULL-state stop under Q1 = (B): the real stop dimension can be
+    NEAR/TRIGGERED where LEAN sent HOLDING, which flips both the overall state
+    and the limiting trigger. Re-deriving here (rather than patching
+    ``stop_state`` alone) keeps the persisted row internally consistent —
+    there is exactly one combiner, so the display can never disagree about
+    which exit is closest.
+
+    Precedence: a TRIGGERED ``decommission`` (operator kill switch) wins
+    outright (it CLOSES every held position next cycle regardless of
+    indicators). Otherwise the most-advanced-toward-closing trigger wins
+    (TRIGGERED > NEAR > HOLDING), tie-broken by the smallest numeric headroom
+    (closest to its line), then the stable ``_CLOSEST_EXIT_PRECEDENCE`` order.
+    """
+    triggers: dict[str, ExitTriggerProximity] = {
+        "trend_flip": trend_flip,
+        "stop": stop,
+        "reversal": reversal,
+        "decommission": decommission,
+    }
+    if decommission.state is ExitState.TRIGGERED:
+        # Decommission takes precedence (operator kill switch closes everything).
+        return ExitState.TRIGGERED, "decommission"
+
+    # Most-advanced-toward-closing wins; tie-break by smallest numeric
+    # headroom (closest to its line), then the stable precedence order.
+    def _sort_key(item: tuple[str, ExitTriggerProximity]) -> tuple[int, Decimal, int]:
+        name, trigger = item
+        headroom_key = trigger.headroom if trigger.headroom is not None else Decimal("Infinity")
+        return (-_STATE_RANK[trigger.state], headroom_key, _CLOSEST_EXIT_PRECEDENCE[name])
+
+    closest_exit, closest_trigger = min(triggers.items(), key=_sort_key)
+    return closest_trigger.state, closest_exit
+
+
 def compute_position_exit_proximity(
     *,
     market: str,
@@ -333,26 +381,12 @@ def compute_position_exit_proximity(
         gate_status = "decommissioned"
 
     # --- overall state + closest_exit (§3.3) ------------------------------
-    triggers: dict[str, ExitTriggerProximity] = {
-        "trend_flip": trend_flip,
-        "stop": stop,
-        "reversal": reversal,
-        "decommission": decommission,
-    }
-    if decommission.state is ExitState.TRIGGERED:
-        # Decommission takes precedence (operator kill switch closes everything).
-        overall_state = ExitState.TRIGGERED
-        closest_exit = "decommission"
-    else:
-        # Most-advanced-toward-closing wins; tie-break by smallest numeric
-        # headroom (closest to its line), then the stable precedence order.
-        def _sort_key(item: tuple[str, ExitTriggerProximity]) -> tuple[int, Decimal, int]:
-            name, trigger = item
-            headroom_key = trigger.headroom if trigger.headroom is not None else Decimal("Infinity")
-            return (-_STATE_RANK[trigger.state], headroom_key, _CLOSEST_EXIT_PRECEDENCE[name])
-
-        closest_exit, closest_trigger = min(triggers.items(), key=_sort_key)
-        overall_state = closest_trigger.state
+    # One combiner, shared with the PR-B api-side stop enrichment (see
+    # ``combine_overall_exit``) so the LEAN-computed and api-persisted views
+    # can never disagree about which exit is closest.
+    overall_state, closest_exit = combine_overall_exit(
+        trend_flip=trend_flip, stop=stop, reversal=reversal, decommission=decommission
+    )
 
     return PositionExitProximity(
         market=market,
@@ -380,6 +414,7 @@ __all__ = [
     "PositionExitProximity",
     "classify_reversal",
     "classify_stop",
+    "combine_overall_exit",
     "compute_position_exit_proximity",
     "directional_reversal_entry_state",
 ]
