@@ -1600,6 +1600,13 @@ async def _start_bar_sync_worker(
     )
     alert_dispatch_hook = _build_bar_sync_alert_dispatch_hook(settings)
     worker = BarSyncWorker(config=config, partial_cycle_alert_hook=alert_dispatch_hook)
+    # Register the worker with the read-only status provider so
+    # GET /api/system/bar-sync (+ the Discord /barsync command) can read
+    # the last cycle outcome without SSHing to grep journald. In-memory
+    # only; mirrors the heartbeat registry. See services/api/bar_sync_status.py.
+    from services.api.bar_sync_status import get_bar_sync_status_provider
+
+    get_bar_sync_status_provider().set_source(worker)
     task = asyncio.create_task(worker.run_forever(), name="bar_sync_worker.run_forever")
     log.info(
         "bar_sync_worker_spawned",
@@ -1619,6 +1626,11 @@ async def _start_bar_sync_worker(
 
 async def _stop_bar_sync_worker(state: tuple[object, object] | None) -> None:
     """Request stop + await the worker task. Best-effort."""
+    # Clear the status provider unconditionally so a stale worker handle
+    # can't outlive the lifespan (the next start re-registers a fresh one).
+    from services.api.bar_sync_status import get_bar_sync_status_provider
+
+    get_bar_sync_status_provider().clear()
     if state is None:
         return
     worker, task = state

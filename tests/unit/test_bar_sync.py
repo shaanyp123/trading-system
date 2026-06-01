@@ -3288,6 +3288,60 @@ class TestBarSyncWorkerCycle:
         assert result.successful_markets[0].market == "TLT"
         assert result.failed_markets[0].market == "/MES"
 
+    def test_last_cycle_result_none_before_first_cycle(self, small_config: BarSyncConfig) -> None:
+        worker = BarSyncWorker(
+            config=small_config,
+            ib_factory=_FakeIb,
+            clock=lambda: datetime(2026, 5, 19, 21, 0, tzinfo=UTC),
+        )
+        assert worker.last_cycle_result is None
+        assert worker.consecutive_failure_count == 0
+        assert worker.consecutive_sentinel_count == 0
+
+    def test_run_cycle_stores_last_cycle_result(self, small_config: BarSyncConfig) -> None:
+        ib = _FakeIb()
+        ib.historical_bars = [
+            _FakeBarData(
+                date=date(2026, 5, 19), open=100, high=101, low=99, close=100.5, volume=10
+            ),
+        ]
+        ib.contract_details = [
+            _FakeContractDetails(_FakeContract(lastTradeDateOrContractMonth="20260620")),
+        ]
+        worker = BarSyncWorker(
+            config=small_config,
+            ib_factory=lambda: ib,
+            clock=lambda: datetime(2026, 5, 19, 21, 0, tzinfo=UTC),
+        )
+        result = asyncio.run(worker.run_cycle(today=date(2026, 5, 19)))
+        # The accessor returns the same result object run_cycle produced.
+        assert worker.last_cycle_result is result
+        assert worker.last_cycle_result is not None
+        assert len(worker.last_cycle_result.successful_markets) == 2
+        # Clean cycle → both counters at 0.
+        assert worker.consecutive_failure_count == 0
+
+    def test_consecutive_failure_count_exposed_after_dirty_cycle(
+        self, small_config: BarSyncConfig
+    ) -> None:
+        # No live front-month for /MES → that market fails (a dirty cycle).
+        ib = _FakeIb()
+        ib.historical_bars = [
+            _FakeBarData(
+                date=date(2026, 5, 19), open=100, high=101, low=99, close=100.5, volume=10
+            ),
+        ]
+        ib.contract_details = []  # /MES fails
+        worker = BarSyncWorker(
+            config=small_config,
+            ib_factory=lambda: ib,
+            clock=lambda: datetime(2026, 5, 19, 21, 0, tzinfo=UTC),
+        )
+        asyncio.run(worker.run_cycle(today=date(2026, 5, 19)))
+        assert worker.consecutive_failure_count == 1
+        assert worker.last_cycle_result is not None
+        assert len(worker.last_cycle_result.failed_markets) == 1
+
     def test_run_cycle_sets_market_data_type_before_market_loop(
         self, small_config: BarSyncConfig
     ) -> None:
