@@ -2026,6 +2026,13 @@ class BarSyncWorker:
         # to 0 on a fully-clean cycle (no failures, no sentinels).
         self._consecutive_failure_count: int = 0
         self._consecutive_sentinel_count: int = 0
+        # Most-recent cycle outcome, retained in memory for the read-only
+        # ``GET /api/system/bar-sync`` status surface (mirrors the
+        # heartbeat-registry precedent in ``services/api/heartbeats.py`` —
+        # in-memory, not a DB table; lost on api restart, which the status
+        # endpoint reports honestly as "no cycle since restart"). ``None``
+        # until the first cycle fires.
+        self._last_cycle_result: BarSyncCycleResult | None = None
         self._log = log.bind(
             worker="bar_sync",
             sync_time_et=config.sync_time_et.isoformat(),
@@ -2049,6 +2056,33 @@ class BarSyncWorker:
     @property
     def is_running(self) -> bool:
         return self._is_running
+
+    @property
+    def last_cycle_result(self) -> BarSyncCycleResult | None:
+        """Most-recent :class:`BarSyncCycleResult`, or None before the first cycle.
+
+        Retained in memory for the read-only status surface; not persisted.
+        After an api restart this reads None until the next cycle fires.
+        """
+        return self._last_cycle_result
+
+    @property
+    def consecutive_failure_count(self) -> int:
+        """Consecutive cycles (incl. the latest) that had ≥1 failed market.
+
+        Resets to 0 on a fully-clean cycle. Mirrors the partial-cycle
+        alert counter; exposed read-only for the status surface.
+        """
+        return self._consecutive_failure_count
+
+    @property
+    def consecutive_sentinel_count(self) -> int:
+        """Consecutive cycles (incl. the latest) that OI-sentinel-substituted.
+
+        Resets to 0 on a cycle with no sentinel substitution. Exposed
+        read-only for the status surface.
+        """
+        return self._consecutive_sentinel_count
 
     async def maybe_fire(self) -> BarSyncCycleResult | None:
         """If the schedule says fire-now, run the cycle. Otherwise no-op.
@@ -2231,6 +2265,11 @@ class BarSyncWorker:
             successful_markets=tuple(successful),
             failed_markets=tuple(failed),
         )
+        # Retain for the read-only status surface. Set BEFORE alert
+        # evaluation so the consecutive counters the endpoint reads are
+        # consistent with this same result (``_evaluate_alerts`` updates
+        # the counters below).
+        self._last_cycle_result = cycle_result
         self._log.info(
             "bar_sync_cycle_completed",
             session_date_et=today.isoformat(),

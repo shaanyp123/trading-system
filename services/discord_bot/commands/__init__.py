@@ -24,6 +24,7 @@ module per spec §6.7 layout).
 """
 
 from services.discord_bot.commands.approve import register_approve
+from services.discord_bot.commands.bar_sync import register_bar_sync
 from services.discord_bot.commands.capital import register_capital_event_commands
 from services.discord_bot.commands.halt import register_halt
 from services.discord_bot.commands.positions import register_positions
@@ -31,6 +32,7 @@ from services.discord_bot.commands.status import register_status
 
 __all__ = [
     "register_approve",
+    "register_bar_sync",
     "register_capital_event_commands",
     "register_halt",
     "register_positions",

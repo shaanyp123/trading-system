@@ -37,6 +37,7 @@ import discord
 
 from services.discord_bot.api_client import (
     ApiClientHTTPError,
+    BarSyncStatusResponse,
     HealthResponse,
     PositionsResponse,
     SignalApproveResponse,
@@ -490,6 +491,96 @@ def build_status_embed(
 
 
 # ---------------------------------------------------------------------------
+# /barsync — last bar_sync cycle outcome
+# ---------------------------------------------------------------------------
+
+
+def build_bar_sync_embed(
+    response: BarSyncStatusResponse,
+    *,
+    environment: str,
+    now: datetime,
+) -> discord.Embed:
+    """Build the ``/barsync`` embed from ``GET /api/system/bar-sync``.
+
+    Three color/title branches off ``response.status``:
+
+      * ``ok`` — green; "Bar sync OK" + per-market counts + duration.
+      * ``degraded`` — amber; lists the failed markets so the operator
+        sees which symbol(s) missed before LEAN's 21:30 UTC read.
+      * ``pending`` — info blue; "no cycle since restart" (NOT a fault).
+
+    ``consecutive_failure_count`` / ``consecutive_sentinel_count`` are
+    surfaced only when non-zero — a clean steady state stays uncluttered.
+    """
+    if response.status == "ok":
+        color = EMBED_COLOR_OK
+        headline = "Bar sync OK"
+    elif response.status == "degraded":
+        color = EMBED_COLOR_WARNING
+        headline = "Bar sync DEGRADED"
+    else:
+        color = EMBED_COLOR_INFO
+        headline = "Bar sync pending"
+
+    title = f"{headline} — {_env_pill(environment)} · {_format_et(now)}"
+    embed = discord.Embed(title=title, color=color)
+
+    if response.status == "pending":
+        # No cycle has run since the api last restarted.
+        running = "running" if response.worker_running else "not running"
+        last_fired = response.last_fired_session_date_et or "never"
+        embed.description = (
+            f"No bar_sync cycle recorded since the api last restarted "
+            f"(worker {running}). Last fired session: `{last_fired}`."
+        )
+        embed.set_footer(text=f"trading-system bot · {env_tag(environment)}")
+        return embed
+
+    embed.add_field(
+        name="Markets",
+        value=f"✅ `{response.successful_count}` / ❌ `{response.failed_count}` "
+        f"of `{response.total_markets}`",
+        inline=True,
+    )
+    if response.duration_seconds is not None:
+        embed.add_field(
+            name="Duration",
+            value=f"`{response.duration_seconds}s`",
+            inline=True,
+        )
+    if response.cycle_completed_at_utc is not None:
+        embed.add_field(
+            name="Completed",
+            value=f"`{_format_et(response.cycle_completed_at_utc, with_date=True)}`",
+            inline=True,
+        )
+
+    if response.failed_markets:
+        fail_lines = [
+            f"❌ `{m.market}` — {m.error or 'unknown error'}" for m in response.failed_markets
+        ]
+        # Discord field-value cap is 1024 chars; the Phase-1 universe is 11
+        # markets so the joined text stays well under, but truncate
+        # defensively to keep the embed valid if error strings balloon.
+        value = "\n".join(fail_lines)
+        if len(value) > 1024:
+            value = value[:1010] + "\n… (truncated)"
+        embed.add_field(name="Failed markets", value=value, inline=False)
+
+    badges = []
+    if response.consecutive_failure_count > 0:
+        badges.append(f"consecutive dirty cycles: `{response.consecutive_failure_count}`")
+    if response.consecutive_sentinel_count > 0:
+        badges.append(f"consecutive OI-sentinel cycles: `{response.consecutive_sentinel_count}`")
+    if badges:
+        embed.add_field(name="Watch", value="\n".join(badges), inline=False)
+
+    embed.set_footer(text=f"trading-system bot · {env_tag(environment)}")
+    return embed
+
+
+# ---------------------------------------------------------------------------
 # /approve — confirm + post-confirm embeds
 # ---------------------------------------------------------------------------
 
@@ -644,6 +735,7 @@ __all__ = [
     "build_approve_error_embed",
     "build_approve_invalid_uuid_embed",
     "build_approve_success_embed",
+    "build_bar_sync_embed",
     "build_halt_confirm_embed",
     "build_halt_invoke_error_embed",
     "build_halt_invoke_success_embed",

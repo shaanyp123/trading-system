@@ -110,6 +110,51 @@ class PositionsResponse(BaseModel):
     as_of: datetime
 
 
+class BarSyncMarketResult(BaseModel):
+    """One market's outcome from ``GET /api/system/bar-sync``.
+
+    Mirrors ``services/api/schemas/system.BarSyncMarketResult``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    market: str
+    success: bool
+    bars_written: int
+    last_session_date: str | None
+    front_month_expiry: str | None
+    error: str | None
+    open_interest: int | None
+    open_interest_was_sentinel: bool
+
+
+class BarSyncStatusResponse(BaseModel):
+    """``GET /api/system/bar-sync`` response shape.
+
+    Mirrors ``services/api/schemas/system.BarSyncStatusResponse`` — the
+    read-only projection of the last bar_sync cycle. ``status="pending"``
+    means no cycle has run since the api last restarted (per-cycle fields
+    null/empty in that branch).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["ok", "degraded", "pending"]
+    worker_running: bool
+    last_fired_session_date_et: str | None
+    cycle_started_at_utc: datetime | None
+    cycle_completed_at_utc: datetime | None
+    duration_seconds: float | None
+    successful_count: int
+    failed_count: int
+    total_markets: int
+    consecutive_failure_count: int
+    consecutive_sentinel_count: int
+    successful_markets: list[BarSyncMarketResult]
+    failed_markets: list[BarSyncMarketResult]
+    server_now: datetime
+
+
 # ---------------------------------------------------------------------------
 # Request models
 # ---------------------------------------------------------------------------
@@ -342,6 +387,19 @@ class ApiClient:
             self._raise_for_response(response)
         return PositionsResponse.model_validate(response.json())
 
+    async def get_bar_sync_status(self) -> BarSyncStatusResponse:
+        """``GET /api/system/bar-sync`` — last bar_sync cycle outcome.
+
+        Requires bot bearer auth. Raises :class:`ApiClientHTTPError` on
+        non-2xx. A ``status="pending"`` body (no cycle since restart) is a
+        valid 200 — the ``/barsync`` command renders it as an info embed,
+        not an error.
+        """
+        response = await self._client.get("/api/system/bar-sync")
+        if response.status_code != 200:
+            self._raise_for_response(response)
+        return BarSyncStatusResponse.model_validate(response.json())
+
     async def approve_signal(
         self,
         signal_id: str,
@@ -461,6 +519,8 @@ __all__ = [
     "ApiClient",
     "ApiClientError",
     "ApiClientHTTPError",
+    "BarSyncMarketResult",
+    "BarSyncStatusResponse",
     "CapitalEventInvokePayload",
     "CapitalEventInvokeResponse",
     "HealthCheck",
