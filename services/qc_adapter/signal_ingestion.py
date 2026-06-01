@@ -58,6 +58,7 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import structlog
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from services.audit.chain import jcs_serialize
@@ -108,6 +109,30 @@ _VALID_EXIT_REASONS: Final[frozenset[str]] = frozenset({"reversal", "trend_flip"
 class SignalIngestError(ValueError):
     """Raised on payload-shape problems — caller routes the bad record
     to ``data_quality_events`` instead of into ``signals``."""
+
+
+class DuplicateInFlightExitError(Exception):
+    """Raised when an exit signal duplicates a non-terminal exit already in
+    flight for the same ``(account, env, market)`` (PR-A2 idempotency guard).
+
+    NOT a :class:`SignalIngestError` — the payload is well-formed, so this is a
+    legitimate dedup, not a data-quality failure. The LEAN route maps it to a
+    benign success (``accepted=False`` at the endpoint's 202), NOT a ``422`` /
+    ``data_quality_events`` route, so a re-emit of an already-pending exit is a
+    no-op rather than a noisy "invalid payload" error.
+
+    Why this is needed: once indicator exits fire on the api's real positions
+    (PR-A2), a trend_flip persists every cycle until the close fills, so the
+    strategy would re-POST the same exit each night — and two approved duplicates
+    could double-close inside the fill window. This is the server-side chokepoint;
+    LEAN also suppresses client-side via ``exits_in_flight``. See
+    ``Docs/exit-pipeline-design.md`` + ``Docs/decisions-log.md`` 2026-05-31.
+    """
+
+    def __init__(self, *, market: str, env: str) -> None:
+        self.market = market
+        self.env = env
+        super().__init__(f"exit already in flight for market={market!r} env={env!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,6 +291,20 @@ async def ingest_signal_emitted(
                     f"{payload.get(forbidden)!r}"
                 )
 
+    # ---- PR-A2: in-flight-exit idempotency guard (server-side chokepoint) ----
+    # Reject a NEW exit when a non-terminal exit already exists for
+    # (account, env, market). Runs AFTER payload validation but BEFORE the
+    # audit-first write, so a duplicate lands NO audit row + NO signals row.
+    # Distinct from SignalIngestError: a duplicate exit is well-formed, so the
+    # route maps DuplicateInFlightExitError to a benign 200 (not a 422 /
+    # data_quality route). Defense-in-depth alongside LEAN's client-side
+    # exits_in_flight suppression. See Docs/decisions-log.md 2026-05-31.
+    if signal_type == "exit" and await _exit_in_flight_exists(
+        session_factory, account_id=account_id, env=env, market=market
+    ):
+        log.info("qc_exit_signal_duplicate_suppressed", market=market, env=env)
+        raise DuplicateInFlightExitError(market=market, env=env)
+
     # Build the AUDIT payload — must be A05-clean (no floats). Convert
     # the entire payload's money-shaped fields to Decimal via _convert_floats.
     audit_payload: dict[str, Any] = {
@@ -364,6 +403,56 @@ async def ingest_signal_emitted(
         audit_event_uuid=audit_record.event_uuid,
         signal_id=signal_id,
     )
+
+
+# ---------------------------------------------------------------------------
+# PR-A2 in-flight-exit idempotency
+# ---------------------------------------------------------------------------
+
+
+async def _exit_in_flight_exists(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    account_id: UUID,
+    env: Environment,
+    market: str,
+) -> bool:
+    """True when an exit for (account, env, market) is still GENUINELY IN FLIGHT.
+
+    **In-flight allowlist** — block re-emit ONLY while an exit is actively trying
+    to close the CURRENT position (``pending/approved/deferred/working/
+    partially_filled``). A *completed* exit (``filled/closed/stopped_out``) must
+    NOT block, or a re-opened position's next exit would be permanently
+    suppressed; ``rejected/cancelled/expired`` + the never-dispatched drop states
+    are likewise re-emittable. Keep IN SYNC with the LEAN-suppression repo method
+    ``services/api/repos/phase1.py::fetch_inflight_exit_markets`` (this is the
+    cross-night semantic — distinct from the operator tool's session-scoped
+    ``fetch_already_emitted_exits``).
+
+    NOTE (TOCTOU): this SELECT and the later audit+INSERT run in separate
+    transactions with no unique constraint, so two concurrent first-exit POSTs
+    for the same market could both pass. Safe for V1 — the nightly LEAN cycle is
+    single-threaded, the LEAN-side ``exits_in_flight`` suppression is the first
+    line, and even a double-insert only yields two ``pending`` rows the operator
+    individually approves (the dispatcher's fresh-read flat guard catches a true
+    double-close at place-order time). Revisit (e.g. a partial unique index)
+    before ``EXIT_AUTO_APPROVE`` ships and removes the operator backstop.
+    Read-only, own session (the writer manages its own SERIALIZABLE transactions).
+    """
+    async with session_factory() as session:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT 1 FROM signals "
+                    "WHERE account_id = :acc AND env = :env AND market = :market "
+                    "  AND signal_type = 'exit' "
+                    "  AND status IN ('pending','approved','deferred','working','partially_filled') "
+                    "LIMIT 1"
+                ),
+                {"acc": account_id, "env": env, "market": market},
+            )
+        ).fetchone()
+    return row is not None
 
 
 # ---------------------------------------------------------------------------

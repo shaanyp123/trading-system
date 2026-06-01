@@ -78,6 +78,15 @@ symbols that mypy can't resolve. Lint discipline for this file is "matches
 LEAN's published examples"; we don't enforce our backend conventions here.
 """
 
+# ``from __future__ import annotations`` (PEP 563) makes all annotations lazy
+# strings so QC type names used in method signatures (e.g. ``data: Slice``) are
+# NOT evaluated at class-definition time. This keeps the module importable
+# outside LEAN's runtime with only ``QCAlgorithm`` stubbed, which lets the pure
+# module-level helpers (``_position_from_api_row``, ``_coerce_bool_param``) be
+# unit-tested directly (tests/unit/test_lean_live_positions.py). LEAN never
+# introspects strategy annotations at runtime, so this is behavior-preserving.
+from __future__ import annotations
+
 # LEAN injects these symbols from `AlgorithmImports`; type: ignore because the
 # import only resolves inside LEAN's runtime / Docker container.
 # ruff: noqa: F401, N802, N803, N806  -- LEAN API symbols
@@ -193,6 +202,42 @@ def _coerce_bool_param(value) -> bool:  # noqa: ANN001 — LEAN dict[str, str] s
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() == "true"
+
+
+def _position_from_api_row(row) -> Position:  # noqa: ANN001 — JSON dict from the api; untyped on purpose
+    """Map one ``GET /api/internal/lean/positions`` item → strategy ``Position`` (PR-A2).
+
+    Pure + module-level so it is unit-testable without the LEAN runtime. Mirrors
+    ``scripts/operator_tools/trigger_v1_cycle.py::build_position_from_row``:
+    quantity sign drives direction (positive=LONG, negative=SHORT, zero=FLAT).
+    ``opened_at_session_date`` is the api-computed ET calendar date (already
+    DST-aware), so no tzdata is needed here — a missing/blank value (no open
+    trade recorded) leaves it None and the strategy conservatively skips the
+    MIN_HOLDING_DAYS gate.
+    """
+    quantity = int(row["quantity"])
+    if quantity > 0:
+        direction = Direction.LONG
+    elif quantity < 0:
+        direction = Direction.SHORT
+    else:
+        direction = Direction.FLAT
+
+    opened_at_session_date: _date | None = None
+    raw_opened = row.get("opened_at_session_date")
+    if direction is not Direction.FLAT and raw_opened:
+        try:
+            opened_at_session_date = _date.fromisoformat(str(raw_opened))
+        except ValueError:
+            opened_at_session_date = None
+
+    return Position(
+        market=str(row["market"]),
+        direction=direction,
+        quantity=quantity,
+        avg_cost=Decimal(str(row["avg_cost"])),
+        opened_at_session_date=opened_at_session_date,
+    )
 
 
 class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]  # noqa: F405
@@ -505,6 +550,28 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         self._strategy_min_bars = strategy.min_required_bars
 
         # Step 3-4: build active universe + positions.
+        #
+        # PR-A2: the position source is LIVE-MODE-AWARE. Under PaperBrokerage
+        # live-mode ``self.portfolio`` is empty (the api owns positions), which
+        # left both the exit pipeline AND the entry anti-pyramiding guard
+        # dormant (Docs/decisions-log.md 2026-05-31). In live mode we GET the
+        # api's REAL open positions + the in-flight-exit set; these feed BOTH
+        # generate_signals (POSITION_ALREADY_SAME_DIRECTION) and
+        # generate_exit_candidates (trend_flip / reversal / decommission). In
+        # BACKTEST we keep ``_snapshot_position`` so backtest behavior is
+        # byte-for-byte unchanged. FAIL SAFE: a live fetch failure falls back to
+        # the empty snapshot (today's behavior — legit new entries still fire,
+        # no spurious exits) and flags the heartbeat.
+        live_positions: dict[str, Position] | None = None
+        exits_in_flight: frozenset[str] = frozenset()
+        positions_fetch_failed = False
+        if self.live_mode:
+            fetched = self._fetch_live_positions()
+            if fetched is None:
+                positions_fetch_failed = True
+            else:
+                live_positions, exits_in_flight = fetched
+
         active_universe: dict[str, BarSeries] = {}
         current_positions: dict[str, Position] = {}
         history_failures: list[str] = []
@@ -518,9 +585,19 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
                 history_failures.append(market_key)
                 continue
             active_universe[market_key] = series
-            current_positions[market_key] = self._snapshot_position(
-                market_key=market_key, symbol=symbol
-            )
+            if live_positions is None:
+                # Backtest, or live fetch failed (fail-safe) → LEAN snapshot
+                # (empty under live PaperBrokerage; populated in backtest).
+                current_positions[market_key] = self._snapshot_position(
+                    market_key=market_key, symbol=symbol
+                )
+
+        if live_positions is not None:
+            # Live: the api's real positions are authoritative and cover ALL held
+            # markets — including any whose bars failed to load this cycle, so a
+            # decommission close can still fire (trend_flip self-skips on
+            # INSUFFICIENT_BAR_HISTORY inside generate_exit_candidates).
+            current_positions = dict(live_positions)
 
         if history_failures:
             self.log(
@@ -615,6 +692,12 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         # observes it (and a thin follow-up can escalate to a P1 Discord alert).
         if self._parameters_fetch_failed:
             heartbeat_extra["error"] = "parameters_fetch_failed"
+        elif positions_fetch_failed:
+            # PR-A2: surface the live-positions fetch failure on the heartbeat.
+            # Lower priority than parameters_fetch_failed (which has its own P1
+            # alert keyed on the exact string) so the param alert is never
+            # masked; this cycle already fell back to the empty snapshot above.
+            heartbeat_extra["error"] = "positions_fetch_failed"
         self._post_event("lean_cycle_heartbeat", extra=heartbeat_extra)
 
         # Step 7: emit each entry signal.
@@ -663,6 +746,7 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
                 exit_result=exit_result,
                 session_date=session_date,
                 equity=equity,
+                exits_in_flight=exits_in_flight,
             )
         return
 
@@ -733,6 +817,7 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         exit_result,  # noqa: ANN001  -- ExitGenerationResult; LEAN runtime
         session_date,  # noqa: ANN001  -- date; LEAN runtime
         equity,  # noqa: ANN001  -- Decimal; LEAN runtime
+        exits_in_flight=frozenset(),  # noqa: ANN001  -- frozenset[str]; LEAN runtime
     ) -> None:
         """POST each exit candidate computed by ``_generate_exits``.
 
@@ -740,8 +825,22 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         can't suppress the others. Called after the heartbeat (and after the
         entry POSTs) per the cycle ordering — generation already happened so
         the proximity could ride the heartbeat.
+
+        PR-A2 idempotency: skip a market that already has a non-terminal exit
+        in flight (``exits_in_flight``, from the positions endpoint). Without
+        this, a trend_flip — which persists every cycle until the close fills —
+        would re-POST the same exit each night. The server-side ingest guard
+        (``DuplicateInFlightExitError``) backstops this for any that slip
+        through; suppressing here avoids the wasted POST + benign-200 noise.
+        ``exits_in_flight`` is always empty in backtest (it is live-only).
         """
         for exit_signal in exit_result.signals:
+            if exit_signal.market in exits_in_flight:
+                self.log(
+                    f"v1_exit_suppressed_in_flight session_date={session_date} "
+                    f"market={exit_signal.market} exit_reason={exit_signal.exit_reason}"
+                )
+                continue
             payload = self._build_exit_signal_payload(
                 exit_signal=exit_signal,
                 session_date=session_date,
@@ -1296,6 +1395,83 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
     # ------------------------------------------------------------------
     # HTTP POST plumbing (Pivot-PR-A)
     # ------------------------------------------------------------------
+
+    def _fetch_live_positions(self):  # noqa: ANN201 — tuple[dict[str,Position], frozenset[str]] | None; LEAN runtime
+        """GET the api's real open positions for the live cycle (PR-A2).
+
+        Returns ``(positions_by_market, exits_in_flight)`` on success, or
+        ``None`` on ANY failure (HTTP / network / non-2xx / malformed body).
+        The caller FAILS SAFE on ``None`` — falls back to the empty
+        ``self.portfolio`` snapshot (today's behavior: no spurious exits; IBKR
+        bracket stops still protect held positions) and flags the heartbeat.
+
+        Live mode only: under PaperBrokerage ``self.portfolio`` is empty (the
+        api owns positions), which is why indicator exits were dormant
+        (``Docs/decisions-log.md`` 2026-05-31). In backtest LEAN's own portfolio
+        is authoritative, so the caller does not invoke this. Reuses the same
+        base URL + bearer + short timeout as :meth:`_post_event` /
+        :meth:`_fetch_active_decommission_flag`.
+        """
+        url = f"{self._api_base_url.rstrip('/')}/api/internal/lean/positions"
+        try:
+            req = urllib.request.Request(
+                url=url,
+                method="GET",
+                headers={
+                    "Authorization": f"Bearer {self._api_bearer_token}",
+                    "User-Agent": "trading-lean-local/0.1",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=_API_TIMEOUT_SECONDS) as response:
+                if response.status >= 400:
+                    self.log(f"lean_positions_fetch_failed http_status={response.status}")
+                    return None
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            self.log(f"lean_positions_fetch_failed http_error status={exc.code} reason={exc.reason}")
+            return None
+        except urllib.error.URLError as exc:
+            self.log(f"lean_positions_fetch_failed url_error reason={exc.reason}")
+            return None
+        except Exception as exc:  # noqa: BLE001 -- best-effort net I/O; fail-safe on anything
+            self.log(f"lean_positions_fetch_failed unexpected exc={exc!r}")
+            return None
+
+        if not isinstance(payload, dict):
+            self.log("lean_positions_fetch_failed malformed_body_not_dict")
+            return None
+        raw_positions = payload.get("positions")
+        if not isinstance(raw_positions, list):
+            self.log("lean_positions_fetch_failed malformed_body_no_positions")
+            return None
+
+        positions_by_market: dict[str, Position] = {}
+        for raw in raw_positions:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                position = _position_from_api_row(raw)
+            except Exception as exc:  # noqa: BLE001 -- skip a malformed row, keep the rest
+                self.log(f"lean_positions_row_skipped exc={exc!r} raw={raw!r}")
+                continue
+            # The api never returns quantity=0 rows, but defend: only held
+            # positions belong in current_positions (the strategy treats
+            # absence as FLAT).
+            if position.direction is not Direction.FLAT:
+                positions_by_market[position.market] = position
+
+        raw_exits = payload.get("exits_in_flight")
+        exits_in_flight = (
+            frozenset(str(m) for m in raw_exits if isinstance(m, str))
+            if isinstance(raw_exits, list)
+            else frozenset()
+        )
+
+        self.log(
+            f"lean_positions_fetched positions_count={len(positions_by_market)} "
+            f"exits_in_flight_count={len(exits_in_flight)}"
+        )
+        return positions_by_market, exits_in_flight
 
     def _fetch_active_decommission_flag(self) -> bool | None:
         """GET the active ``STRATEGY_DECOMMISSIONED`` from the api (design §12.3).
