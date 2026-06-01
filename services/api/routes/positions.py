@@ -133,10 +133,17 @@ async def positions_current(
                 unrealized_pnl_pct_of_nav=unrealized_pct,
                 cluster=None,  # Phase 1: contracts JOIN deferred
                 managed_by_strategy_version=managed_by_version[:7],
+                price_as_of=mtm.price_as_of,
             )
         )
 
-    return PositionsResponse(positions=positions, as_of=now)
+    # Headline "prices as of" = the most-recent bar date across positions.
+    # max() over ISO YYYY-MM-DD strings sorts chronologically. None when no
+    # position read a fresh bar.
+    bar_dates = [p.price_as_of for p in positions if p.price_as_of is not None]
+    prices_as_of = max(bar_dates) if bar_dates else None
+
+    return PositionsResponse(positions=positions, as_of=now, prices_as_of=prices_as_of)
 
 
 __all__ = ["router"]

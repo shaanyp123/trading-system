@@ -65,6 +65,20 @@ _FUTURES_MEMBER_RE: Final[re.Pattern[str]] = re.compile(
 )
 
 
+def _iso_date_from_bar_field(raw: str) -> str | None:
+    """Parse a LEAN daily-bar first field → ISO ``YYYY-MM-DD``.
+
+    LEAN daily CSVs start each row with ``YYYYMMDD HH:MM`` (e.g.
+    ``"20260527 00:00"``). We take the leading ``YYYYMMDD`` and reshape
+    to ISO so the api can surface a "prices as of <date>" label. Returns
+    ``None`` if the field isn't an 8-digit date prefix.
+    """
+    head = raw.split(" ", 1)[0]
+    if len(head) >= 8 and head[:8].isdigit():
+        return f"{head[:4]}-{head[4:6]}-{head[6:8]}"
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class PositionMtmResult:
     """Return shape for :func:`compute_position_mtm`.
@@ -74,20 +88,26 @@ class PositionMtmResult:
     the position row without a null. ``unrealized_pnl`` is signed (+
     for in-the-money longs / shorts; - for losing). ``source`` is the
     diagnostic string surfaced in structlog for missing-data debugging.
+    ``price_as_of`` is the latest bar's session date (ISO ``YYYY-MM-DD``)
+    so the frontend can show "prices as of <date>" — the operator's
+    at-a-glance "did bar_sync produce fresh data" signal. ``None`` on the
+    fallback/unknown paths (no fresh bar was read).
     """
 
     current_price: Decimal
     unrealized_pnl: Decimal
     source: str  # "fresh_bar" / "fallback_avg_cost" / "unknown_market"
+    price_as_of: str | None = None
 
 
-def _read_last_bar_close(zip_path: Path, member_name: str) -> Decimal | None:
-    """Open ``zip_path``, read ``member_name``, return last row's close.
+def _read_last_bar_close(zip_path: Path, member_name: str) -> tuple[Decimal, str | None] | None:
+    """Open ``zip_path``, read ``member_name``, return (last close, ISO date).
 
     Returns ``None`` if the zip is missing, unreadable, the member
     doesn't exist, the CSV is empty, or the close field can't be
     parsed as a Decimal. All failure modes log at WARN with the
-    specific reason.
+    specific reason. The second tuple element is the bar's session date
+    (``YYYY-MM-DD``) or ``None`` if the date field is unparseable.
     """
     if not zip_path.is_file():
         return None
@@ -111,7 +131,7 @@ def _read_last_bar_close(zip_path: Path, member_name: str) -> Decimal | None:
         log.warning("position_mtm_csv_row_malformed", zip_path=str(zip_path), last_line=last_line)
         return None
     try:
-        return Decimal(parts[4])
+        close = Decimal(parts[4])
     except (ValueError, ArithmeticError) as exc:
         log.warning(
             "position_mtm_close_unparseable",
@@ -120,11 +140,12 @@ def _read_last_bar_close(zip_path: Path, member_name: str) -> Decimal | None:
             error=str(exc),
         )
         return None
+    return close, _iso_date_from_bar_field(parts[0])
 
 
-def _read_futures_latest_close(zip_path: Path) -> Decimal | None:
+def _read_futures_latest_close(zip_path: Path) -> tuple[Decimal, str | None] | None:
     """For a futures-daily zip, find the member whose last bar has the
-    largest session_date + return that close.
+    largest session_date + return (that close, its ISO session date).
 
     Multiple per-contract-month CSV members may coexist (PR #229
     historical-contract backfill). The current front-month's CSV has
@@ -168,14 +189,16 @@ def _read_futures_latest_close(zip_path: Path) -> Decimal | None:
                     continue
                 if best is None or (last_date, yyyymm) > (best[0], best[1]):
                     best = (last_date, yyyymm, close)
-            return best[2] if best is not None else None
+            if best is None:
+                return None
+            return best[2], _iso_date_from_bar_field(best[0])
     except (zipfile.BadZipFile, OSError) as exc:
         log.warning("position_mtm_zip_read_failed", zip_path=str(zip_path), error=str(exc))
         return None
 
 
-def fetch_current_price(market: str, data_root: Path) -> Decimal | None:
-    """Return the latest on-disk bar close for ``market`` in dollars,
+def _fetch_price_and_date(market: str, data_root: Path) -> tuple[Decimal, str | None] | None:
+    """Return ``(latest bar close in dollars, ISO session date)`` for ``market``,
     or ``None`` if data is unavailable.
 
     Routes ETFs to ``equity_daily_zip_path`` + futures to
@@ -189,18 +212,30 @@ def fetch_current_price(market: str, data_root: Path) -> Decimal | None:
     if universe_meta.kind == "etf":
         zip_path = equity_daily_zip_path(data_root, universe_meta.ibkr_symbol)
         member = f"{universe_meta.ibkr_symbol.lower()}.csv"
-        raw_close = _read_last_bar_close(zip_path, member)
-        if raw_close is None:
+        res = _read_last_bar_close(zip_path, member)
+        if res is None:
             return None
-        return (raw_close / _EQUITY_DECI_CENTS_PER_DOLLAR).quantize(Decimal("0.0001"))
+        raw_close, bar_date = res
+        return (raw_close / _EQUITY_DECI_CENTS_PER_DOLLAR).quantize(Decimal("0.0001")), bar_date
     # Futures branch
     zip_path = futures_trade_zip_path(
         data_root, universe_meta.ibkr_symbol, universe_meta.market_dir
     )
-    raw_close = _read_futures_latest_close(zip_path)
-    if raw_close is None:
+    res = _read_futures_latest_close(zip_path)
+    if res is None:
         return None
-    return raw_close.quantize(Decimal("0.0001"))
+    raw_close, bar_date = res
+    return raw_close.quantize(Decimal("0.0001")), bar_date
+
+
+def fetch_current_price(market: str, data_root: Path) -> Decimal | None:
+    """Return the latest on-disk bar close for ``market`` in dollars,
+    or ``None`` if data is unavailable. Thin wrapper over
+    :func:`_fetch_price_and_date` (drops the date) for callers that only
+    need the price.
+    """
+    res = _fetch_price_and_date(market, data_root)
+    return res[0] if res is not None else None
 
 
 def compute_position_mtm(
@@ -227,13 +262,15 @@ def compute_position_mtm(
             source="unknown_market",
         )
 
-    current_price = fetch_current_price(market, data_root)
-    if current_price is None:
+    price_and_date = _fetch_price_and_date(market, data_root)
+    if price_and_date is None:
         return PositionMtmResult(
             current_price=avg_cost,
             unrealized_pnl=Decimal("0"),
             source="fallback_avg_cost",
+            price_as_of=None,
         )
+    current_price, price_as_of = price_and_date
 
     # Direction-aware: a SHORT with qty=-1 gains when current_price drops
     # below avg_cost. The multiplication signs work out as long as we
@@ -248,6 +285,7 @@ def compute_position_mtm(
         current_price=current_price,
         unrealized_pnl=unrealized,
         source="fresh_bar",
+        price_as_of=price_as_of,
     )
 
 
