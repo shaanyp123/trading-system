@@ -77,6 +77,24 @@ export function formatDateTimeET(iso: string | null | undefined): string {
 }
 
 /**
+ * True when `iso` is within `withinHours` of `nowIso` — i.e. a daily cycle ran
+ * "recently" (today's cycle happened). Returns `null` when either input is
+ * missing/unparseable so the caller can render an "unknown" (grey) state rather
+ * than a misleading fresh/stale. Used by the Today pipeline-freshness strip.
+ */
+export function isWithinHours(
+  iso: string | null | undefined,
+  withinHours: number,
+  nowIso: string | null | undefined,
+): boolean | null {
+  if (iso == null || iso === '' || nowIso == null || nowIso === '') return null;
+  const t = new Date(iso).getTime();
+  const now = new Date(nowIso).getTime();
+  if (Number.isNaN(t) || Number.isNaN(now)) return null;
+  return now - t <= withinHours * 3_600_000;
+}
+
+/**
  * Format a Decimal-string P&L value with sign prefix + thousands separator.
  *
  * Phase 0 payloads return "0" which renders as "$0.00" (no sign). Negative

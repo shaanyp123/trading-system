@@ -50,7 +50,7 @@ import {
   type PositionExitProximityView,
 } from '@/lib/api/exit-proximity';
 import { usePositionsCurrent } from '@/lib/api/queries';
-import { formatPrice, formatTimeETShort } from '@/lib/format';
+import { formatDateTimeET, formatPrice, formatTimeETShort } from '@/lib/format';
 import { cn } from '@/lib/utils';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import {
@@ -84,6 +84,11 @@ export function ExitWatchingSection(): JSX.Element {
           trigger&apos;s band, TRIGGERED&nbsp;= closing this cycle. Ordered
           closest-to-closing.
         </p>
+        {data?.as_of_cycle_ts_utc != null && (
+          <p className="text-xs text-text-muted" title="When the LEAN cycle that produced this view last ran">
+            As of cycle {formatDateTimeET(data.as_of_cycle_ts_utc)}
+          </p>
+        )}
       </CardHeader>
       <CardContent>
         {isLoading && <p className="text-sm text-text-muted">Loading…</p>}

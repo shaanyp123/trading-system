@@ -124,11 +124,18 @@ export interface Position {
   readonly unrealized_pnl_pct_of_nav: string;
   readonly cluster: PositionCluster | null;
   readonly managed_by_strategy_version: string;
+  /** Session date (ET, YYYY-MM-DD) of the bar `current_price` came from — i.e.
+   *  when bar_sync last produced data for this market. null on the avg_cost
+   *  fallback (no fresh bar). */
+  readonly price_as_of: string | null;
 }
 
 export interface PositionsResponse {
   readonly positions: readonly Position[];
   readonly as_of: string;
+  /** Most-recent bar date across positions (YYYY-MM-DD) — the "prices as of"
+   *  headline. null when no position has a fresh bar. */
+  readonly prices_as_of: string | null;
 }
 
 // ---------------------------------------------------------------------------

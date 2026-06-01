@@ -19,6 +19,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from services.api.position_mtm import (
+    _iso_date_from_bar_field,
     compute_position_mtm,
     fetch_current_price,
 )
@@ -199,3 +200,29 @@ class TestComputePositionMtm:
         assert result.source == "unknown_market"
         assert result.current_price == Decimal("100")
         assert result.unrealized_pnl == Decimal("0")
+
+
+class TestPriceAsOf:
+    """``price_as_of`` = the latest bar's session date (data-freshness feature)."""
+
+    def test_iso_date_from_bar_field(self) -> None:
+        assert _iso_date_from_bar_field("20260527 00:00") == "2026-05-27"
+        assert _iso_date_from_bar_field("20260601") == "2026-06-01"
+        assert _iso_date_from_bar_field("garbage") is None
+        assert _iso_date_from_bar_field("") is None
+
+    def test_etf_price_as_of_is_last_bar_date(self, tmp_path: Path) -> None:
+        csv_body = (
+            "20260520 00:00,837000,838500,835000,837200,1000000\n"
+            "20260527 00:00,838000,840100,835100,836400,1234567\n"
+        )
+        _write_etf_zip(tmp_path, "TLT", csv_body=csv_body)
+        result = compute_position_mtm("TLT", 1, Decimal("90"), tmp_path)
+        assert result.source == "fresh_bar"
+        assert result.price_as_of == "2026-05-27"  # last bar, not the earlier one
+
+    def test_fallback_price_as_of_is_none(self, tmp_path: Path) -> None:
+        # No zip on disk → fallback to avg_cost, no bar date to report.
+        result = compute_position_mtm("TLT", 1, Decimal("90"), tmp_path)
+        assert result.source == "fallback_avg_cost"
+        assert result.price_as_of is None

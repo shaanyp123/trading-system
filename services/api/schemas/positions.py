@@ -57,6 +57,11 @@ class Position(BaseModel):
     unrealized_pnl_pct_of_nav: Decimal
     cluster: PositionCluster | None
     managed_by_strategy_version: str
+    #: Session date (ET, ``YYYY-MM-DD``) of the bar ``current_price`` was read
+    #: from — i.e. when bar_sync last produced data for this market. ``None``
+    #: when the price fell back to avg_cost (no fresh bar on disk). Lets the UI
+    #: show "price as of <date>" + flag a market whose bar lags the others.
+    price_as_of: str | None = None
 
 
 class PositionsResponse(BaseModel):
@@ -64,6 +69,10 @@ class PositionsResponse(BaseModel):
 
     positions: list[Position]
     as_of: datetime
+    #: The most-recent bar date across all positions (``YYYY-MM-DD``) — a
+    #: single "prices as of" headline for the table. ``None`` when no position
+    #: has a fresh bar. Per-position ``price_as_of`` reveals any straggler.
+    prices_as_of: str | None = None
 
 
 __all__ = ["Position", "PositionCluster", "PositionsResponse"]

@@ -28,6 +28,7 @@ import { ActiveAlerts } from '@/components/today/active-alerts';
 import { ExitWatchingSection } from '@/components/today/ExitWatchingSection';
 import { ExposureBreakdown } from '@/components/today/exposure-breakdown';
 import { HealthScoreTile } from '@/components/today/health-score-tile';
+import { PipelineFreshnessStrip } from '@/components/today/pipeline-freshness-strip';
 import { PnLSummary } from '@/components/today/pnl-summary';
 import { PositionsTable } from '@/components/today/positions-table';
 import { QueuedSignals } from '@/components/today/queued-signals';
@@ -43,6 +44,7 @@ export default function TodayPage(): JSX.Element {
         <h1 className="font-mono text-2xl">Today</h1>
         <SSEStatusPill status={status} lastSequenceNo={lastSequenceNo} />
       </header>
+      <PipelineFreshnessStrip />
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
         <div className="lg:col-span-6">
           <HealthScoreTile />
