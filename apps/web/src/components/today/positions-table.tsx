@@ -35,9 +35,16 @@ export function PositionsTable(): JSX.Element {
   return (
     <Card>
       <CardHeader className="pb-3">
-        <CardTitle className="text-base">
-          Positions <span className="text-text-muted">({positions.length})</span>
-        </CardTitle>
+        <div className="flex items-baseline justify-between gap-2">
+          <CardTitle className="text-base">
+            Positions <span className="text-text-muted">({positions.length})</span>
+          </CardTitle>
+          {data?.prices_as_of != null && (
+            <span className="text-xs text-text-muted" title="Session date of the bars the marks were read from (bar_sync output)">
+              Prices as of {data.prices_as_of}
+            </span>
+          )}
+        </div>
       </CardHeader>
       <CardContent>
         {isLoading && <p className="text-sm text-text-muted">Loading…</p>}
@@ -76,6 +83,16 @@ export function PositionsTable(): JSX.Element {
                   </TableCell>
                   <TableCell className="text-right font-mono tabular-nums">
                     {formatPrice(p.current_price)}
+                    {p.price_as_of != null &&
+                      data?.prices_as_of != null &&
+                      p.price_as_of !== data.prices_as_of && (
+                        <div
+                          className="text-[10px] font-sans text-severity-p1"
+                          title={`This market's bar lags the others (bar_sync may have skipped it)`}
+                        >
+                          ⚠ {p.price_as_of}
+                        </div>
+                      )}
                   </TableCell>
                   <TableCell
                     className={`text-right font-mono tabular-nums ${
