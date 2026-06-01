@@ -452,18 +452,35 @@ class PostgresPhase1QueryRepo:
         recorded — the strategy then conservatively skips the MIN_HOLDING check
         (per ``strategies/v1_trend_following/strategy.py::generate_exit_candidates``).
         The endpoint converts ``opened_at_utc`` → ET session date for the response.
+
+        **Aggregated per market** (``SUM(quantity) GROUP BY market``), mirroring
+        the recon path ``services/reconciliation/eod_cycle.build_backend_view``:
+        ``positions_current`` is ``UNIQUE(account_id, market, contract_id)``, so a
+        futures roll can legally produce >1 row for the same market. We return the
+        NET signed quantity (and a qty-weighted ``avg_cost``) so LEAN sees one
+        ``Position`` per market — without this, two rows would collapse in LEAN's
+        ``positions_by_market`` dict and one leg would be silently dropped.
+        ``HAVING SUM(quantity) <> 0`` drops a market whose legs net flat. The
+        qty-weighted ``avg_cost`` is cast back to the column's ``NUMERIC(20,8)``
+        so the wire string stays clean + deterministic (numeric division
+        otherwise widens the scale).
         """
         rows = (
             await self._session.execute(
                 text(
-                    "SELECT p.market, p.quantity, p.avg_cost, "
+                    "SELECT p.market, "
+                    "       SUM(p.quantity) AS quantity, "
+                    "       (SUM(p.avg_cost * p.quantity) / NULLIF(SUM(p.quantity), 0))"
+                    "         ::numeric(20,8) AS avg_cost, "
                     "       (SELECT MIN(t.opened_at_utc) FROM trades t "
                     "          WHERE t.account_id = p.account_id "
                     "            AND t.market = p.market "
                     "            AND t.state = 'open_position') AS opened_at_utc "
                     "FROM positions_current p "
                     "WHERE p.account_id = :acc "
-                    "  AND p.quantity <> 0"
+                    "GROUP BY p.account_id, p.market "
+                    "HAVING SUM(p.quantity) <> 0 "
+                    "ORDER BY p.market"
                 ),
                 {"acc": account_id},
             )
@@ -475,16 +492,28 @@ class PostgresPhase1QueryRepo:
         account_id: UUID,
         env: str,
     ) -> set[str]:
-        """Markets with a non-terminal exit signal already in flight (PR-A2).
+        """Markets with an exit signal still GENUINELY IN FLIGHT (PR-A2).
 
         The idempotency key for the nightly exit cycle: once an indicator exit
         is emitted, a trend_flip persists every cycle until the close fills, so
         the strategy would re-emit the same exit each night. This set lets LEAN
         suppress those re-emits (and the server-side ingest guard rejects any
-        that slip through). Status filter mirrors the operator tool's
-        ``fetch_already_emitted_exits`` (terminal-but-not-actionable =
-        rejected/cancelled/expired → re-emittable) but is intentionally NOT
-        session-scoped, so it dedups an exit across multiple nightly cycles.
+        that slip through).
+
+        **In-flight allowlist, NOT the operator tool's filter.** Because this is
+        cross-night (NOT session-scoped, unlike
+        ``trigger_v1_cycle.fetch_already_emitted_exits``), we must block ONLY the
+        states where an exit is actively trying to close the CURRENT position —
+        ``pending/approved/deferred/working/partially_filled``. A *completed*
+        exit (``filled/closed/stopped_out``) must NOT block, or a market would be
+        suppressed forever and the NEXT exit on a RE-OPENED position would be
+        silently dropped (V1 re-entry is a real path — the entry-side
+        POSITION_ALREADY_SAME_DIRECTION guard only fires while the position is
+        held). ``rejected/cancelled/expired`` (operator declined/withdrew) and
+        the never-dispatched drop states (sub_minimum_size / macro_window_drop /
+        market_drop_settlement_unavailable, where the position is still held)
+        are likewise re-emittable. Keep this set in sync with
+        ``services/qc_adapter/signal_ingestion._exit_in_flight_exists``.
         """
         rows = (
             await self._session.execute(
@@ -493,7 +522,7 @@ class PostgresPhase1QueryRepo:
                     "WHERE account_id = :acc "
                     "  AND env = :env "
                     "  AND signal_type = 'exit' "
-                    "  AND status NOT IN ('rejected','cancelled','expired')"
+                    "  AND status IN ('pending','approved','deferred','working','partially_filled')"
                 ),
                 {"acc": account_id, "env": env},
             )

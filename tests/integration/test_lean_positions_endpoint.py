@@ -398,3 +398,93 @@ async def test_first_exit_for_market_is_accepted(client: AsyncClient, sync_engin
             {"acct": account_id},
         ).scalar_one()
     assert exit_rows == 1
+
+
+def _seed_raw_position(
+    conn: Any, *, account_id: uuid.UUID, market: str, quantity: int, avg_cost: str
+) -> None:
+    """A bare positions_current row (no trade/contract) — for the multi-contract
+    aggregation test. contract_id stays NULL (NULLs are distinct in the
+    UNIQUE(account_id, market, contract_id) index, so two NULL-contract rows for
+    the same market coexist — the same shape a roll produces)."""
+    conn.execute(
+        text(
+            "INSERT INTO positions_current ("
+            "  account_id, market, quantity, avg_cost, margin_held, last_mark_ts, managed_by_version"
+            ") VALUES (:acct, :market, :qty, :avg, 0, now(), :mbv)"
+        ),
+        {
+            "acct": account_id,
+            "market": market,
+            "qty": quantity,
+            "avg": Decimal(avg_cost),
+            "mbv": _MANAGED_BY,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_completed_exit_does_not_block_reentry(
+    client: AsyncClient, sync_engine: Engine
+) -> None:
+    """A RESOLVED exit (closed/filled/stopped_out) must NOT keep its market in
+    ``exits_in_flight`` or suppress a fresh exit on a RE-OPENED position. Regresses
+    the bug where the non-session-scoped filter blocked re-exits forever."""
+    with sync_engine.begin() as conn:
+        slip = _seed_slippage_head(conn)
+        account_id = _seed_account(conn)
+        # The prior position's exit already COMPLETED.
+        _seed_signal(
+            conn,
+            account_id=account_id,
+            slip=slip,
+            market="/MES",
+            signal_type="exit",
+            direction="flat",
+            status="closed",
+        )
+        # A freshly re-opened /MES position (entry + trade + positions_current).
+        _seed_held_position(
+            conn,
+            account_id=account_id,
+            slip=slip,
+            market="/MES",
+            quantity=2,
+            avg_cost="5200.00",
+            opened_at_utc=datetime(2026, 5, 30, 14, 0, tzinfo=UTC),
+        )
+
+    # GET: the completed exit is NOT in flight → /MES is exit-eligible again.
+    resp = await client.get(_POSITIONS_PATH, headers=_AUTH)
+    assert resp.status_code == 200
+    assert resp.json()["exits_in_flight"] == []
+
+    # POST: a fresh exit for the re-opened position is ACCEPTED (not suppressed).
+    resp = await client.post(_SIGNALS_PATH, headers=_AUTH, json=_exit_post_body("/MES"))
+    assert resp.status_code == 202
+    assert resp.json()["accepted"] is True
+    assert resp.json()["signal_id"] is not None
+
+
+@pytest.mark.asyncio
+async def test_multi_contract_market_is_aggregated(
+    client: AsyncClient, sync_engine: Engine
+) -> None:
+    """Two positions_current rows for one market (a roll) net to ONE Position with
+    the summed quantity — mirrors the recon SUM(quantity) GROUP BY market pattern
+    so LEAN never silently drops a leg."""
+    with sync_engine.begin() as conn:
+        account_id = _seed_account(conn)
+        _seed_raw_position(
+            conn, account_id=account_id, market="/MES", quantity=2, avg_cost="5000.00"
+        )
+        _seed_raw_position(
+            conn, account_id=account_id, market="/MES", quantity=1, avg_cost="5100.00"
+        )
+
+    resp = await client.get(_POSITIONS_PATH, headers=_AUTH)
+    assert resp.status_code == 200
+    positions = resp.json()["positions"]
+    assert len(positions) == 1  # one netted row, not two
+    assert positions[0]["market"] == "/MES"
+    assert positions[0]["quantity"] == 3  # 2 + 1 summed, not silently overwritten

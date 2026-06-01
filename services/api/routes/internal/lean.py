@@ -975,7 +975,10 @@ async def get_lean_positions(
         positions.append(
             LeanPositionItem(
                 market=str(r["market"]),
-                quantity=int(str(r["quantity"])),  # DB returns object-typed dict
+                # quantity is INTEGER (now SUM()-aggregated → still integral);
+                # str() round-trip satisfies mypy's int() overload (dict value
+                # is typed ``object``), the runtime value is already an int.
+                quantity=int(str(r["quantity"])),
                 avg_cost=str(r["avg_cost"]),
                 opened_at_session_date=opened_at_session_date,
             )

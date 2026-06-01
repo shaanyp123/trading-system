@@ -417,14 +417,27 @@ async def _exit_in_flight_exists(
     env: Environment,
     market: str,
 ) -> bool:
-    """True when a non-terminal exit signal already exists for (account, env, market).
+    """True when an exit for (account, env, market) is still GENUINELY IN FLIGHT.
 
-    The status filter (terminal-but-not-actionable = rejected/cancelled/expired
-    → re-emittable) MIRRORS the LEAN-suppression repo method
-    (``services/api/repos/phase1.py::fetch_inflight_exit_markets``) and the
-    operator tool's ``fetch_already_emitted_exits``. Keep all three in sync —
-    they are the same idempotency rule expressed at three call sites. Read-only,
-    own session (the writer manages its own SERIALIZABLE transactions).
+    **In-flight allowlist** — block re-emit ONLY while an exit is actively trying
+    to close the CURRENT position (``pending/approved/deferred/working/
+    partially_filled``). A *completed* exit (``filled/closed/stopped_out``) must
+    NOT block, or a re-opened position's next exit would be permanently
+    suppressed; ``rejected/cancelled/expired`` + the never-dispatched drop states
+    are likewise re-emittable. Keep IN SYNC with the LEAN-suppression repo method
+    ``services/api/repos/phase1.py::fetch_inflight_exit_markets`` (this is the
+    cross-night semantic — distinct from the operator tool's session-scoped
+    ``fetch_already_emitted_exits``).
+
+    NOTE (TOCTOU): this SELECT and the later audit+INSERT run in separate
+    transactions with no unique constraint, so two concurrent first-exit POSTs
+    for the same market could both pass. Safe for V1 — the nightly LEAN cycle is
+    single-threaded, the LEAN-side ``exits_in_flight`` suppression is the first
+    line, and even a double-insert only yields two ``pending`` rows the operator
+    individually approves (the dispatcher's fresh-read flat guard catches a true
+    double-close at place-order time). Revisit (e.g. a partial unique index)
+    before ``EXIT_AUTO_APPROVE`` ships and removes the operator backstop.
+    Read-only, own session (the writer manages its own SERIALIZABLE transactions).
     """
     async with session_factory() as session:
         row = (
@@ -433,7 +446,7 @@ async def _exit_in_flight_exists(
                     "SELECT 1 FROM signals "
                     "WHERE account_id = :acc AND env = :env AND market = :market "
                     "  AND signal_type = 'exit' "
-                    "  AND status NOT IN ('rejected','cancelled','expired') "
+                    "  AND status IN ('pending','approved','deferred','working','partially_filled') "
                     "LIMIT 1"
                 ),
                 {"acc": account_id, "env": env, "market": market},
