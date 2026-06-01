@@ -393,13 +393,23 @@ class PostgresPhase1QueryRepo:
         # — a new emission on the next 21:30 UTC cycle supersedes this signal,
         # so 24h is an upper bound on "still actionable".
         params: dict[str, object] = {"acc": account_id, "lim": limit}
+        # ``signal_type`` (entry/exit discriminator) + a JSONB extraction of
+        # the prior position side power the /signals "Side" pill (green LONG /
+        # red SHORT / amber CLOSE). The local LEAN strategy persists the side
+        # being closed only inside the exit row's sizing_trace
+        # (lean_naive_sizing.prior_position_direction, see
+        # lean/v1_strategy.py::_build_exit_sizing_trace) — there is no
+        # dedicated column. ``#>>`` returns NULL when the path is absent, so
+        # entry rows (and any row missing the key) come back NULL with no error.
         sql = (
-            "SELECT id, market, direction, target_contracts, "
+            "SELECT id, market, direction, signal_type, target_contracts, "
             "       decision_price, expected_fill_price, expected_slippage_bps, "
             "       unsettled, anomaly_reasons, status, emitted_at_utc, "
             "       COALESCE(expires_at_utc, emitted_at_utc + INTERVAL '24 hours') "
             "         AS expires_at_utc, "
-            "       strategy_hash, parameter_set_hash "
+            "       strategy_hash, parameter_set_hash, "
+            "       sizing_trace #>> '{lean_naive_sizing,prior_position_direction}' "
+            "         AS prior_position_direction "
             "FROM signals WHERE account_id = :acc"
         )
         if status:

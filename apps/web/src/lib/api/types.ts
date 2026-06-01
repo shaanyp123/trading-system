@@ -169,6 +169,16 @@ export interface SignalSummary {
   readonly id: string;
   readonly market: string;
   readonly direction: 'long' | 'short' | 'flat';
+  // Entry-vs-exit discriminator (`signals.signal_type`). Production paper
+  // emits 'entry' / 'exit'; 'donchian_breakout' is a sibling backtest-only
+  // value that never reaches this table. The Side pill keys off `=== 'exit'`
+  // (with `direction === 'flat'` as a secondary tell) so it degrades safely
+  // for any unanticipated value.
+  readonly signal_type: 'entry' | 'exit' | 'donchian_breakout';
+  // For exit signals, the side of the position being closed — lets the UI
+  // render "CLOSE · was long/short". `null` for entries (nothing to close)
+  // and for exit rows whose sizing_trace omits the prior side.
+  readonly prior_position_direction: 'long' | 'short' | null;
   readonly target_contracts: number;
   readonly decision_price: string;
   readonly expected_fill_price: string | null;
