@@ -574,6 +574,8 @@ class TestListSignals:
                         "id": signal_id,
                         "market": "/MES",
                         "direction": "long",
+                        "signal_type": "entry",
+                        "prior_position_direction": None,
                         "target_contracts": 1,
                         "decision_price": Decimal("7587.75"),
                         "expected_fill_price": None,
@@ -612,9 +614,68 @@ class TestListSignals:
         assert item["unsettled"] is False
         assert item["anomaly_reasons"] == []
         assert item["status"] == "pending"
+        # Entry discriminator + null prior side (entries close nothing).
+        assert item["signal_type"] == "entry"
+        assert item["prior_position_direction"] is None
         # 8-char git-short-hash convention truncation
         assert item["strategy_short_hash"] == "aaaaaaaa"
         assert item["parameter_set_short_hash"] == "bbbbbbbb"
+
+    @pytest.mark.asyncio
+    async def test_exit_signal_maps_signal_type_and_prior_direction(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        """An exit signal (PR-A2 indicator exits, #312) round-trips its
+        ``signal_type='exit'`` discriminator + the prior position side so the
+        /signals "Side" column can render an amber "CLOSE · was long" pill
+        instead of a confusing bare "flat".
+
+        ``prior_position_direction`` is sourced by the repo query from the
+        ``sizing_trace`` JSONB (``lean_naive_sizing.prior_position_direction``)
+        — the only place the local LEAN strategy persists it. Here the stub
+        repo returns it as a pre-extracted row key, exercising the route-side
+        mapper + Pydantic validation + JSON serialization.
+        """
+        signal_id = uuid4()
+        repo = _StubRepo(
+            account_id=uuid4(),
+            signals_page=(
+                [
+                    {
+                        "id": signal_id,
+                        "market": "/MES",
+                        # Exit sentinel direction is FLAT (the close side is
+                        # resolved from prior_position_direction).
+                        "direction": "flat",
+                        "signal_type": "exit",
+                        "prior_position_direction": "long",
+                        "target_contracts": 0,
+                        "decision_price": Decimal("7600.25"),
+                        "expected_fill_price": None,
+                        "expected_slippage_bps": None,
+                        "unsettled": False,
+                        "anomaly_reasons": [],
+                        "status": "pending",
+                        "emitted_at_utc": datetime(2026, 6, 2, 21, 30, 1, tzinfo=UTC),
+                        "expires_at_utc": datetime(2026, 6, 3, 21, 30, 1, tzinfo=UTC),
+                        "strategy_hash": "c" * 40,
+                        "parameter_set_hash": "d" * 64,
+                    }
+                ],
+                None,
+                False,
+            ),
+        )
+        _bind_repo(override_dep, signals_route, repo)
+        response = await api_client.get("/api/signals?status=pending")
+        assert response.status_code == 200, response.text
+        item = response.json()["items"][0]
+        assert item["id"] == str(signal_id)
+        assert item["direction"] == "flat"
+        assert item["signal_type"] == "exit"
+        assert item["prior_position_direction"] == "long"
 
     @pytest.mark.asyncio
     async def test_anomaly_reasons_pass_through_unchanged(

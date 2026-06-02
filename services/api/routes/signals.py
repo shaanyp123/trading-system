@@ -194,6 +194,13 @@ def _row_to_signal_summary(row: dict[str, Any]) -> SignalSummary:
     * ``expires_at_utc``: the repo query COALESCEs this to ``emitted_at_utc +
       24h`` when the column is NULL, so the wire shape is always non-null
       and the frontend's ``string`` typing holds.
+    * ``signal_type``: the free-TEXT ``signals.signal_type`` column
+      (``'entry'`` / ``'exit'`` on paper). Defaulted to ``'entry'`` when
+      absent for backwards-compat with pre-column projections.
+    * ``prior_position_direction``: extracted by the repo query from the
+      ``sizing_trace`` JSONB (``lean_naive_sizing.prior_position_direction``);
+      ``None`` for entries / rows without the trace key. Lets the UI render
+      "CLOSE · was long/short" for exit signals.
     All other fields pass through unchanged.
     """
     strategy_hash = str(row["strategy_hash"])
@@ -205,6 +212,13 @@ def _row_to_signal_summary(row: dict[str, Any]) -> SignalSummary:
         id=row["id"],
         market=str(row["market"]),
         direction=row["direction"],
+        # `.get` with the canonical "entry" default (mirrors the
+        # approve/reject/defer handlers' `summary.get("signal_type",
+        # "entry")`) so the mapper tolerates a row projection that predates
+        # the signal_type/prior_position_direction columns. The real
+        # fetch_signals_page query always supplies both.
+        signal_type=str(row.get("signal_type") or "entry"),
+        prior_position_direction=row.get("prior_position_direction"),
         target_contracts=int(row["target_contracts"]),
         decision_price=row["decision_price"],
         expected_fill_price=row["expected_fill_price"],

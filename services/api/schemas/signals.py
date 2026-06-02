@@ -59,6 +59,25 @@ class SignalSummary(BaseModel):
     id: UUID
     market: str
     direction: Literal["long", "short", "flat"]
+    # Entry-vs-exit discriminator (`signals.signal_type`). Typed ``str`` —
+    # NOT a Literal — because the column is free TEXT with no DB CHECK
+    # (signal_ingestion.py:99); the application is the canonical gate. The
+    # production ingestion contract (``LeanEventRequest`` in schemas/lean.py)
+    # only emits ``'entry'`` / ``'exit'``, so those are the values seen on
+    # paper today; ``'donchian_breakout'`` is a sibling *backtest-only* value
+    # (strategies/v1_trend_following) that never reaches this table. Keeping
+    # ``str`` means an unanticipated value can never 422 this read endpoint
+    # (which would break the whole /signals page). The frontend distinguishes
+    # exits via ``signal_type == 'exit'`` (with ``direction == 'flat'`` as a
+    # secondary tell).
+    signal_type: str
+    # For exit signals, the side of the position being closed
+    # (``'long'`` / ``'short'``). Sourced from the signals row's
+    # ``sizing_trace.lean_naive_sizing.prior_position_direction`` JSONB leaf
+    # (the only place the local LEAN strategy persists it — it is NOT a
+    # dedicated column). ``None`` for entries and for any exit row that
+    # predates / omits the trace key. Lets the UI render "CLOSE · was long".
+    prior_position_direction: str | None = None
     target_contracts: int
     decision_price: Decimal
     expected_fill_price: Decimal | None

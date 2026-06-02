@@ -66,7 +66,7 @@ export function QueuedSignals(): JSX.Element {
             <TableHeader>
               <TableRow>
                 <TableHead>Market</TableHead>
-                <TableHead>Dir</TableHead>
+                <TableHead>Side</TableHead>
                 <TableHead>Size</TableHead>
                 <TableHead>Price</TableHead>
                 <TableHead>Anomaly</TableHead>
@@ -96,7 +96,10 @@ function SignalRow({ signal }: { signal: SignalSummary }): JSX.Element {
   const [modal, setModal] = useState<DiaryModalState>({ open: false });
   const busy = approve.isPending || reject.isPending || defer.isPending;
   const anomaly = signal.anomaly_reasons[0];
-  const subjectLabel = `${signal.market} ${signal.direction}`;
+  // Human side for the decision-diary modal title. Exits carry
+  // direction='flat'; surface "close" there instead of the confusing "flat".
+  const sideText = isCloseSignal(signal) ? 'close' : signal.direction;
+  const subjectLabel = `${signal.market} ${sideText}`;
 
   const handleDiarySubmit = async (entry: DecisionDiaryEntry): Promise<void> => {
     if (!modal.open) return;
@@ -118,7 +121,9 @@ function SignalRow({ signal }: { signal: SignalSummary }): JSX.Element {
     <>
       <TableRow>
         <TableCell className="font-mono">{signal.market}</TableCell>
-        <TableCell>{signal.direction}</TableCell>
+        <TableCell>
+          <SignalSidePill signal={signal} />
+        </TableCell>
         <TableCell className="font-mono tabular-nums">
           {signal.target_contracts}
         </TableCell>
@@ -178,5 +183,62 @@ function SignalRow({ signal }: { signal: SignalSummary }): JSX.Element {
         isSubmitting={reject.isPending || defer.isPending}
       />
     </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Side pill — green LONG / red SHORT / amber CLOSE, so the operator can read a
+// signal's side at a glance. The old plain-text "Dir" cell had no color + the
+// same weight as every other cell (easy to miss), and exit signals (PR-A2
+// indicator exits, #312 — direction='flat') rendered as a confusing bare
+// "flat" with no entry/exit distinction.
+//
+// Chip shape mirrors ExitWatchingSection's StateChip; colors use the
+// health.* / severity.* tailwind tokens (tailwind.config.ts) following the
+// codebase's `bg-{token}/20 text-{token}` convention (signals/WatchingSection).
+// ---------------------------------------------------------------------------
+
+/** True for an exit (close) signal. Keys off the dedicated discriminator, with
+ *  `direction === 'flat'` as a secondary tell so the pill stays correct even
+ *  if `signal_type` ever carries an unanticipated value. */
+function isCloseSignal(signal: SignalSummary): boolean {
+  return signal.signal_type === 'exit' || signal.direction === 'flat';
+}
+
+function SignalSidePill({ signal }: { signal: SignalSummary }): JSX.Element {
+  if (isCloseSignal(signal)) {
+    // Exits close a position; surface the prior side ("CLOSE · was long") when
+    // it's available so the operator sees what the close acts on, not "flat".
+    const prior = signal.prior_position_direction;
+    return (
+      <span className="inline-flex items-center gap-1 rounded-md bg-severity-p1/20 px-2 py-0.5 text-xs font-medium text-severity-p1">
+        <span className="uppercase tracking-wide">CLOSE</span>
+        {(prior === 'long' || prior === 'short') && (
+          <span className="font-normal opacity-80">· was {prior}</span>
+        )}
+      </span>
+    );
+  }
+  if (signal.direction === 'long') {
+    return (
+      <span className="inline-flex items-center rounded-md bg-health-green/20 px-2 py-0.5 text-xs font-medium uppercase tracking-wide text-health-green">
+        LONG
+      </span>
+    );
+  }
+  if (signal.direction === 'short') {
+    return (
+      <span className="inline-flex items-center rounded-md bg-health-red/20 px-2 py-0.5 text-xs font-medium uppercase tracking-wide text-health-red">
+        SHORT
+      </span>
+    );
+  }
+  // Defensive: entries are long/short and exits are caught above, so this is
+  // unreachable today — render the raw value in a neutral pill rather than
+  // silently emitting nothing if an unexpected direction ever appears.
+  return (
+    <span className="inline-flex items-center rounded-md bg-bg-elevated px-2 py-0.5 text-xs font-medium uppercase tracking-wide text-text-secondary">
+      {signal.direction}
+    </span>
   );
 }
