@@ -91,9 +91,11 @@ GateStateLiteral = Literal["pass", "close", "fail"]
 GateStatusLiteral = Literal["ok", "warming_up", "decommissioned"]
 
 #: The per-market "which gate is driving the worst state" label. Matches
-#: the four values ``proximity.compute_market_proximity`` can emit
-#: (proximity.py lines 91-92 + 276-281).
-ClosestGateLiteral = Literal["donchian", "trend", "hurst", "history"]
+#: the values ``proximity.compute_market_proximity`` can emit. ``'hurst'``
+#: is RETAINED for backward-compatibility with historic ``signal_proximity``
+#: rows emitted before the 2026-06-02 Hurst→Efficiency-Ratio gate swap;
+#: new rows emit ``'efficiency'``.
+ClosestGateLiteral = Literal["donchian", "trend", "hurst", "efficiency", "history"]
 
 
 # ---------------------------------------------------------------------------
@@ -166,8 +168,16 @@ class MarketEvaluationItem(BaseModel):
     short_donchian: GateProximityItem
     long_trend: GateProximityItem
     short_trend: GateProximityItem
-    hurst: GateProximityItem
+    efficiency: GateProximityItem
     last_close: Decimal | None = Field(default=None)
+    # Raw Efficiency Ratio + active threshold at evaluation time. Carried in
+    # addition to the ``efficiency`` gate's state+headroom so the live ER
+    # distribution is mineable directly from ``signal_proximity`` (interim
+    # calibration evidence for the 0.20 launch threshold — no backtester yet;
+    # see signal-proximity-design.md addendum + the gate-swap PR). Optional so
+    # warming-up rows (value None) and older emitters stay valid.
+    efficiency_ratio_value: Decimal | None = Field(default=None)
+    efficiency_ratio_threshold: Decimal | None = Field(default=None)
     overall_state: GateStateLiteral
     closest_gate: ClosestGateLiteral
     gate_status: GateStatusLiteral

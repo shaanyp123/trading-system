@@ -4,7 +4,7 @@
  * `WatchingSection` — daily proximity table for `/signals`.
  *
  * Renders the V1 universe with at-a-glance per-gate state (Donchian /
- * Trend / Hurst) so the operator can see which markets are about to
+ * Trend / Trend Quality) so the operator can see which markets are about to
  * fire on the next LEAN signal cycle (~21:30 UTC). Sits above the
  * existing pending-signals list on the `/signals` page.
  *
@@ -100,7 +100,7 @@ function WatchingBody({
           <TableHead>Market</TableHead>
           <TableHead>Donchian</TableHead>
           <TableHead>Trend</TableHead>
-          <TableHead>Hurst</TableHead>
+          <TableHead>Trend Quality</TableHead>
           <TableHead>Closest gate</TableHead>
           <TableHead className="text-right">Last close · cycle</TableHead>
         </TableRow>
@@ -147,7 +147,7 @@ function WatchingRow({ market }: { market: MarketProximityView }): JSX.Element {
         />
       </TableCell>
       <TableCell>
-        <GateCell hurst={market.hurst} kind="hurst" warming={warming} />
+        <GateCell efficiency={market.efficiency} kind="efficiency" warming={warming} />
       </TableCell>
       <TableCell>
         <span
@@ -189,13 +189,13 @@ function BucketBadge({ bucket }: { bucket: ProximityBucket }): JSX.Element | nul
   return null;
 }
 
-type GateKind = 'donchian' | 'trend' | 'hurst';
+type GateKind = 'donchian' | 'trend' | 'efficiency';
 
 interface GateCellProps {
   readonly kind: GateKind;
   readonly long?: GateView;
   readonly short?: GateView;
-  readonly hurst?: GateView;
+  readonly efficiency?: GateView;
   readonly warming: boolean;
 }
 
@@ -207,13 +207,15 @@ interface GateCellProps {
  * pair) so future iterations can surface it on hover; V0 shows the
  * better side only to keep the table narrow.
  */
-function GateCell({ kind, long, short, hurst, warming }: GateCellProps): JSX.Element {
+function GateCell({ kind, long, short, efficiency, warming }: GateCellProps): JSX.Element {
   if (warming) {
     return <GateChip state="fail" label="—" muted />;
   }
-  if (kind === 'hurst') {
-    if (hurst === undefined) return <GateChip state="fail" label="—" muted />;
-    return <GateChip state={hurst.state} label={formatHurstHeadroom(hurst.headroom)} />;
+  if (kind === 'efficiency') {
+    if (efficiency === undefined) return <GateChip state="fail" label="—" muted />;
+    return (
+      <GateChip state={efficiency.state} label={formatEfficiencyHeadroom(efficiency.headroom)} />
+    );
   }
   // Directional: prefer the better of long/short, falling back to either if
   // the other is missing (shouldn't happen in practice — the schema sends
@@ -300,11 +302,11 @@ function formatTrendHeadroom(decimalStr: string | null): string {
   return `${sign}${Math.abs(pct).toFixed(2)}%`;
 }
 
-function formatHurstHeadroom(decimalStr: string | null): string {
+function formatEfficiencyHeadroom(decimalStr: string | null): string {
   if (decimalStr === null || decimalStr === '') return '—';
   const n = parseFloat(decimalStr);
   if (Number.isNaN(n)) return '—';
-  // Hurst headroom is value-minus-threshold in the same units (~0..1
+  // Efficiency-Ratio headroom is value-minus-threshold in ER units (~0..1
   // range). Not a percentage — 3 sig digits is enough for the operator.
   const sign = n > 0 ? '+' : n < 0 ? '−' : '';
   return `${sign}${Math.abs(n).toFixed(3)}`;

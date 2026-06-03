@@ -229,7 +229,7 @@ class TestReversalMapping:
     def test_directional_state_for_held_long_reads_short_gates(self) -> None:
         # Held LONG → reversal is a SHORT entry. Build a market where the SHORT
         # gates all PASS: close 80 < donchian_low 85 (short donchian broken),
-        # 80 < ma_fast 90 < ma_slow 100 (short trend), hurst 0.60 ≥ 0.57.
+        # 80 < ma_fast 90 < ma_slow 100 (short trend), efficiency 0.60 ≥ 0.25.
         mp = compute_market_proximity(
             market="/MES",
             last_close=Decimal("80"),
@@ -237,8 +237,8 @@ class TestReversalMapping:
             donchian_low=Decimal("85"),
             ma_fast=Decimal("90"),
             ma_slow=Decimal("100"),
-            hurst_value=Decimal("0.60"),
-            hurst_threshold=Decimal("0.55"),
+            efficiency_value=Decimal("0.60"),
+            efficiency_threshold=Decimal("0.20"),
         )
         state = directional_reversal_entry_state(market_proximity=mp, held_direction="long")
         assert state is GateState.PASS
@@ -543,7 +543,7 @@ class TestDriftVsGenerateExitCandidates:
         as_of = series.bars[-1].session_date
         positions = {"/MES": _long_position("/MES", opened_at=as_of - timedelta(days=30))}
         # Craft a MarketProximity whose SHORT side is CLOSE: close just above
-        # donchian_low (short donchian CLOSE) and short trend CLOSE, hurst PASS.
+        # donchian_low (short donchian CLOSE) and short trend CLOSE, efficiency PASS.
         entry_eval = compute_market_proximity(
             market="/MES",
             last_close=Decimal("100"),
@@ -551,8 +551,8 @@ class TestDriftVsGenerateExitCandidates:
             donchian_low=Decimal("99.5"),  # (100-99.5)/100 = 0.005 → short donchian CLOSE
             ma_fast=Decimal("100.2"),
             ma_slow=Decimal("100.6"),  # short trend gaps within band → CLOSE
-            hurst_value=Decimal("0.60"),
-            hurst_threshold=Decimal("0.55"),
+            efficiency_value=Decimal("0.60"),
+            efficiency_threshold=Decimal("0.20"),
         )
         result = strategy.generate_exit_candidates(
             active_universe={"/MES": series},

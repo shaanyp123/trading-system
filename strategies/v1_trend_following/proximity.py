@@ -43,8 +43,8 @@ DONCHIAN_CLOSE_BAND_PCT: Decimal = Decimal("0.01")
 #: Trend: within 0.5% of crossover = CLOSE.
 TREND_CLOSE_BAND_PCT: Decimal = Decimal("0.005")
 
-#: Hurst: within 0.02 of the persistence threshold = CLOSE.
-HURST_CLOSE_BAND: Decimal = Decimal("0.02")
+#: Efficiency Ratio: within 0.05 (ER units) of the threshold = CLOSE.
+EFFICIENCY_CLOSE_BAND: Decimal = Decimal("0.05")
 
 
 class GateState(StrEnum):
@@ -87,8 +87,18 @@ class MarketProximity:
 
     ``last_close`` is None when the market is warming up. ``overall_state``
     is the worst of (closer-of-Donchian-directions, closer-of-Trend-directions,
-    hurst). ``closest_gate`` names which of ``'donchian'`` / ``'trend'`` /
-    ``'hurst'`` drives that worst state, or ``'history'`` when warming up.
+    efficiency). ``closest_gate`` names which of ``'donchian'`` / ``'trend'`` /
+    ``'efficiency'`` drives that worst state, or ``'history'`` when warming up.
+
+    ``efficiency_value`` / ``efficiency_threshold`` are the RAW Efficiency
+    Ratio and the active threshold at evaluation time. They are carried (in
+    addition to the ``efficiency`` gate's state + headroom) so the live ER
+    distribution is mineable directly from ``signal_proximity`` for the
+    calibration that confirms / adjusts the 0.20 launch threshold (no
+    backtester yet — the live distribution is the interim evidence). The
+    other gates don't carry raw values because they have no equivalent
+    calibration need. ``efficiency_value`` is None when warming up;
+    ``efficiency_threshold`` is always known (it's a parameter).
     """
 
     market: str
@@ -96,8 +106,10 @@ class MarketProximity:
     short_donchian: GateProximity
     long_trend: GateProximity
     short_trend: GateProximity
-    hurst: GateProximity
+    efficiency: GateProximity
     last_close: Decimal | None
+    efficiency_value: Decimal | None
+    efficiency_threshold: Decimal | None
     overall_state: GateState
     closest_gate: str
     gate_status: GateStatus = "ok"
@@ -162,21 +174,23 @@ def _classify_trend(
     return GateProximity(state=GateState.FAIL, headroom=closer_gap)
 
 
-def _classify_hurst(
+def _classify_efficiency(
     *,
-    hurst_value: Decimal,
-    hurst_threshold: Decimal,
+    efficiency_value: Decimal,
+    efficiency_threshold: Decimal,
 ) -> GateProximity:
-    """Direction-agnostic Hurst classification.
+    """Direction-agnostic Efficiency Ratio classification.
 
-    Passes when ``hurst_value >= hurst_threshold + HURST_CLOSE_BAND``
-    (strict-pass band); CLOSE when within ``HURST_CLOSE_BAND`` either side
-    of the threshold; FAIL otherwise.
+    Mirrors the prior Hurst classification's shape. Passes when
+    ``efficiency_value >= efficiency_threshold + EFFICIENCY_CLOSE_BAND``
+    (strict-pass band); CLOSE when within ``EFFICIENCY_CLOSE_BAND`` either
+    side of the threshold; FAIL otherwise. ``headroom`` is value minus
+    threshold (in ER units), positive when above.
     """
-    headroom = hurst_value - hurst_threshold
-    if headroom >= HURST_CLOSE_BAND:
+    headroom = efficiency_value - efficiency_threshold
+    if headroom >= EFFICIENCY_CLOSE_BAND:
         return GateProximity(state=GateState.PASS, headroom=headroom)
-    if headroom >= -HURST_CLOSE_BAND:
+    if headroom >= -EFFICIENCY_CLOSE_BAND:
         return GateProximity(state=GateState.CLOSE, headroom=headroom)
     return GateProximity(state=GateState.FAIL, headroom=headroom)
 
@@ -204,8 +218,8 @@ def compute_market_proximity(
     donchian_low: Decimal | None,
     ma_fast: Decimal | None,
     ma_slow: Decimal | None,
-    hurst_value: Decimal | None,
-    hurst_threshold: Decimal,
+    efficiency_value: Decimal | None,
+    efficiency_threshold: Decimal,
     decommissioned: bool = False,
 ) -> MarketProximity:
     """Build the per-market proximity record.
@@ -225,7 +239,7 @@ def compute_market_proximity(
         or donchian_low is None
         or ma_fast is None
         or ma_slow is None
-        or hurst_value is None
+        or efficiency_value is None
     )
     if warming_up:
         sentinel = _warming_up_gate()
@@ -236,8 +250,10 @@ def compute_market_proximity(
             short_donchian=sentinel,
             long_trend=sentinel,
             short_trend=sentinel,
-            hurst=sentinel,
+            efficiency=sentinel,
             last_close=last_close,
+            efficiency_value=efficiency_value,
+            efficiency_threshold=efficiency_threshold,
             overall_state=GateState.FAIL,
             closest_gate="history",
             gate_status=gate_status,
@@ -249,7 +265,7 @@ def compute_market_proximity(
     assert donchian_low is not None
     assert ma_fast is not None
     assert ma_slow is not None
-    assert hurst_value is not None
+    assert efficiency_value is not None
 
     long_donchian = _classify_donchian(
         last_close=last_close, threshold=donchian_high, direction="long"
@@ -263,22 +279,24 @@ def compute_market_proximity(
     short_trend = _classify_trend(
         last_close=last_close, ma_fast=ma_fast, ma_slow=ma_slow, direction="short"
     )
-    hurst = _classify_hurst(hurst_value=hurst_value, hurst_threshold=hurst_threshold)
+    efficiency = _classify_efficiency(
+        efficiency_value=efficiency_value, efficiency_threshold=efficiency_threshold
+    )
 
     donchian_market_state = _better(long_donchian.state, short_donchian.state)
     trend_market_state = _better(long_trend.state, short_trend.state)
 
-    overall_state = _worst(_worst(donchian_market_state, trend_market_state), hurst.state)
+    overall_state = _worst(_worst(donchian_market_state, trend_market_state), efficiency.state)
 
     # closest_gate names the gate driving the worst state. When two gates tie
-    # for worst, pick the first in the (donchian, trend, hurst) order — the
-    # operator's mental model walks the gate list in that sequence.
+    # for worst, pick the first in the (donchian, trend, efficiency) order —
+    # the operator's mental model walks the gate list in that sequence.
     if donchian_market_state == overall_state:
         closest_gate = "donchian"
     elif trend_market_state == overall_state:
         closest_gate = "trend"
     else:
-        closest_gate = "hurst"
+        closest_gate = "efficiency"
 
     return MarketProximity(
         market=market,
@@ -286,8 +304,10 @@ def compute_market_proximity(
         short_donchian=short_donchian,
         long_trend=long_trend,
         short_trend=short_trend,
-        hurst=hurst,
+        efficiency=efficiency,
         last_close=last_close,
+        efficiency_value=efficiency_value,
+        efficiency_threshold=efficiency_threshold,
         overall_state=overall_state,
         closest_gate=closest_gate,
         gate_status="decommissioned" if decommissioned else "ok",
@@ -296,7 +316,7 @@ def compute_market_proximity(
 
 __all__ = [
     "DONCHIAN_CLOSE_BAND_PCT",
-    "HURST_CLOSE_BAND",
+    "EFFICIENCY_CLOSE_BAND",
     "TREND_CLOSE_BAND_PCT",
     "GateProximity",
     "GateState",

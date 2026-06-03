@@ -25,7 +25,9 @@ from services.api.repos.signal_proximity import SignalProximityRow
 
 GateStateLiteral = Literal["pass", "close", "fail"]
 GateStatusLiteral = Literal["ok", "warming_up", "decommissioned"]
-ClosestGateLiteral = Literal["donchian", "trend", "hurst", "history"]
+# ``'hurst'`` RETAINED for historic rows emitted before the 2026-06-02
+# Hurst→Efficiency-Ratio gate swap; new rows emit ``'efficiency'``.
+ClosestGateLiteral = Literal["donchian", "trend", "hurst", "efficiency", "history"]
 
 
 class GateView(BaseModel):
@@ -38,8 +40,9 @@ class GateView(BaseModel):
         default=None,
         description=(
             "Numeric headroom. Donchian: pct of last_close needed to reach "
-            "the breakout line; Trend: smaller of the two cross gaps; Hurst: "
-            "value minus threshold. None when warming up."
+            "the breakout line; Trend: smaller of the two cross gaps; "
+            "Efficiency Ratio: value minus threshold (ER units). None when "
+            "warming up."
         ),
     )
 
@@ -74,7 +77,7 @@ class MarketProximityView(BaseModel):
     short_donchian: GateView
     long_trend: GateView
     short_trend: GateView
-    hurst: GateView
+    efficiency: GateView
     overall_state: GateStateLiteral
     closest_gate: ClosestGateLiteral
     gate_status: GateStatusLiteral
@@ -121,9 +124,9 @@ def row_to_view(row: SignalProximityRow) -> MarketProximityView:
             state=_gate_state_literal(row.short_trend_state),
             headroom=row.short_trend_gap_pct,
         ),
-        hurst=GateView(
-            state=_gate_state_literal(row.hurst_state),
-            headroom=row.hurst_headroom,
+        efficiency=GateView(
+            state=_gate_state_literal(row.efficiency_ratio_state),
+            headroom=row.efficiency_ratio_headroom,
         ),
         overall_state=_gate_state_literal(row.overall_state),
         closest_gate=_closest_gate_literal(row.closest_gate),
@@ -141,7 +144,8 @@ def _gate_state_literal(value: str) -> GateStateLiteral:
 
 
 def _closest_gate_literal(value: str) -> ClosestGateLiteral:
-    if value not in ("donchian", "trend", "hurst", "history"):
+    # 'hurst' retained for historic rows pre-dating the 2026-06-02 gate swap.
+    if value not in ("donchian", "trend", "hurst", "efficiency", "history"):
         raise ValueError(f"unexpected closest_gate in signal_proximity row: {value!r}")
     return value  # type: ignore[return-value]
 

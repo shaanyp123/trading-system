@@ -118,7 +118,7 @@ def _flat_position(market: str) -> Position:
 
 def _short_entry_candidate(market: str, session_date: date) -> CandidateSignal:
     """Synthetic SHORT entry candidate; mirrors what generate_signals would
-    emit on a downward Donchian breakout that passes trend + Hurst.
+    emit on a downward Donchian breakout that passes trend + Efficiency Ratio.
 
     Tests use this to exercise reversal coupling without re-running the entry
     pipeline against a contrived price series."""
@@ -134,7 +134,7 @@ def _short_entry_candidate(market: str, session_date: date) -> CandidateSignal:
             "donchian_low": Decimal("70"),
             "ma_fast": Decimal("90"),
             "ma_slow": Decimal("95"),
-            "hurst": Decimal("0.65"),
+            "efficiency_ratio": Decimal("0.65"),
             "atr": Decimal("1.00"),
         },
     )
@@ -283,7 +283,7 @@ class TestGenerateExitCandidates:
         self, strategy: V1TrendFollowing
     ) -> None:
         """LONG held; the entry pipeline rejected the opposite SHORT
-        (e.g. HURST_BELOW_THRESHOLD), so entry_candidates is empty for
+        (e.g. EFFICIENCY_BELOW_THRESHOLD), so entry_candidates is empty for
         this market. The exit pipeline must NOT synthesize a reversal —
         per design §3 "Donchian-alone is insufficient" — and must fall
         through to the trend_flip evaluation."""
@@ -611,7 +611,7 @@ class TestExitPipelineParameters:
             lookback_days_donchian=60,
             ma_fast_days=50,
             ma_slow_days=200,
-            hurst_threshold=Decimal("0.55"),
+            efficiency_ratio_threshold=Decimal("0.20"),
             stop_distance_atr_mult=Decimal("3.0"),
             atr_lookback_days=20,
             min_holding_days=14,

@@ -571,7 +571,7 @@ effective_io_concurrency = 200
 | Authentication | LEAN→backend uses shared bearer token from sops `lean.api_bearer_token`; `LeanAuthMiddleware` runs outermost (peer of Day 23 `BotAuthMiddleware`) and CSRF-skip when the bearer is valid | n/a (signal engine ran in-process; no auth boundary) |
 
 **Strategy v1 (authored by Claude Code; PR-required):**
-- **Entry signal:** Donchian channel breakout (`LOOKBACK_DAYS_DONCHIAN`-day high broken to upside, low broken to downside); confirmed by trend filter (close > `MA_FAST_DAYS` AND `MA_FAST_DAYS` > `MA_SLOW_DAYS`); confirmed by Hurst exponent ≥ `HURST_THRESHOLD` over the same lookback.
+- **Entry signal:** Donchian channel breakout (`LOOKBACK_DAYS_DONCHIAN`-day high broken to upside, low broken to downside); confirmed by trend filter (close > `MA_FAST_DAYS` AND `MA_FAST_DAYS` > `MA_SLOW_DAYS`); confirmed by Kaufman Efficiency Ratio ≥ `EFFICIENCY_RATIO_THRESHOLD` over the same lookback (trend-quality filter; direction-agnostic). ER replaced the Hurst R/S persistence gate 2026-06-02 — same gate slot, launched active at 0.20; see `Docs/decisions-log.md`.
 - **Stop:** ATR-based (`STOP_DISTANCE_ATR_MULT` × ATR(20)); stop-market exit.
 - **Profit target:** none (let trend run). Exit only on: stop hit, signal reversal, MIN_HOLDING_DAYS=14 satisfied AND trend filter flips, or strategy decommission.
 - **Position sizing:** delegated to risk engine (Stage 0–5 algorithm).
@@ -1381,7 +1381,7 @@ CREATE TABLE parameter_sets (
 > **Hash input scope — operator-only flags excluded (clarified 2026-05-29,
 > `Docs/parameter-sets-bootstrap-design.md` §11 Q1-A).** The "Parameter Ranges
 > Table" params hashed above are the 10 agent/PR-tunable strategy parameters:
-> `LOOKBACK_DAYS_DONCHIAN`, `MA_FAST_DAYS`, `MA_SLOW_DAYS`, `HURST_THRESHOLD`,
+> `LOOKBACK_DAYS_DONCHIAN`, `MA_FAST_DAYS`, `MA_SLOW_DAYS`, `EFFICIENCY_RATIO_THRESHOLD`,
 > `STOP_DISTANCE_ATR_MULT`, `ATR_LOOKBACK_DAYS`, `MIN_HOLDING_DAYS`,
 > `VOL_TARGET_PCT_ANNUAL`, `INSTRUMENT_VOL_LOOKBACK_DAYS`,
 > `ROLL_DAYS_BEFORE_EXPIRY` (the PR-locked `ATR_LOOKBACK_DAYS` /
@@ -4806,7 +4806,7 @@ AGENT_TOOLS = [
      "input_schema": {"type": "object", "properties": {
          "parameter_name": {"type": "string", "enum": [
              "LOOKBACK_DAYS_DONCHIAN", "VOL_TARGET_PCT_ANNUAL", "MA_FAST_DAYS",
-             "MA_SLOW_DAYS", "STOP_DISTANCE_ATR_MULT", "HURST_THRESHOLD",
+             "MA_SLOW_DAYS", "STOP_DISTANCE_ATR_MULT", "EFFICIENCY_RATIO_THRESHOLD",
              "ROLL_DAYS_BEFORE_EXPIRY"
              # NOT INCLUDED: INSTRUMENT_VOL_LOOKBACK_DAYS (n/a tighten direction)
              # NOT INCLUDED: MIN_HOLDING_DAYS (locked PR-only constant)

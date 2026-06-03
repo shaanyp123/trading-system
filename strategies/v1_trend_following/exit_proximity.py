@@ -225,9 +225,9 @@ def directional_reversal_entry_state(
     """Derive the opposite-direction entry readiness from an entry proximity row.
 
     For a held LONG the reversal is a SHORT entry (and vice versa). The
-    opposite entry fires only when its Donchian + trend + Hurst gates all
-    PASS, so its readiness is the *worst* of those three gates. Returns
-    ``None`` when no entry proximity row is available for the market.
+    opposite entry fires only when its Donchian + trend + Efficiency-Ratio
+    gates all PASS, so its readiness is the *worst* of those three gates.
+    Returns ``None`` when no entry proximity row is available for the market.
     """
     if market_proximity is None:
         return None
@@ -237,7 +237,7 @@ def directional_reversal_entry_state(
     else:
         donchian = market_proximity.long_donchian.state
         trend = market_proximity.long_trend.state
-    return _worst_gate(donchian, trend, market_proximity.hurst.state)
+    return _worst_gate(donchian, trend, market_proximity.efficiency.state)
 
 
 def _classify_decommission(*, decommissioned: bool) -> ExitTriggerProximity:

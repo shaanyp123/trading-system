@@ -6,6 +6,8 @@
 **Implementer:** Claude Code (multi-session, one per PR)
 **Precedent:** Mirrors the structure of `Docs/exit-pipeline-design.md` (3-PR plan, COMPLETE 2026-05-27).
 
+> **ADDENDUM 2026-06-02 — entry gate #3 swapped (Hurst → Efficiency Ratio).** This design doc was authored when gate #3 was Hurst persistence (R/S). On 2026-06-02 that gate was replaced by the Kaufman Efficiency Ratio (ER), launched **active at `EFFICIENCY_RATIO_THRESHOLD=0.20`**. Read every "Hurst" / "hurst" / `hurst_*` reference below as the **"Trend Quality" / Efficiency-Ratio gate** (`MarketProximity.efficiency`, `EFFICIENCY_CLOSE_BAND=0.05` ER units, `closest_gate='efficiency'`, DB columns `efficiency_ratio_{value,threshold,state,headroom}`, UI column "Trend Quality"). The proximity machinery (per-gate PASS/CLOSE/FAIL classification, headroom math, sort key, persistence, endpoint, Watching table) is structurally unchanged — only the third gate's identity + close-band + column names changed, plus the raw ER value/threshold are now persisted so the live ER distribution is mineable for calibration. The legacy `'hurst'` `closest_gate` value is retained (API/TS literal + CHECK) for historic rows. See `Docs/decisions-log.md` 2026-06-02 + the gate-swap PR.
+
 ## 0. Motivation
 
 The operator wants a "Watching" view on `spratcapital.com/signals` showing how close each market in the V1 universe is to triggering a signal. V1 has three pre-position gates (Donchian breakout, MA trend filter, Hurst persistence); the proximity view surfaces the per-gate state and distance-to-firing so the operator can see at-a-glance which markets are about to fire on the next daily 17:30 ET cycle.

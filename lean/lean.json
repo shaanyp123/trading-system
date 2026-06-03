@@ -12,13 +12,13 @@
   "algorithm-location": "v1_strategy.py",
   "$comment-algorithm-location": "LEAN Local reads this field — the file was renamed from v1_qc_algorithm.py to v1_strategy.py post-pivot (Pivot-PR-A Q3 resolution). The QC Cloud deploy path is retired so the dual-filename pattern from the pre-pivot README is no longer needed.",
 
-  "description": "v1_trend_following — Donchian/MA/Hurst/ATR trend strategy on Phase 1 sub-universe (CME micro futures + bond ETFs). Daily resolution, 17:30 ET signal cycle. Runs locally via LEAN Local + PaperBrokerage (for fills) + FakeDataQueue + SubscriptionDataReaderHistoryProvider (reads on-disk bars written by the api's BarSyncWorker on clientId=2 at 17:00 ET; data-layer-pivot-v2 architecture per `services/data/bar_sync.py`).",
+  "description": "v1_trend_following — Donchian/MA/EfficiencyRatio/ATR trend strategy on Phase 1 sub-universe (CME micro futures + bond ETFs). Daily resolution, 17:30 ET signal cycle. Runs locally via LEAN Local + PaperBrokerage (for fills) + FakeDataQueue + SubscriptionDataReaderHistoryProvider (reads on-disk bars written by the api's BarSyncWorker on clientId=2 at 17:00 ET; data-layer-pivot-v2 architecture per `services/data/bar_sync.py`).",
 
   "parameters": {
     "LOOKBACK_DAYS_DONCHIAN": "60",
     "MA_FAST_DAYS": "50",
     "MA_SLOW_DAYS": "200",
-    "HURST_THRESHOLD": "0.55",
+    "EFFICIENCY_RATIO_THRESHOLD": "0.20",
     "STOP_DISTANCE_ATR_MULT": "3.0",
     "ATR_LOOKBACK_DAYS": "20",
     "MIN_HOLDING_DAYS": "14",

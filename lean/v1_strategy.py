@@ -156,7 +156,7 @@ V1_PARAMETER_DEFAULTS = {
     "LOOKBACK_DAYS_DONCHIAN": "60",
     "MA_FAST_DAYS": "50",
     "MA_SLOW_DAYS": "200",
-    "HURST_THRESHOLD": "0.55",
+    "EFFICIENCY_RATIO_THRESHOLD": "0.20",
     "STOP_DISTANCE_ATR_MULT": "3.0",
     "ATR_LOOKBACK_DAYS": "20",
     "MIN_HOLDING_DAYS": "14",
@@ -630,7 +630,7 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         # Per-market rejection visibility — added 2026-05-25 after the saga's
         # 21:30 UTC validation cycle showed ``signals_emitted_count=0
         # rejections_count=10`` with no way to tell which filter (no_breakout
-        # vs hurst_below_threshold vs trend_filter_failed vs ...) rejected
+        # vs efficiency_below_threshold vs trend_filter_failed vs ...) rejected
         # each of the 10 markets. ``result.rejections`` is
         # ``tuple[tuple[str, RejectionReason], ...]`` (see
         # ``strategies/v1_trend_following/signals.py::SignalGenerationResult``);
@@ -883,14 +883,21 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
             }
 
         last_close = evaluation.last_close
+        eff_value = evaluation.efficiency_value
+        eff_threshold = evaluation.efficiency_threshold
         return {
             "market": evaluation.market,
             "long_donchian": _gate(evaluation.long_donchian),
             "short_donchian": _gate(evaluation.short_donchian),
             "long_trend": _gate(evaluation.long_trend),
             "short_trend": _gate(evaluation.short_trend),
-            "hurst": _gate(evaluation.hurst),
+            "efficiency": _gate(evaluation.efficiency),
             "last_close": str(last_close) if last_close is not None else None,
+            # Raw ER + active threshold carried alongside the gate so the live
+            # ER distribution is mineable from signal_proximity (calibration of
+            # the 0.20 launch threshold — no backtester yet).
+            "efficiency_ratio_value": str(eff_value) if eff_value is not None else None,
+            "efficiency_ratio_threshold": str(eff_threshold) if eff_threshold is not None else None,
             "overall_state": evaluation.overall_state.value,
             "closest_gate": evaluation.closest_gate,
             "gate_status": evaluation.gate_status,
@@ -999,7 +1006,7 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         """Stage 0-shaped trace for exits (Decimal-as-string per A05).
 
         Distinct from the entry-side ``_build_minimal_sizing_trace``
-        because exit candidates DO NOT carry the Donchian / Hurst keys
+        because exit candidates DO NOT carry the Donchian / Efficiency-Ratio keys
         (per CandidateSignal docstring: indicators_snapshot is populated
         only when a snapshot was computed — trend_flip exits — and is
         empty for decommission / reversal exits). We surface the
@@ -1065,7 +1072,7 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
             lookback_days_donchian=int(raw["LOOKBACK_DAYS_DONCHIAN"]),
             ma_fast_days=int(raw["MA_FAST_DAYS"]),
             ma_slow_days=int(raw["MA_SLOW_DAYS"]),
-            hurst_threshold=Decimal(str(raw["HURST_THRESHOLD"])),
+            efficiency_ratio_threshold=Decimal(str(raw["EFFICIENCY_RATIO_THRESHOLD"])),
             stop_distance_atr_mult=Decimal(str(raw["STOP_DISTANCE_ATR_MULT"])),
             atr_lookback_days=int(raw["ATR_LOOKBACK_DAYS"]),
             min_holding_days=int(raw["MIN_HOLDING_DAYS"]),
@@ -1271,7 +1278,7 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
                 "donchian_low": str(snapshot["donchian_low"]),
                 "ma_fast": str(snapshot["ma_fast"]),
                 "ma_slow": str(snapshot["ma_slow"]),
-                "hurst": str(snapshot["hurst"]),
+                "efficiency_ratio": str(snapshot["efficiency_ratio"]),
                 "atr": str(snapshot["atr"]),
                 "stop_price": str(signal.stop_price),
                 "lookback_days_donchian": int(snapshot["lookback_days_donchian"]),

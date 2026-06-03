@@ -61,8 +61,8 @@ class SignalProximityRow:
     long_trend_gap_pct: Decimal | None
     short_trend_state: str
     short_trend_gap_pct: Decimal | None
-    hurst_state: str
-    hurst_headroom: Decimal | None
+    efficiency_ratio_state: str
+    efficiency_ratio_headroom: Decimal | None
     overall_state: str
     closest_gate: str
     gate_status: str
@@ -108,8 +108,12 @@ async def insert_rows(
             "long_trend_gap_pct": ev.long_trend.headroom,
             "short_trend_state": ev.short_trend.state,
             "short_trend_gap_pct": ev.short_trend.headroom,
-            "hurst_state": ev.hurst.state,
-            "hurst_headroom": ev.hurst.headroom,
+            "efficiency_ratio_state": ev.efficiency.state,
+            "efficiency_ratio_headroom": ev.efficiency.headroom,
+            # Raw ER + threshold persisted for the live calibration distribution
+            # (see schemas/lean.MarketEvaluationItem). value is NULL when warming.
+            "efficiency_ratio_value": ev.efficiency_ratio_value,
+            "efficiency_ratio_threshold": ev.efficiency_ratio_threshold,
             "overall_state": ev.overall_state,
             "closest_gate": ev.closest_gate,
             "gate_status": ev.gate_status,
@@ -124,7 +128,8 @@ async def insert_rows(
             "    short_donchian_state, short_donchian_headroom_pct,"
             "    long_trend_state, long_trend_gap_pct,"
             "    short_trend_state, short_trend_gap_pct,"
-            "    hurst_state, hurst_headroom,"
+            "    efficiency_ratio_state, efficiency_ratio_headroom,"
+            "    efficiency_ratio_value, efficiency_ratio_threshold,"
             "    overall_state, closest_gate, gate_status"
             ") VALUES ("
             "    :cycle_ts_utc, :session_date_et, :market, :last_close,"
@@ -132,7 +137,8 @@ async def insert_rows(
             "    :short_donchian_state, :short_donchian_headroom_pct,"
             "    :long_trend_state, :long_trend_gap_pct,"
             "    :short_trend_state, :short_trend_gap_pct,"
-            "    :hurst_state, :hurst_headroom,"
+            "    :efficiency_ratio_state, :efficiency_ratio_headroom,"
+            "    :efficiency_ratio_value, :efficiency_ratio_threshold,"
             "    :overall_state, :closest_gate, :gate_status"
             ")"
         ),
@@ -162,7 +168,7 @@ async def fetch_latest_per_market(
                 "  short_donchian_state, short_donchian_headroom_pct, "
                 "  long_trend_state, long_trend_gap_pct, "
                 "  short_trend_state, short_trend_gap_pct, "
-                "  hurst_state, hurst_headroom, "
+                "  efficiency_ratio_state, efficiency_ratio_headroom, "
                 "  overall_state, closest_gate, gate_status "
                 "FROM signal_proximity "
                 "ORDER BY market, cycle_ts_utc DESC"
@@ -187,8 +193,8 @@ async def fetch_latest_per_market(
             long_trend_gap_pct=row.long_trend_gap_pct,
             short_trend_state=row.short_trend_state,
             short_trend_gap_pct=row.short_trend_gap_pct,
-            hurst_state=row.hurst_state,
-            hurst_headroom=row.hurst_headroom,
+            efficiency_ratio_state=row.efficiency_ratio_state,
+            efficiency_ratio_headroom=row.efficiency_ratio_headroom,
             overall_state=row.overall_state,
             closest_gate=row.closest_gate,
             gate_status=row.gate_status,

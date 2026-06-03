@@ -1,10 +1,12 @@
-"""V1TrendFollowing — Donchian / MA / Hurst trend-following strategy (Phase 1).
+"""V1TrendFollowing — Donchian / MA / Efficiency-Ratio trend-following strategy (Phase 1).
 
 Implements the strategy logic locked in `Docs/backend-spec.md §2.3`:
 
 - Entry signal: Donchian channel breakout (LOOKBACK_DAYS_DONCHIAN-day high to
   upside / low to downside) AND trend filter (close > MA_FAST > MA_SLOW for long;
-  inverted for short) AND Hurst >= HURST_THRESHOLD over the same lookback.
+  inverted for short) AND Efficiency Ratio >= EFFICIENCY_RATIO_THRESHOLD over the
+  same lookback. (ER replaced the Hurst R/S persistence gate 2026-06-02 — same
+  gate slot, real trend-quality signal; see decisions-log.md.)
 - Stop: ATR-based, STOP_DISTANCE_ATR_MULT x ATR(20). Stop-market exit. Strategy
   emits the `stop_price` as a candidate; execution service places the actual
   stop order.
@@ -48,7 +50,7 @@ from strategies.v1_trend_following.exit_proximity import (
 from strategies.v1_trend_following.indicators import (
     average_true_range,
     donchian_channel,
-    hurst_exponent_rs,
+    efficiency_ratio,
     simple_moving_average,
 )
 from strategies.v1_trend_following.parameters import V1Parameters
@@ -81,7 +83,7 @@ class _IndicatorSnapshot:
     donchian_low: Decimal
     ma_fast: Decimal
     ma_slow: Decimal
-    hurst: Decimal
+    efficiency_ratio: Decimal
     atr: Decimal
     last_close: Decimal
 
@@ -116,8 +118,9 @@ class V1TrendFollowing:
     def __init__(self, parameters: V1Parameters) -> None:
         self._params = parameters
         # `min_required_bars` is the largest lookback the strategy needs.
-        # Donchian and Hurst share the same lookback per backend-spec §2.3
-        # ("confirmed by Hurst exponent over the same lookback"). MA_SLOW
+        # Donchian and the Efficiency Ratio share the same lookback per
+        # backend-spec §2.3 ("confirmed by trend-quality filter over the same
+        # lookback"). MA_SLOW
         # may exceed it. ATR needs lookback + 1 prior bar. Donchian needs
         # lookback + 1 bars too (channel from prior N bars + the current bar
         # for the breakout-comparison close).
@@ -237,8 +240,8 @@ class V1TrendFollowing:
 
         Pure observation-only — does not feed back into entry-signal logic.
         Lives on the strategy class only so it can read ``self._params`` for
-        the Hurst threshold and the decommission flag without leaking those
-        into the pure-Python proximity module.
+        the Efficiency Ratio threshold and the decommission flag without
+        leaking those into the pure-Python proximity module.
         """
         decommissioned = self._params.strategy_decommissioned
         if snapshot is None:
@@ -249,8 +252,8 @@ class V1TrendFollowing:
                 donchian_low=None,
                 ma_fast=None,
                 ma_slow=None,
-                hurst_value=None,
-                hurst_threshold=self._params.hurst_threshold,
+                efficiency_value=None,
+                efficiency_threshold=self._params.efficiency_ratio_threshold,
                 decommissioned=decommissioned,
             )
         return compute_market_proximity(
@@ -260,8 +263,8 @@ class V1TrendFollowing:
             donchian_low=snapshot.donchian_low,
             ma_fast=snapshot.ma_fast,
             ma_slow=snapshot.ma_slow,
-            hurst_value=snapshot.hurst,
-            hurst_threshold=self._params.hurst_threshold,
+            efficiency_value=snapshot.efficiency_ratio,
+            efficiency_threshold=self._params.efficiency_ratio_threshold,
             decommissioned=decommissioned,
         )
 
@@ -288,7 +291,7 @@ class V1TrendFollowing:
           1. enough history?               -> INSUFFICIENT_BAR_HISTORY
           2. Donchian breakout?            -> NO_BREAKOUT
           3. trend filter passes?          -> TREND_FILTER_FAILED
-          4. Hurst >= threshold?           -> HURST_BELOW_THRESHOLD
+          4. Efficiency Ratio >= threshold? -> EFFICIENCY_BELOW_THRESHOLD
           5. position-aware gates:
              - same-direction position?    -> POSITION_ALREADY_SAME_DIRECTION
              - opposite-direction position + held < MIN_HOLDING_DAYS
@@ -336,11 +339,13 @@ class V1TrendFollowing:
                     outcome=RejectionReason.TREND_FILTER_FAILED, snapshot=snapshot
                 )
 
-        # Step 4: Hurst persistence threshold (same direction-agnostic check —
-        # Hurst measures persistence regardless of sign).
-        if snapshot.hurst < self._params.hurst_threshold:
+        # Step 4: Efficiency Ratio trend-quality threshold (direction-agnostic —
+        # ER uses the absolute net move, so it scores an efficient down-move
+        # like an efficient up-move). LIVE at EFFICIENCY_RATIO_THRESHOLD=0.20
+        # from cycle one: a sub-threshold (choppy) breakout is vetoed here.
+        if snapshot.efficiency_ratio < self._params.efficiency_ratio_threshold:
             return _EvaluationResult(
-                outcome=RejectionReason.HURST_BELOW_THRESHOLD, snapshot=snapshot
+                outcome=RejectionReason.EFFICIENCY_BELOW_THRESHOLD, snapshot=snapshot
             )
 
         # Step 5: position-aware rejections.
@@ -393,7 +398,7 @@ class V1TrendFollowing:
                     "donchian_low": snapshot.donchian_low,
                     "ma_fast": snapshot.ma_fast,
                     "ma_slow": snapshot.ma_slow,
-                    "hurst": snapshot.hurst,
+                    "efficiency_ratio": snapshot.efficiency_ratio,
                     "atr": snapshot.atr,
                     "lookback_days_donchian": self._params.lookback_days_donchian,
                 },
@@ -414,14 +419,18 @@ class V1TrendFollowing:
         channel = donchian_channel(bars, params.lookback_days_donchian)
         ma_fast = simple_moving_average(closes, params.ma_fast_days)
         ma_slow = simple_moving_average(closes, params.ma_slow_days)
-        hurst = hurst_exponent_rs(closes[-params.lookback_days_donchian :])
+        # Efficiency Ratio over the SAME LOOKBACK_DAYS_DONCHIAN slice the
+        # Hurst gate used (60 closes by default). ER's own minimum is 2
+        # closes; the INSUFFICIENT_BAR_HISTORY guard (driven by MA_SLOW_DAYS)
+        # fires far earlier, so this slice is always full.
+        efficiency = efficiency_ratio(closes[-params.lookback_days_donchian :])
         atr = average_true_range(bars, params.atr_lookback_days)
         return _IndicatorSnapshot(
             donchian_high=channel.high,
             donchian_low=channel.low,
             ma_fast=ma_fast,
             ma_slow=ma_slow,
-            hurst=hurst,
+            efficiency_ratio=efficiency,
             atr=atr,
             last_close=closes[-1],
         )
@@ -459,7 +468,7 @@ class V1TrendFollowing:
           (a) stop hit — unchanged; the bracket stop-market fires at IBKR.
               This pipeline emits no candidate for (a).
           (b) reversal — held position + opposite direction passes ALL 3
-              entry filters (Donchian + trend + Hurst). Detected via the
+              entry filters (Donchian + trend + Efficiency Ratio). Detected via the
               ``entry_candidates`` argument: the entry pipeline's output is
               the authoritative signal that the opposite direction is "live."
           (c) trend_flip — held LONG + ``close < MA_FAST`` (mirror for SHORT)

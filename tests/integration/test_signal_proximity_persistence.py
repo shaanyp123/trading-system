@@ -155,8 +155,10 @@ def _evaluation(
         short_donchian=_gate("fail", "0.085"),
         long_trend=_gate("pass", "0.015"),
         short_trend=_gate("fail", "-0.015"),
-        hurst=_gate("pass", "0.03"),
+        efficiency=_gate("pass", "0.23"),
         last_close=Decimal(last_close) if last_close is not None else None,
+        efficiency_ratio_value=Decimal("0.43"),
+        efficiency_ratio_threshold=Decimal("0.20"),
         overall_state=overall,  # type: ignore[arg-type]
         closest_gate=closest,  # type: ignore[arg-type]
         gate_status=status,  # type: ignore[arg-type]
@@ -172,8 +174,10 @@ def _warming_up_evaluation(market: str) -> MarketEvaluationItem:
         short_donchian=sentinel,
         long_trend=sentinel,
         short_trend=sentinel,
-        hurst=sentinel,
+        efficiency=sentinel,
         last_close=None,
+        efficiency_ratio_value=None,
+        efficiency_ratio_threshold=Decimal("0.20"),
         overall_state="fail",
         closest_gate="history",
         gate_status="warming_up",
@@ -208,8 +212,10 @@ def _wire_evaluation(market: str = "/MES") -> dict[str, object]:
         "short_donchian": {"state": "fail", "headroom": "0.085", "detail": None},
         "long_trend": {"state": "pass", "headroom": "0.015", "detail": None},
         "short_trend": {"state": "fail", "headroom": "-0.015", "detail": None},
-        "hurst": {"state": "pass", "headroom": "0.03", "detail": None},
+        "efficiency": {"state": "pass", "headroom": "0.23", "detail": None},
         "last_close": "5234.50",
+        "efficiency_ratio_value": "0.43",
+        "efficiency_ratio_threshold": "0.20",
         "overall_state": "close",
         "closest_gate": "donchian",
         "gate_status": "ok",
@@ -246,7 +252,8 @@ async def test_insert_rows_writes_every_column(
                 "short_donchian_state, short_donchian_headroom_pct, "
                 "long_trend_state, long_trend_gap_pct, "
                 "short_trend_state, short_trend_gap_pct, "
-                "hurst_state, hurst_headroom, "
+                "efficiency_ratio_state, efficiency_ratio_headroom, "
+                "efficiency_ratio_value, efficiency_ratio_threshold, "
                 "overall_state, closest_gate, gate_status "
                 "FROM signal_proximity"
             )
@@ -264,8 +271,11 @@ async def test_insert_rows_writes_every_column(
     assert row.long_trend_gap_pct == Decimal("0.015")
     assert row.short_trend_state == "fail"
     assert row.short_trend_gap_pct == Decimal("-0.015")
-    assert row.hurst_state == "pass"
-    assert row.hurst_headroom == Decimal("0.03")
+    assert row.efficiency_ratio_state == "pass"
+    assert row.efficiency_ratio_headroom == Decimal("0.23")
+    # Raw ER + threshold persisted for the live calibration distribution.
+    assert row.efficiency_ratio_value == Decimal("0.43")
+    assert row.efficiency_ratio_threshold == Decimal("0.20")
     assert row.overall_state == "close"
     assert row.closest_gate == "donchian"
     assert row.gate_status == "ok"
@@ -290,14 +300,19 @@ async def test_insert_rows_warming_up_writes_nulls(
     with sync_engine.connect() as conn:
         row = conn.execute(
             text(
-                "SELECT last_close, long_donchian_headroom_pct, hurst_headroom, "
+                "SELECT last_close, long_donchian_headroom_pct, efficiency_ratio_headroom, "
+                "efficiency_ratio_value, efficiency_ratio_state, "
                 "long_donchian_state, gate_status, closest_gate "
                 "FROM signal_proximity"
             )
         ).one()
     assert row.last_close is None
     assert row.long_donchian_headroom_pct is None
-    assert row.hurst_headroom is None
+    assert row.efficiency_ratio_headroom is None
+    # Warming up: raw ER value is NULL; the state column still carries the
+    # NOT-NULL 'fail' sentinel.
+    assert row.efficiency_ratio_value is None
+    assert row.efficiency_ratio_state == "fail"
     assert row.long_donchian_state == "fail"
     assert row.gate_status == "warming_up"
     assert row.closest_gate == "history"
@@ -361,7 +376,7 @@ async def test_fetch_latest_per_market_returns_most_recent_row(
             cycle_ts_utc=earlier,
             session_date_et="2026-05-27",
             evaluations=[
-                _evaluation("/MES", overall="fail", closest="hurst"),
+                _evaluation("/MES", overall="fail", closest="efficiency"),
                 _evaluation("/MNQ", overall="close"),
             ],
         )
@@ -371,7 +386,7 @@ async def test_fetch_latest_per_market_returns_most_recent_row(
             session_date_et="2026-05-28",
             evaluations=[
                 _evaluation("/MES", overall="pass", closest="trend"),
-                _evaluation("/MNQ", overall="fail", closest="hurst"),
+                _evaluation("/MNQ", overall="fail", closest="efficiency"),
             ],
         )
         await session.commit()
@@ -554,8 +569,10 @@ async def test_heartbeat_warming_up_market_lands_nulls(
         "short_donchian": {"state": "fail", "headroom": None, "detail": "warming_up"},
         "long_trend": {"state": "fail", "headroom": None, "detail": "warming_up"},
         "short_trend": {"state": "fail", "headroom": None, "detail": "warming_up"},
-        "hurst": {"state": "fail", "headroom": None, "detail": "warming_up"},
+        "efficiency": {"state": "fail", "headroom": None, "detail": "warming_up"},
         "last_close": None,
+        "efficiency_ratio_value": None,
+        "efficiency_ratio_threshold": "0.20",
         "overall_state": "fail",
         "closest_gate": "history",
         "gate_status": "warming_up",
@@ -570,10 +587,11 @@ async def test_heartbeat_warming_up_market_lands_nulls(
     with sync_engine.connect() as conn:
         row = conn.execute(
             text(
-                "SELECT last_close, hurst_headroom, gate_status, closest_gate FROM signal_proximity"
+                "SELECT last_close, efficiency_ratio_headroom, gate_status, closest_gate "
+                "FROM signal_proximity"
             )
         ).one()
     assert row.last_close is None
-    assert row.hurst_headroom is None
+    assert row.efficiency_ratio_headroom is None
     assert row.gate_status == "warming_up"
     assert row.closest_gate == "history"

@@ -53,7 +53,7 @@ Architectural notes
   zip + per-day universe CSV) under ``DataNormalizationMode.RAW``
   without requiring per-historical-expiry IBKR queries. For a
   daily-resolution trend-following strategy where the Donchian/MA/
-  Hurst/ATR all derive from close prices, the continuous-mapped
+  EfficiencyRatio/ATR all derive from close prices, the continuous-mapped
   back-history is functionally equivalent to a per-expiry replay.
 
 * **ETF strategy.** Simpler: fetch daily bars via ``reqHistoricalData``
@@ -569,7 +569,7 @@ def build_equity_factor_file(ref_price: Decimal) -> str:
     """LEAN factor_files 2-row sentinel.
 
     Format: ``YYYYMMDD,<price_factor>,<split_factor>,<ref_price>``.
-    The strategy operates on un-adjusted prices (Donchian/MA/Hurst/ATR
+    The strategy operates on un-adjusted prices (Donchian/MA/EfficiencyRatio/ATR
     over raw closes) so we hard-code price_factor=1 + split_factor=1.
     The second row's ref_price=0 is LEAN's far-future sentinel
     convention.
