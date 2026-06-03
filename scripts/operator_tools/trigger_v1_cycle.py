@@ -863,7 +863,7 @@ def build_v1_parameters_from_dict(raw: dict[str, object]) -> V1Parameters:
         lookback_days_donchian=int(str(raw["LOOKBACK_DAYS_DONCHIAN"])),
         ma_fast_days=int(str(raw["MA_FAST_DAYS"])),
         ma_slow_days=int(str(raw["MA_SLOW_DAYS"])),
-        hurst_threshold=Decimal(str(raw["HURST_THRESHOLD"])),
+        efficiency_ratio_threshold=Decimal(str(raw["EFFICIENCY_RATIO_THRESHOLD"])),
         stop_distance_atr_mult=Decimal(str(raw["STOP_DISTANCE_ATR_MULT"])),
         atr_lookback_days=int(str(raw["ATR_LOOKBACK_DAYS"])),
         min_holding_days=int(str(raw["MIN_HOLDING_DAYS"])),
@@ -960,7 +960,7 @@ def build_minimal_sizing_trace(
             "donchian_low": str(snapshot["donchian_low"]),
             "ma_fast": str(snapshot["ma_fast"]),
             "ma_slow": str(snapshot["ma_slow"]),
-            "hurst": str(snapshot["hurst"]),
+            "efficiency_ratio": str(snapshot["efficiency_ratio"]),
             "atr": str(snapshot["atr"]),
             "stop_price": str(signal.stop_price),
             "lookback_days_donchian": int(snapshot["lookback_days_donchian"]),
@@ -1102,9 +1102,10 @@ def build_exit_sizing_trace(
     """Stage 0-shaped sizing_trace for exits — mirrors LEAN's exit shape.
 
     Distinct from ``build_minimal_sizing_trace`` because exit candidates
-    have no Donchian / Hurst indicators (decommission + reversal exits
-    have an empty ``indicators_snapshot``; trend_flip has ma_fast +
-    ma_slow + last_close + atr only — no donchian_high/low/hurst keys).
+    have no Donchian / Efficiency-Ratio indicators (decommission + reversal
+    exits have an empty ``indicators_snapshot``; trend_flip has ma_fast +
+    ma_slow + last_close + atr only — no donchian_high/low/efficiency_ratio
+    keys).
     Match LEAN's ``_build_exit_sizing_trace`` so identical payloads
     round-trip through the api ingestion path.
     """

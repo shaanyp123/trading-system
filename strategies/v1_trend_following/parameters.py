@@ -7,7 +7,7 @@ Locked vs agent-mutable per `Docs/backend-spec.md §12.3` (`tighten_parameter` e
 | `LOOKBACK_DAYS_DONCHIAN`       | agent-mutable        | up   (longer lookback = fewer signals = tighter) |
 | `MA_FAST_DAYS`                 | agent-mutable        | up   (slower = fewer crossovers) |
 | `MA_SLOW_DAYS`                 | agent-mutable        | up   (slower = stricter trend filter) |
-| `HURST_THRESHOLD`              | agent-mutable        | up   (more selective on persistence) |
+| `EFFICIENCY_RATIO_THRESHOLD`   | agent-mutable        | up   (more selective on trend quality) |
 | `STOP_DISTANCE_ATR_MULT`       | agent-mutable        | down (tighter stop) |
 | `VOL_TARGET_PCT_ANNUAL`        | agent-mutable        | down (lower target = smaller positions) |
 | `ROLL_DAYS_BEFORE_EXPIRY`      | agent-mutable        | up   (roll earlier = more conservative) |
@@ -38,13 +38,25 @@ V1_DEFAULTS: Final[dict[str, int | str | bool]] = {
     "LOOKBACK_DAYS_DONCHIAN": 60,
     "MA_FAST_DAYS": 50,
     "MA_SLOW_DAYS": 200,
-    # HURST_THRESHOLD = 0.55, not 0.50, to compensate for the R/S estimator's
-    # known small-sample upward bias on a 60-bar window (typically inflates H
-    # by ~0.05). 0.55 is what 0.50 buys you on a 60-bar lookback after
-    # de-biasing — i.e. "moderate persistence" rather than "any positive
-    # autocorrelation." Agent can tighten further (up direction = stricter)
-    # via tighten_parameter; PR required to loosen below 0.50.
-    "HURST_THRESHOLD": "0.55",
+    # EFFICIENCY_RATIO_THRESHOLD = 0.20 — Kaufman Efficiency Ratio entry gate
+    # #3 (replaced the Hurst R/S persistence gate 2026-06-02). ER =
+    # |net move| / |total path| over the LOOKBACK_DAYS_DONCHIAN window, in
+    # [0, 1]: ~1.0 = a clean efficient trend, ~0.0 = choppy/no net progress.
+    # 0.20 vetoes the choppy left tail (sim: conditional ER median on fired
+    # bars ~0.45; 0.20 culls ~12% of entries — ~5% of bond-ETF breakouts,
+    # ~27% of equity-index). LIVE from cycle one. Agent can tighten further
+    # (up direction = stricter on trend quality) via tighten_parameter; PR
+    # required to loosen (including dialing toward off). This is the
+    # calibrated launch point, NOT inert.
+    #
+    # Replaces the prior HURST_THRESHOLD=0.55, which carried a now-corrected
+    # bias claim ("~0.05"): R/S on a 60-bar window actually over-estimates H
+    # by ~+0.12 (pure random walk reads mean H~0.62), is drift-blind (per-
+    # chunk de-meaning removes drift), and is orthogonal to trend magnitude
+    # (corr ~+0.005) — i.e. it culled ~31% of breakouts at near-random. ER
+    # correlates with trend magnitude at ~+0.97. See decisions-log.md
+    # 2026-06-02 + the PR description for the full Monte-Carlo evidence.
+    "EFFICIENCY_RATIO_THRESHOLD": "0.20",
     # Stop / exit. ATR_LOOKBACK_DAYS and MIN_HOLDING_DAYS are LOCKED at the values
     # in backend-spec §2.3 — agent cannot tighten; PR required to change.
     "STOP_DISTANCE_ATR_MULT": "3.0",
@@ -158,7 +170,7 @@ class V1Parameters:
     lookback_days_donchian: int
     ma_fast_days: int
     ma_slow_days: int
-    hurst_threshold: Decimal
+    efficiency_ratio_threshold: Decimal
 
     # --- Stop / exit --------------------------------------------------------
     stop_distance_atr_mult: Decimal
@@ -196,8 +208,10 @@ class V1Parameters:
             )
         if not 5 <= self.ma_fast_days < self.ma_slow_days <= 400:
             raise ValueError(f"MA pair invalid: fast={self.ma_fast_days}, slow={self.ma_slow_days}")
-        if not Decimal("0.40") <= self.hurst_threshold <= Decimal("0.80"):
-            raise ValueError(f"hurst_threshold={self.hurst_threshold} outside [0.40, 0.80]")
+        if not Decimal("0.0") <= self.efficiency_ratio_threshold <= Decimal("0.90"):
+            raise ValueError(
+                f"efficiency_ratio_threshold={self.efficiency_ratio_threshold} outside [0.0, 0.90]"
+            )
         if not Decimal("1.0") <= self.stop_distance_atr_mult <= Decimal("6.0"):
             raise ValueError(
                 f"stop_distance_atr_mult={self.stop_distance_atr_mult} outside [1.0, 6.0]"
@@ -232,7 +246,7 @@ class V1Parameters:
             "lookback_days_donchian": "LOOKBACK_DAYS_DONCHIAN",
             "ma_fast_days": "MA_FAST_DAYS",
             "ma_slow_days": "MA_SLOW_DAYS",
-            "hurst_threshold": "HURST_THRESHOLD",
+            "efficiency_ratio_threshold": "EFFICIENCY_RATIO_THRESHOLD",
             "stop_distance_atr_mult": "STOP_DISTANCE_ATR_MULT",
             "atr_lookback_days": "ATR_LOOKBACK_DAYS",
             "min_holding_days": "MIN_HOLDING_DAYS",
@@ -252,7 +266,7 @@ def default_v1_parameters() -> V1Parameters:
         lookback_days_donchian=int(raw["LOOKBACK_DAYS_DONCHIAN"]),
         ma_fast_days=int(raw["MA_FAST_DAYS"]),
         ma_slow_days=int(raw["MA_SLOW_DAYS"]),
-        hurst_threshold=Decimal(str(raw["HURST_THRESHOLD"])),
+        efficiency_ratio_threshold=Decimal(str(raw["EFFICIENCY_RATIO_THRESHOLD"])),
         stop_distance_atr_mult=Decimal(str(raw["STOP_DISTANCE_ATR_MULT"])),
         atr_lookback_days=int(raw["ATR_LOOKBACK_DAYS"]),
         min_holding_days=int(raw["MIN_HOLDING_DAYS"]),

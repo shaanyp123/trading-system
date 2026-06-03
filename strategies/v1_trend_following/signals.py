@@ -36,7 +36,11 @@ class RejectionReason(StrEnum):
 
     INSUFFICIENT_BAR_HISTORY = "insufficient_bar_history"
     TREND_FILTER_FAILED = "trend_filter_failed"
-    HURST_BELOW_THRESHOLD = "hurst_below_threshold"
+    # Entry gate #3 — Kaufman Efficiency Ratio below the threshold (replaced
+    # HURST_BELOW_THRESHOLD 2026-06-02). The `rejection`-side string lands in
+    # the audit_log JSONB payload (free TEXT — no DB enum, no migration);
+    # historic rows keep the legacy ``hurst_below_threshold`` value.
+    EFFICIENCY_BELOW_THRESHOLD = "efficiency_below_threshold"
     NO_BREAKOUT = "no_breakout"
     MIN_HOLDING_DAYS_NOT_SATISFIED = "min_holding_days_not_satisfied"
     # Same-direction breakout while we already hold the position. V1 treats

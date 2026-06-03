@@ -7,6 +7,10 @@ The proximity module is pure-Python and observation-only — these tests
 exercise it directly with bare Decimal literals, no LEAN runtime or
 strategy-class fixtures required. PR-A scope: classification + edge cases
 (insufficient history, decommissioned, exact-threshold ties).
+
+Gate #3 swapped Hurst R/S → Kaufman Efficiency Ratio on 2026-06-02: the
+``efficiency`` gate uses ``EFFICIENCY_CLOSE_BAND=0.05`` (ER units) and a
+default threshold of 0.20.
 """
 
 from __future__ import annotations
@@ -17,14 +21,14 @@ import pytest
 
 from strategies.v1_trend_following.proximity import (
     DONCHIAN_CLOSE_BAND_PCT,
-    HURST_CLOSE_BAND,
+    EFFICIENCY_CLOSE_BAND,
     TREND_CLOSE_BAND_PCT,
     GateState,
     MarketProximity,
     compute_market_proximity,
 )
 
-HURST_THRESHOLD = Decimal("0.55")
+EFFICIENCY_THRESHOLD = Decimal("0.20")
 
 
 def _proximity(**overrides: object) -> MarketProximity:
@@ -32,7 +36,7 @@ def _proximity(**overrides: object) -> MarketProximity:
 
     Defaults: last_close = 100, donchian_high = 95 (long broken), donchian_low = 80
     (short far from break), ma_fast = 99 > ma_slow = 95 (long trend passing),
-    hurst = 0.60 (>= threshold 0.55 + 0.02 close band). Overrides let each
+    efficiency = 0.40 (>= threshold 0.20 + 0.05 close band). Overrides let each
     test toggle ONE gate's input and assert the resulting state.
     """
     base: dict[str, object] = {
@@ -42,8 +46,8 @@ def _proximity(**overrides: object) -> MarketProximity:
         "donchian_low": Decimal("80"),
         "ma_fast": Decimal("99"),
         "ma_slow": Decimal("95"),
-        "hurst_value": Decimal("0.60"),
-        "hurst_threshold": HURST_THRESHOLD,
+        "efficiency_value": Decimal("0.40"),
+        "efficiency_threshold": EFFICIENCY_THRESHOLD,
         "decommissioned": False,
     }
     base.update(overrides)
@@ -156,48 +160,56 @@ class TestTrendClassification:
 
 
 # ---------------------------------------------------------------------------
-# Hurst gate classification (direction-agnostic)
+# Efficiency Ratio gate classification (direction-agnostic)
 # ---------------------------------------------------------------------------
-class TestHurstClassification:
+class TestEfficiencyClassification:
     def test_pass_at_threshold_plus_band(self) -> None:
-        # threshold 0.55 + band 0.02 = 0.57 → exactly at the PASS boundary.
-        p = _proximity(hurst_value=Decimal("0.57"))
-        assert p.hurst.state == GateState.PASS
-        assert p.hurst.headroom == HURST_CLOSE_BAND
+        # threshold 0.20 + band 0.05 = 0.25 → exactly at the PASS boundary.
+        p = _proximity(efficiency_value=Decimal("0.25"))
+        assert p.efficiency.state == GateState.PASS
+        assert p.efficiency.headroom == EFFICIENCY_CLOSE_BAND
 
     def test_close_just_inside_band(self) -> None:
-        # 0.56 → headroom 0.01 → within +/- 0.02 = CLOSE.
-        p = _proximity(hurst_value=Decimal("0.56"))
-        assert p.hurst.state == GateState.CLOSE
+        # 0.23 → headroom 0.03 → within +/- 0.05 = CLOSE.
+        p = _proximity(efficiency_value=Decimal("0.23"))
+        assert p.efficiency.state == GateState.CLOSE
 
     def test_close_at_threshold_exact(self) -> None:
-        # 0.55 == threshold → headroom 0.00 → in CLOSE band per design Q5 spirit.
-        p = _proximity(hurst_value=Decimal("0.55"))
-        assert p.hurst.state == GateState.CLOSE
-        assert p.hurst.headroom == Decimal("0.00")
+        # 0.20 == threshold → headroom 0.00 → in CLOSE band.
+        p = _proximity(efficiency_value=Decimal("0.20"))
+        assert p.efficiency.state == GateState.CLOSE
+        assert p.efficiency.headroom == Decimal("0.00")
 
     def test_fail_well_below_threshold(self) -> None:
-        # 0.50 → headroom -0.05 → outside -0.02 = FAIL.
-        p = _proximity(hurst_value=Decimal("0.50"))
-        assert p.hurst.state == GateState.FAIL
+        # 0.10 → headroom -0.10 → outside -0.05 = FAIL.
+        p = _proximity(efficiency_value=Decimal("0.10"))
+        assert p.efficiency.state == GateState.FAIL
 
     def test_pass_well_above_threshold(self) -> None:
-        # 0.80 → headroom 0.25 → PASS.
-        p = _proximity(hurst_value=Decimal("0.80"))
-        assert p.hurst.state == GateState.PASS
+        # 0.80 → headroom 0.60 → PASS.
+        p = _proximity(efficiency_value=Decimal("0.80"))
+        assert p.efficiency.state == GateState.PASS
 
     def test_threshold_minus_band_boundary_is_close(self) -> None:
-        """``hurst_value == threshold - HURST_CLOSE_BAND`` resolves to CLOSE.
+        """``efficiency_value == threshold - EFFICIENCY_CLOSE_BAND`` resolves to CLOSE.
 
-        Design §3.2: ``CLOSE if -0.02 <= hurst_headroom < 0.02``. The
+        Design §3.2: ``CLOSE if -0.05 <= efficiency_headroom < 0.05``. The
         inclusive lower bound is intentional — markets exactly at the
         bottom edge of the CLOSE band should be displayed as CLOSE, not
         FAIL. A market hovering at the threshold's bottom needs operator
         eyes, which "CLOSE" promotes.
         """
-        p = _proximity(hurst_value=HURST_THRESHOLD - HURST_CLOSE_BAND)
-        assert p.hurst.headroom == -HURST_CLOSE_BAND
-        assert p.hurst.state == GateState.CLOSE
+        p = _proximity(efficiency_value=EFFICIENCY_THRESHOLD - EFFICIENCY_CLOSE_BAND)
+        assert p.efficiency.headroom == -EFFICIENCY_CLOSE_BAND
+        assert p.efficiency.state == GateState.CLOSE
+
+    def test_raw_value_and_threshold_surfaced_for_persistence(self) -> None:
+        """The raw ER + active threshold are carried on the record so the live
+        ER distribution is mineable from ``signal_proximity`` (calibration of
+        the 0.20 launch threshold)."""
+        p = _proximity(efficiency_value=Decimal("0.42"))
+        assert p.efficiency_value == Decimal("0.42")
+        assert p.efficiency_threshold == EFFICIENCY_THRESHOLD
 
 
 # ---------------------------------------------------------------------------
@@ -212,41 +224,41 @@ class TestOverallState:
             donchian_low=Decimal("50"),
             ma_fast=Decimal("105"),
             ma_slow=Decimal("100"),
-            hurst_value=Decimal("0.70"),
+            efficiency_value=Decimal("0.70"),
         )
         assert p.overall_state == GateState.PASS
 
     def test_overall_fail_when_any_gate_fails(self) -> None:
-        # Hurst clearly failing pulls overall down to FAIL even when
+        # Efficiency clearly failing pulls overall down to FAIL even when
         # Donchian + Trend are passing.
         p = _proximity(
             last_close=Decimal("110"),
             donchian_high=Decimal("100"),
             ma_fast=Decimal("105"),
             ma_slow=Decimal("100"),
-            hurst_value=Decimal("0.20"),
+            efficiency_value=Decimal("0.05"),
         )
         assert p.overall_state == GateState.FAIL
-        assert p.closest_gate == "hurst"
+        assert p.closest_gate == "efficiency"
 
-    def test_overall_close_when_hurst_in_close_band_and_others_pass(self) -> None:
-        # Donchian + trend PASS; hurst exactly at threshold (CLOSE).
+    def test_overall_close_when_efficiency_in_close_band_and_others_pass(self) -> None:
+        # Donchian + trend PASS; efficiency exactly at threshold (CLOSE).
         p = _proximity(
             last_close=Decimal("110"),
             donchian_high=Decimal("100"),
             ma_fast=Decimal("105"),
             ma_slow=Decimal("100"),
-            hurst_value=HURST_THRESHOLD,
+            efficiency_value=EFFICIENCY_THRESHOLD,
         )
         assert p.overall_state == GateState.CLOSE
-        assert p.closest_gate == "hurst"
+        assert p.closest_gate == "efficiency"
 
-    def test_closest_gate_walks_donchian_trend_hurst_when_tied(self) -> None:
+    def test_closest_gate_walks_donchian_trend_efficiency_when_tied(self) -> None:
         """When ALL gates share the same state, closest_gate ties to ``donchian``.
 
-        This locks the operator's mental-walk order (Donchian → Trend → Hurst,
-        the gate-check sequence in ``_evaluate_market``) so the UI doesn't
-        flip-flop attribution when multiple gates are equally limiting.
+        This locks the operator's mental-walk order (Donchian → Trend →
+        Efficiency, the gate-check sequence in ``_evaluate_market``) so the UI
+        doesn't flip-flop attribution when multiple gates are equally limiting.
         """
         # All three FAIL with similar magnitudes.
         p = _proximity(
@@ -255,7 +267,7 @@ class TestOverallState:
             donchian_low=Decimal("10"),
             ma_fast=Decimal("90"),
             ma_slow=Decimal("100"),
-            hurst_value=Decimal("0.30"),
+            efficiency_value=Decimal("0.05"),
         )
         assert p.overall_state == GateState.FAIL
         assert p.closest_gate == "donchian"
@@ -272,10 +284,10 @@ class TestOverallState:
             last_close=Decimal("50"),
             donchian_high=Decimal("100"),  # long-fail: 50 far below 100
             donchian_low=Decimal("60"),  # short-pass: 50 already below 60
-            # Keep trend + hurst PASSing so overall reflects donchian's better side.
+            # Keep trend + efficiency PASSing so overall reflects donchian's better side.
             ma_fast=Decimal("48"),
             ma_slow=Decimal("55"),
-            hurst_value=Decimal("0.70"),
+            efficiency_value=Decimal("0.70"),
         )
         # short_donchian PASS, long_donchian FAIL — market Donchian = PASS.
         assert p.short_donchian.state == GateState.PASS
@@ -294,8 +306,8 @@ class TestEdgeCases:
             donchian_low=None,
             ma_fast=None,
             ma_slow=None,
-            hurst_value=None,
-            hurst_threshold=HURST_THRESHOLD,
+            efficiency_value=None,
+            efficiency_threshold=EFFICIENCY_THRESHOLD,
         )
         assert p.gate_status == "warming_up"
         assert p.overall_state == GateState.FAIL
@@ -306,7 +318,10 @@ class TestEdgeCases:
         assert p.short_donchian.headroom is None
         assert p.long_trend.headroom is None
         assert p.short_trend.headroom is None
-        assert p.hurst.headroom is None
+        assert p.efficiency.headroom is None
+        # Raw ER value is None when warming; the threshold is still known.
+        assert p.efficiency_value is None
+        assert p.efficiency_threshold == EFFICIENCY_THRESHOLD
 
     def test_warming_up_when_any_field_missing(self) -> None:
         """A partial snapshot is treated as fully warming up.
@@ -322,8 +337,8 @@ class TestEdgeCases:
             donchian_low=Decimal("80"),
             ma_fast=Decimal("99"),
             ma_slow=Decimal("95"),
-            hurst_value=None,  # missing one field
-            hurst_threshold=HURST_THRESHOLD,
+            efficiency_value=None,  # missing one field
+            efficiency_threshold=EFFICIENCY_THRESHOLD,
         )
         assert p.gate_status == "warming_up"
         assert p.closest_gate == "history"
@@ -336,7 +351,7 @@ class TestEdgeCases:
         # into what the gates WOULD have said if the strategy were live.
         assert p.long_donchian.headroom is not None
         assert p.short_donchian.headroom is not None
-        assert p.hurst.headroom is not None
+        assert p.efficiency.headroom is not None
         # Overall state still reflects gate values (not forced to FAIL).
         assert p.overall_state in (GateState.PASS, GateState.CLOSE, GateState.FAIL)
 
@@ -354,8 +369,8 @@ class TestEdgeCases:
             donchian_low=None,
             ma_fast=None,
             ma_slow=None,
-            hurst_value=None,
-            hurst_threshold=HURST_THRESHOLD,
+            efficiency_value=None,
+            efficiency_threshold=EFFICIENCY_THRESHOLD,
             decommissioned=True,
         )
         assert p.gate_status == "decommissioned"
@@ -373,23 +388,23 @@ class TestConstants:
     def test_trend_close_band_is_half_percent(self) -> None:
         assert TREND_CLOSE_BAND_PCT == Decimal("0.005")
 
-    def test_hurst_close_band_is_two_hundredths(self) -> None:
-        assert HURST_CLOSE_BAND == Decimal("0.02")
+    def test_efficiency_close_band_is_five_hundredths(self) -> None:
+        assert EFFICIENCY_CLOSE_BAND == Decimal("0.05")
 
 
 # ---------------------------------------------------------------------------
 # Property-style: overall_state is always the worst gate state per §3.3
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
-    ("donchian_high", "ma_fast", "ma_slow", "hurst_value", "expected"),
+    ("donchian_high", "ma_fast", "ma_slow", "efficiency_value", "expected"),
     [
         # All three pass: overall PASS.
         (Decimal("95"), Decimal("99"), Decimal("95"), Decimal("0.70"), GateState.PASS),
-        # Hurst dips into CLOSE; others PASS: overall CLOSE.
-        (Decimal("95"), Decimal("99"), Decimal("95"), HURST_THRESHOLD, GateState.CLOSE),
-        # Hurst fails; others PASS: overall FAIL.
-        (Decimal("95"), Decimal("99"), Decimal("95"), Decimal("0.20"), GateState.FAIL),
-        # Donchian fails (long-direction); short-direction trend + hurst still
+        # Efficiency dips into CLOSE; others PASS: overall CLOSE.
+        (Decimal("95"), Decimal("99"), Decimal("95"), EFFICIENCY_THRESHOLD, GateState.CLOSE),
+        # Efficiency fails; others PASS: overall FAIL.
+        (Decimal("95"), Decimal("99"), Decimal("95"), Decimal("0.05"), GateState.FAIL),
+        # Donchian fails (long-direction); short-direction trend + efficiency still
         # produce overall = FAIL via the donchian gate.
         (Decimal("200"), Decimal("50"), Decimal("60"), Decimal("0.70"), GateState.FAIL),
     ],
@@ -398,7 +413,7 @@ def test_overall_state_matches_worst_gate(
     donchian_high: Decimal,
     ma_fast: Decimal,
     ma_slow: Decimal,
-    hurst_value: Decimal,
+    efficiency_value: Decimal,
     expected: GateState,
 ) -> None:
     p = _proximity(
@@ -407,6 +422,6 @@ def test_overall_state_matches_worst_gate(
         donchian_low=Decimal("10"),
         ma_fast=ma_fast,
         ma_slow=ma_slow,
-        hurst_value=hurst_value,
+        efficiency_value=efficiency_value,
     )
     assert p.overall_state == expected

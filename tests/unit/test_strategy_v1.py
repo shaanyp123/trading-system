@@ -32,6 +32,7 @@ from strategies.v1_trend_following import (
 from strategies.v1_trend_following.indicators import (
     average_true_range,
     donchian_channel,
+    efficiency_ratio,
     hurst_exponent_rs,
     simple_moving_average,
 )
@@ -61,14 +62,14 @@ def _series_with_breakout(
 ) -> BarSeries:
     """Construct a synthetic price series with a clear upward breakout on the
     final bar. Uses a smooth exponential drift to keep MA_FAST > MA_SLOW and
-    Hurst high enough to pass the persistence filter.
+    the Efficiency Ratio high enough to pass the trend-quality filter.
     """
     start = date(2026, 1, 1)
     bars: list[Bar] = []
     for i in range(n_bars):
-        # Smooth trending drift: 0.2% per day compounding. Without noise the
-        # Hurst R/S regression is degenerate (zero variance after mean adjust),
-        # so add a tiny modulation that doesn't disturb the trend.
+        # Smooth trending drift: 0.2% per day compounding plus a tiny
+        # modulation. The near-monotone drift keeps the Efficiency Ratio high
+        # (efficient one-directional move) so the trend-quality gate passes.
         drift = base * (Decimal("1.002") ** i)
         wave = Decimal(str(0.5 + 0.5 * ((i % 7) / 6)))
         close = (drift + wave).quantize(Decimal("0.01"))
@@ -91,7 +92,7 @@ class TestV1Parameters:
         assert "LOOKBACK_DAYS_DONCHIAN" in canonical
         assert "MIN_HOLDING_DAYS" in canonical
         # Values are stringified (Decimal precision preservation).
-        assert canonical["HURST_THRESHOLD"] == "0.55"
+        assert canonical["EFFICIENCY_RATIO_THRESHOLD"] == "0.20"
         assert canonical["LOOKBACK_DAYS_DONCHIAN"] == "60"
 
     def test_invalid_ma_pair_rejected(self) -> None:
@@ -100,7 +101,7 @@ class TestV1Parameters:
                 lookback_days_donchian=60,
                 ma_fast_days=50,
                 ma_slow_days=40,  # slow < fast — invalid
-                hurst_threshold=Decimal("0.50"),
+                efficiency_ratio_threshold=Decimal("0.50"),
                 stop_distance_atr_mult=Decimal("3.0"),
                 atr_lookback_days=20,
                 min_holding_days=14,
@@ -109,13 +110,13 @@ class TestV1Parameters:
                 roll_days_before_expiry=5,
             )
 
-    def test_hurst_threshold_out_of_range_rejected(self) -> None:
-        with pytest.raises(ValueError, match="hurst_threshold"):
+    def test_efficiency_ratio_threshold_out_of_range_rejected(self) -> None:
+        with pytest.raises(ValueError, match="efficiency_ratio_threshold"):
             V1Parameters(
                 lookback_days_donchian=60,
                 ma_fast_days=50,
                 ma_slow_days=200,
-                hurst_threshold=Decimal("0.95"),  # > 0.80 cap
+                efficiency_ratio_threshold=Decimal("0.95"),  # > 0.90 cap
                 stop_distance_atr_mult=Decimal("3.0"),
                 atr_lookback_days=20,
                 min_holding_days=14,
@@ -216,7 +217,73 @@ class TestIndicators:
             closes.append(Decimal(str(round(prev * (1 + inc), 4))))
         h = hurst_exponent_rs(closes)
         # R/S has a known small-sample upward bias; tolerance reflects that.
+        # hurst_exponent_rs is RETAINED (uncalled by the live gate) as a
+        # backtest-comparison variant; this locks it still computes.
         assert Decimal("0.30") <= h <= Decimal("0.85"), f"H out of expected range: {h}"
+
+    # --- Efficiency Ratio (entry gate #3 since 2026-06-02) ---------------
+    def test_efficiency_ratio_clean_uptrend_is_one(self) -> None:
+        # Monotone +1/bar: net move == total path ⇒ perfectly efficient.
+        closes = [Decimal(str(100 + i)) for i in range(60)]
+        assert efficiency_ratio(closes) == Decimal("1.00000000")
+
+    def test_efficiency_ratio_clean_downtrend_is_one_direction_agnostic(self) -> None:
+        # An equally clean DOWN move scores the same (absolute net move).
+        up = [Decimal(str(100 + i)) for i in range(30)]
+        down = [Decimal(str(100 - i)) for i in range(30)]
+        assert efficiency_ratio(up) == efficiency_ratio(down) == Decimal("1.00000000")
+
+    def test_efficiency_ratio_flat_series_is_zero(self) -> None:
+        # Zero total path length ⇒ degenerate 0/0 guarded to Decimal(0).
+        assert efficiency_ratio([Decimal("100")] * 60) == Decimal(0)
+
+    def test_efficiency_ratio_half_efficient(self) -> None:
+        # net |110 - 100| = 10 over path 5+5+5+5 = 20 ⇒ 0.5.
+        closes = [Decimal("100"), Decimal("105"), Decimal("100"), Decimal("105"), Decimal("110")]
+        assert efficiency_ratio(closes) == Decimal("0.50000000")
+
+    def test_efficiency_ratio_choppy_below_clean(self) -> None:
+        clean = [Decimal(str(100 + i)) for i in range(60)]
+        choppy = [
+            Decimal("100")
+            + (Decimal("6") if i % 2 == 0 else Decimal("-6"))
+            + Decimal(i) * Decimal("0.05")
+            for i in range(60)
+        ]
+        assert efficiency_ratio(choppy) < efficiency_ratio(clean)
+
+    def test_efficiency_ratio_requires_two_closes(self) -> None:
+        with pytest.raises(ValueError, match="need >=2 closes"):
+            efficiency_ratio([Decimal("100")])
+
+    def test_efficiency_ratio_lean_backend_parity_reference(self) -> None:
+        """LEAN ↔ backend parity gate (backend-spec §10.2).
+
+        LEAN's ``lean/v1_strategy.py`` imports ``efficiency_ratio`` from THIS
+        module and runs the gate via the shared ``V1TrendFollowing`` class —
+        there is no second implementation, so the two runtimes are
+        byte-identical by construction. This test pins the canonical Decimal
+        the single shared path produces for a fixed close series (the same
+        closes a LEAN cycle would feed), so any future divergence (a reimpl,
+        a rounding/quantize change) is caught here. The string compare locks
+        the exact serialized form that crosses the LEAN→api wire.
+        """
+        # net |110 - 100| = 10 ; path 2+1+3+1+4+3 = 14 ; 10/14 = 0.714285...
+        closes = [
+            Decimal("100"),
+            Decimal("102"),
+            Decimal("101"),
+            Decimal("104"),
+            Decimal("103"),
+            Decimal("107"),
+            Decimal("110"),
+        ]
+        result = efficiency_ratio(closes)
+        assert str(result) == "0.71428571"
+        # The strategy pipeline must surface this identical value in the
+        # emitted snapshot (what LEAN serializes). Build a series whose final
+        # LOOKBACK window is exactly these closes is overkill here; the shared
+        # function identity above is the parity guarantee.
 
 
 # ---------------------------------------------------------------------------
@@ -233,8 +300,8 @@ class TestV1TrendFollowing:
 
     def test_long_breakout_passes_all_filters(self, strategy: V1TrendFollowing) -> None:
         # A clean upward-trending series with a final-bar breakout. With the
-        # default params (60 / 50 / 200 / 0.50 / 3.0xATR), the trending series
-        # fixture should pass Donchian + MA + Hurst.
+        # default params (60 / 50 / 200 / ER 0.20 / 3.0xATR), the trending series
+        # fixture should pass Donchian + MA + Efficiency Ratio.
         series = _series_with_breakout("/MES")
         result = strategy.generate_signals(
             active_universe={"/MES": series},
@@ -243,9 +310,9 @@ class TestV1TrendFollowing:
             as_of_emitted_at_utc=datetime(2026, 5, 1, 21, 30, tzinfo=UTC),
         )
         assert isinstance(result, SignalGenerationResult)
-        # Either we got a long breakout candidate, or Hurst/MA filtered it out.
-        # Both are valid behaviors for a synthetic series — the assertion that
-        # matters is that one or the other resolution happened cleanly.
+        # Either we got a long breakout candidate, or Efficiency-Ratio/MA filtered
+        # it out. Both are valid behaviors for a synthetic series — the assertion
+        # that matters is that one or the other resolution happened cleanly.
         if result.signals:
             sig = result.signals[0]
             assert isinstance(sig, CandidateSignal)
@@ -259,11 +326,62 @@ class TestV1TrendFollowing:
             reasons = {r for _, r in result.rejections}
             assert reasons.issubset(
                 {
-                    RejectionReason.HURST_BELOW_THRESHOLD,
+                    RejectionReason.EFFICIENCY_BELOW_THRESHOLD,
                     RejectionReason.TREND_FILTER_FAILED,
                     RejectionReason.NO_BREAKOUT,
                 }
             ), f"unexpected rejection set: {reasons}"
+
+    def test_efficiency_gate_vetoes_choppy_breakout(self, strategy: V1TrendFollowing) -> None:
+        """Active-veto-from-cycle-one: a breakout that clears Donchian + trend
+        but is CHOPPY (low Efficiency Ratio) is vetoed at gate #3 with
+        EFFICIENCY_BELOW_THRESHOLD.
+
+        Net up-drift (breaks the 60-day high, keeps close > MA50 > MA200) plus a
+        heavy bar-to-bar zigzag drives ER well under the 0.20 threshold. The
+        choppy left tail is exactly what the gate is meant to trim.
+        """
+        start = date(2026, 1, 1)
+        bars: list[Bar] = []
+        for i in range(250):
+            base = Decimal("100") + Decimal(i) * Decimal("0.4")  # slow net up-drift
+            wig = Decimal("8") if i % 2 == 0 else Decimal("-8")  # heavy zigzag => low ER
+            bars.append(_make_bar(start + timedelta(days=i), close=base + wig))
+        bars[-1] = _make_bar(bars[-1].session_date, close=Decimal("250"))  # clean breakout level
+        series = BarSeries(market="/MES", bars=tuple(bars))
+        result = strategy.generate_signals(
+            active_universe={"/MES": series},
+            current_positions={},
+            as_of_session_date=bars[-1].session_date,
+        )
+        reasons = {r for _, r in result.rejections}
+        assert RejectionReason.EFFICIENCY_BELOW_THRESHOLD in reasons, (
+            f"expected efficiency veto on a choppy breakout, got {reasons}"
+        )
+        assert all(sig.market != "/MES" for sig in result.signals)
+        # The proximity record carries the sub-threshold raw ER + attributes
+        # the worst gate to efficiency.
+        mp = result.market_evaluations[0]
+        assert mp.efficiency_value is not None and mp.efficiency_value < Decimal("0.20")
+        assert mp.closest_gate == "efficiency"
+
+    def test_efficiency_gate_passes_clean_breakout(self, strategy: V1TrendFollowing) -> None:
+        """Mirror of the veto test: the clean trending fixture (high Efficiency
+        Ratio) is NOT vetoed at gate #3 — ER >= 0.20. If a signal fires, its
+        emitted snapshot ER clears the threshold."""
+        series = _series_with_breakout("/MES")
+        result = strategy.generate_signals(
+            active_universe={"/MES": series},
+            current_positions={},
+            as_of_session_date=series.bars[-1].session_date,
+        )
+        reasons = {r for _, r in result.rejections}
+        assert RejectionReason.EFFICIENCY_BELOW_THRESHOLD not in reasons, (
+            f"clean breakout should clear the efficiency gate; rejections={reasons}"
+        )
+        if result.signals:
+            er = Decimal(str(result.signals[0].indicators_snapshot["efficiency_ratio"]))
+            assert er >= Decimal("0.20")
 
     def test_insufficient_history_rejected(self, strategy: V1TrendFollowing) -> None:
         short_series = BarSeries(
@@ -284,10 +402,10 @@ class TestV1TrendFollowing:
     def test_no_breakout_when_close_inside_channel(self, strategy: V1TrendFollowing) -> None:
         """Series with mild noise but no breakout on the final bar.
 
-        A perfectly flat series triggers zero-variance in the Hurst R/S
-        regression and degenerates the indicator pipeline, so we use a
-        small-amplitude oscillation instead — enough variance to compute
-        Hurst, not enough to break the trailing 60-day channel.
+        A perfectly flat series degenerates the indicator pipeline (collapsed
+        MAs / channel; Efficiency Ratio's zero-path 0/0 case), so we use a
+        small-amplitude oscillation instead — enough movement to keep the
+        indicators well-defined, not enough to break the trailing 60-day channel.
         """
         # 250 bars oscillating in [98, 102] — channel range ~4 absolute, never
         # exceeded by the final close (which lands mid-range).
@@ -391,7 +509,7 @@ class TestV1TrendFollowing:
         assert reasons.issubset(
             {
                 RejectionReason.POSITION_ALREADY_SAME_DIRECTION,
-                RejectionReason.HURST_BELOW_THRESHOLD,
+                RejectionReason.EFFICIENCY_BELOW_THRESHOLD,
                 RejectionReason.TREND_FILTER_FAILED,
                 RejectionReason.NO_BREAKOUT,
             }

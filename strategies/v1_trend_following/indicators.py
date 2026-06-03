@@ -221,3 +221,63 @@ def hurst_exponent_rs(
         raise ValueError("hurst_rs: zero variance in log_n (degenerate regression)")
     slope = num / den
     return Decimal(str(round(slope, 4)))
+
+
+def efficiency_ratio(closes: Sequence[Decimal]) -> Decimal:
+    """Kaufman Efficiency Ratio (ER) over the provided closes.
+
+        ER = |close[-1] - close[0]| / sum(|close[i] - close[i-1]|)
+
+    The numerator is the *net* directional move over the window; the
+    denominator is the *total path length* (sum of absolute bar-to-bar
+    moves). ER lies in [0, 1]:
+
+      - ER -> 1.0 : a clean, efficient trend — price marched in one
+                    direction with little back-and-forth.
+      - ER -> 0.0 : choppy / mean-reverting — lots of motion, no net
+                    progress.
+
+    Direction-agnostic: the absolute net move scores an efficient down-move
+    exactly like an efficient up-move (mirroring the sign-agnostic reading
+    of the Hurst gate this indicator replaces as V1 entry gate #3).
+
+    This is the third entry gate per backend-spec §2.3: it measures
+    *trend quality*. Unlike the R/S Hurst estimator it replaced, ER is
+    strongly correlated with trend magnitude (sim corr ~+0.97) and is not
+    biased on short windows, so it actually discriminates noise from trend
+    on the 60-bar V1 lookback rather than culling at near-random.
+
+    Anti-pattern A05: the ratio is computed in `float` (bounded to [0, 1]
+    and fed only into a `>= threshold` comparison — never P&L bookkeeping),
+    then converted back to `Decimal` and quantized to `_PRICE_QUANTUM` at
+    the boundary, matching the other indicators in this module.
+
+    Degenerate window — zero total path length (every close identical):
+    return `Decimal(0)`. A flat series has no efficient trend, and the 0/0
+    case must not raise. A single dominant gap can inflate ER toward 1.0
+    (its known failure mode); the ATR-based trailing stop is the backstop,
+    not this gate.
+
+    Requires `len(closes) >= 2` (one net move + at least one path step).
+    Raises `ValueError` otherwise. In the V1 pipeline this is always called
+    on the `LOOKBACK_DAYS_DONCHIAN`-close slice (60 closes by default); the
+    INSUFFICIENT_BAR_HISTORY guard (driven by `MA_SLOW_DAYS`, not by this
+    function raising) fires long before a sub-2-close window could reach
+    here. The 2-close floor is the mathematical minimum, not the operating
+    point.
+    """
+    n = len(closes)
+    if n < 2:
+        raise ValueError(f"efficiency_ratio: need >=2 closes, got {n}")
+
+    # float for the division per A05; closes are Decimal at the boundary.
+    net_change = abs(float(closes[-1]) - float(closes[0]))
+    path_length = 0.0
+    for i in range(1, n):
+        path_length += abs(float(closes[i]) - float(closes[i - 1]))
+
+    if path_length == 0.0:
+        # Flat / degenerate window: no path, no efficiency. Avoid 0/0.
+        return Decimal(0)
+
+    return Decimal(str(net_change / path_length)).quantize(_PRICE_QUANTUM)

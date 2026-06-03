@@ -38,7 +38,7 @@ class StrategyInputsTrace(TypedDict):
     donchian_low: str
     ma_fast: str
     ma_slow: str
-    hurst: str
+    efficiency_ratio: str  # was `hurst` pre-2026-06-02; old JSONB rows keep `hurst`
     atr: str
     stop_price: str
     lookback_days_donchian: int

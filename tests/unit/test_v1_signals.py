@@ -139,7 +139,7 @@ def test_decommissioned_market_emits_proximity_with_values() -> None:
     headrooms = [
         mes.long_donchian.headroom,
         mes.short_donchian.headroom,
-        mes.hurst.headroom,
+        mes.efficiency.headroom,
     ]
     assert any(h is not None for h in headrooms)
 

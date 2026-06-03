@@ -40,7 +40,9 @@ export type GateStateLiteral = 'pass' | 'close' | 'fail';
 
 export type GateStatusLiteral = 'ok' | 'warming_up' | 'decommissioned';
 
-export type ClosestGateLiteral = 'donchian' | 'trend' | 'hurst' | 'history';
+// 'hurst' retained for historic rows pre-dating the 2026-06-02 gate swap;
+// new rows emit 'efficiency'.
+export type ClosestGateLiteral = 'donchian' | 'trend' | 'hurst' | 'efficiency' | 'history';
 
 export interface GateView {
   readonly state: GateStateLiteral;
@@ -60,7 +62,7 @@ export interface MarketProximityView {
   readonly short_donchian: GateView;
   readonly long_trend: GateView;
   readonly short_trend: GateView;
-  readonly hurst: GateView;
+  readonly efficiency: GateView;
   readonly overall_state: GateStateLiteral;
   readonly closest_gate: ClosestGateLiteral;
   readonly gate_status: GateStatusLiteral;
@@ -125,8 +127,14 @@ export function closestGateAbsGap(market: MarketProximityView): number {
         absParseOrInfinity(market.long_trend.headroom),
         absParseOrInfinity(market.short_trend.headroom),
       );
+    case 'efficiency':
+      return absParseOrInfinity(market.efficiency.headroom);
     case 'hurst':
-      return absParseOrInfinity(market.hurst.headroom);
+      // Legacy rows pre-dating the 2026-06-02 gate swap carry no `efficiency`
+      // headroom to compare on; sort them to the bottom of their bucket. Such
+      // rows are stale by definition (a market not re-evaluated since the
+      // swap) and age out after the next cycle.
+      return Number.POSITIVE_INFINITY;
     case 'history':
       return Number.POSITIVE_INFINITY;
   }

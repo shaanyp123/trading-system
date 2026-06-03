@@ -1,4 +1,4 @@
-"""v1_trend_following — Donchian / MA / Hurst trend-following strategy (Phase 1).
+"""v1_trend_following — Donchian / MA / Efficiency-Ratio trend-following strategy (Phase 1).
 
 Public surface used by `services/signal/` and `lean/v1_qc_algorithm.py`. Internals
 (indicators, audit-event payload shapes, sizing-trace skeleton) are exposed for
@@ -32,7 +32,7 @@ from strategies.v1_trend_following.parameters import (
 )
 from strategies.v1_trend_following.proximity import (
     DONCHIAN_CLOSE_BAND_PCT,
-    HURST_CLOSE_BAND,
+    EFFICIENCY_CLOSE_BAND,
     TREND_CLOSE_BAND_PCT,
     GateProximity,
     GateState,
@@ -54,7 +54,7 @@ from strategies.v1_trend_following.strategy import STRATEGY_NAME, V1TrendFollowi
 
 __all__ = [
     "DONCHIAN_CLOSE_BAND_PCT",
-    "HURST_CLOSE_BAND",
+    "EFFICIENCY_CLOSE_BAND",
     "STRATEGY_NAME",
     "TREND_CLOSE_BAND_PCT",
     "V1_CANDIDATE_UNIVERSE",

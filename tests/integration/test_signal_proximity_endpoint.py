@@ -131,8 +131,10 @@ def _evaluation(
         short_donchian=_gate("fail", "0.085"),
         long_trend=_gate("pass", "0.015"),
         short_trend=_gate("fail", "-0.015"),
-        hurst=_gate("pass", "0.03"),
+        efficiency=_gate("pass", "0.23"),
         last_close=Decimal("5234.50"),
+        efficiency_ratio_value=Decimal("0.43"),
+        efficiency_ratio_threshold=Decimal("0.20"),
         overall_state=overall,  # type: ignore[arg-type]
         closest_gate=closest,  # type: ignore[arg-type]
         gate_status=status,  # type: ignore[arg-type]
@@ -232,7 +234,7 @@ async def test_endpoint_returns_latest_per_market(
             cycle_ts_utc=earlier,
             session_date_et="2026-05-27",
             evaluations=[
-                _evaluation("/MES", overall="fail", closest="hurst"),
+                _evaluation("/MES", overall="fail", closest="efficiency"),
                 _evaluation("/MNQ", overall="close"),
             ],
         )
@@ -242,7 +244,7 @@ async def test_endpoint_returns_latest_per_market(
             session_date_et="2026-05-28",
             evaluations=[
                 _evaluation("/MES", overall="pass", closest="trend"),
-                _evaluation("/MNQ", overall="fail", closest="hurst"),
+                _evaluation("/MNQ", overall="fail", closest="efficiency"),
             ],
         )
         await session.commit()
@@ -255,7 +257,7 @@ async def test_endpoint_returns_latest_per_market(
     assert by_market["/MES"]["overall_state"] == "pass"
     assert by_market["/MES"]["closest_gate"] == "trend"
     assert by_market["/MNQ"]["overall_state"] == "fail"
-    assert by_market["/MNQ"]["closest_gate"] == "hurst"
+    assert by_market["/MNQ"]["closest_gate"] == "efficiency"
 
 
 @pytest.mark.asyncio
@@ -300,7 +302,7 @@ async def test_endpoint_response_shape_matches_design(
     assert market["short_donchian"] == {"state": "fail", "headroom": "0.085"}
     assert market["long_trend"] == {"state": "pass", "headroom": "0.015"}
     assert market["short_trend"] == {"state": "fail", "headroom": "-0.015"}
-    assert market["hurst"] == {"state": "pass", "headroom": "0.03"}
+    assert market["efficiency"] == {"state": "pass", "headroom": "0.23"}
 
 
 @pytest.mark.asyncio
@@ -316,8 +318,10 @@ async def test_endpoint_warming_up_market_serializes_nulls(
         short_donchian=sentinel,
         long_trend=sentinel,
         short_trend=sentinel,
-        hurst=sentinel,
+        efficiency=sentinel,
         last_close=None,
+        efficiency_ratio_value=None,
+        efficiency_ratio_threshold=Decimal("0.20"),
         overall_state="fail",
         closest_gate="history",
         gate_status="warming_up",
@@ -338,7 +342,7 @@ async def test_endpoint_warming_up_market_serializes_nulls(
     assert market["gate_status"] == "warming_up"
     assert market["closest_gate"] == "history"
     assert market["long_donchian"]["headroom"] is None
-    assert market["hurst"]["headroom"] is None
+    assert market["efficiency"]["headroom"] is None
 
 
 # ---------------------------------------------------------------------------

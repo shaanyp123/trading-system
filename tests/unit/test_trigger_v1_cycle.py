@@ -129,7 +129,7 @@ def _make_signal(
             "donchian_low": Decimal("90.00"),
             "ma_fast": Decimal("96.00"),
             "ma_slow": Decimal("92.00"),
-            "hurst": Decimal("0.65"),
+            "efficiency_ratio": Decimal("0.65"),
             "atr": Decimal("1.50"),
             "lookback_days_donchian": 60,
         },
@@ -582,7 +582,7 @@ class TestBuildV1Parameters:
         assert params.lookback_days_donchian == 60
         assert params.ma_fast_days == 50
         assert params.ma_slow_days == 200
-        assert params.hurst_threshold == Decimal("0.55")
+        assert params.efficiency_ratio_threshold == Decimal("0.20")
         assert params.atr_lookback_days == 20
         assert params.min_holding_days == 14
 
@@ -674,7 +674,7 @@ class TestBuildMinimalSizingTrace:
         si = stage0["strategy_inputs"][signal.market]
         assert si["donchian_high"] == "99.50"
         assert si["ma_fast"] == "96.00"
-        assert si["hurst"] == "0.65"
+        assert si["efficiency_ratio"] == "0.65"
         assert si["lookback_days_donchian"] == 60
         # lean_naive_sizing surfaces the equity + rationale
         sizing = trace["lean_naive_sizing"]
@@ -900,14 +900,14 @@ class TestSummarize:
             rejections=[
                 ("TLT", RejectionReason.NO_BREAKOUT),
                 ("IEF", RejectionReason.NO_BREAKOUT),
-                ("SHY", RejectionReason.HURST_BELOW_THRESHOLD),
+                ("SHY", RejectionReason.EFFICIENCY_BELOW_THRESHOLD),
             ],
             history_missing_markets=(),
             stale_markets=(),
         )
         assert s.rejections_count == 3
         assert s.rejection_reasons["no_breakout"] == 2
-        assert s.rejection_reasons["hurst_below_threshold"] == 1
+        assert s.rejection_reasons["efficiency_below_threshold"] == 1
 
     def test_mixed_outcomes_counted_correctly(self) -> None:
         outcomes = [
@@ -1226,8 +1226,9 @@ def _emit_breakout_bars(start: date, n_bars: int) -> list[tuple[date, Decimal]]:
     """Generate ``n_bars`` (date, close) tuples that pass the V1 entry filters.
 
     Same trajectory shape as ``test_strategy_v1._series_with_breakout``:
-    smooth 0.2%/day uptrend with a small modulation for Hurst variance,
-    plus a clear breakout above the trailing high on the final bar.
+    smooth 0.2%/day uptrend (an efficient one-directional move → high
+    Efficiency Ratio) with a small modulation, plus a clear breakout above
+    the trailing high on the final bar.
     """
     base = Decimal("100")
     out: list[tuple[date, Decimal]] = []

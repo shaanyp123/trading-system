@@ -169,11 +169,13 @@ A long entry fires when **all three** conditions are met on the daily bar at 17:
 
 1. **Donchian breakout** — today's close prints above the trailing `LOOKBACK_DAYS_DONCHIAN`-day high (default 60 days)
 2. **Trend filter** — `close > MA_FAST` AND `MA_FAST > MA_SLOW` (defaults: 50-day fast, 200-day slow)
-3. **Persistence filter** — Hurst exponent over the same lookback ≥ `HURST_THRESHOLD` (default 0.55)
+3. **Trend-quality filter** — Kaufman Efficiency Ratio over the same lookback ≥ `EFFICIENCY_RATIO_THRESHOLD` (default 0.20)
 
-Short entries are the symmetric mirror (close below trailing low, MA_FAST < MA_SLOW, same Hurst threshold).
+Short entries are the symmetric mirror (close below trailing low, MA_FAST < MA_SLOW, same Efficiency-Ratio threshold — ER is direction-agnostic).
 
-**Hurst exponent** is a measure of long-range dependence in a price series. H = 0.5 is a random walk; H > 0.5 indicates persistence (a trending series); H < 0.5 indicates mean reversion. The R/S (rescaled-range) estimator is used. The 0.55 threshold is calibrated to the small-sample upward bias of R/S on a 60-bar window (the estimator typically inflates H by ~0.05 on short series, so 0.55 is what 0.50 buys you on a clean signal).
+**Efficiency Ratio (ER)** is `|close[-1] − close[0]| / Σ|close[i] − close[i−1]|` over the lookback window — net directional move divided by total path length, in [0, 1]. ER → 1.0 is a clean, efficient one-directional trend; ER → 0.0 is choppy / no net progress. It replaced the Hurst R/S persistence gate on **2026-06-02** (gate #3, same slot) and launched **active at 0.20** (vetoes from cycle one). A single dominant gap can inflate ER toward 1.0 (its known failure mode); the ATR×3 trailing stop is the backstop.
+
+> **Why ER replaced Hurst (R/S).** A Monte-Carlo evaluation of the *production* R/S estimator on a 60-bar window found it over-estimates H by **~+0.12** on a pure random walk (mean H ≈ 0.62), **not the ~0.05** earlier docs claimed — that figure was factually wrong. R/S was also drift-blind (per-chunk de-meaning removes drift; a 3.3× price move read byte-identical H) and orthogonal to trend magnitude (corr ≈ +0.005), i.e. it culled ~31% of breakouts at near-random. ER correlates with trend magnitude at ≈ +0.97 and actually discriminates noise from trend on the 60-bar lookback. At 0.20 the gate vetoes ~12% of entries (sim: ~5% of bond-ETF breakouts, ~27% of equity-index); conditional ER median on fired bars ≈ 0.45, so 0.20 trims the choppy left tail. Calibrated on simulation (no live ER data at launch); the live ER distribution now accumulating in `signal_proximity` is the interim evidence to confirm/adjust 0.20. See `Docs/decisions-log.md` 2026-06-02.
 
 **Signal cycle timing.** Signals are computed at 17:30 ET on every CME session. If settlement prices aren't available yet, the signal engine retries every 5 minutes; at 18:00 ET it falls back to the bid/ask midpoint and tags the signal `unsettled`; at 18:30 ET it drops the signal for that market and continues with the others.
 
@@ -381,7 +383,7 @@ These live in `strategies/v1_trend_following/parameters.py` and are persisted as
 | `LOOKBACK_DAYS_DONCHIAN` | 60 | [20, 252] | up (longer = stricter) | **Agent** (within range, tighten only) |
 | `MA_FAST_DAYS` | 50 | [5, MA_SLOW_DAYS) | up (slower = fewer crossovers) | **Agent** |
 | `MA_SLOW_DAYS` | 200 | (MA_FAST_DAYS, 400] | up (slower = stricter trend) | **Agent** |
-| `HURST_THRESHOLD` | 0.55 | [0.40, 0.80] | up (more selective) | **Agent** above 0.50; **PR** to go below 0.50 |
+| `EFFICIENCY_RATIO_THRESHOLD` | 0.20 | [0.0, 0.90] | up (more selective on trend quality) | **Agent** to tighten up; **PR** to loosen down (incl. dialing toward off) |
 | `STOP_DISTANCE_ATR_MULT` | 3.0 | [1.0, 6.0] | down (tighter stop) | **Agent** |
 | `ATR_LOOKBACK_DAYS` | 20 | [5, 60] | n/a | **PR-only — locked** |
 | `MIN_HOLDING_DAYS` | 14 | [1, 60] | n/a | **PR-only — locked** |
@@ -585,11 +587,12 @@ The thing being optimized: **a verifiable, reproducible, defensible track record
 | **Composite identity** | `(strategy_hash, parameter_set_hash, slippage_calibration_version_id)` — attached to every signal/trade so historical decisions are reproducible |
 | **CONVALESCENT** | Risk state with vol multiplier 0.5; entries permitted; auto-promotes to NORMAL after 5 clean CME sessions |
 | **Donchian channel** | The trailing N-day high and low; "Donchian breakout" = today's close prints above the trailing high (or below the low for shorts) |
+| **Efficiency Ratio (ER)** | Kaufman Efficiency Ratio: `\|net move\| / total path length` over the lookback, in [0, 1]. ER → 1 = clean efficient trend; ER → 0 = choppy. V1 entry gate #3 since 2026-06-02 (default threshold 0.20, direction-agnostic); replaced the Hurst R/S gate |
 | **F&F** | Friends and Family — the post-Phase-3 pool of outside capital |
 | **FlexQuery** | IBKR's daily XML report — used for end-of-day reconciliation |
 | **HALT_NEW** | No new entries; existing positions hold; exits continue (stops, profit-targets, manual close). Three sub-flavors by severity: `routine`, `defensive_envelope`, `incident_review` |
 | **Hot-fix whitelist** | Code paths where Claude Code (or the agent) can deploy without a PR — logging, retry helpers, monitoring, agent reporting templates. Auto-rollback on metric breach. |
-| **Hurst exponent** | A measure of long-range dependence in a price series. H > 0.5 = persistent / trending; H < 0.5 = mean reverting; H = 0.5 = random walk |
+| **Hurst exponent** | A measure of long-range dependence in a price series. H > 0.5 = persistent / trending; H < 0.5 = mean reverting; H = 0.5 = random walk. **Retired as V1 entry gate #3 on 2026-06-02** (replaced by the Efficiency Ratio — the R/S estimator was ~+0.12-biased + trend-orthogonal on a 60-bar window); `hurst_exponent_rs` is retained in `indicators.py` as an uncalled backtest-comparison variant |
 | **JCS** | RFC 8785 JSON Canonicalization Scheme — how the audit log serializes data before hashing |
 | **`live-small`** | Real money, equity < $50k at signal time |
 | **`live-scale`** | Real money, equity ≥ $50k at signal time |

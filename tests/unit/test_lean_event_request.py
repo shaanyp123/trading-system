@@ -46,8 +46,10 @@ def _proximity_row(market: str = "/MES") -> dict[str, object]:
         "short_donchian": {"state": "fail", "headroom": "0.085", "detail": None},
         "long_trend": {"state": "pass", "headroom": "0.015", "detail": None},
         "short_trend": {"state": "fail", "headroom": "-0.015", "detail": None},
-        "hurst": {"state": "pass", "headroom": "0.03", "detail": None},
+        "efficiency": {"state": "pass", "headroom": "0.23", "detail": None},
         "last_close": "5234.50",
+        "efficiency_ratio_value": "0.43",
+        "efficiency_ratio_threshold": "0.20",
         "overall_state": "close",
         "closest_gate": "donchian",
         "gate_status": "ok",
@@ -198,7 +200,7 @@ def test_market_evaluation_invalid_overall_state_rejected() -> None:
 
 
 def test_market_evaluation_invalid_closest_gate_rejected() -> None:
-    """closest_gate must be one of donchian / trend / hurst / history."""
+    """closest_gate must be one of donchian / trend / hurst / efficiency / history."""
     row = _proximity_row("/MES")
     row["closest_gate"] = "donchian_high"  # close to a real value but wrong
     with pytest.raises(ValidationError):
@@ -247,8 +249,10 @@ def test_market_evaluation_warming_up_with_none_numerics_parses() -> None:
         "short_donchian": {"state": "fail", "headroom": None, "detail": "warming_up"},
         "long_trend": {"state": "fail", "headroom": None, "detail": "warming_up"},
         "short_trend": {"state": "fail", "headroom": None, "detail": "warming_up"},
-        "hurst": {"state": "fail", "headroom": None, "detail": "warming_up"},
+        "efficiency": {"state": "fail", "headroom": None, "detail": "warming_up"},
         "last_close": None,
+        "efficiency_ratio_value": None,
+        "efficiency_ratio_threshold": "0.20",
         "overall_state": "fail",
         "closest_gate": "history",
         "gate_status": "warming_up",
