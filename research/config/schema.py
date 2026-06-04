@@ -21,8 +21,9 @@ import yaml
 KNOWN_ENGINES: Final = ("daily", "vbt", "lean")
 #: Resolutions known to the schema. Only ``daily`` runs now (intraday deferred).
 KNOWN_RESOLUTIONS: Final = ("daily", "minute", "tick")
-#: Strategy refs the registry can build (P1 buy-and-hold + the P2/P3 Donchian).
-KNOWN_STRATEGIES: Final = ("buy_and_hold", "donchian")
+#: Strategy refs the registry can build (P1 buy-and-hold + P2/P3 Donchian +
+#: the v1_adapter, which replays the production V1 logic — backtest "our strategy").
+KNOWN_STRATEGIES: Final = ("buy_and_hold", "donchian", "v1_adapter")
 
 _DEFAULT_DATA_ROOT_ENV = "RESEARCH_DATA_ROOT"
 _DEFAULT_DATA_ROOT = "research/data/cache/lean_bars"

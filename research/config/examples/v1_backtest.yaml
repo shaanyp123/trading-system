@@ -1,0 +1,31 @@
+# Backtest the PRODUCTION strategy (V1) — replays the REAL V1 logic via the
+# v1_adapter (strategies/v1_trend_following), so entry/exit timing is faithful to
+# what live + LEAN actually decide. Run it:
+#   make research RUN=research/config/examples/v1_backtest.yaml
+#   → research/runs/<UTC-ts>/report.html  (V1's equity + leverage/ruin per cap)
+#
+# Fidelity (numpy screen — LEAN is the authority for fills, design D1):
+#   • entry (Donchian + MA filter + Kaufman ER gate) + indicator exits
+#     (reversal/trend-flip/decommission, MIN_HOLDING-gated) are the REAL V1 logic.
+#   • V1's ATR protective stop is intrabar; approximated close-based here. The
+#     authoritative fill/stop/margin run is the LEAN path (a follow-up).
+#   • Single instrument: V1's per-market direction, sized by vol_target (V1's
+#     Clenow sizing) under the leverage cap. Multi-instrument portfolio = P4.
+#
+# Swap `universe` to any market in the V1 set (/MES /MNQ /MYM /M2K /MGC /MBT +
+# TLT IEF SHY TIP). For a future / single-expiry, add an `expiries:` block
+# (continuous multi-year futures needs the LEAN path). To backtest a DIFFERENT
+# daily strategy, add a ResearchStrategy subclass (v1_adapter / donchian are the
+# templates) and reference it by name here.
+name: v1_tlt_backtest
+engine: daily
+mode: backtest
+resolution: daily
+universe: ["TLT"]            # V1 shorts TLT's downtrend over this window
+date_range: { start: 2025-06-05, end: 2026-06-03 }
+starting_cash: 100000
+strategy: { ref: v1_adapter }                              # production V1, live default params
+# V1's Clenow sizing — lookbacks pinned to V1_DEFAULTS so the sweep's sizing can't
+# silently desync from a future change to the harness defaults.
+sizing: { scheme: vol_target, vol_target_pct_annual: 0.15, instrument_vol_lookback_days: 60, atr_lookback_days: 20 }
+leverage: { cap: 3.0, sweep: [1.0, 2.0, 3.0] }
