@@ -211,7 +211,9 @@ def check_parity(
     )
     pnl_ok = pnl_fraction <= max_pnl_fraction
 
-    # 3. per-trade slippage (matched pairwise by entry order).
+    # 3. per-trade slippage (matched pairwise by entry order). strict=False
+    # truncates to the shorter list — acceptable because criterion 1 (count
+    # divergence) already catches a gross trade-set mismatch before we get here.
     leg_slippages: list[LegSlippage] = []
     worst = Decimal("0")
     for idx, (r, lake) in enumerate(zip(research_closed, lean_closed, strict=False)):

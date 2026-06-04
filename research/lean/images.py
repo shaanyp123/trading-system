@@ -73,6 +73,30 @@ def docker_available() -> bool:
     return proc.returncode == 0 and bool(proc.stdout.strip())
 
 
+def docker_image_available(image: str) -> bool:
+    """True iff a Docker image named ``image`` exists LOCALLY (no registry pull).
+
+    The raw-docker backend needs the locally-built ``lean_local`` image; a live
+    daemon alone is not enough. Without this check, a daemon-up / image-absent
+    environment (CI, or a dev box mid-build) would turn a skip into a spurious
+    ``docker run`` error — the integration tests use this to SKIP visibly instead.
+    """
+    docker = shutil.which("docker")
+    if docker is None:
+        return False
+    try:
+        proc = subprocess.run(
+            [docker, "image", "inspect", image],
+            capture_output=True,
+            text=True,
+            timeout=_DOCKER_PROBE_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
 def cli_backend_runnable() -> bool:
     """The CLI backend needs both the ``lean`` CLI and a live Docker daemon."""
     return lean_cli_available() and docker_available()
@@ -96,6 +120,27 @@ def select_backend(prefer: Backend | None = None) -> Backend | None:
     if cli_backend_runnable():
         return "lean_cli"
     if docker_backend_runnable():
+        return "docker"
+    return None
+
+
+def runnable_backend(prefer: Backend | None = None, *, lean_local_image: str) -> Backend | None:
+    """Like :func:`select_backend`, but the docker backend also requires that its
+    ``lean_local_image`` is built locally (the CLI pulls its own image on demand).
+
+    This is what callers/tests should gate on before a REAL run: it returns ``None``
+    (→ a visible skip) when the engine cannot actually run, rather than letting a
+    daemon-up / image-absent box fall through to a ``docker run`` error.
+    """
+    cli = cli_backend_runnable()
+    docker_ok = docker_backend_runnable() and docker_image_available(lean_local_image)
+    if prefer == "lean_cli":
+        return "lean_cli" if cli else None
+    if prefer == "docker":
+        return "docker" if docker_ok else None
+    if cli:
+        return "lean_cli"
+    if docker_ok:
         return "docker"
     return None
 

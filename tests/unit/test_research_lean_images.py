@@ -74,6 +74,31 @@ def test_select_backend_docker_only(monkeypatch: pytest.MonkeyPatch) -> None:
     assert images.select_backend("lean_cli") is None
 
 
+def test_docker_image_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(images.shutil, "which", lambda _name: "/usr/local/bin/docker")
+
+    def fake_run(args: list[str], **_k: object) -> subprocess.CompletedProcess[str]:
+        rc = 0 if args[-1] == "present:latest" else 1
+        return subprocess.CompletedProcess(args=args, returncode=rc, stdout="", stderr="")
+
+    monkeypatch.setattr(images.subprocess, "run", fake_run)
+    assert images.docker_image_available("present:latest") is True
+    assert images.docker_image_available("absent:latest") is False
+
+
+def test_runnable_backend_requires_image_for_docker(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Docker daemon up, CLI absent, image NOT built ⇒ no runnable backend (→ skip),
+    # even though select_backend() would optimistically return "docker".
+    monkeypatch.setattr(images, "lean_cli_available", lambda: False)
+    monkeypatch.setattr(images, "docker_available", lambda: True)
+    monkeypatch.setattr(images, "docker_image_available", lambda _img: False)
+    assert images.select_backend() == "docker"  # daemon-only optimism
+    assert images.runnable_backend(lean_local_image="x:latest") is None  # image-aware → skip
+    # ...image present ⇒ docker is runnable.
+    monkeypatch.setattr(images, "docker_image_available", lambda _img: True)
+    assert images.runnable_backend(lean_local_image="x:latest") == "docker"
+
+
 def test_select_backend_none_when_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(images, "lean_cli_available", lambda: False)
     monkeypatch.setattr(images, "docker_available", lambda: False)

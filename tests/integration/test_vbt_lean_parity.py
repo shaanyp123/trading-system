@@ -36,7 +36,7 @@ from research.data.daily_loader import load_daily_series
 from research.eval.parity import check_parity, extract_trades_from_positions, lean_trade_to_trade
 from research.lean import images
 from research.lean.config_render import reference_parameters
-from research.lean.driver import LeanRunSpec, run_backtest
+from research.lean.driver import DEFAULT_LEAN_LOCAL_IMAGE, LeanRunSpec, run_backtest
 from research.screen.daily_eval import evaluate_daily
 from research.strategy.donchian import DonchianBreakout
 
@@ -53,11 +53,13 @@ _REFERENCE_ALGO = Path("research/lean/projects/donchian_reference.py")
 
 
 def test_vectorbt_lean_parity(tmp_path: Path) -> None:
-    backend = images.select_backend()
+    backend = images.runnable_backend(lean_local_image=DEFAULT_LEAN_LOCAL_IMAGE)
     if backend is None:
         pytest.skip(
-            "no LEAN backend (lean CLI + Docker daemon) — the parity rail needs a real "
-            f"engine: {images.availability_report()} (design §9 P2; never a silent pass)"
+            "no RUNNABLE LEAN backend — need either the `lean` CLI + Docker, or the "
+            f"`{DEFAULT_LEAN_LOCAL_IMAGE}` image built + Docker "
+            f"({images.availability_report()}). Build it per research/lean/README. "
+            "(design §9 P2; never a silent pass)"
         )
     if not _DATA_ROOT.exists():
         pytest.skip(

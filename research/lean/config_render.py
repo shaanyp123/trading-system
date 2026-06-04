@@ -46,6 +46,9 @@ class LeanProjectConfig:
     algorithm_location: str  # e.g. "v1_strategy.py" or "donchian_reference.py"
     parameters: dict[str, str]  # LEAN parameter map (all string values)
     description: str = "research throwaway config (P2 LEAN driver)"
+    #: Only meaningful for the LEAN CLI backend. The raw-docker backend's
+    #: ``lean_local`` entrypoint FORCE-OVERRIDES the active environment from
+    #: ``LEAN_LIVE_MODE`` (entrypoint.sh), so this field is ignored there.
     environment: str = "backtesting"
     #: In-container results dir for the raw-docker backend (mounted to the host
     #: output dir). ``None`` leaves it to the backend default (the CLI's ``--output``).

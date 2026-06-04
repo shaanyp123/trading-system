@@ -51,8 +51,14 @@ class DonchianReferenceAlgorithm(QCAlgorithm):  # noqa: F405
         self.set_cash(cash)
         self.set_time_zone("America/New_York")
 
+        # RAW normalization to match the numpy loader's raw close-to-close prices
+        # (research/data/daily_loader.py) AND to avoid a factor_file dependency the
+        # on-disk bar COPY does not carry. Default add_equity is Adjusted.
         equity = self.add_equity(  # noqa: F405
-            ticker, resolution=Resolution.DAILY, extended_market_hours=False  # noqa: F405
+            ticker,
+            resolution=Resolution.DAILY,  # noqa: F405
+            extended_market_hours=False,
+            data_normalization_mode=DataNormalizationMode.RAW,  # noqa: F405
         )
         self._symbol = equity.symbol
         # Zero fees + slippage so parity isolates the fill-convention gap (above).

@@ -29,7 +29,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 
 import numpy as np
@@ -230,8 +230,16 @@ def _parse_equity_curve(
             "LEAN result has no Strategy Equity points — cannot build an equity curve"
         )
     points.sort(key=lambda p: p[0])
-    dates = tuple(_unix_to_datetime(x).date() for x, _ in points)
-    equity = np.asarray([v for _, v in points], dtype=np.float64)
+    # Collapse same-(UTC)-date points keeping the last value. LEAN occasionally
+    # emits a duplicate final equity point; a dup date would otherwise misalign the
+    # positions reconstruction (which keys off dates). Daily resolution ⇒ at most a
+    # boundary dup, never real intraday loss.
+    by_date: dict[date, float] = {}
+    for x, v in points:
+        by_date[_unix_to_datetime(x).date()] = v
+    ordered = sorted(by_date.items())
+    dates = tuple(d for d, _ in ordered)
+    equity = np.asarray([v for _, v in ordered], dtype=np.float64)
     return dates, equity
 
 
@@ -246,13 +254,15 @@ def _parse_trades(result_obj: dict[str, object]) -> tuple[LeanTrade, ...]:
         if not isinstance(raw, dict):
             continue
         qty = _as_decimal(_get(raw, "Quantity", "quantity"))
+        # Round (don't truncate) to an integer contract count — int(Decimal("0.1"))
+        # silently zeroes; ROUND_HALF_UP is consistent with parse_filled_orders.
         trades.append(
             LeanTrade(
                 entry_time=_parse_datetime(_get(raw, "EntryTime", "entryTime")),
                 entry_price=_as_decimal(_get(raw, "EntryPrice", "entryPrice")),
                 exit_time=_parse_datetime(_get(raw, "ExitTime", "exitTime")),
                 exit_price=_as_decimal(_get(raw, "ExitPrice", "exitPrice")),
-                quantity=abs(int(qty)),
+                quantity=abs(int(qty.to_integral_value(rounding=ROUND_HALF_UP))),
                 direction=_normalize_direction(_get(raw, "Direction", "direction")),
                 profit_loss=_as_decimal(_get(raw, "ProfitLoss", "profitLoss")),
                 fees=_as_decimal(_get(raw, "TotalFees", "totalFees")),

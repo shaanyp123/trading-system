@@ -29,7 +29,7 @@ from research.eval.reproduce_v1 import (
     load_oracle,
 )
 from research.lean import images
-from research.lean.driver import run_backtest
+from research.lean.driver import DEFAULT_LEAN_LOCAL_IMAGE, run_backtest
 
 pytestmark = pytest.mark.integration
 
@@ -47,10 +47,12 @@ def _window() -> tuple[date, date] | None:
 
 
 def test_reproduce_v1_matches_oracle(tmp_path: Path) -> None:
-    if images.select_backend("docker") is None:
+    if images.runnable_backend("docker", lean_local_image=DEFAULT_LEAN_LOCAL_IMAGE) is None:
         pytest.skip(
-            "V1 reproduction needs the docker backend (the POST-stub env is only wired "
-            f"there): {images.availability_report()} (design §9 P2; never a silent pass)"
+            "V1 reproduction needs the docker backend + the "
+            f"`{DEFAULT_LEAN_LOCAL_IMAGE}` image (the POST-stub env is only wired there): "
+            f"{images.availability_report()}. Build it per research/lean/README. "
+            "(design §9 P2; never a silent pass)"
         )
     if not _DATA_ROOT.exists():
         pytest.skip(f"data snapshot absent at {_DATA_ROOT} — see research/lean/README")
@@ -59,10 +61,18 @@ def test_reproduce_v1_matches_oracle(tmp_path: Path) -> None:
             "oracle snapshot absent — set $RESEARCH_V1_ORACLE to a capture of the prod "
             "signals table (SQL in research/lean/README)"
         )
+    window = _window()
+    if window is None:
+        pytest.skip(
+            "set $RESEARCH_V1_WINDOW=YYYY-MM-DD:YYYY-MM-DD to a SINGLE-phash sub-window "
+            "— a full-window match is unreliable (parameter_set_hash varies per signal: "
+            "params calibrated mid-window + the ER gate landed 2026-06-02). See "
+            "research/lean/README → reproduce-V1."
+        )
 
     spec = build_v1_run_spec(_DATA_ROOT)
     parsed = run_backtest(spec, work_dir=tmp_path, backend="docker")
     entries = entries_from_fills(list(parsed.fills))
     oracle = load_oracle(_ORACLE_PATH)
-    report = crosscheck_entries(entries, oracle, window=_window())
+    report = crosscheck_entries(entries, oracle, window=window)
     assert report.match_rate >= _MIN_MATCH_RATE, report.summary()
