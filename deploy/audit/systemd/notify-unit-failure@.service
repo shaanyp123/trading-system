@@ -1,0 +1,41 @@
+[Unit]
+# OnFailure= handler — posts a P1 Discord #alerts notification when a monitored
+# host unit enters the failed state. Instantiated per failing unit via
+#   OnFailure=notify-unit-failure@%n.service
+# on each monitored unit, so the instance name (%i) is the failed unit's full
+# name, e.g. notify-unit-failure@lean-universe-synthesis.service.
+#
+# Closes the monitoring gap surfaced by PR #321: a host oneshot
+# (lean-universe-synthesis.service) exited FAILURE nightly for >=2 days
+# unnoticed because nothing alerts on systemd unit failure. Covers all four
+# host units: lean-universe-synthesis, lean-local-daily-restart,
+# recovery-agent-poll, verify-chain-daily.
+#
+# Cross-cutting: used by both lean_local and audit units. Homed in repo here
+# alongside the other ops-monitoring units (recovery-agent-poll,
+# verify-chain-daily) whose install ceremony shares deploy/audit/README.md.
+# systemd installs every unit flat into /etc/systemd/system/, so the repo path
+# is documentation only — it does not constrain which units may reference this.
+#
+# A template unit is instantiated on demand by OnFailure=; it is NOT enabled and
+# has no [Install] section. See scripts/operator_tools/notify_unit_failure.sh +
+# deploy/audit/README.md for the script and the operator install ceremony.
+
+Description=Post a P1 #alerts Discord notification for failed unit %i
+Documentation=https://github.com/shaanyp123/trading-system/blob/main/deploy/audit/README.md
+# Deliberately NO After=/Requires=docker.service: the notifier is pure curl + a
+# file read, so it must run even when docker is the thing that failed.
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/trading
+# Pass the failed unit name as %i — the literal instance string (NOT %I, which
+# would un-escape the hyphens and mangle the unit name). The script sanitises it
+# again before use.
+ExecStart=/opt/trading/scripts/operator_tools/notify_unit_failure.sh %i
+# Runs as root — matches verify-chain-daily.service + recovery-agent-poll.service.
+# The webhook file /etc/trading/alerts-webhook.url is chmod 600 trading:trading,
+# but root reads it regardless.
+TimeoutStartSec=30
+StandardOutput=journal
+StandardError=journal

@@ -19,6 +19,9 @@ Description=Restart lean_local to refresh its on-boot data layer cache (post-bar
 Documentation=https://github.com/shaanyp123/trading-system/blob/main/deploy/lean_local/systemd/README.md
 After=docker.service
 Requires=docker.service
+# Alert on failure — posts P1 to Discord #alerts (closes the silent-failure
+# gap from PR #321). See deploy/audit/systemd/notify-unit-failure@.service.
+OnFailure=notify-unit-failure@%n.service
 
 [Service]
 Type=oneshot

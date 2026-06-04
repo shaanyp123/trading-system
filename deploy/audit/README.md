@@ -564,3 +564,146 @@ For the full lineage + design rationale:
   the agent invokes (clientId=99, fill_processor lineage)
 - `scripts/operator_tools/recovery_agent.py` — the agent itself
   (classification logic, exit code contract, A-gates)
+
+---
+
+## Host unit failure alerting (`OnFailure=` → Discord `#alerts`)
+
+The verify-chain and recovery-agent crons above each post their *result*
+to Discord on a clean run. But until 2026-06-04 nothing alerted when a
+host systemd unit itself **failed** (script crash, non-zero exit, timeout,
+OOM). That gap bit us: `lean-universe-synthesis.service` exited FAILURE
+every night for ≥2 days completely unnoticed (root cause + fix in PR #321;
+memory `project_bar_sync_universe_permission`). This section closes it for
+**all** host units.
+
+**How it works:** each monitored unit carries
+`OnFailure=notify-unit-failure@%n.service`. When the unit enters the failed
+state, systemd starts the template unit
+`notify-unit-failure@<failed-unit>.service`, which runs
+`scripts/operator_tools/notify_unit_failure.sh <failed-unit>` — a pure
+`curl` POST of a P1 message to Discord `#alerts`, naming the unit and a
+`journalctl` triage hint.
+
+**Why direct-to-Discord (not the `alerts` table):** the notifier must fire
+exactly when infrastructure is broken, so it deliberately has **no
+docker / postgres / api / sops dependency** (routing through the `alerts`
+table would need postgres + api up — the very things that may be down — and
+a new `alert_category` enum value, i.e. an `alembic/**` migration requiring
+`risk-review-approved`). Same compounded-failure-silence reasoning as the
+dedicated webhooks above. Trade-off: this is a notification only — no audit
+row, no `/alerts` UI entry, no ack.
+
+**Severity:** a failed host unit is operational degradation → **P1 →
+`#alerts`** per the channel taxonomy (`#critical` is reserved for P0:
+kill-switch, audit-chain break, halt-new).
+
+**Files (in repo):**
+- `scripts/operator_tools/notify_unit_failure.sh` — the notifier (always exits 0; per-unit cooldown)
+- `deploy/audit/systemd/notify-unit-failure@.service` — the `OnFailure=` template unit
+- `OnFailure=notify-unit-failure@%n.service` lines already shipped in the four
+  monitored unit files: `deploy/lean_local/systemd/lean-universe-synthesis.service`,
+  `deploy/lean_local/systemd/lean-local-daily-restart.service`,
+  `deploy/audit/systemd/recovery-agent-poll.service`,
+  `deploy/audit/systemd/verify-chain-daily.service`
+
+### Install ceremony (operator-side, run once on the VPS)
+
+**Step 1 — Create the Discord webhook for `#alerts`.**
+
+In Discord: `#alerts` channel → settings (gear icon) → Integrations →
+Webhooks → New Webhook → name it "host-unit-failure" → Copy Webhook URL.
+
+If you already have an `#alerts` webhook URL (e.g. in
+`secrets/paper.enc.yaml::discord.webhook_urls.alerts`, if that field holds a
+real webhook URL rather than a bare channel ID), reuse it — the file is the
+single point of truth for the systemd path.
+
+**Step 2 — Save the webhook URL on the VPS (per `feedback_secret_handling.md`).**
+
+```bash
+# SSH to VPS as operator/trading user. Paste the URL via here-doc to keep it
+# out of shell history.
+sudo mkdir -p /etc/trading
+sudo tee /etc/trading/alerts-webhook.url > /dev/null <<'EOF'
+PASTE_ALERTS_WEBHOOK_URL_ON_THIS_LINE
+EOF
+sudo chmod 600 /etc/trading/alerts-webhook.url
+sudo chown trading:trading /etc/trading/alerts-webhook.url
+
+# Verify file size only — never display content
+wc -c /etc/trading/alerts-webhook.url   # Discord webhook URLs are ~120-150 bytes
+```
+
+**Step 3 — Install the template unit + the updated monitored units.**
+
+```bash
+# The OnFailure= template handler:
+sudo cp /opt/trading/deploy/audit/systemd/notify-unit-failure@.service \
+        /etc/systemd/system/notify-unit-failure@.service
+
+# Re-copy the four monitored units (they now carry the OnFailure= line):
+sudo cp /opt/trading/deploy/lean_local/systemd/lean-universe-synthesis.service \
+        /etc/systemd/system/lean-universe-synthesis.service
+sudo cp /opt/trading/deploy/lean_local/systemd/lean-local-daily-restart.service \
+        /etc/systemd/system/lean-local-daily-restart.service
+sudo cp /opt/trading/deploy/audit/systemd/recovery-agent-poll.service \
+        /etc/systemd/system/recovery-agent-poll.service
+sudo cp /opt/trading/deploy/audit/systemd/verify-chain-daily.service \
+        /etc/systemd/system/verify-chain-daily.service
+
+sudo systemctl daemon-reload
+```
+
+The template unit is instantiated on demand by `OnFailure=` — it is **not**
+enabled and needs no `systemctl enable`. The timers for the monitored units
+are unchanged; `daemon-reload` is enough to pick up the new `OnFailure=`.
+
+**Step 4 — Smoke test (fires the real notifier path end-to-end).**
+
+```bash
+# Starting a template instance directly runs the handler with %i = the
+# instance name — exercises the script + webhook without breaking a real unit.
+sudo systemctl start notify-unit-failure@smoke-test.service
+journalctl -u notify-unit-failure@smoke-test.service --since '1 min ago' --no-pager
+# Expected: "notify_unit_failure: posted P1 #alerts for unit=smoke-test ..."
+# Check the #alerts Discord channel for:
+#   "P1 HOST UNIT FAILURE <ts> — host=<host>\nunit=smoke-test entered the failed state. ..."
+```
+
+**Step 5 — (optional) Verify a genuine OnFailure wiring.**
+
+```bash
+# Force a real failure on a throwaway transient unit that declares OnFailure:
+sudo systemd-run --unit=onfail-probe \
+  --property=OnFailure=notify-unit-failure@%n.service \
+  /bin/false
+# /bin/false exits 1 → onfail-probe fails → notify-unit-failure@onfail-probe fires.
+journalctl -u notify-unit-failure@onfail-probe.service --since '1 min ago' --no-pager
+# Expect another #alerts post naming unit=onfail-probe.service.
+```
+
+**Step 6 — Rotation.** Same as the other webhooks: regenerate in Discord →
+repeat Step 2 → no restart needed (the script re-reads the file every run).
+
+### Failure modes
+
+| Symptom | Diagnosis | Fix |
+|---|---|---|
+| A host unit failed but no `#alerts` post | Either the webhook file is missing/unreadable, or the unit wasn't re-copied with `OnFailure=` | `journalctl -u notify-unit-failure@<unit>.service` — `cannot read /etc/trading/alerts-webhook.url` → re-run Step 2; nothing logged at all → re-run Step 3 (`daemon-reload`) |
+| Smoke test (Step 4) logs `cannot read .../alerts-webhook.url` | Step 2 not done or wrong perms | Re-run Step 2 |
+| Smoke test logs `curl POST ... FAILED` | Webhook URL revoked/invalid, or no egress | Step 6 (re-create + replace file); check the host can reach `discord.com` |
+| `#alerts` gets only one post during a sustained failure loop | Working as designed — per-unit cooldown (`NOTIFY_COOLDOWN_SECONDS`, default 3600s) suppresses duplicates | Lower the cooldown via a drop-in `Environment=NOTIFY_COOLDOWN_SECONDS=…` on the template unit if you want more frequent reminders |
+| Posts reference `unit=unknown.unit` | The handler got no/garbled instance arg | Confirm the monitored unit uses `OnFailure=notify-unit-failure@%n.service` (note `%n`, not `%i`) |
+
+### Reversibility
+
+```bash
+# Drop the OnFailure= line from each monitored unit (re-copy the pre-PR
+# version or edit in place), then:
+sudo rm /etc/systemd/system/notify-unit-failure@.service
+sudo systemctl daemon-reload
+```
+Removing the template while units still reference it is harmless — systemd
+just logs that the `OnFailure=` dependency can't be found; the monitored
+units still run normally.

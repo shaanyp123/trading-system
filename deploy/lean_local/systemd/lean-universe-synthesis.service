@@ -3,6 +3,10 @@ Description=Synthesize LEAN futures per-day universe files for today
 Documentation=file:///opt/trading/scripts/operator_tools/synthesize_today_universe.sh
 After=docker.service
 Wants=docker.service
+# Alert on failure — posts P1 to Discord #alerts (closes the silent-failure
+# gap surfaced by PR #321, where this very unit failed nightly unnoticed).
+# See deploy/audit/systemd/notify-unit-failure@.service.
+OnFailure=notify-unit-failure@%n.service
 
 [Service]
 Type=oneshot
