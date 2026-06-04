@@ -659,6 +659,13 @@ The template unit is instantiated on demand by `OnFailure=` — it is **not**
 enabled and needs no `systemctl enable`. The timers for the monitored units
 are unchanged; `daemon-reload` is enough to pick up the new `OnFailure=`.
 
+> Re-copy only the units actually installed on *this* host — check first with
+> `systemctl list-unit-files | grep -E 'lean-universe-synthesis|lean-local-daily-restart|recovery-agent-poll|verify-chain-daily'`.
+> Not every host has all four (e.g. `recovery-agent-poll` is not installed on
+> the paper host as of 2026-06-04); copying a `.service` whose timer isn't
+> installed just drops an inert unit file. Back up the live copy first:
+> `cp -a /etc/systemd/system/<unit>.service{,.bak-pre-onfailure-$(date -u +%Y%m%dT%H%M%SZ)}`.
+
 **Step 4 — Smoke test (fires the real notifier path end-to-end).**
 
 ```bash
@@ -671,16 +678,32 @@ journalctl -u notify-unit-failure@smoke-test.service --since '1 min ago' --no-pa
 #   "P1 HOST UNIT FAILURE <ts> — host=<host>\nunit=smoke-test entered the failed state. ..."
 ```
 
-**Step 5 — (optional) Verify a genuine OnFailure wiring.**
+**Step 5 — (optional) Verify a genuine OnFailure trigger.**
+
+`%n` is only expanded inside a unit *file*, not by `systemd-run --property`
+(that path errors `Invalid unit name`), so use a throwaway unit file that
+mirrors the production wiring:
 
 ```bash
-# Force a real failure on a throwaway transient unit that declares OnFailure:
-sudo systemd-run --unit=onfail-probe \
-  --property=OnFailure=notify-unit-failure@%n.service \
-  /bin/false
-# /bin/false exits 1 → onfail-probe fails → notify-unit-failure@onfail-probe fires.
-journalctl -u notify-unit-failure@onfail-probe.service --since '1 min ago' --no-pager
-# Expect another #alerts post naming unit=onfail-probe.service.
+sudo tee /etc/systemd/system/onfail-probe.service > /dev/null <<'UNIT'
+[Unit]
+Description=Throwaway OnFailure probe (safe to delete)
+OnFailure=notify-unit-failure@%n.service
+[Service]
+Type=oneshot
+ExecStart=/bin/false
+UNIT
+sudo systemctl daemon-reload
+sudo systemctl start onfail-probe.service || true   # /bin/false → fails on purpose
+# Query by the script's syslog identifier (robust): the handler's OWN unit name
+# is notify-unit-failure@onfail-probe.service.service — a DOUBLE .service suffix,
+# because %n already includes ".service" (so the instance is "onfail-probe.service").
+journalctl -t notify_unit_failure.sh --since '1 min ago' --no-pager
+# Expect: "posted P1 #alerts for unit=onfail-probe.service" + a post in #alerts.
+# Cleanup:
+sudo systemctl reset-failed onfail-probe.service
+sudo rm /etc/systemd/system/onfail-probe.service
+sudo systemctl daemon-reload
 ```
 
 **Step 6 — Rotation.** Same as the other webhooks: regenerate in Discord →
@@ -690,7 +713,7 @@ repeat Step 2 → no restart needed (the script re-reads the file every run).
 
 | Symptom | Diagnosis | Fix |
 |---|---|---|
-| A host unit failed but no `#alerts` post | Either the webhook file is missing/unreadable, or the unit wasn't re-copied with `OnFailure=` | `journalctl -u notify-unit-failure@<unit>.service` — `cannot read /etc/trading/alerts-webhook.url` → re-run Step 2; nothing logged at all → re-run Step 3 (`daemon-reload`) |
+| A host unit failed but no `#alerts` post | Either the webhook file is missing/unreadable, or the unit wasn't re-copied with `OnFailure=` | `journalctl -t notify_unit_failure.sh` (use the syslog identifier — the handler's own unit name is `notify-unit-failure@<unit>.service.service`, a *double* `.service` suffix, since `%n` already includes `.service`) — `cannot read /etc/trading/alerts-webhook.url` → re-run Step 2; nothing logged at all → re-run Step 3 (`daemon-reload`) |
 | Smoke test (Step 4) logs `cannot read .../alerts-webhook.url` | Step 2 not done or wrong perms | Re-run Step 2 |
 | Smoke test logs `curl POST ... FAILED` | Webhook URL revoked/invalid, or no egress | Step 6 (re-create + replace file); check the host can reach `discord.com` |
 | `#alerts` gets only one post during a sustained failure loop | Working as designed — per-unit cooldown (`NOTIFY_COOLDOWN_SECONDS`, default 3600s) suppresses duplicates | Lower the cooldown via a drop-in `Environment=NOTIFY_COOLDOWN_SECONDS=…` on the template unit if you want more frequent reminders |
