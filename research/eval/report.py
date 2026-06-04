@@ -224,6 +224,16 @@ def _fmt_lev(x: float) -> str:
     return f"{x:.2f}x" if math.isfinite(x) else "n/a"
 
 
+def _fmt_pct_unsigned(x: float) -> str:
+    """Render a non-negative magnitude / probability as ``XX.XX%`` (no leading sign).
+
+    Vols, vol-drag, and ruin probabilities are non-negative; a ``+100.00%`` risk-of-
+    ruin reads oddly, so these columns drop the sign (``100.00%``). CAGR keeps its
+    sign (it can be negative) via :func:`_fmt_pct`.
+    """
+    return f"{x * 100:.2f}%" if math.isfinite(x) else "n/a"
+
+
 def _finite_curve(arr: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
     """Forward-fill non-finite values so a leverage sparkline holds through a wipeout."""
     out = np.array(arr, dtype=np.float64, copy=True)
@@ -313,8 +323,10 @@ def _lev_cell(row: LeverageRow, key: str) -> str:
     if key == "fractional_kelly":
         return _fmt_lev(row.metrics.get("fractional_kelly", float("nan")))
     value = row.metrics.get(key, float("nan"))
-    if key in ("cagr", "annualized_vol", "volatility_drag", "p_drawdown_gt_50pct", "risk_of_ruin"):
-        return _fmt_pct(value)
+    if key == "cagr":
+        return _fmt_pct(value)  # signed — CAGR can be negative
+    if key in ("annualized_vol", "volatility_drag", "p_drawdown_gt_50pct", "risk_of_ruin"):
+        return _fmt_pct_unsigned(value)  # non-negative magnitudes / probabilities
     if key == "max_drawdown_pct":
         return _fmt_dd(value)
     if key == "max_drawdown_dollars":

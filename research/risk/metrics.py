@@ -66,9 +66,11 @@ def _finite(arr: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
 def max_drawdown_pct(equity_curve: npt.NDArray[np.float64]) -> float:
     """Largest peak-to-trough decline as a positive fraction (``0.2`` = -20%).
 
-    LIMITATION (P1): once equity has gone non-positive a percentage drawdown is
-    undefined, so further collapse below zero is understated. Under leverage use
-    :func:`max_drawdown_dollars` + :func:`is_wiped` instead — they hold past a
+    LIMITATION (P1): a percentage drawdown loses its clean [0, 1] meaning once equity
+    goes non-positive under leverage. It stays normalized to the running PEAK, so a
+    collapse past zero reads as >100% (e.g. equity at -20% of a 100k peak → 1.2). The
+    number errs LARGE (it never UNDERstates), but the honest leverage headline is
+    :func:`max_drawdown_dollars` + :func:`is_wiped`, which stay well-defined through a
     wipeout.
     """
     if equity_curve.size < 2:
