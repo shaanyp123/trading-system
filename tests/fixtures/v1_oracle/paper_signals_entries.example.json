@@ -1,0 +1,9 @@
+{
+  "$oracle-note": "Representative snapshot of the prod `signals` table (entry rows) — the live paper V1 decision oracle (design §8). Shape mirrors the reproduce-V1 SQL in research/lean/README. The OPERATOR captures the REAL snapshot from the prod DB during P2 acceptance and drops it in; this example lets the cross-check logic run in CI. As of 2026-06-04 the real table has 18 entry/long rows; this example carries the two earliest (/M2K 05-27, /MES 05-28) that the golden fixture reproduces.",
+  "env": "paper",
+  "signal_type": "entry",
+  "entries": [
+    { "session_date": "2026-05-27", "market": "/M2K", "direction": "long" },
+    { "session_date": "2026-05-28", "market": "/MES", "direction": "long" }
+  ]
+}

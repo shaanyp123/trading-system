@@ -25,7 +25,7 @@ open research/runs/<UTC-ts>/report.html
 | Phase | Scope | Status |
 |---|---|---|
 | **P1** | daily loader + contract specs + strategy contract + buy-and-hold + report | **built** |
-| P2 | LEAN driver + §6.6 vbt↔LEAN parity + reproduce V1 | next |
+| **P2** | LEAN driver + §6.6 vbt↔LEAN parity + reproduce V1 | **built** (code + parser + parity-logic + V1 cross-check CI-green without LEAN; real-engine run is the operator acceptance gate — see [`lean/README.md`](lean/README.md)) |
 | P3 | leverage / margin / liquidation / ruin metrics + sizing schemes | planned |
 | P4 | walk-forward + sweep (vectorbt) + anti-overfitting + comparison | planned |
 | P5–P6 | intraday minute/tick | **deferred** (daily-only per 2026-06-03 sign-off; no data vendor yet) |

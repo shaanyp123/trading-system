@@ -92,6 +92,7 @@ jobs:
             python_backend:
               - 'services/**'
               - 'strategies/**'
+              - 'research/**'
               - 'infrastructure/**'
               - 'tests/**'
               - 'scripts/**'
@@ -205,7 +206,7 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
       - run: pip install -e ".[dev]"
-      - run: mypy services infrastructure strategies scripts
+      - run: mypy services infrastructure strategies scripts research
 
   test:
     name: test (pytest --cov)
