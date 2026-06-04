@@ -1,0 +1,31 @@
+# P3 leverage / ruin sweep (design §6 + §9 P3). Single-instrument — the ruin story
+# lives per-instrument (multi-instrument portfolio leverage is P4).
+#
+#   make research RUN=research/config/examples/p3_leverage_sweep.yaml
+#   → research/runs/<UTC-ts>/report.html
+#       · leverage-over-time per swept cap
+#       · the full §6.5 ruin metric suite (CAGR, vol, Sharpe, MaxDD %/$, vol drag,
+#         P(dd>50%), risk-of-ruin, CVaR, peak leverage, fractional-Kelly)
+#       · a RED banner naming every cap that would have been LIQUIDATED — by the
+#         daily intrabar estimator (flag-for-confirmation, design §6.3) and/or a
+#         LEAN-native margin call (when driven through LEAN).
+name: tlt_leverage_ruin_sweep
+engine: daily            # numpy sized evaluator; LEAN-native margin events arrive via the P2 driver
+mode: backtest
+resolution: daily
+universe: ["TLT"]        # bond ETF — clean daily series, no roll, Reg-T 25% maintenance margin
+date_range: { start: 2025-06-05, end: 2026-06-03 }
+starting_cash: 100000
+strategy: { ref: buy_and_hold, contracts: 1 }   # constant-long exposure; the scheme sizes the magnitude
+
+# fixed_fractional with a target fraction ABOVE the highest swept cap, so every cap
+# is the BINDING leverage — a clean cliff: realized leverage ≈ cap at each level.
+# Swap in the other schemes to size by signal/vol instead:
+#   vol_target:  { scheme: vol_target, vol_target_pct_annual: 0.15 }   # V1's Clenow target
+#   atr:         { scheme: atr, risk_pct: 0.01, stop_atr_mult: 3.0 }   # V1's stop logic
+#   risk_parity: { scheme: risk_parity, vol_target_pct_annual: 0.15 }  # == vol_target single-instrument
+sizing: { scheme: fixed_fractional, fraction: 10.0 }
+
+# Sweep the leverage CEILING. On a 25%-maintenance ETF, ~4x is already past the cliff
+# (maintenance ≥ equity), so the upper caps should trip the red liquidation banner.
+leverage: { cap: 3.0, sweep: [1.0, 2.0, 3.0, 5.0, 8.0] }

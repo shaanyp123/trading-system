@@ -14,26 +14,39 @@ import argparse
 from datetime import UTC, datetime
 from pathlib import Path
 
+import numpy as np
 import structlog
 
 from research import __version__
 from research.config.schema import RunConfig, load_run_config
 from research.data.contract_specs import get_spec
 from research.data.daily_loader import load_daily_series
-from research.eval.metrics import summarize
-from research.eval.report import ReportRow, write_report
+from research.eval.report import LeverageRow, ReportRow, write_leverage_report, write_report
+from research.risk.liquidation import estimate_intrabar_liquidation, margin_model_for
+from research.risk.metrics import compute_risk_metrics, summarize
+from research.risk.sizing_schemes import SizingScheme, simulate_sized_path
 from research.screen.daily_eval import evaluate_daily
 from research.strategy.buy_and_hold import BuyAndHold
 from research.strategy.contract import ResearchStrategy
+from research.strategy.donchian import DonchianBreakout
 
 _DEFAULT_RUNS_DIR = Path("research/runs")
+_DEFAULT_VOL_LOOKBACK = 60
+_DEFAULT_ATR_LOOKBACK = 20
 _log = structlog.get_logger("research.run")
 
 
 def _build_strategy(cfg: RunConfig) -> ResearchStrategy:
     if cfg.strategy_ref == "buy_and_hold":
         return BuyAndHold(cfg.contracts)
+    if cfg.strategy_ref == "donchian":
+        return DonchianBreakout(channel=cfg.channel or 20, contracts=abs(cfg.contracts))
     raise ValueError(f"unknown strategy.ref {cfg.strategy_ref!r}")
+
+
+def _is_leverage_sweep(cfg: RunConfig) -> bool:
+    """A run is a P3 leverage sweep when it carries a sizing scheme."""
+    return cfg.sizing_scheme is not None
 
 
 def _guard_phase(cfg: RunConfig) -> None:
@@ -65,6 +78,8 @@ def run(cfg: RunConfig, *, runs_dir: Path = _DEFAULT_RUNS_DIR) -> Path:
             "on-disk LEAN bars (never the live trading_lean_data volume; see design "
             "§4.2)."
         )
+    if _is_leverage_sweep(cfg):
+        return run_leverage_sweep(cfg, runs_dir=runs_dir)
     strategy = _build_strategy(cfg)
     rows: list[ReportRow] = []
     for symbol in cfg.universe:
@@ -120,6 +135,107 @@ def run(cfg: RunConfig, *, runs_dir: Path = _DEFAULT_RUNS_DIR) -> Path:
         "research_run_complete",
         run_name=cfg.name,
         instruments=len(rows),
+        report=str(html_path),
+    )
+    return html_path
+
+
+def run_leverage_sweep(cfg: RunConfig, *, runs_dir: Path = _DEFAULT_RUNS_DIR) -> Path:
+    """P3 leverage sweep → a ruin report (design §6, §9 P3).
+
+    Single-instrument (the first symbol in ``universe`` — per-instrument is where the
+    ruin story lives; multi-instrument portfolio leverage is P4). For each cap in
+    ``leverage.sweep`` (or the single ``leverage.cap``) the strategy's per-bar
+    DIRECTION is sized by ``sizing.scheme`` under that hard cap, the equity path rides
+    through any wipeout, and the daily intrabar estimator + ruin metrics surface the
+    liquidation. Writes ``report.html`` with a RED banner when any cap liquidates.
+    """
+    symbol = cfg.universe[0]
+    if len(cfg.universe) > 1:
+        _log.warning(
+            "research_leverage_sweep_single_instrument",
+            swept=symbol,
+            ignored=list(cfg.universe[1:]),
+            note="leverage sweep is per-instrument; run others separately (portfolio = P4)",
+        )
+    spec = get_spec(symbol)
+    multiplier = float(spec.multiplier)
+    series = load_daily_series(
+        cfg.data_root, symbol, expiry=cfg.expiries.get(symbol), start=cfg.start, end=cfg.end
+    )
+    strategy = _build_strategy(cfg)
+    directions = np.sign(strategy.target_positions(series)).astype(np.int64)
+    assert cfg.sizing_scheme is not None  # guaranteed by _is_leverage_sweep
+    scheme = SizingScheme(name=cfg.sizing_scheme, params=cfg.sizing_params)  # type: ignore[arg-type]
+    margin = margin_model_for(spec, data_root=cfg.data_root)
+    starting_cash = cfg.starting_cash if cfg.starting_cash is not None else 100_000.0
+    vol_lookback = int(cfg.sizing_params.get("instrument_vol_lookback_days", _DEFAULT_VOL_LOOKBACK))
+    atr_lookback = int(cfg.sizing_params.get("atr_lookback_days", _DEFAULT_ATR_LOOKBACK))
+    caps = list(cfg.leverage_sweep) or ([cfg.leverage_cap] if cfg.leverage_cap is not None else [])
+    if not caps:
+        raise ValueError("a leverage sweep requires leverage.sweep [..] or leverage.cap")
+
+    rows: list[LeverageRow] = []
+    for cap in caps:
+        sized = simulate_sized_path(
+            series,
+            directions,
+            scheme,
+            multiplier=multiplier,
+            starting_cash=starting_cash,
+            leverage_cap=cap,
+            vol_lookback=vol_lookback,
+            atr_lookback=atr_lookback,
+        )
+        estimate = estimate_intrabar_liquidation(sized.result, series, margin)
+        first_flag = estimate.first_flag
+        metrics = compute_risk_metrics(
+            sized.result,
+            peak_leverage=sized.leverage.peak,
+            mean_leverage=sized.leverage.mean,
+            n_margin_events=estimate.n_flagged,
+            liquidated=estimate.liquidated or sized.leverage.wiped,
+            first_liquidation_date=first_flag.flag_date if first_flag is not None else None,
+        )
+        rows.append(
+            LeverageRow(
+                leverage_cap=cap,
+                scheme=scheme.name,
+                metrics=metrics.to_report_dict(),
+                liquidated=metrics.liquidated,
+                first_liquidation_date=metrics.first_liquidation_date,
+                n_liquidation_flags=estimate.n_flagged,
+                bars_evaluated=estimate.bars_evaluated,
+                lean_margin_events=0,  # numpy sweep; LEAN-native events arrive via the driver
+                residual_uncertainty=estimate.residual_uncertainty,
+                leverage_curve=sized.leverage.leverage,
+            )
+        )
+        _log.info(
+            "research_leverage_level_evaluated",
+            symbol=symbol,
+            leverage_cap=cap,
+            peak_leverage=round(sized.leverage.peak, 3),
+            liquidation_flags=estimate.n_flagged,
+            liquidated=metrics.liquidated,
+        )
+
+    generated_at = datetime.now(UTC)
+    run_dir = runs_dir / generated_at.strftime("%Y%m%dT%H%M%SZ")
+    html_path = write_leverage_report(
+        run_dir,
+        run_name=cfg.name,
+        harness_version=__version__,
+        generated_at=generated_at,
+        symbol=symbol,
+        rows=rows,
+    )
+    _log.info(
+        "research_leverage_sweep_complete",
+        run_name=cfg.name,
+        symbol=symbol,
+        levels=len(rows),
+        liquidation_detected=any(r.flagged for r in rows),
         report=str(html_path),
     )
     return html_path

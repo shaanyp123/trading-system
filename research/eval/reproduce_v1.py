@@ -21,6 +21,7 @@ skip-gated).
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -36,6 +37,18 @@ _log = structlog.get_logger(__name__)
 #: Repo paths (read-only inputs) for the production V1 algorithm + its package.
 _V1_ALGORITHM = Path("lean/v1_strategy.py")
 _STRATEGIES_PKG = Path("strategies")
+
+# V1 emits decisions via HTTP POST and places NO LEAN orders, so its decisions live
+# in the LEAN LOG, not the result JSON's orders/trades. Per cycle the log records one
+# ``v1_signal_rejected ... market=X`` per rejected market + a ``v1_signals_generated
+# ... signals_emitted_count=N`` summary; the N emitted markets are exactly
+# (universe seen) - (rejected this cycle). These regexes parse that. (Direction is
+# long — V1's Donchian breakout is long-only today; the live oracle confirms all-long.
+# Short capture would need POST-body capture, which is a future enhancement.)
+_REJECTED_RE = re.compile(r"v1_signal_rejected session_date=(\d{4}-\d{2}-\d{2}) market=(\S+)")
+_GENERATED_RE = re.compile(
+    r"v1_signals_generated session_date=(\d{4}-\d{2}-\d{2}) signals_emitted_count=(\d+)"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,13 +75,89 @@ def _normalize_direction(value: object) -> str:
     return str(value).strip().lower()
 
 
+def _find_v1_log(output_dir: Path) -> Path:
+    """Locate the algorithm log that carries V1's per-cycle decisions."""
+    for path in sorted(output_dir.glob("*log*.txt")):
+        try:
+            if "v1_signals_generated" in path.read_text(encoding="utf-8", errors="replace"):
+                return path
+        except OSError:
+            continue
+    raise FileNotFoundError(
+        f"no V1 algorithm log (with 'v1_signals_generated') under {output_dir} — did the "
+        "backtest run V1TrendFollowingAlgorithm?"
+    )
+
+
+def parse_v1_decisions_from_log(output_dir: Path, *, direction: str = "long") -> list[Entry]:
+    """Extract V1 entry DECISIONS from the LEAN log (V1 places no orders; it POSTs).
+
+    Per cycle: emitted markets = (universe seen across the run) - (markets rejected
+    that cycle), for cycles whose ``signals_emitted_count`` is non-zero. When the
+    elimination is ambiguous (a market neither emitted nor rejected that cycle, e.g. a
+    data error → count mismatch) the cycle is SKIPPED rather than fabricating an entry.
+    """
+    log = _find_v1_log(output_dir).read_text(encoding="utf-8", errors="replace").splitlines()
+    rejected: dict[str, set[str]] = {}
+    emitted_count: dict[str, int] = {}
+    universe: set[str] = set()
+    for line in log:
+        rej = _REJECTED_RE.search(line)
+        if rej is not None:
+            rejected.setdefault(rej.group(1), set()).add(rej.group(2))
+            universe.add(rej.group(2))
+            continue
+        gen = _GENERATED_RE.search(line)
+        if gen is not None:
+            emitted_count[gen.group(1)] = int(gen.group(2))
+    entries: list[Entry] = []
+    for session, count in emitted_count.items():
+        if count <= 0:
+            continue
+        emitted = universe - rejected.get(session, set())
+        if len(emitted) != count:
+            _log.warning(
+                "research_v1_log_emit_ambiguous",
+                session_date=session,
+                emitted_count=count,
+                derived=len(emitted),
+            )
+            continue
+        for market in sorted(emitted):
+            entries.append(Entry(date.fromisoformat(session), market, direction))
+    _log.info("research_v1_decisions_from_log", decisions=len(entries))
+    return entries
+
+
+def first_entry_per_market(entries: list[Entry]) -> list[Entry]:
+    """Reduce to the FIRST entry per (market, direction), ascending by date.
+
+    Neutralizes the structural backtest-vs-live gap: backtest V1 runs under
+    PaperBrokerage with NO position feedback (the live ``/positions`` GET is live-mode
+    only), so it RE-EMITS the same breakout every cycle while the channel holds, whereas
+    the position-aware live system emits once (anti-pyramiding, PR #250). Comparing
+    first-entries asks "did each market flag, and when first" rather than re-emit cadence.
+    """
+    seen: set[tuple[str, str]] = set()
+    out: list[Entry] = []
+    for entry in sorted(entries, key=lambda e: (e.session_date, e.market)):
+        key = (entry.market, entry.direction)
+        if key not in seen:
+            seen.add(key)
+            out.append(entry)
+    return out
+
+
 def entries_from_fills(fills: list[OrderFill]) -> list[Entry]:
     """Reduce filled orders to entry decisions (flat → directional per market).
 
-    V1 enters once per breakout (no pyramiding — anti-pyramiding guard, PR #250),
-    so the first fill that opens a market is the entry. A subsequent fill that flips
+    NOTE: V1 places NO LEAN orders (it POSTs decisions), so for the V1 reproduction
+    use :func:`parse_v1_decisions_from_log` instead — this fill-based path yields
+    nothing for V1 and exists for reference strategies that DO place LEAN orders.
+
+    The first fill that opens a market is the entry. A subsequent fill that flips
     direction (flat-crossing) also counts as a new entry; fills that merely close to
-    flat do not.
+    flat do not (no pyramiding — anti-pyramiding guard, PR #250).
     """
     running: dict[str, int] = {}
     entries: list[Entry] = []

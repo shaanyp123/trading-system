@@ -6,15 +6,83 @@ import json
 from datetime import date
 from pathlib import Path
 
+import pytest
+
 from research.eval.reproduce_v1 import (
     Entry,
     OracleEntry,
     build_v1_run_spec,
     crosscheck_entries,
     entries_from_fills,
+    first_entry_per_market,
     load_oracle,
+    parse_v1_decisions_from_log,
 )
 from research.lean.results import OrderFill
+
+
+def _write_v1_log(output_dir: Path, body: str) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "V1TrendFollowingAlgorithm-log.txt").write_text(body, encoding="utf-8")
+
+
+def test_parse_v1_decisions_emitted_by_elimination(tmp_path: Path) -> None:
+    # universe (rejected across the run) = {/MES, /MNQ, TLT}; on 05-06 /MNQ is the one
+    # market NOT rejected with emitted_count=1 ⇒ the emitted decision.
+    _write_v1_log(
+        tmp_path,
+        "\n".join(
+            [
+                "t v1_signal_rejected session_date=2026-05-06 market=/MES reason=no_breakout",
+                "t v1_signal_rejected session_date=2026-05-06 market=TLT reason=no_breakout",
+                "t v1_signals_generated session_date=2026-05-06 signals_emitted_count=1 "
+                "rejections_count=2 reasons={}",
+                "t v1_signal_rejected session_date=2026-05-07 market=/MES reason=no_breakout",
+                "t v1_signal_rejected session_date=2026-05-07 market=/MNQ reason=no_breakout",
+                "t v1_signal_rejected session_date=2026-05-07 market=TLT reason=no_breakout",
+                "t v1_signals_generated session_date=2026-05-07 signals_emitted_count=0 "
+                "rejections_count=3 reasons={}",
+            ]
+        ),
+    )
+    entries = parse_v1_decisions_from_log(tmp_path)
+    assert entries == [Entry(date(2026, 5, 6), "/MNQ", "long")]
+
+
+def test_parse_v1_decisions_skips_ambiguous_cycle(tmp_path: Path) -> None:
+    # count=1 but two markets are unrejected ⇒ elimination ambiguous ⇒ skip (no fabrication).
+    _write_v1_log(
+        tmp_path,
+        "\n".join(
+            [
+                "t v1_signal_rejected session_date=2026-05-08 market=/MES reason=no_breakout",
+                "t v1_signal_rejected session_date=2026-05-09 market=/MNQ reason=no_breakout",
+                "t v1_signal_rejected session_date=2026-05-09 market=TLT reason=no_breakout",
+                # universe={/MES,/MNQ,TLT}; on 05-08 only /MES rejected ⇒ derived 2 != count 1.
+                "t v1_signals_generated session_date=2026-05-08 signals_emitted_count=1 "
+                "rejections_count=1 reasons={}",
+            ]
+        ),
+    )
+    assert parse_v1_decisions_from_log(tmp_path) == []
+
+
+def test_parse_v1_decisions_no_log_raises(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="v1_signals_generated"):
+        parse_v1_decisions_from_log(tmp_path)
+
+
+def test_first_entry_per_market() -> None:
+    entries = [
+        Entry(date(2026, 5, 8), "/MNQ", "long"),
+        Entry(date(2026, 5, 6), "/MNQ", "long"),  # earlier /MNQ — should win
+        Entry(date(2026, 5, 10), "TLT", "long"),
+    ]
+    reduced = first_entry_per_market(entries)
+    assert reduced == [
+        Entry(date(2026, 5, 6), "/MNQ", "long"),
+        Entry(date(2026, 5, 10), "TLT", "long"),
+    ]
 
 
 def _fill(market: str, day: date, qty: int) -> OrderFill:
