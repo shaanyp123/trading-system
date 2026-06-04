@@ -29,6 +29,7 @@ from research.screen.daily_eval import evaluate_daily
 from research.strategy.buy_and_hold import BuyAndHold
 from research.strategy.contract import ResearchStrategy
 from research.strategy.donchian import DonchianBreakout
+from research.strategy.v1_adapter import V1Adapter
 
 _DEFAULT_RUNS_DIR = Path("research/runs")
 _DEFAULT_VOL_LOOKBACK = 60
@@ -41,6 +42,9 @@ def _build_strategy(cfg: RunConfig) -> ResearchStrategy:
         return BuyAndHold(cfg.contracts)
     if cfg.strategy_ref == "donchian":
         return DonchianBreakout(channel=cfg.channel or 20, contracts=abs(cfg.contracts))
+    if cfg.strategy_ref == "v1_adapter":
+        # Production V1 with its live default params (replays the real V1 logic).
+        return V1Adapter()
     raise ValueError(f"unknown strategy.ref {cfg.strategy_ref!r}")
 
 
