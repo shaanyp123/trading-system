@@ -1,0 +1,23 @@
+# Docker build-context excludes. The repo root is the build context for every
+# service image (`docker build ... .`); without this file Docker tars the whole
+# tree — ~5.9G, dominated by `.claude/` session transcripts — and sends it to the
+# daemon before any layer runs (slow; can stall a build mid-send).
+#
+# Scope: ONLY paths no Dockerfile ever COPYs — VCS, the local venv, tool caches,
+# session transcripts, and the research data snapshot. Source dirs and
+# node_modules are intentionally NOT excluded so apps/web/Dockerfile and the
+# services/* images are unaffected.
+.claude/
+.git/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+**/__pycache__/
+*.pyc
+
+# Research data snapshots + run outputs (hundreds of MB of LEAN bars; never built
+# into an image — the harness mounts a copy at run time, design §4.2).
+research/data/cache/
+research/runs/

@@ -60,15 +60,22 @@ def extract_trades_from_positions(
     positions: npt.NDArray[np.int64],
     closes: npt.NDArray[np.float64],
     multiplier: float,
+    *,
+    opens: npt.NDArray[np.float64] | None = None,
 ) -> list[Trade]:
-    """Round-trips from an evaluator's per-bar ``positions`` + the close series.
+    """Round-trips from an evaluator's per-bar ``positions``.
 
-    Mirrors ``research.screen.daily_eval.evaluate_daily``'s convention exactly:
     ``positions[t]`` is the position held over ``(t-1, t]`` (the target decided at
-    ``t-1``), so a position that becomes non-zero at index ``i`` was entered at
-    ``close[i-1]`` and one that returns to zero at index ``j`` was exited at
-    ``close[j-1]``. P&L of a round-trip is then ``qty * multiplier *
-    (exit_close - entry_close)`` — identical to the equity curve's step sum.
+    ``t-1``), so a position becomes non-zero at index ``i`` and returns to zero at
+    index ``j``.
+
+    **Fill convention (`opens`):** when ``opens`` is given, fills are priced at the
+    NEXT session's open — ``open[i]`` (entry) / ``open[j]`` (exit) — which is what
+    actually executes a close-decision AND what LEAN's daily fills do; this is the
+    convention the §6.6 parity rail compares against real LEAN (verified 0 bps on a
+    fee/slippage-free reference). When ``opens`` is ``None`` (pure-logic unit tests),
+    fills are priced at the decision close — ``close[i-1]`` / ``close[j-1]`` —
+    matching ``evaluate_daily``'s close-to-close MTM step sum exactly.
     """
     n = int(positions.shape[0])
     trades: list[Trade] = []
@@ -76,11 +83,16 @@ def extract_trades_from_positions(
     entry_qty = 0
     entry_px = Decimal("0")
 
+    def _fill_price(active_index: int) -> Decimal:
+        if opens is not None:
+            return Decimal(str(float(opens[active_index])))
+        return Decimal(str(float(closes[active_index - 1])))
+
     def _open(i: int, qty: int) -> tuple[int, int, Decimal]:
-        return i, qty, Decimal(str(float(closes[i - 1])))
+        return i, qty, _fill_price(i)
 
     def _close(j: int) -> Trade:
-        exit_px = Decimal(str(float(closes[j - 1])))
+        exit_px = _fill_price(j)
         pnl = Decimal(entry_qty) * Decimal(str(multiplier)) * (exit_px - entry_px)
         return Trade(
             entry_index=entry_idx if entry_idx is not None else j,

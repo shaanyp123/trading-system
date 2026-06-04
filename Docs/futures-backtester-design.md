@@ -835,11 +835,11 @@ POST config). The **LEAN CLI backend** serves the POST-free reference strategies
 releases, so `research/lean/results.py` finds the result file by CONTENT (not
 filename), reads the equity curve from both the line-series `{x,y}` and candlestick
 `{x,…,close}` shapes, and accepts PascalCase/camelCase keys + int/string enums. It is
-unit-tested against two committed fixtures covering both shapes. The committed V1
-golden + oracle snapshots are REPRESENTATIVE (hand-authored to the schema; entries
-mirror the live `/M2K` 05-27 + `/MES` 05-28); the operator re-captures REAL ones
-during acceptance (commands in `research/lean/README.md`) — the tests then run the
-same assertions against the real engine.
+unit-tested against committed fixtures covering all three shapes (line, candlestick,
+array-form). The V1 reproduction golden uses a REAL captured V1 LEAN log
+(`tests/fixtures/v1_repro_log/`, from an isolated harness run on the production
+algorithm) + a REAL prod `signals` oracle snapshot (`tests/fixtures/v1_oracle/`); see
+the real-engine results below.
 
 **What is CI-green vs operator-acceptance.** Green with NO Docker/LEAN: the parser,
 config render, availability checks, command-assembly safety invariants, parity
@@ -848,6 +848,72 @@ fixtures). Gated to SKIP visibly until the operator runs the real engine: the
 end-to-end LEAN backtest, the empirical §6.6 tolerance pass, and the real V1↔oracle
 match. If the parity tolerances need a fill-model tweak on first real run, that is a
 one-line change in `donchian_reference.py` — expected iteration against a real engine.
+
+### P2 real-engine acceptance — RESULTS (2026-06-04, `quantconnect/lean:latest` 42.5GB)
+
+Both trust-bridge proofs ran against actual LEAN (image built locally; bars snapshotted
+from prod; oracle captured from the prod `signals` table):
+
+- **§6.6 parity rail — PASS.** Donchian on TLT (2025-07→2026-05): trade count 3 = 3,
+  aggregate P&L Δ ≈ 0.0005% of equity, per-trade slippage **0.0 bps**. The real LEAN
+  result JSON for this build is **array-form equity points** (`[ts, o, h, l, c]`, not
+  dict points) + all-camelCase — the parser was extended to handle array-form (a third
+  shape beside line `{x,y}` and candlestick `{x,…,close}`). Slippage is 0 because the
+  numpy fills are priced at the NEXT session's open (the realistic, LEAN-matching
+  convention) rather than the decision close; a close-vs-open comparison was 14–68 bps.
+- **Reproduce-V1 — PARTIAL (structural), harness PROVEN.** The harness drives the
+  production `V1TrendFollowingAlgorithm` end-to-end in real LEAN, FULLY ISOLATED (every
+  per-cycle POST → "Connection refused"; zero prod contact), warmup completes, and the
+  real ER-gate decision logic executes. But a clean decision match against the live
+  oracle is **structurally limited** (4/9 strict (date,market); 3/4 markets), for three
+  real reasons that are now documented + handled:
+  1. **V1 emits via POST, not LEAN orders** — it places no LEAN orders, so its decisions
+     live in the LEAN LOG (`v1_signals_generated` / `v1_signal_rejected`), not the result
+     JSON. `research/eval/reproduce_v1.py` parses the log (emitted = universe − rejected
+     per cycle), keeping the strongest `--network none` isolation (no POST-capture
+     sidecar). [The original order-fill extraction yielded 0 for V1 — fixed.]
+  2. **Backtest V1 has no position feedback** (PaperBrokerage; the `/positions` GET is
+     live-mode only), so it RE-EMITS the same breakout every cycle, unlike the
+     position-aware live system (anti-pyramiding, PR #250). `first_entry_per_market`
+     reduces both sides to neutralize this for a fair market-level comparison.
+  3. **Live used a distinct param-hash per signal** (params calibrated mid-window + the
+     ER gate landed 2026-06-02) vs the uniform-param backtest → date/market mismatches.
+  Net: V1 reproduction is a directional proof (harness runs prod V1 + reproduces live
+  decisions where params align), not a byte-for-byte match. Exact short-side capture
+  would need POST-body capture (a future enhancement; today V1 is long-only and the
+  oracle confirms all-long).
+
+### P3 landed — leverage / margin / liquidation / ruin (2026-06-04)
+
+Shipped `research/risk/{sizing_schemes,leverage,liquidation,metrics}.py` + the report /
+config / run wiring. Implementation notes (versioned with the design):
+
+- **Sizing schemes** (`sizing_schemes.py`): fixed / fixed-fractional / vol-target /
+  ATR / risk-parity, each a pure `size_for_bar` under a HARD `leverage.cap`
+  (`cap_contracts_to_leverage` can only shrink a position). `simulate_sized_path` is the
+  P3 analog of `evaluate_daily` — per-bar sizing, one-bar lag, RIDES THROUGH a wipeout
+  (it never auto-de-risks, so ruin is surfaced, not hidden — §6.2).
+- **Parity pin** (`tests/unit/test_research_sizing_parity_pin.py`): `vol_target_notional`
+  is pinned against the LIVE `services/risk/sizing.py` Stage-1 `unconstrained_notional`
+  (imported public result; forbidden path NOT modified), compared as `Decimal` at the
+  boundary (D8/R7). Holds across 3 (vol, m_combined) cases on V1's locked 0.15 target.
+- **Liquidation** (`liquidation.py`): the daily intrabar ESTIMATOR overlays each bar's
+  high/low on the held position vs maintenance margin → a WARNING with the mandatory
+  residual-uncertainty caveat (re-run at minute = P5). Maintenance margin is `Decimal`
+  (futures: fixed $/contract reference, or LEAN's `margins/<SYM>.csv` when the snapshot
+  is present; ETFs: Reg-T 25% of notional).
+- **Metrics** (`metrics.py`, moved+extended from `eval/metrics.py`): the full §6.5 suite,
+  liquidation-aware (absolute-$ drawdown + `is_wiped` replace the P1 post-wipeout pct-DD
+  limitation; `risk_of_ruin = 1.0` when liquidated/wiped, else the parametric Brownian
+  P(dd>50%)).
+- **LEAN-native liquidation** (`lean/results.py`): `parse_margin_events` surfaces
+  margin-call / liquidation orders by tag; `ParsedLeanResult.liquidated` + the report's
+  RED banner fire on the estimator OR a LEAN margin call.
+- **Acceptance MET:** `make research RUN=research/config/examples/p3_leverage_sweep.yaml`
+  → a ruin report (leverage-over-time + the §6.5 suite + a RED liquidation banner). The
+  TLT sweep cleanly shows the ETF 25%-maintenance cliff: survives ≤3x, LIQUIDATED ≥5x;
+  vol drag scales ~quadratically (0.5% → 31% from 1x → 8x). All green: full unit suite,
+  `mypy --strict`, `ruff`.
 
 ### P3–P7 kickoff stubs
 

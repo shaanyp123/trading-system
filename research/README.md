@@ -25,16 +25,16 @@ open research/runs/<UTC-ts>/report.html
 | Phase | Scope | Status |
 |---|---|---|
 | **P1** | daily loader + contract specs + strategy contract + buy-and-hold + report | **built** |
-| **P2** | LEAN driver + §6.6 vbt↔LEAN parity + reproduce V1 | **built** (code + parser + parity-logic + V1 cross-check CI-green without LEAN; real-engine run is the operator acceptance gate — see [`lean/README.md`](lean/README.md)) |
-| P3 | leverage / margin / liquidation / ruin metrics + sizing schemes | planned |
+| **P2** | LEAN driver + §6.6 vbt↔LEAN parity + reproduce V1 | **built + real-engine accepted** (parity PASS + V1-repro PASS vs real LEAN 2026-06-04; see [`lean/README.md`](lean/README.md)) |
+| **P3** | leverage / margin / liquidation / ruin metrics + sizing schemes | **built** (`research/risk/`; `make research RUN=research/config/examples/p3_leverage_sweep.yaml` → ruin report with a RED liquidation banner) |
 | P4 | walk-forward + sweep (vectorbt) + anti-overfitting + comparison | planned |
 | P5–P6 | intraday minute/tick | **deferred** (daily-only per 2026-06-03 sign-off; no data vendor yet) |
 | P7 | isolated live paper-forward | planned |
 
 ## P1 layout notes (deltas from design §4.1)
 
-- Metrics live in `eval/metrics.py` (not `risk/metrics.py`) — there is no `risk/`
-  dir until P3; they move/extend there with the leverage work.
+- Metrics moved to `risk/metrics.py` in P3 (the full §6.5 ruin suite); `eval/metrics.py`
+  is gone. `run.py`'s P1 daily-spine report imports `summarize` from there now.
 - `run.py`, `screen/daily_eval.py`, `data/bars.py`, and `eval/results.py` are P1
   primitives not spelled out in the §4.1 tree. `eval/results.py` holds the single
   canonical `BacktestResult`; the P2 LEAN driver normalizes into that same type.

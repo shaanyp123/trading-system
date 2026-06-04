@@ -76,8 +76,11 @@ def test_vectorbt_lean_parity(tmp_path: Path) -> None:
     research_result = evaluate_daily(
         series, strategy, multiplier=multiplier, starting_cash=float(_CASH)
     )
+    # Price fills at the NEXT session's open — the realistic convention that LEAN's
+    # daily fills use (a close-decision can't fill at that same close). This is the
+    # apples-to-apples basis for the §6.6 per-trade slippage check.
     research_trades = extract_trades_from_positions(
-        research_result.positions, series.close, multiplier
+        research_result.positions, series.close, multiplier, opens=series.open
     )
 
     # --- LEAN (authority) side ------------------------------------------------

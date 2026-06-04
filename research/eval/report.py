@@ -211,3 +211,250 @@ def write_report(
         _result_json(run_name, harness_version, generated_at, rows), encoding="utf-8"
     )
     return html_path
+
+
+# =========================================================================== #
+# P3 leverage / ruin report (design §6.2 + §6.5) — make liquidation un-missable
+# =========================================================================== #
+def _fmt_ratio(x: float) -> str:
+    return f"{x:.2f}" if math.isfinite(x) else "n/a"
+
+
+def _fmt_lev(x: float) -> str:
+    return f"{x:.2f}x" if math.isfinite(x) else "n/a"
+
+
+def _finite_curve(arr: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+    """Forward-fill non-finite values so a leverage sparkline holds through a wipeout."""
+    out = np.array(arr, dtype=np.float64, copy=True)
+    last = 0.0
+    for i in range(out.shape[0]):
+        if math.isfinite(out[i]):
+            last = float(out[i])
+        else:
+            out[i] = last
+    return out
+
+
+@dataclass(frozen=True, slots=True)
+class LeverageRow:
+    """One leverage level in a sweep: its ruin metrics + liquidation evidence.
+
+    ``metrics`` is ``RiskMetrics.to_report_dict()``. ``liquidated`` is the daily
+    intrabar-estimator verdict (``n_liquidation_flags`` flagged bars from
+    ``research.risk.liquidation``); ``lean_margin_events`` counts LEAN-native
+    margin-call orders (``research.lean.results``). Either ⇒ the red banner fires.
+    """
+
+    leverage_cap: float
+    scheme: str
+    metrics: dict[str, float]
+    liquidated: bool
+    first_liquidation_date: date | None
+    n_liquidation_flags: int
+    bars_evaluated: int
+    lean_margin_events: int
+    residual_uncertainty: str
+    leverage_curve: npt.NDArray[np.float64] = field(repr=False)
+
+    @property
+    def flagged(self) -> bool:
+        return self.liquidated or self.lean_margin_events > 0
+
+
+_LEVERAGE_BANNER = (
+    "P3 leverage / ruin report — RESEARCH-ONLY, NON-AUTHORITATIVE. The leverage cap "
+    "binds at SIZING time; realized leverage can drift above it as equity erodes. "
+    "Liquidation flags are the DAILY intrabar ESTIMATOR (a flag-for-confirmation, not "
+    "a verdict) and/or LEAN-native margin-call orders. Confirm flagged days at minute "
+    "resolution (design §6.3 → P5, deferred)."
+)
+
+
+def _ruin_banner_lines(rows: list[LeverageRow]) -> list[str]:
+    """The red-banner body when any leverage level would have been liquidated."""
+    flagged = [r for r in rows if r.flagged]
+    if not flagged:
+        return []
+    lines = ["⚠ LIQUIDATION DETECTED — this leverage would have wiped the account:"]
+    for r in flagged:
+        first = r.first_liquidation_date.isoformat() if r.first_liquidation_date else "n/a"
+        src = []
+        if r.n_liquidation_flags:
+            src.append(f"{r.n_liquidation_flags} intrabar-estimator day(s)")
+        if r.lean_margin_events:
+            src.append(f"{r.lean_margin_events} LEAN margin-call order(s)")
+        lines.append(
+            f"  • {r.leverage_cap:g}x ({r.scheme}): first breach {first} — {', '.join(src)}"
+        )
+    return lines
+
+
+_LEV_COLUMNS = (
+    ("leverage_cap", "Cap"),
+    ("peak_leverage", "Peak lev"),
+    ("cagr", "CAGR"),
+    ("annualized_vol", "Ann vol"),
+    ("sharpe", "Sharpe"),
+    ("max_drawdown_pct", "Max DD %"),
+    ("max_drawdown_dollars", "Max DD $"),
+    ("volatility_drag", "Vol drag"),
+    ("p_drawdown_gt_50pct", "P(dd>50%)"),
+    ("risk_of_ruin", "Risk of ruin"),
+    ("fractional_kelly", "Frac Kelly"),
+)
+
+
+def _lev_cell(row: LeverageRow, key: str) -> str:
+    if key == "leverage_cap":
+        return f"{row.leverage_cap:g}x"
+    if key == "peak_leverage":
+        return _fmt_lev(row.metrics.get("peak_leverage", float("nan")))
+    if key == "fractional_kelly":
+        return _fmt_lev(row.metrics.get("fractional_kelly", float("nan")))
+    value = row.metrics.get(key, float("nan"))
+    if key in ("cagr", "annualized_vol", "volatility_drag", "p_drawdown_gt_50pct", "risk_of_ruin"):
+        return _fmt_pct(value)
+    if key == "max_drawdown_pct":
+        return _fmt_dd(value)
+    if key == "max_drawdown_dollars":
+        return _fmt_money(value)
+    return _fmt_ratio(value)
+
+
+def _leverage_markdown(
+    run_name: str, version: str, generated_at: datetime, symbol: str, rows: list[LeverageRow]
+) -> str:
+    lines = [f"# Leverage / ruin sweep: {run_name}", "", f"> {_LEVERAGE_BANNER}", ""]
+    banner = _ruin_banner_lines(rows)
+    if banner:
+        lines += ["> 🟥 **" + banner[0] + "**", *[f"> {b}" for b in banner[1:]], ""]
+    lines += [
+        f"- harness version: `{version}`",
+        f"- generated: {generated_at.isoformat()}",
+        f"- instrument: {symbol}",
+        f"- leverage levels: {len(rows)}",
+        "",
+        "| " + " | ".join(label for _, label in _LEV_COLUMNS) + " | Liq days | Liquidated |",
+        "|" + "---|" * (len(_LEV_COLUMNS) + 2),
+    ]
+    for r in rows:
+        cells = [_lev_cell(r, key) for key, _ in _LEV_COLUMNS]
+        liq = "🟥 YES" if r.flagged else "no"
+        lines.append("| " + " | ".join(cells) + f" | {r.n_liquidation_flags} | {liq} |")
+    if any(r.flagged for r in rows):
+        lines += ["", f"> Residual uncertainty: {rows[0].residual_uncertainty}"]
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _leverage_html(
+    run_name: str, version: str, generated_at: datetime, symbol: str, rows: list[LeverageRow]
+) -> str:
+    esc = html.escape
+    banner = _ruin_banner_lines(rows)
+    parts = [
+        "<!doctype html><html><head><meta charset='utf-8'>",
+        f"<title>Leverage sweep: {esc(run_name)}</title>",
+        "<style>body{font:14px/1.5 -apple-system,system-ui,sans-serif;margin:2rem;color:#1f2328}"
+        ".banner{background:#fff8c5;border:1px solid #d4a72c;padding:.75rem 1rem;border-radius:6px}"
+        ".ruin{background:#ffebe9;border:2px solid #cf222e;color:#82071e;padding:.75rem 1rem;"
+        "border-radius:6px;margin:1rem 0;font-weight:600}"
+        "table{border-collapse:collapse;width:100%;margin:1rem 0}"
+        "th,td{border:1px solid #d0d7de;padding:.4rem .6rem;text-align:right}"
+        "th:first-child,td:first-child{text-align:left}"
+        ".liq{color:#cf222e;font-weight:700}.spark{border:1px solid #d0d7de;border-radius:6px;"
+        "margin:.5rem 0;padding:.25rem}.muted{color:#656d76}</style></head><body>",
+        f"<h1>Leverage / ruin sweep: {esc(run_name)}</h1>",
+        f"<p class='banner'>{esc(_LEVERAGE_BANNER)}</p>",
+    ]
+    if banner:
+        parts.append("<div class='ruin'>" + "<br>".join(esc(b) for b in banner) + "</div>")
+    parts.append(
+        f"<p class='muted'>harness <code>{esc(version)}</code> · generated "
+        f"{esc(generated_at.isoformat())} · {esc(symbol)} · {len(rows)} leverage level(s)</p>"
+    )
+    header = "".join(f"<th>{esc(label)}</th>" for _, label in _LEV_COLUMNS)
+    parts.append(
+        f"<table><thead><tr>{header}<th>Liq days</th><th>Liquidated</th></tr></thead><tbody>"
+    )
+    for r in rows:
+        cells = "".join(f"<td>{esc(_lev_cell(r, key))}</td>" for key, _ in _LEV_COLUMNS)
+        liq = "<span class='liq'>🟥 YES</span>" if r.flagged else "no"
+        parts.append(f"<tr>{cells}<td>{r.n_liquidation_flags}</td><td>{liq}</td></tr>")
+    parts.append("</tbody></table>")
+    for r in rows:
+        parts.append(
+            f"<div class='spark'><div class='muted'>{esc(f'{r.leverage_cap:g}x')} leverage over time "
+            f"(peak {_fmt_lev(r.metrics.get('peak_leverage', float('nan')))})</div>"
+            f"{_sparkline_svg(_finite_curve(r.leverage_curve))}</div>"
+        )
+    if banner:
+        parts.append(
+            f"<p class='muted'>Residual uncertainty: {esc(rows[0].residual_uncertainty)}</p>"
+        )
+    parts.append("</body></html>")
+    return "".join(parts)
+
+
+def _leverage_result_json(
+    run_name: str, version: str, generated_at: datetime, symbol: str, rows: list[LeverageRow]
+) -> str:
+    payload = {
+        "run_name": run_name,
+        "harness_version": version,
+        "generated_at": generated_at.isoformat(),
+        "report_type": "leverage_sweep",
+        "authoritative": False,
+        "symbol": symbol,
+        "liquidation_detected": any(r.flagged for r in rows),
+        "residual_uncertainty": rows[0].residual_uncertainty if rows else "",
+        "levels": [
+            {
+                "leverage_cap": r.leverage_cap,
+                "scheme": r.scheme,
+                "liquidated": r.flagged,
+                "first_liquidation_date": (
+                    r.first_liquidation_date.isoformat() if r.first_liquidation_date else None
+                ),
+                "n_liquidation_flags": r.n_liquidation_flags,
+                "bars_evaluated": r.bars_evaluated,
+                "lean_margin_events": r.lean_margin_events,
+                "metrics": {
+                    k: (round(v, 8) if math.isfinite(v) else None) for k, v in r.metrics.items()
+                },
+            }
+            for r in rows
+        ],
+    }
+    return json.dumps(payload, indent=2)
+
+
+def write_leverage_report(
+    run_dir: Path,
+    *,
+    run_name: str,
+    harness_version: str,
+    generated_at: datetime,
+    symbol: str,
+    rows: list[LeverageRow],
+) -> Path:
+    """Write the P3 leverage/ruin ``report.{md,html}`` + ``result.json`` into ``run_dir``.
+
+    A RED banner fires (impossible to miss, design §6.2) whenever any leverage level
+    would have been liquidated — by the daily intrabar estimator or a LEAN-native
+    margin call. Returns the path to ``report.html``.
+    """
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "report.md").write_text(
+        _leverage_markdown(run_name, harness_version, generated_at, symbol, rows), encoding="utf-8"
+    )
+    html_path = run_dir / "report.html"
+    html_path.write_text(
+        _leverage_html(run_name, harness_version, generated_at, symbol, rows), encoding="utf-8"
+    )
+    (run_dir / "result.json").write_text(
+        _leverage_result_json(run_name, harness_version, generated_at, symbol, rows),
+        encoding="utf-8",
+    )
+    return html_path
