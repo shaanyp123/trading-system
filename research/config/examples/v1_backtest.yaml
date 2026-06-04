@@ -25,5 +25,7 @@ universe: ["TLT"]            # V1 shorts TLT's downtrend over this window
 date_range: { start: 2025-06-05, end: 2026-06-03 }
 starting_cash: 100000
 strategy: { ref: v1_adapter }                              # production V1, live default params
-sizing: { scheme: vol_target, vol_target_pct_annual: 0.15 }   # V1's 15%/yr Clenow target
+# V1's Clenow sizing — lookbacks pinned to V1_DEFAULTS so the sweep's sizing can't
+# silently desync from a future change to the harness defaults.
+sizing: { scheme: vol_target, vol_target_pct_annual: 0.15, instrument_vol_lookback_days: 60, atr_lookback_days: 20 }
 leverage: { cap: 3.0, sweep: [1.0, 2.0, 3.0] }

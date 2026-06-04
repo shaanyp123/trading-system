@@ -113,12 +113,19 @@ class V1Adapter(ResearchStrategy):
                     opened_at = day
             else:
                 close_t = Decimal(str(float(series.close[t])))
+                # (a) ATR protective stop (close-based approx; MIN_HOLDING-exempt, as
+                # production's IBKR bracket is). Takes precedence — an intrabar standing
+                # order vs the settlement-cycle indicator exits.
                 stopped = stop_price is not None and (
                     (direction is Direction.LONG and close_t <= stop_price)
                     or (direction is Direction.SHORT and close_t >= stop_price)
                 )
-                exited = stopped
-                if not stopped:
+                if stopped:
+                    direction = Direction.FLAT
+                    stop_price = None
+                    avg_cost = None
+                    opened_at = None
+                else:
                     position = V1Position(
                         market=market,
                         direction=direction,
@@ -126,17 +133,49 @@ class V1Adapter(ResearchStrategy):
                         avg_cost=avg_cost if avg_cost is not None else close_t,
                         opened_at_session_date=opened_at,
                     )
+                    # Run the ENTRY pipeline on the held market too: a same-direction
+                    # breakout is rejected (anti-pyramiding), but an OPPOSITE-direction
+                    # breakout is emitted — exactly what generate_exit_candidates needs as
+                    # ``entry_candidates`` to detect a (b) REVERSAL exit. Mirrors the prod
+                    # cycle (lean/v1_strategy.py runs both each day).
+                    entries = self._v1.generate_signals(
+                        active_universe={market: window},
+                        current_positions={market: position},
+                        as_of_session_date=day,
+                    ).signals
                     exit_result = self._v1.generate_exit_candidates(
                         active_universe={market: window},
                         current_positions={market: position},
                         as_of_session_date=day,
+                        entry_candidates=entries,
                     )
-                    exited = any(s.market == market for s in exit_result.signals)
-                if exited:
-                    direction = Direction.FLAT
-                    stop_price = None
-                    avg_cost = None
-                    opened_at = None
+                    exit_sig = next((s for s in exit_result.signals if s.market == market), None)
+                    if exit_sig is not None and exit_sig.exit_reason == "reversal":
+                        # Reversal = close + open the opposite side in the SAME decision
+                        # (production closes the held leg and opens the paired entry).
+                        opposite = next(
+                            (
+                                e
+                                for e in entries
+                                if e.market == market and e.direction is not direction
+                            ),
+                            None,
+                        )
+                        if opposite is not None:
+                            direction = opposite.direction
+                            stop_price = opposite.stop_price
+                            avg_cost = opposite.decision_price
+                            opened_at = day
+                        else:  # defensive: reversal with no paired entry → just close
+                            direction = Direction.FLAT
+                            stop_price = None
+                            avg_cost = None
+                            opened_at = None
+                    elif exit_sig is not None:  # trend_flip / decommission → close
+                        direction = Direction.FLAT
+                        stop_price = None
+                        avg_cost = None
+                        opened_at = None
 
             targets[t] = _DIR_TO_INT[direction]
         return targets

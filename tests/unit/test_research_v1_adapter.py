@@ -101,6 +101,30 @@ def test_only_unit_directions() -> None:
     assert set(pos.tolist()) <= {-1, 0, 1}
 
 
+def test_trend_then_reverse_exits_and_flips() -> None:
+    # Up for >warmup bars (enter long), then down (exit the long via stop/trend-flip/
+    # reversal, then enter short). Guards the EXIT state machine, not just entries.
+    up = [300.0 + 0.5 * i for i in range(230)]
+    down = [up[-1] - 0.5 * (i + 1) for i in range(140)]
+    closes = np.asarray(up + down, dtype=np.float64)
+    n = len(closes)
+    series = BarSeries(
+        symbol="TLT",
+        dates=tuple(date(2024, 1, 1) + timedelta(days=i) for i in range(n)),
+        open=closes.copy(),
+        high=closes + 0.1,
+        low=closes - 0.1,
+        close=closes,
+        volume=np.full(n, 1000.0, dtype=np.float64),
+    )
+    pos = V1Adapter().target_positions(series)
+    assert 1 in pos.tolist()  # went long in the uptrend
+    assert -1 in pos.tolist()  # exited + went short in the downtrend
+    first_long = next(i for i, p in enumerate(pos.tolist()) if p == 1)
+    first_short = next(i for i, p in enumerate(pos.tolist()) if p == -1)
+    assert first_long < first_short  # long BEFORE short (exited then flipped)
+
+
 def test_config_registry_builds_v1_adapter() -> None:
     from research.config.schema import KNOWN_STRATEGIES
     from research.run import _build_strategy
