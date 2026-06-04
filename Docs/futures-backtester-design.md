@@ -721,10 +721,83 @@ cost-bearing / strategy-ambiguous ones.
 > - `contract_specs.py` unit-tested against the multipliers in `parameters.py`.
 > - `make test` green before opening the PR.
 
-### P2–P7 kickoff stubs
+## P2 Kickoff Prompt (for next Claude Code session)
+
+P1 (daily spine) merged in PR #319. Copy-paste this to start P2:
+
+> I want to start P2 from `Docs/futures-backtester-design.md` — the LEAN driver +
+> the vbt↔LEAN parity rail + reproducing production V1. This is the phase that
+> makes LEAN the authority and proves the backtest→live trust bridge.
+>
+> Context: P1 shipped `research/{config,data,strategy,screen,eval}` + `run.py` +
+> `make research`. P1's evaluator (`research/screen/daily_eval.py`) is
+> research-only / NON-authoritative; do NOT extend it into an engine — drive LEAN.
+>
+> Per the design doc (D1, §4.3, §6.6, §8, §9):
+>
+> - Scope: NEW files under `research/lean/` + make `tests/integration/
+>   test_vbt_lean_parity.py` real. No forbidden path → normal review.
+> - Build:
+>   - `research/lean/config_render.py` — render a THROWAWAY per-run `lean.json`
+>     (env `backtesting`, resolution, the `parameters` block, `set_cash`,
+>     start/end) into a temp project dir. NEVER edit production `lean/lean.json`.
+>   - `research/lean/images.py` — the invocation backend: LEAN CLI (`lean
+>     backtest`) default + raw `docker run` against the Launcher as fallback.
+>   - `research/lean/driver.py` — launch a daily LEAN backtest for V1 or a
+>     reference strategy against the on-disk bar COPY (§4.2; never the live
+>     volume); collect the output dir.
+>   - `research/lean/results.py` — PARSE LEAN's result JSON (orders/trades/
+>     statistics) and NORMALIZE into the SHARED
+>     `research.eval.results.BacktestResult` (+ a trades list). A parser, not a
+>     second result type.
+>   - Promote `tests/integration/test_vbt_lean_parity.py` (dev-guide §6.6) from
+>     sketch to real: run a daily strategy in BOTH the research evaluator and
+>     LEAN; assert per-trade slippage ≤ 5 bps, aggregate P&L ≤ 0.5% of starting
+>     equity, trade count within 5%. Use Decimal at the comparison boundary.
+>
+> Hard realities — handle them, don't pretend them away:
+>   - LEAN/Docker may be ABSENT locally and in CI. Make the driver + parser
+>     UNIT-testable WITHOUT running LEAN by committing a CAPTURED LEAN-output
+>     fixture under `tests/`, and gate the REAL LEAN run behind an availability
+>     check that SKIPS when LEAN/Docker is missing — mirror the optional-vectorbt
+>     seam in `research/screen/vbt_screen.py`. A missing LEAN must never become a
+>     silent pass.
+>   - Reproduce production V1: drive LEAN to run `V1TrendFollowingAlgorithm`
+>     (`lean/v1_strategy.py`) on a fixed daily window with the live params, and
+>     show the harness-captured `BacktestResult` matches a RECORDED production V1
+>     backtest committed as a golden fixture (dev-guide §6.5 pattern).
+>   - Decimal-at-boundary (design D8): parse LEAN trade prices/P&L as Decimal
+>     where they feed the §6.6 comparison.
+>
+> Read in this order:
+>   1. `Docs/futures-backtester-design.md` (§4.3 driver, §6.6, §8 trust bridge, §9 P2)
+>   2. `Docs/claude-dev-guide.md` §6.6 (parity criteria) + §6.5 (golden pattern)
+>   3. `lean/lean.json` (environments `backtesting` vs `paper-internal`;
+>      algorithm-type-name / location / parameters). NOTE `lean/README.md`'s
+>      `paper-internal` clientId=10 / data-queue text is STALE post-Option-C —
+>      trust `lean.json` + `CLAUDE.md` + `Docs/recent-architecture-changes.md`.
+>   4. `lean/v1_strategy.py` (the algorithm to reproduce: `add_future` RAW +
+>      `OPEN_INTEREST` + `contract_depth_offset=0` + `set_filter(-365, 90)`; IBKR
+>      MARGIN brokerage model; warmup; 17:30 ET cycle)
+>   5. `research/screen/daily_eval.py` + `research/eval/results.py` (the evaluator
+>      + the shared result type to parity-check against)
+>   6. `research/data/daily_loader.py` (the on-disk format the LEAN data copy uses)
+>
+> Acceptance (design §8/§9):
+>   - A programmatic LEAN daily backtest runs end-to-end (real LEAN) → `BacktestResult`.
+>   - `test_vbt_lean_parity.py` passes the §6.6 tolerances on a daily strategy.
+>   - Production V1 reproduced: harness-driven LEAN matches the recorded V1 golden
+>     within tolerance.
+>   - Driver + parser UNIT-tested against a committed LEAN-output fixture (CI green
+>     with no Docker/LEAN). `make test` green; ruff + mypy `--strict` clean
+>     (`research` is in the typecheck target).
+
+### P3–P7 kickoff stubs
 
 Each later phase starts the same way ("start P{N} from
 `Docs/futures-backtester-design.md`"), scoped to that phase's files in §9 +
-acceptance in §9/§10. P2 makes the LEAN driver + parity rail real and reproduces
-V1; P3 adds leverage/ruin; P4 adds walk-forward/sweep; P5 (gated on §14 Q-B) adds
-intraday ingest + sessions; P6 adds tick; P7 adds isolated live paper-forward.
+acceptance in §9/§10. P3 adds leverage / margin / liquidation + ruin metrics +
+sizing schemes (and replaces the P1 drawdown's post-wipeout limitation with
+liquidation-aware ruin metrics); P4 adds walk-forward / sweep / anti-overfitting
+ranked on OOS; P5–P7 are DEFERRED (intraday ingest + sessions; tick; isolated
+live paper-forward) pending the operator taking up the intraday-data decision.
