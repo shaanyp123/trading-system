@@ -1,0 +1,16 @@
+[Unit]
+Description=Synthesize LEAN futures per-day universe files for today
+Documentation=file:///opt/trading/scripts/operator_tools/synthesize_today_universe.sh
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/trading/scripts/operator_tools/synthesize_today_universe.sh
+StandardOutput=journal
+StandardError=journal
+# The script's transient alpine containers run `--user 1000:1000`, so the
+# synthesized universe files match the api/bar_sync uid. The unit itself stays
+# User=root only because it needs docker socket access; it writes nothing to the
+# volume directly. See scripts/operator_tools/synthesize_today_universe.sh.
+User=root
