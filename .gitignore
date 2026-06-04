@@ -20,6 +20,11 @@ dist/
 .coverage
 .coverage.*
 htmlcov/
+
+# Futures research harness (research/) — local artifacts, never source.
+research/runs/*
+!research/runs/.gitignore
+research/data/cache/
 coverage.xml
 *.cover
 

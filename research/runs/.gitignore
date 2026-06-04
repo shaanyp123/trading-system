@@ -1,0 +1,4 @@
+# Research run outputs are local artifacts, not source. Keep the dir, ignore
+# its contents (design §4.1).
+*
+!.gitignore

@@ -1,0 +1,27 @@
+# P1 example — daily buy-and-hold over one ETF + one micro future.
+#
+# Run it:   make research RUN=research/config/examples/p1_buy_and_hold.yaml
+#
+# `data_root` must point at a COPY of the api's on-disk LEAN bars (the same tree
+# bar_sync writes: equity/usa/daily/<lower>.zip + future/<dir>/daily/<lower>_trade.zip).
+# NEVER point it at the live `trading_lean_data` Docker volume (design §4.2, R1).
+# Copy a snapshot first, e.g. on the VPS:
+#   docker run --rm -v trading_lean_data:/src -v "$PWD/research/data/cache/lean_bars":/dst \
+#     alpine sh -c 'cp -a /src/. /dst/'
+name: p1_buy_and_hold_smoke
+engine: daily          # daily (P1) | vbt (P4) | lean (P2)
+mode: backtest         # backtest (P1) | forward (P7)
+resolution: daily      # daily only until intraday is taken up (P5)
+universe: ["TLT", "/MES"]
+date_range:
+  start: 2024-01-01
+  end: 2025-12-31
+strategy:
+  ref: buy_and_hold
+  contracts: 1
+# Per-future expiry to load (single-expiry P1; continuous stitching is LEAN's job, P2).
+expiries:
+  "/MES": "202606"
+data_root: research/data/cache/lean_bars
+# starting_cash: optional. Omitted ⇒ per-symbol entry notional, so a single
+# contract's total_return reads as the instrument's price return.
