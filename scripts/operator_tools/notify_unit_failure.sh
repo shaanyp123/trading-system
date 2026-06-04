@@ -70,7 +70,10 @@ HOSTNAME_SHORT="$(hostname -s 2>/dev/null || echo host)"
 # --- Per-unit cooldown ------------------------------------------------------
 # Suppress a repeat post for the same unit within the cooldown window. State
 # lives in /run (tmpfs) so a reboot legitimately re-arms alerting. Best-effort:
-# any read/write failure here must never block the post.
+# any read/write failure here must never block the post — if the state dir is
+# unwritable the cooldown is simply skipped (favour delivering a real alert over
+# suppressing a duplicate). In prod the unit runs as root and /run is always
+# writable, so "no cooldown" only happens in a broken host setup.
 mkdir -p "$STATE_DIR" 2>/dev/null || true
 STATE_FILE="$STATE_DIR/${UNIT}.last"
 if [ -r "$STATE_FILE" ]; then
@@ -100,7 +103,10 @@ WEBHOOK_URL="$(cat "$WEBHOOK_FILE")"
 PAYLOAD="$(printf '{"content":"P1 HOST UNIT FAILURE %s — host=%s\\nunit=%s entered the failed state.\\nTriage: journalctl -u %s -n 50 --no-pager"}' \
           "$TIMESTAMP" "$HOSTNAME_SHORT" "$UNIT" "$UNIT")"
 
-if curl -fsS -X POST "$WEBHOOK_URL" \
+# --max-time 20 bounds a hung connect (< the unit's TimeoutStartSec=30, so the
+# script logs FAILED rather than being SIGKILLed; also protects the standalone
+# operator dry-run path which has no systemd timeout around it).
+if curl -fsS --max-time 20 -X POST "$WEBHOOK_URL" \
      -H 'Content-Type: application/json' \
      -d "$PAYLOAD" >/dev/null 2>&1; then
   # Record the post time for the cooldown only on a successful post, so a
