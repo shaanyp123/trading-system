@@ -200,6 +200,15 @@ If `Failed` shows up in the timer journal, investigate via
 (likely: docker daemon hiccup, lean_local container missing, compose
 file moved).
 
+> **Automated alerting (2026-06-04):** you no longer have to grep for
+> `Failed` by hand. Both units here (`lean-local-daily-restart`,
+> `lean-universe-synthesis`) carry
+> `OnFailure=notify-unit-failure@%n.service`, which posts a **P1 to Discord
+> `#alerts`** on any systemd-level failure. The one-time install ceremony
+> (the `#alerts` webhook + the template unit) lives in
+> **`deploy/audit/README.md` → "Host unit failure alerting"**. The manual
+> grep above remains a useful spot-check / history backfill.
+
 ## Reversibility
 
 Trivial — see "Disable" above. The unit files live entirely in

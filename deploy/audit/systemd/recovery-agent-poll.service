@@ -32,6 +32,11 @@ Description=Recovery agent — async_task_died poll + replay decisioning
 Documentation=https://github.com/shaanyp123/trading-system/blob/main/deploy/audit/README.md
 After=docker.service
 Requires=docker.service
+# Alert on failure — posts P1 to Discord #alerts (closes the silent-failure
+# gap from PR #321). See deploy/audit/systemd/notify-unit-failure@.service.
+# The notifier's per-unit cooldown caps this 60s-cadence unit at one #alerts
+# post/hour if it ever enters a sustained failure loop.
+OnFailure=notify-unit-failure@%n.service
 
 [Service]
 Type=oneshot

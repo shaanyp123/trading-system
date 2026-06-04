@@ -24,6 +24,11 @@ Description=Daily audit-chain verification (verify_chain --env paper -> Discord 
 Documentation=https://github.com/shaanyp123/trading-system/blob/main/deploy/audit/README.md
 After=docker.service
 Requires=docker.service
+# Alert on failure — posts P1 to Discord #alerts (closes the silent-failure
+# gap from PR #321). Note this is the *systemd-level* failure path (script
+# crash / timeout / OOM); a CHAIN BREAK is already posted to #audit by the
+# script itself on a clean exit. See deploy/audit/systemd/notify-unit-failure@.service.
+OnFailure=notify-unit-failure@%n.service
 
 [Service]
 Type=oneshot
