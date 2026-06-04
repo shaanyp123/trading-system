@@ -1,0 +1,519 @@
+Launching analysis for V1TrendFollowingAlgorithm with LEAN Engine v2.5.0.0
+2026-05-01 00:00:00 Warning: SetBenchmark(SPY): no existing symbol found, benchmark security will be added with Equity type.
+2025-06-09 00:00:00 Algorithm starting warm up...
+2026-05-01 00:00:00 v1_strategy initialized (post-pivot 2026-05-12, Pivot-PR-D) live_mode=False api_base=http://127.0.0.1:9 strategy_version=v1_trend_following@phase1-pivot-d params_keys=['ATR_LOOKBACK_DAYS', 'EFFICIENCY_RATIO_THRESHOLD', 'EXIT_AUTO_APPROVE', 'INSTRUMENT_VOL_LOOKBACK_DAYS', 'LOOKBACK_DAYS_DONCHIAN', 'MA_FAST_DAYS', 'MA_SLOW_DAYS', 'MIN_HOLDING_DAYS', 'ROLL_DAYS_BEFORE_EXPIRY', 'STARTING_CASH_USD', 'STOP_DISTANCE_ATR_MULT', 'STRATEGY_DECOMMISSIONED', 'VOL_TARGET_PCT_ANNUAL']
+2026-05-01 00:00:00 v1_universe_data_fresh markets_checked=6 threshold_days=5 fresh_count=6
+2026-05-01 00:00:00 lean_signal_post_url_error event_type=lean_strategy_initialized reason=[Errno 111] Connection refused
+2025-06-24 00:00:00 Processing algorithm warm-up request 4%...
+2026-05-01 00:00:00 Algorithm finished warming up.
+2026-05-01 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-05-01 17:30:00 lean_parameters_fetch_failed session_date=2026-05-01 fail_open=True lean_json_default=False
+2026-05-01 17:30:00 v1_signal_rejected session_date=2026-05-01 market=/MES reason=efficiency_below_threshold
+2026-05-01 17:30:00 v1_signal_rejected session_date=2026-05-01 market=/MNQ reason=efficiency_below_threshold
+2026-05-01 17:30:00 v1_signal_rejected session_date=2026-05-01 market=/MYM reason=no_breakout
+2026-05-01 17:30:00 v1_signal_rejected session_date=2026-05-01 market=/M2K reason=no_breakout
+2026-05-01 17:30:00 v1_signal_rejected session_date=2026-05-01 market=/MGC reason=no_breakout
+2026-05-01 17:30:00 v1_signal_rejected session_date=2026-05-01 market=/MBT reason=no_breakout
+2026-05-01 17:30:00 v1_signal_rejected session_date=2026-05-01 market=TLT reason=no_breakout
+2026-05-01 17:30:00 v1_signal_rejected session_date=2026-05-01 market=IEF reason=no_breakout
+2026-05-01 17:30:00 v1_signal_rejected session_date=2026-05-01 market=SHY reason=no_breakout
+2026-05-01 17:30:00 v1_signal_rejected session_date=2026-05-01 market=TIP reason=no_breakout
+2026-05-01 17:30:00 v1_signals_generated session_date=2026-05-01 signals_emitted_count=0 rejections_count=10 reasons={'efficiency_below_threshold': 2, 'no_breakout': 8}
+2026-05-01 17:30:00 v1_exits_generated session_date=2026-05-01 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-05-01 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-05-02 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-05-02 17:30:00 lean_parameters_fetch_failed session_date=2026-05-02 fail_open=True lean_json_default=False
+2026-05-02 17:30:00 v1_signal_rejected session_date=2026-05-02 market=/MES reason=efficiency_below_threshold
+2026-05-02 17:30:00 v1_signal_rejected session_date=2026-05-02 market=/MNQ reason=efficiency_below_threshold
+2026-05-02 17:30:00 v1_signal_rejected session_date=2026-05-02 market=/MYM reason=no_breakout
+2026-05-02 17:30:00 v1_signal_rejected session_date=2026-05-02 market=/M2K reason=no_breakout
+2026-05-02 17:30:00 v1_signal_rejected session_date=2026-05-02 market=/MGC reason=no_breakout
+2026-05-02 17:30:00 v1_signal_rejected session_date=2026-05-02 market=/MBT reason=no_breakout
+2026-05-02 17:30:00 v1_signal_rejected session_date=2026-05-02 market=TLT reason=no_breakout
+2026-05-02 17:30:00 v1_signal_rejected session_date=2026-05-02 market=IEF reason=no_breakout
+2026-05-02 17:30:00 v1_signal_rejected session_date=2026-05-02 market=SHY reason=no_breakout
+2026-05-02 17:30:00 v1_signal_rejected session_date=2026-05-02 market=TIP reason=no_breakout
+2026-05-02 17:30:00 v1_signals_generated session_date=2026-05-02 signals_emitted_count=0 rejections_count=10 reasons={'efficiency_below_threshold': 2, 'no_breakout': 8}
+2026-05-02 17:30:00 v1_exits_generated session_date=2026-05-02 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-05-02 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-05-03 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-05-03 17:30:00 lean_parameters_fetch_failed session_date=2026-05-03 fail_open=True lean_json_default=False
+2026-05-03 17:30:00 v1_signal_rejected session_date=2026-05-03 market=/MES reason=efficiency_below_threshold
+2026-05-03 17:30:00 v1_signal_rejected session_date=2026-05-03 market=/MNQ reason=efficiency_below_threshold
+2026-05-03 17:30:00 v1_signal_rejected session_date=2026-05-03 market=/MYM reason=no_breakout
+2026-05-03 17:30:00 v1_signal_rejected session_date=2026-05-03 market=/M2K reason=no_breakout
+2026-05-03 17:30:00 v1_signal_rejected session_date=2026-05-03 market=/MGC reason=no_breakout
+2026-05-03 17:30:00 v1_signal_rejected session_date=2026-05-03 market=/MBT reason=no_breakout
+2026-05-03 17:30:00 v1_signal_rejected session_date=2026-05-03 market=TLT reason=no_breakout
+2026-05-03 17:30:00 v1_signal_rejected session_date=2026-05-03 market=IEF reason=no_breakout
+2026-05-03 17:30:00 v1_signal_rejected session_date=2026-05-03 market=SHY reason=no_breakout
+2026-05-03 17:30:00 v1_signal_rejected session_date=2026-05-03 market=TIP reason=no_breakout
+2026-05-03 17:30:00 v1_signals_generated session_date=2026-05-03 signals_emitted_count=0 rejections_count=10 reasons={'efficiency_below_threshold': 2, 'no_breakout': 8}
+2026-05-03 17:30:00 v1_exits_generated session_date=2026-05-03 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-05-03 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-05-04 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-05-04 17:30:00 lean_parameters_fetch_failed session_date=2026-05-04 fail_open=True lean_json_default=False
+2026-05-04 17:30:00 v1_signal_rejected session_date=2026-05-04 market=/MES reason=no_breakout
+2026-05-04 17:30:00 v1_signal_rejected session_date=2026-05-04 market=/MNQ reason=no_breakout
+2026-05-04 17:30:00 v1_signal_rejected session_date=2026-05-04 market=/MYM reason=no_breakout
+2026-05-04 17:30:00 v1_signal_rejected session_date=2026-05-04 market=/M2K reason=no_breakout
+2026-05-04 17:30:00 v1_signal_rejected session_date=2026-05-04 market=/MGC reason=no_breakout
+2026-05-04 17:30:00 v1_signal_rejected session_date=2026-05-04 market=/MBT reason=trend_filter_failed
+2026-05-04 17:30:00 v1_signal_rejected session_date=2026-05-04 market=TLT reason=efficiency_below_threshold
+2026-05-04 17:30:00 v1_signal_rejected session_date=2026-05-04 market=IEF reason=no_breakout
+2026-05-04 17:30:00 v1_signal_rejected session_date=2026-05-04 market=SHY reason=efficiency_below_threshold
+2026-05-04 17:30:00 v1_signal_rejected session_date=2026-05-04 market=TIP reason=no_breakout
+2026-05-04 17:30:00 v1_signals_generated session_date=2026-05-04 signals_emitted_count=0 rejections_count=10 reasons={'no_breakout': 7, 'trend_filter_failed': 1, 'efficiency_below_threshold': 2}
+2026-05-04 17:30:00 v1_exits_generated session_date=2026-05-04 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-05-04 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-05-05 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-05-05 17:30:00 lean_parameters_fetch_failed session_date=2026-05-05 fail_open=True lean_json_default=False
+2026-05-05 17:30:00 v1_signal_rejected session_date=2026-05-05 market=/MES reason=no_breakout
+2026-05-05 17:30:00 v1_signal_rejected session_date=2026-05-05 market=/MNQ reason=efficiency_below_threshold
+2026-05-05 17:30:00 v1_signal_rejected session_date=2026-05-05 market=/MYM reason=no_breakout
+2026-05-05 17:30:00 v1_signal_rejected session_date=2026-05-05 market=/M2K reason=efficiency_below_threshold
+2026-05-05 17:30:00 v1_signal_rejected session_date=2026-05-05 market=/MGC reason=no_breakout
+2026-05-05 17:30:00 v1_signal_rejected session_date=2026-05-05 market=/MBT reason=trend_filter_failed
+2026-05-05 17:30:00 v1_signal_rejected session_date=2026-05-05 market=TLT reason=no_breakout
+2026-05-05 17:30:00 v1_signal_rejected session_date=2026-05-05 market=IEF reason=no_breakout
+2026-05-05 17:30:00 v1_signal_rejected session_date=2026-05-05 market=SHY reason=no_breakout
+2026-05-05 17:30:00 v1_signal_rejected session_date=2026-05-05 market=TIP reason=no_breakout
+2026-05-05 17:30:00 v1_signals_generated session_date=2026-05-05 signals_emitted_count=0 rejections_count=10 reasons={'no_breakout': 7, 'efficiency_below_threshold': 2, 'trend_filter_failed': 1}
+2026-05-05 17:30:00 v1_exits_generated session_date=2026-05-05 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-05-05 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-05-06 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-05-06 17:30:00 lean_parameters_fetch_failed session_date=2026-05-06 fail_open=True lean_json_default=False
+2026-05-06 17:30:00 v1_signal_rejected session_date=2026-05-06 market=/MES reason=efficiency_below_threshold
+2026-05-06 17:30:00 v1_signal_rejected session_date=2026-05-06 market=/MYM reason=no_breakout
+2026-05-06 17:30:00 v1_signal_rejected session_date=2026-05-06 market=/M2K reason=efficiency_below_threshold
+2026-05-06 17:30:00 v1_signal_rejected session_date=2026-05-06 market=/MGC reason=no_breakout
+2026-05-06 17:30:00 v1_signal_rejected session_date=2026-05-06 market=/MBT reason=no_breakout
+2026-05-06 17:30:00 v1_signal_rejected session_date=2026-05-06 market=TLT reason=no_breakout
+2026-05-06 17:30:00 v1_signal_rejected session_date=2026-05-06 market=IEF reason=no_breakout
+2026-05-06 17:30:00 v1_signal_rejected session_date=2026-05-06 market=SHY reason=no_breakout
+2026-05-06 17:30:00 v1_signal_rejected session_date=2026-05-06 market=TIP reason=no_breakout
+2026-05-06 17:30:00 v1_signals_generated session_date=2026-05-06 signals_emitted_count=1 rejections_count=9 reasons={'efficiency_below_threshold': 2, 'no_breakout': 7}
+2026-05-06 17:30:00 v1_exits_generated session_date=2026-05-06 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-05-06 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-05-06 17:30:00 lean_signal_post_url_error event_type=signal_emitted reason=[Errno 111] Connection refused
+2026-05-07 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-05-07 17:30:00 lean_parameters_fetch_failed session_date=2026-05-07 fail_open=True lean_json_default=False
+2026-05-07 17:30:00 v1_signal_rejected session_date=2026-05-07 market=/MES reason=no_breakout
+2026-05-07 17:30:00 v1_signal_rejected session_date=2026-05-07 market=/MNQ reason=no_breakout
+2026-05-07 17:30:00 v1_signal_rejected session_date=2026-05-07 market=/MYM reason=no_breakout
+2026-05-07 17:30:00 v1_signal_rejected session_date=2026-05-07 market=/M2K reason=no_breakout
+2026-05-07 17:30:00 v1_signal_rejected session_date=2026-05-07 market=/MGC reason=no_breakout
+2026-05-07 17:30:00 v1_signal_rejected session_date=2026-05-07 market=/MBT reason=no_breakout
+2026-05-07 17:30:00 v1_signal_rejected session_date=2026-05-07 market=TLT reason=no_breakout
+2026-05-07 17:30:00 v1_signal_rejected session_date=2026-05-07 market=IEF reason=no_breakout
+2026-05-07 17:30:00 v1_signal_rejected session_date=2026-05-07 market=SHY reason=no_breakout
+2026-05-07 17:30:00 v1_signal_rejected session_date=2026-05-07 market=TIP reason=no_breakout
+2026-05-07 17:30:00 v1_signals_generated session_date=2026-05-07 signals_emitted_count=0 rejections_count=10 reasons={'no_breakout': 10}
+2026-05-07 17:30:00 v1_exits_generated session_date=2026-05-07 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-05-07 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-05-08 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-05-08 17:30:00 lean_parameters_fetch_failed session_date=2026-05-08 fail_open=True lean_json_default=False
+2026-05-08 17:30:00 v1_signal_rejected session_date=2026-05-08 market=/MES reason=efficiency_below_threshold
+2026-05-08 17:30:00 v1_signal_rejected session_date=2026-05-08 market=/MYM reason=no_breakout
+2026-05-08 17:30:00 v1_signal_rejected session_date=2026-05-08 market=/M2K reason=no_breakout
+2026-05-08 17:30:00 v1_signal_rejected session_date=2026-05-08 market=/MGC reason=no_breakout
+2026-05-08 17:30:00 v1_signal_rejected session_date=2026-05-08 market=/MBT reason=no_breakout
+2026-05-08 17:30:00 v1_signal_rejected session_date=2026-05-08 market=TLT reason=no_breakout
+2026-05-08 17:30:00 v1_signal_rejected session_date=2026-05-08 market=IEF reason=no_breakout
+2026-05-08 17:30:00 v1_signal_rejected session_date=2026-05-08 market=SHY reason=no_breakout
+2026-05-08 17:30:00 v1_signal_rejected session_date=2026-05-08 market=TIP reason=no_breakout
+2026-05-08 17:30:00 v1_signals_generated session_date=2026-05-08 signals_emitted_count=1 rejections_count=9 reasons={'efficiency_below_threshold': 1, 'no_breakout': 8}
+2026-05-08 17:30:00 v1_exits_generated session_date=2026-05-08 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-05-08 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-05-08 17:30:00 lean_signal_post_url_error event_type=signal_emitted reason=[Errno 111] Connection refused
+2026-05-09 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-05-09 17:30:00 lean_parameters_fetch_failed session_date=2026-05-09 fail_open=True lean_json_default=False
+2026-05-09 17:30:00 v1_signal_rejected session_date=2026-05-09 market=/MES reason=efficiency_below_threshold
+2026-05-09 17:30:00 v1_signal_rejected session_date=2026-05-09 market=/MYM reason=no_breakout
+2026-05-09 17:30:00 v1_signal_rejected session_date=2026-05-09 market=/M2K reason=no_breakout
+2026-05-09 17:30:00 v1_signal_rejected session_date=2026-05-09 market=/MGC reason=no_breakout
+2026-05-09 17:30:00 v1_signal_rejected session_date=2026-05-09 market=/MBT reason=no_breakout
+2026-05-09 17:30:00 v1_signal_rejected session_date=2026-05-09 market=TLT reason=no_breakout
+2026-05-09 17:30:00 v1_signal_rejected session_date=2026-05-09 market=IEF reason=no_breakout
+2026-05-09 17:30:00 v1_signal_rejected session_date=2026-05-09 market=SHY reason=no_breakout
+2026-05-09 17:30:00 v1_signal_rejected session_date=2026-05-09 market=TIP reason=no_breakout
+2026-05-09 17:30:00 v1_signals_generated session_date=2026-05-09 signals_emitted_count=1 rejections_count=9 reasons={'efficiency_below_threshold': 1, 'no_breakout': 8}
+2026-05-09 17:30:00 v1_exits_generated session_date=2026-05-09 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-05-09 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-05-09 17:30:00 lean_signal_post_url_error event_type=signal_emitted reason=[Errno 111] Connection refused
+2026-05-10 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-05-10 17:30:00 lean_parameters_fetch_failed session_date=2026-05-10 fail_open=True lean_json_default=False
+2026-05-10 17:30:00 v1_signal_rejected session_date=2026-05-10 market=/MES reason=efficiency_below_threshold
+2026-05-10 17:30:00 v1_signal_rejected session_date=2026-05-10 market=/MYM reason=no_breakout
+2026-05-10 17:30:00 v1_signal_rejected session_date=2026-05-10 market=/M2K reason=no_breakout
+2026-05-10 17:30:00 v1_signal_rejected session_date=2026-05-10 market=/MGC reason=no_breakout
+2026-05-10 17:30:00 v1_signal_rejected session_date=2026-05-10 market=/MBT reason=no_breakout
+2026-05-10 17:30:00 v1_signal_rejected session_date=2026-05-10 market=TLT reason=no_breakout
+2026-05-10 17:30:00 v1_signal_rejected session_date=2026-05-10 market=IEF reason=no_breakout
+2026-05-10 17:30:00 v1_signal_rejected session_date=2026-05-10 market=SHY reason=no_breakout
+2026-05-10 17:30:00 v1_signal_rejected session_date=2026-05-10 market=TIP reason=no_breakout
+2026-05-10 17:30:00 v1_signals_generated session_date=2026-05-10 signals_emitted_count=1 rejections_count=9 reasons={'efficiency_below_threshold': 1, 'no_breakout': 8}
+2026-05-10 17:30:00 v1_exits_generated session_date=2026-05-10 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-05-10 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-05-10 17:30:00 lean_signal_post_url_error event_type=signal_emitted reason=[Errno 111] Connection refused
+2026-05-11 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-05-11 17:30:00 lean_parameters_fetch_failed session_date=2026-05-11 fail_open=True lean_json_default=False
+2026-05-11 17:30:00 v1_signal_rejected session_date=2026-05-11 market=/MES reason=efficiency_below_threshold
+2026-05-11 17:30:00 v1_signal_rejected session_date=2026-05-11 market=/MYM reason=no_breakout
+2026-05-11 17:30:00 v1_signal_rejected session_date=2026-05-11 market=/M2K reason=no_breakout
+2026-05-11 17:30:00 v1_signal_rejected session_date=2026-05-11 market=/MGC reason=no_breakout
+2026-05-11 17:30:00 v1_signal_rejected session_date=2026-05-11 market=/MBT reason=no_breakout
+2026-05-11 17:30:00 v1_signal_rejected session_date=2026-05-11 market=TLT reason=no_breakout
+2026-05-11 17:30:00 v1_signal_rejected session_date=2026-05-11 market=IEF reason=no_breakout
+2026-05-11 17:30:00 v1_signal_rejected session_date=2026-05-11 market=SHY reason=no_breakout
+2026-05-11 17:30:00 v1_signal_rejected session_date=2026-05-11 market=TIP reason=no_breakout
+2026-05-11 17:30:00 v1_signals_generated session_date=2026-05-11 signals_emitted_count=1 rejections_count=9 reasons={'efficiency_below_threshold': 1, 'no_breakout': 8}
+2026-05-11 17:30:00 v1_exits_generated session_date=2026-05-11 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-05-11 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-05-11 17:30:00 lean_signal_post_url_error event_type=signal_emitted reason=[Errno 111] Connection refused
+2026-05-12 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-05-12 17:30:00 lean_parameters_fetch_failed session_date=2026-05-12 fail_open=True lean_json_default=False
+2026-05-12 17:30:00 v1_signal_rejected session_date=2026-05-12 market=/MES reason=no_breakout
+2026-05-12 17:30:00 v1_signal_rejected session_date=2026-05-12 market=/MNQ reason=no_breakout
+2026-05-12 17:30:00 v1_signal_rejected session_date=2026-05-12 market=/MYM reason=no_breakout
+2026-05-12 17:30:00 v1_signal_rejected session_date=2026-05-12 market=/M2K reason=no_breakout
+2026-05-12 17:30:00 v1_signal_rejected session_date=2026-05-12 market=/MGC reason=no_breakout
+2026-05-12 17:30:00 v1_signal_rejected session_date=2026-05-12 market=/MBT reason=no_breakout
+2026-05-12 17:30:00 v1_signal_rejected session_date=2026-05-12 market=TLT reason=no_breakout
+2026-05-12 17:30:00 v1_signal_rejected session_date=2026-05-12 market=IEF reason=no_breakout
+2026-05-12 17:30:00 v1_signal_rejected session_date=2026-05-12 market=SHY reason=no_breakout
+2026-05-12 17:30:00 v1_signal_rejected session_date=2026-05-12 market=TIP reason=no_breakout
+2026-05-12 17:30:00 v1_signals_generated session_date=2026-05-12 signals_emitted_count=0 rejections_count=10 reasons={'no_breakout': 10}
+2026-05-12 17:30:00 v1_exits_generated session_date=2026-05-12 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-05-12 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-05-13 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-05-13 17:30:00 lean_parameters_fetch_failed session_date=2026-05-13 fail_open=True lean_json_default=False
+2026-05-13 17:30:00 v1_signal_rejected session_date=2026-05-13 market=/MES reason=efficiency_below_threshold
+2026-05-13 17:30:00 v1_signal_rejected session_date=2026-05-13 market=/MNQ reason=no_breakout
+2026-05-13 17:30:00 v1_signal_rejected session_date=2026-05-13 market=/MYM reason=no_breakout
+2026-05-13 17:30:00 v1_signal_rejected session_date=2026-05-13 market=/M2K reason=no_breakout
+2026-05-13 17:30:00 v1_signal_rejected session_date=2026-05-13 market=/MGC reason=no_breakout
+2026-05-13 17:30:00 v1_signal_rejected session_date=2026-05-13 market=/MBT reason=no_breakout
+2026-05-13 17:30:00 v1_signal_rejected session_date=2026-05-13 market=TLT reason=no_breakout
+2026-05-13 17:30:00 v1_signal_rejected session_date=2026-05-13 market=IEF reason=no_breakout
+2026-05-13 17:30:00 v1_signal_rejected session_date=2026-05-13 market=SHY reason=no_breakout
+2026-05-13 17:30:00 v1_signal_rejected session_date=2026-05-13 market=TIP reason=no_breakout
+2026-05-13 17:30:00 v1_signals_generated session_date=2026-05-13 signals_emitted_count=0 rejections_count=10 reasons={'efficiency_below_threshold': 1, 'no_breakout': 9}
+2026-05-13 17:30:00 v1_exits_generated session_date=2026-05-13 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-05-13 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-05-14 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-05-14 17:30:00 lean_parameters_fetch_failed session_date=2026-05-14 fail_open=True lean_json_default=False
+2026-05-14 17:30:00 v1_signal_rejected session_date=2026-05-14 market=/MES reason=efficiency_below_threshold
+2026-05-14 17:30:00 v1_signal_rejected session_date=2026-05-14 market=/MYM reason=no_breakout
+2026-05-14 17:30:00 v1_signal_rejected session_date=2026-05-14 market=/M2K reason=no_breakout
+2026-05-14 17:30:00 v1_signal_rejected session_date=2026-05-14 market=/MGC reason=no_breakout
+2026-05-14 17:30:00 v1_signal_rejected session_date=2026-05-14 market=/MBT reason=no_breakout
+2026-05-14 17:30:00 v1_signal_rejected session_date=2026-05-14 market=TLT reason=no_breakout
+2026-05-14 17:30:00 v1_signal_rejected session_date=2026-05-14 market=IEF reason=no_breakout
+2026-05-14 17:30:00 v1_signal_rejected session_date=2026-05-14 market=SHY reason=no_breakout
+2026-05-14 17:30:00 v1_signal_rejected session_date=2026-05-14 market=TIP reason=no_breakout
+2026-05-14 17:30:00 v1_signals_generated session_date=2026-05-14 signals_emitted_count=1 rejections_count=9 reasons={'efficiency_below_threshold': 1, 'no_breakout': 8}
+2026-05-14 17:30:00 v1_exits_generated session_date=2026-05-14 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-05-14 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-05-14 17:30:00 lean_signal_post_url_error event_type=signal_emitted reason=[Errno 111] Connection refused
+2026-05-15 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-05-15 17:30:00 lean_parameters_fetch_failed session_date=2026-05-15 fail_open=True lean_json_default=False
+2026-05-15 17:30:00 v1_signal_rejected session_date=2026-05-15 market=/MES reason=no_breakout
+2026-05-15 17:30:00 v1_signal_rejected session_date=2026-05-15 market=/MNQ reason=no_breakout
+2026-05-15 17:30:00 v1_signal_rejected session_date=2026-05-15 market=/MYM reason=no_breakout
+2026-05-15 17:30:00 v1_signal_rejected session_date=2026-05-15 market=/M2K reason=no_breakout
+2026-05-15 17:30:00 v1_signal_rejected session_date=2026-05-15 market=/MGC reason=no_breakout
+2026-05-15 17:30:00 v1_signal_rejected session_date=2026-05-15 market=/MBT reason=no_breakout
+2026-05-15 17:30:00 v1_signal_rejected session_date=2026-05-15 market=SHY reason=efficiency_below_threshold
+2026-05-15 17:30:00 v1_signal_rejected session_date=2026-05-15 market=TIP reason=no_breakout
+2026-05-15 17:30:00 v1_signals_generated session_date=2026-05-15 signals_emitted_count=2 rejections_count=8 reasons={'no_breakout': 7, 'efficiency_below_threshold': 1}
+2026-05-15 17:30:00 v1_exits_generated session_date=2026-05-15 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-05-15 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-05-15 17:30:00 lean_signal_post_url_error event_type=signal_emitted reason=[Errno 111] Connection refused
+2026-05-15 17:30:00 lean_signal_post_url_error event_type=signal_emitted reason=[Errno 111] Connection refused
+2026-05-16 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-05-16 17:30:00 lean_parameters_fetch_failed session_date=2026-05-16 fail_open=True lean_json_default=False
+2026-05-16 17:30:00 v1_signal_rejected session_date=2026-05-16 market=/MES reason=no_breakout
+2026-05-16 17:30:00 v1_signal_rejected session_date=2026-05-16 market=/MNQ reason=no_breakout
+2026-05-16 17:30:00 v1_signal_rejected session_date=2026-05-16 market=/MYM reason=no_breakout
+2026-05-16 17:30:00 v1_signal_rejected session_date=2026-05-16 market=/M2K reason=no_breakout
+2026-05-16 17:30:00 v1_signal_rejected session_date=2026-05-16 market=/MGC reason=no_breakout
+2026-05-16 17:30:00 v1_signal_rejected session_date=2026-05-16 market=/MBT reason=no_breakout
+2026-05-16 17:30:00 v1_signal_rejected session_date=2026-05-16 market=SHY reason=efficiency_below_threshold
+2026-05-16 17:30:00 v1_signal_rejected session_date=2026-05-16 market=TIP reason=no_breakout
+2026-05-16 17:30:00 v1_signals_generated session_date=2026-05-16 signals_emitted_count=2 rejections_count=8 reasons={'no_breakout': 7, 'efficiency_below_threshold': 1}
+2026-05-16 17:30:00 v1_exits_generated session_date=2026-05-16 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-05-16 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-05-16 17:30:00 lean_signal_post_url_error event_type=signal_emitted reason=[Errno 111] Connection refused
+2026-05-16 17:30:00 lean_signal_post_url_error event_type=signal_emitted reason=[Errno 111] Connection refused
+2026-05-17 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-05-17 17:30:00 lean_parameters_fetch_failed session_date=2026-05-17 fail_open=True lean_json_default=False
+2026-05-17 17:30:00 v1_signal_rejected session_date=2026-05-17 market=/MES reason=no_breakout
+2026-05-17 17:30:00 v1_signal_rejected session_date=2026-05-17 market=/MNQ reason=no_breakout
+2026-05-17 17:30:00 v1_signal_rejected session_date=2026-05-17 market=/MYM reason=no_breakout
+2026-05-17 17:30:00 v1_signal_rejected session_date=2026-05-17 market=/M2K reason=no_breakout
+2026-05-17 17:30:00 v1_signal_rejected session_date=2026-05-17 market=/MGC reason=no_breakout
+2026-05-17 17:30:00 v1_signal_rejected session_date=2026-05-17 market=/MBT reason=no_breakout
+2026-05-17 17:30:00 v1_signal_rejected session_date=2026-05-17 market=SHY reason=efficiency_below_threshold
+2026-05-17 17:30:00 v1_signal_rejected session_date=2026-05-17 market=TIP reason=no_breakout
+2026-05-17 17:30:00 v1_signals_generated session_date=2026-05-17 signals_emitted_count=2 rejections_count=8 reasons={'no_breakout': 7, 'efficiency_below_threshold': 1}
+2026-05-17 17:30:00 v1_exits_generated session_date=2026-05-17 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-05-17 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-05-17 17:30:00 lean_signal_post_url_error event_type=signal_emitted reason=[Errno 111] Connection refused
+2026-05-17 17:30:00 lean_signal_post_url_error event_type=signal_emitted reason=[Errno 111] Connection refused
+2026-05-18 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-05-18 17:30:00 lean_parameters_fetch_failed session_date=2026-05-18 fail_open=True lean_json_default=False
+2026-05-18 17:30:00 v1_signal_rejected session_date=2026-05-18 market=/MES reason=no_breakout
+2026-05-18 17:30:00 v1_signal_rejected session_date=2026-05-18 market=/MNQ reason=no_breakout
+2026-05-18 17:30:00 v1_signal_rejected session_date=2026-05-18 market=/MYM reason=no_breakout
+2026-05-18 17:30:00 v1_signal_rejected session_date=2026-05-18 market=/M2K reason=no_breakout
+2026-05-18 17:30:00 v1_signal_rejected session_date=2026-05-18 market=/MGC reason=no_breakout
+2026-05-18 17:30:00 v1_signal_rejected session_date=2026-05-18 market=/MBT reason=no_breakout
+2026-05-18 17:30:00 v1_signal_rejected session_date=2026-05-18 market=SHY reason=no_breakout
+2026-05-18 17:30:00 v1_signal_rejected session_date=2026-05-18 market=TIP reason=no_breakout
+2026-05-18 17:30:00 v1_signals_generated session_date=2026-05-18 signals_emitted_count=2 rejections_count=8 reasons={'no_breakout': 8}
+2026-05-18 17:30:00 v1_exits_generated session_date=2026-05-18 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-05-18 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-05-18 17:30:00 lean_signal_post_url_error event_type=signal_emitted reason=[Errno 111] Connection refused
+2026-05-18 17:30:00 lean_signal_post_url_error event_type=signal_emitted reason=[Errno 111] Connection refused
+2026-05-19 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-05-19 17:30:00 lean_parameters_fetch_failed session_date=2026-05-19 fail_open=True lean_json_default=False
+2026-05-19 17:30:00 v1_signal_rejected session_date=2026-05-19 market=/MES reason=no_breakout
+2026-05-19 17:30:00 v1_signal_rejected session_date=2026-05-19 market=/MNQ reason=no_breakout
+2026-05-19 17:30:00 v1_signal_rejected session_date=2026-05-19 market=/MYM reason=no_breakout
+2026-05-19 17:30:00 v1_signal_rejected session_date=2026-05-19 market=/M2K reason=no_breakout
+2026-05-19 17:30:00 v1_signal_rejected session_date=2026-05-19 market=/MGC reason=no_breakout
+2026-05-19 17:30:00 v1_signal_rejected session_date=2026-05-19 market=/MBT reason=no_breakout
+2026-05-19 17:30:00 v1_signal_rejected session_date=2026-05-19 market=TIP reason=no_breakout
+2026-05-19 17:30:00 v1_signals_generated session_date=2026-05-19 signals_emitted_count=3 rejections_count=7 reasons={'no_breakout': 7}
+2026-05-19 17:30:00 v1_exits_generated session_date=2026-05-19 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-05-19 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-05-19 17:30:00 lean_signal_post_url_error event_type=signal_emitted reason=[Errno 111] Connection refused
+2026-05-19 17:30:00 lean_signal_post_url_error event_type=signal_emitted reason=[Errno 111] Connection refused
+2026-05-19 17:30:00 lean_signal_post_url_error event_type=signal_emitted reason=[Errno 111] Connection refused
+2026-05-20 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-05-20 17:30:00 lean_parameters_fetch_failed session_date=2026-05-20 fail_open=True lean_json_default=False
+2026-05-20 17:30:00 v1_signal_rejected session_date=2026-05-20 market=/MES reason=no_breakout
+2026-05-20 17:30:00 v1_signal_rejected session_date=2026-05-20 market=/MNQ reason=no_breakout
+2026-05-20 17:30:00 v1_signal_rejected session_date=2026-05-20 market=/MYM reason=no_breakout
+2026-05-20 17:30:00 v1_signal_rejected session_date=2026-05-20 market=/M2K reason=no_breakout
+2026-05-20 17:30:00 v1_signal_rejected session_date=2026-05-20 market=/MGC reason=no_breakout
+2026-05-20 17:30:00 v1_signal_rejected session_date=2026-05-20 market=/MBT reason=no_breakout
+2026-05-20 17:30:00 v1_signal_rejected session_date=2026-05-20 market=TLT reason=no_breakout
+2026-05-20 17:30:00 v1_signal_rejected session_date=2026-05-20 market=IEF reason=no_breakout
+2026-05-20 17:30:00 v1_signal_rejected session_date=2026-05-20 market=SHY reason=no_breakout
+2026-05-20 17:30:00 v1_signal_rejected session_date=2026-05-20 market=TIP reason=no_breakout
+2026-05-20 17:30:00 v1_signals_generated session_date=2026-05-20 signals_emitted_count=0 rejections_count=10 reasons={'no_breakout': 10}
+2026-05-20 17:30:00 v1_exits_generated session_date=2026-05-20 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-05-20 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-05-21 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-05-21 17:30:00 lean_parameters_fetch_failed session_date=2026-05-21 fail_open=True lean_json_default=False
+2026-05-21 17:30:00 v1_signal_rejected session_date=2026-05-21 market=/MES reason=no_breakout
+2026-05-21 17:30:00 v1_signal_rejected session_date=2026-05-21 market=/MNQ reason=no_breakout
+2026-05-21 17:30:00 v1_signal_rejected session_date=2026-05-21 market=/MYM reason=efficiency_below_threshold
+2026-05-21 17:30:00 v1_signal_rejected session_date=2026-05-21 market=/M2K reason=no_breakout
+2026-05-21 17:30:00 v1_signal_rejected session_date=2026-05-21 market=/MGC reason=no_breakout
+2026-05-21 17:30:00 v1_signal_rejected session_date=2026-05-21 market=/MBT reason=no_breakout
+2026-05-21 17:30:00 v1_signal_rejected session_date=2026-05-21 market=TLT reason=no_breakout
+2026-05-21 17:30:00 v1_signal_rejected session_date=2026-05-21 market=IEF reason=no_breakout
+2026-05-21 17:30:00 v1_signal_rejected session_date=2026-05-21 market=SHY reason=no_breakout
+2026-05-21 17:30:00 v1_signal_rejected session_date=2026-05-21 market=TIP reason=no_breakout
+2026-05-21 17:30:00 v1_signals_generated session_date=2026-05-21 signals_emitted_count=0 rejections_count=10 reasons={'no_breakout': 9, 'efficiency_below_threshold': 1}
+2026-05-21 17:30:00 v1_exits_generated session_date=2026-05-21 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-05-21 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-05-22 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-05-22 17:30:00 lean_parameters_fetch_failed session_date=2026-05-22 fail_open=True lean_json_default=False
+2026-05-22 17:30:00 v1_signal_rejected session_date=2026-05-22 market=/MES reason=no_breakout
+2026-05-22 17:30:00 v1_signal_rejected session_date=2026-05-22 market=/MNQ reason=no_breakout
+2026-05-22 17:30:00 v1_signal_rejected session_date=2026-05-22 market=/MYM reason=efficiency_below_threshold
+2026-05-22 17:30:00 v1_signal_rejected session_date=2026-05-22 market=/M2K reason=no_breakout
+2026-05-22 17:30:00 v1_signal_rejected session_date=2026-05-22 market=/MGC reason=no_breakout
+2026-05-22 17:30:00 v1_signal_rejected session_date=2026-05-22 market=/MBT reason=no_breakout
+2026-05-22 17:30:00 v1_signal_rejected session_date=2026-05-22 market=TLT reason=no_breakout
+2026-05-22 17:30:00 v1_signal_rejected session_date=2026-05-22 market=IEF reason=no_breakout
+2026-05-22 17:30:00 v1_signal_rejected session_date=2026-05-22 market=SHY reason=no_breakout
+2026-05-22 17:30:00 v1_signal_rejected session_date=2026-05-22 market=TIP reason=no_breakout
+2026-05-22 17:30:00 v1_signals_generated session_date=2026-05-22 signals_emitted_count=0 rejections_count=10 reasons={'no_breakout': 9, 'efficiency_below_threshold': 1}
+2026-05-22 17:30:00 v1_exits_generated session_date=2026-05-22 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-05-22 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-05-23 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-05-23 17:30:00 lean_parameters_fetch_failed session_date=2026-05-23 fail_open=True lean_json_default=False
+2026-05-23 17:30:00 v1_signal_rejected session_date=2026-05-23 market=/MES reason=no_breakout
+2026-05-23 17:30:00 v1_signal_rejected session_date=2026-05-23 market=/MNQ reason=no_breakout
+2026-05-23 17:30:00 v1_signal_rejected session_date=2026-05-23 market=/MYM reason=efficiency_below_threshold
+2026-05-23 17:30:00 v1_signal_rejected session_date=2026-05-23 market=/M2K reason=no_breakout
+2026-05-23 17:30:00 v1_signal_rejected session_date=2026-05-23 market=/MGC reason=no_breakout
+2026-05-23 17:30:00 v1_signal_rejected session_date=2026-05-23 market=/MBT reason=no_breakout
+2026-05-23 17:30:00 v1_signal_rejected session_date=2026-05-23 market=TLT reason=no_breakout
+2026-05-23 17:30:00 v1_signal_rejected session_date=2026-05-23 market=IEF reason=no_breakout
+2026-05-23 17:30:00 v1_signal_rejected session_date=2026-05-23 market=SHY reason=no_breakout
+2026-05-23 17:30:00 v1_signal_rejected session_date=2026-05-23 market=TIP reason=no_breakout
+2026-05-23 17:30:00 v1_signals_generated session_date=2026-05-23 signals_emitted_count=0 rejections_count=10 reasons={'no_breakout': 9, 'efficiency_below_threshold': 1}
+2026-05-23 17:30:00 v1_exits_generated session_date=2026-05-23 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-05-23 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-05-24 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-05-24 17:30:00 lean_parameters_fetch_failed session_date=2026-05-24 fail_open=True lean_json_default=False
+2026-05-24 17:30:00 v1_signal_rejected session_date=2026-05-24 market=/MES reason=no_breakout
+2026-05-24 17:30:00 v1_signal_rejected session_date=2026-05-24 market=/MNQ reason=no_breakout
+2026-05-24 17:30:00 v1_signal_rejected session_date=2026-05-24 market=/MYM reason=efficiency_below_threshold
+2026-05-24 17:30:00 v1_signal_rejected session_date=2026-05-24 market=/M2K reason=no_breakout
+2026-05-24 17:30:00 v1_signal_rejected session_date=2026-05-24 market=/MGC reason=no_breakout
+2026-05-24 17:30:00 v1_signal_rejected session_date=2026-05-24 market=/MBT reason=no_breakout
+2026-05-24 17:30:00 v1_signal_rejected session_date=2026-05-24 market=TLT reason=no_breakout
+2026-05-24 17:30:00 v1_signal_rejected session_date=2026-05-24 market=IEF reason=no_breakout
+2026-05-24 17:30:00 v1_signal_rejected session_date=2026-05-24 market=SHY reason=no_breakout
+2026-05-24 17:30:00 v1_signal_rejected session_date=2026-05-24 market=TIP reason=no_breakout
+2026-05-24 17:30:00 v1_signals_generated session_date=2026-05-24 signals_emitted_count=0 rejections_count=10 reasons={'no_breakout': 9, 'efficiency_below_threshold': 1}
+2026-05-24 17:30:00 v1_exits_generated session_date=2026-05-24 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-05-24 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-05-25 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-05-25 17:30:00 lean_parameters_fetch_failed session_date=2026-05-25 fail_open=True lean_json_default=False
+2026-05-25 17:30:00 v1_signal_rejected session_date=2026-05-25 market=/MES reason=no_breakout
+2026-05-25 17:30:00 v1_signal_rejected session_date=2026-05-25 market=/MNQ reason=no_breakout
+2026-05-25 17:30:00 v1_signal_rejected session_date=2026-05-25 market=/MYM reason=no_breakout
+2026-05-25 17:30:00 v1_signal_rejected session_date=2026-05-25 market=/M2K reason=no_breakout
+2026-05-25 17:30:00 v1_signal_rejected session_date=2026-05-25 market=/MGC reason=no_breakout
+2026-05-25 17:30:00 v1_signal_rejected session_date=2026-05-25 market=/MBT reason=no_breakout
+2026-05-25 17:30:00 v1_signal_rejected session_date=2026-05-25 market=TLT reason=no_breakout
+2026-05-25 17:30:00 v1_signal_rejected session_date=2026-05-25 market=IEF reason=no_breakout
+2026-05-25 17:30:00 v1_signal_rejected session_date=2026-05-25 market=SHY reason=no_breakout
+2026-05-25 17:30:00 v1_signal_rejected session_date=2026-05-25 market=TIP reason=no_breakout
+2026-05-25 17:30:00 v1_signals_generated session_date=2026-05-25 signals_emitted_count=0 rejections_count=10 reasons={'no_breakout': 10}
+2026-05-25 17:30:00 v1_exits_generated session_date=2026-05-25 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-05-25 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-05-26 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-05-26 17:30:00 lean_parameters_fetch_failed session_date=2026-05-26 fail_open=True lean_json_default=False
+2026-05-26 17:30:00 v1_signal_rejected session_date=2026-05-26 market=/MES reason=no_breakout
+2026-05-26 17:30:00 v1_signal_rejected session_date=2026-05-26 market=/MYM reason=no_breakout
+2026-05-26 17:30:00 v1_signal_rejected session_date=2026-05-26 market=/M2K reason=efficiency_below_threshold
+2026-05-26 17:30:00 v1_signal_rejected session_date=2026-05-26 market=/MGC reason=no_breakout
+2026-05-26 17:30:00 v1_signal_rejected session_date=2026-05-26 market=/MBT reason=no_breakout
+2026-05-26 17:30:00 v1_signal_rejected session_date=2026-05-26 market=TLT reason=no_breakout
+2026-05-26 17:30:00 v1_signal_rejected session_date=2026-05-26 market=IEF reason=no_breakout
+2026-05-26 17:30:00 v1_signal_rejected session_date=2026-05-26 market=SHY reason=no_breakout
+2026-05-26 17:30:00 v1_signal_rejected session_date=2026-05-26 market=TIP reason=no_breakout
+2026-05-26 17:30:00 v1_signals_generated session_date=2026-05-26 signals_emitted_count=1 rejections_count=9 reasons={'no_breakout': 8, 'efficiency_below_threshold': 1}
+2026-05-26 17:30:00 v1_exits_generated session_date=2026-05-26 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-05-26 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-05-26 17:30:00 lean_signal_post_url_error event_type=signal_emitted reason=[Errno 111] Connection refused
+2026-05-27 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-05-27 17:30:00 lean_parameters_fetch_failed session_date=2026-05-27 fail_open=True lean_json_default=False
+2026-05-27 17:30:00 v1_signal_rejected session_date=2026-05-27 market=/MES reason=no_breakout
+2026-05-27 17:30:00 v1_signal_rejected session_date=2026-05-27 market=/MNQ reason=no_breakout
+2026-05-27 17:30:00 v1_signal_rejected session_date=2026-05-27 market=/MYM reason=no_breakout
+2026-05-27 17:30:00 v1_signal_rejected session_date=2026-05-27 market=/M2K reason=no_breakout
+2026-05-27 17:30:00 v1_signal_rejected session_date=2026-05-27 market=/MGC reason=no_breakout
+2026-05-27 17:30:00 v1_signal_rejected session_date=2026-05-27 market=/MBT reason=no_breakout
+2026-05-27 17:30:00 v1_signal_rejected session_date=2026-05-27 market=TLT reason=no_breakout
+2026-05-27 17:30:00 v1_signal_rejected session_date=2026-05-27 market=IEF reason=no_breakout
+2026-05-27 17:30:00 v1_signal_rejected session_date=2026-05-27 market=SHY reason=no_breakout
+2026-05-27 17:30:00 v1_signal_rejected session_date=2026-05-27 market=TIP reason=no_breakout
+2026-05-27 17:30:00 v1_signals_generated session_date=2026-05-27 signals_emitted_count=0 rejections_count=10 reasons={'no_breakout': 10}
+2026-05-27 17:30:00 v1_exits_generated session_date=2026-05-27 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-05-27 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-05-28 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-05-28 17:30:00 lean_parameters_fetch_failed session_date=2026-05-28 fail_open=True lean_json_default=False
+2026-05-28 17:30:00 v1_signal_rejected session_date=2026-05-28 market=/MNQ reason=no_breakout
+2026-05-28 17:30:00 v1_signal_rejected session_date=2026-05-28 market=/MYM reason=no_breakout
+2026-05-28 17:30:00 v1_signal_rejected session_date=2026-05-28 market=/M2K reason=no_breakout
+2026-05-28 17:30:00 v1_signal_rejected session_date=2026-05-28 market=/MGC reason=no_breakout
+2026-05-28 17:30:00 v1_signal_rejected session_date=2026-05-28 market=/MBT reason=no_breakout
+2026-05-28 17:30:00 v1_signal_rejected session_date=2026-05-28 market=TLT reason=no_breakout
+2026-05-28 17:30:00 v1_signal_rejected session_date=2026-05-28 market=IEF reason=no_breakout
+2026-05-28 17:30:00 v1_signal_rejected session_date=2026-05-28 market=SHY reason=no_breakout
+2026-05-28 17:30:00 v1_signal_rejected session_date=2026-05-28 market=TIP reason=no_breakout
+2026-05-28 17:30:00 v1_signals_generated session_date=2026-05-28 signals_emitted_count=1 rejections_count=9 reasons={'no_breakout': 9}
+2026-05-28 17:30:00 v1_exits_generated session_date=2026-05-28 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-05-28 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-05-28 17:30:00 lean_signal_post_url_error event_type=signal_emitted reason=[Errno 111] Connection refused
+2026-05-29 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-05-29 17:30:00 lean_parameters_fetch_failed session_date=2026-05-29 fail_open=True lean_json_default=False
+2026-05-29 17:30:00 v1_signal_rejected session_date=2026-05-29 market=/MYM reason=no_breakout
+2026-05-29 17:30:00 v1_signal_rejected session_date=2026-05-29 market=/M2K reason=no_breakout
+2026-05-29 17:30:00 v1_signal_rejected session_date=2026-05-29 market=/MGC reason=no_breakout
+2026-05-29 17:30:00 v1_signal_rejected session_date=2026-05-29 market=/MBT reason=no_breakout
+2026-05-29 17:30:00 v1_signal_rejected session_date=2026-05-29 market=TLT reason=no_breakout
+2026-05-29 17:30:00 v1_signal_rejected session_date=2026-05-29 market=IEF reason=no_breakout
+2026-05-29 17:30:00 v1_signal_rejected session_date=2026-05-29 market=SHY reason=no_breakout
+2026-05-29 17:30:00 v1_signal_rejected session_date=2026-05-29 market=TIP reason=no_breakout
+2026-05-29 17:30:00 v1_signals_generated session_date=2026-05-29 signals_emitted_count=2 rejections_count=8 reasons={'no_breakout': 8}
+2026-05-29 17:30:00 v1_exits_generated session_date=2026-05-29 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-05-29 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-05-29 17:30:00 lean_signal_post_url_error event_type=signal_emitted reason=[Errno 111] Connection refused
+2026-05-29 17:30:00 lean_signal_post_url_error event_type=signal_emitted reason=[Errno 111] Connection refused
+2026-05-30 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-05-30 17:30:00 lean_parameters_fetch_failed session_date=2026-05-30 fail_open=True lean_json_default=False
+2026-05-30 17:30:00 v1_signal_rejected session_date=2026-05-30 market=/MYM reason=no_breakout
+2026-05-30 17:30:00 v1_signal_rejected session_date=2026-05-30 market=/M2K reason=no_breakout
+2026-05-30 17:30:00 v1_signal_rejected session_date=2026-05-30 market=/MGC reason=no_breakout
+2026-05-30 17:30:00 v1_signal_rejected session_date=2026-05-30 market=/MBT reason=no_breakout
+2026-05-30 17:30:00 v1_signal_rejected session_date=2026-05-30 market=TLT reason=no_breakout
+2026-05-30 17:30:00 v1_signal_rejected session_date=2026-05-30 market=IEF reason=no_breakout
+2026-05-30 17:30:00 v1_signal_rejected session_date=2026-05-30 market=SHY reason=no_breakout
+2026-05-30 17:30:00 v1_signal_rejected session_date=2026-05-30 market=TIP reason=no_breakout
+2026-05-30 17:30:00 v1_signals_generated session_date=2026-05-30 signals_emitted_count=2 rejections_count=8 reasons={'no_breakout': 8}
+2026-05-30 17:30:00 v1_exits_generated session_date=2026-05-30 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-05-30 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-05-30 17:30:00 lean_signal_post_url_error event_type=signal_emitted reason=[Errno 111] Connection refused
+2026-05-30 17:30:00 lean_signal_post_url_error event_type=signal_emitted reason=[Errno 111] Connection refused
+2026-05-31 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-05-31 17:30:00 lean_parameters_fetch_failed session_date=2026-05-31 fail_open=True lean_json_default=False
+2026-05-31 17:30:00 v1_signal_rejected session_date=2026-05-31 market=/MYM reason=no_breakout
+2026-05-31 17:30:00 v1_signal_rejected session_date=2026-05-31 market=/M2K reason=no_breakout
+2026-05-31 17:30:00 v1_signal_rejected session_date=2026-05-31 market=/MGC reason=no_breakout
+2026-05-31 17:30:00 v1_signal_rejected session_date=2026-05-31 market=/MBT reason=no_breakout
+2026-05-31 17:30:00 v1_signal_rejected session_date=2026-05-31 market=TLT reason=no_breakout
+2026-05-31 17:30:00 v1_signal_rejected session_date=2026-05-31 market=IEF reason=no_breakout
+2026-05-31 17:30:00 v1_signal_rejected session_date=2026-05-31 market=SHY reason=no_breakout
+2026-05-31 17:30:00 v1_signal_rejected session_date=2026-05-31 market=TIP reason=no_breakout
+2026-05-31 17:30:00 v1_signals_generated session_date=2026-05-31 signals_emitted_count=2 rejections_count=8 reasons={'no_breakout': 8}
+2026-05-31 17:30:00 v1_exits_generated session_date=2026-05-31 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-05-31 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-05-31 17:30:00 lean_signal_post_url_error event_type=signal_emitted reason=[Errno 111] Connection refused
+2026-05-31 17:30:00 lean_signal_post_url_error event_type=signal_emitted reason=[Errno 111] Connection refused
+2026-06-01 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-06-01 17:30:00 lean_parameters_fetch_failed session_date=2026-06-01 fail_open=True lean_json_default=False
+2026-06-01 17:30:00 v1_signal_rejected session_date=2026-06-01 market=/MYM reason=no_breakout
+2026-06-01 17:30:00 v1_signal_rejected session_date=2026-06-01 market=/M2K reason=no_breakout
+2026-06-01 17:30:00 v1_signal_rejected session_date=2026-06-01 market=/MGC reason=no_breakout
+2026-06-01 17:30:00 v1_signal_rejected session_date=2026-06-01 market=/MBT reason=no_breakout
+2026-06-01 17:30:00 v1_signal_rejected session_date=2026-06-01 market=TLT reason=no_breakout
+2026-06-01 17:30:00 v1_signal_rejected session_date=2026-06-01 market=IEF reason=no_breakout
+2026-06-01 17:30:00 v1_signal_rejected session_date=2026-06-01 market=SHY reason=no_breakout
+2026-06-01 17:30:00 v1_signal_rejected session_date=2026-06-01 market=TIP reason=no_breakout
+2026-06-01 17:30:00 v1_signals_generated session_date=2026-06-01 signals_emitted_count=2 rejections_count=8 reasons={'no_breakout': 8}
+2026-06-01 17:30:00 v1_exits_generated session_date=2026-06-01 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-06-01 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-06-01 17:30:00 lean_signal_post_url_error event_type=signal_emitted reason=[Errno 111] Connection refused
+2026-06-01 17:30:00 lean_signal_post_url_error event_type=signal_emitted reason=[Errno 111] Connection refused
+2026-06-02 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-06-02 17:30:00 lean_parameters_fetch_failed session_date=2026-06-02 fail_open=True lean_json_default=False
+2026-06-02 17:30:00 v1_signal_rejected session_date=2026-06-02 market=/MES reason=no_breakout
+2026-06-02 17:30:00 v1_signal_rejected session_date=2026-06-02 market=/MYM reason=efficiency_below_threshold
+2026-06-02 17:30:00 v1_signal_rejected session_date=2026-06-02 market=/M2K reason=no_breakout
+2026-06-02 17:30:00 v1_signal_rejected session_date=2026-06-02 market=/MGC reason=no_breakout
+2026-06-02 17:30:00 v1_signal_rejected session_date=2026-06-02 market=/MBT reason=no_breakout
+2026-06-02 17:30:00 v1_signal_rejected session_date=2026-06-02 market=TLT reason=no_breakout
+2026-06-02 17:30:00 v1_signal_rejected session_date=2026-06-02 market=IEF reason=no_breakout
+2026-06-02 17:30:00 v1_signal_rejected session_date=2026-06-02 market=SHY reason=no_breakout
+2026-06-02 17:30:00 v1_signal_rejected session_date=2026-06-02 market=TIP reason=no_breakout
+2026-06-02 17:30:00 v1_signals_generated session_date=2026-06-02 signals_emitted_count=1 rejections_count=9 reasons={'no_breakout': 8, 'efficiency_below_threshold': 1}
+2026-06-02 17:30:00 v1_exits_generated session_date=2026-06-02 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-06-02 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+2026-06-02 17:30:00 lean_signal_post_url_error event_type=signal_emitted reason=[Errno 111] Connection refused
+2026-06-03 17:30:00 lean_parameters_fetch_failed url_error reason=[Errno 111] Connection refused
+2026-06-03 17:30:00 lean_parameters_fetch_failed session_date=2026-06-03 fail_open=True lean_json_default=False
+2026-06-03 17:30:00 v1_signal_rejected session_date=2026-06-03 market=/MES reason=no_breakout
+2026-06-03 17:30:00 v1_signal_rejected session_date=2026-06-03 market=/MNQ reason=no_breakout
+2026-06-03 17:30:00 v1_signal_rejected session_date=2026-06-03 market=/MYM reason=no_breakout
+2026-06-03 17:30:00 v1_signal_rejected session_date=2026-06-03 market=/M2K reason=no_breakout
+2026-06-03 17:30:00 v1_signal_rejected session_date=2026-06-03 market=/MGC reason=no_breakout
+2026-06-03 17:30:00 v1_signal_rejected session_date=2026-06-03 market=/MBT reason=no_breakout
+2026-06-03 17:30:00 v1_signal_rejected session_date=2026-06-03 market=TLT reason=no_breakout
+2026-06-03 17:30:00 v1_signal_rejected session_date=2026-06-03 market=IEF reason=no_breakout
+2026-06-03 17:30:00 v1_signal_rejected session_date=2026-06-03 market=SHY reason=no_breakout
+2026-06-03 17:30:00 v1_signal_rejected session_date=2026-06-03 market=TIP reason=no_breakout
+2026-06-03 17:30:00 v1_signals_generated session_date=2026-06-03 signals_emitted_count=0 rejections_count=10 reasons={'no_breakout': 10}
+2026-06-03 17:30:00 v1_exits_generated session_date=2026-06-03 exits_emitted_count=0 exit_rejections_count=0 exit_reasons={}
+2026-06-03 17:30:00 lean_signal_post_url_error event_type=lean_cycle_heartbeat reason=[Errno 111] Connection refused
+Algorithm Id:(V1TrendFollowingAlgorithm) completed in 16.20 seconds at 5k data points per second. Processing total of 82,899 data points.

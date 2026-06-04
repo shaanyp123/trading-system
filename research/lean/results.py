@@ -76,13 +76,35 @@ class OrderFill:
 
 
 @dataclass(frozen=True, slots=True)
+class MarginEvent:
+    """A LEAN-native margin call / forced liquidation order (design §6.2).
+
+    LEAN's ``set_brokerage_model(IB, MARGIN)`` models maintenance margin and issues
+    liquidating orders via its ``MarginCallModel`` when equity falls below the
+    requirement; those orders carry a ``Tag`` flagging the margin call. Surfacing
+    them is the point of P3 — a liquidation event must be impossible to miss (§6.2).
+    """
+
+    event_date: date
+    market: str
+    quantity: int  # signed liquidating quantity
+    tag: str  # the LEAN order tag that identified it (e.g. "Margin Call")
+
+
+@dataclass(frozen=True, slots=True)
 class ParsedLeanResult:
-    """The normalized ``BacktestResult`` plus the raw trades + LEAN statistics."""
+    """The normalized ``BacktestResult`` plus raw trades, stats, and margin events."""
 
     result: BacktestResult
     trades: tuple[LeanTrade, ...]
     fills: tuple[OrderFill, ...]
     statistics: dict[str, str]
+    margin_events: tuple[MarginEvent, ...] = ()
+
+    @property
+    def liquidated(self) -> bool:
+        """Did LEAN issue any margin-call / liquidation order on this path?"""
+        return bool(self.margin_events)
 
 
 # --------------------------------------------------------------------------- #
@@ -216,13 +238,19 @@ def _parse_equity_curve(
     """Return (dates, equity_curve) from the Strategy Equity chart points."""
     points: list[tuple[float, float]] = []
     for raw in _equity_series_values(result_obj):
-        if not isinstance(raw, dict):
+        x: object
+        y: object
+        if isinstance(raw, dict):
+            x = _get(raw, "x", "Time", "time")
+            y = _get(raw, "y", "close", "Close")  # line-series y, else candlestick close
+        elif isinstance(raw, (list, tuple)) and len(raw) >= 2:
+            # Array-form points (LEAN 2026 builds): ``[ts, open, high, low, close]``
+            # (candlestick) or ``[ts, y]`` (line). Use close (last OHLC) / y.
+            x = raw[0]
+            y = raw[4] if len(raw) >= 5 else raw[1]
+        else:
             continue
-        x = _get(raw, "x", "Time", "time")
-        if x is None:
-            continue
-        y = _get(raw, "y", "close", "Close")  # line-series y, else candlestick close
-        if y is None:
+        if x is None or y is None:
             continue
         points.append((_as_float(x), _as_float(y)))
     if not points:
@@ -369,6 +397,42 @@ def _positions_from_fills(
     return positions
 
 
+#: Order-tag substrings that mark a LEAN margin-call / forced-liquidation order.
+#: LEAN's ``DefaultMarginCallModel`` tags generated orders "Margin Call"; we also
+#: match "liquidat" to catch brokerage-model variants. Case-insensitive.
+_MARGIN_CALL_MARKERS = ("margin call", "liquidat")
+
+
+def parse_margin_events(result_obj: dict[str, object]) -> tuple[MarginEvent, ...]:
+    """All margin-call / forced-liquidation orders in a LEAN result (design §6.2).
+
+    Detected by the order ``Tag`` (LEAN tags margin-call orders "Margin Call"); the
+    scan is tolerant of PascalCase/camelCase + the symbol-dict / bare-string forms.
+    Empty for an un-leveraged or never-liquidated run (e.g. the §6.6 ETF parity).
+    """
+    events: list[MarginEvent] = []
+    for raw in _orders_iter(result_obj):
+        if not isinstance(raw, dict):
+            continue
+        tag = str(_get(raw, "Tag", "tag", default="") or "")
+        if not any(marker in tag.lower() for marker in _MARGIN_CALL_MARKERS):
+            continue
+        qty_raw = _get(raw, "Quantity", "quantity", "FillQuantity", "fillQuantity")
+        when = _get(raw, "LastFillTime", "lastFillTime", "Time", "time", "CreatedTime")
+        if qty_raw is None or when is None:
+            continue
+        events.append(
+            MarginEvent(
+                event_date=_parse_datetime(when).date(),
+                market=_normalize_market(_get(raw, "Symbol", "symbol")),
+                quantity=int(round(_as_float(qty_raw))),
+                tag=tag,
+            )
+        )
+    events.sort(key=lambda e: (e.event_date, e.market))
+    return tuple(events)
+
+
 # --------------------------------------------------------------------------- #
 # public entry point
 # --------------------------------------------------------------------------- #
@@ -398,6 +462,7 @@ def parse_lean_result(
     positions = _positions_from_fills(fills, dates)
     trades = _parse_trades(obj)
     statistics = _parse_statistics(obj)
+    margin_events = parse_margin_events(obj)
     start_cash = float(starting_cash) if starting_cash is not None else float(equity[0])
 
     result = BacktestResult(
@@ -417,6 +482,13 @@ def parse_lean_result(
         bars=len(dates),
         trades=len(trades),
         fills=len(fills),
+        margin_events=len(margin_events),
         final_equity=round(result.final_equity, 2),
     )
-    return ParsedLeanResult(result=result, trades=trades, fills=fills, statistics=statistics)
+    return ParsedLeanResult(
+        result=result,
+        trades=trades,
+        fills=fills,
+        statistics=statistics,
+        margin_events=margin_events,
+    )

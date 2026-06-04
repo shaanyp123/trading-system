@@ -10,7 +10,7 @@ error at run time (e.g. ``lean`` → P2, ``minute`` → P5).
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import Final
@@ -21,8 +21,8 @@ import yaml
 KNOWN_ENGINES: Final = ("daily", "vbt", "lean")
 #: Resolutions known to the schema. Only ``daily`` runs now (intraday deferred).
 KNOWN_RESOLUTIONS: Final = ("daily", "minute", "tick")
-#: Strategy refs the P1 registry can build.
-KNOWN_STRATEGIES: Final = ("buy_and_hold",)
+#: Strategy refs the registry can build (P1 buy-and-hold + the P2/P3 Donchian).
+KNOWN_STRATEGIES: Final = ("buy_and_hold", "donchian")
 
 _DEFAULT_DATA_ROOT_ENV = "RESEARCH_DATA_ROOT"
 _DEFAULT_DATA_ROOT = "research/data/cache/lean_bars"
@@ -46,6 +46,16 @@ class RunConfig:
     #: Per-future expiry (``YYYYMM``) for P1 single-expiry loads; futures absent
     #: here must have exactly one expiry on disk or the load errors.
     expiries: dict[str, str]
+    #: Donchian channel length (``strategy.channel``); ``None`` for buy-and-hold.
+    channel: int | None = None
+    #: P3 sizing scheme (``sizing.scheme``) + its params (everything else under
+    #: ``sizing``, as floats). ``None`` ⇒ no leverage sweep (P1/P2 fixed path).
+    sizing_scheme: str | None = None
+    sizing_params: dict[str, float] = field(default_factory=dict)
+    #: P3 leverage cap + optional sweep (``leverage.cap`` / ``leverage.sweep``).
+    #: ``leverage_sweep`` non-empty (or ``sizing_scheme`` set) routes to the sweep.
+    leverage_cap: float | None = None
+    leverage_sweep: tuple[float, ...] = ()
 
 
 def _as_str(value: object, ctx: str) -> str:
@@ -106,6 +116,34 @@ def parse_run_config(raw: dict[str, object]) -> RunConfig:
     # doesn't silently become 1.
     if isinstance(contracts_raw, bool) or not isinstance(contracts_raw, int) or contracts_raw == 0:
         raise ValueError(f"strategy.contracts must be a non-zero int, got {contracts_raw!r}")
+    channel_raw = strategy.get("channel")
+    channel = (
+        int(channel_raw)
+        if isinstance(channel_raw, int) and not isinstance(channel_raw, bool)
+        else None
+    )
+
+    # P3 sizing + leverage blocks (absent for P1/P2 fixed runs).
+    sizing = _require_mapping(raw.get("sizing", {}), "sizing")
+    sizing_scheme = _as_str(sizing["scheme"], "sizing.scheme") if "scheme" in sizing else None
+    sizing_params = {
+        k: float(v)
+        for k, v in sizing.items()
+        if k != "scheme" and isinstance(v, (int, float)) and not isinstance(v, bool)
+    }
+    leverage = _require_mapping(raw.get("leverage", {}), "leverage")
+    cap_raw = leverage.get("cap")
+    leverage_cap = (
+        float(cap_raw)
+        if isinstance(cap_raw, (int, float)) and not isinstance(cap_raw, bool)
+        else None
+    )
+    sweep_raw = leverage.get("sweep", [])
+    if not isinstance(sweep_raw, list):
+        raise ValueError("leverage.sweep must be a list of leverage caps")
+    leverage_sweep = tuple(
+        float(x) for x in sweep_raw if isinstance(x, (int, float)) and not isinstance(x, bool)
+    )
 
     starting_cash_raw = raw.get("starting_cash")
     starting_cash = (
@@ -133,6 +171,11 @@ def parse_run_config(raw: dict[str, object]) -> RunConfig:
         starting_cash=starting_cash,
         data_root=data_root,
         expiries=expiries,
+        channel=channel,
+        sizing_scheme=sizing_scheme,
+        sizing_params=sizing_params,
+        leverage_cap=leverage_cap,
+        leverage_sweep=leverage_sweep,
     )
 
 
