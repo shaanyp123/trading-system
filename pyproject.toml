@@ -81,6 +81,7 @@ extend-exclude = [
   "apps",          # JS/TS
   "packages",      # JS/TS
   "lean",          # QC LEAN code (different conventions)
+  "research/lean/projects",  # QC LEAN algorithms (AlgorithmImports * — like lean/)
 ]
 
 [tool.ruff.lint]
@@ -112,6 +113,11 @@ ignore = [
 "services/discord_bot/entrypoint.py" = ["S603", "S606"]
 # qc_adapter entrypoint mirrors the api/discord_bot pattern.
 "services/qc_adapter/entrypoint.py" = ["S603", "S606"]
+# research/lean drives LEAN via subprocess (lean CLI / docker run). argv is built
+# from known constants + validated paths (full exe resolved via shutil.which);
+# never shell=True. Same exemption as the service entrypoints above.
+"research/lean/images.py" = ["S603", "S607"]
+"research/lean/driver.py" = ["S603", "S607"]
 # signal_ingestion uses sha1 for deterministic strategy_hash derivation
 # (40-char hex identity, NOT a cryptographic security boundary —
 # audit-chain integrity is via SHA-256 in services/audit/chain.py).
@@ -142,6 +148,7 @@ exclude = [
   "apps/",
   "packages/",
   "lean/",
+  "research/lean/projects/",  # QC LEAN algorithms (AlgorithmImports * — like lean/)
   "alembic/versions/",   # generated migration files
 ]
 

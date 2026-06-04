@@ -516,9 +516,13 @@ forbidden path — only the eventual graduation PR does).
   **Acceptance:** reproduces buy-and-hold exactly on a daily window; report
   artifact renders.
 - **P2 — LEAN driver.** `research/lean/{driver,config_render,results,images}.py` +
-  make `tests/integration/test_vbt_lean_parity.py` real.
-  **Acceptance:** programmatic LEAN daily backtest runs end-to-end; §6.6 parity
-  passes; reproduces production V1 on a fixed window.
+  `research/lean/projects/donchian_reference.py` + `research/strategy/donchian.py` +
+  `research/eval/{parity,reproduce_v1}.py` + make
+  `tests/integration/test_vbt_lean_parity.py` real. **Code + parser + parity-logic +
+  V1 cross-check land CI-green WITHOUT LEAN** (committed LEAN-output fixtures); the
+  REAL engine run is the operator's acceptance gate (see "P2 landed" below + the
+  ⚠️ POST hazard). **Acceptance:** programmatic LEAN daily backtest runs end-to-end;
+  §6.6 parity passes; reproduces production V1 on a fixed window.
 - **P3 — Leverage.** `research/risk/{sizing_schemes,leverage,liquidation,metrics}.py`.
   **Acceptance:** leverage sweep produces a ruin report; LEAN liquidation events
   surface; daily intrabar-liquidation estimator flags + reports uncertainty.
@@ -791,6 +795,59 @@ P1 (daily spine) merged in PR #319. Copy-paste this to start P2:
 >   - Driver + parser UNIT-tested against a committed LEAN-output fixture (CI green
 >     with no Docker/LEAN). `make test` green; ruff + mypy `--strict` clean
 >     (`research` is in the typecheck target).
+
+### P2 landed — implementation notes + the ⚠️ POST hazard (versioned)
+
+This subsection records how P2 was built so it is versioned with the design.
+
+**⚠️ POST hazard (the #1 safety fact).** `lean/v1_strategy.py` POSTs `signal_emitted`
++ `lean_cycle_heartbeat` to `LEAN_LOCAL_API_BASE_URL` (default `http://api:8000`) on
+EVERY daily cycle, in backtest AND live mode, and `initialize()` fail-closes when
+`LEAN_LOCAL_BEARER_TOKEN` is empty. A research V1 backtest MUST NOT reach the prod
+api. The driver (`research/lean/driver.py`) neutralizes this THREE ways, applied
+uniformly to every run (defense in depth; the reference strategies don't POST):
+
+1. **`--network none`** — the run is never joined to the prod `internal` docker
+   network, so `http://api:8000` cannot resolve at all.
+2. **Unreachable `LEAN_LOCAL_API_BASE_URL` stub** (`http://127.0.0.1:9`) — every POST
+   fails fast/harmlessly (`v1_strategy._post_event` is best-effort; a URLError is
+   logged, not fatal).
+3. **Dummy non-empty `LEAN_LOCAL_BEARER_TOKEN`** — satisfies the fail-closed check
+   without authenticating anything (no api is ever reached).
+
+For the parser's captured fixture + the parity rail, a NON-posting reference
+(`donchian_reference.py`) is preferred so no POST path is exercised at all. Data
+isolation (R1) is enforced too: the data mount is ALWAYS a read-only host COPY
+(`research/data/cache/lean_bars`); `driver._guard_data_root` refuses the live
+`trading_lean_data` / `lean_data` volume by name. Unit tests assert these invariants
+on the assembled `docker run` argv (no prod api string, no live-volume mount,
+`--network none`, the stub URL + dummy bearer).
+
+**Backend split.** Two invocation backends (design §4.3), chosen by availability
+(`research/lean/images.py`, which probes the `lean` EXECUTABLE + the Docker DAEMON —
+never `importlib.find_spec`, which an empty `lean` namespace-package artifact fools):
+the **raw-docker backend against the `lean_local` image** is the production-faithful,
+env-controllable path and the ONLY one used for V1 (its entrypoint merges the
+throwaway config + honours the isolation env; the CLI cannot inject V1's `os.environ`
+POST config). The **LEAN CLI backend** serves the POST-free reference strategies.
+
+**Parser tolerance + fixture-capture handoff.** LEAN's result JSON drifts across
+releases, so `research/lean/results.py` finds the result file by CONTENT (not
+filename), reads the equity curve from both the line-series `{x,y}` and candlestick
+`{x,…,close}` shapes, and accepts PascalCase/camelCase keys + int/string enums. It is
+unit-tested against two committed fixtures covering both shapes. The committed V1
+golden + oracle snapshots are REPRESENTATIVE (hand-authored to the schema; entries
+mirror the live `/M2K` 05-27 + `/MES` 05-28); the operator re-captures REAL ones
+during acceptance (commands in `research/lean/README.md`) — the tests then run the
+same assertions against the real engine.
+
+**What is CI-green vs operator-acceptance.** Green with NO Docker/LEAN: the parser,
+config render, availability checks, command-assembly safety invariants, parity
+comparison logic, and the reproduce-V1 parse + oracle cross-check (all on committed
+fixtures). Gated to SKIP visibly until the operator runs the real engine: the
+end-to-end LEAN backtest, the empirical §6.6 tolerance pass, and the real V1↔oracle
+match. If the parity tolerances need a fill-model tweak on first real run, that is a
+one-line change in `donchian_reference.py` — expected iteration against a real engine.
 
 ### P3–P7 kickoff stubs
 
