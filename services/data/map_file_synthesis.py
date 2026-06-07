@@ -903,6 +903,15 @@ def detect_real_rolls(
     2. Drop runs shorter than ``persistence_days`` — these are noise
        (day-to-day flip-flopping in bar_sync's ``reqContractDetails``
        front-month picker).
+    2b. ALWAYS keep the most-recent run (the "live edge") even if it is
+       shorter than ``persistence_days``. The newest run is the current
+       front month bar_sync recorded on disk; dropping it strands LEAN's
+       continuous resolver on the prior — now EXPIRED — contract and
+       serves its last stale bar (the 2026-06 /MBT staleness: the
+       202605→202606 roll was suppressed at 8/15 sessions, pinning the
+       continuous to the expired May contract). Interior runs keep full
+       persistence denoising, so historical/backtest roll calendars are
+       unaffected.
     3. Walk the surviving stable runs in order; each adjacent pair is
        a genuine roll boundary, dated at the new run's first session.
 
@@ -933,6 +942,20 @@ def detect_real_rolls(
 
     # Step 2: keep only runs persisting at least persistence_days sessions.
     stable_runs = [r for r in runs if r[2] >= persistence_days]
+
+    # Step 2b: always honor the live edge. The most-recent run reflects the
+    # front-month bar_sync recorded on disk *right now*; if the persistence
+    # filter drops it (because the new contract hasn't yet persisted
+    # ``persistence_days`` sessions) LEAN's continuous resolver strands on the
+    # prior — now EXPIRED — contract and serves its last stale bar. Force-
+    # include ``runs[-1]`` whenever the filter dropped it. Interior/historical
+    # runs keep full persistence denoising, so backtest roll calendars are
+    # unaffected and the 2026-05-22 flip-flop noise stays filtered. Identity is
+    # the run's start index (runs[k][0]); appending a same-expiry live-edge run
+    # is harmless — Step 3 skips same-expiry adjacent pairs, so no spurious roll
+    # is emitted (e.g. a 1-session flip back to the prior contract).
+    if runs and (not stable_runs or stable_runs[-1][0] != runs[-1][0]):
+        stable_runs.append(runs[-1])
 
     # Step 3: build transitions between adjacent stable runs. Skip pairs
     # whose expiry is unchanged — they're stable runs that bracket a
@@ -1189,6 +1212,33 @@ def synthesize_futures_map_file(
     content_changed = existing != content
     if content_changed:
         _write_atomic(map_file_path, content)
+    # Stale-front-month guard: the contract LEAN resolves to at the live edge
+    # is the latest universe session's expiry. If its computed last-trading
+    # date is already past relative to that session, bar_sync recorded an
+    # EXPIRED contract as the front month — an upstream staleness the live-edge
+    # rule in :func:`detect_real_rolls` cannot fix (it can only stop the filter
+    # from manufacturing staleness; it can't repair a bad input). Warn loudly
+    # so the condition is observable per-cycle instead of silently mispricing
+    # the market for weeks (the 2026-06 /MBT failure mode).
+    if sessions:
+        latest = sessions[-1]
+        try:
+            front_month_last_trading_date = compute_future_expiry(
+                ticker=ticker, contract_month=latest.expiry
+            )
+        except ValueError:
+            front_month_last_trading_date = None
+        if (
+            front_month_last_trading_date is not None
+            and front_month_last_trading_date < latest.session_date
+        ):
+            bound.warning(
+                "futures_map_file_front_month_expired",
+                latest_session_date=latest.session_date.isoformat(),
+                front_month_expiry=latest.expiry,
+                front_month_last_trading_date=front_month_last_trading_date.isoformat(),
+                map_file_path=str(map_file_path),
+            )
     bound.info(
         "futures_map_file_synthesized",
         roll_count=len(rolls),
