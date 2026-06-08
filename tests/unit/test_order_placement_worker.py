@@ -104,6 +104,73 @@ def _signal(
     )
 
 
+class TestOrderPlacementFailureAlertHook:
+    """The dispatch loop fires a P1 alert hook on IbkrPlacementError so a
+    failed order on an approved signal is no longer silent (2026-06-08).
+
+    Exercises the worker-side surface only (the fail-open helper); the
+    INSERT+dispatch body lives in services/api/main.py (hot-fix lane).
+    """
+
+    def _worker(self, hook: Any) -> Any:
+        from services.risk.order_placement_worker import OrderPlacementWorker
+
+        return OrderPlacementWorker(
+            session_factory=MagicMock(),
+            ibkr_client=MagicMock(),
+            account_id=UUID("019e1864-9e9d-747b-a177-0d49b96054b2"),
+            env="paper",
+            order_placement_failure_alert_hook=hook,
+        )
+
+    def _exc(self) -> Any:
+        from services.execution.types import IbkrPlacementError
+
+        return IbkrPlacementError(
+            operation="placeOrder",
+            detail="Error 200, No security definition has been found",
+            underlying_exception_class="EmptyQualificationResult",
+            occurred_at_utc=datetime(2026, 6, 8, tzinfo=UTC),
+        )
+
+    async def test_hook_fires_with_descriptor(self) -> None:
+        from services.risk.order_placement_worker import (
+            OrderPlacementFailureAlertDescriptor,
+        )
+
+        captured: list[OrderPlacementFailureAlertDescriptor] = []
+
+        async def hook(desc: OrderPlacementFailureAlertDescriptor) -> None:
+            captured.append(desc)
+
+        worker = self._worker(hook)
+        signal = _signal(market="/MYM")
+        await worker._emit_placement_failure_alert(signal, self._exc())
+
+        assert len(captured) == 1
+        d = captured[0]
+        assert d.market == "/MYM"
+        assert d.signal_id == signal.signal_id
+        assert d.signal_type == signal.signal_type
+        # Attributed to the worker's account, not the signal row's.
+        assert d.account_id == UUID("019e1864-9e9d-747b-a177-0d49b96054b2")
+        assert "Error 200" in d.failure_reason
+
+    async def test_no_hook_is_noop(self) -> None:
+        worker = self._worker(None)
+        # Must not raise when the hook is unwired (pre-2026-06-08 behavior).
+        await worker._emit_placement_failure_alert(_signal(market="/MYM"), self._exc())
+
+    async def test_hook_exception_is_swallowed(self) -> None:
+        async def boom(desc: Any) -> None:
+            raise RuntimeError("dispatch blew up")
+
+        worker = self._worker(boom)
+        # Fails open — a hook crash must never propagate (never blocks the
+        # worker's break/retry path).
+        await worker._emit_placement_failure_alert(_signal(market="/MYM"), self._exc())
+
+
 class TestLockedConstants:
     """Verify the locked module-level constants stay locked."""
 

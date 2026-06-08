@@ -908,8 +908,11 @@ class TestAlertCategoryEnumMirror:
         # cancel-success+place-fail failure mode);
         # 2026-05-29_reconciliation_data_source_degraded migration adds 1
         # more (`reconciliation_data_source_degraded` for the Option C
-        # recon-fix reqPositions→FlexQuery fallback push).
-        assert len(list(AlertCategory)) == 33
+        # recon-fix reqPositions→FlexQuery fallback push);
+        # 2026-06-08_order_placement_failed migration adds 1 more
+        # (`order_placement_failed` for the silent order-placement-failure
+        # alert — broker unavailable / contract rejection).
+        assert len(list(AlertCategory)) == 34
 
     def test_canonical_values_present(self) -> None:
         # Sentinel check; full set in alembic 0004 + spec §3.27.

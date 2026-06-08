@@ -208,11 +208,18 @@ async def _start_order_placement_worker(settings: APISettings) -> tuple[object, 
     # ``PositionUnprotectedAlertHook | None``; cast for mypy.
     from typing import cast as _cast
 
-    from services.risk.order_placement_worker import PositionUnprotectedAlertHook
+    from services.risk.order_placement_worker import (
+        OrderPlacementFailureAlertHook,
+        PositionUnprotectedAlertHook,
+    )
 
     position_unprotected_hook = _cast(
         "PositionUnprotectedAlertHook | None",
         _build_position_unprotected_alert_hook(settings),
+    )
+    order_placement_failure_hook = _cast(
+        "OrderPlacementFailureAlertHook | None",
+        _build_order_placement_failure_alert_hook(settings),
     )
 
     worker = OrderPlacementWorker(
@@ -223,6 +230,7 @@ async def _start_order_placement_worker(settings: APISettings) -> tuple[object, 
         poll_interval_seconds=settings.order_placement_poll_interval_seconds,
         ibkr_call_timeout_seconds=settings.ibkr_call_timeout_seconds,
         position_unprotected_alert_hook=position_unprotected_hook,
+        order_placement_failure_alert_hook=order_placement_failure_hook,
     )
     task = asyncio.create_task(worker.run_forever(), name="order_placement_worker.run_forever")
     log.info(
@@ -563,6 +571,121 @@ def _build_position_unprotected_alert_hook(
                 )
         log.error(
             "position_unprotected_alert_dispatched",
+            alert_id=str(alert_id),
+            short_circuited=report.short_circuited,
+            delivery_status=dict(report.delivery_status),
+        )
+
+    return _hook
+
+
+def _build_order_placement_failure_alert_hook(
+    settings: APISettings,
+) -> object | None:
+    """Construct the order_placement_worker's ORDER_PLACEMENT_FAILED P1
+    alert hook, or return None.
+
+    Silent-failure follow-up (2026-06-08). The worker invokes this from the
+    dispatch loop's ``IbkrPlacementError`` catch — broker unavailable OR a
+    contract rejection (e.g. the 2026-06-04 /MYM Error-200 wrong-exchange
+    case fixed in #327). The hook INSERTs an ``alerts`` row
+    category='order_placement_failed' + severity='P1', then invokes
+    :func:`services.webhook_pusher.dispatcher.dispatch_alert` for the
+    Discord ``#alerts`` push (``SEVERITY_TO_CHANNELS[P1]`` = #alerts only;
+    no #critical, no email — no money is at risk, the order simply didn't
+    place and the signal stays ``approved`` for the next poll).
+
+    Returns ``None`` when ``discord.webhook_urls.alerts`` isn't in sops —
+    the worker then logs-only (same degradation contract as the other
+    hooks; the failure is still in the structlog ``order_placement_broker_
+    unavailable`` line). Returns ``object | None`` to dodge the worker-side
+    circular import (same crutch as the position-unprotected hook).
+    """
+    from services.risk.order_placement_worker import (
+        OrderPlacementFailureAlertDescriptor,
+    )
+    from services.webhook_pusher.dispatcher import dispatch_alert
+    from services.webhook_pusher.payloads import (
+        AlertCategory,
+        AlertSeverity,
+        ChannelName,
+    )
+
+    if settings.discord_webhook_url_alerts is None:
+        log.warning(
+            "order_placement_failure_alert_hook_skipped_no_webhook_url",
+            note=(
+                "discord.webhook_urls.alerts not in sops; order-placement "
+                "failures stay log-only (no #alerts push). Wire the sops "
+                "field + restart api to enable the P1 alert."
+            ),
+        )
+        return None
+
+    webhook_urls: dict[ChannelName, str] = {
+        ChannelName.DISCORD_ALERTS: settings.discord_webhook_url_alerts.get_secret_value(),
+    }
+
+    log.info("order_placement_failure_alert_hook_constructed")
+
+    async def _hook(descriptor: OrderPlacementFailureAlertDescriptor) -> None:
+        """Per-failure: INSERT alerts row + dispatch the P1 #alerts push."""
+        session_factory = api_db.get_session_factory()
+        message_text = (
+            f"ORDER_PLACEMENT_FAILED · {descriptor.market} "
+            f"({descriptor.signal_type}) — IBKR order placement failed; the "
+            f"signal remains approved for the next poll cycle. "
+            f"reason={descriptor.failure_reason}"
+        )
+        detail_payload: dict[str, Any] = {
+            "signal_id": str(descriptor.signal_id),
+            "market": descriptor.market,
+            "signal_type": descriptor.signal_type,
+            "failure_reason": descriptor.failure_reason,
+        }
+        async with session_factory() as ins_session:
+            row = (
+                await ins_session.execute(
+                    text(
+                        "INSERT INTO alerts ("
+                        "    account_id, severity, category, message, detail"
+                        ") VALUES ("
+                        "    :acct, :sev, :cat, :msg, CAST(:detail AS JSONB)"
+                        ") RETURNING id"
+                    ),
+                    {
+                        "acct": descriptor.account_id,
+                        "sev": AlertSeverity.P1.value,
+                        "cat": AlertCategory.ORDER_PLACEMENT_FAILED.value,
+                        "msg": message_text,
+                        "detail": json.dumps(detail_payload),
+                    },
+                )
+            ).fetchone()
+            assert row is not None
+            alert_id = UUID(str(row.id))
+            await ins_session.commit()
+
+        log.error(
+            "order_placement_failure_alert_inserted",
+            alert_id=str(alert_id),
+            account_id=str(descriptor.account_id),
+            signal_id=str(descriptor.signal_id),
+            market=descriptor.market,
+            signal_type=descriptor.signal_type,
+        )
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as http_client:
+            async with session_factory() as disp_session:
+                report = await dispatch_alert(
+                    session=disp_session,
+                    alert_id=alert_id,
+                    http_client=http_client,
+                    webhook_urls=webhook_urls,
+                    email_identity=None,
+                )
+        log.error(
+            "order_placement_failure_alert_dispatched",
             alert_id=str(alert_id),
             short_circuited=report.short_circuited,
             delivery_status=dict(report.delivery_status),

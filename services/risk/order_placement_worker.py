@@ -402,6 +402,41 @@ class PositionUnprotectedAlertDescriptor:
 PositionUnprotectedAlertHook = Callable[[PositionUnprotectedAlertDescriptor], Awaitable[None]]
 
 
+@dataclass(frozen=True, slots=True)
+class OrderPlacementFailureAlertDescriptor:
+    """Inputs the worker hands to the order-placement-failure alert hook.
+
+    Built at the ``IbkrPlacementError`` catch in the dispatch loop when an
+    approved signal's IBKR order placement fails — broker unavailable OR a
+    contract rejection (e.g. the 2026-06-04 /MYM Error-200 wrong-exchange
+    case fixed in #327). Hook implementer (``services/api/main.py``, hot-fix
+    whitelist) INSERTs an ``alerts`` row category='order_placement_failed'
+    severity='P1' + dispatches to Discord ``#alerts``. P1 because no money
+    is at risk — the order simply didn't place and the signal stays
+    ``approved`` for the next poll cycle (vs. P0 POSITION_UNPROTECTED where
+    a live position is left naked).
+
+    A02 note: like :class:`PositionUnprotectedAlertDescriptor`, the hook
+    body lives in ``services/api/main.py`` — only this descriptor + the
+    optional constructor arg touch the forbidden ``services/risk`` path.
+    """
+
+    account_id: UUID
+    signal_id: UUID
+    market: str
+    signal_type: str
+    failure_reason: str
+
+
+#: Callback the worker invokes from the dispatch loop's
+#: ``IbkrPlacementError`` catch. Fails open: any exception is caught +
+#: logged by the worker (the order failure is already logged + the signal
+#: remains ``approved``, so a hook crash never blocks the retry path).
+#: When unwired (``None``) the failure stays log-only (pre-2026-06-08
+#: behavior — the silent gap this closes).
+OrderPlacementFailureAlertHook = Callable[[OrderPlacementFailureAlertDescriptor], Awaitable[None]]
+
+
 def _build_client_order_id(
     *,
     strategy_hash: str,
@@ -1932,6 +1967,7 @@ class OrderPlacementWorker:
         poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
         ibkr_call_timeout_seconds: float = DEFAULT_IBKR_CALL_TIMEOUT_SECONDS,
         position_unprotected_alert_hook: PositionUnprotectedAlertHook | None = None,
+        order_placement_failure_alert_hook: OrderPlacementFailureAlertHook | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._ibkr_client = ibkr_client
@@ -1952,6 +1988,12 @@ class OrderPlacementWorker:
         # skipped (with a structured WARNING in the worker log). Hook
         # owner: ``services/api/main.py`` lifespan startup.
         self._position_unprotected_alert_hook = position_unprotected_alert_hook
+        # Silent-failure follow-up (2026-06-08): optional P1 #alerts hook the
+        # dispatch loop invokes when an approved signal's order placement
+        # raises IbkrPlacementError (broker unavailable / contract rejection).
+        # When None the failure stays log-only (pre-2026-06-08 behavior).
+        # Hook owner: ``services/api/main.py`` lifespan startup.
+        self._order_placement_failure_alert_hook = order_placement_failure_alert_hook
         self._stop_event = asyncio.Event()
         self._order_status_subscribed = False
         # Tracks broker_order_ids we've already emitted a "fill" SSE for
@@ -1969,6 +2011,38 @@ class OrderPlacementWorker:
     def request_stop(self) -> None:
         """Signal the run_forever loop to exit at the next iteration boundary."""
         self._stop_event.set()
+
+    async def _emit_placement_failure_alert(
+        self, signal: ApprovedSignalRow, exc: IbkrPlacementError
+    ) -> None:
+        """Fire the order-placement-failure alert (P1 #alerts), if wired.
+
+        Fails open: any hook exception is caught + logged so an
+        alert-dispatch failure never blocks the worker's retry path. The
+        order failure itself is already logged via
+        ``order_placement_broker_unavailable`` + the signal stays
+        ``approved`` for the next poll. No-op when the hook is unwired.
+        """
+        hook = self._order_placement_failure_alert_hook
+        if hook is None:
+            return
+        # IbkrPlacementError is a frozen dataclass(Exception) with no
+        # ``args`` → ``str(exc)`` is empty; compose the reason from its
+        # structured fields so the alert carries the actual IBKR message
+        # (e.g. "qualifyContractsAsync: Error 200, No security definition...").
+        failure_reason = f"{exc.operation}: {exc.detail}"
+        try:
+            await hook(
+                OrderPlacementFailureAlertDescriptor(
+                    account_id=self._account_id,
+                    signal_id=signal.signal_id,
+                    market=signal.market,
+                    signal_type=signal.signal_type,
+                    failure_reason=failure_reason,
+                )
+            )
+        except Exception:
+            self._log.exception("order_placement_failure_alert_hook_failed")
 
     async def run_once(self) -> int:
         """Drain all currently-approved signals in one pass.
@@ -2043,6 +2117,10 @@ class OrderPlacementWorker:
                     signal_type=signal.signal_type,
                     error=str(exc),
                 )
+                # Silent-failure follow-up (2026-06-08): fire a P1 #alerts
+                # notification so a failed order on an approved signal is no
+                # longer silent. Fails open (never blocks the break/retry).
+                await self._emit_placement_failure_alert(signal, exc)
                 # Don't continue iterating — broker is down, fail fast.
                 break
         return placed
@@ -2659,6 +2737,8 @@ __all__ = [
     "BracketStopRow",
     "ExitClosePlan",
     "OrderPlacementError",
+    "OrderPlacementFailureAlertDescriptor",
+    "OrderPlacementFailureAlertHook",
     "OrderPlacementPlan",
     "OrderPlacementResult",
     "OrderPlacementWorker",
