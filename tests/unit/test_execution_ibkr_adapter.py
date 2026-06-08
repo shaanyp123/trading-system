@@ -1086,6 +1086,31 @@ class TestResolveContract:
         ref = await client.resolve_contract("/MYM")
         assert ref.market == "/MYM"
         assert ref.multiplier == Decimal("0.5")
+        # /MYM lists on CBOT, not CME — the 2026-06-04 order failure.
+        assert ref.exchange == "CBOT"
+
+    async def test_resolve_per_market_futures_exchange(self) -> None:
+        """Each Phase 1 future resolves to its correct IBKR exchange.
+
+        /MYM is CBOT, /MGC is COMEX, /MCL is NYMEX; the rest are CME.
+        Mirrors bar_sync's ``PHASE1_UNIVERSE_METADATA``. Regression for the
+        2026-06-04 /MYM order failure: ``resolve_contract`` hardcoded
+        ``exchange="CME"`` for all micros, so ``qualifyContractsAsync`` hit
+        IBKR Error 200 for the CBOT/COMEX/NYMEX contracts and no order placed.
+        """
+        client = IbAsyncIbkrClient(ib_factory=_fake_ib_class())
+        expected = {
+            "/MES": "CME",
+            "/MNQ": "CME",
+            "/M2K": "CME",
+            "/MBT": "CME",
+            "/MYM": "CBOT",
+            "/MGC": "COMEX",
+            "/MCL": "NYMEX",
+        }
+        for market, exch in expected.items():
+            ref = await client.resolve_contract(market)
+            assert ref.exchange == exch, f"{market}: expected {exch}, got {ref.exchange}"
 
     async def test_resolve_mbt_has_fractional_btc_multiplier(self) -> None:
         """/MBT is 0.1 BTC per contract — pre-2026-05-27 the static resolve
