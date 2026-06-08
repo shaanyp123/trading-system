@@ -98,12 +98,26 @@ def _sparkline_svg(equity: npt.NDArray[np.float64], *, width: int = 600, height:
     )
 
 
-def _markdown(run_name: str, version: str, generated_at: datetime, rows: list[ReportRow]) -> str:
+def _markdown(
+    run_name: str,
+    version: str,
+    generated_at: datetime,
+    rows: list[ReportRow],
+    alerts: tuple[str, ...] = (),
+) -> str:
     lines = [
         f"# Research run: {run_name}",
         "",
         f"> {_BANNER}",
         "",
+    ]
+    if alerts:
+        lines += [
+            "> 🟥 **⚠ LIQUIDATION DETECTED — LEAN issued a margin-call / forced-liquidation order:**",
+            *[f"> {a}" for a in alerts],
+            "",
+        ]
+    lines += [
         f"- harness version: `{version}`",
         f"- generated: {generated_at.isoformat()}",
         f"- instruments: {len(rows)}",
@@ -122,13 +136,21 @@ def _markdown(run_name: str, version: str, generated_at: datetime, rows: list[Re
     return "\n".join(lines)
 
 
-def _html(run_name: str, version: str, generated_at: datetime, rows: list[ReportRow]) -> str:
+def _html(
+    run_name: str,
+    version: str,
+    generated_at: datetime,
+    rows: list[ReportRow],
+    alerts: tuple[str, ...] = (),
+) -> str:
     esc = html.escape
     parts = [
         "<!doctype html><html><head><meta charset='utf-8'>",
         f"<title>Research run: {esc(run_name)}</title>",
         "<style>body{font:14px/1.5 -apple-system,system-ui,sans-serif;margin:2rem;color:#1f2328}"
         ".banner{background:#fff8c5;border:1px solid #d4a72c;padding:.75rem 1rem;border-radius:6px}"
+        ".ruin{background:#ffebe9;border:2px solid #cf222e;color:#82071e;padding:.75rem 1rem;"
+        "border-radius:6px;margin:1rem 0;font-weight:600}"
         "table{border-collapse:collapse;width:100%;margin:1rem 0}"
         "th,td{border:1px solid #d0d7de;padding:.4rem .6rem;text-align:right}"
         "th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}"
@@ -136,12 +158,20 @@ def _html(run_name: str, version: str, generated_at: datetime, rows: list[Report
         ".muted{color:#656d76}</style></head><body>",
         f"<h1>Research run: {esc(run_name)}</h1>",
         f"<p class='banner'>{esc(_BANNER)}</p>",
+    ]
+    if alerts:
+        body = "⚠ LIQUIDATION DETECTED — LEAN issued a margin-call / forced-liquidation order:<br>"
+        body += "<br>".join(esc(a) for a in alerts)
+        parts.append(f"<div class='ruin'>{body}</div>")
+    parts.append(
         f"<p class='muted'>harness <code>{esc(version)}</code> · generated "
-        f"{esc(generated_at.isoformat())} · {len(rows)} instrument(s)</p>",
+        f"{esc(generated_at.isoformat())} · {len(rows)} instrument(s)</p>"
+    )
+    parts.append(
         "<table><thead><tr><th>Symbol</th><th>Strategy</th><th>Start</th><th>End</th>"
         "<th>Bars</th><th>Total return</th><th>CAGR</th><th>Max DD</th><th>P&amp;L</th>"
-        "</tr></thead><tbody>",
-    ]
+        "</tr></thead><tbody>"
+    )
     for r in rows:
         m = r.metrics
         parts.append(
@@ -161,13 +191,20 @@ def _html(run_name: str, version: str, generated_at: datetime, rows: list[Report
     return "".join(parts)
 
 
-def _result_json(run_name: str, version: str, generated_at: datetime, rows: list[ReportRow]) -> str:
+def _result_json(
+    run_name: str,
+    version: str,
+    generated_at: datetime,
+    rows: list[ReportRow],
+    alerts: tuple[str, ...] = (),
+) -> str:
     payload = {
         "run_name": run_name,
         "harness_version": version,
         "generated_at": generated_at.isoformat(),
         "resolution": "daily",
-        "authoritative": False,
+        "authoritative": bool(rows) and all(r.fill == "lean" for r in rows),
+        "liquidation_alerts": list(alerts),
         "instruments": [
             {
                 "symbol": r.symbol,
@@ -196,19 +233,24 @@ def write_report(
     harness_version: str,
     generated_at: datetime,
     rows: list[ReportRow],
+    alerts: tuple[str, ...] = (),
 ) -> Path:
     """Write ``report.md`` + ``report.html`` + ``result.json`` into ``run_dir``.
 
-    Returns the path to ``report.html`` (the operator-facing artifact).
+    ``alerts`` (e.g. LEAN-native margin-call summaries from the ``engine: lean``
+    path) render an impossible-to-miss RED banner (design §6.2). Returns the path
+    to ``report.html`` (the operator-facing artifact).
     """
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "report.md").write_text(
-        _markdown(run_name, harness_version, generated_at, rows), encoding="utf-8"
+        _markdown(run_name, harness_version, generated_at, rows, alerts), encoding="utf-8"
     )
     html_path = run_dir / "report.html"
-    html_path.write_text(_html(run_name, harness_version, generated_at, rows), encoding="utf-8")
+    html_path.write_text(
+        _html(run_name, harness_version, generated_at, rows, alerts), encoding="utf-8"
+    )
     (run_dir / "result.json").write_text(
-        _result_json(run_name, harness_version, generated_at, rows), encoding="utf-8"
+        _result_json(run_name, harness_version, generated_at, rows, alerts), encoding="utf-8"
     )
     return html_path
 

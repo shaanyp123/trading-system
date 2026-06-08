@@ -76,10 +76,14 @@ def test_end_to_end_metrics_are_correct(tmp_path: Path) -> None:
     assert by_symbol["/MES"]["metrics"]["pnl"] == pytest.approx(125.0)
 
 
-def test_lean_engine_points_to_p2(tmp_path: Path) -> None:
+def test_lean_engine_is_wired_not_stubbed(tmp_path: Path) -> None:
+    # engine=lean is no longer a P2 stub: it routes to run_lean → the reference
+    # run-spec builder, which (with no end date) surfaces the bounded-window guard.
+    # This proves the wiring without shelling out to a LEAN backend.
     root = _seed(tmp_path)
-    with pytest.raises(NotImplementedError, match="LEAN driver lands in P2"):
-        run(_cfg(root, engine="lean"), runs_dir=tmp_path / "runs")
+    cfg = _cfg(root, engine="lean", strategy={"ref": "donchian", "channel": 20})
+    with pytest.raises(ValueError, match=r"needs date_range\.end"):
+        run(cfg, runs_dir=tmp_path / "runs")
 
 
 def test_intraday_resolution_points_to_p5(tmp_path: Path) -> None:

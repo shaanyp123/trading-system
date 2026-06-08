@@ -22,6 +22,10 @@ from research.config.schema import RunConfig, load_run_config
 from research.data.contract_specs import get_spec
 from research.data.daily_loader import load_daily_series
 from research.eval.report import LeverageRow, ReportRow, write_leverage_report, write_report
+from research.eval.reproduce_v1 import build_v1_run_spec
+from research.lean.driver import run_backtest
+from research.lean.reference import REFERENCE_STRATEGIES, build_reference_run_spec
+from research.lean.results import ParsedLeanResult
 from research.risk.liquidation import estimate_intrabar_liquidation, margin_model_for
 from research.risk.metrics import compute_risk_metrics, summarize
 from research.risk.sizing_schemes import SizingScheme, simulate_sized_path
@@ -62,14 +66,12 @@ def _guard_phase(cfg: RunConfig) -> None:
         )
     if cfg.mode != "backtest":
         raise NotImplementedError(f"mode={cfg.mode!r}: live/paper-forward is P7.")
-    if cfg.engine == "lean":
-        raise NotImplementedError("engine='lean': the LEAN driver lands in P2.")
     if cfg.engine == "vbt":
         raise NotImplementedError(
             "engine='vbt': the vectorbt sweep lands in P4. Use engine='daily' for the "
             "numpy evaluator."
         )
-    if cfg.engine != "daily":
+    if cfg.engine not in ("daily", "lean"):
         raise ValueError(f"unsupported engine {cfg.engine!r}")
 
 
@@ -82,6 +84,8 @@ def run(cfg: RunConfig, *, runs_dir: Path = _DEFAULT_RUNS_DIR) -> Path:
             "on-disk LEAN bars (never the live trading_lean_data volume; see design "
             "§4.2)."
         )
+    if cfg.engine == "lean":
+        return run_lean(cfg, runs_dir=runs_dir)
     if _is_leverage_sweep(cfg):
         return run_leverage_sweep(cfg, runs_dir=runs_dir)
     strategy = _build_strategy(cfg)
@@ -240,6 +244,127 @@ def run_leverage_sweep(cfg: RunConfig, *, runs_dir: Path = _DEFAULT_RUNS_DIR) ->
         symbol=symbol,
         levels=len(rows),
         liquidation_detected=any(r.flagged for r in rows),
+        report=str(html_path),
+    )
+    return html_path
+
+
+def lean_ruin_alert(symbol: str, parsed: ParsedLeanResult) -> str | None:
+    """Return a ruin-banner line for ``symbol`` if the LEAN run shows ruin, else ``None``.
+
+    Ruin must be impossible to miss (design §6.2), and there are TWO independent
+    signals — the tag check alone is not enough:
+
+    * a LEAN-native margin-call / forced-liquidation order (``parsed.liquidated``,
+      detected by order tag); AND
+    * the equity curve crossing ``<= $0`` — at high leverage LEAN may simply run the
+      account negative and HALT the backtest WITHOUT emitting a tagged margin-call
+      order (observed: 50x /MES wiped equity to -$7k with zero tagged events).
+    """
+    equity = parsed.result.equity_curve
+    wiped = bool(equity.size) and bool(np.any(equity <= 0.0))
+    if not (parsed.liquidated or wiped):
+        return None
+    reasons: list[str] = []
+    if parsed.margin_events:
+        first = parsed.margin_events[0].event_date.isoformat()
+        reasons.append(f"{len(parsed.margin_events)} LEAN margin-call order(s) (first {first})")
+    if wiped:
+        reasons.append(f"equity wiped to ${parsed.result.final_equity:,.0f} (crossed <= $0)")
+    return f"{symbol}: " + "; ".join(reasons)
+
+
+def run_lean(cfg: RunConfig, *, runs_dir: Path = _DEFAULT_RUNS_DIR) -> Path:
+    """Authoritative LEAN backtest path (design D1, §4.3) — ``engine: lean``.
+
+    Drives REAL LEAN (the engine of record) over the on-disk bar COPY, isolated
+    (``--network none`` + POST stub — :mod:`research.lean.driver`), and normalizes
+    the output into the shared report. Reference strategies (``donchian`` /
+    ``buy_and_hold``) run the self-contained :class:`ResearchRunnerAlgorithm` over a
+    continuous future or ETF, one instrument each; ``v1_adapter`` runs the production
+    ``V1TrendFollowingAlgorithm`` as a single portfolio backtest.
+
+    LEAN-native margin-call / forced-liquidation orders surface as a RED report
+    banner (design §6.2). Raises :class:`research.lean.images.LeanUnavailableError`
+    (actionable) when no LEAN backend is available — the CLI operator sees the
+    message; the integration test skips. The numpy screen (``engine: daily``)
+    remains the fast, non-authoritative path.
+    """
+    if cfg.strategy_ref == "v1_adapter":
+        # V1 subscribes to its whole universe internally → ONE portfolio backtest.
+        # Its window is hard-coded in lean/v1_strategy.py initialize() and is NOT
+        # renderable, so date_range is ignored here (reproduce-V1 semantics).
+        _log.warning(
+            "research_lean_v1_window_fixed",
+            note="v1_adapter+lean runs V1's own hard-coded initialize() window; "
+            "cfg.date_range is ignored (parameterizing V1's window is a follow-up)",
+        )
+        specs = [build_v1_run_spec(cfg.data_root)]
+    elif cfg.strategy_ref in REFERENCE_STRATEGIES:
+        specs = [build_reference_run_spec(cfg, symbol) for symbol in cfg.universe]
+    else:
+        raise ValueError(
+            f"engine='lean' supports {(*REFERENCE_STRATEGIES, 'v1_adapter')}, "
+            f"got strategy.ref={cfg.strategy_ref!r}"
+        )
+
+    generated_at = datetime.now(UTC)
+    run_dir = runs_dir / generated_at.strftime("%Y%m%dT%H%M%SZ")
+    rows: list[ReportRow] = []
+    alerts: list[str] = []
+    for index, spec in enumerate(specs):
+        work_dir = run_dir / f"lean_{index:02d}_{spec.symbol.lstrip('/') or 'portfolio'}"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        # Force the raw-docker (lean_local) backend: it is the ONLY one that mounts
+        # our read-only data COPY at /Lean/Data (the CLI backend uses the CLI's own
+        # data folder) AND carries the isolation env. So both references and V1 use
+        # it — the production-faithful, data-wired path (design §4.3).
+        parsed = run_backtest(spec, work_dir=work_dir, backend="docker")
+        result = parsed.result
+        treatment = (
+            "continuous RAW · LEAN fills" if spec.symbol.startswith("/") else "RAW · LEAN fills"
+        )
+        rows.append(
+            ReportRow(
+                symbol=spec.symbol,
+                strategy_name=result.strategy_name,
+                start=result.dates[0],
+                end=result.dates[-1],
+                bars=len(result.dates),
+                # LEAN's result carries the equity curve, not the instrument price
+                # series — price columns are not parsed (a possible enhancement).
+                start_price=0.0,
+                end_price=0.0,
+                price_treatment=treatment,
+                fill=result.fill,
+                metrics=summarize(result),
+                equity_curve=result.equity_curve,
+            )
+        )
+        alert = lean_ruin_alert(spec.symbol, parsed)
+        if alert is not None:
+            alerts.append(alert)
+        _log.info(
+            "research_lean_instrument_evaluated",
+            symbol=spec.symbol,
+            bars=len(result.dates),
+            total_return=round(result.total_return, 6),
+            liquidated=alert is not None,
+        )
+
+    html_path = write_report(
+        run_dir,
+        run_name=cfg.name,
+        harness_version=__version__,
+        generated_at=generated_at,
+        rows=rows,
+        alerts=tuple(alerts),
+    )
+    _log.info(
+        "research_lean_run_complete",
+        run_name=cfg.name,
+        instruments=len(rows),
+        liquidation_detected=bool(alerts),
         report=str(html_path),
     )
     return html_path
