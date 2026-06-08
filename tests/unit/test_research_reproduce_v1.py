@@ -176,3 +176,22 @@ def test_build_v1_run_spec_is_isolated_and_uses_prod_inputs() -> None:
     # Live params pulled from the production lean.json.
     assert spec.parameters["LOOKBACK_DAYS_DONCHIAN"] == "60"
     assert spec.parameters["EFFICIENCY_RATIO_THRESHOLD"] == "0.20"
+
+
+def test_build_v1_run_spec_injects_backtest_window() -> None:
+    # start/end ⇒ the BACKTEST_START_DATE/END_DATE params V1 reads in initialize(),
+    # which is what lets the harness backtest the REAL V1 over a multi-year span.
+    spec = build_v1_run_spec(
+        Path("research/data/cache/lean_bars"), start=date(2023, 9, 1), end=date(2026, 6, 3)
+    )
+    assert spec.parameters["BACKTEST_START_DATE"] == "20230901"
+    assert spec.parameters["BACKTEST_END_DATE"] == "20260603"
+    assert spec.parameters["EFFICIENCY_RATIO_THRESHOLD"] == "0.20"  # prod params still present
+
+
+def test_build_v1_run_spec_omits_window_when_unset() -> None:
+    # No start/end ⇒ V1 falls back to its own default initialize() window (keys absent),
+    # so the existing reproduce-V1 path is unchanged.
+    spec = build_v1_run_spec(Path("research/data/cache/lean_bars"))
+    assert "BACKTEST_START_DATE" not in spec.parameters
+    assert "BACKTEST_END_DATE" not in spec.parameters

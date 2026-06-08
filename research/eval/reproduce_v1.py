@@ -281,6 +281,8 @@ def build_v1_run_spec(
     data_root: Path,
     *,
     parameters: dict[str, str] | None = None,
+    start: date | None = None,
+    end: date | None = None,
     v1_algorithm: Path = _V1_ALGORITHM,
     strategies_pkg: Path = _STRATEGIES_PKG,
 ) -> LeanRunSpec:
@@ -289,13 +291,22 @@ def build_v1_run_spec(
     Drives the REPO's ``lean/v1_strategy.py`` (a read-only input, not copied) with
     the live params from ``lean/lean.json`` and the ``strategies/`` package mounted.
     ``posts_to_api=True`` forces the docker backend + the isolation env so V1's
-    per-cycle POSTs never reach the prod api (design §9 P2). V1's backtest WINDOW is
-    its own hard-coded ``initialize()`` range — not renderable from here.
+    per-cycle POSTs never reach the prod api (design §9 P2).
+
+    ``start`` / ``end`` set V1's backtest window via the ``BACKTEST_START_DATE`` /
+    ``BACKTEST_END_DATE`` parameters (V1 reads them in ``initialize()``, defaulting to
+    its original hard-coded paper window when absent). This is what lets the harness
+    backtest the REAL V1 over any multi-year span.
     """
+    params = dict(parameters or load_production_v1_parameters())
+    if start is not None:
+        params["BACKTEST_START_DATE"] = start.strftime("%Y%m%d")
+    if end is not None:
+        params["BACKTEST_END_DATE"] = end.strftime("%Y%m%d")
     return LeanRunSpec(
         algorithm_type_name="V1TrendFollowingAlgorithm",
         algorithm_source=v1_algorithm,
-        parameters=parameters or load_production_v1_parameters(),
+        parameters=params,
         data_root=data_root,
         symbol="PORTFOLIO",  # V1 is multi-instrument; equity curve is account-level
         multiplier=1.0,
