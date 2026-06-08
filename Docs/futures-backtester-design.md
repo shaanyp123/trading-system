@@ -924,3 +924,96 @@ sizing schemes (and replaces the P1 drawdown's post-wipeout limitation with
 liquidation-aware ruin metrics); P4 adds walk-forward / sweep / anti-overfitting
 ranked on OOS; P5–P7 are DEFERRED (intraday ingest + sessions; tick; isolated
 live paper-forward) pending the operator taking up the intraday-data decision.
+
+---
+
+## Trust-with-Money Charter (post-#333, 2026-06-08)
+
+> **Status: the design's daily phases P1–P4 are MERGED + the V1 backtest-window
+> param (#333) is merged — the daily backtester is FEATURE-COMPLETE.** This charter
+> is the next-phase kickoff: the gaps between feature-complete and "trustworthy
+> enough to base real-money decisions on its verdicts." It is ~4 PRs in order, each:
+> build → real-engine validate → subagent review → address nits → update-branch → CI
+> green → merge. Commit early (never work only in `/tmp`). Use a git worktree off
+> latest `main`; do NOT disturb the main checkout. PAUSE at ⚠️ESCALATE points.
+
+**DONE (context, do not redo):** P1 #319, P2 #320, P3 #322, v1_adapter #325,
+authoritative `engine=lean` #330, P4 walk-forward/sweep #332, V1 backtest-window param
+#333 (`a4c4aee`). **Verified:** `engine=lean` + `ref=v1_adapter` runs the REAL V1
+(donchian + MA-200 trend + Kaufman ER gate) over any window — but V1 is **POST-ONLY
+(places no LEAN orders)**, so the LEAN equity is FLAT: it captures DECISIONS, not P&L.
+Reference strategies (donchian/buy_and_hold) via `research_runner` DO place orders +
+produce P&L.
+
+**Read first:** the memory note on this initiative (the arc + the POST-only finding +
+the G1/G2/G3 continuous-futures order gotchas solved in
+`research/lean/projects/research_runner.py`); §1 + §8 above (trust bridge — "the thing
+you backtest must BE the thing that trades"); `CLAUDE.md` + dev-guide §1.5/§2.2. The
+operator's box has the `trading-lean-local` image + a data snapshot at
+`research/data/cache/lean_bars` → validate against the REAL engine (~30s–2min/run).
+
+### PR A — Authoritative V1 P&L (HIGHEST VALUE: the real "how did V1 do over years")
+Problem: #333 gave multi-year V1 DECISIONS but a flat equity curve (V1 POSTs, places
+no LEAN orders). We need a real V1 equity curve / Sharpe / max-DD / ruin.
+**APPROACH: DECIDED — Approach A (operator, 2026-06-08).** In `lean/v1_strategy.py`, in
+BACKTEST mode ONLY (`not self.live_mode`), ALSO place LEAN market orders mirroring the
+signals V1 already computes — entries sized by V1's vol-target → integer contracts on
+the MAPPED front contract; exits per the existing exit pipeline — so LEAN computes
+fills + margin + P&L. Reuse the G1/G2/G3 continuous-futures order/roll mechanics from
+`research/lean/projects/research_runner.py`. This keeps the backtest IDENTICAL to the
+real V1 (no fork, no parity drift) — the trust-bridge principle. (Approach B — porting
+V1's logic into the runner — was REJECTED: it duplicates V1 and adds a parity-
+maintenance burden.)
+⚠️ **LIVE-FILE / GOVERNANCE:** this edits the live strategy. It MUST be provably
+backtest-only (live mode places NO orders, behavior byte-for-byte unchanged), with a
+live-safety unit test (mirror #333's `_parse_backtest_date` test + the
+`test_lean_live_positions.py` `AlgorithmImports` stub) + subagent review + operator
+sign-off before merge. `lean/` is lint-excluded — `py_compile` it + validate on the
+real engine. Do NOT auto-merge a live-strategy change.
+Acceptance: a real V1 backtest over 2023-09→2026-06 (existing micro data) produces a
+NON-flat equity curve with trades, Sharpe, max-DD, and LEAN-native ruin surfacing;
+prod live behavior provably unchanged (live places no orders) + a live-safety test.
+
+### PR B — Cost / fill fidelity (every P&L number — incl. V1's new one — depends on it)
+Confirm LEAN's IB-margin commission + slippage match real IBKR micro-futures costs
+(≈ $0.25–0.85/contract incl. fees; slippage ≈ ~1 tick) for `research_runner` AND V1.
+If off, set an explicit documented fee/slippage model; surface the assumed cost/
+contract + slippage in the report header; unit-test the per-contract commission.
+Acceptance: a backtest's reported commission/round-trip matches IBKR micro reality
+within a stated tolerance; slippage assumption reported, not hidden.
+
+### PR C — Deep multi-year PARENTS history (extends V1 P&L + powers walk-forward)
+Walk-forward + a multi-decade V1 backtest need years across regimes (2008/2020/2022);
+the snapshot is ~3yr micros / ~1yr ETFs. Decision made: PARENTS (ES/NQ/RTY/YM/GC/BTC,
+decades) for the long lookback, micros for the recent live-aligned period.
+Build: parent↔micro map in `research/data/contract_specs.py`; source + ingest deep
+DAILY parent bars into the on-disk cache (reuse `services/data/map_file_synthesis.py`
+for rolls/map_files; offline, idempotent, cached); validate coverage + probe a price.
+⚠️ESCALATE the data SOURCE + cost (candidates: `lean data download` from the QC
+dataset; a small Databento daily backfill; or LEAN free sample if deep enough) and
+WAIT for operator go before purchasing.
+Acceptance: a walk-forward (or V1 backtest) on a parent spans ≥ 10yr with several OOS
+folds crossing 2020 + 2022; the multiple-testing null is over a real sample.
+
+### PR D — Quantify + tighten the V1↔live trust bridge (now that V1 runs multi-year)
+Re-run `reproduce_v1` over a single-param-hash aligned window; MEASURE the decision
+match rate + DOCUMENT the residual & why (POST-not-orders, no position feedback in
+backtest, per-signal param hash). OPTIONALLY improve via POST-body capture (capture
+V1's POSTed decisions incl. short side) — only if clean; else document the bound.
+Acceptance: the V1 reproduction match rate has a stated error bar.
+
+### PR E — Exercise the graduation pipeline once, end-to-end (proves governance, D6)
+The "research feeds governance" bridge (D6) has never run. Prove it with a
+DELIBERATELY SAFE candidate (re-affirm current params or a tiny justified tweak):
+research report + LEAN backtest-delta artifact → `strategies/**` PR → full cycle.
+⚠️ GOVERNANCE: `strategies/**` REQUIRES the `risk-review-approved` label (operator-
+applied, never self-applied) + ultrareview; live strategy code → operator sign-off
+mandatory. Write the repeatable graduation runbook as you go.
+Acceptance: one change has traversed research → PR (w/ backtest delta) →
+risk-review-approved → merge; the graduation runbook is documented.
+
+**When A–E land:** the backtester can show an authoritative MULTI-YEAR, MULTI-REGIME
+P&L for the real strategy with honest costs + ruin, a quantified trust bridge, and a
+proven path to production — trustworthy enough to risk money on its verdicts. (Intraday
+P5–P7 stays DEFERRED; the live-money cutover itself follows
+`Docs/live-money-cutover-plan.md` and is a separate operator decision.)
