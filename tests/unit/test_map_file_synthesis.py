@@ -42,6 +42,7 @@ from datetime import date
 from pathlib import Path
 
 import pytest
+from structlog.testing import capture_logs
 
 from services.data import map_file_synthesis as mfs
 from services.data.map_file_synthesis import (
@@ -417,6 +418,59 @@ class TestDetectRealRolls:
             yield UniverseSession(session_date=date(2026, 1, 2), expiry="E1")
 
         assert detect_real_rolls(gen(), persistence_days=1) == []  # type: ignore[arg-type]
+
+    # --- Live-edge rule (Step 2b): the most-recent run is ALWAYS honored even
+    # below persistence_days, so the continuous never strands on an expired
+    # contract. Regression for the 2026-06 /MBT staleness.
+
+    def test_live_edge_fresh_roll_honored_below_persistence(self) -> None:
+        # 30 stable sessions of E1 → 4 fresh sessions of E2 (< persistence=15).
+        # PRE-FIX: the 4-session run was dropped → 0 rolls → continuous pinned
+        # to E1 (which has since expired). POST-FIX: the live edge is honored.
+        sessions = _make_sessions([("202605", 30), ("202606", 4)])
+        rolls = detect_real_rolls(sessions, persistence_days=15)
+        assert len(rolls) == 1
+        assert rolls[0].from_expiry == "202605"
+        assert rolls[0].to_expiry == "202606"
+        # Boundary date is the FIRST session of the fresh (live-edge) run.
+        assert rolls[0].boundary_date == sessions[30].session_date
+        # The short run's length is recorded as-is (observability).
+        assert rolls[0].persisted_sessions == 4
+
+    def test_mbt_monthly_roll_regression(self) -> None:
+        # The exact shape of the 2026-06 /MBT bug: a long stable prior run
+        # (202605, 31 sessions) followed by the fresh monthly roll (202606,
+        # 8 sessions < 15). The fresh roll MUST appear so LEAN resolves to the
+        # live June contract instead of serving the expired May contract's bar.
+        sessions = _make_sessions([("202604", 22), ("202605", 31), ("202606", 8)])
+        rolls = detect_real_rolls(sessions, persistence_days=15)
+        assert len(rolls) == 2
+        assert (rolls[0].from_expiry, rolls[0].to_expiry) == ("202604", "202605")
+        assert (rolls[1].from_expiry, rolls[1].to_expiry) == ("202605", "202606")
+
+    def test_interior_noise_dropped_but_live_edge_honored(self) -> None:
+        # Interior noise (202605, 3 sessions) is still filtered; only the
+        # live-edge run (202606, 4 sessions) survives the sub-threshold rule.
+        # Result: a single roll straight from the prior stable run to the
+        # live edge, skipping the interior blip.
+        sessions = _make_sessions([("202604", 20), ("202605", 3), ("202606", 4)])
+        rolls = detect_real_rolls(sessions, persistence_days=15)
+        assert len(rolls) == 1
+        assert (rolls[0].from_expiry, rolls[0].to_expiry) == ("202604", "202606")
+
+    def test_live_edge_flip_back_emits_no_spurious_roll(self) -> None:
+        # The live edge flips back to the prior stable contract for 1 session
+        # (E1[30] → E2[3 noise] → E1[1]). Honoring the live edge must NOT
+        # manufacture a roll: the appended same-expiry run is skipped by the
+        # same-expiry guard, so the continuous stays correctly on E1.
+        sessions = _make_sessions([("202605", 30), ("202606", 3), ("202605", 1)])
+        assert detect_real_rolls(sessions, persistence_days=15) == []
+
+    def test_live_edge_single_short_run_no_roll(self) -> None:
+        # A single sub-threshold run (brand-new ticker) is force-kept but
+        # cannot form a transition on its own — no roll, no crash.
+        sessions = _make_sessions([("202606", 4)])
+        assert detect_real_rolls(sessions, persistence_days=15) == []
 
 
 # ---------------------------------------------------------------------------
@@ -1083,6 +1137,72 @@ class TestSynthesizeFuturesMapFile:
         )
         assert len(lax.rolls) == 1
         assert len(strict.rolls) == 0
+
+    def test_live_edge_roll_present_in_map_file(self, tmp_path: Path) -> None:
+        # End-to-end regression for the 2026-06 /MBT staleness: a long stable
+        # prior contract (202605) + a fresh sub-threshold live-edge roll
+        # (202606, 4 sessions). The synthesized map_file's END SENTINEL — what
+        # LEAN's continuous resolver carries forward to "now" — must map to the
+        # LIVE June contract, not the (now-expired) May contract.
+        universe_dir = tmp_path / "future" / "cme" / "universes" / "mbt"
+        sessions = _make_sessions([("202605", 30), ("202606", 4)], start_date=date(2026, 5, 1))
+        for s in sessions:
+            _write_universe_file(
+                universe_dir=universe_dir, session_date=s.session_date, expiry=s.expiry
+            )
+        result = synthesize_futures_map_file(
+            data_root=tmp_path, ticker="MBT", market_dir="cme", market_code="CME"
+        )
+        assert len(result.rolls) == 1
+        assert result.rolls[-1].to_expiry == "202606"
+        sid_live = compute_future_sid_hash(
+            expiry_date=compute_future_expiry(ticker="MBT", contract_month="202606"),
+            market_dir="cme",
+        )
+        sid_expired = compute_future_sid_hash(
+            expiry_date=compute_future_expiry(ticker="MBT", contract_month="202605"),
+            market_dir="cme",
+        )
+        assert sid_live != sid_expired
+        content = result.map_file_path.read_text(encoding="utf-8")
+        # End sentinel carries the LIVE contract's SID, not the expired one.
+        assert content.splitlines()[-1] == f"20501231,mbt {sid_live},CME,2"
+        assert sid_expired not in content.splitlines()[-1]
+
+    def test_fresh_front_month_no_warning(self, tmp_path: Path) -> None:
+        # Healthy case: the latest session's front month has not yet expired →
+        # the stale-front-month guard stays silent.
+        universe_dir = tmp_path / "future" / "cme" / "universes" / "mbt"
+        sessions = _make_sessions([("202605", 30), ("202606", 4)], start_date=date(2026, 5, 1))
+        for s in sessions:
+            _write_universe_file(
+                universe_dir=universe_dir, session_date=s.session_date, expiry=s.expiry
+            )
+        with capture_logs() as logs:
+            synthesize_futures_map_file(
+                data_root=tmp_path, ticker="MBT", market_dir="cme", market_code="CME"
+            )
+        assert not any(e.get("event") == "futures_map_file_front_month_expired" for e in logs)
+
+    def test_stale_front_month_emits_warning(self, tmp_path: Path) -> None:
+        # Upstream staleness the live-edge rule cannot fix: bar_sync recorded an
+        # ALREADY-EXPIRED contract as the latest front month. /MBT 202601
+        # expires 2026-01-30 (last Friday of Jan); a session dated 2026-03-02
+        # carrying 202601 is past-expiry → the guard must warn so the condition
+        # is observable per-cycle instead of silently mispricing for weeks.
+        universe_dir = tmp_path / "future" / "cme" / "universes" / "mbt"
+        for d in (date(2026, 2, 26), date(2026, 2, 27), date(2026, 3, 2)):
+            _write_universe_file(universe_dir=universe_dir, session_date=d, expiry="202601")
+        with capture_logs() as logs:
+            result = synthesize_futures_map_file(
+                data_root=tmp_path, ticker="MBT", market_dir="cme", market_code="CME"
+            )
+        warnings = [e for e in logs if e.get("event") == "futures_map_file_front_month_expired"]
+        assert len(warnings) == 1
+        assert warnings[0]["front_month_expiry"] == "202601"
+        assert warnings[0]["front_month_last_trading_date"] == "2026-01-30"
+        # Guard is warn-only — the map_file is still written.
+        assert result.map_file_path.exists()
 
     def test_emit_sid_hash_false_falls_back_to_bare_permtick(self, tmp_path: Path) -> None:
         # PR #222's pre-fix output via the explicit knob.
