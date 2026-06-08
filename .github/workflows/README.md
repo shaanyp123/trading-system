@@ -16,12 +16,14 @@ This README documents `ci.yml`. The forbidden-paths workflow is small and self-d
 | Change type | Jobs that run | Approx wall time |
 |---|---|---|
 | Docs-only (`Docs/**`, `**.md`, `LICENSE`, etc.) | precheck + lint + dep-drift + gitleaks + ci-gate | ~30s |
-| Backend Python (one service touched) | + typecheck + test + that service's docker build | ~5m |
+| Backend Python (api-bundled source: `services/**`, `infrastructure/**`, `strategies/**`, `alembic/**`, `scripts/**`) | + typecheck + test + `docker-build-api` + any other touched service's docker build | ~5-6m |
 | Frontend only (`apps/web/**`) | + frontend-test + docker-build-web | ~3m |
 | Workflow self-modify (`ci.yml`) | All conditional jobs fire (full matrix) | ~18m |
 | `[skip ci]` in commit/PR | precheck + gitleaks + ci-gate | ~25s |
 
 The breakdown is intentional: every minute spent inspects something relevant to the change. Lint, dep-drift, and gitleaks run on every push because they're cheap (~30s combined) and they catch issues that don't correlate with file paths (formatting drift, dep table desync, secrets pasted into any file).
+
+**On a push to `main`,** an api-bundled source change additionally runs `docker-publish-api`, which pushes `ghcr.io/<owner>/trading-api:<sha>` + `:latest` so the VPS can `docker compose pull api`. That is why the `api` filter spans the whole image build context (every tree the Dockerfile COPYs), not just `services/api/**` — a narrower filter let `:latest` go stale when bundled code outside `services/api/**` changed (2026-06-08).
 
 ---
 
@@ -36,7 +38,8 @@ Computes two things and exposes them as outputs:
    - `workflow_self` — `.github/workflows/ci.yml` or `scripts/check_dockerfile_deps_against_pyproject.py`
    - `python_backend` — all Python source (`services/**`, `strategies/**`, `infrastructure/**`, `tests/**`, `scripts/**`, `alembic/**`, plus `pyproject.toml`, `Makefile`, `conftest.py`)
    - `frontend` — `apps/web/**` or `packages/**`
-   - `api`, `discord_bot`, `qc_adapter`, `webhook_pusher` — per-service Python source + `pyproject.toml`
+   - `api` — the api image's **full build context** (`services/**`, `infrastructure/**`, `strategies/**`, `alembic/**`, `alembic.ini`, `scripts/**`, `pyproject.toml`) — i.e. every tree `services/api/Dockerfile` COPYs into the image, **not** just `services/api/**`. Deliberately broad: it gates both `docker-build-api` (PR) and `docker-publish-api` (main push), and if it were narrower the published `:latest` would silently go stale whenever bundled-but-non-`api` code changed (root-caused 2026-06-08 — see the comment on the filter in `ci.yml`). Keep it in lockstep with the Dockerfile's COPY layers.
+   - `discord_bot`, `qc_adapter`, `webhook_pusher` — per-service Python source + `pyproject.toml` (build-only; these images are not published yet, so a narrow filter is correct for them)
 
 Every downstream job references these flags in its `if:` condition.
 
