@@ -60,6 +60,17 @@ class RunConfig:
     #: Cost model (``costs.model``) — ``ibkr`` (realistic IBKR commission/slippage,
     #: the default) or ``zero`` (clean comparison). Consumed by the LEAN engine path.
     costs_model: str = "ibkr"
+    #: P4 validity / walk-forward (``validity.scheme`` = ``walk_forward`` + integer
+    #: ``is_months`` / ``oos_months`` / optional ``step_months``). ``validity_scheme``
+    #: set ⇒ the run is an OOS-ranked sweep, not a single backtest.
+    validity_scheme: str | None = None
+    is_months: int | None = None
+    oos_months: int | None = None
+    step_months: int | None = None
+    #: P4 parameter grid (``strategy.sweep``: ``{param: [values]}``) swept per combo,
+    #: and the comparison ``benchmarks`` (strategy refs, e.g. ``buy_and_hold``).
+    strategy_sweep: dict[str, tuple[float, ...]] = field(default_factory=dict)
+    benchmarks: tuple[str, ...] = ()
 
 
 def _as_str(value: object, ctx: str) -> str:
@@ -127,6 +138,21 @@ def parse_run_config(raw: dict[str, object]) -> RunConfig:
         else None
     )
 
+    # P4 parameter grid (``strategy.sweep: {param: [values]}``) — absent for non-sweep runs.
+    sweep_grid_raw = strategy.get("sweep", {})
+    strategy_sweep: dict[str, tuple[float, ...]] = {}
+    if sweep_grid_raw:
+        grid = _require_mapping(sweep_grid_raw, "strategy.sweep")
+        for key, values in grid.items():
+            if not isinstance(values, list) or not values:
+                raise ValueError(f"strategy.sweep.{key} must be a non-empty list of values")
+            nums = tuple(
+                float(v) for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)
+            )
+            if not nums:
+                raise ValueError(f"strategy.sweep.{key} must contain numbers")
+            strategy_sweep[key] = nums
+
     # P3 sizing + leverage blocks (absent for P1/P2 fixed runs).
     sizing = _require_mapping(raw.get("sizing", {}), "sizing")
     sizing_scheme = _as_str(sizing["scheme"], "sizing.scheme") if "scheme" in sizing else None
@@ -153,6 +179,27 @@ def parse_run_config(raw: dict[str, object]) -> RunConfig:
     costs_model = _as_str(costs.get("model", "ibkr"), "costs.model")
     if costs_model not in ("ibkr", "zero"):
         raise ValueError(f"costs.model={costs_model!r} not in ('ibkr', 'zero')")
+
+    # P4 validity (walk-forward) block + comparison benchmarks (absent otherwise).
+    validity = _require_mapping(raw.get("validity", {}), "validity")
+    validity_scheme = (
+        _as_str(validity["scheme"], "validity.scheme") if "scheme" in validity else None
+    )
+    if validity_scheme is not None and validity_scheme != "walk_forward":
+        raise ValueError(f"validity.scheme={validity_scheme!r} not in ('walk_forward',)")
+
+    def _opt_int(mapping: dict[str, object], key: str) -> int | None:
+        value = mapping.get(key)
+        return int(value) if isinstance(value, int) and not isinstance(value, bool) else None
+
+    is_months = _opt_int(validity, "is_months")
+    oos_months = _opt_int(validity, "oos_months")
+    step_months = _opt_int(validity, "step_months")
+
+    benchmarks_raw = raw.get("benchmarks", [])
+    if not isinstance(benchmarks_raw, list):
+        raise ValueError("benchmarks must be a list of strategy refs")
+    benchmarks = tuple(_as_str(b, "benchmarks[]") for b in benchmarks_raw)
 
     starting_cash_raw = raw.get("starting_cash")
     starting_cash = (
@@ -186,6 +233,12 @@ def parse_run_config(raw: dict[str, object]) -> RunConfig:
         leverage_cap=leverage_cap,
         leverage_sweep=leverage_sweep,
         costs_model=costs_model,
+        validity_scheme=validity_scheme,
+        is_months=is_months,
+        oos_months=oos_months,
+        step_months=step_months,
+        strategy_sweep=strategy_sweep,
+        benchmarks=benchmarks,
     )
 
 

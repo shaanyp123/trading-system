@@ -11,6 +11,7 @@ House rule: no ``print`` / stdlib logging — structlog only (dev-guide §3.5).
 from __future__ import annotations
 
 import argparse
+import itertools
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -21,8 +22,17 @@ from research import __version__
 from research.config.schema import RunConfig, load_run_config
 from research.data.contract_specs import get_spec
 from research.data.daily_loader import load_daily_series
-from research.eval.report import LeverageRow, ReportRow, write_leverage_report, write_report
+from research.eval.compare import ComparisonRow, run_compare
+from research.eval.report import (
+    LeverageRow,
+    ReportRow,
+    write_leverage_report,
+    write_report,
+    write_validity_report,
+)
 from research.eval.reproduce_v1 import build_v1_run_spec
+from research.eval.sweep import Candidate, run_sweep
+from research.eval.walk_forward import generate_windows
 from research.lean.driver import run_backtest
 from research.lean.reference import REFERENCE_STRATEGIES, build_reference_run_spec
 from research.lean.results import ParsedLeanResult
@@ -86,6 +96,8 @@ def run(cfg: RunConfig, *, runs_dir: Path = _DEFAULT_RUNS_DIR) -> Path:
         )
     if cfg.engine == "lean":
         return run_lean(cfg, runs_dir=runs_dir)
+    if cfg.validity_scheme is not None:
+        return run_validity(cfg, runs_dir=runs_dir)
     if _is_leverage_sweep(cfg):
         return run_leverage_sweep(cfg, runs_dir=runs_dir)
     strategy = _build_strategy(cfg)
@@ -365,6 +377,130 @@ def run_lean(cfg: RunConfig, *, runs_dir: Path = _DEFAULT_RUNS_DIR) -> Path:
         run_name=cfg.name,
         instruments=len(rows),
         liquidation_detected=bool(alerts),
+        report=str(html_path),
+    )
+    return html_path
+
+
+def _build_swept_strategy(cfg: RunConfig, overrides: dict[str, float]) -> ResearchStrategy:
+    """Build the run's strategy with sweep overrides applied (reference strategies only)."""
+    if cfg.strategy_ref == "donchian":
+        channel = int(overrides.get("channel", cfg.channel or 20))
+        return DonchianBreakout(channel=channel, contracts=abs(cfg.contracts))
+    if cfg.strategy_ref == "buy_and_hold":
+        contracts = int(overrides.get("contracts", cfg.contracts))
+        return BuyAndHold(abs(contracts))
+    raise ValueError(
+        f"strategy.ref={cfg.strategy_ref!r} is not sweepable for validity "
+        "(use donchian or buy_and_hold; V1 has no free params on this path)"
+    )
+
+
+def _fmt_param(value: float) -> str:
+    return str(int(value)) if float(value).is_integer() else f"{value:g}"
+
+
+def _candidate_strategies(cfg: RunConfig) -> list[Candidate]:
+    """Cartesian product of ``strategy.sweep`` → labeled candidates (else the base strategy)."""
+    if not cfg.strategy_sweep:
+        return [Candidate(label=cfg.strategy_ref, strategy=_build_strategy(cfg))]
+    keys = sorted(cfg.strategy_sweep)
+    candidates: list[Candidate] = []
+    for combo in itertools.product(*(cfg.strategy_sweep[k] for k in keys)):
+        overrides = dict(zip(keys, combo, strict=True))
+        label = ", ".join(f"{k}={_fmt_param(v)}" for k, v in zip(keys, combo, strict=True))
+        candidates.append(Candidate(label=label, strategy=_build_swept_strategy(cfg, overrides)))
+    return candidates
+
+
+def _benchmark_candidates(cfg: RunConfig) -> list[Candidate]:
+    """Build the comparison benchmark strategies from ``cfg.benchmarks``."""
+    contracts = abs(cfg.contracts)
+    out: list[Candidate] = []
+    for ref in cfg.benchmarks:
+        if ref == "buy_and_hold":
+            out.append(Candidate("buy_and_hold", BuyAndHold(contracts)))
+        elif ref == "donchian":
+            channel = cfg.channel or 20
+            out.append(Candidate(f"donchian({channel})", DonchianBreakout(channel, contracts)))
+        elif ref == "v1_adapter":
+            out.append(Candidate("v1_adapter", V1Adapter()))
+        else:
+            raise ValueError(f"unknown benchmark ref {ref!r}")
+    return out
+
+
+def run_validity(cfg: RunConfig, *, runs_dir: Path = _DEFAULT_RUNS_DIR) -> Path:
+    """P4 walk-forward OOS-ranked sweep → a validity report (design §7, §9 P4).
+
+    Sweeps ``strategy.sweep`` over rolling IS/OOS windows on the fast numpy screen
+    (NON-authoritative — confirm the winner in LEAN, design D1), ranks combos on the
+    out-of-sample metric, surfaces IS→OOS degradation + a multiple-testing reality-
+    check, and compares the top candidate against ``benchmarks``. Single-instrument
+    (the first symbol; portfolio walk-forward is a later extension).
+    """
+    if cfg.is_months is None or cfg.oos_months is None:
+        raise ValueError("validity needs validity.is_months and validity.oos_months")
+    symbol = cfg.universe[0]
+    if len(cfg.universe) > 1:
+        _log.warning(
+            "research_validity_single_instrument",
+            evaluated=symbol,
+            ignored=list(cfg.universe[1:]),
+            note="walk-forward is per-instrument; run others separately",
+        )
+    spec = get_spec(symbol)
+    multiplier = float(spec.multiplier)
+    series = load_daily_series(
+        cfg.data_root, symbol, expiry=cfg.expiries.get(symbol), start=cfg.start, end=cfg.end
+    )
+    starting_cash = cfg.starting_cash if cfg.starting_cash is not None else 100_000.0
+    windows = generate_windows(
+        series.dates,
+        is_months=cfg.is_months,
+        oos_months=cfg.oos_months,
+        step_months=cfg.step_months,
+    )
+    if not windows:
+        raise ValueError(
+            f"no walk-forward windows fit {len(series)} bars ({series.start}..{series.end}) "
+            f"with is_months={cfg.is_months} + oos_months={cfg.oos_months}. Use a longer "
+            "date_range / deeper data or smaller windows (deep multi-year history is the "
+            "parents-for-history follow-up)."
+        )
+    candidates = _candidate_strategies(cfg)
+    sweep = run_sweep(
+        series, candidates, windows, multiplier=multiplier, starting_cash=starting_cash
+    )
+    comparison: tuple[ComparisonRow, ...] = ()
+    if cfg.benchmarks and sweep.best is not None:
+        best = next(c for c in candidates if c.label == sweep.best.label)
+        comparison = run_compare(
+            series,
+            best,
+            _benchmark_candidates(cfg),
+            multiplier=multiplier,
+            starting_cash=starting_cash,
+        )
+    generated_at = datetime.now(UTC)
+    run_dir = runs_dir / generated_at.strftime("%Y%m%dT%H%M%SZ")
+    html_path = write_validity_report(
+        run_dir,
+        run_name=cfg.name,
+        harness_version=__version__,
+        generated_at=generated_at,
+        symbol=symbol,
+        sweep=sweep,
+        comparison=comparison,
+    )
+    _log.info(
+        "research_validity_complete",
+        run_name=cfg.name,
+        symbol=symbol,
+        n_windows=len(windows),
+        n_candidates=len(candidates),
+        best=sweep.best.label if sweep.best else None,
+        likely_overfit=sweep.likely_overfit,
         report=str(html_path),
     )
     return html_path
