@@ -1,0 +1,33 @@
+# AUTHORITATIVE LEAN backtest — Donchian breakout over a CONTINUOUS micro future.
+#
+# Runs the REAL LEAN engine of record (design D1) via the generic
+# ResearchRunnerAlgorithm: LEAN stitches the continuous /MES contract from the
+# on-disk per-expiry bars (RAW + OPEN_INTEREST, exactly like production V1), fills
+# at the next session's open, and models IBKR maintenance margin + forced
+# liquidation. A margin call surfaces as a RED banner in the report (design §6.2).
+#
+#   make research RUN=research/config/examples/lean_donchian_futures.yaml
+#   → research/runs/<UTC-ts>/report.html  (+ the raw LEAN output under lean_00_MES/)
+#
+# Needs a LEAN backend: the `trading-lean-local` image (built from
+# infrastructure/lean_local/Dockerfile) OR `pip install lean` + Docker, AND a COPY
+# of the on-disk bars at data_root (NEVER the live trading_lean_data volume —
+# design §4.2). Absent either, the run fails loudly with what to install (never a
+# silent pass). See research/lean/README.
+#
+# This is the authoritative counterpart to v1_backtest.yaml's numpy screen: the
+# numpy path (engine: daily) is fast + single-expiry; this path is slower but
+# stitches multi-year continuous futures and uses LEAN's real fills/margin. Swap
+# `universe` to any single V1 market (/MNQ /MYM /M2K /MGC /MBT or an ETF), or
+# `strategy.ref` to buy_and_hold. For the production strategy use ref: v1_adapter
+# (runs lean/v1_strategy.py as a portfolio backtest; its window is V1's own).
+name: lean_donchian_mes
+engine: lean              # daily (numpy screen) | lean (authority) | vbt (P4)
+mode: backtest
+resolution: daily         # daily only until intraday is taken up (P5)
+universe: ["/MES"]
+date_range: { start: 2023-09-01, end: 2026-06-03 }
+starting_cash: 100000
+strategy: { ref: donchian, channel: 20, contracts: 1 }
+costs: { model: ibkr }    # ibkr (realistic commission/slippage) | zero (clean compare)
+data_root: research/data/cache/lean_bars

@@ -57,6 +57,9 @@ class RunConfig:
     #: ``leverage_sweep`` non-empty (or ``sizing_scheme`` set) routes to the sweep.
     leverage_cap: float | None = None
     leverage_sweep: tuple[float, ...] = ()
+    #: Cost model (``costs.model``) — ``ibkr`` (realistic IBKR commission/slippage,
+    #: the default) or ``zero`` (clean comparison). Consumed by the LEAN engine path.
+    costs_model: str = "ibkr"
 
 
 def _as_str(value: object, ctx: str) -> str:
@@ -146,6 +149,11 @@ def parse_run_config(raw: dict[str, object]) -> RunConfig:
         float(x) for x in sweep_raw if isinstance(x, (int, float)) and not isinstance(x, bool)
     )
 
+    costs = _require_mapping(raw.get("costs", {}), "costs")
+    costs_model = _as_str(costs.get("model", "ibkr"), "costs.model")
+    if costs_model not in ("ibkr", "zero"):
+        raise ValueError(f"costs.model={costs_model!r} not in ('ibkr', 'zero')")
+
     starting_cash_raw = raw.get("starting_cash")
     starting_cash = (
         float(starting_cash_raw) if isinstance(starting_cash_raw, (int, float)) else None
@@ -177,6 +185,7 @@ def parse_run_config(raw: dict[str, object]) -> RunConfig:
         sizing_params=sizing_params,
         leverage_cap=leverage_cap,
         leverage_sweep=leverage_sweep,
+        costs_model=costs_model,
     )
 
 
