@@ -1007,14 +1007,20 @@ class IbAsyncIbkrClient:
             ) from exc
 
     async def resolve_contract(self, market: str) -> IbkrContractRef:
-        """Resolve a market symbol (e.g., '/MES') to an IBKR contract.
+        """Resolve a market symbol (e.g., '/MES') to an IBKR contract ref.
 
         Phase 1 sub-universe is locked; markets not in the universe raise
-        ``KeyError``. The full implementation (front-month futures contract
-        selection via IBKR's contract-search API + the roll-calendar) is
-        deferred to Pivot-PR-C scope when reconciliation needs it
-        end-to-end. For Pivot-PR-B, this method returns a stub
-        ``IbkrContractRef`` with the market symbol and locked exchange.
+        ``KeyError``. Returns an ``IbkrContractRef`` carrying the market
+        symbol, the per-market IBKR primary exchange (CME/CBOT/COMEX/NYMEX
+        for futures, SMART for ETFs), and the contract multiplier.
+
+        Front-month contract selection is NOT done here: the placement path
+        builds a ``ContFuture`` from this ref and ``qualifyContractsAsync``
+        resolves it to the concrete front-month ``Future`` (see
+        ``_build_ib_contract`` + ``place_order``). ``ibkr_local_symbol`` is
+        left empty for futures for that reason. (The earlier Pivot-PR-C
+        ``reqContractDetails`` TODO is obsolete — qualify already does the
+        front-month resolution; only the per-market exchange was missing.)
         """
         if market in self._contract_cache:
             return self._contract_cache[market]
@@ -1022,12 +1028,32 @@ class IbAsyncIbkrClient:
         phase1_futures = {"/MES", "/MNQ", "/MYM", "/M2K", "/MGC", "/MCL", "/MBT"}
         phase1_etfs = {"TLT", "IEF", "SHY", "TIP"}
         if market in phase1_futures:
-            exchange = "CME"
-            # Pivot-PR-C will replace this with a real
-            # `ib.reqContractDetailsAsync(...)` lookup for the front-month
-            # contract. For now, the local_symbol is empty (the dispatcher
-            # treats this as "Pivot-PR-C will fix" and falls back to a
-            # market-aware lookup elsewhere if needed).
+            # Per-market IBKR primary exchange. Most Phase 1 micros list on
+            # CME, but /MYM is CBOT, /MGC is COMEX, /MCL is NYMEX. Mirrors
+            # bar_sync's canonical ``PHASE1_UNIVERSE_METADATA`` ``ibkr_exchange``
+            # (services/data/bar_sync.py) — the data path and the order path
+            # must agree. Hardcoding "CME" for ALL micros made
+            # ``qualifyContractsAsync`` raise IBKR Error 200 ("No security
+            # definition") for the non-CME micros — the 2026-06-04 first-ever
+            # /MYM order failed exactly this way (order_placement_broker_
+            # unavailable, no fill). Indexed (not ``.get(..., "CME")``) so a
+            # future added to ``phase1_futures`` without an exchange entry
+            # fails loud rather than silently mis-routing to CME.
+            exchange = {
+                "/MES": "CME",
+                "/MNQ": "CME",
+                "/MYM": "CBOT",
+                "/M2K": "CME",
+                "/MGC": "COMEX",
+                "/MCL": "NYMEX",
+                "/MBT": "CME",
+            }[market]
+            # local_symbol stays empty: the placement path builds a
+            # ``ContFuture(symbol, exchange)`` and ``qualifyContractsAsync``
+            # resolves it to the concrete front-month ``Future`` (see
+            # ``_build_ib_contract`` + ``place_order``). The earlier
+            # "Pivot-PR-C reqContractDetails" TODO is obsolete — qualify
+            # already does front-month resolution; only the exchange was wrong.
             local_symbol = ""
             #: Per-market futures multiplier. Most are integer dollar-per-point
             #: but /MYM is $0.50/pt and /MBT is 0.1 BTC per contract — must
