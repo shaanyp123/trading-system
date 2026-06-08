@@ -172,6 +172,17 @@ class AlertCategory(StrEnum):
     # snapshot, so the operator-facing effect is "same-day-fill false
     # breaks may reappear this cycle" — actionable but not P0.
     RECONCILIATION_DATA_SOURCE_DEGRADED = "reconciliation_data_source_degraded"
+    # Silent-failure follow-up (2026-06-08, P1). INSERTed by the
+    # ``order_placement_worker`` when an approved signal's IBKR order
+    # placement raises ``IbkrPlacementError`` — broker unavailable OR a
+    # contract rejection (e.g. the 2026-06-04 /MYM Error-200 wrong-exchange
+    # case fixed in #327). PREVIOUSLY SILENT: the worker logged
+    # ``order_placement_broker_unavailable`` + retried but fired no alert,
+    # so a failed order on an approved signal went unnoticed. P1-severity
+    # routing — ``#alerts`` only (no money at risk: the order simply didn't
+    # place + the signal stays ``approved`` for the next poll). No paired
+    # audit event (no state change — the orders row stays ``pending``).
+    ORDER_PLACEMENT_FAILED = "order_placement_failed"
 
 
 class ChannelName(StrEnum):
