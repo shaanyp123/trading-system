@@ -17,9 +17,14 @@ import math
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import numpy.typing as npt
+
+if TYPE_CHECKING:
+    from research.eval.compare import ComparisonRow
+    from research.eval.sweep import SweepReport
 
 
 @dataclass(frozen=True, slots=True)
@@ -509,6 +514,239 @@ def write_leverage_report(
     )
     (run_dir / "result.json").write_text(
         _leverage_result_json(run_name, harness_version, generated_at, symbol, rows),
+        encoding="utf-8",
+    )
+    return html_path
+
+
+# =========================================================================== #
+# P4 validity report (design §7) — rank on OOS, show degradation + the MT haircut
+# =========================================================================== #
+_VALIDITY_BANNER = (
+    "P4 validity report — RESEARCH-ONLY, NON-AUTHORITATIVE. Combos are ranked on "
+    "WALK-FORWARD OUT-OF-SAMPLE performance (never in-sample); IS→OOS degradation and "
+    "a multiple-testing reality-check are shown so a lucky/overfit winner is visible. "
+    "Confirm the top candidate in LEAN (the authority) before acting (design D1)."
+)
+
+
+def _fmt_score(x: float) -> str:
+    return f"{x:.3f}" if math.isfinite(x) else "n/a"
+
+
+def _mt_lines(sweep: SweepReport) -> list[str]:
+    """The multiple-testing reality-check sentences (design §7)."""
+    best = sweep.best
+    best_oos = _fmt_score(best.oos_score) if best else "n/a"
+    null = _fmt_score(sweep.expected_max_under_null)
+    verdict = (
+        "⚠ the best OOS score is WITHIN what random chance would produce over this many "
+        "trials — treat it as likely overfit, not an edge."
+        if sweep.likely_overfit
+        else "the best OOS score EXCEEDS the multiple-testing null — a tentative edge "
+        "(still confirm in LEAN)."
+    )
+    return [
+        f"Tried {sweep.n_trials} combo(s) over {sweep.n_oos_obs} OOS bar(s). "
+        f"Best OOS {sweep.metric_name} = {best_oos}; a pure-noise winner over "
+        f"{sweep.n_trials} trials would be expected to post ≈ {null}.",
+        verdict,
+    ]
+
+
+def _validity_markdown(
+    run_name: str,
+    version: str,
+    generated_at: datetime,
+    symbol: str,
+    sweep: SweepReport,
+    comparison: tuple[ComparisonRow, ...],
+) -> str:
+    lines = [f"# Validity / walk-forward sweep: {run_name}", "", f"> {_VALIDITY_BANNER}", ""]
+    if sweep.likely_overfit:
+        lines += ["> 🟥 **LIKELY OVERFIT** — " + _mt_lines(sweep)[0], ""]
+    lines += [
+        f"- harness version: `{version}`",
+        f"- generated: {generated_at.isoformat()}",
+        f"- instrument: {symbol}",
+        f"- ranked on: walk-forward OOS {sweep.metric_name}",
+        "",
+        "## Multiple-testing reality-check",
+        "",
+        *[f"- {line}" for line in _mt_lines(sweep)],
+        "",
+        f"## Candidates (ranked on OOS {sweep.metric_name})",
+        "",
+        f"| Rank | Params | IS {sweep.metric_name} | OOS {sweep.metric_name} | IS→OOS drop | Folds |",
+        "|---:|---|---:|---:|---:|---:|",
+    ]
+    for rank, row in enumerate(sweep.rows, start=1):
+        lines.append(
+            f"| {rank} | {row.label} | {_fmt_score(row.is_score)} | {_fmt_score(row.oos_score)} | "
+            f"{_fmt_score(row.degradation)} | {row.n_folds} |"
+        )
+    if comparison:
+        lines += [
+            "",
+            "## Vs benchmarks (full sample, normalized)",
+            "",
+            "| Strategy | Role | Total return | CAGR | Sharpe | Max DD |",
+            "|---|---|---:|---:|---:|---:|",
+        ]
+        for c in comparison:
+            lines.append(
+                f"| {c.label} | {c.role} | {_fmt_pct(c.total_return)} | {_fmt_pct(c.cagr)} | "
+                f"{_fmt_score(c.sharpe)} | {_fmt_dd(c.max_drawdown_pct)} |"
+            )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _validity_html(
+    run_name: str,
+    version: str,
+    generated_at: datetime,
+    symbol: str,
+    sweep: SweepReport,
+    comparison: tuple[ComparisonRow, ...],
+) -> str:
+    esc = html.escape
+    parts = [
+        "<!doctype html><html><head><meta charset='utf-8'>",
+        f"<title>Validity sweep: {esc(run_name)}</title>",
+        "<style>body{font:14px/1.5 -apple-system,system-ui,sans-serif;margin:2rem;color:#1f2328}"
+        ".banner{background:#fff8c5;border:1px solid #d4a72c;padding:.75rem 1rem;border-radius:6px}"
+        ".ruin{background:#ffebe9;border:2px solid #cf222e;color:#82071e;padding:.75rem 1rem;"
+        "border-radius:6px;margin:1rem 0;font-weight:600}"
+        ".mt{background:#ddf4ff;border:1px solid #54aeff;padding:.5rem 1rem;border-radius:6px;margin:1rem 0}"
+        "table{border-collapse:collapse;width:100%;margin:1rem 0}"
+        "th,td{border:1px solid #d0d7de;padding:.4rem .6rem;text-align:right}"
+        "th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}"
+        ".muted{color:#656d76}</style></head><body>",
+        f"<h1>Validity / walk-forward sweep: {esc(run_name)}</h1>",
+        f"<p class='banner'>{esc(_VALIDITY_BANNER)}</p>",
+    ]
+    if sweep.likely_overfit:
+        parts.append("<div class='ruin'>LIKELY OVERFIT — " + esc(_mt_lines(sweep)[0]) + "</div>")
+    parts.append(
+        f"<p class='muted'>harness <code>{esc(version)}</code> · generated "
+        f"{esc(generated_at.isoformat())} · {esc(symbol)} · ranked on walk-forward OOS "
+        f"{esc(sweep.metric_name)}</p>"
+    )
+    parts.append(
+        "<div class='mt'>" + "<br>".join(esc(line) for line in _mt_lines(sweep)) + "</div>"
+    )
+    header = (
+        f"<th>Rank</th><th>Params</th><th>IS {esc(sweep.metric_name)}</th>"
+        f"<th>OOS {esc(sweep.metric_name)}</th><th>IS&rarr;OOS drop</th><th>Folds</th>"
+    )
+    parts.append(f"<table><thead><tr>{header}</tr></thead><tbody>")
+    for rank, row in enumerate(sweep.rows, start=1):
+        parts.append(
+            f"<tr><td>{rank}</td><td>{esc(row.label)}</td><td>{_fmt_score(row.is_score)}</td>"
+            f"<td>{_fmt_score(row.oos_score)}</td><td>{_fmt_score(row.degradation)}</td>"
+            f"<td>{row.n_folds}</td></tr>"
+        )
+    parts.append("</tbody></table>")
+    if comparison:
+        parts.append("<h2>Vs benchmarks (full sample, normalized)</h2>")
+        parts.append(
+            "<table><thead><tr><th>Strategy</th><th>Role</th><th>Total return</th>"
+            "<th>CAGR</th><th>Sharpe</th><th>Max DD</th></tr></thead><tbody>"
+        )
+        for c in comparison:
+            parts.append(
+                f"<tr><td>{esc(c.label)}</td><td>{esc(c.role)}</td><td>{_fmt_pct(c.total_return)}</td>"
+                f"<td>{_fmt_pct(c.cagr)}</td><td>{_fmt_score(c.sharpe)}</td>"
+                f"<td>{_fmt_dd(c.max_drawdown_pct)}</td></tr>"
+            )
+        parts.append("</tbody></table>")
+    parts.append("</body></html>")
+    return "".join(parts)
+
+
+def _validity_result_json(
+    run_name: str,
+    version: str,
+    generated_at: datetime,
+    symbol: str,
+    sweep: SweepReport,
+    comparison: tuple[ComparisonRow, ...],
+) -> str:
+    payload = {
+        "run_name": run_name,
+        "harness_version": version,
+        "generated_at": generated_at.isoformat(),
+        "report_type": "validity_walk_forward",
+        "authoritative": False,
+        "symbol": symbol,
+        "ranked_on": f"walk_forward_oos_{sweep.metric_name}",
+        "multiple_testing": {
+            "n_trials": sweep.n_trials,
+            "n_oos_obs": sweep.n_oos_obs,
+            "expected_max_under_null": (
+                round(sweep.expected_max_under_null, 6)
+                if math.isfinite(sweep.expected_max_under_null)
+                else None
+            ),
+            "likely_overfit": sweep.likely_overfit,
+        },
+        "ranking": [
+            {
+                "rank": rank,
+                "params": row.label,
+                "is_score": round(row.is_score, 6) if math.isfinite(row.is_score) else None,
+                "oos_score": round(row.oos_score, 6) if math.isfinite(row.oos_score) else None,
+                "degradation": (
+                    round(row.degradation, 6) if math.isfinite(row.degradation) else None
+                ),
+                "n_folds": row.n_folds,
+            }
+            for rank, row in enumerate(sweep.rows, start=1)
+        ],
+        "benchmarks": [
+            {
+                "label": c.label,
+                "role": c.role,
+                "total_return": round(c.total_return, 8),
+                "cagr": round(c.cagr, 8) if math.isfinite(c.cagr) else None,
+                "sharpe": round(c.sharpe, 6) if math.isfinite(c.sharpe) else None,
+                "max_drawdown_pct": round(c.max_drawdown_pct, 8),
+            }
+            for c in comparison
+        ],
+    }
+    return json.dumps(payload, indent=2)
+
+
+def write_validity_report(
+    run_dir: Path,
+    *,
+    run_name: str,
+    harness_version: str,
+    generated_at: datetime,
+    symbol: str,
+    sweep: SweepReport,
+    comparison: tuple[ComparisonRow, ...] = (),
+) -> Path:
+    """Write the P4 validity ``report.{md,html}`` + ``result.json`` into ``run_dir``.
+
+    Candidates are ranked on walk-forward OOS; a blue multiple-testing note (and a RED
+    "LIKELY OVERFIT" banner when the best OOS score is within the null) keeps the
+    reader honest (design §7). Returns the path to ``report.html``.
+    """
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "report.md").write_text(
+        _validity_markdown(run_name, harness_version, generated_at, symbol, sweep, comparison),
+        encoding="utf-8",
+    )
+    html_path = run_dir / "report.html"
+    html_path.write_text(
+        _validity_html(run_name, harness_version, generated_at, symbol, sweep, comparison),
+        encoding="utf-8",
+    )
+    (run_dir / "result.json").write_text(
+        _validity_result_json(run_name, harness_version, generated_at, symbol, sweep, comparison),
         encoding="utf-8",
     )
     return html_path
