@@ -204,6 +204,21 @@ def _coerce_bool_param(value) -> bool:  # noqa: ANN001 — LEAN dict[str, str] s
     return str(value).strip().lower() == "true"
 
 
+def _parse_backtest_date(token, default_y, default_m, default_d):  # noqa: ANN001 — LEAN str surface
+    """Parse a ``YYYYMMDD`` backtest-window parameter, else the default (y, m, d).
+
+    BACKTEST-ONLY: LEAN ignores ``set_start_date`` / ``set_end_date`` in live mode,
+    so this knob is inert in production. A missing / malformed token falls back to
+    the default, so a bad param can never silently shift the window to an
+    unparseable date — it reproduces the original hard-coded paper window. Lets the
+    research harness backtest any window without editing this file again.
+    """
+    token = (token or "").strip()
+    if len(token) == 8 and token.isdigit():
+        return int(token[:4]), int(token[4:6]), int(token[6:8])
+    return default_y, default_m, default_d
+
+
 def _position_from_api_row(row) -> Position:  # noqa: ANN001 — JSON dict from the api; untyped on purpose
     """Map one ``GET /api/internal/lean/positions`` item → strategy ``Position`` (PR-A2).
 
@@ -274,8 +289,18 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
             )
 
         # Backtest window (only relevant in backtest mode; live mode ignores).
-        self.set_start_date(2026, 5, 1)
-        self.set_end_date(2026, 12, 31)
+        # Overridable via BACKTEST_START_DATE / BACKTEST_END_DATE (YYYYMMDD) so the
+        # research harness can backtest any window; DEFAULTS reproduce the original
+        # hard-coded paper window, so production (which sets neither param) is
+        # byte-for-byte unchanged.
+        start_y, start_m, start_d = _parse_backtest_date(
+            self.get_parameter("BACKTEST_START_DATE"), 2026, 5, 1
+        )
+        end_y, end_m, end_d = _parse_backtest_date(
+            self.get_parameter("BACKTEST_END_DATE"), 2026, 12, 31
+        )
+        self.set_start_date(start_y, start_m, start_d)
+        self.set_end_date(end_y, end_m, end_d)
         self.set_cash(int(params["STARTING_CASH_USD"]))
         self.set_time_zone("America/New_York")
         self.set_benchmark("SPY")

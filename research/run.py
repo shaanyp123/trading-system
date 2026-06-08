@@ -311,14 +311,9 @@ def run_lean(cfg: RunConfig, *, runs_dir: Path = _DEFAULT_RUNS_DIR) -> Path:
     """
     if cfg.strategy_ref == "v1_adapter":
         # V1 subscribes to its whole universe internally → ONE portfolio backtest.
-        # Its window is hard-coded in lean/v1_strategy.py initialize() and is NOT
-        # renderable, so date_range is ignored here (reproduce-V1 semantics).
-        _log.warning(
-            "research_lean_v1_window_fixed",
-            note="v1_adapter+lean runs V1's own hard-coded initialize() window; "
-            "cfg.date_range is ignored (parameterizing V1's window is a follow-up)",
-        )
-        specs = [build_v1_run_spec(cfg.data_root)]
+        # The window flows through BACKTEST_START_DATE/END_DATE params (V1 reads them
+        # in initialize()), so date_range now drives a real multi-year V1 backtest.
+        specs = [build_v1_run_spec(cfg.data_root, start=cfg.start, end=cfg.end)]
     elif cfg.strategy_ref in REFERENCE_STRATEGIES:
         specs = [build_reference_run_spec(cfg, symbol) for symbol in cfg.universe]
     else:
