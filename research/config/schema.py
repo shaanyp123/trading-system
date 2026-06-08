@@ -146,12 +146,12 @@ def parse_run_config(raw: dict[str, object]) -> RunConfig:
         for key, values in grid.items():
             if not isinstance(values, list) or not values:
                 raise ValueError(f"strategy.sweep.{key} must be a non-empty list of values")
-            nums = tuple(
-                float(v) for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)
-            )
-            if not nums:
-                raise ValueError(f"strategy.sweep.{key} must contain numbers")
-            strategy_sweep[key] = nums
+            for v in values:
+                # bool is an int subclass — reject it explicitly so a stray `true`
+                # isn't silently coerced/dropped (cf. strategy.contracts handling).
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                    raise ValueError(f"strategy.sweep.{key} values must be numbers, got {v!r}")
+            strategy_sweep[key] = tuple(float(v) for v in values)
 
     # P3 sizing + leverage blocks (absent for P1/P2 fixed runs).
     sizing = _require_mapping(raw.get("sizing", {}), "sizing")

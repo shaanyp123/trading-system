@@ -83,6 +83,13 @@ def _guard_phase(cfg: RunConfig) -> None:
         )
     if cfg.engine not in ("daily", "lean"):
         raise ValueError(f"unsupported engine {cfg.engine!r}")
+    if cfg.validity_scheme is not None and cfg.engine != "daily":
+        # The walk-forward sweep runs on the fast numpy screen (design D2); pairing it
+        # with engine: lean would silently ignore the sweep. Reject rather than no-op.
+        raise NotImplementedError(
+            f"validity (walk-forward sweep) runs on engine: daily, not engine={cfg.engine!r}. "
+            "Sweep on the numpy screen, then confirm the winning combo in engine: lean."
+        )
 
 
 def run(cfg: RunConfig, *, runs_dir: Path = _DEFAULT_RUNS_DIR) -> Path:
