@@ -103,8 +103,26 @@ jobs:
             frontend:
               - 'apps/web/**'
               - 'packages/**'
+            # The api image (services/api/Dockerfile) is built from the repo
+            # ROOT and COPYs the FULL backend source surface into the image —
+            # NOT just services/api/**. This filter MUST track that surface
+            # (the Dockerfile's COPY layers) or main-push publishes silently
+            # skip when bundled-but-non-api code changes, leaving
+            # ghcr.io/<owner>/trading-api:latest STALE. Root-caused 2026-06-08:
+            # PRs #326/#327/#328 touched services/data, services/execution, and
+            # scripts/operator_tools — all bundled into the image, none under
+            # services/api/** — so docker-publish-api skipped on those main
+            # pushes and the paper host had to fall back to a local build.
+            # Keep this list in lockstep with services/api/Dockerfile's COPYs.
+            # (research/, tests/, Makefile, conftest.py are intentionally
+            #  EXCLUDED — they are not COPYed into the image.)
             api:
-              - 'services/api/**'
+              - 'services/**'
+              - 'infrastructure/**'
+              - 'strategies/**'
+              - 'alembic/**'
+              - 'alembic.ini'
+              - 'scripts/**'
               - 'pyproject.toml'
             discord_bot:
               - 'services/discord_bot/**'
