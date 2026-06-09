@@ -67,6 +67,15 @@ _CONTAINER_ALGO_DIR: Final = "/Lean/Algorithm"
 _CONTAINER_ALGO_FILE: Final = f"{_CONTAINER_ALGO_DIR}/v1_strategy.py"  # entrypoint hard-codes this
 _CONTAINER_CONFIG: Final = f"{_CONTAINER_ALGO_DIR}/lean.json"  # entrypoint TEMPLATE_PATH
 _CONTAINER_STRATEGIES: Final = "/Lean/strategies"  # `strategies.*` package mount
+#: Where the repo ``services/`` tree is mounted (read-only) when a spec needs it.
+#: ``/Lean`` is already on the container PYTHONPATH (entrypoint.sh), but the
+#: backtest-order path loads ``services/risk/sizing.py`` by FILE PATH (importlib)
+#: rather than as ``services.risk.sizing`` — importing the package would run
+#: ``services/risk/__init__.py``, which pulls in sqlalchemy + ``services.audit``
+#: (absent in the LEAN image). Loading the single module file by path sidesteps
+#: that: ``sizing.py``'s own imports are numpy / structlog / ``strategies.*`` only,
+#: all present in the image. Used ONLY by the (backtest-only) V1 order path.
+_CONTAINER_SERVICES: Final = "/Lean/services"
 _CONTAINER_DATA: Final = "/Lean/Data"
 _CONTAINER_RESULTS: Final = "/Results"
 
@@ -99,6 +108,10 @@ class LeanRunSpec:
     multiplier: float
     strategy_name: str
     extra_package_mounts: tuple[Path, ...] = ()
+    #: Optional repo ``services/`` dir, mounted read-only at ``/Lean/services``.
+    #: Only the V1 backtest-order run needs it (to load ``services/risk/sizing.py``
+    #: by path for Stage 0-5 sizing); reference strategies leave it ``None``.
+    service_package_mount: Path | None = None
     starting_cash: float | None = None
     environment: str = "backtesting"
     #: Marks an algorithm that POSTs to the api (V1). Purely informational — the
@@ -172,6 +185,10 @@ def assemble_docker_run(
     ]
     for pkg in spec.extra_package_mounts:
         mounts.append(Mount(pkg.resolve(), _CONTAINER_STRATEGIES, read_only=True))
+    if spec.service_package_mount is not None:
+        mounts.append(
+            Mount(spec.service_package_mount.resolve(), _CONTAINER_SERVICES, read_only=True)
+        )
 
     return _Assembled(config_path=config_path, mounts=mounts, env=isolation_env())
 
