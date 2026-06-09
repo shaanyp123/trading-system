@@ -26,6 +26,45 @@ data mount is ALWAYS a read-only COPY (`research/data/cache/lean_bars`) — the 
 unit-tested invariants. **Never** run a research V1 backtest joined to the prod
 docker network.
 
+## Authoritative V1 P&L — the backtest-only order path (PR #335)
+
+The numpy / vbt screen (research/README.md) is a *daily screen*; LEAN is the
+authority for fills, stops, margin, and the equity curve (design D1). PR #335
+(2026-06-09, `a10013c`) makes that authoritative run the LIVE strategy itself:
+
+- **Mechanism.** In a research backtest (`not self.live_mode`), `lean/v1_strategy.py`
+  places real LEAN **market orders** mirroring its computed per-bar signals, sized by
+  the **production Stage 0-5 sizer** (`services/risk/sizing.py`, loaded by file path
+  inside the LEAN container — the harness mounts `services/` read-only). Orders fill
+  next-bar; the resulting equity curve, drawdown, and margin events are LEAN's, not a
+  reconstruction. Reconcile/roll logic lives in `_place_backtest_orders`.
+- **Production is byte-for-byte unchanged.** The path is gated by
+  `self._backtest_orders_enabled = not bool(self.live_mode)` (set once in
+  `initialize`, never mutated). In paper/live V1 stays POST-only and places **ZERO**
+  LEAN orders — a live-safety unit test (`tests/unit/test_v1_backtest_orders.py`)
+  locks that the order path is provably unreachable when `live_mode` is true.
+- **Isolation is identical to the POST path.** The acceptance run is `--network none`,
+  POST stub `http://127.0.0.1:9`, dummy non-empty bearer, read-only data COPY — never
+  the live `trading_lean_data` volume.
+
+**Acceptance (real engine, isolated container, 2023-09-01 → 2026-06-08):** 1013 bars,
+45 fills, 18 closed trades, **+4.10% total return**, Sharpe **−1.00**, max drawdown
+**6.30%**, **0 margin events**, NON-FLAT equity **$100k → $104,104**, realized vol
+**4.4% annualized**. Driver: `/tmp/v1_acceptance_run.py` (env `V1_START` / `V1_END` /
+`V1_TIMEOUT`); run from a worktree with `cwd` AND `PYTHONPATH` set to that worktree.
+
+**Follow-up findings (post-#335, in `Docs/futures-backtester-design.md` charter PR A
+follow-up):** the two roll nits were investigated — nit (a) `invested_since`-reset is
+*structurally inert* (the MIN_HOLDING gate reads a field LEAN doesn't populate, so it
+never engages); nit (b)'s one-bar chain-edge gap root-causes to a price-source artifact
+(the mapped front contract reads `.price == 0` for months, so the new leg can't be
+ordered on the close bar) — a real but *separate* price-source fix, out of scope for a
+roll-handler change. A READ-ONLY vol-deployment diagnostic explains the 4.4% « 15%
+target: V1 is flat ~66% of bars (median 1 concurrent position); the binding constraint
+is sparse time-in-market × the 25%/name cap at micro-contract granularity, **not** the
+portfolio gross 3.0× / net 1.5× caps. Tuning caps upward does nothing for flat days;
+the price-source fix (same root cause as nit b) is the higher-leverage lever.
+
 ## Operator acceptance (the real-engine gate)
 
 The code + parser + parity-logic + V1 cross-check are CI-green on committed fixtures

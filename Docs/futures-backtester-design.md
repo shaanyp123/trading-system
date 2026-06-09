@@ -952,7 +952,7 @@ you backtest must BE the thing that trades"); `CLAUDE.md` + dev-guide §1.5/§2.
 operator's box has the `trading-lean-local` image + a data snapshot at
 `research/data/cache/lean_bars` → validate against the REAL engine (~30s–2min/run).
 
-### PR A — Authoritative V1 P&L (HIGHEST VALUE: the real "how did V1 do over years")
+### PR A — Authoritative V1 P&L (HIGHEST VALUE: the real "how did V1 do over years") — ✅ DONE (#335, 2026-06-09)
 Problem: #333 gave multi-year V1 DECISIONS but a flat equity curve (V1 POSTs, places
 no LEAN orders). We need a real V1 equity curve / Sharpe / max-DD / ruin.
 **APPROACH: DECIDED — Approach A (operator, 2026-06-08).** In `lean/v1_strategy.py`, in
@@ -973,6 +973,70 @@ real engine. Do NOT auto-merge a live-strategy change.
 Acceptance: a real V1 backtest over 2023-09→2026-06 (existing micro data) produces a
 NON-flat equity curve with trades, Sharpe, max-DD, and LEAN-native ruin surfacing;
 prod live behavior provably unchanged (live places no orders) + a live-safety test.
+
+**✅ DONE — PR #335 (`a10013c`), merged 2026-06-09.** Backtest-only LEAN orders
+(`lean/v1_strategy.py::_place_backtest_orders`, master-gated `not self.live_mode`) sized
+by the real Stage 0-5 sizer (`services/risk/sizing.py`, loaded by file-path in-container;
+`services/` mounted read-only by `research/lean/driver.py`). Live path byte-for-byte
+unchanged (POST-only, zero LEAN orders); live-safety unit test in
+`tests/unit/test_v1_backtest_orders.py`. Real-engine acceptance 2023-09-01→2026-06-08
+(isolated container — `--network none`, POST stub `http://127.0.0.1:9`, dummy bearer,
+read-only data COPY `research/data/cache/lean_bars`): **1013 bars · 45 fills · 18 closed
+trades · +4.10% total return · Sharpe −1.00 · max-DD 6.30% · 0 margin events · non-flat
+equity $100k→$104,104 · realized vol 4.4%.**
+
+#### PR A follow-up (post-#335, 2026-06-09): roll nits + vol diagnostic
+Two roll nits and the vol-deployment question were chartered as PR-A follow-ups. After
+measurement, **no live-file change was warranted** — both nits resolve to "inert" or "real
+but unfixable in the roll handler," and the vol shortfall is not a sizing-cap problem.
+
+- **Roll nit (a) — `invested_since` reset on roll: STRUCTURALLY INERT, no fix.** The roll
+  re-opens the carried leg via `market_order`, restamping LEAN's `invested_since`. But the
+  MIN_HOLDING_DAYS gate never reads it in backtest: `_snapshot_position` sources
+  `opened_at_session_date` solely from `holding.invested_since`, absent in this LEAN build →
+  always `None` → the gate (`strategies/v1_trend_following/strategy.py`) is SKIPPED. Verified:
+  0 MIN_HOLDING rejections in the acceptance log; every trend exit held ≫14 days. Re-stamping
+  a value the gate ignores is a no-op; editing the live file for it adds risk for zero effect.
+
+- **Roll nit (b) — chain-edge exposure gap: REAL, but UNFIXABLE in the roll handler;
+  root-caused to a price-source artifact.** #335's handler closes the expiring leg and
+  re-opens the new front *only if it is priced* (`v1_roll_carried`, 4 of 13 rolls); else
+  close-only (`v1_roll_close_only`, 9 of 13). A prototyped "park the carry + restore when the
+  new front prices" fix produced a **byte-identical** curve (same 45 fills, same +4.10%) and
+  was reverted. Reason: on the index micros the *mapped front contract's* `.price` reads **0
+  for months** after a roll (`v1_backtest_order_skipped_zero_price`: /MNQ 631, /MYM 631, /MES
+  540, /MGC 363 of 1013 bars), during which the continuous re-rolls — so there is no priced
+  contract to carry onto and the parked key goes stale. The multi-month flats this causes
+  (e.g. /MGC flat 2024-10-30→2025-02-10 while gold ran 2781→2934) are a **price-source
+  artifact** (reading the mapped contract's `.price` instead of the continuous's), not a
+  handler bug — no handler logic can order a contract that has no price. **Recommended
+  follow-up (separate, properly-scoped PR):** source the backtest order path's price from the
+  continuous future (or add explicit front-month subscriptions / revisit the roll config),
+  then re-run acceptance — a material change to the live order path (moves the curve by
+  percentage points; changes sizing inputs + turnover) that needs its OWN acceptance +
+  risk-review, NOT a bundle with docs.
+
+- **Vol-deployment diagnostic — realized 4.4% vs `VOL_TARGET_PCT_ANNUAL` 15% (READ-ONLY;
+  `services/risk/sizing.py` untouched).** The BINDING constraint is NOT a portfolio cap.
+  From LEAN's own `Exposure` chart over the acceptance run:
+  - **Time-in-market dominates:** 66% of the 1013 bars are completely FLAT (gross < 0.01).
+    Concurrent open positions: median 1, mean 1.22, max 5 (0–1 positions two-thirds of the time).
+  - **When deployed, gross is modest:** mean 0.45×, median 0.28× — vs the **3.0× gross cap
+    (mean usage 0.15× = 5% of cap)** and **1.5× net cap** (grazed once, late, via an anomalous
+    bond-ETF short reaching ~1.8× notional → flag for the PR B cost/fill review). The
+    portfolio gross/net caps essentially **never bind**.
+  - **The 25% per-position cap × micro granularity is the real per-name throttle:** all 19
+    futures entries are ≥21% of $100k for a SINGLE contract (MNQ 49%, MGC 37–43%, MES 34–38%,
+    MYM 26%), so the vol-target-implied size (~3–4 contracts for 15% vol) is clipped to 1 —
+    integer-contract granularity even forces some single positions *over* 25%. At $100k the
+    account is too small to hold the micro universe diversified under 25%/name, and the
+    breakout + MA-200 + ER(0.20) gating (plus the price=0 skip artifact) rarely puts ≥3 names
+    in-trend-and-tradeable at once → time-averaged gross stays ~0.15×.
+  - **Arithmetic:** 15% × √(0.34 time-in-market) ≈ 8.7%, × (0.45× deployed gross / ~1.0×
+    needed) ≈ **4.4%** — matches the realized figure. **Lever order (before ANY parameter
+    tuning):** (1) fix the price=0 skip artifact (raises time-in-market — same root cause as
+    nit b); (2) more simultaneous diversifying trends, or a larger account so micros fit under
+    25%/name. Tuning vol-target or the caps UPWARD does nothing for the 66% of days that are flat.
 
 ### PR B — Cost / fill fidelity (every P&L number — incl. V1's new one — depends on it)
 Confirm LEAN's IB-margin commission + slippage match real IBKR micro-futures costs
