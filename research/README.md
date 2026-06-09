@@ -28,6 +28,7 @@ open research/runs/<UTC-ts>/report.html
 | **P2** | LEAN driver + §6.6 vbt↔LEAN parity + reproduce V1 | **built + real-engine accepted** (parity PASS + V1-repro PASS vs real LEAN 2026-06-04; see [`lean/README.md`](lean/README.md)) |
 | **P3** | leverage / margin / liquidation / ruin metrics + sizing schemes | **built** (`research/risk/`; `make research RUN=research/config/examples/p3_leverage_sweep.yaml` → ruin report with a RED liquidation banner) |
 | **V1 adapter** | backtest the PRODUCTION strategy (`strategy.ref: v1_adapter`) | **built** (`research/strategy/v1_adapter.py` replays the REAL V1 logic; `make research RUN=research/config/examples/v1_backtest.yaml`) |
+| **V1 P&L (LEAN-native)** | authoritative multi-year V1 equity curve — the LIVE `lean/v1_strategy.py` places real LEAN orders in a backtest, sized by the production Stage 0-5 engine | **built + accepted** (PR #335, 2026-06-09; see [`lean/README.md`](lean/README.md) "Authoritative V1 P&L") |
 | P4 | walk-forward + sweep (vectorbt) + anti-overfitting + comparison | planned |
 | P5–P6 | intraday minute/tick | **deferred** (daily-only per 2026-06-03 sign-off; no data vendor yet) |
 | P7 | isolated live paper-forward | planned |
@@ -49,7 +50,8 @@ To backtest a **new** daily strategy, add a `ResearchStrategy` subclass (the
 
 **Fidelity limits (numpy screen — LEAN is the authority for fills, design D1):**
 - V1's ATR protective stop is intrabar; the adapter approximates it close-based.
-  The authoritative fill/stop/margin run is the LEAN path (a follow-up).
+  The authoritative fill/stop/margin run is the **LEAN-native order path (landed
+  PR #335)** — see [`lean/README.md`](lean/README.md) "Authoritative V1 P&L".
 - The 200-day MA-slow warmup consumes most of a short single-series window (an ETF
   ~250 bars → ~50 tradeable; a single futures contract ~314 → ~114). A meaningful
   multi-year futures backtest needs the **continuous-contract LEAN path** (LEAN
