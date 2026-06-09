@@ -255,6 +255,126 @@ def _position_from_api_row(row) -> Position:  # noqa: ANN001 — JSON dict from 
     )
 
 
+# ---------------------------------------------------------------------------
+# Backtest-only Stage 0-5 sizing (Trust-with-Money charter PR A).
+#
+# In BACKTEST mode V1 places REAL LEAN orders so the run yields an authoritative
+# equity curve. It sizes them with the SAME canonical five-stage sizer the live
+# risk engine uses — ``services/risk/sizing.py`` — loaded BY FILE PATH inside the
+# LEAN container (``V1TrendFollowingAlgorithm._load_sizing_pipeline``; the package
+# ``__init__`` drags sqlalchemy + ``services.audit``, absent in the LEAN image, so
+# a normal import can't be used). This is NOT a re-implementation/fork: the sizer
+# is the production module. LIVE mode never reaches any of this — it POSTs
+# ``target_contracts=1`` and the server sizes.
+#
+# These pure module-level helpers build the sizer's NUMERIC inputs from the
+# cycle's ``BarSeries`` closes: an annualized return covariance (Stage 1
+# inverse-vol weighting + Stage 3 PSD repair / cluster shrink) and a per-market
+# momentum proxy (the Stage 3 non-convergence drop tiebreak). Matrix math is
+# numpy ``float64`` — the documented Decimals+numpy split (sizing.py module
+# docstring / anti-pattern A05): money stays ``Decimal``; only the covariance is
+# float64, exactly as ``services/risk/sizing.py`` itself does. Dependency-light
+# and pure → unit-tested outside the LEAN runtime (test_v1_backtest_orders.py).
+# ---------------------------------------------------------------------------
+_TRADING_DAYS_PER_YEAR = 252
+
+# Stage 3 cluster map — macro grouping per V1 market (mirrors the universe's
+# cluster assignment used by the sizer's Stage 3 cluster cap). The eventual live
+# wiring of Stage 0-5 will source this from the ``contracts`` table; here it is
+# pinned to the V1 universe. Markets absent here fall back to their own name as a
+# singleton cluster (no cluster sharing — the conservative default).
+_V1_CLUSTER_MAP = {
+    "/MES": "equity_index",
+    "/MNQ": "equity_index",
+    "/MYM": "equity_index",
+    "/M2K": "equity_index",
+    "/MGC": "commodity",
+    "/MCL": "commodity",
+    "/MBT": "crypto",
+    "TLT": "rates",
+    "IEF": "rates",
+    "SHY": "rates",
+    "TIP": "rates",
+}
+
+
+def _daily_returns_by_date(bars, lookback):  # noqa: ANN001 -- list[Bar]; LEAN runtime surface
+    """Simple daily returns over the last ``lookback`` window, keyed by date.
+
+    ``r_t = (c_t - c_{t-1}) / c_{t-1}`` as ``float`` — these feed the numpy
+    covariance matrix (the documented money-stays-Decimal / matrix-is-float64
+    split). Keyed by ``bar.session_date`` so :func:`_annualized_covariance` can
+    align markets on a listwise date intersection. A non-positive prior close
+    (bad data) skips that step. Returns ``{}`` when < 2 returns are available.
+    """
+    if not bars or lookback < 2:
+        return {}
+    # ``lookback`` returns need ``lookback + 1`` closes; take the tail window.
+    window = bars[-(lookback + 1):]
+    out: dict = {}
+    for i in range(1, len(window)):
+        prev = window[i - 1].close
+        if prev <= 0:
+            continue
+        out[window[i].session_date] = float((window[i].close - prev) / prev)
+    return out
+
+
+def _annualized_covariance(returns_by_market):  # noqa: ANN001 -- dict[str, dict[date, float]]
+    """Annualized return covariance over the listwise-common dates of all markets.
+
+    Returns ``(sigma_index, sigma_annual)`` — exactly the pair ``SizingInputs``
+    wants — where ``sigma_index`` is the tuple of SURVIVING markets (>= 2 aligned
+    returns AND positive sample variance over the common window) and
+    ``sigma_annual`` is the matching ``n x n`` numpy ``float64`` covariance scaled
+    by 252. Markets with too little overlap or a degenerate (zero-variance) window
+    are dropped — the sizer rejects non-positive diagonal variance, and the caller
+    sizes a dropped market 0 this cycle (reconciling next). Returns ``None`` when
+    fewer than two common dates remain or no market survives (caller sizes none).
+    """
+    import numpy as np
+
+    markets = [m for m, r in returns_by_market.items() if len(r) >= 2]
+    if not markets:
+        return None
+    common = set.intersection(*(set(returns_by_market[m]) for m in markets))
+    if len(common) < 2:
+        return None
+    dates = sorted(common)
+    rows: list = []
+    kept: list = []
+    for m in markets:
+        row = [returns_by_market[m][d] for d in dates]
+        if float(np.var(row, ddof=1)) <= 0.0:
+            continue  # constant stretch → the sizer rejects non-positive variance
+        rows.append(row)
+        kept.append(m)
+    if not kept:
+        return None
+    data = np.array(rows, dtype=np.float64)
+    if len(kept) == 1:
+        var = float(np.var(data[0], ddof=1)) * _TRADING_DAYS_PER_YEAR
+        return tuple(kept), np.array([[var]], dtype=np.float64)
+    cov = np.asarray(np.cov(data, ddof=1), dtype=np.float64) * _TRADING_DAYS_PER_YEAR
+    return tuple(kept), cov
+
+
+def _total_return(bars, lookback):  # noqa: ANN001 -- list[Bar]; LEAN runtime surface
+    """Total return over the last ``lookback`` closes, as ``Decimal`` (momentum).
+
+    A monotonic proxy for V1's momentum z-score — only the RELATIVE ordering
+    across this cycle's candidates matters (Stage 3 drops the lowest-momentum
+    signal in the binding cluster on non-convergence). Returns ``Decimal('0')``
+    on insufficient data or a non-positive base close.
+    """
+    if not bars or lookback < 1 or len(bars) < lookback + 1:
+        return Decimal("0")
+    base = bars[-(lookback + 1)].close
+    if base <= 0:
+        return Decimal("0")
+    return (bars[-1].close - base) / base
+
+
 class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]  # noqa: F405
     """LEAN Local entry-point. Daily resolution; 17:30 ET signal cycle.
 
@@ -454,10 +574,27 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         # parameter fetch fails (fail-OPEN); surfaced on the cycle heartbeat's
         # ``error`` field so the api observes the kill-switch read failure.
         self._parameters_fetch_failed: bool = False
+
+        # Trust-with-Money charter PR A: the SINGLE master switch for the
+        # backtest-only order-placement path. Fixed ONCE here from ``live_mode``.
+        # When False (LIVE), every order-placement code path early-returns, so the
+        # production strategy stays POST-only — zero LEAN orders, byte-for-byte
+        # unchanged. When True (BACKTEST), V1 ALSO places real LEAN orders that
+        # mirror the signals it already computes, producing an authoritative
+        # equity curve. Grep ``market_order`` to verify: every call sits behind a
+        # ``self._backtest_orders_enabled`` guard (``_place_backtest_orders`` +
+        # ``on_symbol_changed_events``).
+        self._backtest_orders_enabled: bool = not bool(self.live_mode)
+        # Lazy cache for the canonical Stage 0-5 sizer (loaded by file path on
+        # first backtest order cycle; see ``_load_sizing_pipeline``). Stays None
+        # in LIVE mode — the sizer is never loaded there.
+        self._sizing_pipeline_module = None
+
         self.log(
             f"v1_strategy initialized (post-pivot 2026-05-12, Pivot-PR-D) "
             f"live_mode={self.live_mode} api_base={self._api_base_url} "
             f"strategy_version={self._strategy_version_str} "
+            f"backtest_orders_enabled={self._backtest_orders_enabled} "
             f"params_keys={sorted(params.keys())}"
         )
 
@@ -488,6 +625,49 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
     def on_data(self, data: Slice):  # noqa: F405
         """No per-tick logic in V1. All signal work happens in on_daily_signal_cycle."""
         return
+
+    def on_symbol_changed_events(self, events):  # noqa: ANN001 -- SymbolChangedEvents; LEAN runtime
+        """Carry the economic position across a futures roll — BACKTEST ONLY.
+
+        Trust-with-Money charter PR A / G3: when LEAN's continuous-future mapping
+        rolls to a new front contract, CLOSE the expiring leg and OPEN the same
+        signed quantity in the new front so the position carries through the roll.
+        We use paired ``market_order`` legs and NEVER ``self.liquidate()`` — the
+        liquidate path tags fills "Liquidated", which false-trips the ruin parser
+        (``research/run.py::lean_ruin_alert``).
+
+        Provably unreachable in live mode: the live strategy is POST-only (the api
+        owns real roll handling via ``services/execution``); this early-returns when
+        ``self._backtest_orders_enabled`` is False. Roll resets ``invested_since``
+        on the new leg (a MIN_HOLDING_DAYS artifact) — tolerable since quarterly
+        rolls (~63 sessions) vastly exceed the 14-day min-holding gate.
+        """
+        if not self._backtest_orders_enabled:
+            return
+        for changed in events.values():
+            old_symbol = changed.old_symbol
+            new_symbol = changed.new_symbol
+            try:
+                old_qty = int(self.portfolio[old_symbol].quantity)
+            except Exception as exc:  # noqa: BLE001 -- defensive; a bad holding read must not crash
+                self.log(f"v1_roll_snapshot_failed old={old_symbol} exc={exc!r}")
+                continue
+            if old_qty == 0:
+                continue
+            # Close the expiring leg unconditionally (always priced — it is held).
+            self.market_order(old_symbol, -old_qty, tag="roll")
+            # Re-open the carried position in the new front; guard the chain-edge
+            # zero price (G2) — if unavailable, the daily reconcile re-opens once
+            # the new front prices.
+            new_price = self.securities[new_symbol].price if new_symbol in self.securities else 0
+            if new_price and new_price > 0:
+                self.market_order(new_symbol, old_qty, tag="roll")
+                self.log(f"v1_roll_carried old={old_symbol} new={new_symbol} qty={old_qty}")
+            else:
+                self.log(
+                    f"v1_roll_close_only old={old_symbol} new={new_symbol} "
+                    f"qty={old_qty} reason=new_front_price_unavailable"
+                )
 
     def on_daily_signal_cycle(self):
         """17:30 ET daily — run V1 strategy + POST each signal to the backend.
@@ -613,8 +793,21 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
             if live_positions is None:
                 # Backtest, or live fetch failed (fail-safe) → LEAN snapshot
                 # (empty under live PaperBrokerage; populated in backtest).
+                #
+                # PR A: in BACKTEST the holding lives in the MAPPED front contract,
+                # not the continuous canonical, so snapshot THAT — otherwise the
+                # snapshot reads FLAT and the strategy would re-emit entries every
+                # cycle (pyramiding) and never see a position to exit. Gated on
+                # ``_backtest_orders_enabled`` so the LIVE fetch-failure fallback is
+                # byte-for-byte unchanged (snapshots the continuous symbol, which is
+                # empty under PaperBrokerage anyway).
+                snapshot_symbol = symbol
+                if self._backtest_orders_enabled:
+                    tradeable = self._tradeable_symbol(market_key, symbol)
+                    if tradeable is not None:
+                        snapshot_symbol = tradeable
                 current_positions[market_key] = self._snapshot_position(
-                    market_key=market_key, symbol=symbol
+                    market_key=market_key, symbol=snapshot_symbol
                 )
 
         if live_positions is not None:
@@ -772,6 +965,23 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
                 session_date=session_date,
                 equity=equity,
                 exits_in_flight=exits_in_flight,
+            )
+
+        # Step 9 (BACKTEST ONLY): place real LEAN orders mirroring the decisions
+        # POSTed above, so the backtest produces an AUTHORITATIVE equity curve
+        # (Trust-with-Money charter PR A). Both this call-site guard AND the
+        # method's own early-return key off ``self._backtest_orders_enabled``
+        # (== ``not self.live_mode``, fixed at initialize) — defense in depth so
+        # the live strategy stays POST-only: zero LEAN orders, byte-for-byte.
+        if self._backtest_orders_enabled:
+            self._place_backtest_orders(
+                active_universe=active_universe,
+                entry_signals=result.signals,
+                exit_result=exit_result,
+                equity=equity,
+                vol_target_pct_annual=v1_params.vol_target_pct_annual,
+                instrument_vol_lookback_days=v1_params.instrument_vol_lookback_days,
+                session_date=session_date,
             )
         return
 
@@ -1332,6 +1542,289 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
                 ),
             },
         }
+
+    # ------------------------------------------------------------------
+    # Backtest-only order placement (Trust-with-Money charter PR A)
+    #
+    # Everything below this banner exists SOLELY to give a BACKTEST an
+    # authoritative equity curve. Each entry point early-returns when
+    # ``self._backtest_orders_enabled`` is False, so in LIVE mode the production
+    # strategy is byte-for-byte the POST-only path above: it never reaches a
+    # ``market_order`` call. The order mechanics (integer contracts on the mapped
+    # front; roll = close-old + open-new) reuse G1/G2/G3 from
+    # ``research/lean/projects/research_runner.py``.
+    # ------------------------------------------------------------------
+
+    def _tradeable_symbol(self, market_key, continuous_symbol):  # noqa: ANN001 -- LEAN Symbol; runtime
+        """Resolve the LEAN ``Symbol`` to order against for ``market_key``.
+
+        Futures (``/MES`` form) trade the MAPPED front contract —
+        ``self.securities[continuous].mapped`` — which can be ``None`` before the
+        first mapping on the chain edge (caller skips that cycle, G2). ETFs (bare
+        ticker) trade their own subscription symbol directly.
+        """
+        if market_key.startswith("/"):
+            try:
+                return self.securities[continuous_symbol].mapped
+            except Exception:  # noqa: BLE001 -- not mapped yet / not in securities
+                return None
+        return continuous_symbol
+
+    def _contract_multiplier(self, market_key):  # noqa: ANN201 -- Decimal; LEAN runtime
+        """Per-contract multiplier (point value) for ``market_key``, as ``Decimal``.
+
+        Read from LEAN's ``symbol_properties.contract_multiplier`` so sizing uses
+        the SAME multiplier LEAN applies to P&L (keeps size + MTM consistent).
+        Falls back to ``Decimal('1')`` (the equity case, and a safe default if the
+        property is unreadable).
+        """
+        continuous_symbol = self._market_subscriptions.get(market_key)
+        tradeable = self._tradeable_symbol(market_key, continuous_symbol)
+        try:
+            props = self.securities[tradeable].symbol_properties
+            multiplier = Decimal(str(props.contract_multiplier))
+            if multiplier > 0:
+                return multiplier
+        except Exception:  # noqa: BLE001 -- unreadable property → safe default
+            pass
+        return Decimal("1")
+
+    def _current_contract_qty(self, tradeable):  # noqa: ANN001 -- LEAN Symbol; runtime
+        """Signed integer quantity currently held in ``tradeable`` (0 if none)."""
+        try:
+            return int(self.portfolio[tradeable].quantity)
+        except Exception:  # noqa: BLE001 -- absent holding reads as flat
+            return 0
+
+    def _load_sizing_pipeline(self):  # noqa: ANN201 -- module; LEAN runtime
+        """Load the canonical Stage 0-5 sizer (``services/risk/sizing.py``) by PATH.
+
+        BACKTEST-ONLY, cached on the instance. ``services/risk/__init__.py``
+        eagerly imports sqlalchemy + ``services.audit`` (absent in the LEAN
+        image), so ``import services.risk.sizing`` crashes on the package init.
+        Loading the module file directly bypasses ``__init__``; sizing.py's own
+        imports are numpy / structlog / ``strategies.*`` / stdlib — all present in
+        the LEAN runtime. ``services/`` is mounted read-only at ``/Lean/services``
+        by the backtest driver (``research/lean/driver.py``). A unit test injects
+        a pre-loaded module into ``self._sizing_pipeline_module`` to exercise the
+        real pipeline without the container path.
+        """
+        if self._sizing_pipeline_module is not None:
+            return self._sizing_pipeline_module
+        import importlib.util
+        import sys
+
+        path = "/Lean/services/risk/sizing.py"
+        if not os.path.exists(path):
+            raise RuntimeError(
+                f"backtest Stage 0-5 sizer unavailable: {path!r} not found "
+                "(is services/ mounted read-only into the LEAN container? see "
+                "research/lean/driver.py service_package_mount)"
+            )
+        spec = importlib.util.spec_from_file_location("v1_backtest_sizing_pipeline", path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"backtest Stage 0-5 sizer: cannot create import spec for {path!r}")
+        module = importlib.util.module_from_spec(spec)
+        # Register BEFORE exec: sizing.py's ``@dataclass(slots=True)`` under
+        # ``from __future__ import annotations`` makes the dataclass machinery look
+        # up ``sys.modules[cls.__module__]`` during class creation. Without this the
+        # load raises ``AttributeError: 'NoneType' object has no attribute '__dict__'``.
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        self._sizing_pipeline_module = module
+        return module
+
+    def _run_stage_0_5_sizing(
+        self,
+        *,
+        signals_by_market: dict,  # type: ignore[type-arg]  -- {market: CandidateSignal}
+        resolved: dict,  # type: ignore[type-arg]  -- {market: (tradeable, price, mult, qty)}
+        active_universe: dict,  # type: ignore[type-arg]
+        equity,  # noqa: ANN001  -- Decimal
+        vol_target_pct_annual,  # noqa: ANN001  -- Decimal
+        lookback: int,
+        session_date,  # noqa: ANN001  -- date
+    ) -> dict:  # type: ignore[type-arg]  -- {market: signed int}
+        """Size this cycle's NEW-ENTRY batch via the canonical Stage 0-5 pipeline.
+
+        ``signals_by_market`` maps each new-entry market (flat breakout entries +
+        reversal flips) to the ``CandidateSignal`` whose ``.direction`` sets the
+        side. Held positions are NOT passed here — they hold unchanged
+        (anti-pyramiding), so the sizer only ever grows the book by genuinely new
+        entries. Joint inverse-vol weighting + the Stage 2/3/4 caps run across the
+        batch, so a multi-entry cycle is co-sized exactly as the live risk engine
+        would. Returns the signed target-contract dict (absent market → 0, i.e. a
+        Stage 0 / Stage 3 / Stage 5 drop).
+
+        The covariance is built from the cycle's continuous-series returns; the
+        single-contract notional from the MAPPED-front price x multiplier (the
+        contract actually traded). Markets whose covariance window is degenerate
+        are dropped by :func:`_annualized_covariance` and sized 0 this cycle.
+        """
+        sizing = self._load_sizing_pipeline()
+
+        returns_by_market: dict = {}
+        for market_key in signals_by_market:
+            series = active_universe.get(market_key)
+            if series is not None:
+                returns_by_market[market_key] = _daily_returns_by_date(series.bars, lookback)
+        cov = _annualized_covariance(returns_by_market)
+        if cov is None:
+            return {}
+        sigma_index, sigma_annual = cov
+
+        # Build candidate signals + metadata + momentum over the SURVIVING markets
+        # only, so ``sigma_index`` covers every candidate (the sizer's invariant:
+        # an active market missing from sigma_index raises SizingError).
+        candidate_signals: list = []
+        contracts_metadata: dict = {}
+        momentum: dict = {}
+        for market_key in sigma_index:
+            _tradeable, price_dec, mult_dec, _current_qty = resolved[market_key]
+            candidate_signals.append(signals_by_market[market_key])
+            contracts_metadata[market_key] = sizing.ContractMetadata(
+                market=market_key,
+                single_contract_notional=mult_dec * price_dec,
+                cluster=_V1_CLUSTER_MAP.get(market_key, market_key),
+            )
+            momentum[market_key] = _total_return(active_universe[market_key].bars, lookback)
+
+        inputs = sizing.SizingInputs(
+            candidate_signals=tuple(candidate_signals),
+            equity=equity,
+            contracts_metadata=contracts_metadata,
+            sigma_annual=sigma_annual,
+            sigma_index=tuple(sigma_index),
+            momentum_z_scores=momentum,
+            vol_target_pct_annual=vol_target_pct_annual,
+            evaluated_at_utc=session_date.isoformat() if session_date is not None else "",
+        )
+        return dict(sizing.run_sizing_pipeline(inputs).target_contracts)
+
+    def _place_backtest_orders(
+        self,
+        *,
+        active_universe: dict,  # type: ignore[type-arg]
+        entry_signals: tuple,  # type: ignore[type-arg]  -- tuple[CandidateSignal, ...]
+        exit_result,  # noqa: ANN001  -- ExitGenerationResult | None
+        equity,  # noqa: ANN001  -- Decimal-coercible
+        vol_target_pct_annual,  # noqa: ANN001  -- Decimal
+        instrument_vol_lookback_days: int,
+        session_date,  # noqa: ANN001  -- date
+    ) -> None:
+        """Reconcile each market to its target position with real LEAN orders.
+
+        BACKTEST ONLY — early-returns in live mode (the master gate). The cycle:
+
+        1. Resolve every market with bars to its tradeable symbol (mapped front
+           for futures), price + multiplier + real holding; skip a zero / unmapped
+           price (reconcile next cycle, G2).
+        2. Classify: NEW entries (flat + breakout) and reversal flips form the
+           batch to size; held positions with no exit HOLD unchanged
+           (anti-pyramiding — the sizer never re-sizes an open position); plain
+           exits (trend_flip / decommission, or a reversal with no paired entry)
+           target 0.
+        3. Size the new-entry batch JOINTLY through the canonical Stage 0-5
+           pipeline (:meth:`_run_stage_0_5_sizing`).
+        4. Place ONE ``market_order`` per market for the signed delta vs the real
+           holding (G1: integer contracts, never ``set_holdings``). Orders carry a
+           ``v1_backtest`` tag so a roll/close is never tagged "Liquidated"
+           (ruin-parser safety).
+        """
+        if not self._backtest_orders_enabled:
+            return
+
+        entry_by_market = {signal.market: signal for signal in entry_signals}
+        exit_by_market: dict = {}
+        if exit_result is not None:
+            exit_by_market = {signal.market: signal for signal in exit_result.signals}
+
+        # Step 1: resolve every market with bars to (tradeable, price, mult, qty).
+        resolved: dict = {}
+        for market_key in active_universe:
+            continuous_symbol = self._market_subscriptions.get(market_key)
+            if continuous_symbol is None:
+                continue
+            tradeable = self._tradeable_symbol(market_key, continuous_symbol)
+            if tradeable is None or tradeable not in self.securities:
+                # Mapped front not resolved yet on the chain edge — reconcile next
+                # cycle once it maps (G2).
+                continue
+            price = self.securities[tradeable].price
+            if not price or price <= 0:
+                self.log(f"v1_backtest_order_skipped_zero_price market={market_key}")
+                continue
+            resolved[market_key] = (
+                tradeable,
+                Decimal(str(price)),
+                self._contract_multiplier(market_key),
+                self._current_contract_qty(tradeable),
+            )
+
+        # Step 2: classify. ``to_size`` maps a market to the CandidateSignal whose
+        # direction sets the side (flat breakout entry, or a reversal's paired
+        # entry); ``close`` targets 0. Held positions with no exit are in NEITHER
+        # → they hold unchanged in step 4 (anti-pyramiding).
+        to_size: dict = {}
+        close: set = set()
+        for market_key, (_tradeable, _price, _mult, current_qty) in resolved.items():
+            exit_signal = exit_by_market.get(market_key)
+            if exit_signal is not None:
+                if exit_signal.exit_reason == "reversal":
+                    paired_entry = entry_by_market.get(market_key)
+                    if paired_entry is not None:
+                        to_size[market_key] = paired_entry  # flip onto the new side
+                    else:
+                        close.add(market_key)  # defensive: reversal, no paired entry
+                else:
+                    close.add(market_key)  # trend_flip / decommission → close
+                continue
+            if current_qty == 0:
+                entry_signal = entry_by_market.get(market_key)
+                if entry_signal is not None:
+                    to_size[market_key] = entry_signal  # new entry from flat
+                # flat + no breakout → no order (target stays 0 in step 4)
+            # else: held + no exit → hold unchanged (target = current_qty)
+
+        # Step 3: joint Stage 0-5 sizing of the new-entry batch (signed targets).
+        sized: dict = {}
+        if to_size:
+            sized = self._run_stage_0_5_sizing(
+                signals_by_market=to_size,
+                resolved=resolved,
+                active_universe=active_universe,
+                equity=Decimal(str(equity)),
+                vol_target_pct_annual=Decimal(str(vol_target_pct_annual)),
+                lookback=instrument_vol_lookback_days,
+                session_date=session_date,
+            )
+            # Breadcrumb: entries wanted sizing but the sizer returned nothing —
+            # Stage 0 dropped every candidate (1-contract notional > 50% equity) or
+            # the covariance window was degenerate (``_annualized_covariance`` → {}).
+            # Fail-safe (no order placed), but otherwise invisible when reading a
+            # multi-year curve and wondering why a breakout produced no trade.
+            if not sized:
+                self.log(
+                    f"v1_backtest_sizing_empty session_date={session_date} "
+                    f"markets={sorted(to_size)}"
+                )
+
+        # Step 4: reconcile each resolved market to its signed target — ONE order.
+        for market_key, (tradeable, _price, _mult, current_qty) in resolved.items():
+            if market_key in to_size:
+                target_qty = int(sized.get(market_key, 0))  # absent → Stage 0/3/5 drop → 0
+            elif market_key in close:
+                target_qty = 0
+            else:
+                target_qty = current_qty  # held + no exit → hold unchanged
+            delta = target_qty - current_qty
+            if delta == 0:
+                continue
+            self.market_order(tradeable, delta, tag=f"v1_backtest:{market_key}")
+            self.log(
+                f"v1_backtest_order_placed session_date={session_date} "
+                f"market={market_key} current={current_qty} target={target_qty} delta={delta}"
+            )
 
     # ------------------------------------------------------------------
     # Universe freshness defensive check (2026-05-17 evening followup)

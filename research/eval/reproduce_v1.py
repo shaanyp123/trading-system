@@ -37,6 +37,10 @@ _log = structlog.get_logger(__name__)
 #: Repo paths (read-only inputs) for the production V1 algorithm + its package.
 _V1_ALGORITHM = Path("lean/v1_strategy.py")
 _STRATEGIES_PKG = Path("strategies")
+#: The repo ``services/`` tree — mounted read-only at ``/Lean/services`` so the V1
+#: backtest-order path can load ``services/risk/sizing.py`` (the real Stage 0-5
+#: sizer) by file path. See ``research/lean/driver.py::_CONTAINER_SERVICES``.
+_SERVICES_PKG = Path("services")
 
 # V1 emits decisions via HTTP POST and places NO LEAN orders, so its decisions live
 # in the LEAN LOG, not the result JSON's orders/trades. Per cycle the log records one
@@ -285,6 +289,7 @@ def build_v1_run_spec(
     end: date | None = None,
     v1_algorithm: Path = _V1_ALGORITHM,
     strategies_pkg: Path = _STRATEGIES_PKG,
+    services_pkg: Path = _SERVICES_PKG,
 ) -> LeanRunSpec:
     """A :class:`LeanRunSpec` that reproduces production V1 (isolated; POST-stubbed).
 
@@ -312,5 +317,6 @@ def build_v1_run_spec(
         multiplier=1.0,
         strategy_name="v1_trend_following",
         extra_package_mounts=(strategies_pkg,),
+        service_package_mount=services_pkg,
         posts_to_api=True,
     )
