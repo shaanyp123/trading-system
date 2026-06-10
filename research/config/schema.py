@@ -153,27 +153,36 @@ def parse_run_config(raw: dict[str, object]) -> RunConfig:
                     raise ValueError(f"strategy.sweep.{key} values must be numbers, got {v!r}")
             strategy_sweep[key] = tuple(float(v) for v in values)
 
-    # P3 sizing + leverage blocks (absent for P1/P2 fixed runs).
+    # P3 sizing + leverage blocks (absent for P1/P2 fixed runs). Malformed entries
+    # RAISE rather than silently filter — a quoted "2" in a sweep or a stray bool
+    # would otherwise just vanish from the run.
     sizing = _require_mapping(raw.get("sizing", {}), "sizing")
     sizing_scheme = _as_str(sizing["scheme"], "sizing.scheme") if "scheme" in sizing else None
-    sizing_params = {
-        k: float(v)
-        for k, v in sizing.items()
-        if k != "scheme" and isinstance(v, (int, float)) and not isinstance(v, bool)
-    }
+    sizing_params: dict[str, float] = {}
+    for k, v in sizing.items():
+        if k == "scheme":
+            continue
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError(f"sizing.{k} must be a number, got {v!r}")
+        sizing_params[k] = float(v)
     leverage = _require_mapping(raw.get("leverage", {}), "leverage")
     cap_raw = leverage.get("cap")
-    leverage_cap = (
-        float(cap_raw)
-        if isinstance(cap_raw, (int, float)) and not isinstance(cap_raw, bool)
-        else None
-    )
+    leverage_cap: float | None = None
+    if cap_raw is not None:
+        if isinstance(cap_raw, bool) or not isinstance(cap_raw, (int, float)):
+            raise ValueError(f"leverage.cap must be a number, got {cap_raw!r}")
+        if float(cap_raw) <= 0.0:
+            raise ValueError(f"leverage.cap must be > 0, got {cap_raw!r}")
+        leverage_cap = float(cap_raw)
     sweep_raw = leverage.get("sweep", [])
     if not isinstance(sweep_raw, list):
         raise ValueError("leverage.sweep must be a list of leverage caps")
-    leverage_sweep = tuple(
-        float(x) for x in sweep_raw if isinstance(x, (int, float)) and not isinstance(x, bool)
-    )
+    for x in sweep_raw:
+        if isinstance(x, bool) or not isinstance(x, (int, float)):
+            raise ValueError(f"leverage.sweep values must be numbers, got {x!r}")
+        if float(x) <= 0.0:
+            raise ValueError(f"leverage.sweep values must be > 0, got {x!r}")
+    leverage_sweep = tuple(float(x) for x in sweep_raw)
 
     costs = _require_mapping(raw.get("costs", {}), "costs")
     costs_model = _as_str(costs.get("model", "ibkr"), "costs.model")
@@ -202,9 +211,14 @@ def parse_run_config(raw: dict[str, object]) -> RunConfig:
     benchmarks = tuple(_as_str(b, "benchmarks[]") for b in benchmarks_raw)
 
     starting_cash_raw = raw.get("starting_cash")
-    starting_cash = (
-        float(starting_cash_raw) if isinstance(starting_cash_raw, (int, float)) else None
-    )
+    starting_cash: float | None = None
+    if starting_cash_raw is not None:
+        # bool is an int subclass — `starting_cash: true` is not a number here.
+        if isinstance(starting_cash_raw, bool) or not isinstance(starting_cash_raw, (int, float)):
+            raise ValueError(f"starting_cash must be a number, got {starting_cash_raw!r}")
+        if float(starting_cash_raw) <= 0.0:
+            raise ValueError(f"starting_cash must be > 0, got {starting_cash_raw!r}")
+        starting_cash = float(starting_cash_raw)
 
     data_root_raw = raw.get("data_root") or os.environ.get(
         _DEFAULT_DATA_ROOT_ENV, _DEFAULT_DATA_ROOT

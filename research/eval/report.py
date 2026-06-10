@@ -117,8 +117,11 @@ def _markdown(
         "",
     ]
     if alerts:
+        # Wording covers BOTH ruin signals (run.lean_ruin_alert): a tagged LEAN
+        # margin-call order and/or an equity wipe with no tagged order.
         lines += [
-            "> 🟥 **⚠ LIQUIDATION DETECTED — LEAN issued a margin-call / forced-liquidation order:**",
+            "> 🟥 **⚠ LIQUIDATION DETECTED — LEAN margin-call order and/or account "
+            "equity wipe detected:**",
             *[f"> {a}" for a in alerts],
             "",
         ]
@@ -165,7 +168,12 @@ def _html(
         f"<p class='banner'>{esc(_BANNER)}</p>",
     ]
     if alerts:
-        body = "⚠ LIQUIDATION DETECTED — LEAN issued a margin-call / forced-liquidation order:<br>"
+        # Same both-signals wording as the markdown banner (margin-call order
+        # and/or equity wipe — see run.lean_ruin_alert).
+        body = (
+            "⚠ LIQUIDATION DETECTED — LEAN margin-call order and/or account equity "
+            "wipe detected:<br>"
+        )
         body += "<br>".join(esc(a) for a in alerts)
         parts.append(f"<div class='ruin'>{body}</div>")
     parts.append(

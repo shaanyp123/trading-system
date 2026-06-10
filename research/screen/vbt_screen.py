@@ -6,10 +6,11 @@ seam (availability check + graceful failure) without importing vectorbt at modul
 load, so the core harness runs anywhere numpy does.
 
 P1 scope is the seam itself; the dependency-light :mod:`research.screen.daily_eval`
-numpy evaluator is the screen P1 actually uses. The vectorbt-accelerated batch
-parameter sweep — where vectorbt's vectorization earns its keep — lands in P4,
-and every vbt result is gated by the §6.6 parity rail against LEAN before it can
-inform a graduation decision (vbt never has authority; design D1/D2).
+numpy evaluator is the screen actually in use. A vectorbt-accelerated sweep is NOT
+implemented — P4 shipped the parameter sweep on numpy instead
+(:mod:`research.eval.sweep`, driven by a validity config on ``engine='daily'``).
+Any future vbt path must be gated by the §6.6 parity rail against LEAN before it
+can inform a graduation decision (vbt never has authority; design D1/D2).
 """
 
 from __future__ import annotations
@@ -34,15 +35,16 @@ def require_vectorbt() -> None:
 
 
 def daily_sweep() -> None:
-    """Placeholder for the P4 vectorbt-accelerated parameter sweep.
+    """Unimplemented vectorbt sweep seam (the shipped P4 sweep is numpy).
 
-    Intentionally unimplemented in P1: a vbt sweep is only worth its dependency at
-    sweep scale (P4), and every vbt result must pass §6.6 parity vs LEAN before
-    use. Calling it surfaces both the missing-dependency guidance (if vectorbt is
-    absent) and the phase gating.
+    P4's parameter sweep landed on the numpy screen (``research/eval/sweep.py``,
+    via a validity config on ``engine='daily'``), not vectorbt. Calling this
+    surfaces the missing-dependency guidance (if vectorbt is absent) and the fact
+    that any future vbt path stays parity-gated (design D2).
     """
     require_vectorbt()
     raise NotImplementedError(
-        "vectorbt daily sweep lands in P4 (parity-gated). P1 uses the numpy "
-        "evaluator at research.screen.daily_eval.evaluate_daily."
+        "the vectorbt daily sweep is not implemented — use engine='daily' with a "
+        "validity config (the numpy sweep, research/eval/sweep.py). Any future vbt "
+        "path must pass §6.6 parity vs LEAN before use (design D2)."
     )

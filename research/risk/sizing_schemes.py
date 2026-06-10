@@ -135,7 +135,8 @@ class SizingScheme:
 
 
 def _round_to_contracts(notional: float, price: float, multiplier: float) -> int:
-    """Whole contracts whose notional is closest to ``notional`` (banker-free round)."""
+    """Whole contracts closest to ``notional`` — banker's rounding (round-half-even),
+    matching the live Stage-5 ``ROUND_HALF_EVEN`` lot rounding."""
     per_contract = multiplier * price
     if per_contract <= 0.0:
         return 0

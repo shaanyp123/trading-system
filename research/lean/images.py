@@ -2,14 +2,18 @@
 
 Two backends, chosen by availability:
 
-1. **LEAN CLI** (``lean backtest``) — the proposed default. Wraps the Launcher +
-   Docker; takes a project dir + a ``lean.json`` and writes results to ``--output``.
-2. **Raw ``docker run``** against the Launcher — the fallback when the CLI is not
-   installed. Mirrors the production ``infrastructure/lean_local`` entrypoint model
-   (deep-merge ``/Lean/Algorithm/lean.json`` onto the upstream config, run
-   ``QuantConnect.Lean.Launcher.dll``), but ISOLATED: ``--network none``, a
-   read-only data COPY at ``/Lean/Data``, and the POST-stub env (see
+1. **Raw ``docker run``** against the Launcher — the PREFERRED default. Mirrors
+   the production ``infrastructure/lean_local`` entrypoint model (deep-merge
+   ``/Lean/Algorithm/lean.json`` onto the upstream config, run
+   ``QuantConnect.Lean.Launcher.dll``), and is the ONLY backend that mounts +
+   guards ``spec.data_root`` and carries the isolation env (``--network none``, a
+   read-only data COPY at ``/Lean/Data``, the POST stub — see
    :mod:`research.lean.driver`).
+2. **LEAN CLI** (``lean backtest``) — fallback when the docker backend cannot run
+   (e.g. the ``lean_local`` image is not built). Wraps the Launcher + Docker;
+   takes a project dir + a ``lean.json`` and writes results to ``--output``. It
+   uses the CLI's own data folder (no data_root mount/guard) and wires NO
+   isolation env — POST-free reference strategies only.
 
 **Availability is probed via the EXECUTABLE / DAEMON, never ``importlib``.** Some
 venvs carry an empty ``lean`` *namespace-package* artifact that is importable
@@ -108,8 +112,10 @@ def docker_backend_runnable() -> bool:
 
 
 def select_backend(prefer: Backend | None = None) -> Backend | None:
-    """Pick an available backend (CLI preferred), honouring ``prefer``; else ``None``.
+    """Pick an available backend (docker preferred), honouring ``prefer``; else ``None``.
 
+    Docker first: it is the only backend that mounts/guards the data COPY and
+    carries the isolation env; the CLI is a fallback for POST-free references.
     Returning ``None`` is the SKIP signal — callers turn it into a visible
     ``pytest.skip`` / operator-facing message, never a silent pass.
     """
@@ -117,10 +123,10 @@ def select_backend(prefer: Backend | None = None) -> Backend | None:
         return "lean_cli" if cli_backend_runnable() else None
     if prefer == "docker":
         return "docker" if docker_backend_runnable() else None
-    if cli_backend_runnable():
-        return "lean_cli"
     if docker_backend_runnable():
         return "docker"
+    if cli_backend_runnable():
+        return "lean_cli"
     return None
 
 
@@ -130,7 +136,9 @@ def runnable_backend(prefer: Backend | None = None, *, lean_local_image: str) ->
 
     This is what callers/tests should gate on before a REAL run: it returns ``None``
     (→ a visible skip) when the engine cannot actually run, rather than letting a
-    daemon-up / image-absent box fall through to a ``docker run`` error.
+    daemon-up / image-absent box fall through to a ``docker run`` error. Docker is
+    preferred (same rationale as :func:`select_backend`); the CLI is the fallback
+    when the ``lean_local`` image is not built.
     """
     cli = cli_backend_runnable()
     docker_ok = docker_backend_runnable() and docker_image_available(lean_local_image)
@@ -138,10 +146,10 @@ def runnable_backend(prefer: Backend | None = None, *, lean_local_image: str) ->
         return "lean_cli" if cli else None
     if prefer == "docker":
         return "docker" if docker_ok else None
-    if cli:
-        return "lean_cli"
     if docker_ok:
         return "docker"
+    if cli:
+        return "lean_cli"
     return None
 
 
@@ -214,6 +222,7 @@ def build_docker_command(
     command: list[str],
     network: str = "none",
     docker_exe: str | None = None,
+    name: str | None = None,
 ) -> list[str]:
     """Build a ``docker run`` argv for the raw Launcher backend (pure; tested).
 
@@ -221,10 +230,14 @@ def build_docker_command(
     POSTs on every cycle (``lean/v1_strategy.py``), so it must NOT be able to reach
     the prod api. ``--network none`` plus the POST-stub ``env`` (set by the driver)
     makes the POSTs fail harmlessly. ``--rm`` so the throwaway container is cleaned
-    up. Env is sorted for deterministic argv (stable tests).
+    up; ``name`` makes the container addressable for the driver's timeout cleanup
+    (``--rm`` only fires when the run COMPLETES — a killed docker-cli leaves the
+    daemon-owned container running). Env is sorted for deterministic argv.
     """
     exe = docker_exe or shutil.which("docker") or "docker"
     argv = [exe, "run", "--rm", "--network", network]
+    if name is not None:
+        argv += ["--name", name]
     for key in sorted(env):
         argv += ["-e", f"{key}={env[key]}"]
     for mount in mounts:

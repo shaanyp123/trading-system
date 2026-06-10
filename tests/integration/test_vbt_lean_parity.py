@@ -53,7 +53,9 @@ _REFERENCE_ALGO = Path("research/lean/projects/donchian_reference.py")
 
 
 def test_vectorbt_lean_parity(tmp_path: Path) -> None:
-    backend = images.runnable_backend(lean_local_image=DEFAULT_LEAN_LOCAL_IMAGE)
+    # prefer="docker": the only backend that mounts/guards OUR data COPY and
+    # carries the isolation env (the CLI uses its own data folder).
+    backend = images.runnable_backend("docker", lean_local_image=DEFAULT_LEAN_LOCAL_IMAGE)
     if backend is None:
         pytest.skip(
             "no RUNNABLE LEAN backend — need either the `lean` CLI + Docker, or the "

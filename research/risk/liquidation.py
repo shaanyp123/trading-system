@@ -23,7 +23,7 @@ arithmetic is float (design D8).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Final
@@ -51,8 +51,14 @@ FUTURES_MAINTENANCE_MARGIN_USD: Final[dict[str, Decimal]] = {
     "/MBT": Decimal("136"),
 }
 
-#: Reg-T cash-equity maintenance fraction for the bond ETFs (25% of position value).
+#: Vintage of the static reference schedule above (the 2022-01 schedule the LEAN
+#: bundle carries) — the staleness warning compares it against the run window.
+STATIC_MARGIN_VINTAGE: Final[date] = date(2022, 1, 1)
+
+#: Reg-T cash-equity maintenance fractions for the bond ETFs: 25% of position
+#: value for a LONG, 30% for a SHORT (short-equity maintenance is higher).
 DEFAULT_ETF_MAINTENANCE_FRACTION: Final[Decimal] = Decimal("0.25")
+DEFAULT_ETF_SHORT_MAINTENANCE_FRACTION: Final[Decimal] = Decimal("0.30")
 
 _RESIDUAL_UNCERTAINTY: Final[str] = (
     "ESTIMATE, not a verdict: a daily bar hides the intrabar PATH — the high/low "
@@ -67,30 +73,42 @@ _RESIDUAL_UNCERTAINTY: Final[str] = (
 class MarginModel:
     """How to derive maintenance margin per contract for one symbol.
 
-    Futures use a fixed ``$/contract`` (``maintenance_per_contract``); ETFs use a
-    fraction of position value (``etf_maintenance_fraction x price x multiplier``).
-    Exactly one branch applies per symbol (set by :func:`margin_model_for`).
+    Futures use a fixed ``$/contract`` (``maintenance_per_contract``, side-
+    symmetric); ETFs use a Reg-T fraction of position value — 25% long / 30%
+    short. Exactly one branch applies per symbol (set by :func:`margin_model_for`).
     """
 
     symbol: str
     is_future: bool
     maintenance_per_contract: Decimal  # futures: fixed $/contract; ETFs: unused (0)
-    etf_maintenance_fraction: Decimal  # ETFs: fraction of notional; futures: unused
+    etf_maintenance_fraction: Decimal  # ETFs: fraction of notional (long); futures: unused
+    etf_short_maintenance_fraction: Decimal = DEFAULT_ETF_SHORT_MAINTENANCE_FRACTION
 
-    def maintenance_per_contract_at(self, price: float, multiplier: float) -> float:
-        """Maintenance margin for ONE contract at ``price`` (float, design D8)."""
+    def maintenance_per_contract_at(
+        self, price: float, multiplier: float, position: int = 1
+    ) -> float:
+        """Maintenance margin for ONE contract at ``price`` (float, design D8).
+
+        ``position``'s SIGN selects the ETF fraction (Reg-T: 25% long, 30% short);
+        futures margin is side-symmetric, so the sign is ignored there.
+        """
         if self.is_future:
             return float(self.maintenance_per_contract)
-        return float(self.etf_maintenance_fraction) * price * multiplier
+        fraction = (
+            self.etf_short_maintenance_fraction if position < 0 else self.etf_maintenance_fraction
+        )
+        return float(fraction) * price * multiplier
 
 
-def load_lean_maintenance_margin(data_root: Path, spec: ContractSpec) -> Decimal | None:
-    """Last-row maintenance margin from LEAN's per-symbol margin CSV, or ``None``.
+def _load_lean_margin_last_row(
+    data_root: Path, spec: ContractSpec
+) -> tuple[Decimal, date | None] | None:
+    """Last (maintenance, row-date vintage) from LEAN's margin CSV, or ``None``.
 
     ``future/<market_dir>/margins/<ROOT>.csv`` has ``date,initial,maintenance`` rows;
-    we take the most recent ``maintenance``. Returns ``None`` for ETFs (no fixed
-    per-contract margin) or when the file is absent (the gitignored snapshot is not
-    present in CI) — the caller falls back to :data:`FUTURES_MAINTENANCE_MARGIN_USD`.
+    we take the most recent. Returns ``None`` for ETFs (no fixed per-contract
+    margin) or when the file is absent (the gitignored snapshot is not present in
+    CI) — the caller falls back to :data:`FUTURES_MAINTENANCE_MARGIN_USD`.
     """
     if spec.asset_class != "future":
         return None
@@ -110,9 +128,20 @@ def load_lean_maintenance_margin(data_root: Path, spec: ContractSpec) -> Decimal
     if len(parts) < 3:
         return None
     try:
-        return Decimal(parts[2])
+        maintenance = Decimal(parts[2])
     except (ValueError, ArithmeticError):
         return None
+    try:
+        vintage: date | None = datetime.strptime(parts[0], "%Y%m%d").date()
+    except ValueError:
+        vintage = None  # vintage is advisory (staleness warning); the margin still loads
+    return maintenance, vintage
+
+
+def load_lean_maintenance_margin(data_root: Path, spec: ContractSpec) -> Decimal | None:
+    """Last-row maintenance margin from LEAN's per-symbol margin CSV, or ``None``."""
+    row = _load_lean_margin_last_row(data_root, spec)
+    return row[0] if row is not None else None
 
 
 def margin_model_for(
@@ -121,26 +150,41 @@ def margin_model_for(
     data_root: Path | None = None,
     maintenance_override: Decimal | None = None,
     etf_maintenance_fraction: Decimal = DEFAULT_ETF_MAINTENANCE_FRACTION,
+    window_start: date | None = None,
 ) -> MarginModel:
     """Build the :class:`MarginModel` for ``spec`` (override > LEAN CSV > reference).
 
     For futures the per-contract maintenance margin resolves in priority order:
     explicit ``maintenance_override`` → LEAN margin CSV under ``data_root`` →
     :data:`FUTURES_MAINTENANCE_MARGIN_USD` reference. ETFs always use the Reg-T
-    ``etf_maintenance_fraction`` of notional.
+    fractions of notional (25% long / 30% short). ``window_start`` (the run's first
+    session) arms a staleness check: a schedule whose vintage (last CSV row date,
+    or :data:`STATIC_MARGIN_VINTAGE` for the reference dict) predates the window
+    logs ``research_margin_schedule_stale`` — warn-only, margin numbers unchanged.
     """
     is_future = spec.asset_class == "future"
     if not is_future:
         return MarginModel(spec.symbol, False, Decimal("0"), etf_maintenance_fraction)
     maint = maintenance_override
+    vintage: date | None = None  # an explicit override carries no schedule vintage
     if maint is None and data_root is not None:
-        maint = load_lean_maintenance_margin(data_root, spec)
+        row = _load_lean_margin_last_row(data_root, spec)
+        if row is not None:
+            maint, vintage = row
     if maint is None:
         maint = FUTURES_MAINTENANCE_MARGIN_USD.get(spec.symbol)
+        vintage = STATIC_MARGIN_VINTAGE if maint is not None else None
     if maint is None:
         raise KeyError(
             f"no maintenance margin for future {spec.symbol!r}: pass maintenance_override, "
             f"provide a margin CSV under data_root, or extend FUTURES_MAINTENANCE_MARGIN_USD"
+        )
+    if window_start is not None and vintage is not None and vintage < window_start:
+        _log.warning(
+            "research_margin_schedule_stale",
+            symbol=spec.symbol,
+            vintage=vintage.isoformat(),
+            window_start=window_start.isoformat(),
         )
     return MarginModel(spec.symbol, True, maint, etf_maintenance_fraction)
 
@@ -163,6 +207,8 @@ class LiquidationEstimate:
     """Estimator output: flagged days + the mandatory residual-uncertainty caveat."""
 
     flags: tuple[LiquidationFlag, ...]
+    #: Bars with a non-zero position — the denominator ``summary()`` reports (and
+    #: the one ``RiskMetrics.margin_call_frequency`` divides by).
     bars_evaluated: int
     residual_uncertainty: str = _RESIDUAL_UNCERTAINTY
 
@@ -181,11 +227,11 @@ class LiquidationEstimate:
 
     def summary(self) -> str:
         if not self.flags:
-            return f"no intrabar maintenance-margin breach over {self.bars_evaluated} bars"
+            return f"no intrabar maintenance-margin breach over {self.bars_evaluated} position-bars"
         first = self.flags[0]
         return (
-            f"WARNING (estimate): {self.n_flagged}/{self.bars_evaluated} bars would have "
-            f"breached maintenance margin intraday; first {first.flag_date} "
+            f"WARNING (estimate): {self.n_flagged}/{self.bars_evaluated} position-bars would "
+            f"have breached maintenance margin intraday; first {first.flag_date} "
             f"(equity {first.equity_at_adverse:,.0f} < maint {first.maintenance_required:,.0f})"
         )
 
@@ -224,7 +270,7 @@ def estimate_intrabar_liquidation(
             adverse_price - float(close[t - 1])
         )
         maintenance_required = abs(pos) * margin.maintenance_per_contract_at(
-            adverse_price, multiplier
+            adverse_price, multiplier, position=pos
         )
         if equity_at_adverse < maintenance_required:
             flags.append(

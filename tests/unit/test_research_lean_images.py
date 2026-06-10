@@ -59,11 +59,21 @@ def test_docker_available_false_on_timeout(monkeypatch: pytest.MonkeyPatch) -> N
     assert images.docker_available() is False
 
 
-def test_select_backend_prefers_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_select_backend_prefers_docker(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Docker is the default: the only backend that mounts/guards the data COPY and
+    # carries the isolation env. An explicit prefer is still honoured.
     monkeypatch.setattr(images, "lean_cli_available", lambda: True)
     monkeypatch.setattr(images, "docker_available", lambda: True)
-    assert images.select_backend() == "lean_cli"
+    assert images.select_backend() == "docker"
+    assert images.select_backend("lean_cli") == "lean_cli"
     assert images.select_backend("docker") == "docker"
+
+
+def test_select_backend_falls_back_to_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Docker backend unusable, CLI runnable ⇒ the CLI is the fallback.
+    monkeypatch.setattr(images, "docker_backend_runnable", lambda: False)
+    monkeypatch.setattr(images, "cli_backend_runnable", lambda: True)
+    assert images.select_backend() == "lean_cli"
 
 
 def test_select_backend_docker_only(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -97,6 +107,17 @@ def test_runnable_backend_requires_image_for_docker(monkeypatch: pytest.MonkeyPa
     # ...image present ⇒ docker is runnable.
     monkeypatch.setattr(images, "docker_image_available", lambda _img: True)
     assert images.runnable_backend(lean_local_image="x:latest") == "docker"
+
+
+def test_runnable_backend_prefers_docker_over_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Both runnable ⇒ docker (data mount + isolation env); image absent ⇒ the CLI
+    # is the fallback.
+    monkeypatch.setattr(images, "lean_cli_available", lambda: True)
+    monkeypatch.setattr(images, "docker_available", lambda: True)
+    monkeypatch.setattr(images, "docker_image_available", lambda _img: True)
+    assert images.runnable_backend(lean_local_image="x:latest") == "docker"
+    monkeypatch.setattr(images, "docker_image_available", lambda _img: False)
+    assert images.runnable_backend(lean_local_image="x:latest") == "lean_cli"
 
 
 def test_select_backend_none_when_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -143,3 +164,19 @@ def test_build_docker_command_structure() -> None:
     # Image precedes the container command.
     img_idx = cmd.index("trading-lean-local:latest")
     assert cmd[img_idx + 1 :] == ["dotnet", "x.dll"]
+
+
+def test_build_docker_command_optional_name_flag() -> None:
+    named = images.build_docker_command(
+        "img:latest",
+        mounts=[],
+        env={},
+        command=["dotnet"],
+        docker_exe="docker",
+        name="research-lean-x",
+    )
+    assert named[named.index("--name") + 1] == "research-lean-x"
+    unnamed = images.build_docker_command(
+        "img:latest", mounts=[], env={}, command=["dotnet"], docker_exe="docker"
+    )
+    assert "--name" not in unnamed

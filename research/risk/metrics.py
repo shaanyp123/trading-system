@@ -202,11 +202,18 @@ def longest_drawdown_days(result: BacktestResult) -> int:
     peak = float(equity[0])
     peak_date = dates[0]
     longest = 0
+    underwater = False
     for t in range(1, n):
         if equity[t] >= peak:
+            # A drawdown ends at the RECOVERY bar — count the span up to it before
+            # resetting the peak (the last underwater bar alone undercounts).
+            if underwater:
+                longest = max(longest, (dates[t] - peak_date).days)
+                underwater = False
             peak = float(equity[t])
             peak_date = dates[t]
         else:
+            underwater = True
             longest = max(longest, (dates[t] - peak_date).days)
     return longest
 
@@ -281,10 +288,12 @@ def prob_drawdown_exceeds(equity_curve: npt.NDArray[np.float64], threshold: floa
 def kelly_leverage(equity_curve: npt.NDArray[np.float64]) -> float:
     """Full-Kelly leverage implied by the return distribution (``mu / sigma²`` per bar).
 
-    The growth-optimal leverage multiple for this return stream. The chosen sizing's
-    peak leverage as a FRACTION of this is the fractional-Kelly context (design
-    §6.5): a peak leverage above full Kelly is the over-betting regime where
-    volatility drag and ruin dominate.
+    The growth-optimal leverage multiple for this return stream. NB: fed a SIZED
+    path's curve (returns already levered ~L x the asset's), this is ≈ ``f*/L``,
+    not the asset's full-Kelly ``f*`` — :func:`compute_risk_metrics` re-baselines
+    by the realized mean leverage before building the fractional-Kelly context
+    (design §6.5): a peak leverage above full Kelly is the over-betting regime
+    where volatility drag and ruin dominate.
     """
     r = _finite(daily_returns(equity_curve))
     if r.size < 2:
@@ -322,8 +331,12 @@ class RiskMetrics:
     risk_of_ruin: float
     peak_leverage: float
     mean_leverage: float
+    #: The ASSET's full-Kelly f* (curve-implied Kelly re-baselined by mean realized
+    #: leverage); ``fractional_kelly`` = peak_leverage / this.
     kelly_leverage: float
     fractional_kelly: float
+    #: n_margin_events / bars-with-a-position (liquidation's ``summary()`` uses the
+    #: same denominator); falls back to ALL bars when no position-bar is recorded.
     margin_call_frequency: float
     n_margin_events: int
     liquidated: bool
@@ -385,12 +398,27 @@ def compute_risk_metrics(
     ruined = liquidated or wiped
     p_dd_50 = prob_drawdown_exceeds(equity, 0.50)
     risk_of_ruin = 1.0 if ruined else p_dd_50
-    kelly = kelly_leverage(equity)
-    fractional_kelly = (
-        peak_leverage / kelly
-        if math.isfinite(peak_leverage) and math.isfinite(kelly) and kelly != 0.0
+    # The sized path's returns are already levered (~mean_leverage x the asset's),
+    # so the curve-implied Kelly is ≈ f*/L; multiply by mean realized leverage to
+    # re-baseline to the ASSET's full-Kelly f* (else fractional_kelly ≈ L²/f* —
+    # wrong by a factor of L). NaN/0 mean leverage ⇒ no honest re-baseline ⇒ NaN.
+    kelly_curve = kelly_leverage(equity)
+    kelly_asset = (
+        kelly_curve * mean_leverage
+        if math.isfinite(kelly_curve) and math.isfinite(mean_leverage) and mean_leverage != 0.0
         else float("nan")
     )
+    fractional_kelly = (
+        peak_leverage / kelly_asset
+        if math.isfinite(peak_leverage) and math.isfinite(kelly_asset) and kelly_asset != 0.0
+        else float("nan")
+    )
+    # Margin-call frequency per POSITION-BAR (a flat bar cannot have a margin
+    # event), matching liquidation's summary denominator; all-bars fallback keeps
+    # the ratio defined when positions could not be reconstructed (e.g. a parsed
+    # LEAN result with no fills).
+    position_bars = int(np.count_nonzero(result.positions))
+    margin_denominator = position_bars if position_bars > 0 else n_bars
     return RiskMetrics(
         total_return=result.total_return,
         cagr=cagr(result),
@@ -412,9 +440,9 @@ def compute_risk_metrics(
         risk_of_ruin=risk_of_ruin,
         peak_leverage=peak_leverage,
         mean_leverage=mean_leverage,
-        kelly_leverage=kelly,
+        kelly_leverage=kelly_asset,
         fractional_kelly=fractional_kelly,
-        margin_call_frequency=n_margin_events / n_bars,
+        margin_call_frequency=n_margin_events / margin_denominator,
         n_margin_events=n_margin_events,
         liquidated=ruined,
         first_liquidation_date=first_liquidation_date,

@@ -23,6 +23,10 @@ the adapter's one job is the direction/timing, which is the V1-specific part.
   (long) exits at that bar. A daily bar hides the intrabar path, so the exact
   trigger + fill price are LEAN's job; this is the documented numpy-screen limit.
   The position's P&L is the evaluator's close-to-close MTM, not the stop fill.
+* After a close-based stop-out the adapter only re-evaluates ENTRY from the NEXT
+  bar (the stop consumes the bar's decision slot), whereas live can re-enter the
+  same session its bracket stop fills — a same-day stop+re-breakout is deferred
+  one session here.
 
 Decimal in / float out at the boundary (design D8): V1 prices are ``Decimal``; the
 research ``BarSeries`` is float, so bars are converted in, and the output is an int
@@ -98,6 +102,11 @@ class V1Adapter(ResearchStrategy):
                 continue
             window = V1BarSeries(market=market, bars=tuple(v1_bars[: t + 1]))
             day = series.dates[t]
+            # Live positions FILL at the next session (close decision → next-open
+            # order), and that fill date starts the MIN_HOLDING clock — so opened_at
+            # is the NEXT session date, not the decision day. A final-bar entry has
+            # no next session in the window; keep the decision day there.
+            fill_day = series.dates[t + 1] if t + 1 < n else day
 
             if direction is Direction.FLAT:
                 result = self._v1.generate_signals(
@@ -110,7 +119,7 @@ class V1Adapter(ResearchStrategy):
                     direction = signal.direction
                     stop_price = signal.stop_price
                     avg_cost = signal.decision_price
-                    opened_at = day
+                    opened_at = fill_day
             else:
                 close_t = Decimal(str(float(series.close[t])))
                 # (a) ATR protective stop (close-based approx; MIN_HOLDING-exempt, as
@@ -165,7 +174,7 @@ class V1Adapter(ResearchStrategy):
                             direction = opposite.direction
                             stop_price = opposite.stop_price
                             avg_cost = opposite.decision_price
-                            opened_at = day
+                            opened_at = fill_day
                         else:  # defensive: reversal with no paired entry → just close
                             direction = Direction.FLAT
                             stop_price = None

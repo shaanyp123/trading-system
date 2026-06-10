@@ -16,7 +16,7 @@ import numpy as np
 
 from research.data.bars import BarSeries
 from research.strategy.v1_adapter import V1Adapter
-from strategies.v1_trend_following.parameters import default_v1_parameters
+from strategies.v1_trend_following.parameters import V1Parameters, default_v1_parameters
 from strategies.v1_trend_following.signals import Bar
 from strategies.v1_trend_following.signals import BarSeries as V1BarSeries
 from strategies.v1_trend_following.strategy import V1TrendFollowing
@@ -123,6 +123,47 @@ def test_trend_then_reverse_exits_and_flips() -> None:
     first_long = next(i for i, p in enumerate(pos.tolist()) if p == 1)
     first_short = next(i for i, p in enumerate(pos.tolist()) if p == -1)
     assert first_long < first_short  # long BEFORE short (exited then flipped)
+
+
+def test_min_holding_clock_starts_at_next_session_fill() -> None:
+    # Live entries FILL at the session AFTER the decision (close decision →
+    # next-open order), and that fill date starts the MIN_HOLDING clock. With
+    # min_holding_days=3 over consecutive dates, the first eligible trend-flip
+    # decision bar is e+4; a decision-day clock would already have exited at e+3.
+    params = V1Parameters(
+        lookback_days_donchian=20,
+        ma_fast_days=5,
+        ma_slow_days=10,
+        efficiency_ratio_threshold=Decimal("0.0"),
+        stop_distance_atr_mult=Decimal("6.0"),  # wide stop ⇒ the trend flip fires first
+        atr_lookback_days=5,
+        min_holding_days=3,
+        vol_target_pct_annual=Decimal("0.15"),
+        instrument_vol_lookback_days=20,
+        roll_days_before_expiry=7,
+    )
+    adapter = V1Adapter(params)
+    warmup = adapter.warmup_bars  # 21 with these lookbacks
+    # Clean uptrend through warmup (enter long at e = warmup-1), then a slow
+    # decline: below MA_FAST every bar (trend flip pending) but above the wide stop.
+    up = [100.0 + 0.5 * i for i in range(warmup)]
+    down = [up[-1] - 1.5 - 0.1 * i for i in range(10)]
+    closes = np.asarray(up + down, dtype=np.float64)
+    n = len(closes)
+    series = BarSeries(
+        symbol="TLT",
+        dates=tuple(date(2024, 1, 1) + timedelta(days=i) for i in range(n)),
+        open=closes.copy(),
+        high=closes + 0.1,
+        low=closes - 0.1,
+        close=closes,
+        volume=np.full(n, 1000.0, dtype=np.float64),
+    )
+    pos = adapter.target_positions(series)
+    e = int(np.argmax(pos != 0))
+    assert pos[e] == 1  # long entry decided at e (fills at e+1)
+    assert pos[e + 3] == 1  # decision-day clock would have exited here — must hold
+    assert pos[e + 4] == 0  # fill-day clock: first MIN_HOLDING-eligible exit
 
 
 def test_config_registry_builds_v1_adapter() -> None:
