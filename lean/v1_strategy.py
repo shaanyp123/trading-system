@@ -65,12 +65,14 @@ and POSTs each emitted signal to the backend with the full payload required
 by `services/api/routes/internal/lean.py::post_lean_signal` (market /
 direction / target_contracts / decision_price / sizing_trace /
 strategy_version). Sizing for Phase 1 is the conservative single-lot
-allocation (target_contracts=1 per signal) — the full Stage 0-5 pipeline
-runs server-side as approved signals are dispatched (Worker-PR-1's
-order_placement_worker). The single-lot allocation gives the operator
-explicit per-signal approval control during the 30-CME-session paper
-clock; once the Stage 0-5 server-side path is wired, this scales to
-multi-contract per spec §2.4.1.
+allocation (target_contracts=1 per signal), and the LIVE dispatch path
+places exactly that quantity (`order_placement_worker` submits
+`signal.target_contracts`; the Stage 0-5 server-side wiring of spec §2.4.1
+is FUTURE work, not built). The single-lot allocation gives the operator
+explicit per-signal approval control. The Stage 0-5 pipeline IS exercised
+today by the BACKTEST-ONLY order path (charter PR A below), which is why
+the authoritative backtest curve reflects Stage 0-5 sizing while live
+paper fills remain single-lot — a deliberate, documented divergence.
 
 This file is intentionally NOT in the project's mypy/ruff target set (see
 ``pyproject.toml`` ``exclude`` lists). LEAN's ``AlgorithmImports`` injects
@@ -589,6 +591,19 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         # first backtest order cycle; see ``_load_sizing_pipeline``). Stays None
         # in LIVE mode — the sizer is never loaded there.
         self._sizing_pipeline_module = None
+        # PR-B (order-routing fix) BACKTEST-ONLY bookkeeping; both dicts stay
+        # empty in live mode (every writer sits behind the master gate).
+        #   _backtest_pending_rolls: {market_key: (old_symbol, new_symbol)} —
+        #     rolls recorded by ``on_symbol_changed_events`` awaiting next-cycle
+        #     consolidation (ordering AT the event is impossible: the new front
+        #     has no bar yet and LEAN rejects zero-priced orders as Invalid).
+        #   _backtest_entry_dates: {market_key: date} — entry session dates
+        #     tracked by the order layer; restores the MIN_HOLDING_DAYS gate in
+        #     backtest (LEAN holdings carry no ``invested_since`` in this build,
+        #     which left the gate wholly unengaged). Preserved across roll
+        #     consolidations; cleared when a market goes flat.
+        self._backtest_pending_rolls: dict = {}
+        self._backtest_entry_dates: dict = {}
 
         self.log(
             f"v1_strategy initialized (post-pivot 2026-05-12, Pivot-PR-D) "
@@ -627,20 +642,30 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         return
 
     def on_symbol_changed_events(self, events):  # noqa: ANN001 -- SymbolChangedEvents; LEAN runtime
-        """Carry the economic position across a futures roll — BACKTEST ONLY.
+        """RECORD a futures roll for next-cycle consolidation — BACKTEST ONLY.
 
-        Trust-with-Money charter PR A / G3: when LEAN's continuous-future mapping
-        rolls to a new front contract, CLOSE the expiring leg and OPEN the same
-        signed quantity in the new front so the position carries through the roll.
-        We use paired ``market_order`` legs and NEVER ``self.liquidate()`` — the
-        liquidate path tags fills "Liquidated", which false-trips the ruin parser
-        (``research/run.py::lean_ruin_alert``).
+        Trust-with-Money charter PR B (order-routing fix): ordering AT the
+        SymbolChangedEvent is impossible — the event fires at the bar boundary
+        where the NEW front has no bar yet, and LEAN synchronously rejects a
+        market order on a zero-priced security as Invalid (probe-measured; the
+        rejection produces NO order event, so the old close+reopen-here shape
+        silently EVAPORATED the carried position whenever the new front hadn't
+        priced — the close-only branch this replaces). So the handler only
+        records ``{market_key: (old_symbol, new_symbol)}``;
+        ``_consolidate_pending_rolls`` closes the old leg and re-opens the
+        carried quantity at the next 17:30 cycle, deferring until the new front
+        prices (typically one cycle). The old leg keeps receiving bars
+        meanwhile (the ``set_filter(-365, 90)`` chain still feeds it), so
+        mark-to-market stays live across the deferral.
 
-        Provably unreachable in live mode: the live strategy is POST-only (the api
-        owns real roll handling via ``services/execution``); this early-returns when
-        ``self._backtest_orders_enabled`` is False. Roll resets ``invested_since``
-        on the new leg (a MIN_HOLDING_DAYS artifact) — tolerable since quarterly
-        rolls (~63 sessions) vastly exceed the 14-day min-holding gate.
+        ``changed.old_symbol`` / ``changed.new_symbol`` are STRING values in
+        this LEAN build (they resolve in the symbol cache for portfolio reads
+        and orders); ``changed.symbol`` is the canonical continuous Symbol —
+        matched against ``_market_subscriptions`` to recover the market key.
+
+        Provably unreachable in live mode: the live strategy is POST-only (the
+        api owns real roll handling via ``services/execution``); this
+        early-returns when ``self._backtest_orders_enabled`` is False.
         """
         if not self._backtest_orders_enabled:
             return
@@ -654,20 +679,29 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
                 continue
             if old_qty == 0:
                 continue
-            # Close the expiring leg unconditionally (always priced — it is held).
-            self.market_order(old_symbol, -old_qty, tag="roll")
-            # Re-open the carried position in the new front; guard the chain-edge
-            # zero price (G2) — if unavailable, the daily reconcile re-opens once
-            # the new front prices.
-            new_price = self.securities[new_symbol].price if new_symbol in self.securities else 0
-            if new_price and new_price > 0:
-                self.market_order(new_symbol, old_qty, tag="roll")
-                self.log(f"v1_roll_carried old={old_symbol} new={new_symbol} qty={old_qty}")
-            else:
+            market_key = None
+            try:
+                canonical = changed.symbol  # the event's Symbol IS the canonical
+                for key, subscribed in self._market_subscriptions.items():
+                    if subscribed == canonical:
+                        market_key = key
+                        break
+            except Exception as exc:  # noqa: BLE001 -- canonical read is LEAN-runtime only
+                self.log(f"v1_roll_canonical_read_failed old={old_symbol} exc={exc!r}")
+            if market_key is None:
+                # Held position on an unresolvable canonical: loud log; the
+                # market-level quantity still counts the old leg (no re-emit),
+                # but no consolidation will run for it this roll.
                 self.log(
-                    f"v1_roll_close_only old={old_symbol} new={new_symbol} "
-                    f"qty={old_qty} reason=new_front_price_unavailable"
+                    f"v1_roll_unresolved_market old={old_symbol} new={new_symbol} "
+                    f"qty={old_qty}"
                 )
+                continue
+            self._backtest_pending_rolls[market_key] = (old_symbol, new_symbol)
+            self.log(
+                f"v1_roll_recorded market={market_key} old={old_symbol} "
+                f"new={new_symbol} qty={old_qty}"
+            )
 
     def on_daily_signal_cycle(self):
         """17:30 ET daily — run V1 strategy + POST each signal to the backend.
@@ -734,22 +768,31 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         # decommission exits) is operator-gated today, so a wrong fail-open
         # ``False`` cannot auto-execute. Re-evaluate (fail-closed for exits) if
         # exit auto-approval ever ships.
-        fetched_decommission = self._fetch_active_decommission_flag()
-        if fetched_decommission is None:
-            self._parameters_fetch_failed = True
-            self.log(
-                f"lean_parameters_fetch_failed session_date={session_date} "
-                f"fail_open=True lean_json_default={v1_params.strategy_decommissioned}"
-            )
-        else:
-            self._parameters_fetch_failed = False
-            if fetched_decommission != v1_params.strategy_decommissioned:
+        # LIVE-ONLY: a backtest has no api to ask and no operator runtime
+        # kill-switch to honor (lean.json's STRATEGY_DECOMMISSIONED is
+        # authoritative there); fetching against the research isolation stub
+        # merely logged a spurious ``lean_parameters_fetch_failed`` + flagged
+        # the heartbeat on EVERY backtest cycle (1013 false fingerprints per
+        # acceptance run), burying real failures. Live behavior is unchanged.
+        if self.live_mode:
+            fetched_decommission = self._fetch_active_decommission_flag()
+            if fetched_decommission is None:
+                self._parameters_fetch_failed = True
                 self.log(
-                    f"lean_decommission_override session_date={session_date} "
-                    f"lean_json={v1_params.strategy_decommissioned} "
-                    f"db={fetched_decommission}"
+                    f"lean_parameters_fetch_failed session_date={session_date} "
+                    f"fail_open=True lean_json_default={v1_params.strategy_decommissioned}"
                 )
-                v1_params = replace(v1_params, strategy_decommissioned=fetched_decommission)
+            else:
+                self._parameters_fetch_failed = False
+                if fetched_decommission != v1_params.strategy_decommissioned:
+                    self.log(
+                        f"lean_decommission_override session_date={session_date} "
+                        f"lean_json={v1_params.strategy_decommissioned} "
+                        f"db={fetched_decommission}"
+                    )
+                    v1_params = replace(
+                        v1_params, strategy_decommissioned=fetched_decommission
+                    )
 
         strategy = V1TrendFollowing(parameters=v1_params)
         self._strategy_min_bars = strategy.min_required_bars
@@ -794,21 +837,24 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
                 # Backtest, or live fetch failed (fail-safe) → LEAN snapshot
                 # (empty under live PaperBrokerage; populated in backtest).
                 #
-                # PR A: in BACKTEST the holding lives in the MAPPED front contract,
-                # not the continuous canonical, so snapshot THAT — otherwise the
-                # snapshot reads FLAT and the strategy would re-emit entries every
-                # cycle (pyramiding) and never see a position to exit. Gated on
-                # ``_backtest_orders_enabled`` so the LIVE fetch-failure fallback is
-                # byte-for-byte unchanged (snapshots the continuous symbol, which is
-                # empty under PaperBrokerage anyway).
-                snapshot_symbol = symbol
+                # PR B (supersedes PR A's mapped-front snapshot): in BACKTEST the
+                # holding lives in SOME per-expiry contract month — right after a
+                # roll that is the OLD month, not the current mapped front, so a
+                # front-only snapshot read FLAT there → daily entry re-emits +
+                # dormant exits (the /MGC Sept-2024 cluster). Snapshot the
+                # MARKET-level position instead (legs summed across contract
+                # months + the tracked entry date). Gated on
+                # ``_backtest_orders_enabled`` so the LIVE fetch-failure fallback
+                # is byte-for-byte unchanged (snapshots the continuous symbol,
+                # which is empty under PaperBrokerage anyway).
                 if self._backtest_orders_enabled:
-                    tradeable = self._tradeable_symbol(market_key, symbol)
-                    if tradeable is not None:
-                        snapshot_symbol = tradeable
-                current_positions[market_key] = self._snapshot_position(
-                    market_key=market_key, symbol=snapshot_symbol
-                )
+                    current_positions[market_key] = self._snapshot_backtest_position(
+                        market_key=market_key, continuous_symbol=symbol
+                    )
+                else:
+                    current_positions[market_key] = self._snapshot_position(
+                        market_key=market_key, symbol=symbol
+                    )
 
         if live_positions is not None:
             # Live: the api's real positions are authoritative and cover ALL held
@@ -1465,10 +1511,14 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
     def _naive_target_contracts(self, *, equity) -> int:
         """Conservative single-lot allocation for Phase 1.
 
-        Returns `1` when equity > 0, else 0. The full Stage 0-5 sizing
-        pipeline (services/risk/sizing.py) runs server-side when the
-        operator approves a signal and the order_placement_worker picks
-        it up; LEAN emits single-lot candidates because:
+        Returns `1` when equity > 0, else 0. This IS what live trades today:
+        the order_placement_worker submits ``signal.target_contracts``
+        verbatim, so each approved signal places exactly one contract. (A
+        server-side Stage 0-5 dispatch integration per spec §2.4.1 is FUTURE
+        work — the pipeline's only consumer today is the BACKTEST-ONLY order
+        path, which is why the authoritative backtest curve reflects Stage 0-5
+        sizing while live paper fills are single-lot.) LEAN emits single-lot
+        candidates because:
 
           (a) Phase 1 starting equity is $15k-$25k; most micro-futures
               contracts have notional ~$10k-$30k so 1 lot is the natural
@@ -1596,6 +1646,207 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         except Exception:  # noqa: BLE001 -- absent holding reads as flat
             return 0
 
+    def _market_future_legs(self, continuous_symbol):  # noqa: ANN001, ANN201 -- LEAN runtime
+        """``[(symbol, qty, avg_price)]`` for every non-zero per-expiry holding
+        whose ``symbol.canonical`` matches ``continuous_symbol`` — BACKTEST ONLY.
+
+        A futures position lives in a dated contract month, and right after a
+        roll that month is no longer the mapped front. Anything that asks "what
+        does this MARKET hold" must therefore sum across contract months (the
+        live path's ``SUM(qty) GROUP BY market``), not read one expiry. Duck-
+        typed (``symbol.canonical`` guarded per symbol) so equities and test
+        fakes without a canonical are skipped, not fatal.
+        """
+        legs: list = []
+        try:
+            for kvp in self.portfolio:
+                symbol = kvp.key
+                holding = kvp.value
+                try:
+                    qty = int(holding.quantity)
+                except Exception:  # noqa: BLE001 -- unreadable holding → skip
+                    continue
+                if qty == 0:
+                    continue
+                try:
+                    canonical = symbol.canonical
+                except Exception:  # noqa: BLE001 -- non-future symbols have no canonical
+                    continue
+                if canonical != continuous_symbol:
+                    continue
+                avg_price = getattr(holding, "average_price", None)
+                if avg_price is None:
+                    avg_price = getattr(holding, "AveragePrice", 0)
+                legs.append((symbol, qty, avg_price))
+        except Exception as exc:  # noqa: BLE001 -- a portfolio iteration failure must not crash
+            self.log(f"v1_backtest_portfolio_iter_failed exc={exc!r}")
+        return legs
+
+    def _market_filled_qty(self, market_key, continuous_symbol, tradeable):  # noqa: ANN001, ANN201
+        """Signed MARKET-level filled quantity — BACKTEST ONLY.
+
+        Futures: legs summed across contract months (stable across rolls — the
+        per-expiry read was THE daily-re-emit bug). ETFs: the single
+        subscription holding.
+        """
+        if market_key.startswith("/"):
+            return sum(qty for _symbol, qty, _avg in self._market_future_legs(continuous_symbol))
+        return self._current_contract_qty(tradeable)
+
+    def _market_has_open_orders(self, market_key, continuous_symbol, tradeable):  # noqa: ANN001, ANN201
+        """True when LEAN holds an UNFILLED order for this market — BACKTEST ONLY.
+
+        The 17:30 cycle fires on CALENDAR days; a Friday market order cannot
+        fill before Monday's bar, and the Sat/Sun cycles re-derive the same
+        delta from an unchanged filled quantity. Without this check those
+        cycles stack duplicate orders that all fill at Monday's open (~3x the
+        sized entry; an exit can overshoot through flat). Fail-open: if the
+        open-orders read fails we reconcile as before rather than freeze.
+        """
+        try:
+            open_orders = self.transactions.get_open_orders()
+        except Exception as exc:  # noqa: BLE001 -- transactions API absent (tests) / read failure
+            self.log(f"v1_backtest_open_orders_read_failed exc={exc!r}")
+            return False
+        for order in open_orders:
+            try:
+                symbol = order.symbol
+            except Exception:  # noqa: BLE001 -- unreadable order → skip
+                continue
+            if symbol == tradeable:
+                return True
+            if market_key.startswith("/"):
+                try:
+                    if symbol.canonical == continuous_symbol:
+                        return True
+                except Exception:  # noqa: BLE001 -- non-future order symbol
+                    continue
+        return False
+
+    def _ensure_front_subscribed(self, market_key, tradeable) -> None:  # noqa: ANN001
+        """Explicitly subscribe the mapped front so it is FED and FILLABLE — BACKTEST ONLY.
+
+        Under a continuous-only subscription LEAN feeds the per-expiry front
+        contract LAZILY: probe-measured dead stretches where
+        ``securities[mapped].price == 0`` while the canonical prices every bar
+        (/M2K 175 consecutive sessions, /MYM 9+ months), during which market
+        orders on the front are synchronously rejected Invalid — the no-fill
+        half of the price-source artifact. ``add_future_contract`` is
+        idempotent (returns the existing security) and starts the per-contract
+        feed from the next bar; called every cycle for the current front
+        (probe-proven: cured arms logged ZERO dead cycles across two windows,
+        control arms 295 + 184). The canonical's signal series reads the same
+        zips through the map file and is untouched — signals stay
+        byte-identical; only fillability changes.
+        """
+        try:
+            self.add_future_contract(tradeable, Resolution.DAILY)  # noqa: F405
+        except Exception as exc:  # noqa: BLE001 -- subscription failure must not kill the cycle
+            self.log(f"v1_backtest_front_subscribe_failed market={market_key} exc={exc!r}")
+
+    def _consolidate_pending_rolls(self, session_date) -> None:  # noqa: ANN001
+        """Carry recorded rolls: close the old leg, reopen in the new front — BACKTEST ONLY.
+
+        Runs at the top of each order cycle for every roll recorded by
+        ``on_symbol_changed_events``. Probe-proven semantics: the new front is
+        typically unpriced AT the event (orders there are rejected Invalid) but
+        prices within a cycle of being subscribed, so consolidation DEFERS
+        until it does; the old leg keeps receiving bars meanwhile, so the
+        close fills at a live price and mark-to-market never goes stale. Uses
+        paired ``market_order`` legs tagged ``roll`` and NEVER
+        ``self.liquidate()`` — the liquidate path tags fills "Liquidated",
+        which false-trips the ruin parser (``research/run.py::lean_ruin_alert``).
+        The tracked entry date is deliberately PRESERVED across the carry (the
+        market-level position is continuous; restamping would reset the
+        MIN_HOLDING_DAYS clock every roll).
+        """
+        if not self._backtest_orders_enabled:
+            return
+        for market_key, (old_symbol, new_symbol) in list(self._backtest_pending_rolls.items()):
+            try:
+                old_qty = int(self.portfolio[old_symbol].quantity)
+            except Exception:  # noqa: BLE001 -- absent holding reads as flat
+                old_qty = 0
+            if old_qty == 0:
+                # Exited since the roll was recorded — nothing left to carry.
+                del self._backtest_pending_rolls[market_key]
+                continue
+            new_price = 0
+            try:
+                security = self.add_future_contract(new_symbol, Resolution.DAILY)  # noqa: F405
+                new_price = security.price
+            except Exception as exc:  # noqa: BLE001 -- subscribe failure → defer, retry next cycle
+                self.log(
+                    f"v1_roll_subscribe_failed market={market_key} "
+                    f"new={new_symbol} exc={exc!r}"
+                )
+            if not new_price or new_price <= 0:
+                self.log(
+                    f"v1_roll_consolidation_deferred session_date={session_date} "
+                    f"market={market_key} reason=new_front_unpriced"
+                )
+                continue
+            self.market_order(old_symbol, -old_qty, tag="roll")
+            self.market_order(new_symbol, old_qty, tag="roll")
+            del self._backtest_pending_rolls[market_key]
+            self.log(
+                f"v1_roll_carried session_date={session_date} market={market_key} "
+                f"old={old_symbol} new={new_symbol} qty={old_qty}"
+            )
+
+    def _snapshot_backtest_position(self, *, market_key, continuous_symbol):  # noqa: ANN001, ANN201
+        """MARKET-level position snapshot for the BACKTEST order path.
+
+        Futures: legs summed across contract months (a held position lives in
+        the OLD month right after a roll; PR A's mapped-front snapshot read
+        FLAT there → daily entry re-emits + a dormant exit pipeline).
+        ``avg_cost`` is the abs-quantity-weighted mean over legs. ETFs: the
+        single subscription holding. Both feed ``opened_at_session_date`` from
+        the order layer's tracked entry date — LEAN holdings carry no
+        ``invested_since`` in this build, so without the tracker the
+        MIN_HOLDING_DAYS gate (14d, live-enforced) never engages in backtest.
+        """
+        if not market_key.startswith("/"):
+            position = self._snapshot_position(market_key=market_key, symbol=continuous_symbol)
+            if position.direction is not Direction.FLAT:
+                tracked = self._backtest_entry_dates.get(market_key)
+                if tracked is not None and position.opened_at_session_date is None:
+                    position = Position(
+                        market=position.market,
+                        direction=position.direction,
+                        quantity=position.quantity,
+                        avg_cost=position.avg_cost,
+                        opened_at_session_date=tracked,
+                    )
+            return position
+
+        legs = self._market_future_legs(continuous_symbol)
+        quantity = sum(qty for _symbol, qty, _avg in legs)
+        if quantity == 0:
+            return Position(
+                market=market_key,
+                direction=Direction.FLAT,
+                quantity=0,
+                avg_cost=Decimal("0"),
+                opened_at_session_date=None,
+            )
+        direction = Direction.LONG if quantity > 0 else Direction.SHORT
+        total_abs = sum(abs(qty) for _symbol, qty, _avg in legs)
+        weighted = Decimal("0")
+        for _symbol, qty, avg_price in legs:
+            try:
+                weighted += Decimal(str(avg_price)) * abs(qty)
+            except Exception:  # noqa: BLE001 -- unreadable avg price contributes 0
+                continue
+        avg_cost = weighted / total_abs if total_abs else Decimal("0")
+        return Position(
+            market=market_key,
+            direction=direction,
+            quantity=quantity,
+            avg_cost=avg_cost,
+            opened_at_session_date=self._backtest_entry_dates.get(market_key),
+        )
+
     def _load_sizing_pipeline(self):  # noqa: ANN201 -- module; LEAN runtime
         """Load the canonical Stage 0-5 sizer (``services/risk/sizing.py``) by PATH.
 
@@ -1716,9 +1967,16 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
 
         BACKTEST ONLY — early-returns in live mode (the master gate). The cycle:
 
+        0. Consolidate any rolls recorded since the last cycle
+           (:meth:`_consolidate_pending_rolls`) — close the old month, reopen
+           the carried quantity in the new front once it prices.
         1. Resolve every market with bars to its tradeable symbol (mapped front
-           for futures), price + multiplier + real holding; skip a zero / unmapped
-           price (reconcile next cycle, G2).
+           for futures — explicitly subscribed each cycle so it is FED +
+           FILLABLE, :meth:`_ensure_front_subscribed`), price + multiplier +
+           the MARKET-level filled quantity (legs summed across contract
+           months). A still-unpriced front skips this cycle and self-heals the
+           next (the subscription's first bar arrives then); an exit deferred
+           by that skip re-derives next cycle from the unchanged position.
         2. Classify: NEW entries (flat + breakout) and reversal flips form the
            batch to size; held positions with no exit HOLD unchanged
            (anti-pyramiding — the sizer never re-sizes an open position); plain
@@ -1726,13 +1984,22 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
            target 0.
         3. Size the new-entry batch JOINTLY through the canonical Stage 0-5
            pipeline (:meth:`_run_stage_0_5_sizing`).
-        4. Place ONE ``market_order`` per market for the signed delta vs the real
-           holding (G1: integer contracts, never ``set_holdings``). Orders carry a
-           ``v1_backtest`` tag so a roll/close is never tagged "Liquidated"
-           (ruin-parser safety).
+        4. Order per market toward the signed target (G1: integer contracts,
+           never ``set_holdings``), skipping any market with a pending roll
+           consolidation or an unfilled open order (calendar-day cycles would
+           otherwise stack weekend duplicates of the same delta). Exits and
+           flips close EACH held leg explicitly (a post-roll book can hold an
+           old month; a front-only delta would short the front against it);
+           entries order the front. Orders carry a ``v1_backtest`` tag so a
+           close is never tagged "Liquidated" (ruin-parser safety). Entry
+           session dates are stamped/cleared here for the MIN_HOLDING_DAYS
+           tracker.
         """
         if not self._backtest_orders_enabled:
             return
+
+        # Step 0: carry any rolls recorded since the last cycle.
+        self._consolidate_pending_rolls(session_date)
 
         entry_by_market = {signal.market: signal for signal in entry_signals}
         exit_by_market: dict = {}
@@ -1746,19 +2013,28 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
             if continuous_symbol is None:
                 continue
             tradeable = self._tradeable_symbol(market_key, continuous_symbol)
-            if tradeable is None or tradeable not in self.securities:
+            if tradeable is None:
                 # Mapped front not resolved yet on the chain edge — reconcile next
                 # cycle once it maps (G2).
                 continue
+            if market_key.startswith("/"):
+                # The cure for the price-source artifact: keep the front
+                # explicitly subscribed so it prices + fills deterministically.
+                self._ensure_front_subscribed(market_key, tradeable)
+            if tradeable not in self.securities:
+                continue
             price = self.securities[tradeable].price
             if not price or price <= 0:
+                # First cycle after a dead front's subscription: data starts
+                # next bar; ordering now would be rejected Invalid. Self-heals
+                # next cycle (probe-proven) — no longer a months-long dead zone.
                 self.log(f"v1_backtest_order_skipped_zero_price market={market_key}")
                 continue
             resolved[market_key] = (
                 tradeable,
                 Decimal(str(price)),
                 self._contract_multiplier(market_key),
-                self._current_contract_qty(tradeable),
+                self._market_filled_qty(market_key, continuous_symbol, tradeable),
             )
 
         # Step 2: classify. ``to_size`` maps a market to the CandidateSignal whose
@@ -1809,7 +2085,7 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
                     f"markets={sorted(to_size)}"
                 )
 
-        # Step 4: reconcile each resolved market to its signed target — ONE order.
+        # Step 4: reconcile each resolved market to its signed target.
         for market_key, (tradeable, _price, _mult, current_qty) in resolved.items():
             if market_key in to_size:
                 target_qty = int(sized.get(market_key, 0))  # absent → Stage 0/3/5 drop → 0
@@ -1817,13 +2093,61 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
                 target_qty = 0
             else:
                 target_qty = current_qty  # held + no exit → hold unchanged
-            delta = target_qty - current_qty
-            if delta == 0:
+            if target_qty == current_qty:
+                if current_qty == 0:
+                    self._backtest_entry_dates.pop(market_key, None)
                 continue
-            self.market_order(tradeable, delta, tag=f"v1_backtest:{market_key}")
+            if market_key in self._backtest_pending_rolls:
+                # A deferred roll consolidation owns this market's legs until it
+                # lands; reconciling around it would fight the carry.
+                self.log(
+                    f"v1_backtest_roll_pending_skip session_date={session_date} "
+                    f"market={market_key}"
+                )
+                continue
+            continuous_symbol = self._market_subscriptions.get(market_key)
+            if self._market_has_open_orders(market_key, continuous_symbol, tradeable):
+                # An unfilled order is already in flight (weekend/holiday cycle,
+                # or this cycle's consolidation) — re-ordering the same delta
+                # would stack duplicate fills.
+                self.log(
+                    f"v1_backtest_orders_pending_skip session_date={session_date} "
+                    f"market={market_key}"
+                )
+                continue
+            if market_key.startswith("/"):
+                # Close non-front legs explicitly (post-roll books can hold an
+                # old month); then bring the FRONT to the signed target.
+                legs = self._market_future_legs(continuous_symbol)
+                front_qty = 0
+                for leg_symbol, leg_qty, _avg in legs:
+                    if leg_symbol == tradeable:
+                        front_qty += leg_qty
+                    else:
+                        self.market_order(
+                            leg_symbol, -leg_qty, tag=f"v1_backtest:{market_key}"
+                        )
+                front_delta = target_qty - front_qty
+                if front_delta != 0:
+                    self.market_order(tradeable, front_delta, tag=f"v1_backtest:{market_key}")
+            else:
+                self.market_order(
+                    tradeable, target_qty - current_qty, tag=f"v1_backtest:{market_key}"
+                )
+            if current_qty == 0 and target_qty != 0:
+                # Fresh entry: start the MIN_HOLDING_DAYS clock. A reversal flip
+                # (current != 0) restamps below via the same rule next entry; a
+                # carried roll deliberately does NOT touch this date.
+                self._backtest_entry_dates[market_key] = session_date
+            elif target_qty == 0:
+                self._backtest_entry_dates.pop(market_key, None)
+            elif current_qty != 0 and (current_qty > 0) != (target_qty > 0):
+                # Reversal flip: the position changed sides — restart the clock.
+                self._backtest_entry_dates[market_key] = session_date
             self.log(
                 f"v1_backtest_order_placed session_date={session_date} "
-                f"market={market_key} current={current_qty} target={target_qty} delta={delta}"
+                f"market={market_key} current={current_qty} target={target_qty} "
+                f"delta={target_qty - current_qty}"
             )
 
     # ------------------------------------------------------------------

@@ -47,23 +47,30 @@ authority for fills, stops, margin, and the equity curve (design D1). PR #335
   POST stub `http://127.0.0.1:9`, dummy non-empty bearer, read-only data COPY — never
   the live `trading_lean_data` volume.
 
-**Acceptance (real engine, isolated container, 2023-09-01 → 2026-06-08):** 1013 bars,
-45 fills, 18 closed trades, **+4.10% total return**, Sharpe **−1.00**, max drawdown
-**6.30%**, **0 margin events**, NON-FLAT equity **$100k → $104,104**, realized vol
-**4.4% annualized**. Driver: `/tmp/v1_acceptance_run.py` (env `V1_START` / `V1_END` /
-`V1_TIMEOUT`); run from a worktree with `cwd` AND `PYTHONPATH` set to that worktree.
+**Acceptance (real engine, isolated container, 2023-09-01 → 2026-06-08, post
+order-routing fix — design doc "PR A.2"):** 1013 bars, **85 fills, 40 closed trades,
++3.45% total return** ($100k → $103,455), **Sharpe 0.14**, realized vol **9.1%
+annualized**, max drawdown **11.59%**, **0 margin events**, no liquidation.
+Time-in-market 65% of bars; zero-price order skips down **2,165 → 56 market-days
+(−97%)**; **18/18 rolls carried** (record-at-event → consolidate-next-cycle); zero
+same-market entry re-emits. Driver: `/tmp/v1_acceptance_run.py` (env `V1_START` /
+`V1_END` / `V1_TIMEOUT`); run from a worktree with `cwd` AND `PYTHONPATH` set to that
+worktree. *(The #335 baseline — 45 fills / 18 trades / +4.10% / Sharpe −1.00 / vol
+4.4% — was an artifact of NON-execution: the futures sleeve was untradeable on ~60% of
+market-days. The fixed, lower headline is the honest curve.)*
 
 **Follow-up findings (post-#335, in `Docs/futures-backtester-design.md` charter PR A
-follow-up):** the two roll nits were investigated — nit (a) `invested_since`-reset is
-*structurally inert* (the MIN_HOLDING gate reads a field LEAN doesn't populate, so it
-never engages); nit (b)'s one-bar chain-edge gap root-causes to a price-source artifact
-(the mapped front contract reads `.price == 0` for months, so the new leg can't be
-ordered on the close bar) — a real but *separate* price-source fix, out of scope for a
-roll-handler change. A READ-ONLY vol-deployment diagnostic explains the 4.4% « 15%
-target: V1 is flat ~66% of bars (median 1 concurrent position); the binding constraint
-is sparse time-in-market × the 25%/name cap at micro-contract granularity, **not** the
-portfolio gross 3.0× / net 1.5× caps. Tuning caps upward does nothing for flat days;
-the price-source fix (same root cause as nit b) is the higher-leverage lever.
+follow-up):** nit (a) `invested_since`-reset was *structurally inert* only because the
+MIN_HOLDING gate never engaged in backtest — the order-routing fix now tracks entry
+dates in-strategy, so the 14-day gate is live-faithful (and preserved across rolls).
+Nit (b)'s chain-edge gap root-caused to the price-source artifact and is **FIXED** by
+the order-routing fix (explicit front subscriptions + market-level position state +
+record-then-consolidate rolls — design doc "PR A.2" has the full probe evidence and
+the residual-vol-gap analysis). Remaining known divergences (documented, chartered):
+no stop-order simulation in backtest (live brackets every entry at 3-ATR); Stage 0-5
+sizing in backtest vs single-lot live dispatch; the map_file historical-roll horizon
+starts mid-2024 (a `services/data` backfill follow-up — /MYM is pinned to its
+June-2024 contract for the first ~9 months of the window).
 
 ## Operator acceptance (the real-engine gate)
 

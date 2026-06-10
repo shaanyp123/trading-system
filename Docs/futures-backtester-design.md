@@ -1014,7 +1014,9 @@ but unfixable in the roll handler," and the vol shortfall is not a sizing-cap pr
   continuous future (or add explicit front-month subscriptions / revisit the roll config),
   then re-run acceptance — a material change to the live order path (moves the curve by
   percentage points; changes sizing inputs + turnover) that needs its OWN acceptance +
-  risk-review, NOT a bundle with docs.
+  risk-review, NOT a bundle with docs. **✅ DONE — see "PR A.2 — order-routing +
+  position-state fix" below (explicit front subscriptions, market-level position state,
+  record-then-consolidate rolls).**
 
 - **Vol-deployment diagnostic — realized 4.4% vs `VOL_TARGET_PCT_ANNUAL` 15% (READ-ONLY;
   `services/risk/sizing.py` untouched).** The BINDING constraint is NOT a portfolio cap.
@@ -1037,6 +1039,63 @@ but unfixable in the roll handler," and the vol shortfall is not a sizing-cap pr
     tuning):** (1) fix the price=0 skip artifact (raises time-in-market — same root cause as
     nit b); (2) more simultaneous diversifying trends, or a larger account so micros fit under
     25%/name. Tuning vol-target or the caps UPWARD does nothing for the 66% of days that are flat.
+
+#### PR A.2 — Order-routing + position-state fix (the nit (b) / price-source follow-up) — ✅ DONE (2026-06-10)
+
+The complete fix for the price-source artifact, probe-driven against the real engine
+(`lean/v1_strategy.py`, BACKTEST-ONLY, master-gated; live POST path byte-for-byte
+unchanged — live-safety tests + source tripwires lock it):
+
+- **Step-0 findings (probes against `trading-lean-local:latest` + the real bar copy):**
+  (1) trading the canonical continuous is NOT supported in this LEAN build — the Engine
+  DLL's order validation rejects it ("…continuous Futures contracts are not tradable"),
+  empirically confirmed (`Invalid` ticket) → fallback (B), explicit front subscriptions.
+  (2) The artifact reproduced A/B: control arms logged 295 + 184 mapped-price-zero cycles
+  across two windows (/M2K 175 consecutive sessions, /MYM 9+ months); arms with an
+  every-cycle `add_future_contract(mapped)` cure logged ZERO. (3) Orders placed at the
+  SymbolChangedEvent moment are synchronously rejected Invalid (new front has no bar yet,
+  NO order event emitted) — the old close+reopen-at-event roll handler therefore silently
+  EVAPORATED carried positions on unpriced-front rolls; a recorded roll consolidated at
+  the NEXT cycle (deferring until the front prices) fills cleanly. (4) Canonical and
+  mapped prices are byte-equal under RAW when both present.
+- **The fix (5 coupled changes):** explicit front subscription each cycle (fillability);
+  MARKET-level position state — legs summed across contract months (kills the re-emit
+  bug + revives the exit pipeline post-roll; mirrors live's `SUM(qty) GROUP BY market`);
+  rolls recorded at the event + consolidated next cycle (no more evaporation); a
+  pending-order-aware reconcile (calendar-day cycles no longer stack weekend duplicates
+  of an unfilled delta — entries could triple, exits could overshoot through flat); a
+  backtest entry-date tracker restoring the MIN_HOLDING_DAYS gate (LEAN holdings carry
+  no `invested_since` in this build, so the 14-day live gate never engaged in backtest).
+  Plus: the per-cycle decommission-flag GET is now live-gated (was logging a spurious
+  `lean_parameters_fetch_failed` + flagging the heartbeat on every backtest cycle).
+- **Acceptance (real engine, isolated, 2023-09-01 → 2026-06-08, 1013 bars):** **85 fills
+  · 40 closed trades · +3.45% total ($100k→$103,455) · Sharpe 0.14 · realized vol 9.1% ·
+  max-DD 11.59% · 0 margin events · no liquidation.** Mechanics: zero-price skips
+  **2,165 → 56 market-days (−97%)**; rolls **18 recorded → 18 carried (0 lost)**;
+  time-in-market **34% → 65%** of bars; ZERO same-market entry re-emits (the /MGC
+  Sept-2024 cluster now: enter 09-12 → hold through the 10-30 roll → exit 11-11 on
+  signal); weekend-stack suppression engaged 4×; MIN_HOLDING now rejects (1 occurrence).
+- **Reading the delta vs #335's +4.10%:** the baseline's higher headline was an artifact
+  of NON-execution — the futures sleeve was untradeable on ~60% of market-days, so the
+  book sat in a few low-vol positions (4.4% vol, Sharpe −1.00). With routing fixed, the
+  SAME signals actually deploy and the curve shows what V1's rules produce: ~1.2%/yr at
+  9.1% vol with an 11.6% drawdown (Sharpe 0.14). The drop is not value destroyed by the
+  fix; it is the difference between a curve that couldn't execute and one that does.
+- **Residual vol gap (9.1% vs 15% target):** (a) the 25%/name cap × integer micro
+  granularity still clips most positions to 1 contract; (b) ~35% of bars remain flat
+  (breakout + MA-200 + ER gating); (c) the first ~9 months of the window have
+  structurally degraded futures data — **all six markets' map_files carry NO roll rows
+  before mid-2024** (first rows 2024-06-23 index micros / 2024-06-30 MBT / 2024-08-29
+  MGC; /MYM worst: pinned to its June-2024 contract from 2023-09), so early deployment
+  is thin. That horizon is a `services/data` map_file-synthesis backfill follow-up (data
+  fix, NOT a strategy fix — same family as the #326 live-edge work).
+- **Known divergences now documented in-file (operator charter questions, NOT bundled):**
+  the backtest places NO stop orders while live brackets every entry at 3-ATR (max-DD /
+  ruin exclude the primary live loss-cutter — chartered as a follow-up decision); the
+  curve models Stage 0-5 sizing while live dispatch places `target_contracts=1` per
+  approved signal (docstrings corrected; wiring Stage 0-5 into live dispatch is a
+  separate charter question); `single_contract_overrides` / `m_combined` defaults are
+  assumed (a live-scale $15–25k run would Stage-0-drop every micro — documented).
 
 ### PR B — Cost / fill fidelity (every P&L number — incl. V1's new one — depends on it)
 Confirm LEAN's IB-margin commission + slippage match real IBKR micro-futures costs
