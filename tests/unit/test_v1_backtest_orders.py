@@ -65,6 +65,16 @@ sys.modules.setdefault("AlgorithmImports", _stub)
 from lean import v1_strategy  # noqa: E402
 from strategies.v1_trend_following.signals import Direction  # noqa: E402
 
+# Test-order independence: other test files (test_lean_live_positions,
+# test_lean_history_adapter, ...) register their OWN AlgorithmImports stub
+# first under pytest's alphabetical collection, so the setdefault above loses
+# and ``from AlgorithmImports import *`` ran against a stub WITHOUT
+# ``Resolution``. The subscription helpers reference ``Resolution.DAILY`` at
+# call time from the module globals — patch it onto the imported module so the
+# helpers work regardless of which stub won.
+if not hasattr(v1_strategy, "Resolution"):
+    v1_strategy.Resolution = _Resolution
+
 # ---------------------------------------------------------------------------
 # Load the REAL Stage 0-5 sizer by file path — the same mechanism production
 # uses (``_load_sizing_pipeline``), but pointed at the repo copy. This bypasses
@@ -435,6 +445,26 @@ class TestSourceTripwires:
             "the master gate must be derived from live_mode, set once in initialize"
         )
 
+    def test_gate_is_assigned_exactly_once(self) -> None:
+        # A second assignment anywhere (e.g. `self._backtest_orders_enabled =
+        # True` behind an env flag) would defeat the derivation without failing
+        # the literal check above — lock single-assignment via the AST.
+        tree = ast.parse(self._SOURCE)
+        assignments = 0
+        for node in ast.walk(tree):
+            targets: list = []
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+                targets = [node.target]
+            for target in targets:
+                if isinstance(target, ast.Attribute) and target.attr == "_backtest_orders_enabled":
+                    assignments += 1
+        assert assignments == 1, (
+            f"_backtest_orders_enabled assigned {assignments} times; the master "
+            "gate must be set exactly once (in initialize, from live_mode)"
+        )
+
     def _calls_by_function(self) -> dict[str, set[str]]:
         tree = ast.parse(self._SOURCE)
         out: dict[str, set[str]] = {}
@@ -454,24 +484,55 @@ class TestSourceTripwires:
         return out
 
     def test_market_order_sites_confined_to_gated_methods(self) -> None:
+        # Both casings: pythonnet exposes snake_case AND PascalCase forms of
+        # every LEAN API, so `self.MarketOrder(...)` would place orders too.
         callers = {
-            name for name, attrs in self._calls_by_function().items() if "market_order" in attrs
+            name
+            for name, attrs in self._calls_by_function().items()
+            if attrs & {"market_order", "MarketOrder"}
         }
         assert callers == {"_consolidate_pending_rolls", "_place_backtest_orders"}, (
             f"market_order escaped the gated backtest-only methods: {sorted(callers)}"
         )
 
     def test_no_other_order_apis_exist(self) -> None:
-        forbidden = {
+        snake = {
+            "order",
+            "buy",
+            "sell",
             "set_holdings",
             "liquidate",
             "limit_order",
             "stop_market_order",
             "stop_limit_order",
+            "limit_if_touched_order",
+            "trailing_stop_order",
             "market_on_open_order",
             "market_on_close_order",
             "combo_market_order",
+            "combo_limit_order",
+            "combo_leg_limit_order",
+            "exercise_option",
         }
+        pascal = {
+            "Order",
+            "Buy",
+            "Sell",
+            "SetHoldings",
+            "Liquidate",
+            "LimitOrder",
+            "StopMarketOrder",
+            "StopLimitOrder",
+            "LimitIfTouchedOrder",
+            "TrailingStopOrder",
+            "MarketOnOpenOrder",
+            "MarketOnCloseOrder",
+            "ComboMarketOrder",
+            "ComboLimitOrder",
+            "ComboLegLimitOrder",
+            "ExerciseOption",
+        }
+        forbidden = snake | pascal
         for name, attrs in self._calls_by_function().items():
             hit = attrs & forbidden
             assert not hit, f"forbidden order API {sorted(hit)} called in {name}"
@@ -860,13 +921,14 @@ class TestRollRecordAndConsolidation:
 
     def test_reconcile_skips_market_with_pending_roll(self) -> None:
         # While a consolidation is deferred, the daily reconcile must not fight
-        # it (e.g. an exit would close legs the carry is about to move).
+        # it (e.g. an exit would close legs the carry is about to move). The
+        # FRONT stays priced here so /MES resolves in Step 1 and the skip
+        # branch itself is exercised — the deferral comes from the pending
+        # record's NEW month (MESU6) being unpriced (absent from securities →
+        # the fake add_future_contract returns a zero-priced subscription).
         algo = _bare_algo(backtest=True, with_sizer=True)
         _mes_setup(algo, legs=[("MESH6", 2, "4800")])  # old month held
-        algo._backtest_pending_rolls = {"/MES": ("MESH6", "MESM6")}
-        # Make the consolidation defer: route add_future_contract to a
-        # zero-priced security for the NEW front.
-        algo.securities[_FakeSymbol("MESM6", canonical="MES_C")] = _Security(price=Decimal("0"))
+        algo._backtest_pending_rolls = {"/MES": ("MESH6", "MESU6")}
         exit_sig = _Signal(
             market="/MES",
             direction=Direction.FLAT,
@@ -880,10 +942,12 @@ class TestRollRecordAndConsolidation:
             exit_result=_ExitResult([exit_sig]),
             **_PLACE_KWARGS,
         )
-        # No reconcile orders; the deferred carry retries next cycle, and the
-        # exit re-derives then from the unchanged position.
+        # The deferred carry subscribed the new month, placed nothing, and the
+        # reconcile skipped the market (roll_pending_skip) — the exit
+        # re-derives next cycle from the unchanged position.
+        assert "MESU6" in algo._subscribed
         assert algo._orders == []
-        assert algo._backtest_pending_rolls == {"/MES": ("MESH6", "MESM6")}
+        assert algo._backtest_pending_rolls == {"/MES": ("MESH6", "MESU6")}
 
 
 class TestBacktestPositionSnapshot:

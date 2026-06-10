@@ -849,7 +849,8 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
                 # which is empty under PaperBrokerage anyway).
                 if self._backtest_orders_enabled:
                     current_positions[market_key] = self._snapshot_backtest_position(
-                        market_key=market_key, continuous_symbol=symbol
+                        market_key=market_key,
+                        continuous_symbol=symbol,
                     )
                 else:
                     current_positions[market_key] = self._snapshot_position(
