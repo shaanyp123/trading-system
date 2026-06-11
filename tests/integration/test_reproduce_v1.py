@@ -11,7 +11,9 @@ Operator inputs for the real run (P2 acceptance):
 * build/tag the ``trading-lean-local`` image (infrastructure/lean_local/Dockerfile);
 * snapshot the on-disk bars to ``research/data/cache/lean_bars`` (research/README);
 * capture the oracle to ``$RESEARCH_V1_ORACLE`` via the SQL in research/lean/README;
-* optionally set ``$RESEARCH_V1_WINDOW`` = ``YYYY-MM-DD:YYYY-MM-DD`` (single-phash).
+* optionally set ``$RESEARCH_V1_WINDOW`` = ``YYYY-MM-DD:YYYY-MM-DD`` (a single
+  parameter-REGIME window cut by date — prod phashes are per-signal, so the ER-gate
+  boundary 2026-06-02 is the regime cut; see research/lean/README §3).
 """
 
 from __future__ import annotations
@@ -36,9 +38,11 @@ pytestmark = pytest.mark.integration
 _DATA_ROOT = Path(os.environ.get("RESEARCH_DATA_ROOT", "research/data/cache/lean_bars"))
 _ORACLE_PATH = Path(os.environ.get("RESEARCH_V1_ORACLE", ""))
 # Default 0.0: the meaningful gate is "reproduced >=1 oracle decision" (directional
-# proof). An exact match is structurally limited (backtest re-emits without position
-# state; live used a distinct param-hash per signal), so a high bar would be brittle.
-# Operators can raise it via $RESEARCH_V1_MIN_MATCH_RATE.
+# proof). An exact match is structurally limited (measured PR D: bar data revised
+# since live decided, the pre-2026-06-02 ER regime flip, live pre-#312 re-emission
+# dups, sizing-to-zero re-emits — and prod stamps a distinct param-hash per signal),
+# so a high bar would be brittle. Operators can raise it via
+# $RESEARCH_V1_MIN_MATCH_RATE.
 _MIN_MATCH_RATE = float(os.environ.get("RESEARCH_V1_MIN_MATCH_RATE", "0.0"))
 
 
@@ -68,10 +72,10 @@ def test_reproduce_v1_matches_oracle(tmp_path: Path) -> None:
     window = _window()
     if window is None:
         pytest.skip(
-            "set $RESEARCH_V1_WINDOW=YYYY-MM-DD:YYYY-MM-DD to a SINGLE-phash sub-window "
-            "— a full-window match is unreliable (parameter_set_hash varies per signal: "
-            "params calibrated mid-window + the ER gate landed 2026-06-02). See "
-            "research/lean/README → reproduce-V1."
+            "set $RESEARCH_V1_WINDOW=YYYY-MM-DD:YYYY-MM-DD to a single-REGIME window "
+            "(cut by DATE — prod stamps a distinct parameter_set_hash per signal, so "
+            "hash-filtering is unusable; the live regime boundary is the ER gate "
+            "landing 2026-06-02). See research/lean/README → reproduce-V1."
         )
 
     spec = build_v1_run_spec(_DATA_ROOT)
