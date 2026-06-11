@@ -201,38 +201,51 @@ signals table as of 2026-06-11); the golden test guards the measured result.
 ## Measured trust bridge (charter PR D, 2026-06-11)
 
 Real-engine run (isolated) over 2026-05-01→2026-06-08 vs the live paper oracle
-(19 signal rows → 10 unique decisions, all long):
+(19 signal rows → 10 unique decisions, all long). Two layers, stated separately —
+**the log parser cannot see direction** (every derived entry is labeled `long`);
+side evidence exists only where the order path SIZED the market (the signed
+`v1_backtest_order_placed ... target=±N` lines in the committed fixture):
 
-| View | Match | Exact 95% CI |
+| View | Date+market | Side-verified |
 |---|---|---|
-| **Market-level** (did each live-flagged market flag?) | **4/5 = 80%** | [0.28, 0.99] |
-| Strict decision (date+market+direction), full span | 4/10 = 40% | [0.12, 0.74] |
-| Stabilization window (2026-05-26→06-08) | 2/3 = 67% | [0.09, 0.99] |
-| **ER-aligned regime** (2026-06-02→06-08, gate live both sides) | **1/1 = 100%** | [0.02, 1.00] |
+| **Market-level** (did each live-flagged market flag?) | **4/5 = 80%** [0.28, 0.99] | 2 verified long (/MES, /MYM) · 1 side-FLIPPED (TLT) · 1 unverifiable (/MNQ, never sized) |
+| Strict decision, full span | 4/10 = 40% [0.12, 0.74] | **2/10 = 20%** [0.03, 0.56] |
+| Stabilization window (2026-05-26→06-08) | 2/3 = 67% [0.09, 0.99] | 2/3 (both verified long) |
+| **ER-aligned regime** (2026-06-02→06-08, gate live both sides) | **1/1** [0.02, 1.00] (+1 backtest extra: /MNQ 06-02) | 1/1 verified long |
+
+⚠ **The side flip:** the backtest SHORTED the bond complex (TLT target=−299,
+IEF −267, SHY −306 on 05-15/05-19) where the live oracle's TLT rows are LONG —
+so the TLT 05-16/05-17 date+market matches are opposite-side, and the honest
+side-verified strict rate is 2/10. The flip is itself the strongest evidence for
+cause 3 below (the bars live read on 05-16 produced a long signal; today's
+revised bars produce a short one). All-long bounds only the ORACLE side; the
+backtest side needs the signed-order evidence (golden-pinned) or POST-body
+capture (the complete fix — needs live-file/api changes, out of research scope).
 
 **After attribution the unexplained residual is ZERO decisions.** Every miss/extra
-has a verified cause (log lines in the committed fixture):
+maps to a cause (the backtest-side rejection/sizing lines are verified in the
+committed fixture; the data-revision explanation in 3 is the inference those lines
++ the side flip support):
 
 1. **Live dormant anti-pyramiding re-emission (pre-#312, deployed 2026-06-01):**
-   9 of 19 oracle rows are duplicate re-emissions of a held breakout; the backtest
-   is position-aware and correctly suppresses (`position_already_same_direction` —
+   9 of 19 oracle rows are duplicate re-emissions of a held breakout (incl.
+   multiple same-day cycle invocations, e.g. 3×TLT on 05-17); the backtest is
+   position-aware and correctly suppresses (`position_already_same_direction` —
    e.g. TLT 05-18).
 2. **ER-gate regime flip (live boundary 2026-06-02):** the backtest applies the
    current ER(0.20) gate to pre-boundary dates where live had no gate — /M2K
    2026-05-26 logs `efficiency_below_threshold`; this is the single market-level
-   miss.
+   date+market miss (live's gateless emission became a real paper position 05-27).
 3. **Bar data revised since live decided:** bar_sync overwrites daily + map-file
    re-synthesis (#326); /MES 05-18/19 + /MNQ 05-13/18 log `no_breakout` on today's
-   bars where live saw a breakout; same cause for the IEF/SHY/TLT-05-15 extras and
-   /MNQ first flagging 05-06 vs live 05-13.
+   bars where live saw a breakout; the same revision explains the IEF/SHY/TLT-05-15
+   extras, /MNQ first flagging 05-06 vs live 05-13, and the TLT side flip above.
 4. **Sizing-to-zero re-emission:** the 25%/name cap clips one /MNQ contract
    (≈$43k notional) to 0 at $100k → the backtest stays flat and re-emits while the
-   trend persists (`v1_backtest_sizing_empty`, 05-26→06-02 extras). Live /MNQ
-   orders also never filled (no live /MNQ position).
+   trend persists (`v1_backtest_sizing_empty` on EVERY /MNQ emit date — both the
+   05-06→05-14 and 05-26→06-02 extras). Live /MNQ orders also never filled (no
+   live /MNQ position).
 
-Residual bounds (documented, not fixable research-side): the LEAN log carries no
-direction → log-derived entries are labeled `long`; the oracle is all-long as of
-capture (the golden pins that), so this measurement is direction-unambiguous, but a
-future short entry needs POST-body capture to verify side. The error bars are wide
-because clean paper history is short — each new live entry tightens them; re-run
-this ceremony after more paper weeks for a tighter bound.
+The error bars are wide because clean paper history is short — each new live entry
+tightens them; re-run this ceremony after more paper weeks. The structural causes
+1+2 ended by 2026-06-02, so the ER-aligned window is the one that grows.

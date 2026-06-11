@@ -200,7 +200,8 @@ def test_crosscheck_window_filter() -> None:
         OracleEntry(date(2026, 5, 27), "/M2K", "long"),
         OracleEntry(date(2026, 6, 2), "/MES", "long"),
     ]
-    # Restrict to a single-phash sub-window (kickoff guidance) ⇒ only 05-27 compared.
+    # Restrict to a single-REGIME window cut by date (prod phashes are
+    # per-signal — PR D) ⇒ only 05-27 compared.
     report = crosscheck_entries(bt, oracle, window=(date(2026, 5, 26), date(2026, 5, 28)))
     assert report.oracle_count == 1
     assert report.match_rate == 1.0

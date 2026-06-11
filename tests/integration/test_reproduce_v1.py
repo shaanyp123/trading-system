@@ -38,9 +38,11 @@ pytestmark = pytest.mark.integration
 _DATA_ROOT = Path(os.environ.get("RESEARCH_DATA_ROOT", "research/data/cache/lean_bars"))
 _ORACLE_PATH = Path(os.environ.get("RESEARCH_V1_ORACLE", ""))
 # Default 0.0: the meaningful gate is "reproduced >=1 oracle decision" (directional
-# proof). An exact match is structurally limited (backtest re-emits without position
-# state; live used a distinct param-hash per signal), so a high bar would be brittle.
-# Operators can raise it via $RESEARCH_V1_MIN_MATCH_RATE.
+# proof). An exact match is structurally limited (measured PR D: bar data revised
+# since live decided, the pre-2026-06-02 ER regime flip, live pre-#312 re-emission
+# dups, sizing-to-zero re-emits — and prod stamps a distinct param-hash per signal),
+# so a high bar would be brittle. Operators can raise it via
+# $RESEARCH_V1_MIN_MATCH_RATE.
 _MIN_MATCH_RATE = float(os.environ.get("RESEARCH_V1_MIN_MATCH_RATE", "0.0"))
 
 

@@ -1189,37 +1189,54 @@ Real-engine run (isolated, post-#337 routing + post-#339 costs) over
 2026-05-13→2026-06-04). The committed fixtures are now these REAL artifacts and the
 golden test (`tests/golden/test_research_v1_repro.py`) pins every number below.
 
-- **Headline (stated error bars are exact binomial 95% CIs):**
-  - **Market-level — did each market live flagged get flagged by the backtest? 4/5
-    = 80%, CI [0.28, 0.99].** The single miss (/M2K) is the ER-gate regime flip,
-    not drift (below).
-  - Strict decision-level (session_date+market+direction), full span: **4/10 = 40%,
-    CI [0.12, 0.74]**; stabilization window (05-26→06-08): 2/3; **ER-aligned regime
-    window (06-02→06-08, the gate live on BOTH sides): 1/1, CI [0.02, 1.00]**.
-  - The matched set contains the decision that became a real paper position
-    (/MES 05-28) and the only post-ER-regime entry (/MYM 06-04).
-- **Residual: ZERO unexplained decisions after attribution.** Four verified causes
-  (rejection lines in the committed fixture log):
-  1. live dormant anti-pyramiding re-emission pre-#312 (9/19 oracle rows are dups;
-     backtest is position-aware → `position_already_same_direction`);
+- **Headline (stated error bars are exact binomial 95% CIs; DATE+MARKET and
+  SIDE-VERIFIED stated separately — the LEAN log carries no direction, so the
+  parser labels every backtest entry `long`; side evidence comes from the signed
+  `v1_backtest_order_placed target=±N` lines, golden-pinned):**
+  - **Market-level — did each market live flagged get flagged by the backtest?
+    Date+market 4/5 = 80%, CI [0.28, 0.99]** — of those 4: /MES + /MYM
+    side-VERIFIED long, **TLT side-FLIPPED** (backtest shorted −299 where live was
+    long), /MNQ side-unverifiable (never sized). The single date+market miss
+    (/M2K) is the ER-gate regime flip, not drift (below).
+  - Strict decision-level, full span: date+market **4/10 = 40%, CI [0.12, 0.74]**;
+    **side-verified 2/10 = 20%, CI [0.03, 0.56]** (the two TLT matches are
+    opposite-side). Stabilization window (05-26→06-08): 2/3, both side-verified.
+    **ER-aligned regime window (06-02→06-08, gate live BOTH sides): 1/1
+    side-verified, CI [0.02, 1.00]** (one backtest extra in-window: /MNQ 06-02).
+  - The side-verified matches are the decision that became a real paper position
+    (/MES 05-28, target=+1) and the only post-ER-regime entry (/MYM 06-04,
+    target=+1).
+- **Residual: ZERO unexplained decisions after attribution.** Four causes — the
+  backtest-side rejection/sizing evidence is verified in the committed fixture
+  log; the data-revision explanation in (3) is the inference those lines plus the
+  TLT side flip support:
+  1. live dormant anti-pyramiding re-emission pre-#312 (9/19 oracle rows are dups,
+     incl. multiple same-day cycle invocations — 3×TLT on 05-17; backtest is
+     position-aware → `position_already_same_direction`);
   2. ER-gate regime flip at 2026-06-02 (backtest applies the current gate to
      pre-boundary dates: /M2K 05-26 `efficiency_below_threshold` — live emitted it
      gateless and the real paper account opened /M2K 05-27);
   3. bar data revised since live decided (daily bar_sync overwrite + #326 map
-     re-synthesis): /MES 05-18/19 + /MNQ 05-13/18 read `no_breakout` today;
-  4. sizing-to-zero re-emission (`v1_backtest_sizing_empty`: 25%/name cap clips a
+     re-synthesis): /MES 05-18/19 + /MNQ 05-13/18 read `no_breakout` today; the
+     same revision explains the IEF/SHY/TLT-05-15 extras and **the TLT side flip
+     itself** (the bars live read on 05-16 produced a LONG signal; today's bars
+     produce a SHORT one);
+  4. sizing-to-zero re-emission (`v1_backtest_sizing_empty` on EVERY /MNQ emit
+     date — both the 05-06→05-14 and the 05-26→06-02 extras: 25%/name cap clips a
      ≈$43k /MNQ contract to 0 at $100k → flat → re-emits; live /MNQ never filled
      either).
 - **Key discovery — prod stamps a DISTINCT `parameter_set_hash` on EVERY signal**
-  (19 rows, 19 hashes), so the charter's "single-param-hash window" is not a usable
-  filter. Regime windows are cut by DATE; the live boundary is the ER gate landing
-  2026-06-02. `reproduce_v1` + the integration test + README §3 now say so.
+  (19 rows, 19 hashes, golden-pinned), so the charter's "single-param-hash window"
+  is not a usable filter. Regime windows are cut by DATE; the live boundary is the
+  ER gate landing 2026-06-02. `reproduce_v1` + the integration test + README §3
+  now say so.
 - **POST-body capture (the optional short-side improvement) was NOT taken:** it
   requires either live-file changes or api-side capture — out of research-side
-  scope. The bound is documented instead: log-derived entries carry a fixed `long`
-  label; the oracle is all-long as of capture (golden-pinned), so THIS measurement
-  is direction-unambiguous; the first live short entry will need POST-body capture
-  to verify side.
+  scope. The bound is stated instead: direction is structurally unobserved by the
+  log parser; the oracle is all-long as of capture (golden-pinned) so the ORACLE
+  side is unambiguous, but the BACKTEST side is only verifiable where the order
+  path sized the market (signed order lines) — POST-body capture is the complete
+  fix and the first live short entry will force it.
 - **Why the error bars are wide:** clean paper history is ~3 weeks of entries
   (n=5 markets / 10 unique decisions). The ceremony is repeatable (README §3);
   each additional paper entry tightens the bound. The structural causes (1)+(2)
