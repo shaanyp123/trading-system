@@ -75,6 +75,33 @@ from strategies.v1_trend_following.signals import Direction  # noqa: E402
 if not hasattr(v1_strategy, "Resolution"):
     v1_strategy.Resolution = _Resolution
 
+
+# PR-B cost-model runtime names, resolved from module globals at call time by
+# ``_backtest_cost_models`` (the classes are built lazily inside the gated
+# path, never at import). Same patch-onto-the-module pattern as Resolution.
+class _FeeModelBase:
+    def __init__(self) -> None: ...
+
+
+class _CashAmount:
+    def __init__(self, amount, currency) -> None:
+        self.amount = amount
+        self.currency = currency
+
+
+class _OrderFee:
+    def __init__(self, cash_amount) -> None:
+        self.value = cash_amount
+
+
+for _name, _value in (
+    ("FeeModel", _FeeModelBase),
+    ("CashAmount", _CashAmount),
+    ("OrderFee", _OrderFee),
+):
+    if not hasattr(v1_strategy, _name):
+        setattr(v1_strategy, _name, _value)
+
 # ---------------------------------------------------------------------------
 # Load the REAL Stage 0-5 sizer by file path — the same mechanism production
 # uses (``_load_sizing_pipeline``), but pointed at the repo copy. This bypasses
@@ -112,10 +139,21 @@ class _SymbolProperties:
 
 
 class _Security:
-    def __init__(self, *, price, multiplier=1, mapped=None) -> None:
+    def __init__(self, *, price, multiplier=1, mapped=None, symbol=None) -> None:
         self.price = price
         self.symbol_properties = _SymbolProperties(multiplier)
         self.mapped = mapped
+        # PR-B cost-model surfaces: ``symbol`` keys the once-per-contract
+        # application set; the models land via the two setters below.
+        self.symbol = symbol if symbol is not None else f"SYM_{id(self)}"
+        self.fee_models: list = []
+        self.slippage_models: list = []
+
+    def set_fee_model(self, model) -> None:
+        self.fee_models.append(model)
+
+    def set_slippage_model(self, model) -> None:
+        self.slippage_models.append(model)
 
 
 class _Holding:
@@ -206,6 +244,8 @@ def _bare_algo(*, backtest: bool, with_sizer: bool = False):
     algo._market_subscriptions = {}
     algo._backtest_pending_rolls = {}
     algo._backtest_entry_dates = {}
+    algo._backtest_costed_symbols = set()
+    algo._backtest_cost_model_classes = None
     algo.log = lambda *_a, **_k: None
     algo._orders: list = []
     algo.market_order = lambda symbol, qty, tag=None: algo._orders.append((symbol, qty, tag))
@@ -536,6 +576,108 @@ class TestSourceTripwires:
         for name, attrs in self._calls_by_function().items():
             hit = attrs & forbidden
             assert not hit, f"forbidden order API {sorted(hit)} called in {name}"
+
+    def _attr_calls_by_function(self) -> dict[str, set[str]]:
+        # ALL attribute-call names per function, ANY receiver — for APIs that
+        # live on Security objects (``security.set_fee_model(...)``) which the
+        # self-only collector above can't see.
+        tree = ast.parse(self._SOURCE)
+        out: dict[str, set[str]] = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            out[node.name] = {
+                sub.func.attr
+                for sub in ast.walk(node)
+                if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+            }
+        return out
+
+    def test_cost_model_sites_confined_to_gated_application(self) -> None:
+        # PR-B (cost fidelity): the fee/slippage overlays must stay inside the
+        # single gated application helper — a model set anywhere else (both
+        # casings) could change live-visible behavior without tripping here.
+        callers = {
+            name
+            for name, attrs in self._attr_calls_by_function().items()
+            if attrs & {"set_fee_model", "SetFeeModel", "set_slippage_model", "SetSlippageModel"}
+        }
+        assert callers == {"_apply_backtest_cost_models"}, (
+            f"fee/slippage model calls escaped the gated cost helper: {sorted(callers)}"
+        )
+
+
+class TestBacktestCostModels:
+    """PR-B (cost fidelity): explicit fee/slippage models on traded contracts.
+
+    LEAN's bundled IB fee model is stale (probe-measured $0.57/side for ALL
+    micros, $4.77 for MBT vs reality $0.62 / $1.37 / $3.42), so the gated
+    order path overlays an explicit per-contract commission + 1-tick adverse
+    slippage. These tests pin the model math, the once-per-contract
+    application, the live no-op, and the table's sync with the canonical
+    ``research/data/contract_specs.py``.
+    """
+
+    def test_fee_model_charges_all_in_per_contract(self) -> None:
+        algo = _bare_algo(backtest=True)
+        fee_cls, _slip_cls = algo._backtest_cost_models()
+        fee = fee_cls(0.62).get_order_fee(
+            types.SimpleNamespace(order=types.SimpleNamespace(quantity=-3))
+        )
+        assert fee.value.amount == pytest.approx(1.86)  # abs(-3) x $0.62
+        assert fee.value.currency == "USD"
+
+    def test_slippage_model_returns_tick_value(self) -> None:
+        algo = _bare_algo(backtest=True)
+        _fee_cls, slip_cls = algo._backtest_cost_models()
+        assert slip_cls(0.25, 1).get_slippage_approximation(None, None) == pytest.approx(0.25)
+        assert slip_cls(1.0, 1).get_slippage_approximation(None, None) == pytest.approx(1.0)
+
+    def test_apply_sets_models_once_per_contract(self) -> None:
+        algo = _bare_algo(backtest=True)
+        sec = _Security(price=Decimal("5000"), symbol="MESM6")
+        algo._apply_backtest_cost_models("/MES", sec)
+        algo._apply_backtest_cost_models("/MES", sec)  # idempotent: no re-set
+        assert len(sec.fee_models) == 1
+        assert len(sec.slippage_models) == 1
+
+    def test_apply_is_noop_in_live(self) -> None:
+        algo = _bare_algo(backtest=False)
+        sec = _Security(price=Decimal("5000"), symbol="MESM6")
+        algo._apply_backtest_cost_models("/MES", sec)
+        assert sec.fee_models == []
+        assert sec.slippage_models == []
+        assert algo._backtest_cost_model_classes is None  # never built in live
+
+    def test_unknown_market_is_skipped(self) -> None:
+        algo = _bare_algo(backtest=True)
+        sec = _Security(price=Decimal("100"), symbol="XXX1")
+        algo._apply_backtest_cost_models("/XXX", sec)
+        assert sec.fee_models == []
+
+    def test_ensure_front_subscribed_costs_the_security(self) -> None:
+        algo = _bare_algo(backtest=True)
+        front = _FakeSymbol("MESM6", canonical="MES_C")
+        sec = _Security(price=Decimal("5000"), symbol=front)
+        algo.securities = {front: sec}
+        algo._ensure_front_subscribed("/MES", front)
+        assert len(sec.fee_models) == 1
+        assert len(sec.slippage_models) == 1
+
+    def test_tables_match_canonical_contract_specs(self) -> None:
+        # The in-file tables (this file cannot import research/ in-container)
+        # must mirror research/data/contract_specs.py — the canonical cost
+        # table — exactly, or the V1 backtest and the reference runner drift.
+        from research.data.contract_specs import SPECS
+
+        futures = [s for s in SPECS.values() if s.asset_class == "future"]
+        assert v1_strategy._BACKTEST_FUTURES_COMMISSION_PER_SIDE == {
+            s.symbol.lstrip("/"): float(s.commission_per_side) for s in futures
+        }
+        assert v1_strategy._BACKTEST_FUTURES_TICK_SIZE == {
+            s.symbol.lstrip("/"): float(s.tick_size) for s in futures
+        }
+        assert {s.slippage_ticks for s in futures} == {v1_strategy._BACKTEST_FUTURES_SLIPPAGE_TICKS}
 
 
 # ---------------------------------------------------------------------------

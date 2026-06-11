@@ -47,17 +47,56 @@ authority for fills, stops, margin, and the equity curve (design D1). PR #335
   POST stub `http://127.0.0.1:9`, dummy non-empty bearer, read-only data COPY — never
   the live `trading_lean_data` volume.
 
-**Acceptance (real engine, isolated container, 2023-09-01 → 2026-06-08, post
-order-routing fix — design doc "PR A.2"):** 1013 bars, **85 fills, 40 closed trades,
-+3.45% total return** ($100k → $103,455), **Sharpe 0.14**, realized vol **9.1%
-annualized**, max drawdown **11.59%**, **0 margin events**, no liquidation.
-Time-in-market 65% of bars; zero-price order skips down **2,165 → 56 market-days
-(−97%)**; **18/18 rolls carried** (record-at-event → consolidate-next-cycle); zero
-same-market entry re-emits. Driver: `/tmp/v1_acceptance_run.py` (env `V1_START` /
-`V1_END` / `V1_TIMEOUT`); run from a worktree with `cwd` AND `PYTHONPATH` set to that
-worktree. *(The #335 baseline — 45 fills / 18 trades / +4.10% / Sharpe −1.00 / vol
-4.4% — was an artifact of NON-execution: the futures sleeve was untradeable on ~60% of
-market-days. The fixed, lower headline is the honest curve.)*
+**Acceptance (real engine, isolated container, 2023-09-01 → 2026-06-08; post
+order-routing fix "PR A.2" + explicit cost model "PR B", 2026-06-11):** 1013 bars,
+**85 fills, 40 closed trades, +3.42% total return** ($100k → $103,420.76), **Sharpe
+0.14**, realized vol **9.1% annualized**, max drawdown **11.61%**, **0 margin
+events**, no liquidation, **total fees $223.03** (per-fill census matches the cost
+table exactly). Time-in-market 65% of bars; zero-price order skips down **2,165 → 56
+market-days (−97%)**; **18/18 rolls carried** (record-at-event →
+consolidate-next-cycle); zero same-market entry re-emits. Driver:
+`/tmp/v1_acceptance_run.py` (env `V1_START` / `V1_END` / `V1_TIMEOUT`); run from a
+worktree with `cwd` AND `PYTHONPATH` set to that worktree. *(Delta chain: the #335
+baseline — 45 fills / 18 trades / +4.10% / Sharpe −1.00 / vol 4.4% — was an artifact
+of NON-execution; the PR A.2 routing fix made it 85 fills / +3.45% / vol 9.1%; PR B's
+honest costs move it −$33.92 to +3.42% — commissions DOWN $42.01 (LEAN had been
+overcharging MBT ~39%) against ≈$76 of explicit 1-tick slippage. 84/85 fills are
+byte-identical to PR A.2; the one difference is the TLT short sized 314→313 shares
+because Stage 0-5 reads the slippage-bearing equity.)*
+
+## Cost model & fill conventions (charter PR B, 2026-06-11)
+
+Probe-measured in THIS image (`trading-lean-local:latest`), then made explicit:
+
+- **LEAN's bundled `InteractiveBrokersFeeModel` is stale for micros**: it charges
+  $0.57/contract/side for ALL CME/COMEX micros and $4.77 for MBT. Reality (IBKR
+  fixed, non-member, as of 2026-06, ±$0.10/side stated tolerance): index micros
+  **$0.62**, MGC **$1.37**, MBT **$3.42**. ETFs: the bundled model matches IBKR
+  fixed exactly ($0.005/share, $1.00 min) and is kept.
+- **The explicit tables live in `research/data/contract_specs.py`** (canonical:
+  `commission_per_side`, `slippage_ticks`, `FILL_CONVENTION`, `COSTS_AS_OF`) and are
+  mirrored inline in `research/lean/projects/research_runner.py` (`COSTS_MODEL=ibkr`,
+  default) and `lean/v1_strategy.py` (backtest order path, master-gated) — neither
+  can import `research/` in-container; `tests/unit/test_research_contract_specs.py`
+  AST-pins all three tables in sync.
+- **Slippage: futures 1 tick adverse per side, explicit** (probe: a buy fills at
+  close + 1 tick). Rationale: the backtest fills at the SAME session's close — the
+  bar the signal was computed from — while the live ceremony dispatches ~17:30 ET
+  and really fills at the 18:00 ET reopen; 1 tick stands in for that gap +
+  half-spread. ETFs: 0 ticks — they fill at the NEXT session's official open (an
+  achievable auction print), stated rather than hidden.
+- **Fill conventions (empirical):** futures market orders fill same-instant at the
+  session close (`MGC 2024-04-01 17:30 → fill == that bar's close`); ETF orders pend
+  overnight and fill at the next session's open (TLT/IEF/SHY each exactly the next
+  open). The §6.6 parity rail's next-open assumption is confirmed for equities.
+- **Models land on the TRADED CONTRACT security** (fills never happen on the
+  canonical continuous): the runner costs each mapped contract before ordering;
+  V1 costs contracts at its two gated subscription sites. `costs: zero` now zeroes
+  mapped-contract fills too (the old canonical-only application was inert for
+  futures fills).
+- **Every report surfaces the assumptions** (md/html header + `result.json
+  cost_model` block), rendered from `contract_specs.py` so report and engine can't
+  drift.
 
 **Follow-up findings (post-#335, in `Docs/futures-backtester-design.md` charter PR A
 follow-up):** nit (a) `invested_since`-reset was *structurally inert* only because the

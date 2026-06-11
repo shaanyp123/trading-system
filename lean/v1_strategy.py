@@ -145,6 +145,38 @@ PHASE1_FUTURES = ("MES", "MNQ", "MYM", "M2K", "MGC", "MBT")
 PHASE1_ETFS = ("TLT", "IEF", "SHY", "TIP")
 
 
+# Trust-with-Money charter PR B (cost fidelity) — BACKTEST-ONLY cost tables.
+# ALL-IN per-contract per-side commission (IBKR fixed $0.25 + exchange + $0.02
+# NFA; crypto micros priced higher by IBKR) and tick sizes for 1-tick adverse
+# slippage, as of 2026-06. Canonical table: research/data/contract_specs.py
+# (a unit test pins these in sync; this file cannot import research/ inside
+# the container). LEAN's bundled InteractiveBrokersFeeModel is stale —
+# probe-measured $0.57/side for ALL CME/COMEX micros and $4.77 for MBT vs
+# reality $0.62 (index) / $1.37 (MGC) / $3.42 (MBT) — so the backtest order
+# path sets explicit models per traded contract (``_apply_backtest_cost_models``,
+# master-gated). ETFs keep LEAN's bundled IBKR equity model ($0.005/share,
+# $1.00 min — probe-measured to match IBKR fixed exactly) with zero slippage
+# (they fill at the next session's official open). Plain module constants are
+# inert in live mode: every reader sits behind ``_backtest_orders_enabled``.
+_BACKTEST_FUTURES_COMMISSION_PER_SIDE = {
+    "MES": 0.62,
+    "MNQ": 0.62,
+    "MYM": 0.62,
+    "M2K": 0.62,
+    "MGC": 1.37,
+    "MBT": 3.42,
+}
+_BACKTEST_FUTURES_TICK_SIZE = {
+    "MES": 0.25,
+    "MNQ": 0.25,
+    "MYM": 1.0,
+    "M2K": 0.1,
+    "MGC": 0.1,
+    "MBT": 5.0,
+}
+_BACKTEST_FUTURES_SLIPPAGE_TICKS = 1
+
+
 # Parameter keys + V1_DEFAULTS fallbacks (kept in sync with
 # strategies/v1_trend_following/parameters.py V1_DEFAULTS).
 #
@@ -604,6 +636,13 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         #     consolidations; cleared when a market goes flat.
         self._backtest_pending_rolls: dict = {}
         self._backtest_entry_dates: dict = {}
+        # PR-B (cost fidelity) BACKTEST-ONLY bookkeeping: contract securities
+        # that already carry the explicit cost models (applied once each), and
+        # the lazily-built model classes (their bases are LEAN runtime types
+        # that exist only in-container; built on first gated use). Both stay
+        # empty/None in live mode — writers sit behind the master gate.
+        self._backtest_costed_symbols: set = set()
+        self._backtest_cost_model_classes = None
 
         self.log(
             f"v1_strategy initialized (post-pivot 2026-05-12, Pivot-PR-D) "
@@ -1724,6 +1763,72 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
                     continue
         return False
 
+    def _backtest_cost_models(self):  # noqa: ANN201
+        """The PR-B fee/slippage model classes, built lazily — BACKTEST ONLY.
+
+        The fee model subclasses LEAN's ``FeeModel`` (resolvable only inside
+        the container / under the test stubs), so the classes are defined at
+        first gated use rather than import time — live mode never builds them.
+        Interface probe-proven 2026-06-10 (research_runner probe): LEAN maps
+        the snake_case overrides and applies ``get_slippage_approximation``
+        against the trade direction.
+        """
+        if self._backtest_cost_model_classes is None:
+
+            class _PerContractFeeModel(FeeModel):  # noqa: F405
+                """All-in per-contract per-side commission (PR-B table)."""
+
+                def __init__(self, fee_per_contract):
+                    super().__init__()
+                    self._fee_per_contract = fee_per_contract
+
+                def get_order_fee(self, parameters):
+                    quantity = abs(parameters.order.quantity)
+                    return OrderFee(  # noqa: F405
+                        CashAmount(quantity * self._fee_per_contract, "USD")  # noqa: F405
+                    )
+
+            class _TickSlippageModel:
+                """N ticks of adverse slippage per fill (absolute price units)."""
+
+                def __init__(self, tick_size, ticks):
+                    self._slippage = tick_size * ticks
+
+                def get_slippage_approximation(self, asset, order):
+                    return self._slippage
+
+            self._backtest_cost_model_classes = (_PerContractFeeModel, _TickSlippageModel)
+        return self._backtest_cost_model_classes
+
+    def _apply_backtest_cost_models(self, market_key, security) -> None:  # noqa: ANN001
+        """Apply explicit fee + slippage models to a traded contract — BACKTEST ONLY.
+
+        Fee/slippage models live on the SECURITY that fills (G2: fills land on
+        per-expiry contract securities, never the canonical), so every contract
+        the order path touches gets the PR-B models once, keyed by its symbol.
+        Live mode is untouched: both callers sit behind the master gate, and
+        this method early-returns defensively as well.
+        """
+        if not self._backtest_orders_enabled:
+            return
+        ticker = str(market_key).lstrip("/").upper()
+        fee = _BACKTEST_FUTURES_COMMISSION_PER_SIDE.get(ticker)
+        tick = _BACKTEST_FUTURES_TICK_SIZE.get(ticker)
+        if fee is None or tick is None or security is None:
+            return
+        symbol = getattr(security, "symbol", None)
+        if symbol is None or symbol in self._backtest_costed_symbols:
+            return
+        try:
+            fee_model_cls, slippage_model_cls = self._backtest_cost_models()
+            security.set_fee_model(fee_model_cls(fee))
+            security.set_slippage_model(
+                slippage_model_cls(tick, _BACKTEST_FUTURES_SLIPPAGE_TICKS)
+            )
+            self._backtest_costed_symbols.add(symbol)
+        except Exception as exc:  # noqa: BLE001 -- cost-model failure must not kill the cycle
+            self.log(f"v1_backtest_cost_model_failed market={market_key} exc={exc!r}")
+
     def _ensure_front_subscribed(self, market_key, tradeable) -> None:  # noqa: ANN001
         """Explicitly subscribe the mapped front so it is FED and FILLABLE — BACKTEST ONLY.
 
@@ -1738,12 +1843,15 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
         (probe-proven: cured arms logged ZERO dead cycles across two windows,
         control arms 295 + 184). The canonical's signal series reads the same
         zips through the map file and is untouched — signals stay
-        byte-identical; only fillability changes.
+        byte-identical; only fillability changes. The returned security gets
+        the PR-B cost models (idempotent, once per contract).
         """
         try:
-            self.add_future_contract(tradeable, Resolution.DAILY)  # noqa: F405
+            security = self.add_future_contract(tradeable, Resolution.DAILY)  # noqa: F405
         except Exception as exc:  # noqa: BLE001 -- subscription failure must not kill the cycle
             self.log(f"v1_backtest_front_subscribe_failed market={market_key} exc={exc!r}")
+            return
+        self._apply_backtest_cost_models(market_key, security)
 
     def _consolidate_pending_rolls(self, session_date) -> None:  # noqa: ANN001
         """Carry recorded rolls: close the old leg, reopen in the new front — BACKTEST ONLY.
@@ -1776,6 +1884,9 @@ class V1TrendFollowingAlgorithm(QCAlgorithm):  # type: ignore[misc,name-defined]
             try:
                 security = self.add_future_contract(new_symbol, Resolution.DAILY)  # noqa: F405
                 new_price = security.price
+                # The carry's reopen order fills on THIS security before the
+                # regular cycle's _ensure_front_subscribed sees it — cost it now.
+                self._apply_backtest_cost_models(market_key, security)
             except Exception as exc:  # noqa: BLE001 -- subscribe failure → defer, retry next cycle
                 self.log(
                     f"v1_roll_subscribe_failed market={market_key} "
