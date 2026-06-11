@@ -177,6 +177,7 @@ def run(cfg: RunConfig, *, runs_dir: Path = _DEFAULT_RUNS_DIR) -> Path:
         harness_version=__version__,
         generated_at=generated_at,
         rows=rows,
+        costs_model=cfg.costs_model,
     )
     _log.info(
         "research_run_complete",
@@ -397,6 +398,7 @@ def run_lean(cfg: RunConfig, *, runs_dir: Path = _DEFAULT_RUNS_DIR) -> Path:
         harness_version=__version__,
         generated_at=generated_at,
         rows=rows,
+        costs_model=cfg.costs_model,
         alerts=tuple(alerts),
     )
     _log.info(

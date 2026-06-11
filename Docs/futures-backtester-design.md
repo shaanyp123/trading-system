@@ -1105,6 +1105,62 @@ contract + slippage in the report header; unit-test the per-contract commission.
 Acceptance: a backtest's reported commission/round-trip matches IBKR micro reality
 within a stated tolerance; slippage assumption reported, not hidden.
 
+#### PR B — Cost / fill fidelity — ✅ DONE (2026-06-11)
+
+Probe-driven like PR A.2 (engine over docs), then the smallest correct change:
+
+- **Probe findings (real engine, `trading-lean-local:latest`, per-order fees read from
+  the order-events JSON of the 85-fill acceptance run + targeted runner probes):**
+  (1) **LEAN's bundled `InteractiveBrokersFeeModel` is stale**: it charges
+  **$0.57/contract/side for ALL CME/COMEX micros** (incl. MGC) and **$4.77 for MBT**.
+  Reality (IBKR fixed, non-member, as of 2026-06: $0.25 commission + exchange + $0.02
+  NFA; crypto micros carry a $2.25 IBKR commission): index micros **$0.62**, MGC
+  **$1.37** (exchange $1.10 — LEAN ~58% under), MBT **$3.42** (exchange $1.15 — LEAN
+  ~39% OVER; its $2.50 exchange fee is the 2021 schedule). ETFs: LEAN charges exactly
+  IBKR fixed ($0.005/share, $1.00 min — IEF 280 sh = $1.40 ✓) — kept as-is.
+  (2) **Fill conventions pinned empirically:** a 17:30 ET scheduled FUTURES market
+  order fills SAME-instant at that session's close — the close of the very bar the
+  signal was computed from (MGC order 2024-04-01 17:30 → fill 2298.1 == that bar's
+  close), zero inherent slippage. An ETF order pends overnight and fills at the NEXT
+  session's official open (TLT 83.70 / IEF 93.62 / SHY 82.04 — each exactly the next
+  day's open). The §6.6 parity story's next-open assumption holds for equities.
+  (3) A model set on the CANONICAL future never touches a fill (fills land on mapped
+  per-expiry contract securities) — the runner's old `costs: zero` path had exactly
+  that gap on futures (fee model applied to a security that never fills).
+- **Build:** explicit cost tables in `research/data/contract_specs.py` (the canonical:
+  `commission_per_side`, `slippage_ticks`, ETF per-share constants, `FILL_CONVENTION`,
+  as-of + ±$0.10/side stated tolerance) mirrored inline into BOTH LEAN-side algorithms
+  (they cannot import `research/` in-container; an AST unit test pins all three tables
+  in sync). `research_runner` (`COSTS_MODEL=ibkr`, the default) and the V1 backtest
+  order path (`_apply_backtest_cost_models`, master-gated, applied once per traded
+  contract at the two gated subscription sites) now set a per-contract fee model +
+  **1-tick adverse slippage** on every traded futures contract. ETFs keep the bundled
+  (accurate) model with zero slippage — fills at next-open are an achievable auction
+  print; the choice is explicit, not hidden. `costs: zero` now zeroes mapped-contract
+  fills too. Custom-model interface (snake_case `get_order_fee` /
+  `get_slippage_approximation`) probe-proven before touching the live file.
+- **Live safety:** live mode is byte-for-byte unchanged — the model classes are built
+  lazily inside the gate (never at import), both application sites are master-gated,
+  and the source tripwires now also pin `set_fee_model`/`set_slippage_model` (both
+  casings) to the single gated helper. Live-safety suite green.
+- **Surfacing:** every report (md/html/result.json) now carries a cost-model header —
+  per-market commission, slippage, fill conventions, as-of + tolerance — rendered from
+  `contract_specs.py` so it cannot drift; `result.json` gets a machine-readable
+  `cost_model` block. Unit tests cover the commission math (futures per-contract, ETF
+  min-per-order), the table sync, and the header presence.
+- **New authoritative acceptance (real engine, isolated, 2023-09-01 → 2026-06-08,
+  1013 bars):** **85 fills · 40 closed trades · +3.42% total ($100k→$103,420.76) ·
+  Sharpe 0.14 · realized vol 9.1% · max-DD 11.61% · 0 margin events · total fees
+  $223.03.** Delta vs PR A.2's +3.45%/$103,454.68: **−$33.92 (−0.03pp), entirely
+  cost-model mechanics** — commissions DOWN $42.01 ($265.04→$223.03; removing MBT's
+  39% overcharge outweighs MGC's correction up) while 1-tick slippage costs ≈$76
+  across ~118 futures contract-sides (the ≈ also absorbs the 1-share TLT resize). Decisions are untouched: 84 of 85 fills are
+  byte-identical (same symbol/timestamp/side/quantity); the single difference is the
+  TLT short sizing 314→313 shares (Stage 0-5 reads equity, which now carries the
+  slippage drag). Per-market census: index micros exactly $0.62/contract·side, MGC
+  $1.37, MBT $3.42, ETFs $0.005/share — reported commission matches the stated IBKR
+  reference within the stated tolerance by construction, verified per-fill.
+
 ### PR C — Deep multi-year PARENTS history (extends V1 P&L + powers walk-forward)
 Walk-forward + a multi-decade V1 backtest need years across regimes (2008/2020/2022);
 the snapshot is ~3yr micros / ~1yr ETFs. Decision made: PARENTS (ES/NQ/RTY/YM/GC/BTC,

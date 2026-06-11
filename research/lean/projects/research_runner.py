@@ -45,6 +45,61 @@ _RESOLUTIONS = {
     "tick": Resolution.TICK,  # noqa: F405
 }
 
+# --- explicit cost model (charter PR B) -------------------------------------
+# ALL-IN per-contract per-side commission (IBKR fixed + exchange + NFA, as of
+# 2026-06) and tick sizes for 1-tick adverse slippage. These mirror
+# research/data/contract_specs.py (the canonical table — a unit test pins the
+# two in sync; this file cannot import research.* inside the LEAN container).
+# LEAN's bundled InteractiveBrokersFeeModel is stale (probe-measured: $0.57 for
+# ALL CME/COMEX micros, $4.77 for MBT vs reality $0.62 / $1.37 / $3.42), which
+# is why COSTS_MODEL=ibkr sets fees explicitly. ETFs keep LEAN's bundled model
+# ($0.005/share min $1.00 — probe-measured to match IBKR fixed exactly).
+_FUTURES_COMMISSION_PER_SIDE = {
+    "MES": 0.62,
+    "MNQ": 0.62,
+    "MYM": 0.62,
+    "M2K": 0.62,
+    "MGC": 1.37,
+    "MBT": 3.42,
+}
+_FUTURES_TICK_SIZE = {
+    "MES": 0.25,
+    "MNQ": 0.25,
+    "MYM": 1.0,
+    "M2K": 0.1,
+    "MGC": 0.1,
+    "MBT": 5.0,
+}
+#: Adverse ticks per futures fill (explicit, reported; ETFs are 0 — they fill
+#: at the next session's official open, an achievable auction print).
+_FUTURES_SLIPPAGE_TICKS = 1
+
+
+class PerContractFeeModel(FeeModel):  # noqa: F405
+    """Explicit all-in per-contract per-side commission (research cost model)."""
+
+    def __init__(self, fee_per_contract):
+        super().__init__()
+        self._fee_per_contract = fee_per_contract
+
+    def get_order_fee(self, parameters):
+        quantity = abs(parameters.order.quantity)
+        return OrderFee(CashAmount(quantity * self._fee_per_contract, "USD"))  # noqa: F405
+
+
+class TickSlippageModel:
+    """N ticks of adverse slippage per fill, in absolute price units.
+
+    LEAN duck-types slippage models (``get_slippage_approximation``); the fill
+    model applies the returned price offset AGAINST the trade direction.
+    """
+
+    def __init__(self, tick_size, ticks):
+        self._slippage = tick_size * ticks
+
+    def get_slippage_approximation(self, asset, order):
+        return self._slippage
+
 
 def _parse_yyyymmdd(token, fallback):
     token = (token or "").strip()
@@ -127,12 +182,15 @@ class ResearchRunnerAlgorithm(QCAlgorithm):  # noqa: F405
             self._symbol = equity.symbol
             self._security = equity
 
-        if costs_model == "zero":
-            # Zero fees + slippage — for a clean equity comparison vs the numpy
-            # screen (the IBKR model's commission would otherwise add a gap on top
-            # of the fill-convention gap the §6.6 tolerances cover).
-            self._security.set_fee_model(ConstantFeeModel(0))  # noqa: F405
-            self._security.set_slippage_model(ConstantSlippageModel(0))  # noqa: F405
+        # Cost models are applied PER TRADED SECURITY via _ensure_cost_models:
+        # futures fills land on the MAPPED contract securities (G2), so a model
+        # set on the canonical alone never touches a fill — the pre-PR-B "zero"
+        # path had exactly that gap. The primary security is costed here (the
+        # whole story for an ETF; harmless for a future's canonical) and every
+        # mapped contract is costed before it is ordered.
+        self._costs_model = costs_model
+        self._costed_symbols = set()
+        self._ensure_cost_models(self._symbol)
 
         self._highs = deque(maxlen=self._channel)
         self._lows = deque(maxlen=self._channel)
@@ -156,6 +214,44 @@ class ResearchRunnerAlgorithm(QCAlgorithm):  # noqa: F405
         if not self._is_future:
             return self._symbol
         return self.securities[self._symbol].mapped  # may be None before first map
+
+    def _ensure_cost_models(self, symbol) -> None:
+        """Apply the configured cost model to ``symbol``'s security, once.
+
+        Called for the primary security at initialize and for every (mapped)
+        contract before it is ordered — fee/slippage models live on the
+        SECURITY that fills, so each traded contract needs its own application.
+
+          zero  -> no fees, no slippage on everything (clean numpy comparison).
+          ibkr  -> futures: explicit per-contract commission + 1-tick adverse
+                   slippage (tables above); ETFs: keep LEAN's bundled IBKR
+                   equity model (probe-verified accurate) + no slippage (fills
+                   at the next session's official open).
+        """
+        if symbol is None or symbol in self._costed_symbols or symbol not in self.securities:
+            return
+        security = self.securities[symbol]
+        if self._costs_model == "zero":
+            security.set_fee_model(ConstantFeeModel(0))  # noqa: F405
+            security.set_slippage_model(ConstantSlippageModel(0))  # noqa: F405
+        elif self._is_future:
+            ticker = str(symbol.id.symbol).upper()
+            fee = _FUTURES_COMMISSION_PER_SIDE.get(ticker)
+            tick = _FUTURES_TICK_SIZE.get(ticker)
+            if fee is None or tick is None:
+                # Refuse to run "ibkr" costs on a future the table doesn't
+                # cover — LEAN's bundled fallback is stale, and a silently
+                # mis-costed run defeats PR B. Extend the tables (mirror
+                # research/data/contract_specs.py) or run COSTS_MODEL=zero.
+                raise ValueError(
+                    f"COSTS_MODEL=ibkr has no explicit cost entry for futures "
+                    f"ticker {ticker!r} - extend _FUTURES_COMMISSION_PER_SIDE/"
+                    f"_FUTURES_TICK_SIZE (mirror research/data/contract_specs.py) "
+                    f"or run with COSTS_MODEL=zero"
+                )
+            security.set_fee_model(PerContractFeeModel(fee))
+            security.set_slippage_model(TickSlippageModel(tick, _FUTURES_SLIPPAGE_TICKS))
+        self._costed_symbols.add(symbol)
 
     def _decide_target(self, bar) -> int:
         """Return the desired integer-contract position from the strategy (long side).
@@ -194,6 +290,10 @@ class ResearchRunnerAlgorithm(QCAlgorithm):  # noqa: F405
             old = changed.old_symbol
             quantity = self.portfolio[old].quantity
             if quantity != 0:
+                # ``old`` is a string in this build; resolve the Symbol via the
+                # security so the cost-model application keys consistently.
+                if old in self.securities:
+                    self._ensure_cost_models(self.securities[old].symbol)
                 self.market_order(old, -quantity, tag="roll")
 
     def on_data(self, data):  # noqa: F405
@@ -210,6 +310,7 @@ class ResearchRunnerAlgorithm(QCAlgorithm):  # noqa: F405
                     current = self.portfolio[mapped].quantity
                     delta = self._target - current
                     if delta != 0:
+                        self._ensure_cost_models(mapped)  # fills land on the contract
                         self.market_order(mapped, delta)  # G1: integer contracts
 
         # Push AFTER the decision so the donchian channel always excludes today.

@@ -22,6 +22,15 @@ from typing import TYPE_CHECKING
 import numpy as np
 import numpy.typing as npt
 
+from research.data.contract_specs import (
+    COSTS_AS_OF,
+    COSTS_TOLERANCE_PER_SIDE,
+    ETF_COMMISSION_MIN_PER_ORDER,
+    ETF_COMMISSION_PER_SHARE,
+    FILL_CONVENTION,
+    SPECS,
+)
+
 if TYPE_CHECKING:
     from research.eval.compare import ComparisonRow
     from research.eval.sweep import SweepReport
@@ -50,6 +59,72 @@ _BANNER = (
     "margin, liquidation, and ruin metrics land in P3. Daily resolution only "
     "(intraday deferred per the 2026-06-03 sign-off)."
 )
+
+
+def _cost_assumption_lines(costs_model: str = "ibkr") -> list[str]:
+    """The cost/fill assumptions behind every reported number (charter PR B).
+
+    Rendered from ``research/data/contract_specs.py`` (the canonical cost
+    table) so the surfaced assumptions can never drift from what the engines
+    actually charge. Applies to LEAN-fill rows; numpy-screen rows (fill=close)
+    carry no cost model and say so. ``costs_model="zero"`` (the clean-compare
+    mode) must say ZERO — claiming IBKR costs for a zero-cost run is exactly
+    the hidden-assumption failure this header exists to prevent.
+    """
+    fill_line = (
+        f"fill convention: futures — {FILL_CONVENTION['future']}; ETFs — {FILL_CONVENTION['etf']}"
+    )
+    screen_line = "numpy-screen rows (fill=close) model NO costs — screen only, never authority"
+    if costs_model == "zero":
+        return [
+            "cost model: ZERO (clean-compare mode) — no fees, no slippage on any lean-fill row",
+            fill_line,
+            screen_line,
+        ]
+    futures = [s for s in SPECS.values() if s.asset_class == "future"]
+    commissions = ", ".join(
+        f"{s.symbol} ${s.commission_per_side}"
+        for s in sorted(futures, key=lambda s: s.symbol)
+        if s.commission_per_side is not None
+    )
+    slippage = ", ".join(
+        f"{s.symbol} {s.slippage_ticks} tick (${s.slippage_per_side})"
+        for s in sorted(futures, key=lambda s: s.symbol)
+    )
+    return [
+        f"cost model (lean-fill rows; as of {COSTS_AS_OF}, "
+        f"±${COSTS_TOLERANCE_PER_SIDE}/side): futures all-in commission/side "
+        f"{commissions}; ETFs ${ETF_COMMISSION_PER_SHARE}/share "
+        f"min ${ETF_COMMISSION_MIN_PER_ORDER}/order (LEAN IB model, "
+        f"probe-verified)",
+        f"slippage (adverse, per side): futures {slippage}; ETFs none",
+        fill_line,
+        screen_line,
+    ]
+
+
+def _cost_model_json(costs_model: str = "ibkr") -> dict[str, object]:
+    """Machine view of :func:`_cost_assumption_lines` for ``result.json``."""
+    if costs_model == "zero":
+        return {
+            "mode": "zero",
+            "fill_convention": dict(FILL_CONVENTION),
+            "applies_to": "lean-fill rows (numpy-screen rows model no costs)",
+        }
+    futures = sorted(
+        (s for s in SPECS.values() if s.asset_class == "future"), key=lambda s: s.symbol
+    )
+    return {
+        "mode": "ibkr",
+        "as_of": COSTS_AS_OF,
+        "tolerance_per_side_usd": str(COSTS_TOLERANCE_PER_SIDE),
+        "futures_commission_per_side_usd": {s.symbol: str(s.commission_per_side) for s in futures},
+        "futures_slippage_ticks": {s.symbol: s.slippage_ticks for s in futures},
+        "etf_commission_per_share_usd": str(ETF_COMMISSION_PER_SHARE),
+        "etf_commission_min_per_order_usd": str(ETF_COMMISSION_MIN_PER_ORDER),
+        "fill_convention": dict(FILL_CONVENTION),
+        "applies_to": "lean-fill rows (numpy-screen rows model no costs)",
+    }
 
 
 def _fmt_pct(x: float) -> str:
@@ -109,6 +184,7 @@ def _markdown(
     generated_at: datetime,
     rows: list[ReportRow],
     alerts: tuple[str, ...] = (),
+    costs_model: str = "ibkr",
 ) -> str:
     lines = [
         f"# Research run: {run_name}",
@@ -129,6 +205,7 @@ def _markdown(
         f"- harness version: `{version}`",
         f"- generated: {generated_at.isoformat()}",
         f"- instruments: {len(rows)}",
+        *[f"- {line}" for line in _cost_assumption_lines(costs_model)],
         "",
         "| Symbol | Strategy | Start | End | Bars | Total return | CAGR | Max DD | P&L |",
         "|---|---|---|---|---:|---:|---:|---:|---:|",
@@ -150,6 +227,7 @@ def _html(
     generated_at: datetime,
     rows: list[ReportRow],
     alerts: tuple[str, ...] = (),
+    costs_model: str = "ibkr",
 ) -> str:
     esc = html.escape
     parts = [
@@ -181,6 +259,11 @@ def _html(
         f"{esc(generated_at.isoformat())} · {len(rows)} instrument(s)</p>"
     )
     parts.append(
+        "<p class='muted'>"
+        + "<br>".join(esc(line) for line in _cost_assumption_lines(costs_model))
+        + "</p>"
+    )
+    parts.append(
         "<table><thead><tr><th>Symbol</th><th>Strategy</th><th>Start</th><th>End</th>"
         "<th>Bars</th><th>Total return</th><th>CAGR</th><th>Max DD</th><th>P&amp;L</th>"
         "</tr></thead><tbody>"
@@ -210,6 +293,7 @@ def _result_json(
     generated_at: datetime,
     rows: list[ReportRow],
     alerts: tuple[str, ...] = (),
+    costs_model: str = "ibkr",
 ) -> str:
     payload = {
         "run_name": run_name,
@@ -217,6 +301,7 @@ def _result_json(
         "generated_at": generated_at.isoformat(),
         "resolution": "daily",
         "authoritative": bool(rows) and all(r.fill == "lean" for r in rows),
+        "cost_model": _cost_model_json(costs_model),
         "liquidation_alerts": list(alerts),
         "instruments": [
             {
@@ -247,6 +332,7 @@ def write_report(
     generated_at: datetime,
     rows: list[ReportRow],
     alerts: tuple[str, ...] = (),
+    costs_model: str = "ibkr",
 ) -> Path:
     """Write ``report.md`` + ``report.html`` + ``result.json`` into ``run_dir``.
 
@@ -256,14 +342,17 @@ def write_report(
     """
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "report.md").write_text(
-        _markdown(run_name, harness_version, generated_at, rows, alerts), encoding="utf-8"
+        _markdown(run_name, harness_version, generated_at, rows, alerts, costs_model),
+        encoding="utf-8",
     )
     html_path = run_dir / "report.html"
     html_path.write_text(
-        _html(run_name, harness_version, generated_at, rows, alerts), encoding="utf-8"
+        _html(run_name, harness_version, generated_at, rows, alerts, costs_model),
+        encoding="utf-8",
     )
     (run_dir / "result.json").write_text(
-        _result_json(run_name, harness_version, generated_at, rows, alerts), encoding="utf-8"
+        _result_json(run_name, harness_version, generated_at, rows, alerts, costs_model),
+        encoding="utf-8",
     )
     return html_path
 
