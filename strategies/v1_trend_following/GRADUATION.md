@@ -60,6 +60,8 @@ regime window 1/1; zero unexplained residual after attribution.
 **Ruin / hard stops:** 0 margin events, no liquidation, no ruin banner — the
 hard-stop conditions did not fire.
 
-**Outcome:** ☐ operator review → ☐ `risk-review-approved` (operator-applied)
-→ ☐ merge. (Checked off by the operator at merge; this dry-run row proves the
-path — the first VALUE-changing graduation appends the next row.)
+**Outcome:** ☑ operator review (2026-06-11, review verdict APPROVE-WITH-NITS,
+all nits folded) → ☑ `risk-review-approved` (operator-authorized 2026-06-11 —
+"this is good to merge … you can apply the label"; applied by Claude as the
+operator's hands, PR #342) → ☑ merged. The pipeline is proven; the first
+VALUE-changing graduation appends the next row.

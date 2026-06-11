@@ -1278,10 +1278,13 @@ parameter value moves, no strategy-logic decision by Claude):
   is a separate operator decision. `strategies/` deploys two ways (baked into the
   api image + volume-mounted into lean_local at the 21:10 restart) — the runbook's
   deploy step covers both plus the `parameter_sets` DB head ceremony.
-- **Status: the `strategies/**` PR is OPEN and subagent-reviewed; per the charter
-  it is NOT merged by Claude** — the operator applies `risk-review-approved`,
-  signs off, and merges to complete the acceptance (the ledger row's checkboxes
-  record that moment).
+- **Status: ✅ COMPLETE — PR #342 merged 2026-06-11 with the operator-authorized
+  `risk-review-approved` label** (operator sign-off given explicitly in-session
+  after the subagent review came back APPROVE-WITH-NITS with all nits folded;
+  Claude applied the label and merged as the operator's hands — the PR A #335
+  precedent). The ledger row's checkboxes record the completion; the PR E
+  acceptance (research → PR w/ delta → label → merge + documented runbook) is
+  satisfied.
 
 **When A–E land:** the backtester can show an authoritative MULTI-YEAR, MULTI-REGIME
 P&L for the real strategy with honest costs + ruin, a quantified trust bridge, and a
