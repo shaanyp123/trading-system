@@ -27,12 +27,18 @@ from research.risk.metrics import (
 )
 
 
-def _result(equity: list[float], dates: list[date]) -> BacktestResult:
+def _result(
+    equity: list[float], dates: list[date], positions: list[int] | None = None
+) -> BacktestResult:
     return BacktestResult(
         symbol="X",
         dates=tuple(dates),
         equity_curve=np.asarray(equity, dtype=np.float64),
-        positions=np.zeros(len(equity), dtype=np.int64),
+        positions=(
+            np.asarray(positions, dtype=np.int64)
+            if positions is not None
+            else np.zeros(len(equity), dtype=np.int64)
+        ),
         starting_cash=equity[0],
         multiplier=1.0,
         fill="close",
@@ -40,13 +46,13 @@ def _result(equity: list[float], dates: list[date]) -> BacktestResult:
     )
 
 
-def _year(equity: list[float]) -> BacktestResult:
+def _year(equity: list[float], positions: list[int] | None = None) -> BacktestResult:
     """A result whose first/last dates span ~1y (so CAGR/annualization are defined)."""
     n = len(equity)
     dates = [
         date(2024, 1, 1) + (date(2025, 1, 1) - date(2024, 1, 1)) * i // (n - 1) for i in range(n)
     ]
-    return _result(equity, dates)
+    return _result(equity, dates, positions)
 
 
 # --- P1 headline (moved here) ------------------------------------------------
@@ -138,11 +144,43 @@ def test_kelly_sign_tracks_edge() -> None:
     assert kelly_leverage(np.array([100.0, 99.0, 98.0, 97.0, 96.0])) < 0
 
 
+def test_fractional_kelly_rebaselined_to_asset() -> None:
+    # Asset returns with analytically known full-Kelly f* = mu/sigma². The SIZED
+    # path holds a constant 2x (per-bar returns exactly doubled), so the curve-
+    # implied Kelly is f*/2; the mean-leverage re-baseline must report the ASSET's
+    # f* and fractional_kelly ≈ 2/f* (the un-rebaselined bug reported ≈ 4/f*).
+    r_asset = np.tile([0.02, 0.02, -0.01], 40)
+    f_star = float(np.mean(r_asset) / np.var(r_asset, ddof=1))
+    equity = 100_000.0 * np.cumprod(np.concatenate([[1.0], 1.0 + 2.0 * r_asset]))
+    metrics = compute_risk_metrics(
+        _year([float(v) for v in equity]), peak_leverage=2.0, mean_leverage=2.0
+    )
+    assert metrics.kelly_leverage == pytest.approx(f_star, rel=0.15)
+    assert metrics.fractional_kelly == pytest.approx(2.0 / f_star, rel=0.15)
+
+
+def test_fractional_kelly_nan_without_mean_leverage() -> None:
+    # No mean leverage ⇒ no honest re-baseline to the asset ⇒ NaN, not a guess.
+    metrics = compute_risk_metrics(_year([100.0, 110.0, 105.0, 120.0]), peak_leverage=2.0)
+    assert math.isnan(metrics.kelly_leverage)
+    assert math.isnan(metrics.fractional_kelly)
+
+
 # --- drawdown shape ----------------------------------------------------------
 def test_longest_drawdown_days_underwater_span() -> None:
     # Peak at index 0 (2024-01-01); never recovers 100 → underwater to the last date.
     res = _result([100.0, 95.0, 90.0], [date(2024, 1, 1), date(2024, 1, 11), date(2024, 1, 21)])
     assert longest_drawdown_days(res) == 20
+
+
+def test_longest_drawdown_days_runs_to_recovery_bar() -> None:
+    # Peak Jan-1, trough Jan-11, RECOVERED Jan-21: the drawdown ends at the
+    # recovery bar → 20 days (stopping at the last underwater bar undercounts: 10).
+    res = _result([100.0, 90.0, 105.0], [date(2024, 1, 1), date(2024, 1, 11), date(2024, 1, 21)])
+    assert longest_drawdown_days(res) == 20
+    # A new-highs-only curve still reports 0 (recovery bars without a drawdown).
+    up = _result([100.0, 110.0, 120.0], [date(2024, 1, 1), date(2024, 1, 11), date(2024, 1, 21)])
+    assert longest_drawdown_days(up) == 0
 
 
 def test_worst_day_is_most_negative_return() -> None:
@@ -189,7 +227,16 @@ def test_compute_risk_metrics_liquidated_forces_ruin_one() -> None:
     assert metrics.liquidated is True
     assert metrics.risk_of_ruin == 1.0
     assert metrics.first_liquidation_date == date(2024, 4, 1)
+    # All-zero positions vector ⇒ the all-bars fallback denominator (5).
     assert metrics.margin_call_frequency == pytest.approx(4 / 5)
+
+
+def test_margin_call_frequency_uses_position_bars() -> None:
+    # 2 of 5 bars carry a position; 1 margin event ⇒ 1/2 per POSITION-BAR (the
+    # denominator liquidation's summary uses), not 1/5 over all bars.
+    res = _year([100.0, 99.0, 98.0, 99.0, 99.5], positions=[0, 1, 1, 0, 0])
+    metrics = compute_risk_metrics(res, n_margin_events=1)
+    assert metrics.margin_call_frequency == pytest.approx(0.5)
 
 
 def test_compute_risk_metrics_wipeout_is_liquidated() -> None:

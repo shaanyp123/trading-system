@@ -32,6 +32,10 @@ from research.lean.config_render import load_production_v1_parameters
 from research.lean.driver import LeanRunSpec
 from research.lean.results import OrderFill
 
+# Read-only import of the production candidate universe (importing strategies/ is
+# allowed; modifying it is not). Seeds the log parser's universe — see below.
+from strategies.v1_trend_following.parameters import V1_CANDIDATE_UNIVERSE
+
 _log = structlog.get_logger(__name__)
 
 #: Repo paths (read-only inputs) for the production V1 algorithm + its package.
@@ -46,9 +50,11 @@ _SERVICES_PKG = Path("services")
 # in the LEAN LOG, not the result JSON's orders/trades. Per cycle the log records one
 # ``v1_signal_rejected ... market=X`` per rejected market + a ``v1_signals_generated
 # ... signals_emitted_count=N`` summary; the N emitted markets are exactly
-# (universe seen) - (rejected this cycle). These regexes parse that. (Direction is
-# long — V1's Donchian breakout is long-only today; the live oracle confirms all-long.
-# Short capture would need POST-body capture, which is a future enhancement.)
+# (universe) - (rejected this cycle). These regexes parse that. (Direction is NOT
+# captured from the log — neither line carries a side, so every derived entry gets
+# the ``direction`` default label. V1 emits shorts too; capturing the true side
+# needs POST-body capture, a future enhancement — ``crosscheck_entries`` warns when
+# the oracle carries non-long entries.)
 _REJECTED_RE = re.compile(r"v1_signal_rejected session_date=(\d{4}-\d{2}-\d{2}) market=(\S+)")
 _GENERATED_RE = re.compile(
     r"v1_signals_generated session_date=(\d{4}-\d{2}-\d{2}) signals_emitted_count=(\d+)"
@@ -96,15 +102,19 @@ def _find_v1_log(output_dir: Path) -> Path:
 def parse_v1_decisions_from_log(output_dir: Path, *, direction: str = "long") -> list[Entry]:
     """Extract V1 entry DECISIONS from the LEAN log (V1 places no orders; it POSTs).
 
-    Per cycle: emitted markets = (universe seen across the run) - (markets rejected
-    that cycle), for cycles whose ``signals_emitted_count`` is non-zero. When the
-    elimination is ambiguous (a market neither emitted nor rejected that cycle, e.g. a
-    data error → count mismatch) the cycle is SKIPPED rather than fabricating an entry.
+    Per cycle: emitted markets = (universe) - (markets rejected that cycle), for
+    cycles whose ``signals_emitted_count`` is non-zero. The universe is SEEDED from
+    the production ``V1_CANDIDATE_UNIVERSE`` (a rejection-derived universe alone
+    misses a market that is emitted EVERY cycle — never rejected, never seen — and
+    its absence poisons the count check for whole cycles), unioned with the names
+    the log actually rejects. When the elimination is still ambiguous (a market
+    neither emitted nor rejected that cycle, e.g. a data error → count mismatch)
+    the cycle is SKIPPED rather than fabricating an entry.
     """
     log = _find_v1_log(output_dir).read_text(encoding="utf-8", errors="replace").splitlines()
     rejected: dict[str, set[str]] = {}
     emitted_count: dict[str, int] = {}
-    universe: set[str] = set()
+    universe: set[str] = set(V1_CANDIDATE_UNIVERSE)
     for line in log:
         rej = _REJECTED_RE.search(line)
         if rej is not None:
@@ -136,11 +146,13 @@ def parse_v1_decisions_from_log(output_dir: Path, *, direction: str = "long") ->
 def first_entry_per_market(entries: list[Entry]) -> list[Entry]:
     """Reduce to the FIRST entry per (market, direction), ascending by date.
 
-    Neutralizes the structural backtest-vs-live gap: backtest V1 runs under
-    PaperBrokerage with NO position feedback (the live ``/positions`` GET is live-mode
-    only), so it RE-EMITS the same breakout every cycle while the channel holds, whereas
-    the position-aware live system emits once (anti-pyramiding, PR #250). Comparing
-    first-entries asks "did each market flag, and when first" rather than re-emit cadence.
+    Neutralizes the residual backtest-vs-live re-emit gap. Post-#335 the backtest
+    DOES have position feedback (the order path snapshots LEAN holdings), so the
+    blanket "re-emits every cycle" era is over; re-emits now arise only from
+    roll-edge / pending-fill windows where the snapshot reads flat for a cycle or
+    two (the live ``/positions`` GET stays live-mode only; anti-pyramiding live is
+    PR #250). Comparing first-entries asks "did each market flag, and when first"
+    rather than re-emit cadence — still the right level for the cross-check.
     """
     seen: set[tuple[str, str]] = set()
     out: list[Entry] = []
@@ -257,6 +269,17 @@ def crosscheck_entries(
     ``window`` (inclusive) restricts BOTH sides to a single-phash sub-window so a
     mid-window param change does not muddy the comparison (P2 kickoff guidance).
     """
+    # Log-derived backtest entries are all labeled "long" (direction is not in the
+    # LEAN log); a short in the oracle can therefore falsely match/mismatch on
+    # direction. Warn so a non-long oracle is read with that caveat.
+    non_long = sorted({e.direction for e in oracle_entries if e.direction != "long"})
+    if non_long:
+        _log.warning(
+            "research_v1_oracle_non_long_directions",
+            directions=non_long,
+            note="log-derived backtest entries carry a fixed 'long' label; "
+            "direction-level matches against these oracle rows may be spurious",
+        )
     start, end = window if window is not None else (None, None)
 
     def _in_window(d: date) -> bool:
@@ -287,6 +310,7 @@ def build_v1_run_spec(
     parameters: dict[str, str] | None = None,
     start: date | None = None,
     end: date | None = None,
+    starting_cash: float | None = None,
     v1_algorithm: Path = _V1_ALGORITHM,
     strategies_pkg: Path = _STRATEGIES_PKG,
     services_pkg: Path = _SERVICES_PKG,
@@ -301,13 +325,16 @@ def build_v1_run_spec(
     ``start`` / ``end`` set V1's backtest window via the ``BACKTEST_START_DATE`` /
     ``BACKTEST_END_DATE`` parameters (V1 reads them in ``initialize()``, defaulting to
     its original hard-coded paper window when absent). This is what lets the harness
-    backtest the REAL V1 over any multi-year span.
+    backtest the REAL V1 over any multi-year span. ``starting_cash`` flows the same
+    way (``STARTING_CASH_USD``); ``None`` keeps lean.json's value.
     """
     params = dict(parameters or load_production_v1_parameters())
     if start is not None:
         params["BACKTEST_START_DATE"] = start.strftime("%Y%m%d")
     if end is not None:
         params["BACKTEST_END_DATE"] = end.strftime("%Y%m%d")
+    if starting_cash is not None:
+        params["STARTING_CASH_USD"] = str(int(starting_cash))
     return LeanRunSpec(
         algorithm_type_name="V1TrendFollowingAlgorithm",
         algorithm_source=v1_algorithm,

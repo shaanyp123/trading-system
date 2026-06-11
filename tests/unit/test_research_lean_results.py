@@ -14,8 +14,15 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from structlog.testing import capture_logs
 
-from research.lean.results import find_result_json, parse_lean_result
+from research.lean.results import (
+    _parse_datetime,
+    find_result_json,
+    parse_filled_orders,
+    parse_lean_result,
+    parse_margin_events,
+)
 
 _FIXTURES = Path(__file__).parent.parent / "fixtures" / "lean_output"
 _LINE_PASCAL = _FIXTURES / "line_pascal"
@@ -80,6 +87,7 @@ def test_parse_line_series_trades() -> None:
     assert trade.profit_loss == Decimal("120.0")
     assert trade.fees == Decimal("0.0")
     assert trade.entry_time.date() == date(2024, 1, 4)
+    assert trade.symbol == "TLT"  # per-market attribution for portfolio runs
     assert parsed.statistics["Total Trades"] == "1"
 
 
@@ -100,6 +108,7 @@ def test_parse_candlestick_camel_case_and_string_enums() -> None:
     assert trade.entry_price == Decimal("4500.0")
     assert trade.exit_price == Decimal("4480.0")
     assert trade.profit_loss == Decimal("20.0")
+    assert trade.symbol == "/MES"  # normalized from the camelCase symbol dict
     assert parsed.statistics["Net Profit"] == "0.04%"
 
 
@@ -114,3 +123,60 @@ def test_starting_cash_override() -> None:
     # Override wins over the first equity point (the driver knows set_cash).
     assert parsed.result.starting_cash == 99000.0
     assert parsed.result.pnl == pytest.approx(100120.0 - 99000.0)
+
+
+def _order(tag: str, *, qty: float = -1.0, status: int = 3) -> dict[str, object]:
+    return {
+        "Symbol": {"Value": "MES YQB1..."},
+        "Time": "2024-06-24T00:00:00Z",
+        "Quantity": qty,
+        "Status": status,
+        "Tag": tag,
+    }
+
+
+def test_margin_events_skip_delisting_liquidations() -> None:
+    # LEAN also "Liquidate"s on delisting/expiry — a contract lifecycle event, not
+    # ruin; only the genuine margin call may feed the RED banner.
+    obj: dict[str, object] = {
+        "Statistics": {},
+        "Orders": {
+            "1": _order("Liquidated because of delisting"),
+            "2": _order("Margin Call"),
+        },
+    }
+    events = parse_margin_events(obj)
+    assert [e.tag for e in events] == ["Margin Call"]
+
+
+def test_partial_fill_uses_fill_quantity() -> None:
+    # Terminal PartiallyFilled (status 2): Quantity is the ORDERED amount; the
+    # filled amount is FillQuantity. Fully Filled (3) keeps preferring Quantity.
+    obj: dict[str, object] = {
+        "Statistics": {},
+        "Orders": {
+            "1": {
+                "Symbol": {"Value": "TLT"},
+                "Time": "2024-01-04T00:00:00Z",
+                "Quantity": 5,
+                "FillQuantity": 2,
+                "Status": 2,
+            },
+            "2": {
+                "Symbol": {"Value": "TLT"},
+                "Time": "2024-01-05T00:00:00Z",
+                "Quantity": 3,
+                "FillQuantity": 3,
+                "Status": 3,
+            },
+        },
+    }
+    fills = parse_filled_orders(obj)
+    assert [f.quantity for f in fills] == [2, 3]
+
+
+def test_unparseable_timestamp_warns_before_epoch_fallback() -> None:
+    with capture_logs() as logs:
+        dt = _parse_datetime("not-a-timestamp")
+    assert dt.year == 1970  # tolerant epoch fallback is unchanged...
+    assert any(e["event"] == "research_lean_timestamp_unparseable" for e in logs)  # ...but loud

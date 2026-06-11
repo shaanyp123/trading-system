@@ -59,6 +59,9 @@ class LeanTrade:
     direction: int  # +1 long, -1 short
     profit_loss: Decimal
     fees: Decimal
+    #: Normalized market (``/MES``, ``TLT``); ``""`` when the trade carries no
+    #: Symbol. Lets a portfolio-level V1 run attribute trades per market.
+    symbol: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +162,9 @@ def _parse_datetime(value: object) -> datetime:
         try:
             dt = datetime.fromisoformat(text)
         except ValueError:
+            # Epoch-dating a fill silently would corrupt date-keyed comparisons —
+            # keep the tolerant fallback but make it visible.
+            _log.warning("research_lean_timestamp_unparseable", value=value)
             return datetime.fromtimestamp(0, tz=UTC)
         return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
     return datetime.fromtimestamp(0, tz=UTC)
@@ -282,6 +288,7 @@ def _parse_trades(result_obj: dict[str, object]) -> tuple[LeanTrade, ...]:
         if not isinstance(raw, dict):
             continue
         qty = _as_decimal(_get(raw, "Quantity", "quantity"))
+        symbol_field = _get(raw, "Symbol", "symbol")
         # Round (don't truncate) to an integer contract count — int(Decimal("0.1"))
         # silently zeroes; ROUND_HALF_UP is consistent with parse_filled_orders.
         trades.append(
@@ -294,6 +301,7 @@ def _parse_trades(result_obj: dict[str, object]) -> tuple[LeanTrade, ...]:
                 direction=_normalize_direction(_get(raw, "Direction", "direction")),
                 profit_loss=_as_decimal(_get(raw, "ProfitLoss", "profitLoss")),
                 fees=_as_decimal(_get(raw, "TotalFees", "totalFees")),
+                symbol=_normalize_market(symbol_field) if symbol_field is not None else "",
             )
         )
     return tuple(trades)
@@ -323,7 +331,12 @@ _FUTURES_ROOTS = frozenset(
 
 
 def _normalize_market(symbol_field: object) -> str:
-    """LEAN order ``Symbol`` → prod ``signals.market`` form (``/MES``, ``TLT``)."""
+    """LEAN order ``Symbol`` → prod ``signals.market`` form (``/MES``, ``TLT``).
+
+    Only BARE futures roots get the slash re-attached; a dated contract Value
+    (e.g. ``"MESM26"``) intentionally passes through unslashed — cosmetic today,
+    since fills aggregate cross-symbol.
+    """
     value = _get(symbol_field, "Value", "value", default=symbol_field)
     text = str(value).strip()
     root = text.split(" ", 1)[0].lstrip("/").upper()  # "MES YQB1..." / "/MES" → "MES"
@@ -341,13 +354,32 @@ def _is_filled(status: object) -> bool:
     return False
 
 
+def _is_partial_fill(status: object) -> bool:
+    # LEAN OrderStatus.PartiallyFilled=2 (a terminal status in a result dump).
+    if isinstance(status, bool):
+        return False
+    if isinstance(status, (int, float)):
+        return int(status) == 2
+    if isinstance(status, str):
+        return status.strip().lower() == "partiallyfilled"
+    return False
+
+
 def parse_filled_orders(result_obj: dict[str, object]) -> tuple[OrderFill, ...]:
     """All FILLED orders as :class:`OrderFill` (the reproduce-V1 decision bridge)."""
     fills: list[OrderFill] = []
     for raw in _orders_iter(result_obj):
-        if not isinstance(raw, dict) or not _is_filled(_get(raw, "Status", "status")):
+        if not isinstance(raw, dict):
             continue
-        qty_raw = _get(raw, "Quantity", "quantity", "FillQuantity", "fillQuantity")
+        status = _get(raw, "Status", "status")
+        if not _is_filled(status):
+            continue
+        if _is_partial_fill(status):
+            # Terminal PartiallyFilled: Quantity is the ORDERED amount; what
+            # actually filled is FillQuantity — prefer it when present.
+            qty_raw = _get(raw, "FillQuantity", "fillQuantity", "Quantity", "quantity")
+        else:
+            qty_raw = _get(raw, "Quantity", "quantity", "FillQuantity", "fillQuantity")
         when = _get(raw, "LastFillTime", "lastFillTime", "Time", "time", "CreatedTime")
         if qty_raw is None or when is None:
             continue
@@ -399,8 +431,11 @@ def _positions_from_fills(
 
 #: Order-tag substrings that mark a LEAN margin-call / forced-liquidation order.
 #: LEAN's ``DefaultMarginCallModel`` tags generated orders "Margin Call"; we also
-#: match "liquidat" to catch brokerage-model variants. Case-insensitive.
+#: match "liquidat" to catch brokerage-model variants. Case-insensitive. Tags
+#: containing "delist" are EXCLUDED: LEAN also "Liquidate"s on delisting/expiry
+#: ("Liquidated because of delisting…"), a contract lifecycle event, not ruin.
 _MARGIN_CALL_MARKERS = ("margin call", "liquidat")
+_NON_MARGIN_TAG_MARKER = "delist"
 
 
 def parse_margin_events(result_obj: dict[str, object]) -> tuple[MarginEvent, ...]:
@@ -415,8 +450,11 @@ def parse_margin_events(result_obj: dict[str, object]) -> tuple[MarginEvent, ...
         if not isinstance(raw, dict):
             continue
         tag = str(_get(raw, "Tag", "tag", default="") or "")
-        if not any(marker in tag.lower() for marker in _MARGIN_CALL_MARKERS):
+        tag_lower = tag.lower()
+        if not any(marker in tag_lower for marker in _MARGIN_CALL_MARKERS):
             continue
+        if _NON_MARGIN_TAG_MARKER in tag_lower:
+            continue  # delisting/expiry liquidation, not a margin event (see above)
         qty_raw = _get(raw, "Quantity", "quantity", "FillQuantity", "fillQuantity")
         when = _get(raw, "LastFillTime", "lastFillTime", "Time", "time", "CreatedTime")
         if qty_raw is None or when is None:

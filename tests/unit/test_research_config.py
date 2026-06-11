@@ -58,6 +58,18 @@ def test_defaults_applied() -> None:
         ({"strategy": {"ref": "buy_and_hold", "contracts": 0}}, "non-zero int"),
         ({"strategy": {"ref": "buy_and_hold", "contracts": True}}, "non-zero int"),
         ({"date_range": {"start": "2025-01-01", "end": "2024-01-01"}}, "precedes start"),
+        # Malformed numerics RAISE (key + value) instead of silently filtering.
+        ({"leverage": {"sweep": [2, "2"]}}, "leverage.sweep values must be numbers"),
+        ({"leverage": {"sweep": [2, -1]}}, "leverage.sweep values must be > 0"),
+        ({"leverage": {"cap": "3"}}, "leverage.cap must be a number"),
+        ({"leverage": {"cap": -2}}, "leverage.cap must be > 0"),
+        ({"leverage": {"cap": True}}, "leverage.cap must be a number"),
+        ({"starting_cash": True}, "starting_cash must be a number"),
+        ({"starting_cash": -5}, "starting_cash must be > 0"),
+        (
+            {"sizing": {"scheme": "vol_target", "vol_target_pct_annual": "0.15"}},
+            "sizing.vol_target_pct_annual must be a number",
+        ),
     ],
 )
 def test_validation_errors(mutate: dict[str, object], match: str) -> None:

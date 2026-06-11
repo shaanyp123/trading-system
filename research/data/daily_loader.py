@@ -140,10 +140,15 @@ def load_daily_series(
         raise FileNotFoundError(f"no on-disk daily zip for {symbol} at {zip_path}")
 
     stem = _filename_stem(symbol)
+    resolved_expiry: str | None = None
     with zipfile.ZipFile(zip_path, "r") as zf:
         names = zf.namelist()
         if is_future:
             member = _select_futures_member(names, stem, expiry)
+            # The member name carries the contract identity — parse the YYYYMM back
+            # out so an AUTO-selected single-member load doesn't lose the expiry
+            # (same derivation for the explicit path; it round-trips the argument).
+            resolved_expiry = member[len(f"{stem}_trade_") : -len(".csv")]
         else:
             member = f"{stem}.csv"
             if member not in names:
@@ -172,7 +177,7 @@ def load_daily_series(
         volume=_arr(v),
         resolution="daily",
         price_treatment="raw",
-        expiry=expiry if is_future else None,
+        expiry=resolved_expiry,
     )
     _log.debug(
         "research_daily_series_loaded",

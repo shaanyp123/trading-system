@@ -42,6 +42,14 @@ def test_futures_single_expiry_raw_prices(tmp_path: Path) -> None:
     assert series.expiry == "202403"
 
 
+def test_futures_single_member_auto_selection_carries_expiry(tmp_path: Path) -> None:
+    # Auto-selecting the only member must not lose the contract identity — the
+    # YYYYMM is parsed back out of the member name.
+    write_futures_daily(tmp_path, "/MES", "202403", _FUT_BARS, market_dir="cme")
+    series = load_daily_series(tmp_path, "/MES")  # no expiry argument
+    assert series.expiry == "202403"
+
+
 def test_futures_multi_expiry_requires_disambiguation(tmp_path: Path) -> None:
     write_futures_daily(tmp_path, "/MES", "202403", _FUT_BARS, market_dir="cme")
     write_futures_daily(tmp_path, "/MES", "202406", _FUT_BARS, market_dir="cme")

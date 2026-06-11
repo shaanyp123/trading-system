@@ -86,6 +86,53 @@ def test_lean_engine_is_wired_not_stubbed(tmp_path: Path) -> None:
         run(cfg, runs_dir=tmp_path / "runs")
 
 
+def test_lean_engine_rejects_sizing_and_leverage_blocks(tmp_path: Path) -> None:
+    # engine=lean would silently drop the research sizing/leverage blocks.
+    root = _seed(tmp_path)
+    cfg = _cfg(
+        root,
+        engine="lean",
+        strategy={"ref": "donchian", "channel": 20},
+        sizing={"scheme": "vol_target", "vol_target_pct_annual": 0.15},
+    )
+    with pytest.raises(ValueError, match="does not apply research sizing"):
+        run(cfg, runs_dir=tmp_path / "runs")
+
+
+def test_leverage_block_without_sizing_rejected(tmp_path: Path) -> None:
+    root = _seed(tmp_path)
+    cfg = _cfg(root, leverage={"cap": 2})
+    with pytest.raises(ValueError, match="only applies to sized paths"):
+        run(cfg, runs_dir=tmp_path / "runs")
+
+
+def test_strategy_sweep_without_validity_rejected(tmp_path: Path) -> None:
+    root = _seed(tmp_path)
+    cfg = _cfg(root, strategy={"ref": "donchian", "channel": 20, "sweep": {"channel": [10, 20]}})
+    with pytest.raises(ValueError, match="validity"):
+        run(cfg, runs_dir=tmp_path / "runs")
+
+
+def test_run_lean_threads_starting_cash_to_v1_spec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # cfg.starting_cash must reach the V1 spec as STARTING_CASH_USD; stub the LEAN
+    # invocation (record the spec, then stop) — no backend needed.
+    root = _seed(tmp_path)
+    captured: dict[str, object] = {}
+
+    def fake_run_backtest(spec: object, **_k: object) -> object:
+        captured["spec"] = spec
+        raise RuntimeError("stop-after-spec")
+
+    monkeypatch.setattr("research.run.run_backtest", fake_run_backtest)
+    cfg = _cfg(root, engine="lean", strategy={"ref": "v1_adapter"}, starting_cash=250_000)
+    with pytest.raises(RuntimeError, match="stop-after-spec"):
+        run(cfg, runs_dir=tmp_path / "runs")
+    spec = captured["spec"]
+    assert spec.parameters["STARTING_CASH_USD"] == "250000"  # type: ignore[attr-defined]
+
+
 def test_intraday_resolution_points_to_p5(tmp_path: Path) -> None:
     root = _seed(tmp_path)
     with pytest.raises(NotImplementedError, match="intraday is deferred"):

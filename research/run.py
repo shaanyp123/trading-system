@@ -78,8 +78,9 @@ def _guard_phase(cfg: RunConfig) -> None:
         raise NotImplementedError(f"mode={cfg.mode!r}: live/paper-forward is P7.")
     if cfg.engine == "vbt":
         raise NotImplementedError(
-            "engine='vbt': the vectorbt sweep lands in P4. Use engine='daily' for the "
-            "numpy evaluator."
+            "engine='vbt' is not implemented — P4 shipped the numpy sweep instead "
+            "(research/eval/sweep.py, via a validity config on engine='daily'). Any "
+            "future vbt path stays parity-gated per design D2."
         )
     if cfg.engine not in ("daily", "lean"):
         raise ValueError(f"unsupported engine {cfg.engine!r}")
@@ -89,6 +90,25 @@ def _guard_phase(cfg: RunConfig) -> None:
         raise NotImplementedError(
             f"validity (walk-forward sweep) runs on engine: daily, not engine={cfg.engine!r}. "
             "Sweep on the numpy screen, then confirm the winning combo in engine: lean."
+        )
+    # The remaining blocks are consumed by exactly one path each; a config that
+    # pairs them with the wrong engine/path would otherwise be SILENTLY dropped.
+    has_leverage_block = cfg.leverage_cap is not None or bool(cfg.leverage_sweep)
+    if cfg.engine == "lean" and (cfg.sizing_scheme is not None or has_leverage_block):
+        raise ValueError(
+            "engine='lean' with a sizing/leverage block: the LEAN path does not apply "
+            "research sizing/leverage; remove the block or use engine='daily'."
+        )
+    if has_leverage_block and cfg.sizing_scheme is None:
+        raise ValueError(
+            "a leverage block without sizing.scheme: leverage.cap/sweep only applies "
+            "to sized paths — add sizing.scheme (e.g. vol_target) or remove leverage."
+        )
+    if cfg.strategy_sweep and cfg.validity_scheme is None:
+        raise ValueError(
+            "strategy.sweep without a validity block: the sweep is consumed by the "
+            "validity (walk-forward) path only — add validity.scheme: walk_forward "
+            "or remove strategy.sweep."
         )
 
 
@@ -194,7 +214,7 @@ def run_leverage_sweep(cfg: RunConfig, *, runs_dir: Path = _DEFAULT_RUNS_DIR) ->
     directions = np.sign(strategy.target_positions(series)).astype(np.int64)
     assert cfg.sizing_scheme is not None  # guaranteed by _is_leverage_sweep
     scheme = SizingScheme(name=cfg.sizing_scheme, params=cfg.sizing_params)  # type: ignore[arg-type]
-    margin = margin_model_for(spec, data_root=cfg.data_root)
+    margin = margin_model_for(spec, data_root=cfg.data_root, window_start=cfg.start)
     starting_cash = cfg.starting_cash if cfg.starting_cash is not None else 100_000.0
     vol_lookback = int(cfg.sizing_params.get("instrument_vol_lookback_days", _DEFAULT_VOL_LOOKBACK))
     atr_lookback = int(cfg.sizing_params.get("atr_lookback_days", _DEFAULT_ATR_LOOKBACK))
@@ -312,8 +332,13 @@ def run_lean(cfg: RunConfig, *, runs_dir: Path = _DEFAULT_RUNS_DIR) -> Path:
     if cfg.strategy_ref == "v1_adapter":
         # V1 subscribes to its whole universe internally → ONE portfolio backtest.
         # The window flows through BACKTEST_START_DATE/END_DATE params (V1 reads them
-        # in initialize()), so date_range now drives a real multi-year V1 backtest.
-        specs = [build_v1_run_spec(cfg.data_root, start=cfg.start, end=cfg.end)]
+        # in initialize()), as does starting_cash via STARTING_CASH_USD (None keeps
+        # lean.json's value), so date_range drives a real multi-year V1 backtest.
+        specs = [
+            build_v1_run_spec(
+                cfg.data_root, start=cfg.start, end=cfg.end, starting_cash=cfg.starting_cash
+            )
+        ]
     elif cfg.strategy_ref in REFERENCE_STRATEGIES:
         specs = [build_reference_run_spec(cfg, symbol) for symbol in cfg.universe]
     else:

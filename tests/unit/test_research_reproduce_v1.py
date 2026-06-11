@@ -7,6 +7,7 @@ from datetime import date
 from pathlib import Path
 
 import pytest
+from structlog.testing import capture_logs
 
 from research.eval.reproduce_v1 import (
     Entry,
@@ -19,6 +20,7 @@ from research.eval.reproduce_v1 import (
     parse_v1_decisions_from_log,
 )
 from research.lean.results import OrderFill
+from strategies.v1_trend_following.parameters import V1_CANDIDATE_UNIVERSE
 
 
 def _write_v1_log(output_dir: Path, body: str) -> None:
@@ -26,44 +28,58 @@ def _write_v1_log(output_dir: Path, body: str) -> None:
     (output_dir / "V1TrendFollowingAlgorithm-log.txt").write_text(body, encoding="utf-8")
 
 
-def test_parse_v1_decisions_emitted_by_elimination(tmp_path: Path) -> None:
-    # universe (rejected across the run) = {/MES, /MNQ, TLT}; on 05-06 /MNQ is the one
-    # market NOT rejected with emitted_count=1 ⇒ the emitted decision.
-    _write_v1_log(
-        tmp_path,
-        "\n".join(
-            [
-                "t v1_signal_rejected session_date=2026-05-06 market=/MES reason=no_breakout",
-                "t v1_signal_rejected session_date=2026-05-06 market=TLT reason=no_breakout",
-                "t v1_signals_generated session_date=2026-05-06 signals_emitted_count=1 "
-                "rejections_count=2 reasons={}",
-                "t v1_signal_rejected session_date=2026-05-07 market=/MES reason=no_breakout",
-                "t v1_signal_rejected session_date=2026-05-07 market=/MNQ reason=no_breakout",
-                "t v1_signal_rejected session_date=2026-05-07 market=TLT reason=no_breakout",
-                "t v1_signals_generated session_date=2026-05-07 signals_emitted_count=0 "
-                "rejections_count=3 reasons={}",
-            ]
-        ),
+def _reject_lines(session: str, markets: list[str]) -> list[str]:
+    return [
+        f"t v1_signal_rejected session_date={session} market={m} reason=no_breakout"
+        for m in markets
+    ]
+
+
+def _generated_line(session: str, emitted: int, rejected: int) -> str:
+    return (
+        f"t v1_signals_generated session_date={session} signals_emitted_count={emitted} "
+        f"rejections_count={rejected} reasons={{}}"
     )
+
+
+def test_parse_v1_decisions_emitted_by_elimination(tmp_path: Path) -> None:
+    # The universe is the candidate universe; on 05-06 /MNQ is the one market NOT
+    # rejected with emitted_count=1 ⇒ the emitted decision. On 05-07 everything is
+    # rejected (count=0) ⇒ no entry.
+    others = [m for m in V1_CANDIDATE_UNIVERSE if m != "/MNQ"]
+    lines = _reject_lines("2026-05-06", others)
+    lines.append(_generated_line("2026-05-06", 1, len(others)))
+    lines += _reject_lines("2026-05-07", list(V1_CANDIDATE_UNIVERSE))
+    lines.append(_generated_line("2026-05-07", 0, len(V1_CANDIDATE_UNIVERSE)))
+    _write_v1_log(tmp_path, "\n".join(lines))
     entries = parse_v1_decisions_from_log(tmp_path)
     assert entries == [Entry(date(2026, 5, 6), "/MNQ", "long")]
 
 
+def test_parse_v1_decisions_market_emitted_every_cycle_is_captured(tmp_path: Path) -> None:
+    # /MNQ is emitted on BOTH cycles and never rejected, so it never appears in the
+    # log at all — only the V1_CANDIDATE_UNIVERSE seed can place it in the universe.
+    # (A rejection-derived universe alone skipped every such cycle: false
+    # missing_in_backtest.)
+    others = [m for m in V1_CANDIDATE_UNIVERSE if m != "/MNQ"]
+    lines: list[str] = []
+    for session in ("2026-05-06", "2026-05-07"):
+        lines += _reject_lines(session, others)
+        lines.append(_generated_line(session, 1, len(others)))
+    _write_v1_log(tmp_path, "\n".join(lines))
+    entries = parse_v1_decisions_from_log(tmp_path)
+    assert entries == [
+        Entry(date(2026, 5, 6), "/MNQ", "long"),
+        Entry(date(2026, 5, 7), "/MNQ", "long"),
+    ]
+
+
 def test_parse_v1_decisions_skips_ambiguous_cycle(tmp_path: Path) -> None:
     # count=1 but two markets are unrejected ⇒ elimination ambiguous ⇒ skip (no fabrication).
-    _write_v1_log(
-        tmp_path,
-        "\n".join(
-            [
-                "t v1_signal_rejected session_date=2026-05-08 market=/MES reason=no_breakout",
-                "t v1_signal_rejected session_date=2026-05-09 market=/MNQ reason=no_breakout",
-                "t v1_signal_rejected session_date=2026-05-09 market=TLT reason=no_breakout",
-                # universe={/MES,/MNQ,TLT}; on 05-08 only /MES rejected ⇒ derived 2 != count 1.
-                "t v1_signals_generated session_date=2026-05-08 signals_emitted_count=1 "
-                "rejections_count=1 reasons={}",
-            ]
-        ),
-    )
+    others = [m for m in V1_CANDIDATE_UNIVERSE if m not in ("/MNQ", "TLT")]
+    lines = _reject_lines("2026-05-08", others)
+    lines.append(_generated_line("2026-05-08", 1, len(others)))
+    _write_v1_log(tmp_path, "\n".join(lines))
     assert parse_v1_decisions_from_log(tmp_path) == []
 
 
@@ -155,6 +171,29 @@ def test_crosscheck_reports_missing_and_extra() -> None:
     assert report.match_rate == 0.5  # 1 of 2 oracle entries matched
 
 
+def test_crosscheck_warns_on_non_long_oracle_directions() -> None:
+    # Log-derived backtest entries carry a fixed "long" label; a short in the
+    # oracle can falsely match/mismatch on direction — the warning flags that.
+    bt = [Entry(date(2026, 5, 27), "/M2K", "long")]
+    oracle = [
+        OracleEntry(date(2026, 5, 27), "/M2K", "long"),
+        OracleEntry(date(2026, 5, 28), "/MES", "short"),
+    ]
+    with capture_logs() as logs:
+        crosscheck_entries(bt, oracle)
+    warned = [e for e in logs if e["event"] == "research_v1_oracle_non_long_directions"]
+    assert len(warned) == 1
+    assert warned[0]["directions"] == ["short"]
+
+
+def test_crosscheck_all_long_oracle_does_not_warn() -> None:
+    bt = [Entry(date(2026, 5, 27), "/M2K", "long")]
+    oracle = [OracleEntry(date(2026, 5, 27), "/M2K", "long")]
+    with capture_logs() as logs:
+        crosscheck_entries(bt, oracle)
+    assert not [e for e in logs if e["event"] == "research_v1_oracle_non_long_directions"]
+
+
 def test_crosscheck_window_filter() -> None:
     bt = [Entry(date(2026, 5, 27), "/M2K", "long"), Entry(date(2026, 6, 2), "/MES", "long")]
     oracle = [
@@ -195,3 +234,12 @@ def test_build_v1_run_spec_omits_window_when_unset() -> None:
     spec = build_v1_run_spec(Path("research/data/cache/lean_bars"))
     assert "BACKTEST_START_DATE" not in spec.parameters
     assert "BACKTEST_END_DATE" not in spec.parameters
+
+
+def test_build_v1_run_spec_threads_starting_cash() -> None:
+    # cfg.starting_cash flows in as STARTING_CASH_USD (mirrors BACKTEST_START_DATE);
+    # unset keeps lean.json's production value.
+    spec = build_v1_run_spec(Path("research/data/cache/lean_bars"), starting_cash=250_000.0)
+    assert spec.parameters["STARTING_CASH_USD"] == "250000"
+    default = build_v1_run_spec(Path("research/data/cache/lean_bars"))
+    assert default.parameters["STARTING_CASH_USD"] == "100000"  # lean.json's value

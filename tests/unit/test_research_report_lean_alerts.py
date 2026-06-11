@@ -58,6 +58,9 @@ def test_liquidation_alert_renders_red_banner(tmp_path: Path) -> None:
     assert "class='ruin'" in html  # the red-banner style fires
     assert "2024-01-15" in html
     assert "LIQUIDATION DETECTED" in md
+    # The header names BOTH ruin signals — the alert can be an equity wipe with no
+    # tagged margin-call order (see run.lean_ruin_alert).
+    assert "equity wipe" in html and "equity wipe" in md
     assert result["liquidation_alerts"] == [alert]
     assert result["authoritative"] is True  # all rows are LEAN fills
 

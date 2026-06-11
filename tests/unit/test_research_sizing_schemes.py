@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import date
 
 import numpy as np
@@ -12,9 +13,11 @@ from research.risk.sizing_schemes import (
     KNOWN_SCHEMES,
     SizingContext,
     SizingScheme,
+    risk_parity_notionals,
     rolling_annualized_vol,
     simulate_sized_path,
     size_for_bar,
+    vol_target_notional,
     wilders_atr,
 )
 
@@ -66,6 +69,35 @@ def test_risk_parity_single_instrument_equals_vol_target() -> None:
     vt = SizingScheme("vol_target", {"vol_target_pct_annual": 0.15})
     ctx = _ctx(sigma_annual=0.10)
     assert size_for_bar(rp, ctx) == size_for_bar(vt, ctx)
+
+
+def test_risk_parity_notionals_n1_equals_vol_target_notional() -> None:
+    out = risk_parity_notionals(
+        equity=100_000.0, sigmas_annual=np.array([0.10]), vol_target_pct_annual=0.15
+    )
+    expected = vol_target_notional(equity=100_000.0, sigma_annual=0.10, vol_target_pct_annual=0.15)
+    assert out.shape == (1,)
+    assert out[0] == pytest.approx(expected)  # 150k: the documented N=1 equivalence
+
+
+def test_risk_parity_notionals_two_instrument_hand_computed() -> None:
+    # sigmas 10%/20% ⇒ inverse-vol weights 2/3, 1/3; each w·sigma = 1/15 ⇒
+    # portfolio vol = sqrt(2)/15; leverage = 0.15·15/sqrt(2) = 2.25/sqrt(2).
+    out = risk_parity_notionals(
+        equity=100_000.0, sigmas_annual=np.array([0.10, 0.20]), vol_target_pct_annual=0.15
+    )
+    lev = 2.25 / math.sqrt(2.0)
+    assert out[0] == pytest.approx(lev * (2.0 / 3.0) * 100_000.0)
+    assert out[1] == pytest.approx(lev * (1.0 / 3.0) * 100_000.0)
+
+
+def test_risk_parity_notionals_rejects_degenerate_inputs() -> None:
+    with pytest.raises(ValueError, match="non-empty"):
+        risk_parity_notionals(equity=1.0, sigmas_annual=np.array([]), vol_target_pct_annual=0.15)
+    with pytest.raises(ValueError, match="positive"):
+        risk_parity_notionals(
+            equity=1.0, sigmas_annual=np.array([0.1, -0.2]), vol_target_pct_annual=0.15
+        )
 
 
 def test_unknown_scheme_rejected() -> None:
