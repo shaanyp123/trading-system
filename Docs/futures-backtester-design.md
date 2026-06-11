@@ -1174,6 +1174,58 @@ WAIT for operator go before purchasing.
 Acceptance: a walk-forward (or V1 backtest) on a parent spans ≥ 10yr with several OOS
 folds crossing 2020 + 2022; the multiple-testing null is over a real sample.
 
+#### PR C — ⚠️ ESCALATED 2026-06-11 — data source needs an operator decision (no $0 path covers it)
+
+**$0-source investigation (charter step 1) — all verified empty for the full-fidelity
+need:**
+
+- **LEAN's bundled sample data is a demo stub:** the image's `future/cme/daily/
+  es_trade.zip` holds 8 contract files / 75 TOTAL daily bar-lines (a few days each);
+  COMEX `gc` = 54 lines. The bundled `es.csv` map_file spans decades, but the BARS
+  behind it do not exist. The VPS snapshot carries the same stubs.
+- **`lean data download` free tier:** QC Cloud gives free US-futures access only
+  INSIDE their cloud (tick→minute, for cloud backtests). Local LEAN-format downloads
+  are paid (QCC) — pricing below. Running on QC Cloud would re-enter the architecture
+  the 2026-05-12 pivot retired.
+- **Free continuous series (probed):** Stooq's futures endpoint is gone (404).
+  Yahoo's public chart API serves full daily history for `ES=F`-style continuous
+  symbols (probed: ES first-trade 2000-09-18; 2008 slice complete, 505/505 bars) —
+  ES/NQ/YM/GC reach 2000-2002; RTY only 2017+, BTC 2018+ (contracts younger).
+  **Fidelity limits:** UNADJUSTED front-month chains (roll gaps sit INSIDE the
+  series → false breakouts for exactly our strategy class; severe for GC contango
+  ~0.5-1.5%/roll and BTC 5-15%/quarter), no per-expiry contracts → LEAN cannot run
+  them as real futures (no rolls/margin/OI), numpy-screen walk-forward only;
+  unofficial API, ToS-gray.
+- **IBKR (the operator's own account):** historical data for EXPIRED futures is
+  ~2 years per IBKR docs; a read-only CONTFUT depth probe via the existing gateway
+  (clientId 98) timed out in the nightly-reset window 2026-06-11 ~01:20 ET — depth
+  UNVERIFIED; a 10-minute retry ceremony is available on request, but even a deep
+  CONTFUT series would be a continuous chain with the same fidelity limits as Yahoo.
+
+**The decision menu (operator picks; NO purchase/signup made):**
+
+| Option | Cost | Coverage | Fidelity | Notes |
+|---|---|---|---|---|
+| **A. QC AlgoSeek US Futures daily files** | **~$60–90 one-time** (500 QCC ≈ $5 per daily file; 6 roots × trade+OI ≈ 12–18 files; QCC sold in $10 units) | May 2009 → present (16+ yr; covers 2020+2022, NOT 2008) | **Full**: native LEAN per-expiry zips + OI — drops straight into the research cache; map_files via the existing synthesis helpers | Operator already has a QC account. Cleanest path; LEAN-as-futures works (margin/rolls/ruin) |
+| **B. Databento GLBX daily backfill** | ~$0 net (new-account $125 free credit ≫ a daily-OHLCV pull) but **requires a new vendor account** | 2010-06 → present (covers 2020+2022, NOT 2008) | Full per-instrument OHLCV+definitions, but needs a research-side converter (CSV → LEAN zips + maps; ~a day of build) | The design already names Databento for the (deferred) intraday phase — this would front-load that vendor decision |
+| **C. Yahoo continuous (free, no account)** | $0 | 2000 → present for ES/NQ/YM/GC (incl. 2008); RTY 2017+, BTC 2018+ | **Degraded**: unadjusted continuous, numpy-screen walk-forward ONLY, never LEAN-authoritative; ToS-gray | Could power an indicative P4 walk-forward with loud caveats; cannot support trust-with-money verdicts |
+| **D. IBKR CONTFUT probe first** | $0 | unknown (probe pending) | continuous-chain limits (as C) even if deep | 10-min read-only ceremony; answers "is there a free deep chain in-house" before any spend |
+| **E. Defer PR C** | $0 | — | — | Walk-forward stays on ~3yr micros (single regime); revisit when intraday (P5) forces the vendor question anyway |
+
+**Recommendation (for the operator to accept or override):** Option A — bounded
+one-time ~$60–90, native format, full LEAN fidelity, no new vendor relationship,
+16 years crossing 2020 + 2022 (2008 is unreachable at reasonable cost in ANY
+per-expiry source surveyed; AlgoSeek starts 2009-05, Databento 2010-06). Optionally
+precede with D (free, 10 minutes) to close the "was there a free path" question.
+
+**Build plan once unblocked (pre-scoped):** parent↔micro map + parent ContractSpecs
+in `research/data/contract_specs.py` (⚠️ PR B's runner now FAILS LOUDLY on futures
+tickers missing from the cost tables — parents must extend them; verify per-product
+all-in commissions, e.g. ES ≈ $0.25+$1.40+$0.02 class); ingest into
+`research/data/cache/lean_bars` (idempotent, offline); validate coverage + probe
+prices; ≥10yr walk-forward with OOS folds crossing 2020 + 2022; the multiple-testing
+null over the real sample.
+
 ### PR D — Quantify + tighten the V1↔live trust bridge (now that V1 runs multi-year)
 Re-run `reproduce_v1` over a single-param-hash aligned window; MEASURE the decision
 match rate + DOCUMENT the residual & why (POST-not-orders, no position feedback in
