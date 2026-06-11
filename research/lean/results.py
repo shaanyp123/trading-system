@@ -260,9 +260,7 @@ def _parse_equity_curve(
             continue
         points.append((_as_float(x), _as_float(y)))
     if not points:
-        raise ValueError(
-            "LEAN result has no Strategy Equity points — cannot build an equity curve"
-        )
+        raise ValueError("LEAN result has no Strategy Equity points — cannot build an equity curve")
     points.sort(key=lambda p: p[0])
     # Collapse same-(UTC)-date points keeping the last value. LEAN occasionally
     # emits a duplicate final equity point; a dup date would otherwise misalign the
@@ -523,6 +521,7 @@ def parse_lean_result(
         margin_events=len(margin_events),
         final_equity=round(result.final_equity, 2),
     )
+    _warn_on_cost_model_failures(output_dir)
     return ParsedLeanResult(
         result=result,
         trades=trades,
@@ -530,3 +529,29 @@ def parse_lean_result(
         statistics=statistics,
         margin_events=margin_events,
     )
+
+
+#: V1's gated cost-model application logs this marker when it fails and falls
+#: open to LEAN's bundled (stale) fee model. A future LEAN interface change
+#: must not silently revert the "authoritative" curve to bundled costs, so the
+#: parse chain scrapes the algorithm log for it (PR B; same surfacing idea as
+#: ``run.lean_ruin_alert``).
+_COST_MODEL_FAILURE_MARKER = "v1_backtest_cost_model_failed"
+
+
+def _warn_on_cost_model_failures(output_dir: Path) -> None:
+    """WARN if the algorithm log shows the explicit cost model failed to apply."""
+    for log_file in sorted(output_dir.glob("*-log.txt")):
+        try:
+            text = log_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:  # pragma: no cover — unreadable log is not a parse failure
+            continue
+        count = text.count(_COST_MODEL_FAILURE_MARKER)
+        if count:
+            _log.warning(
+                "research_lean_cost_model_failures",
+                log_file=str(log_file),
+                occurrences=count,
+                consequence="affected fills were charged LEAN's bundled (stale) "
+                "fee model, not the explicit PR-B cost table",
+            )

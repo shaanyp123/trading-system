@@ -126,14 +126,25 @@ def test_fill_conventions_documented() -> None:
     assert "next-session" in FILL_CONVENTION["etf"]
 
 
-def _module_dict_literal(source: str, name: str) -> dict:
-    """The literal value of a module-level assignment ``name = {...}``."""
+def _literal_assignments(source: str, name: str) -> list[object]:
+    """All literal values assigned to module-level ``name`` (any scope depth)."""
+    values: list[object] = []
     for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Name) and target.id == name:
-                    return ast.literal_eval(node.value)
-    raise AssertionError(f"no module-level literal assignment for {name}")
+                    values.append(ast.literal_eval(node.value))
+    return values
+
+
+def _module_dict_literal(source: str, name: str) -> dict:
+    """The SINGLE literal dict assigned to ``name`` — a later rebind would win
+    at runtime and out-vote the pinned literal, so exactly one is required."""
+    values = _literal_assignments(source, name)
+    assert len(values) == 1, f"{name}: expected exactly 1 literal assignment, found {len(values)}"
+    value = values[0]
+    assert isinstance(value, dict)
+    return value
 
 
 @pytest.mark.parametrize(
@@ -171,11 +182,8 @@ def test_lean_side_cost_tables_match_canonical(
 
 
 def _module_dict_literal_scalar(source: str, name: str) -> int:
-    for node in ast.walk(ast.parse(source)):
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id == name:
-                    value = ast.literal_eval(node.value)
-                    assert isinstance(value, int)
-                    return value
-    raise AssertionError(f"no module-level literal assignment for {name}")
+    values = _literal_assignments(source, name)
+    assert len(values) == 1, f"{name}: expected exactly 1 literal assignment, found {len(values)}"
+    value = values[0]
+    assert isinstance(value, int)
+    return value

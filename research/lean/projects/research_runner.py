@@ -238,12 +238,19 @@ class ResearchRunnerAlgorithm(QCAlgorithm):  # noqa: F405
             ticker = str(symbol.id.symbol).upper()
             fee = _FUTURES_COMMISSION_PER_SIDE.get(ticker)
             tick = _FUTURES_TICK_SIZE.get(ticker)
-            if fee is not None:
-                security.set_fee_model(PerContractFeeModel(fee))
-            if tick is not None:
-                security.set_slippage_model(
-                    TickSlippageModel(tick, _FUTURES_SLIPPAGE_TICKS)
+            if fee is None or tick is None:
+                # Refuse to run "ibkr" costs on a future the table doesn't
+                # cover — LEAN's bundled fallback is stale, and a silently
+                # mis-costed run defeats PR B. Extend the tables (mirror
+                # research/data/contract_specs.py) or run COSTS_MODEL=zero.
+                raise ValueError(
+                    f"COSTS_MODEL=ibkr has no explicit cost entry for futures "
+                    f"ticker {ticker!r} - extend _FUTURES_COMMISSION_PER_SIDE/"
+                    f"_FUTURES_TICK_SIZE (mirror research/data/contract_specs.py) "
+                    f"or run with COSTS_MODEL=zero"
                 )
+            security.set_fee_model(PerContractFeeModel(fee))
+            security.set_slippage_model(TickSlippageModel(tick, _FUTURES_SLIPPAGE_TICKS))
         self._costed_symbols.add(symbol)
 
     def _decide_target(self, bar) -> int:

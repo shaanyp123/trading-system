@@ -1039,6 +1039,10 @@ class TestRollRecordAndConsolidation:
         # The carry is the SAME economic position — the MIN_HOLDING clock must
         # NOT restart (roll-nit (a) made real, then fixed properly).
         assert algo._backtest_entry_dates == {"/MES": date(2024, 1, 2)}
+        # PR-B: the reopened front is costed BEFORE the carry order fills.
+        new_sec = algo.securities["MES_NEW"]
+        assert len(new_sec.fee_models) == 1
+        assert len(new_sec.slippage_models) == 1
 
     def test_consolidation_defers_while_new_front_unpriced(self) -> None:
         algo = _bare_algo(backtest=True)

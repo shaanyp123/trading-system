@@ -91,3 +91,33 @@ def test_cost_assumptions_surface_in_every_format(tmp_path: Path) -> None:
     assert cost["futures_slippage_ticks"]["/MES"] == 1
     assert cost["etf_commission_per_share_usd"] == "0.005"
     assert "same-session close" in cost["fill_convention"]["future"]
+
+
+def test_zero_costs_mode_says_zero_not_ibkr(tmp_path: Path) -> None:
+    # A `costs.model: zero` run must NOT claim IBKR commissions/slippage were
+    # applied — that would be the exact hidden-assumption failure PR B fixes.
+    row = _row(
+        {
+            "total_return": 0.0,
+            "cagr": 0.0,
+            "max_drawdown_pct": 0.0,
+            "pnl": 0.0,
+            "final_equity": 100000.0,
+        }
+    )
+    html_path = write_report(
+        tmp_path / "run",
+        run_name="zero",
+        harness_version="test",
+        generated_at=datetime.now(UTC),
+        rows=[row],
+        costs_model="zero",
+    )
+    md = (html_path.parent / "report.md").read_text(encoding="utf-8")
+    assert "ZERO (clean-compare mode)" in md
+    assert "$3.42" not in md and "$1.37" not in md  # no IBKR table claimed
+    assert "fill convention" in md  # conventions still stated (cost-independent)
+
+    result = json.loads((html_path.parent / "result.json").read_text(encoding="utf-8"))
+    assert result["cost_model"]["mode"] == "zero"
+    assert "futures_commission_per_side_usd" not in result["cost_model"]

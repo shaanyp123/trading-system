@@ -1153,8 +1153,8 @@ Probe-driven like PR A.2 (engine over docs), then the smallest correct change:
   Sharpe 0.14 · realized vol 9.1% · max-DD 11.61% · 0 margin events · total fees
   $223.03.** Delta vs PR A.2's +3.45%/$103,454.68: **−$33.92 (−0.03pp), entirely
   cost-model mechanics** — commissions DOWN $42.01 ($265.04→$223.03; removing MBT's
-  39% overcharge outweighs MGC's correction up) while 1-tick slippage costs ≈$75.93
-  across ~118 futures contract-sides. Decisions are untouched: 84 of 85 fills are
+  39% overcharge outweighs MGC's correction up) while 1-tick slippage costs ≈$76
+  across ~118 futures contract-sides (the ≈ also absorbs the 1-share TLT resize). Decisions are untouched: 84 of 85 fills are
   byte-identical (same symbol/timestamp/side/quantity); the single difference is the
   TLT short sizing 314→313 shares (Stage 0-5 reads equity, which now carries the
   slippage drag). Per-market census: index micros exactly $0.62/contract·side, MGC
