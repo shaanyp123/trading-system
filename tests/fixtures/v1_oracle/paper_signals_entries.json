@@ -36,13 +36,13 @@
       "session_date": "2026-05-18",
       "market": "/MES",
       "direction": "long",
-      "phash": "5c415b65bc9a"
+      "phash": "0d235c3b88cb"
     },
     {
       "session_date": "2026-05-18",
       "market": "/MES",
       "direction": "long",
-      "phash": "0d235c3b88cb"
+      "phash": "5c415b65bc9a"
     },
     {
       "session_date": "2026-05-18",
@@ -60,7 +60,7 @@
       "session_date": "2026-05-18",
       "market": "/MNQ",
       "direction": "long",
-      "phash": "f3d86eb4d693"
+      "phash": "01bc3aab62f4"
     },
     {
       "session_date": "2026-05-18",
@@ -72,7 +72,7 @@
       "session_date": "2026-05-18",
       "market": "/MNQ",
       "direction": "long",
-      "phash": "01bc3aab62f4"
+      "phash": "f3d86eb4d693"
     },
     {
       "session_date": "2026-05-18",
@@ -90,13 +90,13 @@
       "session_date": "2026-05-19",
       "market": "/MES",
       "direction": "long",
-      "phash": "571699a80e15"
+      "phash": "701aa4d51e6f"
     },
     {
       "session_date": "2026-05-19",
       "market": "/MES",
       "direction": "long",
-      "phash": "701aa4d51e6f"
+      "phash": "571699a80e15"
     },
     {
       "session_date": "2026-05-26",
@@ -109,6 +109,12 @@
       "market": "/MES",
       "direction": "long",
       "phash": "192af0a7514b"
+    },
+    {
+      "session_date": "2026-06-04",
+      "market": "/MYM",
+      "direction": "long",
+      "phash": "65e4069f3293"
     }
   ]
 }

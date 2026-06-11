@@ -1181,6 +1181,51 @@ backtest, per-signal param hash). OPTIONALLY improve via POST-body capture (capt
 V1's POSTed decisions incl. short side) — only if clean; else document the bound.
 Acceptance: the V1 reproduction match rate has a stated error bar.
 
+#### PR D — Trust bridge MEASURED — ✅ DONE (2026-06-11)
+
+Real-engine run (isolated, post-#337 routing + post-#339 costs) over
+2026-05-01→2026-06-08, cross-checked against a fresh prod oracle capture
+(`signals` table 2026-06-11: 19 entry rows → 10 unique decisions, all long,
+2026-05-13→2026-06-04). The committed fixtures are now these REAL artifacts and the
+golden test (`tests/golden/test_research_v1_repro.py`) pins every number below.
+
+- **Headline (stated error bars are exact binomial 95% CIs):**
+  - **Market-level — did each market live flagged get flagged by the backtest? 4/5
+    = 80%, CI [0.28, 0.99].** The single miss (/M2K) is the ER-gate regime flip,
+    not drift (below).
+  - Strict decision-level (session_date+market+direction), full span: **4/10 = 40%,
+    CI [0.12, 0.74]**; stabilization window (05-26→06-08): 2/3; **ER-aligned regime
+    window (06-02→06-08, the gate live on BOTH sides): 1/1, CI [0.02, 1.00]**.
+  - The matched set contains the decision that became a real paper position
+    (/MES 05-28) and the only post-ER-regime entry (/MYM 06-04).
+- **Residual: ZERO unexplained decisions after attribution.** Four verified causes
+  (rejection lines in the committed fixture log):
+  1. live dormant anti-pyramiding re-emission pre-#312 (9/19 oracle rows are dups;
+     backtest is position-aware → `position_already_same_direction`);
+  2. ER-gate regime flip at 2026-06-02 (backtest applies the current gate to
+     pre-boundary dates: /M2K 05-26 `efficiency_below_threshold` — live emitted it
+     gateless and the real paper account opened /M2K 05-27);
+  3. bar data revised since live decided (daily bar_sync overwrite + #326 map
+     re-synthesis): /MES 05-18/19 + /MNQ 05-13/18 read `no_breakout` today;
+  4. sizing-to-zero re-emission (`v1_backtest_sizing_empty`: 25%/name cap clips a
+     ≈$43k /MNQ contract to 0 at $100k → flat → re-emits; live /MNQ never filled
+     either).
+- **Key discovery — prod stamps a DISTINCT `parameter_set_hash` on EVERY signal**
+  (19 rows, 19 hashes), so the charter's "single-param-hash window" is not a usable
+  filter. Regime windows are cut by DATE; the live boundary is the ER gate landing
+  2026-06-02. `reproduce_v1` + the integration test + README §3 now say so.
+- **POST-body capture (the optional short-side improvement) was NOT taken:** it
+  requires either live-file changes or api-side capture — out of research-side
+  scope. The bound is documented instead: log-derived entries carry a fixed `long`
+  label; the oracle is all-long as of capture (golden-pinned), so THIS measurement
+  is direction-unambiguous; the first live short entry will need POST-body capture
+  to verify side.
+- **Why the error bars are wide:** clean paper history is ~3 weeks of entries
+  (n=5 markets / 10 unique decisions). The ceremony is repeatable (README §3);
+  each additional paper entry tightens the bound. The structural causes (1)+(2)
+  age out on their own — both ended by 2026-06-02 — so the ER-aligned window is
+  the one that grows.
+
 ### PR E — Exercise the graduation pipeline once, end-to-end (proves governance, D6)
 The "research feeds governance" bridge (D6) has never run. Prove it with a
 DELIBERATELY SAFE candidate (re-affirm current params or a tiny justified tweak):

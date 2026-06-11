@@ -180,18 +180,59 @@ asyncio.run(main())
 PY
 ```
 
-Then run the reproduce-V1 test, picking a SINGLE-phash sub-window (the
-`parameter_set_hash` varies per signal — params calibrated mid-window + the Kaufman
-ER gate landed 2026-06-02, so a clean cross-check restricts to one phash):
+Then run the reproduce-V1 test over a single parameter-REGIME window, cut by
+DATE. ⚠️ Measured (charter PR D): prod stamps a **distinct `parameter_set_hash`
+on every signal**, so "restrict to one phash" is not a usable filter — the live
+regime boundary is the **ER gate landing 2026-06-02** (before it live ran without
+the gate the current code applies):
 
 ```bash
 RESEARCH_V1_ORACLE=/tmp/v1_oracle.json \
-RESEARCH_V1_WINDOW=2026-05-27:2026-05-29 \
+RESEARCH_V1_WINDOW=2026-06-02:2026-06-08 \
 python -m pytest tests/integration/test_reproduce_v1.py -m integration -rs
 ```
 
 Reproduce at the DECISION level (same market + direction + session_date);
-`decision_price ≠ backtest fill` is expected (the §6.6 tolerances cover that). When
-the real run passes, replace the representative fixtures
-(`tests/fixtures/lean_output/v1_repro/` + `tests/fixtures/v1_oracle/`) with the
-captured artifacts so the golden test guards the real result.
+`decision_price ≠ backtest fill` is expected (the §6.6 tolerances cover that).
+The committed fixtures (`tests/fixtures/v1_repro_log/` + `tests/fixtures/v1_oracle/`)
+ARE captured real artifacts (real-engine run 2026-05-01→2026-06-08 + the prod
+signals table as of 2026-06-11); the golden test guards the measured result.
+
+## Measured trust bridge (charter PR D, 2026-06-11)
+
+Real-engine run (isolated) over 2026-05-01→2026-06-08 vs the live paper oracle
+(19 signal rows → 10 unique decisions, all long):
+
+| View | Match | Exact 95% CI |
+|---|---|---|
+| **Market-level** (did each live-flagged market flag?) | **4/5 = 80%** | [0.28, 0.99] |
+| Strict decision (date+market+direction), full span | 4/10 = 40% | [0.12, 0.74] |
+| Stabilization window (2026-05-26→06-08) | 2/3 = 67% | [0.09, 0.99] |
+| **ER-aligned regime** (2026-06-02→06-08, gate live both sides) | **1/1 = 100%** | [0.02, 1.00] |
+
+**After attribution the unexplained residual is ZERO decisions.** Every miss/extra
+has a verified cause (log lines in the committed fixture):
+
+1. **Live dormant anti-pyramiding re-emission (pre-#312, deployed 2026-06-01):**
+   9 of 19 oracle rows are duplicate re-emissions of a held breakout; the backtest
+   is position-aware and correctly suppresses (`position_already_same_direction` —
+   e.g. TLT 05-18).
+2. **ER-gate regime flip (live boundary 2026-06-02):** the backtest applies the
+   current ER(0.20) gate to pre-boundary dates where live had no gate — /M2K
+   2026-05-26 logs `efficiency_below_threshold`; this is the single market-level
+   miss.
+3. **Bar data revised since live decided:** bar_sync overwrites daily + map-file
+   re-synthesis (#326); /MES 05-18/19 + /MNQ 05-13/18 log `no_breakout` on today's
+   bars where live saw a breakout; same cause for the IEF/SHY/TLT-05-15 extras and
+   /MNQ first flagging 05-06 vs live 05-13.
+4. **Sizing-to-zero re-emission:** the 25%/name cap clips one /MNQ contract
+   (≈$43k notional) to 0 at $100k → the backtest stays flat and re-emits while the
+   trend persists (`v1_backtest_sizing_empty`, 05-26→06-02 extras). Live /MNQ
+   orders also never filled (no live /MNQ position).
+
+Residual bounds (documented, not fixable research-side): the LEAN log carries no
+direction → log-derived entries are labeled `long`; the oracle is all-long as of
+capture (the golden pins that), so this measurement is direction-unambiguous, but a
+future short entry needs POST-body capture to verify side. The error bars are wide
+because clean paper history is short — each new live entry tightens them; re-run
+this ceremony after more paper weeks for a tighter bound.

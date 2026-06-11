@@ -10,11 +10,22 @@ oracle snapshot (``tests/fixtures/v1_oracle/``).
 The separate order/fill parser (used by reference strategies that DO place LEAN
 orders) is covered against a multi-symbol futures order result.
 
-Structural limits this golden pins (design §8 "P2 landed"): the decision-level match
-is partial (4/9 strict, 3/4 markets) because (1) backtest V1 has no position feedback
-under PaperBrokerage → it re-emits the same breakout each cycle (vs the position-aware
-live system); (2) every live signal used a distinct param-hash (params calibrated
-mid-window + the ER gate landed 2026-06-02) vs the uniform-param backtest.
+What this golden pins (charter PR D, measured 2026-06-11 on the real engine over
+2026-05-01→2026-06-08; design doc "PR D" subsection has the full attribution):
+
+* market-level match 4/5 (80%, exact 95% CI [0.28, 0.99]) — the one miss (/M2K) is
+  the ER-gate REGIME FLIP (live had no ER gate before 2026-06-02; the backtest runs
+  current code — the /M2K 2026-05-26 cycle logs ``efficiency_below_threshold``);
+* strict decision-level match 4/10 unique oracle decisions (40%, CI [0.12, 0.74]) —
+  every miss/extra attributes to a VERIFIED cause: (a) live dormant anti-pyramiding
+  re-emission dups pre-#312 (19 oracle rows → 10 unique keys; the backtest correctly
+  suppresses — ``position_already_same_direction``), (b) the ER regime flip, (c) bar
+  data revised since live decided (bar_sync overwrites daily; map re-synthesis #326)
+  → ``no_breakout`` today where live saw a breakout, (d) sizing-to-zero re-emission
+  (``v1_backtest_sizing_empty``: the 25%/name cap clips 1 /MNQ contract ≈$43k
+  notional to 0 at $100k → stays flat → re-emits while the trend persists);
+* prod stamps a DISTINCT parameter_set_hash per signal, so "single-phash window"
+  is NOT a usable filter — regime windows are cut by DATE (ER boundary 2026-06-02).
 """
 
 from __future__ import annotations
@@ -48,25 +59,38 @@ _MULTI_SYMBOL_ORDERS = _FIXTURES / "lean_output" / "multi_symbol_futures"
 # --------------------------------------------------------------------------- #
 def test_v1_decisions_parsed_from_real_log() -> None:
     entries = parse_v1_decisions_from_log(_V1_LOG_DIR)
-    # Deterministic on the committed log: 28 emitted decisions (incl. daily re-emits).
-    assert len(entries) == 28
+    # Deterministic on the committed log (real-engine run 2026-05-01→2026-06-08,
+    # post-#337 position state + post-#339 cost model): 21 emitted decisions.
+    assert len(entries) == 21
     markets = {e.market for e in entries}
-    assert markets == {"/MES", "/MNQ", "TLT", "IEF", "SHY"}
+    assert markets == {"/MES", "/MNQ", "/MYM", "TLT", "IEF", "SHY"}
     assert all(e.direction == "long" for e in entries)
 
 
 def test_v1_reproduction_crosscheck_vs_oracle() -> None:
     entries = parse_v1_decisions_from_log(_V1_LOG_DIR)
     oracle = load_oracle(_ORACLE)
-    assert len({e.key() for e in oracle}) == 9  # 18 rows → 9 unique decisions
+    assert len({e.key() for e in oracle}) == 10  # 19 rows → 10 unique decisions
 
     strict = crosscheck_entries(entries, oracle)
-    # Partial (structural): 4 of 9 oracle decisions reproduced exactly (date+market).
+    # Measured (PR D): 4 of 10 unique oracle decisions reproduced exactly
+    # (date+market+direction); every miss attributes to a verified cause
+    # (module docstring). The 4 matches include the two decisions that became
+    # real paper positions (/MES 05-28) and the post-ER-regime entry (/MYM 06-04).
     assert len(strict.matched) == 4
     assert (date(2026, 5, 28), "/MES", "long") in strict.matched
+    assert (date(2026, 6, 4), "/MYM", "long") in strict.matched
     assert (date(2026, 5, 16), "TLT", "long") in strict.matched
+    assert (date(2026, 5, 17), "TLT", "long") in strict.matched
 
-    # Market-level (first entry per market) is the fairer view: 3/4 markets agree.
+    # The ER-aligned regime window (gate live on both sides) matches 1/1.
+    aligned = crosscheck_entries(entries, oracle, window=(date(2026, 6, 2), date(2026, 6, 8)))
+    assert aligned.matched == ((date(2026, 6, 4), "/MYM", "long"),)
+    assert aligned.match_rate == 1.0
+
+    # Market-level (first entry per market): 4/5 markets agree (80%); the one
+    # miss (/M2K) is the ER-gate regime flip — verified in the committed log
+    # (the 2026-05-26 /M2K cycle logs efficiency_below_threshold).
     bt_markets = {(e.market, e.direction) for e in first_entry_per_market(entries)}
     oracle_markets = {
         (e.market, e.direction)
@@ -75,8 +99,11 @@ def test_v1_reproduction_crosscheck_vs_oracle() -> None:
         )
     }
     matched = bt_markets & oracle_markets
-    assert matched == {("/MES", "long"), ("/MNQ", "long"), ("TLT", "long")}
-    assert len(matched) / len(oracle_markets) == 0.75
+    assert matched == {("/MES", "long"), ("/MNQ", "long"), ("/MYM", "long"), ("TLT", "long")}
+    assert len(matched) / len(oracle_markets) == 0.8
+    assert ("/M2K", "long") not in bt_markets  # the ER regime flip, documented
+    log_text = (_V1_LOG_DIR / "V1TrendFollowingAlgorithm-log.txt").read_text(encoding="utf-8")
+    assert "session_date=2026-05-26 market=/M2K reason=efficiency_below_threshold" in log_text
 
 
 def test_oracle_is_all_long() -> None:

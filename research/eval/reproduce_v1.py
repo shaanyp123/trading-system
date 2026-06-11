@@ -7,10 +7,14 @@ check that the harness-captured backtest AGREES, at the DECISION level (same mar
 ``signals`` table (``env='paper'``, ``signal_type='entry'``).
 
 Per the P2 kickoff: reproduce at the DECISION level, not the fill — ``decision_price
-≠ backtest fill`` is expected (that gap is what the §6.6 tolerances cover), and the
-``parameter_set_hash`` varies per signal (params were calibrating + the Kaufman ER
-gate landed mid-window), so a clean cross-check picks a SINGLE-phash sub-window via
-:func:`crosscheck_entries`'s ``window`` filter.
+≠ backtest fill`` is expected (that gap is what the §6.6 tolerances cover). NOTE
+(measured, charter PR D): prod stamps a DISTINCT ``parameter_set_hash`` on EVERY
+signal, so "restrict to a single phash" is not a usable filter. A clean cross-check
+instead picks a parameter-REGIME window by DATE via :func:`crosscheck_entries`'s
+``window`` filter — the live regime boundary is the Kaufman ER gate landing
+2026-06-02 (before it, live ran WITHOUT the gate the current code applies, so the
+backtest legitimately vetoes some pre-boundary live entries:
+``efficiency_below_threshold``).
 
 This module is LEAN-free + pure: it turns parsed :class:`OrderFill`s into entry
 DECISIONS and diffs them against an oracle snapshot. The actual LEAN run is driven
@@ -266,8 +270,10 @@ def crosscheck_entries(
 ) -> CrossCheckReport:
     """Diff backtest vs oracle entry decisions (market + direction + session_date).
 
-    ``window`` (inclusive) restricts BOTH sides to a single-phash sub-window so a
-    mid-window param change does not muddy the comparison (P2 kickoff guidance).
+    ``window`` (inclusive) restricts BOTH sides to a single parameter-REGIME
+    sub-window (cut by DATE — e.g. the ER gate landed live 2026-06-02) so a
+    mid-window regime change does not muddy the comparison. Prod phashes are
+    per-signal (PR D, measured), so the regime is identified by date, not hash.
     """
     # Log-derived backtest entries are all labeled "long" (direction is not in the
     # LEAN log); a short in the oracle can therefore falsely match/mismatch on
