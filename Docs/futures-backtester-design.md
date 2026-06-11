@@ -1259,12 +1259,14 @@ The pipeline was traversed once with the SAFEST possible candidate — a zero-de
 re-affirmation of `V1_DEFAULTS` (documentation-only `strategies/**` change; no
 parameter value moves, no strategy-logic decision by Claude):
 
-- **Runbook written:** `Docs/graduation-runbook.md` — the repeatable 11-step
+- **Runbook written:** `Docs/graduation-runbook.md` — the repeatable 12-step
   ceremony (candidate definition → P4 validity → authoritative isolated LEAN run →
   delta artifact w/ hard stops → trust-bridge check → `strategies/**` PR →
   risk-review + ultrareview → OPERATOR label + merge → deploy + `parameter_sets`
-  head update → post-deploy observation). Hard stops: margin events / liquidation /
-  ruin / implausible leverage → no PR.
+  head update (incl. closing the superseded head; the seed tool emits NO audit
+  row — A01-N/A posture, governance record = PR + ledger) → post-deploy
+  observation → rollback path). Hard stops: margin events / liquidation / ruin /
+  implausible leverage → no PR.
 - **Ledger started:** `strategies/v1_trend_following/GRADUATION.md` — append-only
   graduation record; the dry-run row cites the authoritative acceptance
   (+3.42% / 9.1% vol / fees $223.03, run `lean_20260611T042002Z`), the PR #340

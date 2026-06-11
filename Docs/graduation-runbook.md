@@ -2,8 +2,8 @@
 
 How a parameter candidate becomes production V1 configuration. First exercised
 end-to-end 2026-06-11 (charter PR E dry-run, zero-delta candidate; ledger:
-`strategies/v1_trend_following/GRADUATION.md`). Every step is mandatory for a
-VALUE-changing candidate; the dry-run notes where a zero-delta candidate may
+`strategies/v1_trend_following/GRADUATION.md`). Every step (incl. the rollback
+path) is mandatory for a VALUE-changing candidate; the dry-run notes where a zero-delta candidate may
 cite existing artifacts instead of re-running.
 
 **Governance invariants (do not weaken):**
@@ -61,8 +61,8 @@ cite existing artifacts instead of re-running.
    - PR body: plain-English summary + risk impact + the step-4 delta table +
      tests. Conventional commit `feat(strategy): …`.
 7. **Review:** subagent risk-review (adversarial, live-impact focus) + the
-   operator triggers `/code-review ultra` (ultrareview is charter-required for
-   `strategies/**`). Fold findings; REQUEST-CHANGES blocks.
+   operator triggers `/ultrareview` (charter-required for `strategies/**`).
+   Fold findings; REQUEST-CHANGES blocks.
 8. **Operator gate:** review per dev-guide §13, apply `risk-review-approved`
    (operator-applied only), sign off, squash-merge. Claude NEVER merges a
    `strategies/**` PR.
@@ -74,13 +74,25 @@ cite existing artifacts instead of re-running.
    - if parameter VALUES changed: update the `parameter_sets` DB head pointer
      (the runtime source of truth — LEAN's nightly fetch reads it) via the
      sanctioned seed tool (`--seed-params-only`, PR #307) or an
-     operator-approved audited UPDATE; verify the new hash on `/system`;
-   - the audit chain stays append-only: parameter changes surface as
-     audit events per backend-spec; `verify_chain --env paper` after.
+     operator-approved UPDATE; verify the new hash on `/system`;
+   - ⚠️ the seed tool emits NO audit row (a bare idempotent INSERT — its own
+     docstring records "A01 N/A"; `PARAMETER_CHANGE_APPLIED` audit events come
+     from the AGENT parameter-change path only). For an operator graduation the
+     governance record is the merged PR + the ledger row + the new row's
+     `first_active_at` — the same A01-N/A posture as the bootstrap genesis row;
+     revisit at live-cutover;
+   - close the SUPERSEDED head: the active-row query is `last_active_at IS
+     NULL ORDER BY first_active_at DESC`, and the seed tool never retires the
+     old row — set the prior head's `last_active_at` (operator-approved
+     UPDATE) so exactly one row reads active; `verify_chain --env paper` after.
 10. **Post-deploy observation (mandatory):** next 21:30 UTC LEAN cycle —
     heartbeat clean, `parameters_fetch_failed` absent, rejection mix sane vs
     the backtest's expectation; EOD recon clean; `verify_chain` OK. Log the
     observation in the decisions log.
+11. **Rollback (if observation fails):** revert the graduation PR (normal PR,
+    same label ceremony), restore the prior `parameter_sets` head (re-open its
+    `last_active_at`, retire the new row), redeploy, re-observe the next
+    cycle, and record the abort in the ledger row + decisions log.
 
 ## Dry-run provenance (2026-06-11)
 

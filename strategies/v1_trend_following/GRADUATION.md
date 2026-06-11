@@ -1,11 +1,13 @@
 # V1 graduation ledger
 
 Append-only record of parameter sets that traversed the research → governance
-bridge (design D6; ceremony: `Docs/graduation-runbook.md`). A row in this file
-means: the candidate was backtested by the AUTHORITATIVE harness (the real
+bridge (design D6; ceremony: `Docs/graduation-runbook.md`). A row is appended
+WITH the graduation PR (its outcome checkboxes still open) and means: the
+candidate was backtested by the AUTHORITATIVE harness (the real
 `lean/v1_strategy.py` in an isolated LEAN container, Stage 0-5 sized, explicit
-costs), its delta against the production baseline was reviewed, and the PR
-carrying it received the operator-applied `risk-review-approved` label.
+costs) and its delta against the production baseline was reviewed. The row is
+COMPLETE only when the operator applies `risk-review-approved` and merges —
+the checkboxes record that moment.
 
 This file is documentation only — it is never imported and has zero runtime
 effect. The runtime source of truth for active parameters is the
