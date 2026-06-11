@@ -1253,6 +1253,34 @@ mandatory. Write the repeatable graduation runbook as you go.
 Acceptance: one change has traversed research → PR (w/ backtest delta) →
 risk-review-approved → merge; the graduation runbook is documented.
 
+#### PR E — DRY-RUN EXECUTED, handed to the operator unmerged (2026-06-11)
+
+The pipeline was traversed once with the SAFEST possible candidate — a zero-delta
+re-affirmation of `V1_DEFAULTS` (documentation-only `strategies/**` change; no
+parameter value moves, no strategy-logic decision by Claude):
+
+- **Runbook written:** `Docs/graduation-runbook.md` — the repeatable 11-step
+  ceremony (candidate definition → P4 validity → authoritative isolated LEAN run →
+  delta artifact w/ hard stops → trust-bridge check → `strategies/**` PR →
+  risk-review + ultrareview → OPERATOR label + merge → deploy + `parameter_sets`
+  head update → post-deploy observation). Hard stops: margin events / liquidation /
+  ruin / implausible leverage → no PR.
+- **Ledger started:** `strategies/v1_trend_following/GRADUATION.md` — append-only
+  graduation record; the dry-run row cites the authoritative acceptance
+  (+3.42% / 9.1% vol / fees $223.03, run `lean_20260611T042002Z`), the PR #340
+  trust-bridge measurement, and the trivially-clean validity status (no search →
+  no selection bias).
+- **Governance notes surfaced:** the mechanical forbidden-paths CI gate does NOT
+  match `strategies/` — the label requirement here is charter-enforced (operator-
+  applied), like the `lean/v1_strategy.py` precedent (#335); extending the CI regex
+  is a separate operator decision. `strategies/` deploys two ways (baked into the
+  api image + volume-mounted into lean_local at the 21:10 restart) — the runbook's
+  deploy step covers both plus the `parameter_sets` DB head ceremony.
+- **Status: the `strategies/**` PR is OPEN and subagent-reviewed; per the charter
+  it is NOT merged by Claude** — the operator applies `risk-review-approved`,
+  signs off, and merges to complete the acceptance (the ledger row's checkboxes
+  record that moment).
+
 **When A–E land:** the backtester can show an authoritative MULTI-YEAR, MULTI-REGIME
 P&L for the real strategy with honest costs + ruin, a quantified trust bridge, and a
 proven path to production — trustworthy enough to risk money on its verdicts. (Intraday
