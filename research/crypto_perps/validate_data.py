@@ -1,4 +1,5 @@
 """Sanity checks on the agent-fetched OHLCV CSVs. Run before any backtest."""
+
 import glob
 import os
 import sys
@@ -20,9 +21,13 @@ def validate(symbol: str) -> pd.DataFrame:
     gaps = df.index.to_series().diff().dt.days.dropna()
     big_gaps = gaps[gaps > 1]
     if len(big_gaps):
-        problems.append(f"{len(big_gaps)} calendar gaps, max {big_gaps.max():.0f}d at {big_gaps.idxmax().date()}")
-    bad_hl = ((df.high < df[["open", "close"]].max(axis=1) - 1e-9)
-              | (df.low > df[["open", "close"]].min(axis=1) + 1e-9)).sum()
+        problems.append(
+            f"{len(big_gaps)} calendar gaps, max {big_gaps.max():.0f}d at {big_gaps.idxmax().date()}"
+        )
+    bad_hl = (
+        (df.high < df[["open", "close"]].max(axis=1) - 1e-9)
+        | (df.low > df[["open", "close"]].min(axis=1) + 1e-9)
+    ).sum()
     if bad_hl:
         problems.append(f"{bad_hl} rows violate high/low vs open/close consistency")
     nonpos = (df[["open", "high", "low", "close"]] <= 0).any(axis=1).sum()
@@ -31,11 +36,17 @@ def validate(symbol: str) -> pd.DataFrame:
     r = np.log(df.close / df.close.shift(1)).dropna()
     extreme = r[abs(r) > 0.60]
     if len(extreme):
-        problems.append(f"{len(extreme)} daily |log return| > 60%: {[str(d.date()) for d in extreme.index]}")
+        problems.append(
+            f"{len(extreme)} daily |log return| > 60%: {[str(d.date()) for d in extreme.index]}"
+        )
 
-    print(f"{symbol.upper()}: {len(df)} rows {df.index[0].date()}..{df.index[-1].date()}, dupes_dropped={dupes}")
-    print(f"  close min={df.close.min():.2f} max={df.close.max():.2f}; "
-          f"ann vol={r.std() * np.sqrt(365):.1%}")
+    print(
+        f"{symbol.upper()}: {len(df)} rows {df.index[0].date()}..{df.index[-1].date()}, dupes_dropped={dupes}"
+    )
+    print(
+        f"  close min={df.close.min():.2f} max={df.close.max():.2f}; "
+        f"ann vol={r.std() * np.sqrt(365):.1%}"
+    )
     for p in problems:
         print(f"  WARN: {p}")
     return df

@@ -15,7 +15,8 @@ import argparse
 import json
 import math
 import os
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -55,8 +56,8 @@ class Params:
     deadband_abs: float = 200.0
     deadband_frac: float = 0.05
     band_edge_rebalance: bool = False  # trade to band edge, not to exact target
-    cash_yield_ann: float = 0.0        # yield on cash not posted as margin
-    margin_frac: float = 0.25          # assumed initial margin as fraction of gross notional
+    cash_yield_ann: float = 0.0  # yield on cash not posted as margin
+    margin_frac: float = 0.25  # assumed initial margin as fraction of gross notional
     subscription_usd_month: float = 0.0  # Coinbase One (gates USDC rewards since 2025-12)
     # stops (section 5)
     atr_window: int = 14
@@ -68,7 +69,7 @@ class Params:
     weekly_loss_limit: float = -0.08
     weekly_penalty_days: int = 7
     halt_frac: float = 0.50  # <= 0 disables the drawdown halt (bust at E<=0 still stops)
-    dd_tiers: tuple = ((0.10, 1.0), (0.20, 0.6), (0.35, 0.35), (9.9, 0.2))
+    dd_tiers: tuple[tuple[float, float], ...] = ((0.10, 1.0), (0.20, 0.6), (0.35, 0.35), (9.9, 0.2))
     eth_min_price: float = 2000.0
     # costs (section 1.5) — per SIDE
     fee_bps: float = 5.0
@@ -133,21 +134,23 @@ def compute_indicators(df: pd.DataFrame, p: Params) -> pd.DataFrame:
     s_b = np.where(c > out["sma_slow"], 1.0, -1.0)
     s_c = np.where(out["mom"] > 0, 1.0, -1.0)
     out["trend"] = (s_a + s_b + s_c) / 3.0
-    out.loc[out[["sma_slow", "mom", "sigma_ann", "vol_slow", "atr"]].isna().any(axis=1), "trend"] = np.nan
+    out.loc[
+        out[["sma_slow", "mom", "sigma_ann", "vol_slow", "atr"]].isna().any(axis=1), "trend"
+    ] = np.nan
     return out
 
 
 @dataclass
 class AssetState:
-    contracts: float = 0.0          # signed integer count (stored as float)
+    contracts: float = 0.0  # signed integer count (stored as float)
     entry_vwap: float = 0.0
-    stop_level: float = np.nan      # client 2xATR stop
-    applied_dir: int = 0            # direction after hysteresis
-    pending_dir: int = 0            # unconfirmed new direction
+    stop_level: float = np.nan  # client 2xATR stop
+    applied_dir: int = 0  # direction after hysteresis
+    pending_dir: int = 0  # unconfirmed new direction
     pending_count: int = 0
-    lockout_until: int = -1         # bar index; same-direction re-entry block
+    lockout_until: int = -1  # bar index; same-direction re-entry block
     lockout_dir: int = 0
-    vol_blocked: bool = False       # S3 state
+    vol_blocked: bool = False  # S3 state
     stopped_today: bool = False
 
 
@@ -162,7 +165,7 @@ def trade_cost(delta_contracts: float, price: float, mult: float, p: Params) -> 
     return (fee + slip) * p.cost_mult
 
 
-def run_backtest(data: dict[str, pd.DataFrame], p: Params, start: str, end: str) -> dict:
+def run_backtest(data: dict[str, pd.DataFrame], p: Params, start: str, end: str) -> dict[str, Any]:
     """Event loop on the union calendar of both assets. Returns metrics + curves."""
     idx = data["BTC"].index
     for sym in ASSETS[1:]:
@@ -173,18 +176,18 @@ def run_backtest(data: dict[str, pd.DataFrame], p: Params, start: str, end: str)
     E = p.initial_equity
     hwm = E
     halted = False
-    pause_until = -1        # daily-loss 24h pause (skip decisions through this bar)
+    pause_until = -1  # daily-loss 24h pause (skip decisions through this bar)
     weekly_mult_until = -1  # bar index until which v_target is halved
     states = {s: AssetState() for s in ASSETS}
 
     equity_curve = []
-    trades = []             # (date, asset, delta, price, cost, reason)
+    trades = []  # (date, asset, delta, price, cost, reason)
     total_costs = 0.0
     total_funding = 0.0
     gross_expo = []
 
     equity_prev_close = E
-    week_equity = []        # trailing closes for 7d loss rule
+    week_equity = []  # trailing closes for 7d loss rule
 
     for i, ts in enumerate(idx):
         if halted:
@@ -271,7 +274,9 @@ def run_backtest(data: dict[str, pd.DataFrame], p: Params, start: str, end: str)
                     cost = trade_cost(st.contracts, row["close"], CONTRACT_MULT[s], p)
                     E -= cost
                     total_costs += cost
-                    trades.append((str(ts.date()), s, -st.contracts, row["close"], cost, "daily_loss"))
+                    trades.append(
+                        (str(ts.date()), s, -st.contracts, row["close"], cost, "daily_loss")
+                    )
                     st.contracts = 0.0
                     st.stop_level = np.nan
                     st.applied_dir = 0
@@ -393,20 +398,28 @@ def run_backtest(data: dict[str, pd.DataFrame], p: Params, start: str, end: str)
                     band_n = math.floor(band_notional / (mult * row["close"]))
                     if band_n >= 1:
                         edge = targets[s] - band_n if delta > 0 else targets[s] + band_n
-                        if (delta > 0 and edge > st.contracts) or (delta < 0 and edge < st.contracts):
+                        if (delta > 0 and edge > st.contracts) or (
+                            delta < 0 and edge < st.contracts
+                        ):
                             delta = edge - st.contracts
                 cost = trade_cost(delta, row["close"], mult, p)
                 E -= cost
                 total_costs += cost
                 trades.append((str(ts.date()), s, delta, row["close"], cost, "signal"))
                 new_pos = st.contracts + delta
-                if new_pos != 0 and (st.contracts == 0 or st.contracts * new_pos < 0 or abs(new_pos) > abs(st.contracts)):
+                if new_pos != 0 and (
+                    st.contracts == 0
+                    or st.contracts * new_pos < 0
+                    or abs(new_pos) > abs(st.contracts)
+                ):
                     # position opened/flipped/expanded: reset entry vwap + stops
                     if st.contracts * new_pos <= 0:
                         st.entry_vwap = row["close"]
                     else:
                         add = abs(delta)
-                        st.entry_vwap = (st.entry_vwap * abs(st.contracts) + row["close"] * add) / abs(new_pos)
+                        st.entry_vwap = (
+                            st.entry_vwap * abs(st.contracts) + row["close"] * add
+                        ) / abs(new_pos)
                     sign = 1 if new_pos > 0 else -1
                     st.stop_level = st.entry_vwap * (1 - sign * p.client_stop_atr * row["atrp"])
                 st.contracts = new_pos
@@ -429,14 +442,27 @@ def run_backtest(data: dict[str, pd.DataFrame], p: Params, start: str, end: str)
     return summarize(curve, trades, total_costs, total_funding, gross_expo, halted, p)
 
 
-def summarize(curve, trades, total_costs, total_funding, gross_expo, halted, p) -> dict:
+def summarize(
+    curve: pd.Series,
+    trades: list[tuple[str, str, float, float, float, str]],
+    total_costs: float,
+    total_funding: float,
+    gross_expo: list[float],
+    halted: bool,
+    p: Params,
+) -> dict[str, Any]:
     rets = curve.pct_change().dropna()
-    def sharpe(x):
-        return float(x.mean() / x.std() * math.sqrt(DAYS_YEAR)) if len(x) > 1 and x.std() > 0 else 0.0
-    def maxdd(c):
+
+    def sharpe(x: pd.Series) -> float:
+        return (
+            float(x.mean() / x.std() * math.sqrt(DAYS_YEAR)) if len(x) > 1 and x.std() > 0 else 0.0
+        )
+
+    def maxdd(c: pd.Series) -> float:
         return float((1 - c / c.cummax()).max())
+
     years = sorted(set(curve.index.year))
-    per_year = {}
+    per_year: dict[str, dict[str, float]] = {}
     for y in years:
         c = curve[curve.index.year == y]
         r = c.pct_change().dropna()
@@ -475,7 +501,7 @@ def summarize(curve, trades, total_costs, total_funding, gross_expo, halted, p) 
     }
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", action="store_true", help="run base scenario only")
     ap.add_argument("--start", default="2017-01-01")
@@ -489,8 +515,12 @@ def main():
     # knob scaled coherently, drawdown halt moved 50% -> 75% (malfunction
     # circuit-breaker only). aggr_nohalt quantifies removing the halt entirely.
     aggr = replace(
-        base, v_target=0.80, per_trade_risk_frac=0.05,
-        daily_loss_limit=-0.08, weekly_loss_limit=-0.16, gross_cap=3.0,
+        base,
+        v_target=0.80,
+        per_trade_risk_frac=0.05,
+        daily_loss_limit=-0.08,
+        weekly_loss_limit=-0.16,
+        gross_cap=3.0,
         dd_tiers=((0.20, 1.0), (0.40, 0.6), (0.70, 0.35), (9.9, 0.2)),
         halt_frac=0.25,
     )
@@ -499,8 +529,11 @@ def main():
     # combo2x structure + cash yield 3.5% (Coinbase One Basic USDC rewards,
     # subscriber-gated since 2025-12) minus the $4.99/mo subscription.
     production = replace(
-        aggr, dd_tiers=((9.9, 1.0),), hysteresis_hold=True,
-        band_edge_rebalance=True, cash_yield_ann=0.035,
+        aggr,
+        dd_tiers=((9.9, 1.0),),
+        hysteresis_hold=True,
+        band_edge_rebalance=True,
+        cash_yield_ann=0.035,
         subscription_usd_month=4.99,
     )
 
@@ -517,26 +550,36 @@ def main():
         scenarios["funding_2x"] = replace(base, funding_ann=2 * base.funding_ann)
         scenarios["gross_no_costs"] = replace(base, cost_mult=0.0, funding_ann=0.0)
         # falsification #4: +-20% lookback perturbations (joint and single)
-        perts = {
+        perts: dict[str, dict[str, Any]] = {
             "lb_all_-20": dict(sma_fast=80, sma_slow=160, mom_lb=16),
             "lb_all_+20": dict(sma_fast=120, sma_slow=240, mom_lb=24),
-            "lb_fast_-20": dict(sma_fast=80), "lb_fast_+20": dict(sma_fast=120),
-            "lb_slow_-20": dict(sma_slow=160), "lb_slow_+20": dict(sma_slow=240),
-            "lb_mom_-20": dict(mom_lb=16), "lb_mom_+20": dict(mom_lb=24),
+            "lb_fast_-20": dict(sma_fast=80),
+            "lb_fast_+20": dict(sma_fast=120),
+            "lb_slow_-20": dict(sma_slow=160),
+            "lb_slow_+20": dict(sma_slow=240),
+            "lb_mom_-20": dict(mom_lb=16),
+            "lb_mom_+20": dict(mom_lb=24),
         }
         for name, kw in perts.items():
             scenarios[name] = replace(base, **kw)
 
-    results = {}
+    results: dict[str, dict[str, Any]] = {}
     for name, params in scenarios.items():
-        d = data if params.sma_fast == base.sma_fast and params.sma_slow == base.sma_slow and params.mom_lb == base.mom_lb \
+        d = (
+            data
+            if params.sma_fast == base.sma_fast
+            and params.sma_slow == base.sma_slow
+            and params.mom_lb == base.mom_lb
             else {s: compute_indicators(load_asset(s), params) for s in ASSETS}
+        )
         results[name] = run_backtest(d, params, args.start, args.end)
         r = results[name]
-        print(f"{name:16s} ret={r['total_return']:+8.1%} cagr={r['cagr']:+7.1%} "
-              f"sharpe={r['sharpe']:+5.2f} dd={r['maxdd']:6.1%} "
-              f"s23={r['sharpe_2023on']:+5.2f} trades/yr={r['trades_per_year']:5.1f} "
-              f"costs=${r['total_costs']:8.0f} halted={r['halted']}")
+        print(
+            f"{name:16s} ret={r['total_return']:+8.1%} cagr={r['cagr']:+7.1%} "
+            f"sharpe={r['sharpe']:+5.2f} dd={r['maxdd']:6.1%} "
+            f"s23={r['sharpe_2023on']:+5.2f} trades/yr={r['trades_per_year']:5.1f} "
+            f"costs=${r['total_costs']:8.0f} halted={r['halted']}"
+        )
 
     with open(RESULTS_PATH, "w") as f:
         json.dump(results, f, indent=2)
@@ -547,7 +590,10 @@ def main():
         f1 = b["sharpe"] < 0.30 or results["costs_2x"]["sharpe"] < 0
         f2 = b["sharpe_2023on"] < 0
         f3 = b["worst_year_dd"] > 0.40
-        f4 = any(results[k]["total_return"] < 0 for k in results if k.startswith("lb_")) and b["total_return"] > 0
+        f4 = (
+            any(results[k]["total_return"] < 0 for k in results if k.startswith("lb_"))
+            and b["total_return"] > 0
+        )
         print("\nFalsification criteria (section 9): any True => do not deploy")
         print(f"  F1 full-sample Sharpe<0.30 or 2x-cost Sharpe<0 : {f1}")
         print(f"  F2 2023+ subsample Sharpe<0                    : {f2}")
