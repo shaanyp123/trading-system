@@ -103,6 +103,20 @@ Notes: (1) hysteresis-hold is a genuine structural gain — going flat during 1-
 
 Notes: (1) **Cash yield is the material win** — the strategy averages ~0.4x gross, so ~85% of equity sits unencumbered; modeled at 4% on cash beyond a 25% margin assumption. Requires a cash-management layer in the build (sweep scheduling; verify the actually-accessible yield — CFM margin is USD, spot-side USDC rewards differ) and shrinks if rates fall (2.5% scenario given). (2) **Band-edge rebalancing is cost insurance, not a booster**: roughly CAGR-neutral at modeled costs (fee savings ≈ tracking drag) but it lifts the 2×-cost Sharpe 0.90 → 1.00 — it pays exactly when live costs run worse than modeled, which is the realistic failure mode on a thin venue. (3) Explicitly NOT pursued (overfitting or venue reality): signal additions/threshold tuning, funding-carry tilt, sentiment overlays, SOL/alt contracts (thin books, minimum-fee regime, short history).
 
+### Exploration round 3 — sizing frontier (scale sweep on the Amendment B structure)
+
+| Scale | CAGR | Sharpe | Max DD | Worst year | Halt headroom* |
+|---|---|---|---|---|---|
+| 1.0× | +23.6% | 1.25 | 34.5% | +3.0% | huge |
+| 1.5× | +33.1% | 1.20 | 47.5% | +1.5% | 28 pts |
+| **2.0× (production)** | **+41.9%** | **1.16** | **58.5%** | −2.9% | **16.5 pts** |
+| 2.5× | +50.0% | 1.14 | 67.2% | −7.9% | 8 pts |
+| 3.0× | +52.4% | 1.06 | 74.4% | −13.9% | 0.6 pts |
+| 3.5× | +57.9% | 1.06 | 80.0% | −22.0% | breach |
+| 4.0× | +60.4% | 1.04 | 84.2% | −34.0% | breach |
+
+\* backtest max DD vs the operator's 75% budget. Sharpe declines monotonically with scale (cost + volatility drag); CAGR still rises at 4× on this path, so the historical growth-optimal ("full-Kelly") scale is ≥4× — but betting at or near it produces 80%+ drawdowns and, on any live-worse-than-history path, the halt. Production at 2.0× ≈ half-Kelly: deliberately below growth-optimal per standard fractional-Kelly practice (parameter estimates are noisy; the penalty for over-betting is convex, the penalty for under-betting is linear). 2.5× was considered (Sharpe −0.02, +8 CAGR, headroom 16.5→8 pts) and deferred to the 6-month live review rather than taken on backtest evidence alone.
+
 ## Recommendation
 
 Deploy-gate **PASS**. Proceed to the backend/frontend delta spec and build **at the Amendment B profile** (Amendment A knobs + hysteresis-hold + no dd-tiers + band-edge rebalancing + cash-yield layer; validated +41.9% CAGR / Sharpe 1.16 / DD 58.5%, operator-selected 2026-07-08 over the 3× alternative), with these riders: (1) expectations per Amendment A — ~30% CAGR central case with ~50% drawdowns and red years (2021/2025-shaped) as a normal part of the deal; (2) BTC-only at launch per F-2; (3) funding telemetry from day one and §7-over-§6 precedence in the sizing engine per F-3/F-4; (4) the $1,500 halt ships as a malfunction circuit-breaker — removing it entirely was evaluated and adds nothing (identical backtest) while removing the debit/runaway backstop.
