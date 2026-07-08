@@ -36,6 +36,12 @@ dependencies = [
   "resend>=2.4",
   "anthropic>=0.39",
   "pyyaml>=6.0",
+  # pandas (crypto-pivot C0-B3): the signal engine (services/signal/
+  # crypto_trend.py) reuses the reference backtest's exact pandas indicator
+  # calls so the parity gate (tests/golden/test_crypto_trend_parity.py)
+  # can never diverge on indicator arithmetic. Promoted from research-only
+  # to runtime with the in-process engine.
+  "pandas>=2.2",
   # coinbase-advanced-py (crypto-pivot C0-B2b, delta spec §3.1): official
   # Coinbase Advanced Trade SDK. Sync REST client with CDP JWT (ES256)
   # request signing, wrapped by services/execution/coinbase_client.py via
@@ -166,9 +172,10 @@ ignore_missing_imports = true
 module = "coinbase.*"
 ignore_missing_imports = true
 
-# pandas is used only by the standalone crypto-perps research backtester
-# (research/crypto_perps/**); it is not a project dependency and CI does not
-# install it (nor pandas-stubs) — treat it as Any there.
+# pandas ships types but pandas-stubs is not installed in CI; the signal
+# engine + research backtester treat frames as Any at the boundary
+# (crypto-pivot C0-B3: pandas became a runtime dep for the parity-locked
+# indicator path).
 [[tool.mypy.overrides]]
 module = "pandas"
 ignore_missing_imports = true
