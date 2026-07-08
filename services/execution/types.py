@@ -1,328 +1,250 @@
-"""services/execution/types.py — pure-policy dataclasses for the IBKR client.
+"""services/execution/types.py — pure-policy dataclasses for the broker layer.
 
-Pivot-PR-B (post-pivot 2026-05-12). Broker-agnostic shapes describing the
-order / fill / position contract between the backend and the broker. The
-``ibkr_adapter.IbAsyncIbkrClient`` translates these into ``ib_async`` calls;
-tests use the Protocol from ``ibkr_client.py`` to swap in mocks.
+Crypto-pivot C0-B2b (delta spec §3.1, 2026-07-09). This module was the
+IBKR DTO set from Pivot-PR-B (2026-05-12); the IBKR/LEAN/CME stack was
+decommissioned at C0 start and its ``Ibkr*`` DTOs died with their only
+consumers (``ibkr_adapter``/``ibkr_client``/``order_placement_worker``/
+``ibkr_intraday`` — deleted in this same PR per the operator's dead-code
+mandate). What replaces them is a **venue-neutral** shape set the
+Coinbase transport (``coinbase_client.py``) parses into and the
+execution policy layer (``coinbase_adapter.py``) consumes — the §3.1
+"DTOs reused where broker-agnostic" contract, applied by rebuilding the
+DTOs venue-agnostic rather than keeping IBKR-flavored names alive.
 
-A02 BINDS — this file is on the forbidden whitelist (``services/execution/**``);
-`risk-review-approved` required for any future changes.
-A05 enforced — all money/price fields are ``Decimal``, serialized as strings
-at the API boundary.
+A02 BINDS — this file is on the forbidden whitelist
+(``services/execution/**``); ``risk-review-approved`` required.
+A05 enforced — all money/price fields are ``Decimal``, serialized as
+strings at API boundaries.
 A06 enforced — all timestamps tz-aware UTC.
 """
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
-from typing import Literal
-from uuid import UUID
+from typing import Any, Literal
 
-#: Locked enum mirroring backend-spec §2.5 (order types).
+#: Order side, our-side convention (lowercase; the Coinbase wire uses
+#: upper — the transport maps at the boundary).
+OrderSide = Literal["buy", "sell"]
+
+#: Order kinds the execution ladder + stop manager place (strategy §5):
 #:
-#: * ``limit_marketable`` — entries with a limit price set 1 tick beyond
-#:   the bid/ask to ensure marketability while bounding slippage.
-#: * ``stop_market`` — stop orders for exits at the strategy's ATR stop.
-#: * ``limit_at_target`` — take-profit limit orders (rarely used in v1
-#:   which has no fixed profit target).
-#: * ``market`` — emergency-only; defensive trim path uses limit_marketable
-#:   1x->2x spread instead. Reserved for kill-switch flatten-all flow.
-IbkrOrderType = Literal[
-    "limit_marketable",
-    "stop_market",
-    "limit_at_target",
-    "market",
-]
+#: * ``limit_post_only`` — ladder stage 1: join the touch, maker-only.
+#: * ``limit_ioc`` — ladder stage 2: cross at mid ± 5 bps, immediate-or-cancel.
+#: * ``market`` — ladder stage 3 + risk-loop flatten path.
+#: * ``stop_limit`` — the venue-native 3xATR backstop (§5 Layer 1). CDE
+#:   has no native stop-market; a wide-limit stop-limit is the closest
+#:   protective order (limit 1% through the trigger).
+OrderKind = Literal["limit_post_only", "limit_ioc", "market", "stop_limit"]
 
+#: Trigger direction for ``stop_limit`` orders. ``stop_down`` = trigger
+#: when mark falls to/below the trigger (protects longs); ``stop_up``
+#: protects shorts.
+StopDirection = Literal["stop_down", "stop_up"]
 
-#: Locked enum mirroring backend-spec §2.5 (order sides).
-IbkrOrderSide = Literal["buy", "sell"]
-
-
-#: Locked enum mirroring backend-spec §3.4 (orders.status). The IBKR API
-#: surfaces a richer status set via ``orderStatus.status``; we map them
-#: to this narrower locked set.
-IbkrOrderStatus = Literal[
-    "pending_submit",
-    "submitted",
-    "partially_filled",
+#: Narrow locked status set the transport maps venue statuses onto.
+#: (Coinbase surfaces OPEN / FILLED / CANCELLED / EXPIRED / FAILED /
+#: QUEUED / CANCEL_QUEUED / PENDING and more; anything unrecognized maps
+#: to ``unknown`` and is logged at the boundary.)
+BrokerOrderStatus = Literal[
+    "open",
     "filled",
     "cancelled",
+    "expired",
+    "failed",
     "rejected",
-]
-
-
-#: Order rejection categories per backend-spec §6.3 (Order Rejection Taxonomy).
-#: The adapter maps IBKR error codes to this enum; the dispatcher uses it to
-#: decide retry vs. halt.
-IbkrRejectionCategory = Literal[
-    "insufficient_margin",
-    "outside_trading_hours",
-    "invalid_contract",
-    "duplicate_order",
-    "limit_too_far_from_market",
-    "broker_disconnect",
+    "queued",
     "unknown",
 ]
 
+#: Which ladder stage produced a fill / where execution stopped.
+LadderStage = Literal["post_only", "ioc_cross", "market"]
+
 
 @dataclass(frozen=True, slots=True)
-class IbkrContractRef:
-    """Identifies an IBKR-tradable instrument.
+class PerpProductRef:
+    """One runtime-discovered CDE perp-style product ([A13]: never hardcoded).
 
-    Phase 1 sub-universe (locked):
-        Futures: /MES, /MNQ, /MYM, /M2K, /MGC, /MCL, /MBT
-        ETFs:    TLT, IEF, SHY, TIP
-
-    For futures, ``ibkr_local_symbol`` carries the continuous-front contract
-    code (e.g., "MESH26" for Mar 2026); the adapter resolves this from the
-    market symbol + roll calendar.
+    ``contract_size`` is in base-asset units per contract (nano BTC
+    0.01, nano ETH 0.10 — read from the venue, never assumed).
     """
 
-    market: str  # e.g., "/MES" or "TLT" — matches strategies parameters.py
-    ibkr_local_symbol: str  # IBKR-side instrument symbol (resolves contract)
-    ibkr_con_id: int | None = None  # IBKR contract ID; cached after first resolve
-    #: Futures point/unit multiplier. Most CME micros are integer ($5/pt for
-    #: /MES, $10/pt for /MGC) but two are fractional: /MYM is $0.50/pt and
-    #: /MBT is 0.1 BTC per contract. Pre-2026-05-27 this field was typed
-    #: ``int`` which silently truncated /MYM → 0 and /MBT → 1 in the
-    #: adapter's static resolve dict and in ``_contract_from_ib`` (which
-    #: cast IBKR's incoming string multiplier via ``int(...)``). The
-    #: notional/PnL paths that actually consume the multiplier numerically
-    #: source it from the ``contracts.multiplier`` DB column (Decimal)
-    #: + ``services/api/exposure.py``'s static Decimal lookup, so the
-    #: silent truncation was informational-only — but enough to fail an
-    #: audit of the adapter's reported contract spec.
-    multiplier: Decimal = Decimal(1)
-    exchange: str = "CME"  # CME for futures; SMART for ETFs
+    product_id: str
+    base_asset: str  # "BTC" / "ETH" — normalized upper
+    contract_size: Decimal
+    tick_size: Decimal
+    trading_disabled: bool
+    raw: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
-class IbkrPlaceOrderRequest:
-    """Request to place a new order via the IBKR adapter.
+class BrokerOrderRequest:
+    """One order the policy layer asks the transport to place.
 
-    The ``client_order_id`` is the 33-char ID per backend-spec §2.5 (locked
-    format). It's threaded through as ``orderRef`` on the IBKR side and
-    persisted in the ``orders`` table; the same ID is used for the audit
-    event UUID generation seed so a single signal → order traceable end-
-    to-end.
-    """
-
-    client_order_id: str  # 33-char strategy_short-paramset_short-signal_short-retry_n
-    contract: IbkrContractRef
-    side: IbkrOrderSide
-    quantity: Decimal  # number of contracts (futures) or shares (ETFs)
-    order_type: IbkrOrderType
-    limit_price: Decimal | None = None  # required for limit_marketable / limit_at_target
-    stop_price: Decimal | None = None  # required for stop_market
-    time_in_force: Literal["DAY", "GTC"] = "DAY"
-    parent_client_order_id: str | None = (
-        None  # informational: links stop to entry CID; not on the wire
-    )
-    parent_broker_order_id: int | None = (
-        None  # IBKR-side bracket parentId — when set on a stop, IBKR treats it as an OCO child of the entry (entry-cancel auto-cancels stop). PR-gamma / drill 6 defect #3 fix.
-    )
-    transmit: bool = True  # IBKR-side transmit flag. PR-eta / drill 9 fix: set False on the entry leg of an atomic bracket so IBKR queues it in PendingSubmit until the child (stop, transmit=True + parentId=entry_id) arrives + releases both atomically. Default True preserves single-order behavior for non-bracket callers (cancel, recon, manual orders).
-
-
-@dataclass(frozen=True, slots=True)
-class IbkrPlaceOrderResult:
-    """Outcome of a placeOrder call.
-
-    ``broker_order_id`` is the IBKR-side numeric ID (returned in
-    ``orderStatus.permId``); persisted into the ``orders`` table. The
-    operation may succeed locally (order acknowledged by IBKR) but the
-    actual fill happens asynchronously — subsequent ``orderStatus`` events
-    surface that. Pivot-PR-D's dispatcher subscribes to those event streams.
+    ``client_order_id`` is the deterministic hash ID (§3.1) — same
+    inputs always produce the same ID so crash recovery is idempotent:
+    a duplicate placement attempt is rejected by the venue and resolved
+    by looking the original order up instead of double-ordering.
     """
 
     client_order_id: str
-    broker_order_id: int  # 0 if order was rejected at submit
-    status: IbkrOrderStatus
+    product_id: str
+    side: OrderSide
+    contracts: Decimal  # positive count; side carries direction
+    kind: OrderKind
+    limit_price: Decimal | None = None  # required for both limit kinds + stop_limit
+    stop_trigger_price: Decimal | None = None  # required for stop_limit
+    stop_direction: StopDirection | None = None  # required for stop_limit
+
+
+@dataclass(frozen=True, slots=True)
+class BrokerOrderAck:
+    """Submit-time outcome. Venue rejection is data, not an exception —
+    the ladder treats a post-only rejection (would-cross) as the signal
+    to escalate to the next stage. Transport failures raise
+    :class:`BrokerError` instead.
+    """
+
+    client_order_id: str
+    order_id: str  # venue-side UUID; "" when rejected at submit
+    accepted: bool
+    rejection_reason: str | None
     submitted_at_utc: datetime
-    rejection_category: IbkrRejectionCategory | None = None
-    rejection_detail: str | None = None  # IBKR's free-text rejection message
 
 
 @dataclass(frozen=True, slots=True)
-class IbkrCancelOrderResult:
-    """Outcome of a cancelOrder call.
+class BrokerOrderState:
+    """Point-in-time order snapshot from the venue (get/list orders)."""
 
-    IBKR's cancel is async — calling ``cancelOrder`` doesn't immediately
-    confirm the cancel; an ``orderStatus`` event with status=Cancelled
-    arrives later. This result captures whether the cancel was successfully
-    submitted; the actual cancel-confirmed transition is tracked via the
-    fill/order-status event subscription.
-    """
-
+    order_id: str
     client_order_id: str
-    broker_order_id: int
-    cancel_submitted_at_utc: datetime
+    product_id: str
+    side: OrderSide
+    status: BrokerOrderStatus
+    contracts: Decimal  # ordered size
+    filled_contracts: Decimal
+    avg_fill_price: Decimal | None
+    total_fees_usd: Decimal
+    kind: OrderKind | None  # None when the venue config shape is unrecognized
+    stop_trigger_price: Decimal | None = None
+    raw: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def is_terminal(self) -> bool:
+        """True once the venue will never fill more of this order."""
+        return self.status in ("filled", "cancelled", "expired", "failed", "rejected")
+
+    @property
+    def remaining_contracts(self) -> Decimal:
+        return max(self.contracts - self.filled_contracts, Decimal(0))
 
 
 @dataclass(frozen=True, slots=True)
-class IbkrFill:
-    """One execution leg returned by ``IB.fills()`` or the live event stream.
+class BrokerFill:
+    """One execution leg (REST fills endpoint or WS user channel).
 
-    The composite key ``(client_order_id, exec_id)`` uniquely identifies a
-    fill; the dispatcher dedupes by this pair to avoid double-counting if
-    the same fill is observed both by the event stream and by the
-    end-of-day reconciliation poll.
+    ``fill_id`` is the venue-side unique leg ID (dedupe key together
+    with ``order_id`` — same discipline the IBKR-era
+    ``(client_order_id, exec_id)`` pair enforced).
     """
 
-    client_order_id: str
-    broker_order_id: int
-    exec_id: str  # IBKR-side execution ID (unique per execution leg)
-    contract: IbkrContractRef
-    side: IbkrOrderSide
-    quantity: Decimal
-    fill_price: Decimal
-    commission_usd: Decimal
+    fill_id: str
+    order_id: str
+    client_order_id: str | None
+    product_id: str
+    side: OrderSide
+    contracts: Decimal
+    price: Decimal
+    fee_usd: Decimal
     filled_at_utc: datetime
 
 
 @dataclass(frozen=True, slots=True)
-class IbkrPosition:
-    """One position snapshot returned by ``IB.positions()``.
+class BrokerPosition:
+    """One venue position snapshot (list/get positions).
 
-    Captured at intraday recon (60s cadence during CME session, per backend-
-    spec §2.6 post-pivot). The dispatcher compares this against the backend's
-    ``positions`` table to detect reconciliation breaks.
+    ``contracts`` is signed: positive = long, negative = short —
+    normalized from the venue's (side, count) pair at the boundary.
     """
 
-    contract: IbkrContractRef
-    quantity: Decimal  # signed: positive = long; negative = short
-    avg_cost_usd: Decimal  # cost basis per contract/share
-    market_price_usd: Decimal | None  # last broker-reported mark; None if untradable
-    unrealized_pnl_usd: Decimal | None  # None if market_price is None
-    realized_pnl_usd: Decimal
+    product_id: str
+    contracts: Decimal
+    entry_vwap: Decimal | None
+    mark_price: Decimal | None
+    unrealized_pnl_usd: Decimal | None
+    raw: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
-class IbkrAccountSummary:
-    """Cash + margin snapshot returned by ``IB.accountSummary()``.
+class FuturesBalanceSummary:
+    """CFM futures balance summary (equity/margin source, §3.1).
 
-    Sampled at 60s recon cadence + on every fill. The risk engine's
-    margin-protocol uses ``used_margin_pct = init_margin_usd / available_funds_usd``
-    to gate defensive trims.
+    Field-by-field Decimals where the venue provides them; ``raw``
+    carries the full payload for recon + forensic use. ``None`` means
+    the venue omitted the field — consumers must treat missing margin
+    data as a reason to fail safe, never as zero.
     """
 
-    account_id: str  # IBKR account number (e.g., "U25655583")
-    net_liquidation_usd: Decimal
-    available_funds_usd: Decimal
-    init_margin_req_usd: Decimal  # initial margin requirement
-    maintenance_margin_req_usd: Decimal
-    buying_power_usd: Decimal
+    total_usd_balance: Decimal | None
+    cbi_usd_balance: Decimal | None
+    cfm_usd_balance: Decimal | None
+    available_margin: Decimal | None
+    initial_margin: Decimal | None
+    unrealized_pnl: Decimal | None
+    daily_realized_pnl: Decimal | None
+    liquidation_threshold: Decimal | None
+    liquidation_buffer_amount: Decimal | None
+    liquidation_buffer_percentage: Decimal | None
     snapshot_at_utc: datetime
+    raw: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
-class IbkrConnectionState:
-    """Health snapshot for the ib_gateway TWS API connection.
+class BestBidAsk:
+    """Top-of-book snapshot for one product (ladder stage-1 join price)."""
 
-    ``IB.isConnected()`` is the authoritative reachability check; the
-    health-check loop (services/execution/dispatch.py in Pivot-PR-B follow-up,
-    or services/monitoring/ in Pivot-PR-C) calls this on a 30s cadence and
-    halt-news on consecutive_disconnect > 10 min per backend-spec §6.6.1-alt.
-    """
+    product_id: str
+    bid: Decimal
+    ask: Decimal
+    observed_at_utc: datetime
 
-    is_connected: bool
-    last_error: str | None
-    client_id: int  # the TWS API clientId used by this process
-    server_version: int | None  # IBKR TWS protocol version
-
-
-#: Broker-agnostic surface for one `orderStatusEvent` from the IBKR adapter.
-#: The IBKR side surfaces a richer enum (PendingSubmit / Submitted /
-#: PreSubmitted / PartiallyFilled / Filled / Cancelled / ApiCancelled /
-#: Inactive / ...); the adapter maps those down to this narrower locked
-#: set so subscribers don't have to care about the IBKR-specific ones.
-#:
-#: ``submitted`` collapses PendingSubmit + Submitted + PreSubmitted (the
-#: order is live at the broker, no fill yet). ``inactive`` is the
-#: post-cancel terminal state IBKR uses for a few odd code paths; we
-#: treat it as a no-op from the SSE consumer's perspective.
-OrderStatusKind = Literal[
-    "submitted",
-    "partially_filled",
-    "filled",
-    "cancelled",
-    "rejected",
-    "inactive",
-]
+    @property
+    def mid(self) -> Decimal:
+        return (self.bid + self.ask) / 2
 
 
 @dataclass(frozen=True, slots=True)
-class OrderStatusUpdate:
-    """One status-event update from the broker's order-status stream.
+class BrokerError(Exception):
+    """Terminal transport failure (network/auth/5xx) — NOT a rejection.
 
-    Surfaced through ``IbkrClient.subscribe_order_status`` so the
-    backend can react to live transitions (Submitted → PartiallyFilled
-    → Filled → ...) without polling. The IBKR side fires
-    ``orderStatusEvent`` for every transition; the adapter maps each
-    raw event to this dataclass before invoking the user callback.
-
-    The ``cumulative_filled_quantity`` + ``avg_fill_price`` +
-    ``total_commission_usd`` fields aggregate across all fills observed
-    so far on this order — so the consumer of a ``status='filled'``
-    update has everything it needs to render the Discord ``#fills``
-    embed and the web fills-feed row in one place.
-
-    ``last_fill_at_utc`` is ``None`` for pre-fill statuses (submitted,
-    rejected) where the order has no execution legs yet; ``observed_at_utc``
-    is always populated as the adapter's receipt timestamp so SSE
-    consumers can sort/correlate even without a fill timestamp.
+    Mirrors the IBKR-era ``IbkrPlacementError`` contract: per-order
+    rejections come back as data (``BrokerOrderAck.accepted=False``);
+    this exception means the call never completed at the venue, and the
+    caller must treat venue state as unknown (re-reconcile by
+    client_order_id before retrying).
     """
 
-    client_order_id: str  # Trade.order.orderRef — the 33-char client ID
-    broker_order_id: int  # Trade.order.orderId
-    status: OrderStatusKind  # mapped from Trade.orderStatus.status
-    market: str  # derived from Trade.contract (e.g., "/MES" or "TLT")
-    side: IbkrOrderSide  # derived from Trade.order.action
-    cumulative_filled_quantity: Decimal  # Trade.orderStatus.filled
-    remaining_quantity: Decimal  # Trade.orderStatus.remaining
-    avg_fill_price: Decimal | None  # Trade.orderStatus.avgFillPrice; None pre-fill
-    total_commission_usd: Decimal  # sum across trade.fills[].commissionReport.commission
-    last_fill_at_utc: datetime | None  # most recent fill.time; None pre-fill
-    observed_at_utc: datetime  # adapter-side receipt timestamp
-    rejection_reason: str | None = None
-    """IBKR-side error message for terminal-reject events (Defect #2 fix
-    2026-05-16). Populated when ``status`` is one of ``cancelled``,
-    ``rejected``, or ``inactive`` AND the underlying ib_async ``Trade``
-    has a ``log`` entry with a message (the IBKR error code + text).
-
-    For the futures-validation case that surfaced today, this carries
-    e.g. ``"321 - Please enter a local symbol or an expiry"`` so the
-    backend can stamp ``orders.rejection_reason`` + the
-    ``order_rejected`` audit payload's ``rejection_reason`` field.
-
-    None for non-terminal statuses (submitted, filled, partially_filled)
-    or when IBKR provides no message on the rejection."""
-
-
-#: Callback signature for ``IbkrClient.subscribe_order_status``. Async so
-#: the implementation can do DB lookups / SSE emits without blocking the
-#: ib_async event loop.
-OrderStatusCallback = Callable[[OrderStatusUpdate], Awaitable[None]]
-
-
-@dataclass(frozen=True, slots=True)
-class IbkrPlacementError(Exception):
-    """Raised on terminal-failure placement attempts (network, auth, etc).
-
-    Different from a per-order rejection (which is captured in the
-    ``IbkrPlaceOrderResult.rejection_*`` fields with status=rejected). This
-    exception fires when the ENTIRE call couldn't reach IBKR — e.g., the
-    ib_gateway container is down, or the TWS API session was disconnected
-    mid-call. The dispatcher catches it + signals a defensive_envelope halt
-    after consecutive_failures threshold.
-    """
-
-    operation: str  # e.g., "placeOrder", "cancelOrder", "reqPositions"
+    operation: str  # e.g., "create_order", "list_positions"
     detail: str
-    underlying_exception_class: str  # e.g., "ConnectionError", "TimeoutError"
+    underlying_exception_class: str
     occurred_at_utc: datetime
-    request_audit_event_uuid: UUID | None = None  # tie-back to the audit row
+
+
+__all__ = [
+    "BestBidAsk",
+    "BrokerError",
+    "BrokerFill",
+    "BrokerOrderAck",
+    "BrokerOrderRequest",
+    "BrokerOrderState",
+    "BrokerOrderStatus",
+    "BrokerPosition",
+    "FuturesBalanceSummary",
+    "LadderStage",
+    "OrderKind",
+    "OrderSide",
+    "PerpProductRef",
+    "StopDirection",
+]

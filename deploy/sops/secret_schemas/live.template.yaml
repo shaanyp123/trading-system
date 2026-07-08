@@ -34,15 +34,20 @@ postgres:
   app_service_password: <TODO_FROM_LIVE_CUTOVER_POSTGRES_BOOTSTRAP>
   app_owner_password: <TODO_FROM_LIVE_CUTOVER_POSTGRES_BOOTSTRAP>
 
+# Crypto-pivot C0-B2b (2026-07-09): the IBKR TWS credential set
+# (live_account/live_username/live_password) was RETIRED with the IBKR
+# execution layer. FlexQuery pair survives only until the §3.5 Coinbase
+# recon fetcher lands.
 ibkr:
-  # Operator's live IBKR account (per cutover plan §10 step 1).
-  live_account: <TODO_FROM_LIVE_CUTOVER_IBKR_ACCOUNT>
-  live_username: <TODO_FROM_LIVE_CUTOVER_IBKR_LOGIN>
-  live_password: <TODO_FROM_LIVE_CUTOVER_IBKR_LOGIN>
-  # Operator creates a SEPARATE FlexQuery template for live in the IBKR
-  # portal pre-cutover (cutover plan §10 step 3 + Open decision O3).
   flex_query_id: <TODO_FROM_LIVE_CUTOVER_FLEX_TEMPLATE>
   flex_query_token: <TODO_FROM_LIVE_CUTOVER_FLEX_TEMPLATE>
+
+# Crypto-pivot C0-B2b (delta spec §3.1): CDP API key for the live
+# Coinbase Advanced Trade surface. Separate key from paper — generate a
+# distinct CDP key for the live env at the C1 cutover ceremony.
+coinbase:
+  api_key_name: <TODO_FROM_C1_COINBASE_KEY_CEREMONY>
+  api_private_key: <TODO_FROM_C1_COINBASE_KEY_CEREMONY>
 
 anthropic:
   # SHARED with paper — same Anthropic workspace; the agent operates against

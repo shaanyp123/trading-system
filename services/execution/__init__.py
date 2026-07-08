@@ -1,95 +1,85 @@
-"""services/execution package — IBKR client + order placement.
+"""services/execution — broker execution layer (Coinbase CFM, crypto-pivot C0-B2b).
 
-Post-pivot 2026-05-12 (Pivot-PR-B). Replaces the pre-pivot QC ObjectStore
-instruction protocol (backend-spec §4.5.2 RETIRED) with direct `ib-async`
-calls to a Dockerized `ib_gateway` container.
+Layered per delta spec §3.1:
 
-**Public surface:**
+* ``types.py`` — venue-neutral DTOs (orders, fills, positions, balance).
+* ``coinbase_client.py`` — :class:`CoinbaseBrokerClient` Protocol + the
+  ``coinbase-advanced-py``-backed :class:`SdkCoinbaseBrokerClient`
+  transport (JWT-authenticated REST; sync SDK bridged via
+  ``asyncio.to_thread``).
+* ``coinbase_adapter.py`` — :class:`CoinbaseExecutionAdapter` policy:
+  the strategy-§5 execution ladder (post-only at touch → 10 min →
+  mid ± 5 bps IOC → market), deterministic ``client_order_id`` crash
+  idempotency, native 3xATR stop management with resting verification,
+  startup reconcile, cancel-all.
 
-* :class:`IbkrClient` (Protocol) — abstract interface in
-  ``ibkr_client.py``. Programs against this; concrete impl in
-  ``ibkr_adapter.py``.
-* :class:`IbAsyncIbkrClient` — `ib-async`-backed adapter. Single
-  instance per process; instantiated at startup with sops-sourced config.
-* Pure-policy dataclasses in ``types.py``:
-  :class:`IbkrPlaceOrderRequest`, :class:`IbkrPlaceOrderResult`,
-  :class:`IbkrFill`, :class:`IbkrPosition`, :class:`IbkrAccountSummary`,
-  :class:`IbkrContractRef`, :class:`IbkrConnectionState`,
-  :class:`IbkrCancelOrderResult`, :class:`IbkrPlacementError`.
+The IBKR client/adapter that previously lived here (Pivot-PR-B,
+2026-05-12 → 2026-07-08) was deleted in C0-B2b together with the
+``ib-async`` dependency — see ``Docs/recent-architecture-changes.md``
+(crypto-pivot entries) and [A13] revised: do NOT re-introduce IBKR
+paths.
 
-**A02 BINDS** — every file in this package is on the forbidden whitelist;
-`risk-review-approved` required for any change.
-
-**A13 (revised 2026-05-12)** — this package IS the canonical direct-IBKR
-path. The pre-pivot rule (no direct IBKR in Phase 1) was inverted; see
-``Docs/claude-dev-guide.md`` §11 [A13] revised + ``Docs/decisions-log.md``
-2026-05-12 entry.
-
-**A27** BINDS — operator runbook + futures-sim precondition smoke at
-``deploy/ibkr/README.md``. The smoke (placeOrder + cancelOrder round-trip
-on /MES paper) is a pre-deploy gate.
-
-**Architectural integration:**
-
-* The api process holds a single :class:`IbAsyncIbkrClient` instance,
-  constructed at lifespan startup with config from
-  ``services.api.config.APISettings`` (Pivot-PR-D wires this).
-* Pivot-PR-D's ``services/risk/signal_dispatch.py`` consumes
-  approved signals + calls into this client's ``place_order()``.
-* Pivot-PR-C's ``services/reconciliation/`` uses ``get_positions()``
-  + ``get_account_summary()`` on 60s intraday cadence during CME session.
+A02 BINDS — everything under ``services/execution/**`` requires the
+``risk-review-approved`` PR label.
+A27 — operator canary runbook at ``deploy/coinbase_execution/README.md``.
 """
 
-from __future__ import annotations
-
-from services.execution.ibkr_adapter import (
-    DEFAULT_CLIENT_ID,
-    IBKR_CONNECTIVITY_ERROR_CODES,
-    IBKR_DATA_FARM_ERROR_CODES,
-    PHASE1_TICK_SIZES,
-    IbAsyncIbkrClient,
-    IbkrErrorState,
-    IbkrErrorStateProvider,
+from services.execution.coinbase_adapter import (
+    INTRADAY_MARGIN_OPTIN_FORBIDDEN,
+    CoinbaseExecutionAdapter,
+    LadderExecutionResult,
+    LadderStageResult,
+    StartupSnapshot,
+    StopEnsureResult,
+    StopVerificationError,
+    compute_stop_prices,
+    deterministic_client_order_id,
+    find_unprotected_positions,
     round_to_tick,
+    select_perp_products,
 )
-from services.execution.ibkr_client import IbkrClient
+from services.execution.coinbase_client import (
+    CoinbaseBrokerClient,
+    SdkCoinbaseBrokerClient,
+)
 from services.execution.types import (
-    IbkrAccountSummary,
-    IbkrCancelOrderResult,
-    IbkrConnectionState,
-    IbkrContractRef,
-    IbkrFill,
-    IbkrOrderSide,
-    IbkrOrderStatus,
-    IbkrOrderType,
-    IbkrPlacementError,
-    IbkrPlaceOrderRequest,
-    IbkrPlaceOrderResult,
-    IbkrPosition,
-    IbkrRejectionCategory,
+    BestBidAsk,
+    BrokerError,
+    BrokerFill,
+    BrokerOrderAck,
+    BrokerOrderRequest,
+    BrokerOrderState,
+    BrokerPosition,
+    FuturesBalanceSummary,
+    OrderKind,
+    OrderSide,
+    PerpProductRef,
 )
 
 __all__ = [
-    "DEFAULT_CLIENT_ID",
-    "IBKR_CONNECTIVITY_ERROR_CODES",
-    "IBKR_DATA_FARM_ERROR_CODES",
-    "PHASE1_TICK_SIZES",
-    "IbAsyncIbkrClient",
-    "IbkrAccountSummary",
-    "IbkrCancelOrderResult",
-    "IbkrClient",
-    "IbkrConnectionState",
-    "IbkrContractRef",
-    "IbkrErrorState",
-    "IbkrErrorStateProvider",
-    "IbkrFill",
-    "IbkrOrderSide",
-    "IbkrOrderStatus",
-    "IbkrOrderType",
-    "IbkrPlaceOrderRequest",
-    "IbkrPlaceOrderResult",
-    "IbkrPlacementError",
-    "IbkrPosition",
-    "IbkrRejectionCategory",
+    "INTRADAY_MARGIN_OPTIN_FORBIDDEN",
+    "BestBidAsk",
+    "BrokerError",
+    "BrokerFill",
+    "BrokerOrderAck",
+    "BrokerOrderRequest",
+    "BrokerOrderState",
+    "BrokerPosition",
+    "CoinbaseBrokerClient",
+    "CoinbaseExecutionAdapter",
+    "FuturesBalanceSummary",
+    "LadderExecutionResult",
+    "LadderStageResult",
+    "OrderKind",
+    "OrderSide",
+    "PerpProductRef",
+    "SdkCoinbaseBrokerClient",
+    "StartupSnapshot",
+    "StopEnsureResult",
+    "StopVerificationError",
+    "compute_stop_prices",
+    "deterministic_client_order_id",
+    "find_unprotected_positions",
     "round_to_tick",
+    "select_perp_products",
 ]

@@ -173,113 +173,6 @@ class APISettings(BaseSettings):
         ),
     )
 
-    # --- IBKR client (Worker-PR-1 follow-up — post-pivot 2026-05-12) ------
-    # IB Gateway connection settings for the api-process-resident
-    # `OrderPlacementWorker` background task. The worker drains
-    # ``signals.status='approved'`` rows into IBKR via the
-    # ``services.execution.ibkr_adapter.IbAsyncIbkrClient`` adapter.
-    #
-    # Defaults match the gnzsnz/ib-gateway externally-published socat
-    # ports (4004 paper, 4003 live; the internal gateway listens on
-    # 127.0.0.1:4002/:4001 but only the socat ports are reachable from
-    # other containers). The IBKR account number is sops-sourced —
-    # operator populates ``ibkr.paper_account`` in
-    # ``secrets/<env>.enc.yaml`` and the api entrypoint maps it to
-    # ``API_IBKR_ACCOUNT``.
-    #
-    # When ``ibkr_account`` is unset OR the api's lifespan can't fetch
-    # an active account_id from the ``accounts`` table, the worker
-    # **does not start** — the api still serves requests (the lifespan
-    # logs the skip but doesn't crash). This keeps a fresh deploy with
-    # no accounts row bootable.
-    ibkr_host: str = Field(
-        default="ib_gateway",
-        description=(
-            "Hostname of the ib_gateway Docker container. Defaults to "
-            "the Docker DNS name on the internal network."
-        ),
-    )
-    ibkr_port: int = Field(
-        default=4004,
-        ge=1,
-        le=65535,
-        description=(
-            "TWS API port. 4004 for paper, 4003 for live (gnzsnz socat "
-            "externally-published ports). Internal gateway listens on "
-            "127.0.0.1:4002/:4001 but socat publishes the externally-"
-            "reachable ports."
-        ),
-    )
-    ibkr_client_id: int = Field(
-        default=1,
-        ge=1,
-        le=7,
-        description=(
-            "TWS API clientId; 1-7 per IBKR's docs. The worker uses a "
-            "fixed clientId so that reconnects after transient "
-            "ib_gateway restarts surface as the same TWS API session."
-        ),
-    )
-    ibkr_account: str | None = Field(
-        default=None,
-        description=(
-            "IBKR account number (e.g., 'DUQ825170' for paper, "
-            "'U25655583' for live). Sourced from sops "
-            "`ibkr.paper_account` / `ibkr.live_account` per env. When "
-            "unset, IbAsyncIbkrClient uses the default account on the "
-            "TWS session."
-        ),
-    )
-    # Operator escape hatch for emergency disable of the
-    # OrderPlacementWorker without touching the docker-compose
-    # configuration. Defaults to True (worker starts when an
-    # IBKR-bound account_id resolves). Operator can set
-    # `API_ORDER_PLACEMENT_WORKER_ENABLED=false` in `deploy/.env` to
-    # disable while keeping the rest of the api running — useful
-    # during the paper-clock period if an order placement issue
-    # surfaces and the operator needs to pause the broker leg without
-    # taking the web UI offline.
-    order_placement_worker_enabled: bool = Field(
-        default=True,
-        description=(
-            "When False, the api lifespan skips OrderPlacementWorker "
-            "startup. Approved signals will queue in the signals "
-            "table until the worker is re-enabled and the api restarts."
-        ),
-    )
-    # Phase 1 poll cadence override. Defaults match
-    # `services.risk.order_placement_worker.DEFAULT_POLL_INTERVAL_SECONDS`
-    # (5.0s). Operator can tune via API_ORDER_PLACEMENT_POLL_INTERVAL
-    # if signal cadence changes Phase 2+.
-    order_placement_poll_interval_seconds: float = Field(
-        default=5.0,
-        gt=0.0,
-        le=600.0,
-        description=(
-            "Seconds between OrderPlacementWorker.run_once() iterations. "
-            "Lower = faster manual-approve → broker latency at the cost "
-            "of marginal DB pressure."
-        ),
-    )
-    # 2026-05-17 follow-up to the silent-worker pattern (see
-    # ``DEFAULT_IBKR_CALL_TIMEOUT_SECONDS`` in
-    # ``services/risk/order_placement_worker.py`` for the full diagnosis).
-    # Hard wall-clock deadline applied via ``asyncio.wait_for`` around
-    # every IBKR adapter await (``resolve_contract``, ``place_order``
-    # entry + stop, ``cancel_order``, ``subscribe_order_status``).
-    # Expiry translates to ``IbkrPlacementError`` so the existing
-    # transient-broker error path handles it.
-    ibkr_call_timeout_seconds: float = Field(
-        default=30.0,
-        gt=0.0,
-        le=600.0,
-        description=(
-            "Hard per-call timeout (seconds) on every "
-            "OrderPlacementWorker IBKR adapter await. 30s default "
-            "balances IBKR round-trip latency under load against "
-            "silent-worker recovery time."
-        ),
-    )
     # -- Async task liveness monitor ----------------------------------------
     #
     # 2026-05-17 follow-up to the silent-worker-death pattern observed
@@ -364,35 +257,6 @@ class APISettings(BaseSettings):
             "reconciliation scheduler does not start."
         ),
     )
-    # Option C (2026-05-28) — EOD recon position-source feature flag.
-    #
-    # Selects where the EOD reconciliation cycle's position-quantity
-    # check reads the broker position list from:
-    #
-    #   - "flexquery" (default): the IBKR FlexQuery XML snapshot. Only
-    #     reports settlement-cleared positions, so same-day fills land
-    #     after the clearing cutoff and trigger false-positive halts.
-    #   - "reqpositions": IBKR's real-time TWS API view via reqPositions
-    #     (clientId=4, per-cycle connect; see
-    #     services/reconciliation/ibkr_intraday.py). No clearing lag.
-    #
-    # Cash / NAV / position MTM stay on FlexQuery either way. This is the
-    # PR-B half of the rollout: the default is "flexquery" so merging +
-    # deploying PR-B changes nothing in production; PR-C flips the default
-    # to "reqpositions" after the operator observes clean cycles with
-    # API_EOD_RECON_POSITION_SOURCE=reqpositions set explicitly in
-    # deploy/.env. Full plan: Docs/ Option-C recon-fix design guide.
-    eod_recon_position_source: Literal["flexquery", "reqpositions"] = Field(
-        default="flexquery",
-        description=(
-            "EOD reconciliation position-quantity source. 'flexquery' "
-            "(default) uses the FlexQuery XML snapshot; 'reqpositions' "
-            "uses IBKR's real-time TWS API view (clientId=4). PR-B ships "
-            "the 'flexquery' default; PR-C flips it after cycle "
-            "observation. Set via API_EOD_RECON_POSITION_SOURCE."
-        ),
-    )
-
     # --- Discord + Resend for the recon-break alert dispatch hook --------
     #
     # When the reconciliation scheduler detects an actionable break, the
@@ -537,6 +401,33 @@ class APISettings(BaseSettings):
         gt=0.0,
         le=600.0,
         description="Per-request timeout on the public REST calls.",
+    )
+
+    # --- Coinbase execution credentials (crypto-pivot C0-B2b, §3.1) --------
+    #
+    # CDP API key for the AUTHENTICATED Advanced Trade surface (orders,
+    # fills, positions, futures balance summary) consumed by
+    # ``services/execution/coinbase_client.SdkCoinbaseBrokerClient``.
+    # Sourced from sops ``coinbase.api_key_name`` + ``coinbase.api_private_key``
+    # (ES256 EC private key in PEM form, as issued by the CDP portal) and
+    # mapped to env vars by ``services/api/entrypoint.py``. When unset,
+    # nothing that trades can start — the strategy worker (§3.3, C0-B3)
+    # fails closed at construction, mirroring the flex-credentials
+    # pattern above. The market-data worker (§3.2) is unaffected (public
+    # endpoints only).
+    coinbase_api_key_name: SecretStr | None = Field(
+        default=None,
+        description=(
+            "CDP API key name (organizations/{org}/apiKeys/{key}). "
+            "Sourced from sops `coinbase.api_key_name`."
+        ),
+    )
+    coinbase_api_private_key: SecretStr | None = Field(
+        default=None,
+        description=(
+            "CDP API EC private key (PEM). Sourced from sops "
+            "`coinbase.api_private_key`. SecretStr keeps it out of repr/logs."
+        ),
     )
 
 

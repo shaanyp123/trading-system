@@ -79,10 +79,11 @@ _STATUS_AUDIT_EVENT_TYPE: Final[dict[TerminalOrderStatus, AuditEventType]] = {
 class TerminalStatusPayload:
     """Inputs to :func:`process_terminal_status_event`.
 
-    ``broker_order_id`` is the IBKR-side numeric order id. ``status_kind``
-    is one of the three locked terminal kinds — the worker derives it
-    from the orderStatusEvent's status field via
-    :data:`services.execution.ibkr_adapter._ORDER_STATUS_KIND_MAP`.
+    ``broker_order_id`` is the broker-side numeric order id.
+    ``status_kind`` is one of the three locked terminal kinds. (The
+    IBKR order-placement worker that produced these events was retired
+    in crypto-pivot C0-B2b; the Coinbase strategy worker re-feeds this
+    processor from venue order states in C0-B3.)
 
     ``rejection_reason`` carries any IBKR-side error code + message (e.g.,
     "321 - Please enter a local symbol or an expiry"). May be None for

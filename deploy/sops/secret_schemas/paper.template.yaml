@@ -15,38 +15,27 @@ postgres:
   app_service_password: <TODO_FROM_DAY_3_POSTGRES_BOOTSTRAP>
   app_owner_password: <TODO_FROM_DAY_3_POSTGRES_BOOTSTRAP>
 
+# Crypto-pivot C0-B2b (2026-07-09): the IBKR TWS credential set
+# (account_number, paper/live usernames+passwords, paper_account,
+# client_id) was RETIRED with the IBKR execution layer — operator
+# ceremony: `sops secrets/paper.enc.yaml` and delete those keys.
+# Only the FlexQuery pair survives, feeding the EOD recon cycle until
+# the §3.5 Coinbase recon fetcher replaces it.
 ibkr:
-  account_number: U25655583       # operator's IBKR Pro account; submitted 2026-05-05
   flex_query_token: <TODO_FROM_WEEK_2_IBKR_FLEX_SETUP>
   flex_query_id: <TODO_FROM_WEEK_2_IBKR_FLEX_SETUP>   # numeric ID from IBKR FlexQuery dashboard
-  # Pivot-PR-B (post-pivot 2026-05-12): paper-trading credentials for
-  # the ib_gateway container. The operator's IBKR Pro account also has
-  # an associated paper account (login + 2FA in IBKR portal under "Paper
-  # Trading"). These fields are the paper-account username + password,
-  # NOT the live-account credentials. The TWS API listens internally on
-  # port 4002 (paper) / 4001 (live) — but external callers connect via
-  # socat at 4004 (paper) / 4003 (live) per gnzsnz convention; see
-  # deploy/ibkr/README.md Step 4.
-  #
-  paper_username: <TODO_FROM_PIVOT_PR_B_BRINGUP>
-  paper_password: <TODO_FROM_PIVOT_PR_B_BRINGUP>
-  # Paper account ID (distinct from `account_number` above which is the
-  # live account). Find this in the IB Gateway boot log line
-  #     "<DUQ_account> Trader Workstation Configuration (Simulated Trading)"
-  # or in the IBKR portal → Paper Trading → Account Profile.
-  # Read by the api's IBKR FlexQuery flow (services/api/entrypoint.py —
-  # falls back to ibkr.account_number above when paper_account is empty).
-  paper_account: <TODO_FROM_PIVOT_PR_F_BRINGUP>
-  # Live credentials. Empty (or placeholder) until Week 8 cutover ceremony.
-  # The operator deliberately defers populating these until 30-paper-session
-  # clock complete + funded account approved.
-  live_username: <TODO_FROM_WEEK_8_LIVE_CUTOVER>
-  live_password: <TODO_FROM_WEEK_8_LIVE_CUTOVER>
-  # TWS API client_id for the execution process. IBKR allows 1-7 distinct
-  # client IDs per TWS session. Phase 1 uses 1 (services/execution).
-  # Reserve 2-7 for future expansion (multi-strategy or read-only telemetry
-  # clients).
-  client_id: 1
+
+# Crypto-pivot C0-B2b (delta spec §3.1): CDP API key for the
+# authenticated Coinbase Advanced Trade surface (orders, fills,
+# positions, futures balance summary). Created in the CDP portal
+# (portal.cdp.coinbase.com → API keys → trade permission). The
+# private key is the ES256 EC key PEM the portal issues — paste it
+# as a quoted multi-line string. Mapped to API_COINBASE_API_KEY_NAME /
+# API_COINBASE_API_PRIVATE_KEY by services/api/entrypoint.py. The
+# public market-data worker (§3.2) needs NO key.
+coinbase:
+  api_key_name: <TODO_FROM_C0_COINBASE_KEY_CEREMONY>   # organizations/{org}/apiKeys/{key}
+  api_private_key: <TODO_FROM_C0_COINBASE_KEY_CEREMONY>  # EC PRIVATE KEY PEM
 
 anthropic:
   api_key: <TODO_FROM_WEEK_5_AGENT_BRINGUP>
