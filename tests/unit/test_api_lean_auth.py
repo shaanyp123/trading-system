@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import AsyncIterator
+from typing import Any
 
 import pytest
 import pytest_asyncio
@@ -554,6 +555,17 @@ class TestModuleContract:
 
     def test_lean_route_registered_in_app(self, monkeypatch: pytest.MonkeyPatch) -> None:
         app = _build_app(monkeypatch)
-        # Find the route path on the app's router.
-        paths = {r.path for r in app.routes if hasattr(r, "path")}  # type: ignore[attr-defined]
+        # Find the route path on the app's router. Starlette >= 1.3 nests
+        # included routers (`_IncludedRouter`, exposing the underlying router
+        # as .original_router, no .path) instead of flattening them into
+        # app.routes, so walk the tree rather than one level.
+        paths: set[str] = set()
+        stack: list[Any] = list(app.routes)
+        while stack:
+            r = stack.pop()
+            inner = getattr(r, "original_router", r)
+            stack.extend(getattr(inner, "routes", []))
+            path = getattr(r, "path", None)
+            if path is not None:
+                paths.add(path)
         assert _LEAN_PATH in paths
