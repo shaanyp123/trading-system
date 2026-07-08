@@ -5,7 +5,7 @@
 # §8.11 (non-root user, --no-cache pip, minimal apt surface).
 #
 # Build context is the repo root so the builder can `pip install -e .`
-# against pyproject.toml + the services/, infrastructure/, strategies/,
+# against pyproject.toml + the services/, infrastructure/,
 # alembic/ trees.
 #
 #   docker build -f services/api/Dockerfile -t local/trading-api:dev .
@@ -33,7 +33,6 @@ WORKDIR /build
 COPY pyproject.toml README.md ./
 COPY services/__init__.py services/
 COPY infrastructure/__init__.py infrastructure/
-COPY strategies/__init__.py strategies/
 
 # Pre-resolve runtime deps into the venv.
 #
@@ -86,7 +85,6 @@ RUN python -m venv /opt/venv \
 # Layer 2: copy the rest of the source tree we actually run.
 COPY services/ services/
 COPY infrastructure/ infrastructure/
-COPY strategies/ strategies/
 COPY alembic/ alembic/
 COPY alembic.ini ./
 # scripts/operator_tools/** ships in the image so operator recovery tooling
@@ -128,7 +126,6 @@ WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /build/services /app/services
 COPY --from=builder /build/infrastructure /app/infrastructure
-COPY --from=builder /build/strategies /app/strategies
 COPY --from=builder /build/alembic /app/alembic
 COPY --from=builder /build/alembic.ini /app/alembic.ini
 COPY --from=builder /build/scripts /app/scripts

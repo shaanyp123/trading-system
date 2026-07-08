@@ -1,6 +1,0 @@
-{
-  "environment": "backtesting",
-  "algorithm-type-name": "DonchianReferenceAlgorithm",
-  "data-folder": "/Lean/Data/",
-  "$note": "A LEAN config side-file — no result signature, so the parser skips it."
-}

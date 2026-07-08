@@ -118,31 +118,10 @@ class DecisionDiaryEntry(BaseModel):
     reasoning_text: str = Field(min_length=10, max_length=2000)
 
 
-class SignalApproveRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    override_size: int | None = None
-
-
-class SignalRejectRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    decision_diary_entry: DecisionDiaryEntry
-
-
-class SignalDeferRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    decision_diary_entry: DecisionDiaryEntry
-
-
 __all__ = [
     "DecisionDiaryEntry",
     "SignalAnomalyReason",
-    "SignalApproveRequest",
-    "SignalDeferRequest",
     "SignalListResponse",
-    "SignalRejectRequest",
     "SignalStatus",
     "SignalSummary",
 ]

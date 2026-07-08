@@ -45,7 +45,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
-from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 import pytest
@@ -489,26 +488,20 @@ class TestSessionStubCsrfBootstrap:
         assert csrf_cookie_value is not None, (
             "Stub did not bootstrap a CSRF cookie on the GET response"
         )
-        # Wire a no-account stub repo so the handler bails at 409 instead of
-        # touching DB-backed code paths.
-        repo = _StubRepo(account_id=None)
-        _bind_repo(override_dep, signals_route, repo)
+        # Crypto-pivot C0-B4: the /approve canary endpoint was retired
+        # (announce-only). The CSRF double-submit gate runs in middleware
+        # BEFORE routing, so a POST to a now-nonexistent path still proves
+        # the gate: 403 CSRF_REJECTED means the gate blocked; 404 means the
+        # gate passed and FastAPI's router answered.
         follow_up = await api_client.post(
             f"/api/signals/{uuid4()}/approve",
             json={"override_size": 1},
             cookies={"__Host-csrf_token": csrf_cookie_value},
             headers={"X-CSRF-Token": csrf_cookie_value},
         )
-        # Specific assertion: the request passed CSRF and reached the route
-        # handler. The handler then returns 409 NO_ACTIVE_ACCOUNT per the
-        # stub repo's account_id=None.
-        assert follow_up.status_code == 409, (
-            f"Expected 409 (NO_ACTIVE_ACCOUNT) after CSRF passed; "
+        assert follow_up.status_code == 404, (
+            f"Expected 404 (route retired, CSRF passed); "
             f"got status={follow_up.status_code} body={follow_up.text!r}"
-        )
-        body = follow_up.json()
-        assert body["error_code"] == "NO_ACTIVE_ACCOUNT", (
-            f"Expected NO_ACTIVE_ACCOUNT after CSRF passed; got {body!r}"
         )
 
 
@@ -725,454 +718,6 @@ class TestListSignals:
             "vol_regime_z_high",
             "slippage_outlier_recent",
         ]
-
-
-class TestSignalApprove:
-    """Pivot-PR-D (post-pivot 2026-05-12): the 501 stub is replaced by a real
-    dispatcher call. Tests now verify the no-account branch returns 409
-    NO_ACTIVE_ACCOUNT — exercising the dispatcher's full path requires a real
-    DB (covered separately by ``test_risk_signal_dispatch.py``).
-    """
-
-    @pytest.mark.asyncio
-    async def test_no_account_returns_409(
-        self,
-        api_client: AsyncClient,
-        override_dep: Any,
-    ) -> None:
-        repo = _StubRepo(account_id=None)
-        _bind_repo(override_dep, signals_route, repo)
-        signal_id = uuid4()
-        response = await api_client.post(
-            f"/api/signals/{signal_id}/approve",
-            json={"override_size": 3},
-            **_csrf_kwargs(),
-        )
-        assert response.status_code == 409
-        body = response.json()
-        assert body["error_code"] == "NO_ACTIVE_ACCOUNT"
-
-    @pytest.mark.asyncio
-    async def test_unknown_field_rejected_with_validation_error(
-        self,
-        api_client: AsyncClient,
-        override_dep: Any,
-    ) -> None:
-        repo = _StubRepo(account_id=None)
-        _bind_repo(override_dep, signals_route, repo)
-        signal_id = uuid4()
-        response = await api_client.post(
-            f"/api/signals/{signal_id}/approve",
-            json={"override_size": 3, "extra": "nope"},
-            **_csrf_kwargs(),
-        )
-        assert response.status_code == 422
-        body = response.json()
-        assert body["error_code"] == "VALIDATION_ERROR"
-
-
-class TestSignalReject:
-    @pytest.mark.asyncio
-    async def test_with_diary_entry_no_account_returns_409(
-        self,
-        api_client: AsyncClient,
-        override_dep: Any,
-    ) -> None:
-        repo = _StubRepo(account_id=None)
-        _bind_repo(override_dep, signals_route, repo)
-        signal_id = uuid4()
-        response = await api_client.post(
-            f"/api/signals/{signal_id}/reject",
-            json={
-                "decision_diary_entry": {
-                    "tag": "data_concern",
-                    "reasoning_text": "vol regime is elevated above z=2 threshold",
-                },
-            },
-            **_csrf_kwargs(),
-        )
-        assert response.status_code == 409
-        assert response.json()["error_code"] == "NO_ACTIVE_ACCOUNT"
-
-    @pytest.mark.asyncio
-    async def test_missing_diary_entry_returns_422(
-        self,
-        api_client: AsyncClient,
-        override_dep: Any,
-    ) -> None:
-        repo = _StubRepo(account_id=None)
-        _bind_repo(override_dep, signals_route, repo)
-        signal_id = uuid4()
-        response = await api_client.post(
-            f"/api/signals/{signal_id}/reject",
-            json={},
-            **_csrf_kwargs(),
-        )
-        assert response.status_code == 422
-
-
-class TestSignalDefer:
-    @pytest.mark.asyncio
-    async def test_with_diary_entry_no_account_returns_409(
-        self,
-        api_client: AsyncClient,
-        override_dep: Any,
-    ) -> None:
-        repo = _StubRepo(account_id=None)
-        _bind_repo(override_dep, signals_route, repo)
-        signal_id = uuid4()
-        response = await api_client.post(
-            f"/api/signals/{signal_id}/defer",
-            json={
-                "decision_diary_entry": {
-                    "tag": "manual_judgment",
-                    "reasoning_text": "want to wait for FOMC tomorrow before adding risk",
-                },
-            },
-            **_csrf_kwargs(),
-        )
-        assert response.status_code == 409
-        assert response.json()["error_code"] == "NO_ACTIVE_ACCOUNT"
-
-
-class TestSignalDecisionSSEEmit:
-    """Verify approve/reject/defer fire a `signal` SSE event on success.
-
-    The dispatcher is monkeypatched (it requires a real Postgres session
-    to walk the audit-first flow); we exercise only the route handler's
-    SSE emission path with a captured fake.
-    """
-
-    @pytest.mark.asyncio
-    async def test_approve_emits_signal_sse_on_success(
-        self,
-        api_client: AsyncClient,
-        override_dep: Any,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        account_id = uuid4()
-        signal_id = uuid4()
-        audit_uuid = uuid4()
-        repo = _StubRepo(
-            account_id=account_id,
-            signal_summary={
-                "market": "/MES",
-                "direction": "long",
-                "target_contracts": 1,
-                "decision_price": Decimal("5250.00"),
-                "strategy_hash": "0" * 40,
-                "parameter_set_hash": "0" * 64,
-                "emitted_at_utc": datetime.now(tz=UTC),
-                "env": "paper",
-                "status": "pending",
-            },
-        )
-        _bind_repo(override_dep, signals_route, repo)
-
-        captured_emits: list[tuple[str, dict[str, Any]]] = []
-
-        async def fake_emit_sse(event_type: str, data: dict[str, Any]) -> int:
-            captured_emits.append((event_type, data))
-            return 99
-
-        async def fake_apply(plan: Any, **_: Any) -> Any:
-            from services.risk.signal_dispatch import SignalDispatchResult
-
-            return SignalDispatchResult(
-                signal_id=plan.signal_id,
-                action=plan.action,
-                new_status=plan.new_status,
-                audit_event_uuid=audit_uuid,
-                audit_sequence_no=42,
-            )
-
-        monkeypatch.setattr(signals_route, "emit_sse", fake_emit_sse)
-        from services.api import db as api_db_module
-        from services.risk import signal_dispatch as sd_module
-
-        monkeypatch.setattr(sd_module, "apply_signal_dispatch", fake_apply)
-        monkeypatch.setattr(api_db_module, "get_session_factory", lambda: object())
-        # PR-H: approve_signal reads risk_state before dispatch. Stub
-        # the helper to return NORMAL so the gate passes; reject/defer
-        # tests below don't exercise this path (the route only calls
-        # fetch_current_risk_state on approve), but patching is a
-        # no-op for those + keeps the fixture symmetric.
-        monkeypatch.setattr(sd_module, "fetch_current_risk_state", AsyncMock(return_value="NORMAL"))
-
-        response = await api_client.post(
-            f"/api/signals/{signal_id}/approve",
-            json={"override_size": 1},
-            **_csrf_kwargs(),
-        )
-        assert response.status_code == 200, response.text
-        assert len(captured_emits) == 1
-        event_type, data = captured_emits[0]
-        assert event_type == "signal"
-        assert data["action"] == "approved"
-        assert data["signal_id"] == str(signal_id)
-        assert data["market"] == "/MES"
-        assert data["direction"] == "long"
-        assert data["decided_by_user_id"] == "phase0-stub-owner"
-        assert data["audit_event_uuid"] == str(audit_uuid)
-        assert "diary_reasoning_text" not in data
-        assert repo.last_signal_summary_args == (account_id, signal_id)
-
-    @pytest.mark.asyncio
-    async def test_reject_emits_signal_sse_with_diary_reasoning(
-        self,
-        api_client: AsyncClient,
-        override_dep: Any,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        account_id = uuid4()
-        signal_id = uuid4()
-        audit_uuid = uuid4()
-        repo = _StubRepo(
-            account_id=account_id,
-            signal_summary={
-                "market": "/MNQ",
-                "direction": "short",
-                "target_contracts": 1,
-                "decision_price": Decimal("18250.00"),
-                "strategy_hash": "0" * 40,
-                "parameter_set_hash": "0" * 64,
-                "emitted_at_utc": datetime.now(tz=UTC),
-                "env": "paper",
-                "status": "pending",
-            },
-        )
-        _bind_repo(override_dep, signals_route, repo)
-
-        captured_emits: list[tuple[str, dict[str, Any]]] = []
-
-        async def fake_emit_sse(event_type: str, data: dict[str, Any]) -> int:
-            captured_emits.append((event_type, data))
-            return 100
-
-        async def fake_apply(plan: Any, **_: Any) -> Any:
-            from services.risk.signal_dispatch import SignalDispatchResult
-
-            return SignalDispatchResult(
-                signal_id=plan.signal_id,
-                action=plan.action,
-                new_status=plan.new_status,
-                audit_event_uuid=audit_uuid,
-                audit_sequence_no=43,
-            )
-
-        monkeypatch.setattr(signals_route, "emit_sse", fake_emit_sse)
-        from services.api import db as api_db_module
-        from services.risk import signal_dispatch as sd_module
-
-        monkeypatch.setattr(sd_module, "apply_signal_dispatch", fake_apply)
-        monkeypatch.setattr(api_db_module, "get_session_factory", lambda: object())
-        # PR-H: approve_signal reads risk_state before dispatch. Stub
-        # the helper to return NORMAL so the gate passes; reject/defer
-        # tests below don't exercise this path (the route only calls
-        # fetch_current_risk_state on approve), but patching is a
-        # no-op for those + keeps the fixture symmetric.
-        monkeypatch.setattr(sd_module, "fetch_current_risk_state", AsyncMock(return_value="NORMAL"))
-
-        response = await api_client.post(
-            f"/api/signals/{signal_id}/reject",
-            json={
-                "decision_diary_entry": {
-                    "tag": "regime_concern",
-                    "reasoning_text": "vol regime elevated above z=2; defer entry",
-                },
-            },
-            **_csrf_kwargs(),
-        )
-        assert response.status_code == 200, response.text
-        assert len(captured_emits) == 1
-        _, data = captured_emits[0]
-        assert data["action"] == "rejected"
-        assert data["market"] == "/MNQ"
-        assert data["direction"] == "short"
-        assert data["diary_reasoning_text"] == "vol regime elevated above z=2; defer entry"
-
-    @pytest.mark.asyncio
-    async def test_defer_emits_signal_sse_with_action_deferred(
-        self,
-        api_client: AsyncClient,
-        override_dep: Any,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        account_id = uuid4()
-        signal_id = uuid4()
-        repo = _StubRepo(
-            account_id=account_id,
-            signal_summary={
-                "market": "TLT",
-                "direction": "long",
-                "target_contracts": 1,
-                "decision_price": Decimal("92.50"),
-                "strategy_hash": "0" * 40,
-                "parameter_set_hash": "0" * 64,
-                "emitted_at_utc": datetime.now(tz=UTC),
-                "env": "paper",
-                "status": "pending",
-            },
-        )
-        _bind_repo(override_dep, signals_route, repo)
-        captured_emits: list[tuple[str, dict[str, Any]]] = []
-
-        async def fake_emit_sse(event_type: str, data: dict[str, Any]) -> int:
-            captured_emits.append((event_type, data))
-            return 101
-
-        async def fake_apply(plan: Any, **_: Any) -> Any:
-            from services.risk.signal_dispatch import SignalDispatchResult
-
-            return SignalDispatchResult(
-                signal_id=plan.signal_id,
-                action=plan.action,
-                new_status=plan.new_status,
-                audit_event_uuid=uuid4(),
-                audit_sequence_no=44,
-            )
-
-        monkeypatch.setattr(signals_route, "emit_sse", fake_emit_sse)
-        from services.api import db as api_db_module
-        from services.risk import signal_dispatch as sd_module
-
-        monkeypatch.setattr(sd_module, "apply_signal_dispatch", fake_apply)
-        monkeypatch.setattr(api_db_module, "get_session_factory", lambda: object())
-        # PR-H: approve_signal reads risk_state before dispatch. Stub
-        # the helper to return NORMAL so the gate passes; reject/defer
-        # tests below don't exercise this path (the route only calls
-        # fetch_current_risk_state on approve), but patching is a
-        # no-op for those + keeps the fixture symmetric.
-        monkeypatch.setattr(sd_module, "fetch_current_risk_state", AsyncMock(return_value="NORMAL"))
-
-        response = await api_client.post(
-            f"/api/signals/{signal_id}/defer",
-            json={
-                "decision_diary_entry": {
-                    "tag": "manual_judgment",
-                    "reasoning_text": "waiting for FOMC tomorrow",
-                },
-            },
-            **_csrf_kwargs(),
-        )
-        assert response.status_code == 200, response.text
-        assert len(captured_emits) == 1
-        _, data = captured_emits[0]
-        assert data["action"] == "deferred"
-        assert data["market"] == "TLT"
-
-    @pytest.mark.asyncio
-    async def test_approve_emit_failure_does_not_fail_request(
-        self,
-        api_client: AsyncClient,
-        override_dep: Any,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """If emit_sse raises, the request still returns 200; audit + signal row are durable."""
-        account_id = uuid4()
-        signal_id = uuid4()
-        repo = _StubRepo(
-            account_id=account_id,
-            signal_summary={
-                "market": "/MES",
-                "direction": "long",
-                "target_contracts": 1,
-                "decision_price": Decimal("5250.00"),
-                "strategy_hash": "0" * 40,
-                "parameter_set_hash": "0" * 64,
-                "emitted_at_utc": datetime.now(tz=UTC),
-                "env": "paper",
-                "status": "pending",
-            },
-        )
-        _bind_repo(override_dep, signals_route, repo)
-
-        async def boom(_event_type: str, _data: dict[str, Any]) -> int:
-            raise RuntimeError("SSE multiplexer crashed")
-
-        async def fake_apply(plan: Any, **_: Any) -> Any:
-            from services.risk.signal_dispatch import SignalDispatchResult
-
-            return SignalDispatchResult(
-                signal_id=plan.signal_id,
-                action=plan.action,
-                new_status=plan.new_status,
-                audit_event_uuid=uuid4(),
-                audit_sequence_no=45,
-            )
-
-        monkeypatch.setattr(signals_route, "emit_sse", boom)
-        from services.api import db as api_db_module
-        from services.risk import signal_dispatch as sd_module
-
-        monkeypatch.setattr(sd_module, "apply_signal_dispatch", fake_apply)
-        monkeypatch.setattr(api_db_module, "get_session_factory", lambda: object())
-        # PR-H: approve_signal reads risk_state before dispatch. Stub
-        # the helper to return NORMAL so the gate passes; reject/defer
-        # tests below don't exercise this path (the route only calls
-        # fetch_current_risk_state on approve), but patching is a
-        # no-op for those + keeps the fixture symmetric.
-        monkeypatch.setattr(sd_module, "fetch_current_risk_state", AsyncMock(return_value="NORMAL"))
-
-        response = await api_client.post(
-            f"/api/signals/{signal_id}/approve",
-            json={"override_size": 1},
-            **_csrf_kwargs(),
-        )
-        # Audit + signal-row write succeeded; SSE failure is logged but
-        # doesn't propagate.
-        assert response.status_code == 200, response.text
-
-    @pytest.mark.asyncio
-    async def test_approve_no_summary_skips_emit_without_crash(
-        self,
-        api_client: AsyncClient,
-        override_dep: Any,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """If fetch_signal_summary returns None, the SSE emit is skipped."""
-        account_id = uuid4()
-        signal_id = uuid4()
-        repo = _StubRepo(account_id=account_id, signal_summary=None)
-        _bind_repo(override_dep, signals_route, repo)
-        captured_emits: list[tuple[str, dict[str, Any]]] = []
-
-        async def fake_emit_sse(event_type: str, data: dict[str, Any]) -> int:
-            captured_emits.append((event_type, data))
-            return 99
-
-        async def fake_apply(plan: Any, **_: Any) -> Any:
-            from services.risk.signal_dispatch import SignalDispatchResult
-
-            return SignalDispatchResult(
-                signal_id=plan.signal_id,
-                action=plan.action,
-                new_status=plan.new_status,
-                audit_event_uuid=uuid4(),
-                audit_sequence_no=46,
-            )
-
-        monkeypatch.setattr(signals_route, "emit_sse", fake_emit_sse)
-        from services.api import db as api_db_module
-        from services.risk import signal_dispatch as sd_module
-
-        monkeypatch.setattr(sd_module, "apply_signal_dispatch", fake_apply)
-        monkeypatch.setattr(api_db_module, "get_session_factory", lambda: object())
-        # PR-H: approve_signal reads risk_state before dispatch. Stub
-        # the helper to return NORMAL so the gate passes; reject/defer
-        # tests below don't exercise this path (the route only calls
-        # fetch_current_risk_state on approve), but patching is a
-        # no-op for those + keeps the fixture symmetric.
-        monkeypatch.setattr(sd_module, "fetch_current_risk_state", AsyncMock(return_value="NORMAL"))
-
-        response = await api_client.post(
-            f"/api/signals/{signal_id}/approve",
-            json={"override_size": 1},
-            **_csrf_kwargs(),
-        )
-        assert response.status_code == 200
-        # No emit because summary was None.
-        assert captured_emits == []
 
 
 # ---------------------------------------------------------------------------
@@ -1931,43 +1476,44 @@ class TestTodayDigestExposureBreakdown:
         api_client: AsyncClient,
         override_dep: Any,
     ) -> None:
-        """Three-position mix exercises long futures (/M2K), short futures
-        (/MGC short), and ETF long (TLT). Verifies cluster bucketing,
-        gross sum, and signed net sum."""
+        """Crypto-pivot C0-B4: the two-asset crypto book buckets into the
+        `crypto` cluster (contract notionals at multiplier 1 until the
+        product-metadata mark source wires in C1); a leftover CME market
+        exercises the unknown-market fallback (equity_index / x1)."""
         account_id = uuid4()
-        now = datetime(2026, 5, 27, 13, 31, tzinfo=UTC)
+        now = datetime(2026, 7, 9, 13, 31, tzinfo=UTC)
         positions_rows = [
-            # /M2K LONG: 1 contract * $2925 * $5/pt = $14,625 notional, equity_index
+            # BTC LONG: 1 x $50,000 x 1 = $50,000 notional, crypto
+            {
+                "id": uuid4(),
+                "market": "BTC",
+                "contract_id": uuid4(),
+                "quantity": 1,
+                "avg_cost": Decimal("50000.00"),
+                "margin_held": Decimal("500"),
+                "unrealized_pnl": None,
+                "last_mark_ts": now,
+                "managed_by_version": "a" * 40,
+            },
+            # ETH SHORT: -5 x $3,000 x 1 = $15,000 notional, crypto
+            {
+                "id": uuid4(),
+                "market": "ETH",
+                "contract_id": uuid4(),
+                "quantity": -5,
+                "avg_cost": Decimal("3000.00"),
+                "margin_held": Decimal("500"),
+                "unrealized_pnl": None,
+                "last_mark_ts": now,
+                "managed_by_version": "a" * 40,
+            },
+            # unknown market (historical CME row) → equity_index/x1 fallback
             {
                 "id": uuid4(),
                 "market": "/M2K",
                 "contract_id": uuid4(),
                 "quantity": 1,
-                "avg_cost": Decimal("2925.00"),
-                "margin_held": Decimal("500"),
-                "unrealized_pnl": None,
-                "last_mark_ts": now,
-                "managed_by_version": "a" * 40,
-            },
-            # /MGC SHORT: -1 contract * $2400 * $10/pt = $24,000 notional, commodity
-            {
-                "id": uuid4(),
-                "market": "/MGC",
-                "contract_id": uuid4(),
-                "quantity": -1,
-                "avg_cost": Decimal("2400.00"),
-                "margin_held": Decimal("500"),
-                "unrealized_pnl": None,
-                "last_mark_ts": now,
-                "managed_by_version": "a" * 40,
-            },
-            # TLT LONG: 100 shares * $83.72 * 1 = $8,372 notional, rates_bonds
-            {
-                "id": uuid4(),
-                "market": "TLT",
-                "contract_id": None,
-                "quantity": 100,
-                "avg_cost": Decimal("83.72"),
+                "avg_cost": Decimal("3000.00"),
                 "margin_held": Decimal("0"),
                 "unrealized_pnl": None,
                 "last_mark_ts": now,
@@ -1984,18 +1530,17 @@ class TestTodayDigestExposureBreakdown:
         assert response.status_code == 200
         body = response.json()
         by_cluster = body["exposure"]["by_cluster"]
-        # /M2K: 14625 / 100000 * 100 = 14.625 → 14.62 (ROUND_HALF_EVEN on .X25)
-        assert Decimal(by_cluster["equity_index"]) == Decimal("14.62")
-        # /MGC abs: 24000 / 100000 * 100 = 24.00
-        assert Decimal(by_cluster["commodity"]) == Decimal("24.00")
-        # TLT: 8372 / 100000 * 100 = 8.372 → 8.37
-        assert Decimal(by_cluster["rates_bonds"]) == Decimal("8.37")
-        assert Decimal(by_cluster["crypto"]) == Decimal("0")
+        # crypto: (50000 + 15000) / 100000 * 100 = 65.00
+        assert Decimal(by_cluster["crypto"]) == Decimal("65.00")
+        # fallback CME row: 3000 / 100000 * 100 = 3.00 into equity_index
+        assert Decimal(by_cluster["equity_index"]) == Decimal("3.00")
+        assert Decimal(by_cluster["commodity"]) == Decimal("0")
+        assert Decimal(by_cluster["rates_bonds"]) == Decimal("0")
         assert Decimal(by_cluster["fx"]) == Decimal("0")
-        # Gross = sum of absolute notionals / NAV * 100 = 46997 / 100000 * 100 = 46.997 → 47.00
-        assert Decimal(body["exposure"]["gross_exposure_pct_nav"]) == Decimal("47.00")
-        # Net = signed sum / NAV * 100 = (14625 - 24000 + 8372) / 100000 * 100 = -1.003 → -1.00
-        assert Decimal(body["exposure"]["net_exposure_pct_nav"]) == Decimal("-1.00")
+        # Gross = (50000 + 15000 + 3000) / 100000 * 100 = 68.00
+        assert Decimal(body["exposure"]["gross_exposure_pct_nav"]) == Decimal("68.00")
+        # Net = (50000 - 15000 + 3000) / 100000 * 100 = 38.00
+        assert Decimal(body["exposure"]["net_exposure_pct_nav"]) == Decimal("38.00")
 
     @pytest.mark.asyncio
     async def test_zero_nav_returns_all_zero_exposure(

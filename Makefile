@@ -1,4 +1,4 @@
-.PHONY: help install lint format typecheck test test-unit test-integration test-golden dep-drift-check frontend-test research ci all clean
+.PHONY: help install lint format typecheck test test-unit test-integration test-golden dep-drift-check frontend-test ci all clean
 
 PYTHON ?= python3
 PIP ?= $(PYTHON) -m pip
@@ -9,8 +9,7 @@ help:
 	@echo "  make install       — install Python deps (incl. dev) into current venv"
 	@echo "  make lint          — ruff format --check + ruff check"
 	@echo "  make format        — ruff format (writes changes)"
-	@echo "  make typecheck     — mypy --strict on services + infrastructure + strategies + research"
-	@echo "  make research RUN=<cfg> — run a futures research config → research/runs/<ts>/report.html"
+	@echo "  make typecheck     — mypy --strict on services + infrastructure + scripts + research"
 	@echo "  make test          — pytest with coverage"
 	@echo "  make test-unit     — pytest tests/unit only"
 	@echo "  make dep-drift-check — diff pyproject runtime deps vs api Dockerfile pip-install list"
@@ -30,7 +29,7 @@ format:
 	$(PYTHON) -m ruff check --fix .
 
 typecheck:
-	$(PYTHON) -m mypy services infrastructure strategies scripts research
+	$(PYTHON) -m mypy services infrastructure scripts research
 
 test:
 	$(PYTHON) -m pytest
@@ -54,11 +53,10 @@ dep-drift-check:
 frontend-test:
 	cd apps/web && $(PNPM) typecheck && $(PNPM) lint && $(PNPM) build
 
-# Futures research harness (Docs/futures-backtester-design.md). Runs one config
-# through the daily spine → research/runs/<ts>/report.html. Usage:
-#   make research RUN=research/config/examples/p1_buy_and_hold.yaml
-research:
-	$(PYTHON) -m research.run --config $(RUN)
+# Crypto-pivot C0-B4: the CME futures research harness (make research)
+# was retired with research/lean + the v1 package. Crypto research runs
+# directly: python3 research/crypto_perps/backtest.py
+
 
 ci: lint dep-drift-check typecheck test frontend-test
 

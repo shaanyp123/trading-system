@@ -23,7 +23,7 @@ Valid transitions (backend-spec §2.4.3 mermaid diagram):
     NORMAL       -> HALT_NEW       (any trigger; severity per trigger taxonomy)
     HALT_NEW     -> CONVALESCENT   (human resume; re-auth web-only)
     CONVALESCENT -> HALT_NEW       (any trigger; counter resets to 0)
-    CONVALESCENT -> NORMAL         (after EXACTLY 5 clean CME sessions)
+    CONVALESCENT -> NORMAL         (after EXACTLY 5 clean UTC calendar days)
 
 Invalid transitions (raise ``IllegalTransitionError``):
     NORMAL       -> CONVALESCENT       (must go through HALT_NEW)
@@ -43,7 +43,9 @@ Severity rules:
   decommission floor.
 
 CONVALESCENT counter rules:
-- Increments at each CME session close while in CONVALESCENT.
+- Increments once per clean UTC calendar day while in CONVALESCENT
+  (crypto-pivot C0-B4: was "at each CME session close"; the daily
+  00:15 UTC recon cycle is the tick source).
 - Reaches 5 -> transition CONVALESCENT -> NORMAL (audit:
   ``state_transition_convalescent_to_normal``).
 - Any new trigger while in CONVALESCENT -> transition CONVALESCENT -> HALT_NEW;
@@ -55,7 +57,7 @@ Tests in ``tests/unit/test_state_machine.py`` cover the §10.1 inventory:
 - NORMAL -> HALT_NEW (each trigger x each severity)
 - HALT_NEW -> CONVALESCENT (routine resume)
 - HALT_NEW -> CONVALESCENT (incident_review resume requires ``incident_review_id``)
-- CONVALESCENT -> NORMAL after EXACTLY 5 sessions (4 doesn't graduate; 5 does)
+- CONVALESCENT -> NORMAL after EXACTLY 5 clean UTC days (4 doesn't graduate; 5 does)
 - CONVALESCENT -> HALT_NEW resets counter to 0
 - Invalid transitions raise ``IllegalTransitionError``
 """
@@ -142,8 +144,12 @@ TRIGGER_SEVERITY: Final[dict[TransitionTrigger, HaltSeverity]] = {
 }
 
 
-#: CONVALESCENT graduates to NORMAL after exactly this many clean sessions
-#: (backend-spec §2.4.3, "5 CME sessions without breach").
+#: CONVALESCENT graduates to NORMAL after exactly this many clean UTC
+#: calendar days (crypto-pivot C0-B4, delta spec §3.4: the pre-pivot
+#: criterion was "5 clean CME sessions" per backend-spec §2.4.3 — crypto
+#: trades 24/7 with no sessions, so the daily 00:15 UTC recon cycle's
+#: session-close call now marks one clean UTC day). Counter/reset
+#: machinery unchanged; only the calendar the caller ticks on changed.
 CONVALESCENT_SESSIONS_TO_NORMAL: Final[int] = 5
 
 
@@ -383,7 +389,7 @@ def plan_resume_from_halt(
 
 
 # ---------------------------------------------------------------------------
-# Plan: CME session close — increment CONVALESCENT counter, maybe graduate
+# Plan: clean-UTC-day close — increment CONVALESCENT counter, maybe graduate
 # ---------------------------------------------------------------------------
 
 
@@ -393,7 +399,13 @@ def plan_session_close(
     convalescent_counter: int,
     timestamp_utc: str,
 ) -> StateTransitionPlan | None:
-    """Plan the per-session-close counter update.
+    """Plan the per-clean-UTC-day counter update.
+
+    Crypto-pivot C0-B4 (delta spec §3.4): "session" now means one UTC
+    calendar day — crypto trades 24/7, so the daily 00:15 UTC recon
+    cycle is the tick source (was: CME session close). The function
+    name is kept for the callers/tests; the semantics are the calendar
+    the caller ticks on.
 
     - NORMAL: no-op (returns None).
     - HALT_NEW: no-op (counter doesn't tick during halt; returns None).

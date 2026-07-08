@@ -6,7 +6,7 @@ allowed-tools: [Bash, Read]
 
 # System health check
 
-Generates the paste-ready SSH ceremony for a fast "is everything OK right now?" snapshot. Output covers: container state, last operational cycles (bar_sync, LEAN, recon), risk state, audit chain tail, IBKR connection status.
+Generates the paste-ready SSH ceremony for a fast "is everything OK right now?" snapshot. Output covers: container state, last operational cycles (Coinbase market-data worker, recon), risk state, audit chain tail. (Crypto-pivot C0-B4: bar_sync/LEAN/IBKR sections retired with the CME stack.)
 
 The actual checks run on the VPS. Claude Code locally can't reach the postgres DB or docker without SSH. This command codifies the canonical commands per the dev-guide § so the operator doesn't have to remember them or grep runbooks.
 
@@ -26,30 +26,17 @@ cd /opt/trading
 ```bash
 docker compose ps
 # Expected: all of api, postgres, caddy, nextjs, webhook_pusher,
-#           discord_bot, ib_gateway, lean_local, autoheal showing
+#           discord_bot showing
 #           (Up + healthy). Any "(unhealthy)" or "Exit N" warrants
 #           inspection.
 ```
 
-### Last bar_sync cycle (today)
+### Coinbase market-data worker (today)
 
 ```bash
-docker compose logs api --since 24h | grep -E "bar_sync_cycle_(firing|completed)" | tail -4
-# Expected (around 21:00 UTC daily):
-#   bar_sync_cycle_firing session_date=YYYY-MM-DD
-#   bar_sync_cycle_completed failed_markets=[]
-# `failed_markets=[]` is the healthy case. Sentinel substitution for
-# /MCL is normal (it's V1_SIDELINED — see memory project_sidelined_markets).
-```
-
-### Last LEAN signal cycle (today)
-
-```bash
-docker compose logs lean_local --since 24h | grep "v1_signals_generated" | tail -2
-# Expected (around 21:30 UTC daily):
-#   v1_signals_generated session_date=YYYY-MM-DD signals_emitted_count=N
-# Count > 0 = strategy active; count = 0 = no signal trigger today (normal
-# if no markets crossed thresholds).
+docker compose logs api --since 24h | grep -E "coinbase_(ws_connected|funding_snapshot_completed|metadata_snapshot_completed|marks_stale)" | tail -6
+# expect: coinbase_ws_connected + one funding_snapshot_completed per hour
+#         + one metadata_snapshot_completed after 00:00 UTC; NO marks_stale
 ```
 
 ### Last EOD reconciliation (today)

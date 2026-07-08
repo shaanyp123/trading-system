@@ -1,7 +1,9 @@
 """services/risk package — risk engine.
 
 Re-exports the canonical sizing pipeline + types so consumers can import from
-``services.risk`` instead of reaching into submodules.
+``services.risk`` instead of reaching into submodules. (Crypto-pivot C0-B4:
+the V1-era ``ContractMetadata``/``PendingAuditEvent`` exports died with the
+CME Stages 0-5 pipeline; the crypto pipeline's types replace them.)
 """
 
 from services.risk.dispatch import (
@@ -9,8 +11,7 @@ from services.risk.dispatch import (
     apply_state_transition,
 )
 from services.risk.sizing import (
-    ContractMetadata,
-    PendingAuditEvent,
+    CryptoProductSpec,
     SizingError,
     SizingInputs,
     SizingResult,
@@ -19,8 +20,7 @@ from services.risk.sizing import (
 
 __all__ = [
     "AppliedStateTransition",
-    "ContractMetadata",
-    "PendingAuditEvent",
+    "CryptoProductSpec",
     "SizingError",
     "SizingInputs",
     "SizingResult",

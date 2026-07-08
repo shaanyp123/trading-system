@@ -55,25 +55,24 @@ class MarketExposureMeta:
     multiplier: Decimal
 
 
-#: Locked V1 universe → exposure metadata. Keys mirror
-#: ``strategies.v1_trend_following.parameters.V1_CANDIDATE_UNIVERSE`` plus
-#: the sidelined ``/MCL`` (preserved for re-enable per
-#: ``V1_SIDELINED_MARKETS``).
-V1_EXPOSURE_METADATA: Final[dict[str, MarketExposureMeta]] = {
-    # CME / CBOT / COMEX micro futures
-    "/MES": MarketExposureMeta(cluster="equity_index", multiplier=Decimal("5")),
-    "/MNQ": MarketExposureMeta(cluster="equity_index", multiplier=Decimal("2")),
-    "/MYM": MarketExposureMeta(cluster="equity_index", multiplier=Decimal("0.50")),
-    "/M2K": MarketExposureMeta(cluster="equity_index", multiplier=Decimal("5")),
-    "/MGC": MarketExposureMeta(cluster="commodity", multiplier=Decimal("10")),
-    "/MCL": MarketExposureMeta(cluster="commodity", multiplier=Decimal("100")),
-    "/MBT": MarketExposureMeta(cluster="crypto", multiplier=Decimal("0.1")),
-    # NYSE bond ETFs — duration spectrum
-    "TLT": MarketExposureMeta(cluster="rates_bonds", multiplier=Decimal("1")),
-    "IEF": MarketExposureMeta(cluster="rates_bonds", multiplier=Decimal("1")),
-    "SHY": MarketExposureMeta(cluster="rates_bonds", multiplier=Decimal("1")),
-    "TIP": MarketExposureMeta(cluster="rates_bonds", multiplier=Decimal("1")),
+#: Crypto-pivot C0-B4 (delta spec §3.4/§3.9): the locked V1 CME/ETF
+#: metadata table died with ``strategies/v1_trend_following``. The
+#: crypto book's exposure math is ``contracts x contract_size x mark``
+#: with contract sizes discovered at runtime (never hardcoded, [A13]) —
+#: so this static table now carries only the base-asset → cluster
+#: mapping for the two-asset universe; per-product contract sizes reach
+#: the exposure/MTM path from the market-data layer's product metadata
+#: (wired with the strategy worker in C1). ``multiplier`` stays 1 here:
+#: post-decommission ``positions_current`` rows (if any) render at
+#: avg-cost notional rather than crashing the home page.
+CRYPTO_EXPOSURE_METADATA: Final[dict[str, MarketExposureMeta]] = {
+    "BTC": MarketExposureMeta(cluster="crypto", multiplier=Decimal("1")),
+    "ETH": MarketExposureMeta(cluster="crypto", multiplier=Decimal("1")),
 }
+
+#: Retired alias kept one PR-cycle for the position_mtm import seam; the
+#: §3.9 frontend-deltas PR renames the consumer surface wholesale.
+V1_EXPOSURE_METADATA: Final[dict[str, MarketExposureMeta]] = CRYPTO_EXPOSURE_METADATA
 
 
 _ZERO_CLUSTERS: Final[dict[ExposureCluster, Decimal]] = {
@@ -89,10 +88,9 @@ def _fallback_meta(market: str) -> MarketExposureMeta:
     """Emit a structured warning + return an ``equity_index``/``1`` default.
 
     Unknown markets in ``positions_current`` should never happen in steady
-    state (the order-placement worker rejects markets outside
-    ``V1_CANDIDATE_UNIVERSE``) but if one does land — e.g., a hand-INSERT
-    during an incident — we'd rather render *something* than crash the
-    home page. The structlog warning gives the operator a trail.
+    state, but post-decommission the table can still carry historical CME
+    rows — we'd rather render *something* than crash the home page. The
+    structlog warning gives the operator a trail.
     """
     log.warning(
         "exposure_unknown_market",

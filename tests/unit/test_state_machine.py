@@ -266,6 +266,12 @@ class TestHaltToConvalescent:
 
 
 class TestConvalescentSessionCounter:
+    """Crypto-pivot C0-B4 (delta spec §3.4): the graduation criterion is
+    5 clean UTC calendar DAYS (was: 5 clean CME sessions). The counter
+    machinery is calendar-agnostic — these tests pin that the threshold
+    stays exactly 5 and the tick/reset behavior is unchanged; the daily
+    00:15 UTC recon cycle is the tick source."""
+
     def test_session_close_in_normal_returns_none(self) -> None:
         plan = plan_session_close(
             current_state=RiskState.NORMAL,
