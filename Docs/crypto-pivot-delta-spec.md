@@ -1,6 +1,6 @@
 # Crypto-Perps Pivot — Backend/Frontend Delta Spec
 
-**Date:** 2026-07-08 · **Status:** DRAFT for operator review · **Authority chain:** `Docs/crypto-perps-strategy.md` (incl. Amendments A/B) → `research/crypto_perps/REPORT.md` (validation PASS) → `Docs/decisions-log.md` 2026-07-08 entries.
+**Date:** 2026-07-08 · **Status:** APPROVED WITH OPERATOR MODIFICATIONS (same day): (1) CME paper system shutdown approved — execute at C0 start; (2) **NO shadow phase** — small-live begins as soon as the build passes its offline gates; (3) cash-yield instrument resolved = Coinbase One **Basic** USDC rewards (see §3.6). · **Authority chain:** `Docs/crypto-perps-strategy.md` (incl. Amendments A/B) → `research/crypto_perps/REPORT.md` (validation PASS) → `Docs/decisions-log.md` 2026-07-08 entries.
 
 This is a **delta** against `Docs/backend-spec.md` / `Docs/frontend-spec.md`, not a rewrite. Anything not named here is **unchanged**. It supersedes the entire 2026-05-12 → 2026-05-24 IBKR/LEAN Phase-1 architecture chain in `Docs/recent-architecture-changes.md`.
 
@@ -62,7 +62,9 @@ The system stops trading CME micro-futures via IBKR/LEAN and starts trading **Co
 - New `services/reconciliation/coinbase_fetcher.py`: `list_positions` + fills + `futures_balance_summary` (+ funding settlements). EOD cycle moves to **00:15 UTC** (after the daily decision); intraday probe reuses the REST position endpoint. Diff tolerances re-based in Phase C1 config. FlexQuery XML path gone.
 
 ### 3.6 Cash-yield worker — `services/risk/cash_manager.py` (new; Amendment B build requirement)
-- Daily target: futures margin + buffer (25% of gross notional) stays at CFM; excess swept to the yield instrument; reclaim same-day on margin calls via `schedule_futures_sweep`. Instrument + realized rate are **open question #1** (§7) — ships OFF by default, enabled once verified. Every sweep → audit event (existing `capital_event` taxonomy) + `cash_sweeps` table row.
+- Daily target: futures margin + buffer (25% of gross notional) stays at CFM as USD; excess swept to **USDC at CBI earning Coinbase One rewards (3.50% as of 2026-07)**; reclaim same-day on margin calls (USDC↔USD 1:1 instant conversion + `schedule_futures_sweep`). Every sweep → audit event (existing `capital_event` taxonomy) + `cash_sweeps` table row.
+- **Prerequisite (operator action): Coinbase One Basic subscription ($4.99/mo)** — since 2025-12-15 USDC rewards are subscriber-exclusive (0% without it). Decision 2026-07-08: Basic YES (≈$158/yr gross yield on ~$4.5k avg idle vs ≈$60/yr cost at launch scale, improving as equity grows); Preferred/Premium NO (their headline zero-fee + fee-rebate perks explicitly **exclude derivatives and Coinbase Advanced** — worthless to this system). Backtest/expectation model uses **3.5% yield minus subscription cost** (was 4%). Residual verification at C1: rewards accrue on the full CBI USDC balance and conversion/sweep timing meets same-day reclaim.
+- Staking/lending explicitly REJECTED for system capital (decisions-log 2026-07-08): asset-denominated yield (ETH ~1.8–3.2% net) rides unconditional price exposure the strategy exists to avoid; staked assets are margin-ineligible (CFM margin is USD) and standard unstaking can queue up to ~10 days, violating same-day reclaim; BTC (2/3 of the book) has no native staking, only counterparty lending. Optional exception: the operator's discretionary spot sleeve (outside the system) may stake.
 
 ### 3.7 API / SSE / DB deltas
 - **No new SSE event types** (avoids `[A03]` migration): funding accruals and sweeps surface through existing `pnl`/`position`/`audit` invalidations.
@@ -87,8 +89,8 @@ The system stops trading CME micro-futures via IBKR/LEAN and starts trading **Co
 
 | Phase | Scope | Exit gate |
 |---|---|---|
-| **C0 — scaffold + shadow** (~1 wk) | Decommission old stack (§1); coinbase_client read-only (products, candles, WS, balance); funding logger; signal engine + parity test vs `research/crypto_perps`; decisions logged + Discord `/cycle` digest, **no orders** | Parity: 30 consecutive days of recorded bars ⇒ identical targets to reference impl; `/cycle` digest fires 3 days running; funding rows accruing |
-| **C1 — execution + small-live** (~1-2 wks build, then 45+ days live) | Order ladder, stops, recon fetcher, risk loop, halt wiring; live at `E_effective = min(equity, $1,500)`, max 2 BTC / 4 ETH contracts | Strategy §10 gates A1–A4 + B1–B3, all green, ≥45 days |
+| **C0 — decommission + build** (~2 wks; **no shadow phase**, operator directive 2026-07-08) | Decommission old stack (§1); coinbase_client (data + execution), funding logger, signal engine, risk loop, recon fetcher, halt wiring, Discord `/cycle` digest | **Offline gates:** signal-engine parity vs `research/crypto_perps` reference on the full recorded 2016–2026 bar history (identical integer-contract targets); order-ladder + stop + restart-recovery integration tests against live API in read-only/1-contract-canary form; `/cycle` digest fires 3 consecutive days |
+| **C1 — small-live, immediately on C0 gates** (45+ days) | Live at `E_effective = min(equity, $1,500)`, max 2 BTC / 4 ETH contracts; all risk rules at full strictness | Strategy §10 gates A1–A4 + B1–B3, all green, ≥45 days |
 | **C2 — full size + polish** | Scale to 50% then 100% equity per §10; cash-yield worker ON (post open-question #1); frontend deltas; governance reports automation | §10 scale-up criteria + demotion triggers armed; quarterly report generated once |
 | **Later** | 2.5× scale decision at the 6-month live review; Bermuda-perps comparison memo if API-tradable | Live-vs-sim tracking within tolerance over 6 months |
 
@@ -100,7 +102,7 @@ Build order note: C0/C1 backend work rides the PR-review flow; `services/{signal
 - `[A13]` (revised): DO use `coinbase-advanced-py` against CDE products from `services/execution/coinbase_*.py`; DO NOT re-introduce IBKR/LEAN/QC paths (RETIRED 2026-07-08); DO NOT hardcode CDE product IDs.
 
 ## 7. Open questions (carry into C0/C1; from strategy §11 + build)
-1. Cash-yield instrument: what does CFM/CBI actually offer for swept USD, at what rate, with same-day reclaim? (Gates §3.6 ON.)
+1. ~~Cash-yield instrument~~ **RESOLVED 2026-07-08** (§3.6: Coinbase One Basic USDC rewards @3.5%). Residual: confirm rewards accrue on full CBI USDC balance + same-day sweep/convert mechanics at C1.
 2. Strategy §11 items 1–9 verbatim (product metadata, live fee minimum, stop-limit support on `*-CDE` via API, programmatic funding retrieval, sandbox coverage, Bermuda-perps status, WS fill schema, overnight-margin-only confirmation, maintenance calendar).
 3. FMP vs venue candles as the permanent quarterly-revalidation data source.
 4. Tax note (§1256 60/40) → operator's CPA; frontend Tax Estimate tile inputs change.
