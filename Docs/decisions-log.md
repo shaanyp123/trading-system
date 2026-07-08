@@ -7390,3 +7390,17 @@ Observed/operated by Claude (root SSH, operator-directed autonomy) across the fu
 **Verification:** full test suite green after the sweep (2109 unit + integration/golden; LEAN-dependent tests removed or converted to loud-failure contract asserts), `ruff format`/`ruff check` clean, `mypy --strict` clean across services/infrastructure/strategies/scripts/research.
 
 **Cost/scope impact:** CI drops the qc_adapter docker-build job. VPS load drops (three fewer containers + no nightly LEAN restart). No DB schema change in this PR.
+
+### 2026-07-08 (EOD) — Operator confirmations: decommission complete, C0-B1 landed, cash-yield prerequisite satisfied
+
+**Topic:** End-of-day state checkpoint before the C0 build PRs (§3.2/§3.1/§3.3/§3.4/§3.5/§3.8) begin. Three operator confirmations recorded so future sessions take them as given rather than re-verifying.
+
+**Confirmed state (operator, 2026-07-08):**
+
+1. **PR #344 (§1 decommission sweep, C0-D1) and PR #345 (C0-B1 migration: `funding_rates`, `cash_sweeps`, `product_metadata` tables) are MERGED to main.** The repo-side decommission and the §3.7 schema additions are done.
+2. **The VPS decommission ceremony (`deploy/cme-paper-decommission.md`) is COMPLETE:** paper orders cancelled, final EOD recon run, `system_stopped` audit event with `reason=strategy_retired` emitted, lean/bar_sync systemd timers removed, retired containers gone. **The CME system no longer exists anywhere — no strategy is currently trading.**
+3. **Coinbase One Basic is ACTIVE; system cash is parked in USDC earning 3.50% while the build proceeds.** The §3.6 cash-yield prerequisite (operator action) is satisfied ahead of the cash-manager build.
+
+**Standing directives re-affirmed for the build window:** all strategy/profile decisions are FINAL per the 2026-07-08 chain above (Amendment B profile, no shadow phase, announce-only Discord, USDC rewards as the cash instrument) — do not re-litigate; escalate only genuinely new ambiguities (e.g., Coinbase API surprises such as missing stop-limit support on CDE products — strategy §11 open question 3, operator call). **Dead-code mandate:** with the old system decommissioned everywhere, each Replace-disposition deletion folds into its replacement PR (ibkr_client/adapter + `ib-async` dep + ibkr sops keys → §3.1 PR; flex_query_fetcher/ibkr_intraday + FlexQuery config → §3.5 PR; `strategies/v1_trend_following/` + reproduce-V1/LEAN-parity harness + exposure V1 metadata → §3.4 sizing PR; stale `.claude` skills and orphaned IBKR config fields retired once their last consumer is deleted). Nothing retired survives C0 except history in `Docs/`.
+
+**Build order (delta spec §5, one reviewable PR per item):** C0-B2a market data (§3.2, non-forbidden — self-merge on green) → C0-B2b coinbase execution adapter (§3.1, forbidden path — parked for `risk-review-approved`) → C0-B3 signal engine + parity gate (§3.3, forbidden) → C0-B4 risk/recon/Discord deltas (§3.4/§3.5/§3.8, forbidden).
