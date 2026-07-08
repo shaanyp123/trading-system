@@ -207,40 +207,11 @@ def test_crosscheck_window_filter() -> None:
     assert report.match_rate == 1.0
 
 
-def test_build_v1_run_spec_is_isolated_and_uses_prod_inputs() -> None:
-    spec = build_v1_run_spec(Path("research/data/cache/lean_bars"))
-    assert spec.algorithm_type_name == "V1TrendFollowingAlgorithm"
-    assert spec.algorithm_source == Path("lean/v1_strategy.py")  # read-only input, not copied
-    assert spec.posts_to_api is True  # forces docker backend + isolation env
-    assert Path("strategies") in spec.extra_package_mounts
-    # Live params pulled from the production lean.json.
-    assert spec.parameters["LOOKBACK_DAYS_DONCHIAN"] == "60"
-    assert spec.parameters["EFFICIENCY_RATIO_THRESHOLD"] == "0.20"
-
-
-def test_build_v1_run_spec_injects_backtest_window() -> None:
-    # start/end ⇒ the BACKTEST_START_DATE/END_DATE params V1 reads in initialize(),
-    # which is what lets the harness backtest the REAL V1 over a multi-year span.
-    spec = build_v1_run_spec(
-        Path("research/data/cache/lean_bars"), start=date(2023, 9, 1), end=date(2026, 6, 3)
-    )
-    assert spec.parameters["BACKTEST_START_DATE"] == "20230901"
-    assert spec.parameters["BACKTEST_END_DATE"] == "20260603"
-    assert spec.parameters["EFFICIENCY_RATIO_THRESHOLD"] == "0.20"  # prod params still present
-
-
-def test_build_v1_run_spec_omits_window_when_unset() -> None:
-    # No start/end ⇒ V1 falls back to its own default initialize() window (keys absent),
-    # so the existing reproduce-V1 path is unchanged.
-    spec = build_v1_run_spec(Path("research/data/cache/lean_bars"))
-    assert "BACKTEST_START_DATE" not in spec.parameters
-    assert "BACKTEST_END_DATE" not in spec.parameters
-
-
-def test_build_v1_run_spec_threads_starting_cash() -> None:
-    # cfg.starting_cash flows in as STARTING_CASH_USD (mirrors BACKTEST_START_DATE);
-    # unset keeps lean.json's production value.
-    spec = build_v1_run_spec(Path("research/data/cache/lean_bars"), starting_cash=250_000.0)
-    assert spec.parameters["STARTING_CASH_USD"] == "250000"
-    default = build_v1_run_spec(Path("research/data/cache/lean_bars"))
-    assert default.parameters["STARTING_CASH_USD"] == "100000"  # lean.json's value
+def test_build_v1_run_spec_raises_post_decommission() -> None:
+    # Crypto-pivot C0 (2026-07-08): the production lean/ dir (lean.json +
+    # v1_strategy.py) was deleted with the LEAN stack, so building the
+    # reproduce-V1 run spec now fails loudly at the production-parameter
+    # read (never a silent fallback). The harness is removed alongside
+    # strategies/v1_trend_following in the risk-review'd deletion PR.
+    with pytest.raises(FileNotFoundError):
+        build_v1_run_spec(Path("research/data/cache/lean_bars"))

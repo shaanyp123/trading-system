@@ -77,12 +77,14 @@ def test_write_config_refuses_production_lean_dir() -> None:
         write_config(Path("lean"), cfg)
 
 
-def test_load_production_v1_parameters() -> None:
-    # Reads the real (read-only) lean/lean.json parameters block.
-    params = load_production_v1_parameters()
-    assert params["LOOKBACK_DAYS_DONCHIAN"] == "60"
-    assert params["EFFICIENCY_RATIO_THRESHOLD"] == "0.20"
-    assert all(isinstance(v, str) for v in params.values())
+def test_load_production_v1_parameters_raises_post_decommission() -> None:
+    # Crypto-pivot C0 (2026-07-08): production lean/lean.json was deleted
+    # with the LEAN stack. The reproduce-V1 harness is retired-by-
+    # construction; loading its production parameters now fails loudly
+    # (never a silent fallback). The harness itself is removed alongside
+    # strategies/v1_trend_following in the risk-review'd deletion PR.
+    with pytest.raises(FileNotFoundError):
+        load_production_v1_parameters()
 
 
 def test_reference_parameters_injects_window_and_cash() -> None:

@@ -37,7 +37,6 @@ from discord import app_commands
 from services.discord_bot.api_client import (
     ApiClient,
     ApiClientHTTPError,
-    BarSyncStatusResponse,
     CapitalEventInvokeResponse,
     HealthCheck,
     HealthResponse,
@@ -46,7 +45,6 @@ from services.discord_bot.api_client import (
     SignalApproveResponse,
 )
 from services.discord_bot.commands.approve import ApproveConfirmView, register_approve
-from services.discord_bot.commands.bar_sync import register_bar_sync
 from services.discord_bot.commands.capital import (
     CapitalEventConfirmView,
     _validate_amount,
@@ -80,7 +78,6 @@ def _stub_api_client() -> ApiClient:
     client.invoke_kill_switch = AsyncMock()  # type: ignore[method-assign]
     client.approve_signal = AsyncMock()  # type: ignore[method-assign]
     client.invoke_capital_event = AsyncMock()  # type: ignore[method-assign]
-    client.get_bar_sync_status = AsyncMock()  # type: ignore[method-assign]
     return client
 
 
@@ -435,66 +432,6 @@ class TestStatusCommand:
         embed = interaction.followup.send.await_args.kwargs["embed"]
         assert "INTERNAL_ERROR" in (embed.title or "")
         assert "boom" in (embed.description or "")
-
-
-# ---------------------------------------------------------------------------
-# /barsync
-# ---------------------------------------------------------------------------
-
-
-def _ok_bar_sync_response() -> BarSyncStatusResponse:
-    return BarSyncStatusResponse(
-        status="ok",
-        worker_running=True,
-        last_fired_session_date_et="2026-05-19",
-        cycle_started_at_utc=datetime(2026, 5, 19, 21, 0, 0, tzinfo=UTC),
-        cycle_completed_at_utc=datetime(2026, 5, 19, 21, 0, 42, tzinfo=UTC),
-        duration_seconds=42.0,
-        successful_count=10,
-        failed_count=0,
-        total_markets=10,
-        consecutive_failure_count=0,
-        consecutive_sentinel_count=0,
-        successful_markets=[],
-        failed_markets=[],
-        server_now=datetime(2026, 5, 19, 21, 5, 0, tzinfo=UTC),
-    )
-
-
-class TestBarSyncCommand:
-    async def test_happy_path_defers_then_followup(self, stub_client: ApiClient) -> None:
-        stub_client.get_bar_sync_status.return_value = _ok_bar_sync_response()  # type: ignore[attr-defined]
-        tree = _build_tree()
-        register_bar_sync(tree, api_client=stub_client, environment="paper")
-        callback = _command_callback(tree, "barsync")
-        interaction = _build_mock_interaction()
-
-        await callback(interaction)
-
-        interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
-        stub_client.get_bar_sync_status.assert_awaited_once()  # type: ignore[attr-defined]
-        interaction.followup.send.assert_awaited_once()
-        embed = interaction.followup.send.await_args.kwargs["embed"]
-        assert "Bar sync OK" in (embed.title or "")
-        assert "paper" in (embed.title or "")
-
-    async def test_api_error_renders_error_embed(self, stub_client: ApiClient) -> None:
-        stub_client.get_bar_sync_status.side_effect = ApiClientHTTPError(  # type: ignore[attr-defined]
-            status_code=503,
-            error_code="SERVICE_UNAVAILABLE",
-            message="db down",
-        )
-        tree = _build_tree()
-        register_bar_sync(tree, api_client=stub_client, environment="paper")
-        callback = _command_callback(tree, "barsync")
-        interaction = _build_mock_interaction()
-
-        await callback(interaction)
-
-        interaction.followup.send.assert_awaited_once()
-        embed = interaction.followup.send.await_args.kwargs["embed"]
-        assert "SERVICE_UNAVAILABLE" in (embed.title or "")
-        assert "db down" in (embed.description or "")
 
 
 # ---------------------------------------------------------------------------

@@ -14,7 +14,6 @@ postgres:
 
 ibkr: null              # not used in dev
 
-quantconnect: null      # not used in dev
 
 anthropic: null         # not used in dev
 
@@ -32,8 +31,6 @@ discord:
     audit: MOCK_dev_webhook_audit
     # ask_agent: lands in Phase 2 per frontend-spec §1481
 
-lean:
-  api_bearer_token: MOCK_dev_lean_api_bearer          # Pivot-PR-A post-pivot 2026-05-12
 
 forex_factory: null
 trading_economics: null

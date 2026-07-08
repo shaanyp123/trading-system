@@ -156,12 +156,8 @@ def _module_dict_literal(source: str, name: str) -> dict:
             "_FUTURES_TICK_SIZE",
             "_FUTURES_SLIPPAGE_TICKS",
         ),
-        (
-            "lean/v1_strategy.py",
-            "_BACKTEST_FUTURES_COMMISSION_PER_SIDE",
-            "_BACKTEST_FUTURES_TICK_SIZE",
-            "_BACKTEST_FUTURES_SLIPPAGE_TICKS",
-        ),
+        # lean/v1_strategy.py's inline copy was retired with the LEAN stack
+        # (crypto-pivot C0 decommission, 2026-07-08).
     ],
 )
 def test_lean_side_cost_tables_match_canonical(

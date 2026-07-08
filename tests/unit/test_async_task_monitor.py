@@ -90,14 +90,12 @@ class TestCollectTrackedTasks:
             order_placement=None,
             reconciliation=None,
             heartbeat_probe=None,
-            bar_sync=None,
         )
-        assert len(result) == 4
+        assert len(result) == 3
         assert [t.name for t in result] == [
             "order_placement_worker.run_forever",
             "reconciliation_scheduler.run_forever",
             "heartbeat_probe.run_forever",
-            "bar_sync_worker.run_forever",
         ]
         assert all(t.task is None for t in result)
         assert all(t.expected_alive is False for t in result)
@@ -113,7 +111,6 @@ class TestCollectTrackedTasks:
                     order_placement=(object(), task),
                     reconciliation=None,
                     heartbeat_probe=None,
-                    bar_sync=None,
                 )
             finally:
                 await task
@@ -126,15 +123,12 @@ class TestCollectTrackedTasks:
         assert result[1].expected_alive is False
         assert result[2].task is None
         assert result[2].expected_alive is False
-        assert result[3].task is None
-        assert result[3].expected_alive is False
 
     def test_non_task_second_element_treated_as_none(self) -> None:
         result = collect_tracked_tasks(
             order_placement=(object(), object()),  # task slot isn't a Task
             reconciliation=None,
             heartbeat_probe=None,
-            bar_sync=None,
         )
         # The tuple is not-None (so expected_alive should be True), but
         # the extracted task is None because the slot wasn't an
@@ -142,40 +136,6 @@ class TestCollectTrackedTasks:
         # shouldn't actually do this, but we handle it cleanly.
         assert result[0].task is None
         assert result[0].expected_alive is True
-
-    def test_bar_sync_tracked_when_provided(self) -> None:
-        async def _runner() -> tuple[asyncio.Task[None], tuple[TrackedTask, ...]]:
-            async def _noop() -> None:
-                pass
-
-            task = asyncio.create_task(_noop())
-            try:
-                tuples = collect_tracked_tasks(
-                    order_placement=None,
-                    reconciliation=None,
-                    heartbeat_probe=None,
-                    bar_sync=(object(), task),
-                )
-            finally:
-                await task
-            return task, tuples
-
-        task, result = asyncio.run(_runner())
-        assert result[3].name == "bar_sync_worker.run_forever"
-        assert result[3].task is task
-        assert result[3].expected_alive is True
-
-    def test_bar_sync_defaults_to_none_when_omitted(self) -> None:
-        # Pre-existing callers that haven't been updated yet still work.
-        result = collect_tracked_tasks(
-            order_placement=None,
-            reconciliation=None,
-            heartbeat_probe=None,
-        )
-        assert len(result) == 4
-        assert result[3].name == "bar_sync_worker.run_forever"
-        assert result[3].task is None
-        assert result[3].expected_alive is False
 
 
 class TestAsyncTaskMonitor:

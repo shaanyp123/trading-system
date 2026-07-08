@@ -6,6 +6,8 @@ Snapshot of code + ops surfaces with current status, recent PR history, and forb
 
 **Cross-refs:** rows reference `Docs/decisions-log.md` entries by date and PRs by number (e.g., PR #232). For the pivot blocks themselves, see `Docs/recent-architecture-changes.md`.
 
+> **🛑 Crypto-pivot C0 decommission (2026-07-08):** rows below referencing `lean/`, `infrastructure/lean_local/`, `services/qc_adapter/`, `services/data/bar_sync*.py`, `services/data/map_file_synthesis.py`, `services/api/bar_sync_status.py`, `services/api/routes/internal/lean.py`, `services/scheduler/calendar_import.py`, `services/discord_bot/commands/bar_sync.py`, the six IBKR operator tools, and the `ib_gateway`/`lean_local`/`qc_adapter`/`autoheal` compose services describe DELETED surfaces (kept for history per the append-only convention). `services/execution/ibkr_*` + `services/reconciliation/{flex_query_fetcher,ibkr_intraday}.py` + `strategies/v1_trend_following/` survive until their §3 replacements land. See `Docs/recent-architecture-changes.md` final entry.
+
 ---
 
 ## File index

@@ -149,7 +149,6 @@ def _make_app(monkeypatch: pytest.MonkeyPatch, pg_url: str, *, environment: str)
     monkeypatch.setenv("API_ENVIRONMENT", environment)
     monkeypatch.setenv("API_VERSION", "test")
     monkeypatch.setenv("API_LOG_LEVEL", "INFO")
-    monkeypatch.setenv("API_LEAN_LOCAL_BEARER_TOKEN", "lean-bearer-secret-test-32-bytes")
     monkeypatch.setenv("API_DISCORD_BOT_BEARER_TOKEN", "bot-bearer-secret-test-32-bytes")
 
     from services.api import config as api_config

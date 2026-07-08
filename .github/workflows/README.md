@@ -39,7 +39,7 @@ Computes two things and exposes them as outputs:
    - `python_backend` — all Python source (`services/**`, `strategies/**`, `infrastructure/**`, `tests/**`, `scripts/**`, `alembic/**`, plus `pyproject.toml`, `Makefile`, `conftest.py`)
    - `frontend` — `apps/web/**` or `packages/**`
    - `api` — the api image's **full build context** (`services/**`, `infrastructure/**`, `strategies/**`, `alembic/**`, `alembic.ini`, `scripts/**`, `pyproject.toml`) — i.e. every tree `services/api/Dockerfile` COPYs into the image, **not** just `services/api/**`. Deliberately broad: it gates both `docker-build-api` (PR) and `docker-publish-api` (main push), and if it were narrower the published `:latest` would silently go stale whenever bundled-but-non-`api` code changed (root-caused 2026-06-08 — see the comment on the filter in `ci.yml`). Keep it in lockstep with the Dockerfile's COPY layers.
-   - `discord_bot`, `qc_adapter`, `webhook_pusher` — per-service Python source + `pyproject.toml` (build-only; these images are not published yet, so a narrow filter is correct for them)
+   - `discord_bot`, `webhook_pusher` — per-service Python source + `pyproject.toml` (build-only; these images are not published yet, so a narrow filter is correct for them)
 
 Every downstream job references these flags in its `if:` condition.
 
@@ -60,7 +60,6 @@ These run on every push that doesn't have `[skip ci]`. `gitleaks` runs even with
 | `frontend-test` | `frontend` or `workflow_self` |
 | `docker-build-api` | `api` or `workflow_self` |
 | `docker-build-discord_bot` | `discord_bot` or `workflow_self` |
-| `docker-build-qc_adapter` | `qc_adapter` or `workflow_self` |
 | `docker-build-web` | `frontend` or `workflow_self` |
 | `docker-build-webhook_pusher` | `webhook_pusher` or `workflow_self` |
 

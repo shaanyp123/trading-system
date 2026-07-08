@@ -67,3 +67,14 @@ The operator directed a full strategy pivot: **retire IBKR/LEAN/CME-futures enti
 - **Everything above in this file describing ib_gateway, bar_sync, LEAN, lean_local, clientIds, FlexQuery, CME universes/map-files is RETIRED** — kept for history only. Do not implement against it.
 - The platform chassis (audit chain, SSE, kill-switch FSM, Discord, recon engine, auth, frontend shell) is retained; broker/data/signal/scheduling layers are replaced per the delta spec.
 - Build phases C0 (shadow) → C1 (small-live, §10 gates) → C2 (full size). No per-trade approval; Discord is announce-only.
+
+---
+
+## 2026-07-08 (later) — Phase C0 START: CME/IBKR/LEAN stack decommissioned (C0-D1)
+
+The delta spec §1 decommission executed (repo-side; VPS ceremony at `deploy/cme-paper-decommission.md`):
+
+- **Deleted:** `lean/` (algorithm + lean.json), `infrastructure/lean_local/`, `deploy/lean_local/` (systemd timers), `deploy/ibkr/`, `deploy/qc_adapter/`, `services/qc_adapter/` (+ CI docker-build job), `services/data/{bar_sync,bar_sync_alerts,map_file_synthesis}.py`, `services/api/bar_sync_status.py`, `services/api/routes/internal/lean.py` + `LeanAuthMiddleware` (+ `lean_local_bearer_token` config + sops keys), `services/scheduler/calendar_import.py`, Discord `/barsync`, IBKR operator tools (`trigger_v1_cycle`, `recon_positions_probe`, `replace_protective_stop`, `replay_executions`, `master_client_id_probe`, `recovery_agent`), compose services `ib_gateway`/`lean_local`/`qc_adapter`/`autoheal` + `lean_data` volume (both compose files).
+- **Degraded-by-design until §3.2:** `services/api/position_mtm.py` is fallback-only (marks at `avg_cost`, PnL 0) — its LEAN-zip price source no longer exists; the Coinbase market-data service becomes the mark source.
+- **Deliberately KEPT (Replace disposition, land with their §3 replacements under risk-review):** `services/execution/ibkr_client.py`+`ibkr_adapter.py` (§3.1), `services/reconciliation/{flex_query_fetcher,ibkr_intraday}.py` (§3.5), `strategies/v1_trend_following/` (unwired by the §3.4 sizing PR — `services/risk/sizing.py` + `services/api/repos/exit_proximity.py` still import it), the `qc_adapter_cursor` table + alembic history (dropped in a later cleanup migration; the seed revision is load-bearing in the migration chain), `services/api/schemas/lean.py` (now proximity-schemas-only; the retired LeanEvent* models were removed), research reproduce-V1 harness code (fails loudly on the deleted `lean/` inputs; removed with the v1 package PR).
+- **Retired research surface note:** the reproduce-V1 / LEAN parity tests that read production `lean/` inputs now assert the loud-failure contract instead; the vbt↔LEAN parity + reproduce-V1 integration tests were removed with the signals ingress.

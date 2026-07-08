@@ -113,24 +113,16 @@ def test_strategy_sweep_without_validity_rejected(tmp_path: Path) -> None:
         run(cfg, runs_dir=tmp_path / "runs")
 
 
-def test_run_lean_threads_starting_cash_to_v1_spec(
+def test_run_lean_v1_spec_raises_post_decommission(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # cfg.starting_cash must reach the V1 spec as STARTING_CASH_USD; stub the LEAN
-    # invocation (record the spec, then stop) — no backend needed.
+    # Crypto-pivot C0 (2026-07-08): the production lean/ dir is deleted, so
+    # the engine=lean + v1_adapter path fails loudly at the production-
+    # parameter read before any LEAN invocation (never a silent fallback).
     root = _seed(tmp_path)
-    captured: dict[str, object] = {}
-
-    def fake_run_backtest(spec: object, **_k: object) -> object:
-        captured["spec"] = spec
-        raise RuntimeError("stop-after-spec")
-
-    monkeypatch.setattr("research.run.run_backtest", fake_run_backtest)
     cfg = _cfg(root, engine="lean", strategy={"ref": "v1_adapter"}, starting_cash=250_000)
-    with pytest.raises(RuntimeError, match="stop-after-spec"):
+    with pytest.raises(FileNotFoundError):
         run(cfg, runs_dir=tmp_path / "runs")
-    spec = captured["spec"]
-    assert spec.parameters["STARTING_CASH_USD"] == "250000"  # type: ignore[attr-defined]
 
 
 def test_intraday_resolution_points_to_p5(tmp_path: Path) -> None:

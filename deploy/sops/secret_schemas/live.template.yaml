@@ -13,7 +13,7 @@
 #   - rp_id / origin (live.spratcapital.com per O1; paper stays at apex)
 #   - bearer tokens (independently generated; do not share with paper):
 #       internal.watchdog_bearer_token, internal.ipc_bearer_token,
-#       discord.api_bearer_token, lean.api_bearer_token,
+#       discord.api_bearer_token,
 #       totp.encryption_key
 #   - postgres.app_service_password + postgres.app_owner_password (fresh)
 #
@@ -67,12 +67,6 @@ discord:
     critical: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
     ops: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
     audit: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
-
-lean:
-  # DISTINCT from paper. 32-byte URL-safe base64. Live LEAN ↔ live api
-  # POST /api/internal/lean/signals auth per backend-spec §6 +
-  # deploy/lean_local/README.md.
-  api_bearer_token: <TODO_FROM_LIVE_CUTOVER_BEARER_GENERATE>
 
 forex_factory:
   api_token: null
