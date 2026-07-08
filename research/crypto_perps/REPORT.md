@@ -57,6 +57,23 @@ python3 research/crypto_perps/validate_data.py   # data sanity
 python3 research/crypto_perps/backtest.py        # full suite -> results.json + falsification verdicts
 ```
 
+## Amendment A — operator-directed 2× risk profile (2026-07-08)
+
+After reviewing the base results, the operator (full-risk-capital mandate) directed a 2× profile: every risk knob scaled coherently — V_target 80%, per-trade risk 5%, daily/weekly loss limits −8%/−16%, drawdown tiers 20/40/70%, gross cap 3.0x — and asked to remove the 50% hard halt. Validation (same protocol, same data):
+
+| Scenario | CAGR | Sharpe | Max DD | Sharpe 2023+ | Halted/bust? |
+|---|---|---|---|---|---|
+| Aggressive, halt at $1,500 (−75%) | **+31.1%** | 1.02 | **51.3%** | +0.40 | never |
+| Aggressive, **no halt at all** | +31.1% | 1.02 | 51.3% | +0.40 | never |
+| Aggressive, costs 2× | +23.2% | 0.82 | 52.7% | +0.27 | never |
+| Aggressive, funding 2× | +32.0% | 1.03 | 51.8% | +0.36 | never |
+
+Per-year (aggressive): 2017 +129% · 2018 +20% · 2019 +58% · 2020 +108% · 2021 **−7.1%** · 2022 +22% · 2023 +14% · 2024 +0.6% (with a **48.5% intra-year drawdown**) · 2025 −6.8% · 2026H1 +17%. Final equity $78,523 vs base $25,982. Avg gross leverage 0.41x, peak 1.44x. Costs $17,213 + funding $8,937 over 9.5y (cost drag scales with notional, as expected).
+
+Sharpe is preserved (1.02 vs 1.04) — the 2× profile is the same edge at double size, not a different bet. The scaling is honest: returns roughly double and so do the pain numbers (2024: a 48.5% drawdown to finish +0.6%).
+
+**Halt disposition:** the $1,500 (−75%) halt and no-halt runs are *identical* — the deep halt never triggered in 9.5 years including the 48.5% drawdown. It was therefore **retained at $1,500 as a malfunction circuit-breaker and debit-risk backstop** (a system down 75% is far more likely broken than unlucky, and FCM accounts can gap into negative balances). It costs nothing in backtest and is not a risk-tolerance bound. Recorded as Amendment A in `Docs/crypto-perps-strategy.md`.
+
 ## Recommendation
 
-Deploy-gate **PASS**. Proceed to the backend/frontend delta spec and build, with three riders: (1) set operator expectations per F-1 (realized vol ~16%, modest absolute returns, red years happen); (2) treat the system as BTC-only at launch per F-2; (3) carry F-3/F-4 into the implementation as explicit items — funding telemetry from day one, and §7-over-§6 precedence in the sizing engine.
+Deploy-gate **PASS**. Proceed to the backend/frontend delta spec and build **at the Amendment A profile**, with these riders: (1) expectations per Amendment A — ~30% CAGR central case with ~50% drawdowns and red years (2021/2025-shaped) as a normal part of the deal; (2) BTC-only at launch per F-2; (3) funding telemetry from day one and §7-over-§6 precedence in the sizing engine per F-3/F-4; (4) the $1,500 halt ships as a malfunction circuit-breaker — removing it entirely was evaluated and adds nothing (identical backtest) while removing the debit/runaway backstop.

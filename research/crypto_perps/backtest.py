@@ -62,7 +62,8 @@ class Params:
     daily_loss_limit: float = -0.04
     weekly_loss_limit: float = -0.08
     weekly_penalty_days: int = 7
-    halt_frac: float = 0.50
+    halt_frac: float = 0.50  # <= 0 disables the drawdown halt (bust at E<=0 still stops)
+    dd_tiers: tuple = ((0.10, 1.0), (0.20, 0.6), (0.35, 0.35), (9.9, 0.2))
     eth_min_price: float = 2000.0
     # costs (section 1.5) — per SIDE
     fee_bps: float = 5.0
@@ -230,8 +231,8 @@ def run_backtest(data: dict[str, pd.DataFrame], p: Params, start: str, end: str)
             E -= f
             total_funding += f
 
-        # ---- 3) hard halt ----
-        if E <= p.halt_frac * p.initial_equity:
+        # ---- 3) hard halt (or bust: equity wiped even with halt disabled) ----
+        if (p.halt_frac > 0 and E <= p.halt_frac * p.initial_equity) or E <= 0:
             for s in ASSETS:
                 st = states[s]
                 row = frames[s].loc[ts]
@@ -270,14 +271,7 @@ def run_backtest(data: dict[str, pd.DataFrame], p: Params, start: str, end: str)
             weekly_mult_until = i + p.weekly_penalty_days
         hwm = max(hwm, E)
         dd = 1.0 - E / hwm
-        if dd <= 0.10:
-            dd_mult = 1.0
-        elif dd <= 0.20:
-            dd_mult = 0.6
-        elif dd <= 0.35:
-            dd_mult = 0.35
-        else:
-            dd_mult = 0.2
+        dd_mult = next(m for lvl, m in p.dd_tiers if dd <= lvl)
         v_target = p.v_target * (0.5 if i <= weekly_mult_until else 1.0)
 
         # ---- 6) decision at close (00:05 UTC next day, approximated at close) ----
@@ -468,8 +462,22 @@ def main():
     base = Params()
     data = {s: compute_indicators(load_asset(s), base) for s in ASSETS}
 
+    # Amendment A (2026-07-08, operator-directed): "2x profile" — every risk
+    # knob scaled coherently, drawdown halt moved 50% -> 75% (malfunction
+    # circuit-breaker only). aggr_nohalt quantifies removing the halt entirely.
+    aggr = replace(
+        base, v_target=0.80, per_trade_risk_frac=0.05,
+        daily_loss_limit=-0.08, weekly_loss_limit=-0.16, gross_cap=3.0,
+        dd_tiers=((0.20, 1.0), (0.40, 0.6), (0.70, 0.35), (9.9, 0.2)),
+        halt_frac=0.25,
+    )
+
     scenarios = {"base": base}
     if not args.base:
+        scenarios["aggr_halt25"] = aggr
+        scenarios["aggr_nohalt"] = replace(aggr, halt_frac=0.0)
+        scenarios["aggr_2xcost"] = replace(aggr, cost_mult=2.0)
+        scenarios["aggr_fund2x"] = replace(aggr, funding_ann=2 * base.funding_ann)
         scenarios["costs_2x"] = replace(base, cost_mult=2.0)
         scenarios["funding_0x"] = replace(base, funding_ann=0.0)
         scenarios["funding_2x"] = replace(base, funding_ann=2 * base.funding_ann)

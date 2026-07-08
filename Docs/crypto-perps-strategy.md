@@ -1,6 +1,17 @@
 # Leveraged Crypto Derivatives Strategy — Coinbase CFM US Perpetual-Style Futures
 
-> **Provenance:** Produced by a deep-research session on 2026-07-08 from the operator's strategy-research prompt; delivered verbatim to this repo for validation. Backtest validation lives in `research/crypto_perps/` (see `REPORT.md` there). Status: **UNDER VALIDATION — not yet approved for implementation.**
+> **Provenance:** Produced by a deep-research session on 2026-07-08 from the operator's strategy-research prompt; delivered verbatim to this repo for validation. Backtest validation lives in `research/crypto_perps/` (see `REPORT.md` there). Status: **VALIDATED (all §9 falsification criteria pass) — approved to proceed to delta spec + build, with Amendment A below.**
+>
+> **⚠️ AMENDMENT A (2026-07-08, operator-directed, post-backtest) — production risk profile is 2× this document's base profile.** The operator (full-risk-capital mandate, explicitly accepting total loss) directed doubling the risk profile after reviewing base-profile backtest results. Every §6/§7 risk knob scales coherently; the body text below states the BASE values — production uses:
+> - `V_target_base`: 40% → **80%** annualized
+> - Per-trade risk cap: 2.5% → **5% of E**
+> - Daily loss limit: −4% → **−8%** · Weekly loss limit: −8% → **−16%**
+> - Drawdown tiers: **0–20% → 1.0; 20–40% → 0.6; 40–70% → 0.35; >70% → 0.2**
+> - Portfolio gross cap: 2.0x → **3.0x** (the §7 30%-liquidation-buffer rule still applies and effectively binds near ~2.8x; verify against live overnight margin, §11-1)
+> - **Hard halt: $3,000 (50%) → $1,500 (25% of initial equity).** The operator asked to remove the halt entirely; it is retained at −75% strictly as a **malfunction circuit-breaker** (broken feed/venue change/code fault) and debit-risk backstop, NOT a risk-tolerance bound — backtest shows it never fires in 9.5 years at the 2× profile, so it costs nothing. Restart still requires manual flag removal.
+> - §10 small-live gates unchanged (Phase A still sizes off `E_effective = min(equity, $1,500)`).
+>
+> Validated profile (2017→2026H1, see `research/crypto_perps/REPORT.md`): **+31.1% CAGR, Sharpe 1.02, max DD 51.3%**, worst year −7.1% (2021), no halt/bust; 2×-cost stress +23.2% CAGR / Sharpe 0.82. Expect ~40% average gross leverage (peaks ~1.4x), roughly double the base profile's cost and funding drag.
 
 **Prepared:** July 8, 2026 · **Capital:** $6,000 USD · **Venue:** Coinbase Financial Markets (CFM) via Coinbase Derivatives Exchange (CDE), traded through the Coinbase Advanced Trade API
 **Status:** Implementation spec for a coding agent. Every rule is stated exactly; anything unverifiable from public sources is logged in §11.

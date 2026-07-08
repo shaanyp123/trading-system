@@ -7329,3 +7329,11 @@ Observed/operated by Claude (root SSH, operator-directed autonomy) across the fu
 **Approved sequence (operator, this session):** backtest → small live (~$1–2k, min contract sizes, §10 gates) → full live. No extended paper phase; §10 Phase A does software-shakeout duty. Next step: backend/frontend delta spec (rip out `ib_gateway`/LEAN/`bar_sync`; keep FastAPI/risk-engine/audit/Discord/frontend; add Coinbase Advanced Trade API adapter + in-house daily signal engine).
 
 **Cost/scope impact:** none yet — this session adds only `Docs/` + `research/crypto_perps/` (no `services/**`, no migrations, no forbidden paths). CLAUDE.md/spec rewrites happen with the delta spec, not before.
+
+### 2026-07-08 (later) — Amendment A: production risk profile 2× base; halt 50% → 25% (retained as circuit-breaker)
+
+**Topic:** Operator reviewed base-profile backtest results and directed doubling the risk profile ("I would be okay losing it all"), asking whether the 50% hard halt could be removed.
+
+**Decision:** All §6/§7 risk knobs scaled coherently (V_target 80%, per-trade risk 5% E, daily/weekly loss limits −8%/−16%, DD tiers 20/40/70%, gross cap 3.0x). Halt NOT removed but moved $3,000 → **$1,500 (−75%)**, reframed as a malfunction circuit-breaker + FCM debit-risk backstop rather than a risk-tolerance bound: backtest shows halt-at-25% and no-halt runs are IDENTICAL over 9.5 years (never fires, including a 48.5% intra-year DD in 2024), so it costs nothing and guards the broken-system tail. Recorded as Amendment A in `Docs/crypto-perps-strategy.md`; scenarios `aggr_*` in `research/crypto_perps/results.json`.
+
+**Validated (2017→2026H1):** +31.1% CAGR, Sharpe 1.02 (unchanged vs base 1.04 — same edge, double size), max DD 51.3%, worst year −7.1%, no halt/bust; 2×-cost stress +23.2%/0.82. Avg gross leverage 0.41x, peak 1.44x. §10 small-live gates unchanged.
