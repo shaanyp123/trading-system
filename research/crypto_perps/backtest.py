@@ -57,6 +57,7 @@ class Params:
     band_edge_rebalance: bool = False  # trade to band edge, not to exact target
     cash_yield_ann: float = 0.0        # yield on cash not posted as margin
     margin_frac: float = 0.25          # assumed initial margin as fraction of gross notional
+    subscription_usd_month: float = 0.0  # Coinbase One (gates USDC rewards since 2025-12)
     # stops (section 5)
     atr_window: int = 14
     client_stop_atr: float = 2.0
@@ -243,6 +244,7 @@ def run_backtest(data: dict[str, pd.DataFrame], p: Params, start: str, end: str)
                 if not np.isnan(frames[s]["close"].loc[ts])
             )
             E += (p.cash_yield_ann / DAYS_YEAR) * max(0.0, E - p.margin_frac * gross_held)
+            E -= p.subscription_usd_month * 12.0 / DAYS_YEAR
 
         # ---- 3) hard halt (or bust: equity wiped even with halt disabled) ----
         if (p.halt_frac > 0 and E <= p.halt_frac * p.initial_equity) or E <= 0:
@@ -493,8 +495,19 @@ def main():
         halt_frac=0.25,
     )
 
+    # Amendment B (2026-07-08, operator-selected): PRODUCTION profile.
+    # combo2x structure + cash yield 3.5% (Coinbase One Basic USDC rewards,
+    # subscriber-gated since 2025-12) minus the $4.99/mo subscription.
+    production = replace(
+        aggr, dd_tiers=((9.9, 1.0),), hysteresis_hold=True,
+        band_edge_rebalance=True, cash_yield_ann=0.035,
+        subscription_usd_month=4.99,
+    )
+
     scenarios = {"base": base}
     if not args.base:
+        scenarios["production"] = production
+        scenarios["production_2xcost"] = replace(production, cost_mult=2.0)
         scenarios["aggr_halt25"] = aggr
         scenarios["aggr_nohalt"] = replace(aggr, halt_frac=0.0)
         scenarios["aggr_2xcost"] = replace(aggr, cost_mult=2.0)
