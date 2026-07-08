@@ -56,3 +56,14 @@ See `Docs/decisions-log.md` for the per-day blow-by-blow + the underlying decisi
 > - **Per-bar front-month write** (`services/data/bar_sync.py::_per_bar_front_month_or_fallback` + `map_file_synthesis.front_month_for_session_date`) — every per-day universe file gets the actual historical front-month for that `session_date`, NOT today's pick. Fixes the pre-PR-#232 `/MES` map_file 9-month gap (2025-06-22 → 2026-03-16) caused by writing today's expiry into every historical universe file
 > - **`set_filter(-365, 90)` for futures** (`lean/v1_strategy.py`) — extends LEAN's continuous-future chain backward to include contracts expired up to 365 days ago, so historical contracts on disk (PR #229 backfill) are actually consumed by `self.history()` instead of being filtered out
 > - **`/MYM` routes via `cbot` market_dir** (`services/data/bar_sync.py::PHASE1_UNIVERSE_METADATA` + `strategies/v1_trend_following/universe_freshness.py::V1_FUTURES_MARKET_PATHS`) — paired with operator-side data migration on the VPS (`mv future/cme/{daily/mym_*,universes/mym} future/cbot/`); matches LEAN's `FuturesExpiryFunctions.cs::MicroDow30EMini` registration under `Market.CBOT` per PR #226
+
+---
+
+## 2026-07-08 — CRYPTO-PERPS PIVOT (supersedes the entire IBKR/LEAN Phase-1 chain above)
+
+The operator directed a full strategy pivot: **retire IBKR/LEAN/CME-futures entirely; the system now trades Coinbase CFM US perpetual-style futures (nano BTC/ETH) via the Coinbase Advanced Trade API**, running a vol-targeted trend strategy validated in `research/crypto_perps/` (all falsification criteria PASS; production profile = Amendment B: +41.9% CAGR / Sharpe 1.16 / max DD 58.5% backtested 2017→2026H1).
+
+- **Authority chain:** `Docs/crypto-perps-strategy.md` (+ Amendments A/B) → `research/crypto_perps/REPORT.md` → `Docs/crypto-pivot-delta-spec.md` (the build plan) → decisions-log 2026-07-08 entries.
+- **Everything above in this file describing ib_gateway, bar_sync, LEAN, lean_local, clientIds, FlexQuery, CME universes/map-files is RETIRED** — kept for history only. Do not implement against it.
+- The platform chassis (audit chain, SSE, kill-switch FSM, Discord, recon engine, auth, frontend shell) is retained; broker/data/signal/scheduling layers are replaced per the delta spec.
+- Build phases C0 (shadow) → C1 (small-live, §10 gates) → C2 (full size). No per-trade approval; Discord is announce-only.

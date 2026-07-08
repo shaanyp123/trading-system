@@ -2,6 +2,8 @@
 
 You are working on a solo-operator algorithmic trading system. The operator is non-coding (finance background, no programming) and relies on you for all implementation.
 
+> **🔴 PIVOT IN PROGRESS (2026-07-08): the IBKR/LEAN/CME system described below is being RETIRED.** The repo is pivoting to Coinbase CFM crypto perpetual-style futures. Read, in order: `Docs/recent-architecture-changes.md` (final entry), `Docs/crypto-perps-strategy.md` (+ Amendments), `research/crypto_perps/REPORT.md`, and **`Docs/crypto-pivot-delta-spec.md`** (the build plan) before trusting anything below about IBKR, LEAN, bar_sync, or the daily cycle. Chassis rules (audit chain, forbidden paths, structlog/Decimal/Argon2id/Resend, SSE discipline) remain in force.
+
 ## Operational status
 
 > **🚀 Paper trading is OPERATIONAL.** Day 1 was 2026-05-20. Daily cycle: 17:00 ET `BarSyncWorker` → 21:00 UTC bar_sync end → 21:10 UTC `lean_local` systemd restart → 21:30 UTC LEAN signal cycle → 22:30 UTC EOD reconciliation. Live-money cutover (`live-small` env tag) remains a future Phase milestone — today is paper-only.
