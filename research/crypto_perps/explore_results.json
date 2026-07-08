@@ -823,5 +823,455 @@
     "max_gross_leverage": 2.192,
     "pct_days_in_market": 0.845,
     "halted": false
+  },
+  "cash/band: combo2x (ref)": {
+    "final_equity": 120182.92,
+    "total_return": 19.0305,
+    "cagr": 0.371,
+    "sharpe": 1.068,
+    "maxdd": 0.6024,
+    "sharpe_2023on": 0.573,
+    "return_2023on": 0.6653,
+    "worst_year_dd": 0.6024,
+    "per_year": {
+      "2017": {
+        "return": 1.3369132339847112,
+        "sharpe": 2.491,
+        "maxdd": 0.1952
+      },
+      "2018": {
+        "return": 0.1275687058902868,
+        "sharpe": 0.561,
+        "maxdd": 0.1987
+      },
+      "2019": {
+        "return": 0.5585033854391563,
+        "sharpe": 1.586,
+        "maxdd": 0.2091
+      },
+      "2020": {
+        "return": 1.0992533760163479,
+        "sharpe": 2.275,
+        "maxdd": 0.1308
+      },
+      "2021": {
+        "return": 0.13437812884324174,
+        "sharpe": 0.524,
+        "maxdd": 0.2936
+      },
+      "2022": {
+        "return": 0.2509279473352093,
+        "sharpe": 0.855,
+        "maxdd": 0.2879
+      },
+      "2023": {
+        "return": 0.13786258167194365,
+        "sharpe": 0.566,
+        "maxdd": 0.3056
+      },
+      "2024": {
+        "return": -0.09115116775168974,
+        "sharpe": 0.007,
+        "maxdd": 0.6024
+      },
+      "2025": {
+        "return": 0.1320788037767835,
+        "sharpe": 0.523,
+        "maxdd": 0.308
+      },
+      "2026": {
+        "return": 0.37083507029265417,
+        "sharpe": 1.877,
+        "maxdd": 0.2172
+      }
+    },
+    "n_position_changes": 1032,
+    "trade_reasons": {
+      "signal": 962,
+      "stop": 59,
+      "daily_loss": 11
+    },
+    "trades_per_year": 108.6,
+    "total_costs": 22622.02,
+    "total_funding_paid": 12729.81,
+    "avg_gross_leverage": 0.493,
+    "max_gross_leverage": 1.763,
+    "pct_days_in_market": 0.843,
+    "halted": false
+  },
+  "cash/band: +band-edge": {
+    "final_equity": 115596.48,
+    "total_return": 18.2661,
+    "cagr": 0.3654,
+    "sharpe": 1.051,
+    "maxdd": 0.5942,
+    "sharpe_2023on": 0.655,
+    "return_2023on": 0.8572,
+    "worst_year_dd": 0.5942,
+    "per_year": {
+      "2017": {
+        "return": 1.3067459955612062,
+        "sharpe": 2.384,
+        "maxdd": 0.2027
+      },
+      "2018": {
+        "return": 0.15468827020727294,
+        "sharpe": 0.642,
+        "maxdd": 0.2027
+      },
+      "2019": {
+        "return": 0.5056435000529094,
+        "sharpe": 1.457,
+        "maxdd": 0.2272
+      },
+      "2020": {
+        "return": 1.098299012940128,
+        "sharpe": 2.247,
+        "maxdd": 0.1324
+      },
+      "2021": {
+        "return": 0.0451255374805124,
+        "sharpe": 0.308,
+        "maxdd": 0.2999
+      },
+      "2022": {
+        "return": 0.20056814524200983,
+        "sharpe": 0.738,
+        "maxdd": 0.3008
+      },
+      "2023": {
+        "return": 0.15431642391174716,
+        "sharpe": 0.612,
+        "maxdd": 0.3045
+      },
+      "2024": {
+        "return": -0.06372949487469104,
+        "sharpe": 0.071,
+        "maxdd": 0.5942
+      },
+      "2025": {
+        "return": 0.18643237125855627,
+        "sharpe": 0.649,
+        "maxdd": 0.3202
+      },
+      "2026": {
+        "return": 0.3990430591837386,
+        "sharpe": 1.976,
+        "maxdd": 0.2125
+      }
+    },
+    "n_position_changes": 1509,
+    "trade_reasons": {
+      "signal": 1446,
+      "stop": 56,
+      "daily_loss": 7
+    },
+    "trades_per_year": 158.9,
+    "total_costs": 18827.01,
+    "total_funding_paid": 11746.92,
+    "avg_gross_leverage": 0.495,
+    "max_gross_leverage": 1.724,
+    "pct_days_in_market": 0.845,
+    "halted": false
+  },
+  "cash/band: +cash 4pct": {
+    "final_equity": 169393.01,
+    "total_return": 27.2291,
+    "cagr": 0.4214,
+    "sharpe": 1.17,
+    "maxdd": 0.5938,
+    "sharpe_2023on": 0.663,
+    "return_2023on": 0.8793,
+    "worst_year_dd": 0.5938,
+    "per_year": {
+      "2017": {
+        "return": 1.391303930689992,
+        "sharpe": 2.554,
+        "maxdd": 0.1935
+      },
+      "2018": {
+        "return": 0.1896913582916815,
+        "sharpe": 0.752,
+        "maxdd": 0.1882
+      },
+      "2019": {
+        "return": 0.6095360614927239,
+        "sharpe": 1.689,
+        "maxdd": 0.1979
+      },
+      "2020": {
+        "return": 1.173428394356871,
+        "sharpe": 2.373,
+        "maxdd": 0.1285
+      },
+      "2021": {
+        "return": 0.18184264652404925,
+        "sharpe": 0.633,
+        "maxdd": 0.2865
+      },
+      "2022": {
+        "return": 0.2997594729111337,
+        "sharpe": 0.975,
+        "maxdd": 0.2803
+      },
+      "2023": {
+        "return": 0.17581310983807574,
+        "sharpe": 0.67,
+        "maxdd": 0.294
+      },
+      "2024": {
+        "return": -0.06408333389773468,
+        "sharpe": 0.072,
+        "maxdd": 0.5938
+      },
+      "2025": {
+        "return": 0.16790172463754516,
+        "sharpe": 0.608,
+        "maxdd": 0.3025
+      },
+      "2026": {
+        "return": 0.40903918565998043,
+        "sharpe": 2.007,
+        "maxdd": 0.2107
+      }
+    },
+    "n_position_changes": 1033,
+    "trade_reasons": {
+      "signal": 963,
+      "stop": 59,
+      "daily_loss": 11
+    },
+    "trades_per_year": 108.8,
+    "total_costs": 28437.63,
+    "total_funding_paid": 16026.68,
+    "avg_gross_leverage": 0.494,
+    "max_gross_leverage": 1.769,
+    "pct_days_in_market": 0.843,
+    "halted": false
+  },
+  "cash/band: +both": {
+    "final_equity": 166331.13,
+    "total_return": 26.7188,
+    "cagr": 0.4187,
+    "sharpe": 1.159,
+    "maxdd": 0.5853,
+    "sharpe_2023on": 0.751,
+    "return_2023on": 1.1101,
+    "worst_year_dd": 0.5853,
+    "per_year": {
+      "2017": {
+        "return": 1.386385100815823,
+        "sharpe": 2.477,
+        "maxdd": 0.2013
+      },
+      "2018": {
+        "return": 0.20207079758708857,
+        "sharpe": 0.784,
+        "maxdd": 0.1832
+      },
+      "2019": {
+        "return": 0.563039841255685,
+        "sharpe": 1.575,
+        "maxdd": 0.2156
+      },
+      "2020": {
+        "return": 1.174637002361374,
+        "sharpe": 2.347,
+        "maxdd": 0.1299
+      },
+      "2021": {
+        "return": 0.08395464270574893,
+        "sharpe": 0.403,
+        "maxdd": 0.2885
+      },
+      "2022": {
+        "return": 0.2646436766982905,
+        "sharpe": 0.902,
+        "maxdd": 0.285
+      },
+      "2023": {
+        "return": 0.19602296058914104,
+        "sharpe": 0.724,
+        "maxdd": 0.2924
+      },
+      "2024": {
+        "return": -0.02940093328102411,
+        "sharpe": 0.152,
+        "maxdd": 0.5853
+      },
+      "2025": {
+        "return": 0.23337958083253252,
+        "sharpe": 0.754,
+        "maxdd": 0.3145
+      },
+      "2026": {
+        "return": 0.4230963486014736,
+        "sharpe": 2.069,
+        "maxdd": 0.2049
+      }
+    },
+    "n_position_changes": 1521,
+    "trade_reasons": {
+      "signal": 1458,
+      "stop": 55,
+      "daily_loss": 8
+    },
+    "trades_per_year": 160.1,
+    "total_costs": 23888.1,
+    "total_funding_paid": 14982.67,
+    "avg_gross_leverage": 0.495,
+    "max_gross_leverage": 1.718,
+    "pct_days_in_market": 0.845,
+    "halted": false
+  },
+  "cash/band: +both, costs 2x": {
+    "final_equity": 99294.92,
+    "total_return": 15.5473,
+    "cagr": 0.3437,
+    "sharpe": 1.002,
+    "maxdd": 0.5992,
+    "sharpe_2023on": 0.646,
+    "return_2023on": 0.8358,
+    "worst_year_dd": 0.5992,
+    "per_year": {
+      "2017": {
+        "return": 1.0903045409686496,
+        "sharpe": 2.075,
+        "maxdd": 0.2593
+      },
+      "2018": {
+        "return": 0.11099794061475698,
+        "sharpe": 0.505,
+        "maxdd": 0.2326
+      },
+      "2019": {
+        "return": 0.46155426521782283,
+        "sharpe": 1.356,
+        "maxdd": 0.2263
+      },
+      "2020": {
+        "return": 1.1020466663408968,
+        "sharpe": 2.247,
+        "maxdd": 0.1342
+      },
+      "2021": {
+        "return": 0.06420730449475665,
+        "sharpe": 0.355,
+        "maxdd": 0.2923
+      },
+      "2022": {
+        "return": 0.20798573172943402,
+        "sharpe": 0.755,
+        "maxdd": 0.2941
+      },
+      "2023": {
+        "return": 0.15230511603041053,
+        "sharpe": 0.605,
+        "maxdd": 0.3076
+      },
+      "2024": {
+        "return": -0.06894227019345811,
+        "sharpe": 0.059,
+        "maxdd": 0.5992
+      },
+      "2025": {
+        "return": 0.1863174777422194,
+        "sharpe": 0.649,
+        "maxdd": 0.324
+      },
+      "2026": {
+        "return": 0.3927443762403393,
+        "sharpe": 1.957,
+        "maxdd": 0.2163
+      }
+    },
+    "n_position_changes": 1497,
+    "trade_reasons": {
+      "signal": 1434,
+      "stop": 55,
+      "daily_loss": 8
+    },
+    "trades_per_year": 157.6,
+    "total_costs": 32738.46,
+    "total_funding_paid": 10124.91,
+    "avg_gross_leverage": 0.496,
+    "max_gross_leverage": 1.721,
+    "pct_days_in_market": 0.845,
+    "halted": false
+  },
+  "cash/band: +both, cash 2.5pct": {
+    "final_equity": 147539.11,
+    "total_return": 23.5882,
+    "cagr": 0.4009,
+    "sharpe": 1.123,
+    "maxdd": 0.5883,
+    "sharpe_2023on": 0.717,
+    "return_2023on": 1.0176,
+    "worst_year_dd": 0.5883,
+    "per_year": {
+      "2017": {
+        "return": 1.3451559232850698,
+        "sharpe": 2.433,
+        "maxdd": 0.2017
+      },
+      "2018": {
+        "return": 0.18472191124404724,
+        "sharpe": 0.733,
+        "maxdd": 0.1874
+      },
+      "2019": {
+        "return": 0.5685999166439348,
+        "sharpe": 1.59,
+        "maxdd": 0.2062
+      },
+      "2020": {
+        "return": 1.1468349925338925,
+        "sharpe": 2.309,
+        "maxdd": 0.1308
+      },
+      "2021": {
+        "return": 0.06479238779319196,
+        "sharpe": 0.357,
+        "maxdd": 0.293
+      },
+      "2022": {
+        "return": 0.2449271353206206,
+        "sharpe": 0.853,
+        "maxdd": 0.2883
+      },
+      "2023": {
+        "return": 0.18021475473524085,
+        "sharpe": 0.682,
+        "maxdd": 0.2967
+      },
+      "2024": {
+        "return": -0.04102175242756656,
+        "sharpe": 0.125,
+        "maxdd": 0.5883
+      },
+      "2025": {
+        "return": 0.2189507545717313,
+        "sharpe": 0.723,
+        "maxdd": 0.3162
+      },
+      "2026": {
+        "return": 0.4122970457682056,
+        "sharpe": 2.031,
+        "maxdd": 0.2077
+      }
+    },
+    "n_position_changes": 1505,
+    "trade_reasons": {
+      "signal": 1443,
+      "stop": 54,
+      "daily_loss": 8
+    },
+    "trades_per_year": 158.4,
+    "total_costs": 22041.97,
+    "total_funding_paid": 13876.02,
+    "avg_gross_leverage": 0.495,
+    "max_gross_leverage": 1.723,
+    "pct_days_in_market": 0.845,
+    "halted": false
   }
 }

@@ -90,6 +90,19 @@ Operator asked what raises CAGR while keeping Sharpe similar and max DD ≤ 75%.
 
 Notes: (1) hysteresis-hold is a genuine structural gain — going flat during 1-day trend wiggles paid a round trip of costs and forfeited exposure for nothing; holding recovers both, raising Sharpe AND lowering DD. (2) Removing dd-tiers is a real trade, not free: the tiers are the mechanism that turns a dead-regime bleed shallow (spec self-critique #1); without them the system holds full size while losing. (3) Selection-bias caveat: picking the best of 8 backtested variants inflates expected live performance — treat +37% as the optimistic edge of the range, not the central case. (4) A backtest max-DD is one draw of history; running the *backtest* to the DD budget (combo3x) means the *live* budget will be breached in a worse-than-history path. Leave headroom.
 
+### Exploration round 2 — capital-efficiency levers (no signal changes)
+
+| Variant (on combo2x) | CAGR | Sharpe | Max DD | Sharpe 2023+ | Costs (9.5y) |
+|---|---|---|---|---|---|
+| combo2x reference | +37.1% | 1.07 | 60.2% | +0.57 | $22,622 |
+| + band-edge rebalancing | +36.5% | 1.05 | 59.4% | +0.66 | $18,827 |
+| + cash yield 4% on unmargined equity | +42.1% | 1.17 | 59.4% | +0.66 | — |
+| **+ both** | **+41.9%** | **1.16** | **58.5%** | **+0.75** | $23,888 |
+| + both at 2× trading costs | +34.4% | 1.00 | 59.9% | +0.65 | — |
+| + both, conservative 2.5% yield | +40.1% | 1.12 | 58.8% | — | — |
+
+Notes: (1) **Cash yield is the material win** — the strategy averages ~0.4x gross, so ~85% of equity sits unencumbered; modeled at 4% on cash beyond a 25% margin assumption. Requires a cash-management layer in the build (sweep scheduling; verify the actually-accessible yield — CFM margin is USD, spot-side USDC rewards differ) and shrinks if rates fall (2.5% scenario given). (2) **Band-edge rebalancing is cost insurance, not a booster**: roughly CAGR-neutral at modeled costs (fee savings ≈ tracking drag) but it lifts the 2×-cost Sharpe 0.90 → 1.00 — it pays exactly when live costs run worse than modeled, which is the realistic failure mode on a thin venue. (3) Explicitly NOT pursued (overfitting or venue reality): signal additions/threshold tuning, funding-carry tilt, sentiment overlays, SOL/alt contracts (thin books, minimum-fee regime, short history).
+
 ## Recommendation
 
 Deploy-gate **PASS**. Proceed to the backend/frontend delta spec and build **at the Amendment A profile**, with these riders: (1) expectations per Amendment A — ~30% CAGR central case with ~50% drawdowns and red years (2021/2025-shaped) as a normal part of the deal; (2) BTC-only at launch per F-2; (3) funding telemetry from day one and §7-over-§6 precedence in the sizing engine per F-3/F-4; (4) the $1,500 halt ships as a malfunction circuit-breaker — removing it entirely was evaluated and adds nothing (identical backtest) while removing the debit/runaway backstop.

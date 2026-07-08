@@ -54,6 +54,9 @@ class Params:
     gross_cap: float = 2.0
     deadband_abs: float = 200.0
     deadband_frac: float = 0.05
+    band_edge_rebalance: bool = False  # trade to band edge, not to exact target
+    cash_yield_ann: float = 0.0        # yield on cash not posted as margin
+    margin_frac: float = 0.25          # assumed initial margin as fraction of gross notional
     # stops (section 5)
     atr_window: int = 14
     client_stop_atr: float = 2.0
@@ -232,6 +235,15 @@ def run_backtest(data: dict[str, pd.DataFrame], p: Params, start: str, end: str)
             E -= f
             total_funding += f
 
+        # ---- 2b) yield on cash not tied up as futures margin ----
+        if p.cash_yield_ann > 0:
+            gross_held = sum(
+                abs(states[s].contracts) * CONTRACT_MULT[s] * frames[s]["close"].loc[ts]
+                for s in ASSETS
+                if not np.isnan(frames[s]["close"].loc[ts])
+            )
+            E += (p.cash_yield_ann / DAYS_YEAR) * max(0.0, E - p.margin_frac * gross_held)
+
         # ---- 3) hard halt (or bust: equity wiped even with halt disabled) ----
         if (p.halt_frac > 0 and E <= p.halt_frac * p.initial_equity) or E <= 0:
             for s in ASSETS:
@@ -371,8 +383,16 @@ def run_backtest(data: dict[str, pd.DataFrame], p: Params, start: str, end: str)
                     continue
                 # dead-band applies to rebalances, not to full exits/entries from flat
                 is_exit = targets[s] == 0 or st.contracts == 0 or (targets[s] * st.contracts < 0)
-                if not is_exit and abs(delta) * mult * row["close"] < max(p.deadband_abs, p.deadband_frac * E):
+                band_notional = max(p.deadband_abs, p.deadband_frac * E)
+                if not is_exit and abs(delta) * mult * row["close"] < band_notional:
                     continue
+                if not is_exit and p.band_edge_rebalance:
+                    # rebalance only to the nearest edge of the no-trade band
+                    band_n = math.floor(band_notional / (mult * row["close"]))
+                    if band_n >= 1:
+                        edge = targets[s] - band_n if delta > 0 else targets[s] + band_n
+                        if (delta > 0 and edge > st.contracts) or (delta < 0 and edge < st.contracts):
+                            delta = edge - st.contracts
                 cost = trade_cost(delta, row["close"], mult, p)
                 E -= cost
                 total_costs += cost
