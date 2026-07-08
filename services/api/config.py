@@ -467,6 +467,78 @@ class APISettings(BaseSettings):
         ),
     )
 
+    # --- Coinbase market data worker (crypto-pivot C0-B2a, delta spec §3.2) --
+    #
+    # The `CoinbaseMarketDataWorker` (services/data/coinbase_market_data.py)
+    # replaces the retired bar_sync worker as the market-data layer: public
+    # WS ticker marks for the 30s risk loop, hourly CDE funding capture into
+    # `funding_rates`, daily `product_metadata` snapshots, spot daily-bar
+    # sampling at 00:00 UTC, and the 3-minute staleness watchdog (strategy
+    # §7 outage detection). No API keys — all endpoints are public; auth
+    # enters only with the §3.1 execution adapter.
+    coinbase_market_data_enabled: bool = Field(
+        default=True,
+        description=(
+            "When False, the api lifespan skips CoinbaseMarketDataWorker "
+            "startup. Marks/funding/metadata capture stop; the risk loop's "
+            "own staleness handling covers the trading side."
+        ),
+    )
+    coinbase_rest_base_url: str = Field(
+        default="https://api.coinbase.com",
+        description=(
+            "Base URL for the public Advanced Trade REST endpoints "
+            "(/api/v3/brokerage/market/**). Override for tests/sandbox."
+        ),
+    )
+    coinbase_ws_url: str = Field(
+        default="wss://advanced-trade-ws.coinbase.com",
+        description="Public Advanced Trade WebSocket URL (ticker channel).",
+    )
+    coinbase_market_data_tick_interval_seconds: float = Field(
+        default=30.0,
+        gt=0.0,
+        le=300.0,
+        description=(
+            "Cadence of the worker's periodic tick (staleness check + "
+            "hourly/daily job due-checks). 30s matches the risk-loop "
+            "cadence the marks feed."
+        ),
+    )
+    coinbase_market_data_stale_threshold_seconds: float = Field(
+        default=180.0,
+        gt=0.0,
+        le=3600.0,
+        description=(
+            "Mark age past which a product counts as stale (strategy §7 "
+            "locked: 3 minutes). Changing this is a strategy-doc amendment, "
+            "not a tuning knob."
+        ),
+    )
+    coinbase_market_data_stale_realert_cooldown_seconds: float = Field(
+        default=900.0,
+        gt=0.0,
+        description=(
+            "Minimum seconds between repeated P2 staleness alerts while "
+            "marks stay continuously stale (A22-style alert throttling)."
+        ),
+    )
+    coinbase_market_data_startup_grace_seconds: float = Field(
+        default=180.0,
+        ge=0.0,
+        description=(
+            "Grace period after worker start before never-ticked products "
+            "count as stale — lets the first WS connect land without a "
+            "boot-time false alarm."
+        ),
+    )
+    coinbase_market_data_http_timeout_seconds: float = Field(
+        default=30.0,
+        gt=0.0,
+        le=600.0,
+        description="Per-request timeout on the public REST calls.",
+    )
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> APISettings:

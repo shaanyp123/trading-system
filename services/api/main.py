@@ -1452,12 +1452,240 @@ async def _stop_heartbeat_probe(state: tuple[object, object] | None) -> None:
         log.exception("heartbeat_probe_task_join_failed")
 
 
+def _build_coinbase_market_data_alert_dispatch_hook(
+    settings: APISettings,
+) -> object | None:
+    """Construct the market-data worker's ``alert_hook`` closure or return None.
+
+    Crypto-pivot C0-B2a (delta spec §3.2). The worker emits
+    :class:`CoinbaseMarketDataAlertDescriptor` from two seams: the
+    3-minute staleness watchdog (P2 ``broker_disconnect`` — remapped to
+    "Coinbase WS/REST outage" per §3.8) and the hourly funding logger's
+    consecutive-miss policy (P2 ``data_quality_reject``). With the hook
+    wired, each descriptor becomes an ``alerts`` row INSERT + a
+    ``dispatch_alert`` Discord #alerts push. Without it (sops
+    ``discord.webhook_urls.alerts`` unpopulated), the worker logs
+    ``coinbase_market_data_alert_dropped_no_hook`` and drops — same
+    skip semantics as the recon/monitor hooks (and the retired bar_sync
+    hook this builder is a pattern-mirror of).
+
+    Returns ``object | None`` to dodge circular imports; the concrete
+    signature is
+    :class:`services.data.coinbase_market_data.MarketDataAlertDispatchHook`.
+    """
+    from services.data.coinbase_market_data_alerts import CoinbaseMarketDataAlertDescriptor
+    from services.webhook_pusher.dispatcher import dispatch_alert
+    from services.webhook_pusher.payloads import (
+        AlertCategory,
+        AlertSeverity,
+        ChannelName,
+        EmailIdentity,
+    )
+
+    if settings.discord_webhook_url_alerts is None:
+        log.warning(
+            "coinbase_market_data_alert_dispatch_hook_skipped_no_webhook_url",
+            note=(
+                "discord.webhook_urls.alerts not in sops; the market-data "
+                "worker will still emit structured "
+                "`coinbase_market_data_alert_dropped_no_hook` WARNING logs "
+                "for staleness + funding-miss alerts, but no Discord "
+                "#alerts push will fire. Wire the sops field + restart api."
+            ),
+        )
+        return None
+
+    webhook_urls: dict[ChannelName, str] = {
+        ChannelName.DISCORD_ALERTS: settings.discord_webhook_url_alerts.get_secret_value(),
+    }
+    if settings.discord_webhook_url_critical is not None:
+        webhook_urls[ChannelName.DISCORD_CRITICAL] = (
+            settings.discord_webhook_url_critical.get_secret_value()
+        )
+
+    # Market-data alerts are P2-only by spec (MARKET_DATA_ALERT_SEVERITY);
+    # P2 routes to #alerts only. Email is wired if the resend fields are
+    # populated so a future severity escalation is already plumbed.
+    email_identity: EmailIdentity | None = None
+    if (
+        settings.resend_api_key is not None
+        and settings.resend_from_address is not None
+        and settings.resend_to_address is not None
+    ):
+        email_identity = EmailIdentity(
+            from_address=settings.resend_from_address,
+            to_address=settings.resend_to_address,
+            resend_api_key=settings.resend_api_key.get_secret_value(),
+        )
+
+    log.info(
+        "coinbase_market_data_alert_dispatch_hook_constructed",
+        channels=[c.value for c in webhook_urls],
+        email_wired=email_identity is not None,
+    )
+
+    audit_env = _audit_env_from_settings(settings)
+
+    async def _hook(descriptor: CoinbaseMarketDataAlertDescriptor) -> None:
+        """Per-alert: INSERT alerts row + dispatch via webhook_pusher.
+
+        Resolves account_id at fire time (missing-account boot state
+        doesn't break hook construction). Market-data alerts have no
+        audit-event upstream — ``triggering_audit_event_uuid`` stays
+        NULL, matching the monitor + retired-bar_sync surfaces. Hook
+        failures propagate to the worker's ``_dispatch_alert``
+        catch-and-log so a Discord 5xx never wedges a tick.
+        """
+        session_factory = api_db.get_session_factory()
+        async with session_factory() as repo_session:
+            repo = PostgresPhase1QueryRepo(repo_session)
+            account_id = await repo.fetch_active_account_id()
+        if account_id is None:
+            log.warning(
+                "coinbase_market_data_alert_dispatch_skipped_no_account",
+                note=(
+                    "market-data worker fired a P2 alert descriptor but no "
+                    "active account is provisioned; alerts row INSERT would "
+                    "violate the NOT NULL FK to accounts. Run /setup + "
+                    "restart api."
+                ),
+                severity=descriptor.severity,
+                category=descriptor.category,
+            )
+            return
+
+        # Defense-in-depth: validate against the locked enums at the wire
+        # boundary (Literal types constrain the descriptor upstream).
+        AlertSeverity(descriptor.severity)
+        AlertCategory(descriptor.category)
+
+        message_text = f"{descriptor.title}\n\n{descriptor.body}"
+        async with session_factory() as ins_session:
+            row = (
+                await ins_session.execute(
+                    text(
+                        "INSERT INTO alerts ("
+                        "    account_id, severity, category, message, detail"
+                        ") VALUES ("
+                        "    :acct, :sev, :cat, :msg, CAST(:detail AS JSONB)"
+                        ") RETURNING id"
+                    ),
+                    {
+                        "acct": account_id,
+                        "sev": descriptor.severity,
+                        "cat": descriptor.category,
+                        "msg": message_text,
+                        "detail": json.dumps(descriptor.payload),
+                    },
+                )
+            ).fetchone()
+            assert row is not None
+            alert_id = UUID(str(row.id))
+            await ins_session.commit()
+
+        log.info(
+            "coinbase_market_data_alert_inserted",
+            alert_id=str(alert_id),
+            severity=descriptor.severity,
+            category=descriptor.category,
+            account_id=str(account_id),
+            env=audit_env,
+        )
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as http_client:
+            async with session_factory() as disp_session:
+                report = await dispatch_alert(
+                    session=disp_session,
+                    alert_id=alert_id,
+                    http_client=http_client,
+                    webhook_urls=webhook_urls,
+                    email_identity=email_identity,
+                )
+        log.info(
+            "coinbase_market_data_alert_dispatched",
+            alert_id=str(alert_id),
+            short_circuited=report.short_circuited,
+            delivery_status=dict(report.delivery_status),
+        )
+
+    return _hook
+
+
+async def _start_coinbase_market_data_worker(
+    settings: APISettings,
+) -> tuple[object, object] | None:
+    """Spawn the Coinbase market-data worker; return (worker, task) or None.
+
+    Crypto-pivot C0-B2a (delta spec §3.2). Unlike the retired bar_sync
+    worker this needs NO broker credentials and NO active accounts row
+    to start — the WS ticker + funding/metadata capture are public-
+    endpoint reads and the DB tables it writes have no account FK. The
+    alert hook resolves account_id at fire time.
+    """
+    if not settings.coinbase_market_data_enabled:
+        log.warning("coinbase_market_data_worker_disabled_via_setting")
+        return None
+    from services.data.coinbase_market_data import (
+        CoinbaseMarketDataConfig,
+        CoinbaseMarketDataWorker,
+    )
+
+    config = CoinbaseMarketDataConfig(
+        rest_base_url=settings.coinbase_rest_base_url,
+        ws_url=settings.coinbase_ws_url,
+        tick_interval_s=settings.coinbase_market_data_tick_interval_seconds,
+        stale_threshold_s=settings.coinbase_market_data_stale_threshold_seconds,
+        stale_realert_cooldown_s=(settings.coinbase_market_data_stale_realert_cooldown_seconds),
+        startup_grace_s=settings.coinbase_market_data_startup_grace_seconds,
+        http_timeout_s=settings.coinbase_market_data_http_timeout_seconds,
+    )
+    alert_hook = _build_coinbase_market_data_alert_dispatch_hook(settings)
+    worker = CoinbaseMarketDataWorker(
+        config=config,
+        session_factory=api_db.get_session_factory(),
+        alert_hook=alert_hook,  # type: ignore[arg-type]
+    )
+    task = asyncio.create_task(worker.run_forever(), name="coinbase_market_data.run_forever")
+    log.info(
+        "coinbase_market_data_worker_spawned",
+        ws_url=settings.coinbase_ws_url,
+        rest_base_url=settings.coinbase_rest_base_url,
+        alert_dispatch_hook_wired=alert_hook is not None,
+    )
+    return worker, task
+
+
+async def _stop_coinbase_market_data_worker(state: tuple[object, object] | None) -> None:
+    """Request stop + await the market-data worker task. Best-effort."""
+    if state is None:
+        return
+    worker, task = state
+    try:
+        worker.request_stop()  # type: ignore[attr-defined]
+    except Exception:
+        log.exception("coinbase_market_data_request_stop_failed")
+    try:
+        await asyncio.wait_for(task, timeout=15.0)  # type: ignore[arg-type]
+    except TimeoutError:
+        log.warning("coinbase_market_data_shutdown_timeout")
+        task.cancel()  # type: ignore[attr-defined]
+        try:
+            await task  # type: ignore[misc]
+        except asyncio.CancelledError:
+            log.info("coinbase_market_data_shutdown_cancelled")
+        except Exception:
+            log.exception("coinbase_market_data_shutdown_unclean")
+    except Exception:
+        log.exception("coinbase_market_data_task_join_failed")
+
+
 async def _start_async_task_monitor(
     settings: APISettings,
     *,
     order_placement: tuple[object, object] | None,
     reconciliation: tuple[object, object] | None,
     heartbeat_probe: tuple[object, object] | None,
+    coinbase_market_data: tuple[object, object] | None = None,
     monitor_alert_hook: object | None = None,
     task_death_alert_hook: object | None = None,
 ) -> tuple[object, object] | None:
@@ -1484,6 +1712,7 @@ async def _start_async_task_monitor(
         order_placement=order_placement,
         reconciliation=reconciliation,
         heartbeat_probe=heartbeat_probe,
+        coinbase_market_data=coinbase_market_data,
     )
 
     ibkr_error_tracker = _build_ibkr_error_tracker(order_placement, monitor_alert_hook)
@@ -1644,6 +1873,7 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     worker_state: tuple[object, object] | None = None
     recon_state: tuple[object, object] | None = None
     heartbeat_probe_state: tuple[object, object] | None = None
+    coinbase_market_data_state: tuple[object, object] | None = None
     async_task_monitor_state: tuple[object, object] | None = None
     try:
         try:
@@ -1677,6 +1907,13 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             # without the probe running.
             log.exception("heartbeat_probe_startup_failed")
         try:
+            coinbase_market_data_state = await _start_coinbase_market_data_worker(settings)
+        except Exception:
+            # Market-data worker startup is best-effort; the api serves
+            # requests without it (positions mark at avg_cost fallback and
+            # funding/metadata capture pauses until the next restart).
+            log.exception("coinbase_market_data_worker_startup_failed")
+        try:
             # The monitor MUST start AFTER the other 4 so it can
             # capture their final `(worker, task)` tuples (or `None`
             # for ones that failed to spawn). The monitor itself is
@@ -1703,6 +1940,7 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 order_placement=worker_state,
                 reconciliation=recon_state,
                 heartbeat_probe=heartbeat_probe_state,
+                coinbase_market_data=coinbase_market_data_state,
                 monitor_alert_hook=monitor_alert_hook,
                 task_death_alert_hook=task_death_alert_hook,
             )
@@ -1715,6 +1953,7 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     finally:
         log.info("api_stopping")
         await _stop_async_task_monitor(async_task_monitor_state)
+        await _stop_coinbase_market_data_worker(coinbase_market_data_state)
         await _stop_heartbeat_probe(heartbeat_probe_state)
         await _stop_reconciliation_scheduler(recon_state)
         await _stop_order_placement_worker(worker_state)

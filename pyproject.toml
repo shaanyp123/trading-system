@@ -41,7 +41,15 @@ dependencies = [
   # services/execution/ibkr_adapter.py to place + cancel + monitor IBKR
   # orders. Talks to the ib_gateway Docker container on port 4002 (paper)
   # / 4001 (live) using IBKR's TWS API protocol (NOT REST; binary framing).
+  # RETIRING: dies with the §3.1 coinbase adapter PR (crypto-pivot C0-B2b).
   "ib-async>=1.0.3",
+  # websockets (crypto-pivot C0-B2a): async client for the public Coinbase
+  # Advanced Trade WS ticker channel (services/data/coinbase_market_data.py
+  # — marks for the 30s risk loop, delta spec §3.2). Fully typed (py.typed);
+  # REST stays on httpx. Upper bound <14: coinbase-advanced-py (the §3.1
+  # execution adapter SDK, C0-B2b) pins websockets>=12,<14 — a >=14 pin
+  # here would make the two unresolvable in one environment.
+  "websockets>=12.0,<14.0",
 ]
 
 [project.optional-dependencies]

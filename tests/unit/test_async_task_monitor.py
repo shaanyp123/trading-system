@@ -91,11 +91,15 @@ class TestCollectTrackedTasks:
             reconciliation=None,
             heartbeat_probe=None,
         )
-        assert len(result) == 3
+        # 4th slot (coinbase_market_data) added by crypto-pivot C0-B2a;
+        # defaulted None so lifespan callers that fail its startup still
+        # produce the full tracked set.
+        assert len(result) == 4
         assert [t.name for t in result] == [
             "order_placement_worker.run_forever",
             "reconciliation_scheduler.run_forever",
             "heartbeat_probe.run_forever",
+            "coinbase_market_data.run_forever",
         ]
         assert all(t.task is None for t in result)
         assert all(t.expected_alive is False for t in result)

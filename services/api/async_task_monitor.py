@@ -121,6 +121,11 @@ DEFAULT_MONITOR_INTERVAL_SECONDS: Final[float] = 30.0
 DEFAULT_TASK_DEATH_ALLOW_LIST: Final[frozenset[str]] = frozenset(
     {
         "order_placement_worker.run_forever",
+        # Crypto-pivot C0-B2a: the market-data worker feeds the 30s risk
+        # loop's marks (delta spec §3.2) — silent death means the risk
+        # loop goes blind, so its death rates the alerts-row + Discord
+        # escalation, not just the ERROR log.
+        "coinbase_market_data.run_forever",
     }
 )
 
@@ -736,6 +741,7 @@ def collect_tracked_tasks(
     order_placement: tuple[object, object] | None,
     reconciliation: tuple[object, object] | None,
     heartbeat_probe: tuple[object, object] | None,
+    coinbase_market_data: tuple[object, object] | None = None,
 ) -> tuple[TrackedTask, ...]:
     """Build the canonical TrackedTask tuple from lifespan state.
 
@@ -745,7 +751,9 @@ def collect_tracked_tasks(
     them as not-spawned at startup but doesn't probe them per-cycle).
 
     The argument order matches the lifespan's ordering for log
-    consistency: order_placement → reconciliation → heartbeat_probe.
+    consistency: order_placement → reconciliation → heartbeat_probe →
+    coinbase_market_data (crypto-pivot C0-B2a; defaulted None so
+    pre-existing call sites stay valid).
     """
     return (
         TrackedTask(
@@ -762,6 +770,11 @@ def collect_tracked_tasks(
             name="heartbeat_probe.run_forever",
             task=_extract_task(heartbeat_probe),
             expected_alive=heartbeat_probe is not None,
+        ),
+        TrackedTask(
+            name="coinbase_market_data.run_forever",
+            task=_extract_task(coinbase_market_data),
+            expected_alive=coinbase_market_data is not None,
         ),
     )
 
