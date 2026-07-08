@@ -90,7 +90,6 @@ jobs:
               - 'scripts/check_dockerfile_deps_against_pyproject.py'
             python_backend:
               - 'services/**'
-              - 'strategies/**'
               - 'research/**'
               - 'infrastructure/**'
               - 'tests/**'
@@ -118,7 +117,6 @@ jobs:
             api:
               - 'services/**'
               - 'infrastructure/**'
-              - 'strategies/**'
               - 'alembic/**'
               - 'alembic.ini'
               - 'scripts/**'
@@ -220,7 +218,7 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
       - run: pip install -e ".[dev]"
-      - run: mypy services infrastructure strategies scripts research
+      - run: mypy services infrastructure scripts research
 
   test:
     name: test (pytest --cov)

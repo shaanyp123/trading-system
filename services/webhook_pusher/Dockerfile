@@ -61,7 +61,6 @@ WORKDIR /build
 COPY pyproject.toml README.md ./
 COPY services/__init__.py services/
 COPY infrastructure/__init__.py infrastructure/
-COPY strategies/__init__.py strategies/
 
 # Pre-resolve runtime deps into the venv.
 #

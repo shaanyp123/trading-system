@@ -18,24 +18,24 @@ from services.api.position_mtm import PositionMtmResult, compute_position_mtm
 
 
 class TestComputePositionMtm:
-    def test_known_futures_market_falls_back_to_avg_cost(self) -> None:
-        result = compute_position_mtm("/M2K", 1, Decimal("2925"))
+    def test_known_crypto_market_falls_back_to_avg_cost(self) -> None:
+        result = compute_position_mtm("BTC", 1, Decimal("50000"))
         assert result == PositionMtmResult(
-            current_price=Decimal("2925"),
+            current_price=Decimal("50000"),
             unrealized_pnl=Decimal("0"),
             source="fallback_avg_cost",
             price_as_of=None,
         )
 
-    def test_known_etf_market_falls_back_to_avg_cost(self) -> None:
-        result = compute_position_mtm("TLT", 100, Decimal("83.50"))
+    def test_second_crypto_market_falls_back_to_avg_cost(self) -> None:
+        result = compute_position_mtm("ETH", 100, Decimal("83.50"))
         assert result.current_price == Decimal("83.50")
         assert result.unrealized_pnl == Decimal("0")
         assert result.source == "fallback_avg_cost"
         assert result.price_as_of is None
 
     def test_short_position_also_falls_back(self) -> None:
-        result = compute_position_mtm("/MGC", -1, Decimal("2400"))
+        result = compute_position_mtm("ETH", -1, Decimal("2400"))
         assert result.current_price == Decimal("2400")
         assert result.unrealized_pnl == Decimal("0")
         assert result.source == "fallback_avg_cost"

@@ -20,7 +20,7 @@ Runs during the live-money cutover ceremony (per
          supplied ``parameter_set_hash`` + ``parameters`` JSONB (the
          live-cutover "copy paper's head" path; operator extracts from
          paper's DB).
-       * ``--mint-from-defaults`` — build the baseline V1 row from the
+       * ``--mint-from-defaults`` — build the baseline row from the
          canonical defaults and MINT its ``parameter_set_hash`` via
          ``services/version/composite_hash.py`` (the paper-seed path; no
          JSON file needed). Stored ``parameters`` carries all canonical keys
@@ -100,7 +100,7 @@ Usage::
         --no-dry-run --confirm
 
     # Paper seed (CORRECT invocation) — seed ONLY the parameter_sets head row
-    # from the canonical V1 defaults, skipping the account + risk_state inserts.
+    # from the canonical Amendment B defaults, skipping the account + risk_state inserts.
     # USE --seed-params-only on any already-bootstrapped env: the live paper
     # account's external_account_id is 'operator', NOT the IBKR number, so a
     # plain --mint-from-defaults run (without --seed-params-only) would create a
@@ -149,8 +149,8 @@ import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from services.risk.crypto_parameters import default_crypto_parameters
 from services.version.composite_hash import OPERATOR_ONLY_FLAG_KEYS, compute_parameter_set_hash
-from strategies.v1_trend_following.parameters import default_v1_parameters
 
 log = structlog.get_logger()
 
@@ -240,8 +240,8 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help=(
-            "Build the baseline V1 parameter_sets row from the canonical V1 "
-            "defaults (strategies/v1_trend_following) and mint its "
+            "Build the baseline parameter_sets row from the canonical "
+            "Amendment B crypto defaults (services/risk/crypto_parameters) and mint its "
             "parameter_set_hash via services/version/composite_hash.py, then "
             "INSERT idempotently. The stored 'parameters' carries all canonical "
             "keys including STRATEGY_DECOMMISSIONED + EXIT_AUTO_APPROVE = False; "
@@ -315,7 +315,7 @@ def parse_args(argv: list[str]) -> ParsedArgs:
     ):
         raise ValueError(
             "--seed-params-only requires a parameter-set source: pass "
-            "--mint-from-defaults (build from canonical V1 defaults) or "
+            "--mint-from-defaults (build from canonical Amendment B defaults) or "
             "--parameter-set-json <file> (load a pre-extracted row). Without one "
             "there is nothing to seed."
         )
@@ -367,24 +367,25 @@ def load_parameter_set_json(path: Path) -> ParameterSetPayload:
 
 
 def build_baseline_parameter_set_payload() -> ParameterSetPayload:
-    """Mint the baseline V1 ``parameter_sets`` row from the canonical defaults.
+    """Mint the baseline ``parameter_sets`` row from the canonical defaults.
 
-    Used by ``--mint-from-defaults`` to seed paper's head row (design §7 PR-A,
-    §11 Q5-A). Two load-bearing invariants:
+    Crypto-pivot C0-B4: the defaults are the Amendment B crypto profile
+    (``services.risk.crypto_parameters``); the V1 defaults died with
+    ``strategies/v1_trend_following``. Two load-bearing invariants
+    (unchanged from the V1-era design §7 PR-A, §11 Q5-A):
 
-    * **Stored ``parameters`` carries ALL canonical keys** — the
-      ``V1Parameters.to_canonical_dict()`` shape (UPPER_CASE keys,
-      decimals-as-strings) including both operator-only flags at their SAFE
-      default ``False`` (locked L2). They render as the string ``"False"`` and
-      round-trip to ``False`` via the trigger_v1_cycle / lean ``_coerce_bool_param``
-      readers (``str(value).strip().lower() == "true"``).
+    * **Stored ``parameters`` carries ALL canonical keys** — UPPER_CASE
+      keys, decimals-as-strings, including both operator-only flags at
+      their SAFE default ``False`` (locked L2). They render as the
+      string ``"False"`` and round-trip to ``False`` via
+      ``str(value).strip().lower() == "true"`` readers.
     * **The hash EXCLUDES the two flags** —
       :func:`services.version.composite_hash.compute_parameter_set_hash` hashes
       only the Parameter-Ranges-Table subset (design §11 Q1-A). This is what lets
       the §10.3 decommission ceremony flip ``STRATEGY_DECOMMISSIONED`` with an
       in-place ``parameters`` UPDATE that does NOT change the content-hash PK.
     """
-    canonical = default_v1_parameters().to_canonical_dict()
+    canonical = default_crypto_parameters()
     parameter_set_hash = compute_parameter_set_hash(canonical)
     return ParameterSetPayload(parameter_set_hash=parameter_set_hash, parameters=dict(canonical))
 

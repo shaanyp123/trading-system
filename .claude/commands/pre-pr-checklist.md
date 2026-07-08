@@ -47,7 +47,7 @@ If ANY changed file matches: output **"⚠️ This PR requires the `risk-review-
 
 ### 3. Hot-fix-whitelist annotation
 
-For each changed file, check whether it's on the hot-fix whitelist (`services/api/**`, `services/data/**`, `strategies/**`, `lean/**`, `watchdog/**`, `scripts/operator_tools/**`, `.github/**`, `deploy/**`). If yes: note "hot-fix scope; no `risk-review-approved` label required" for transparency in the PR description.
+For each changed file, check whether it's on the hot-fix whitelist (`services/api/**`, `services/data/**`, `watchdog/**`, `scripts/operator_tools/**`, `.github/**`, `deploy/**`). If yes: note "hot-fix scope; no `risk-review-approved` label required" for transparency in the PR description.
 
 ### 4. Test status
 
@@ -63,7 +63,7 @@ Report each as ☑ pass / ☐ fail / ⊘ skipped. **A PR MUST NOT be opened if a
 
 Check whether the changes warrant any of:
 - New entry in `Docs/decisions-log.md` (if this PR deviates from a spec OR introduces a new canonical pattern)
-- Updated row in `Docs/file-index.md` (if this PR creates a new tracked file in `services/`, `lean/`, `apps/`, `scripts/`, `deploy/`, `tests/`)
+- Updated row in `Docs/file-index.md` (if this PR creates a new tracked file in `services/`, `apps/`, `scripts/`, `deploy/`, `tests/`)
 - Updated `Docs/recent-architecture-changes.md` (if this PR is part of an architecture pivot)
 - New entry in `Docs/claude-setup-overhaul.md` (if this PR is a meta-tooling change)
 

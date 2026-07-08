@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
@@ -43,8 +42,8 @@ from scripts.operator_tools.bootstrap_live_account import (
     main,
     parse_args,
 )
+from services.risk.crypto_parameters import default_crypto_parameters
 from services.version.composite_hash import compute_parameter_set_hash
-from strategies.v1_trend_following.parameters import default_v1_parameters
 
 _HEX = set("0123456789abcdef")
 
@@ -236,20 +235,10 @@ class TestMainExits:
 # --mint-from-defaults: baseline payload minting
 # ---------------------------------------------------------------------------
 
-_CANONICAL_KEYS = {
-    "LOOKBACK_DAYS_DONCHIAN",
-    "MA_FAST_DAYS",
-    "MA_SLOW_DAYS",
-    "EFFICIENCY_RATIO_THRESHOLD",
-    "STOP_DISTANCE_ATR_MULT",
-    "ATR_LOOKBACK_DAYS",
-    "MIN_HOLDING_DAYS",
-    "VOL_TARGET_PCT_ANNUAL",
-    "INSTRUMENT_VOL_LOOKBACK_DAYS",
-    "ROLL_DAYS_BEFORE_EXPIRY",
-    "STRATEGY_DECOMMISSIONED",
-    "EXIT_AUTO_APPROVE",
-}
+# Crypto-pivot C0-B4: the canonical key set is the Amendment B profile
+# (services/risk/crypto_parameters); the V1 key set died with
+# strategies/v1_trend_following.
+_CANONICAL_KEYS = set(default_crypto_parameters())
 
 
 class TestBuildBaselineParameterSetPayload:
@@ -259,29 +248,27 @@ class TestBuildBaselineParameterSetPayload:
         assert len(payload.parameter_set_hash) == 64
         assert set(payload.parameter_set_hash) <= _HEX
 
-    def test_stored_parameters_carry_all_twelve_canonical_keys(self) -> None:
+    def test_stored_parameters_carry_all_canonical_keys(self) -> None:
         payload = build_baseline_parameter_set_payload()
         assert set(payload.parameters) == _CANONICAL_KEYS
-        assert len(payload.parameters) == 12
 
     def test_both_flags_stored_false(self) -> None:
-        """Stored as the to_canonical_dict() string shape; round-trips to False
-        via the trigger_v1_cycle _coerce_bool_param reader
-        (str("False").lower() != "true")."""
+        """Stored as the canonical string shape; round-trips to False via
+        str("False").lower() != "true" readers."""
         payload = build_baseline_parameter_set_payload()
         assert payload.parameters["STRATEGY_DECOMMISSIONED"] == "False"
         assert payload.parameters["EXIT_AUTO_APPROVE"] == "False"
 
     def test_hash_matches_composite_hash_of_canonical_defaults(self) -> None:
         payload = build_baseline_parameter_set_payload()
-        expected = compute_parameter_set_hash(default_v1_parameters().to_canonical_dict())
+        expected = compute_parameter_set_hash(default_crypto_parameters())
         assert payload.parameter_set_hash == expected
 
     def test_hash_unchanged_when_strategy_decommissioned_flips(self) -> None:
         """The load-bearing invariant: the seed row's PK survives the §10.3
         in-place decommission UPDATE because the hash excludes the flag."""
         payload = build_baseline_parameter_set_payload()
-        flipped = replace(default_v1_parameters(), strategy_decommissioned=True).to_canonical_dict()
+        flipped = dict(default_crypto_parameters(), STRATEGY_DECOMMISSIONED="True")
         assert flipped["STRATEGY_DECOMMISSIONED"] == "True"
         assert compute_parameter_set_hash(flipped) == payload.parameter_set_hash
 

@@ -11,11 +11,8 @@ Phase 0 + post-pivot surface (the four endpoints the bot hits):
     Returns :class:`KillSwitchInvokeResponse` on 200 OR raises
     :class:`ApiClientHTTPError` on non-2xx (carrying the canonical
     ``ErrorEnvelope`` payload).
-  * :meth:`ApiClient.approve_signal` →
-    ``POST /api/signals/{signal_id}/approve``
-    Returns :class:`SignalApproveResponse` on 200; raises
-    :class:`ApiClientHTTPError` on non-2xx. Used by the ``/approve``
-    slash command for operator-from-Discord signal approval.
+  * ``approve_signal`` — RETIRED (crypto-pivot C0-B4: announce-only
+    Discord per delta spec §3.8; no per-trade approval).
 
 Auth: bearer token in ``Authorization: Bearer <token>`` header for every
 request. The api-side ``BotAuthMiddleware`` validates the token and on
@@ -192,44 +189,6 @@ class KillSwitchInvokeResponse(BaseModel):
     severity: Literal["routine", "defensive_envelope", "incident_review"] | None = None
 
 
-class SignalApprovePayload(BaseModel):
-    """``POST /api/signals/{signal_id}/approve`` request body.
-
-    Mirrors ``services/api/schemas/signals.SignalApproveRequest`` —
-    ``override_size`` is optional; None means "use the planner-emitted
-    target_contracts". The Discord-side ``/approve`` command does NOT
-    surface override_size today (Phase 1+ enhancement) — the bot always
-    sends None and trusts the planner's target.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    override_size: int | None = None
-
-
-class SignalApproveResponse(BaseModel):
-    """``POST /api/signals/{signal_id}/approve`` 200 response.
-
-    Mirrors the dict shape returned by
-    ``services/api/routes/signals.approve_signal``. The OrderPlacementWorker
-    picks up the approved signal within ``API_ORDER_PLACEMENT_POLL_INTERVAL``
-    seconds (5s default) and forwards to IBKR.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    signal_id: str
-    new_status: str
-    audit_event_uuid: str
-    audit_sequence_no: int
-    intent_to_place_order: bool
-
-
-# ---------------------------------------------------------------------------
-# Errors
-# ---------------------------------------------------------------------------
-
-
 class ApiClientError(Exception):
     """Base class for api-client errors."""
 
@@ -342,34 +301,6 @@ class ApiClient:
             self._raise_for_response(response)
         return PositionsResponse.model_validate(response.json())
 
-    async def approve_signal(
-        self,
-        signal_id: str,
-        *,
-        override_size: int | None = None,
-    ) -> SignalApproveResponse:
-        """``POST /api/signals/{signal_id}/approve``.
-
-        Raises :class:`ApiClientHTTPError` on non-2xx — typically
-        ``SIGNAL_NOT_FOUND`` (404) when the signal_id is bogus or
-        ``SIGNAL_NOT_PENDING`` (409) when the operator approves a signal
-        that's already been actioned (a fast-double-click race).
-
-        ``signal_id`` is a string here rather than UUID so the caller can
-        pass operator-typed values straight through; UUID validation
-        happens at the api boundary via FastAPI's path-param parser
-        (returns 422 on malformed). The Discord command pre-validates
-        client-side to give a friendlier error before the round-trip.
-        """
-        payload = SignalApprovePayload(override_size=override_size)
-        response = await self._client.post(
-            f"/api/signals/{signal_id}/approve",
-            json=payload.model_dump(),
-        )
-        if response.status_code != 200:
-            self._raise_for_response(response)
-        return SignalApproveResponse.model_validate(response.json())
-
     async def invoke_kill_switch(
         self,
         *,
@@ -469,6 +400,4 @@ __all__ = [
     "KillSwitchInvokeResponse",
     "PositionRow",
     "PositionsResponse",
-    "SignalApprovePayload",
-    "SignalApproveResponse",
 ]

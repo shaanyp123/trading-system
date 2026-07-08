@@ -79,7 +79,6 @@ dev = [
 packages = [
   "services",
   "infrastructure",
-  "strategies",
 ]
 
 # ---------- ruff ----------
@@ -92,11 +91,6 @@ extend-exclude = [
   "Prompts",
   "apps",          # JS/TS
   "packages",      # JS/TS
-  # NOTE: "lean" also matches research/lean/** by ruff's gitignore-style
-  # semantics; kept post-C0 (top-level lean/ deleted 2026-07-08) so the
-  # research LEAN harness keeps its historical lint scope.
-  "lean",
-  "research/lean/projects",  # QC LEAN algorithms (AlgorithmImports *)
 ]
 
 [tool.ruff.lint]
@@ -126,11 +120,6 @@ ignore = [
 "services/api/entrypoint.py" = ["S104", "S603", "S606"]
 # Discord bot entrypoint also exec()s a known argv — same pattern.
 "services/discord_bot/entrypoint.py" = ["S603", "S606"]
-# research/lean drives LEAN via subprocess (lean CLI / docker run). argv is built
-# from known constants + validated paths (full exe resolved via shutil.which);
-# never shell=True. Same exemption as the service entrypoints above.
-"research/lean/images.py" = ["S603", "S607"]
-"research/lean/driver.py" = ["S603", "S607"]
 # Discord bot commands use `@app_commands.describe` decorator + nested
 # closures; B008 (Depends-style) doesn't apply but the decorator pattern
 # trips Ruff's "function call in argument default" check on the
@@ -156,8 +145,6 @@ exclude = [
   "Prompts/",
   "apps/",
   "packages/",
-  "lean/",
-  "research/lean/projects/",  # QC LEAN algorithms (AlgorithmImports * — like lean/)
   "alembic/versions/",   # generated migration files
 ]
 
@@ -204,7 +191,7 @@ markers = [
 # Enforced via `make test` once first service code lands; CI gate added in same PR.
 [tool.coverage.run]
 branch = true
-source = ["services", "infrastructure", "strategies"]
+source = ["services", "infrastructure"]
 omit = ["**/__init__.py", "**/main.py"]
 
 [tool.coverage.report]

@@ -53,7 +53,6 @@ from discord import app_commands
 
 from services.discord_bot.api_client import ApiClient
 from services.discord_bot.commands import (
-    register_approve,
     register_capital_event_commands,
     register_halt,
     register_positions,
@@ -143,12 +142,9 @@ class TradingBotClient(discord.Client):
             api_client=self._api_client,
             guild=self._guild,
         )
-        register_approve(
-            self._tree,
-            api_client=self._api_client,
-            environment=self._settings.environment,
-            guild=self._guild,
-        )
+        # Crypto-pivot C0-B4 (delta spec §3.8): /approve RETIRED —
+        # announce-only Discord per the operator mandate; trades are
+        # announced in #fills with signal rationale, never approved.
         register_capital_event_commands(
             self._tree,
             api_client=self._api_client,

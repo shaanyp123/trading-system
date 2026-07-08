@@ -36,7 +36,6 @@ from services.discord_bot.api_client import (
     HealthResponse,
     PositionRow,
     PositionsResponse,
-    SignalApproveResponse,
 )
 from services.discord_bot.embeds import (
     EMBED_COLOR_CRITICAL,
@@ -46,10 +45,6 @@ from services.discord_bot.embeds import (
     _format_et,
     _format_signed_decimal,
     _require_aware_utc,
-    build_approve_confirm_embed,
-    build_approve_error_embed,
-    build_approve_invalid_uuid_embed,
-    build_approve_success_embed,
     build_halt_confirm_embed,
     build_halt_invoke_error_embed,
     build_halt_invoke_success_embed,
@@ -452,138 +447,6 @@ class TestStatusEmbed:
     def test_returns_discord_embed(self) -> None:
         embed = build_status_embed(_ok_health(), now=self.NOW)
         assert isinstance(embed, discord.Embed)
-
-
-# ---------------------------------------------------------------------------
-# /approve embeds — invalid UUID + confirm + success + error variants
-# ---------------------------------------------------------------------------
-
-
-_VALID_UUID_FOR_EMBEDS = "12345678-1234-5678-1234-567812345678"
-
-
-class TestApproveInvalidUuidEmbed:
-    def test_title_marks_invalid(self) -> None:
-        embed = build_approve_invalid_uuid_embed(raw_signal_id="not-a-uuid")
-        assert "Invalid signal_id" in (embed.title or "")
-        assert embed.color.value == EMBED_COLOR_WARNING  # type: ignore[union-attr]
-
-    def test_truncates_long_garbage(self) -> None:
-        # Pasting a paragraph as signal_id shouldn't blow Discord's 256-char
-        # title limit. We truncate to 100 chars + "..." in the description.
-        long_garbage = "x" * 500
-        embed = build_approve_invalid_uuid_embed(raw_signal_id=long_garbage)
-        # Title doesn't carry the raw value (which would be ugly + risk
-        # exceeding the 256-char limit). Body carries truncated.
-        body = embed.description or ""
-        # "..." appended on truncation
-        assert "..." in body or len(long_garbage) < 100
-
-    def test_body_points_at_signals_channel(self) -> None:
-        embed = build_approve_invalid_uuid_embed(raw_signal_id="x")
-        assert "#signals" in (embed.description or "")
-
-
-class TestApproveConfirmEmbed:
-    def test_title_signal_id_visible(self) -> None:
-        embed = build_approve_confirm_embed(signal_id=_VALID_UUID_FOR_EMBEDS, environment="paper")
-        # The signal_id should be visible somewhere in the embed.
-        text_blob = (
-            (embed.title or "")
-            + (embed.description or "")
-            + " ".join((f.value or "") for f in embed.fields)
-        )
-        assert _VALID_UUID_FOR_EMBEDS in text_blob
-
-    def test_warning_color(self) -> None:
-        # Mirror of halt-confirm: warning color so the operator pauses.
-        embed = build_approve_confirm_embed(signal_id=_VALID_UUID_FOR_EMBEDS, environment="paper")
-        assert embed.color.value == EMBED_COLOR_WARNING  # type: ignore[union-attr]
-
-    def test_body_explains_side_effects(self) -> None:
-        embed = build_approve_confirm_embed(signal_id=_VALID_UUID_FOR_EMBEDS, environment="paper")
-        body = embed.description or ""
-        # Operator should know: audit event written + IBKR forward.
-        assert "audit" in body.lower()
-        assert "IBKR" in body or "ibkr" in body.lower()
-
-    def test_footer_carries_environment(self) -> None:
-        embed = build_approve_confirm_embed(
-            signal_id=_VALID_UUID_FOR_EMBEDS, environment="live-small"
-        )
-        # N2 — live-small (and live-scale) both map to env=LIVE per cutover
-        # plan §9 line 360. Binary visual cue for the operator.
-        assert "env=LIVE" in (embed.footer.text or "")
-
-
-class TestApproveSuccessEmbed:
-    @staticmethod
-    def _response(audit_seq: int = 42) -> SignalApproveResponse:
-        return SignalApproveResponse(
-            signal_id=_VALID_UUID_FOR_EMBEDS,
-            new_status="approved",
-            audit_event_uuid="aud-uuid-1",
-            audit_sequence_no=audit_seq,
-            intent_to_place_order=True,
-        )
-
-    def test_ok_color(self) -> None:
-        embed = build_approve_success_embed(environment="paper", response=self._response())
-        assert embed.color.value == EMBED_COLOR_OK  # type: ignore[union-attr]
-
-    def test_title_carries_short_signal_id(self) -> None:
-        embed = build_approve_success_embed(environment="paper", response=self._response())
-        # First 8 chars of the signal_id appear in the title.
-        assert _VALID_UUID_FOR_EMBEDS[:8] in (embed.title or "")
-
-    def test_body_shows_audit_event_uuid_and_seq(self) -> None:
-        embed = build_approve_success_embed(
-            environment="paper", response=self._response(audit_seq=99)
-        )
-        body = embed.description or ""
-        assert "aud-uuid-1" in body
-        assert "#99" in body
-
-    def test_body_points_at_fills_channel(self) -> None:
-        embed = build_approve_success_embed(environment="paper", response=self._response())
-        # Operator's next action is to watch #fills.
-        assert "#fills" in (embed.description or "")
-
-
-class TestApproveErrorEmbed:
-    def test_signal_not_found_special_case(self) -> None:
-        err = ApiClientHTTPError(
-            status_code=404,
-            error_code="SIGNAL_NOT_FOUND",
-            message="No such signal",
-        )
-        embed = build_approve_error_embed(environment="paper", error=err)
-        assert "Signal not found" in (embed.title or "")
-        assert embed.color.value == EMBED_COLOR_WARNING  # type: ignore[union-attr]
-        # Operator-actionable hint about the embed footer in #signals.
-        assert "#signals" in (embed.description or "")
-
-    def test_signal_not_pending_special_case(self) -> None:
-        err = ApiClientHTTPError(
-            status_code=409,
-            error_code="SIGNAL_NOT_PENDING",
-            message="Already actioned",
-        )
-        embed = build_approve_error_embed(environment="paper", error=err)
-        assert "Signal not pending" in (embed.title or "")
-        assert embed.color.value == EMBED_COLOR_WARNING  # type: ignore[union-attr]
-        assert "audit log" in (embed.description or "").lower()
-
-    def test_generic_error_renders_canonical_envelope(self) -> None:
-        err = ApiClientHTTPError(
-            status_code=503,
-            error_code="SERVICE_UNAVAILABLE",
-            message="db down",
-        )
-        embed = build_approve_error_embed(environment="paper", error=err)
-        assert "SERVICE_UNAVAILABLE" in (embed.title or "")
-        assert "db down" in (embed.description or "")
-        assert embed.color.value == EMBED_COLOR_CRITICAL  # type: ignore[union-attr]
 
 
 # ---------------------------------------------------------------------------
