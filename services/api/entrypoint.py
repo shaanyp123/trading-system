@@ -186,40 +186,25 @@ def main(argv: list[str] | None = None) -> int:
         if origin and not _looks_like_placeholder(origin):
             os.environ["API_WEBAUTHN_ORIGIN"] = origin
 
-    # Worker-PR-1 follow-up (post-pivot 2026-05-12): IBKR account number
-    # for the api-resident OrderPlacementWorker + EOD recon + bar_sync.
-    # Sourced from sops.
-    #
-    # CORRECTED 2026-05-29: IBKR PAPER accounts have a DISTINCT account id
-    # (e.g. ``DUQ825170``) from the live IBKR Pro account (e.g. ``U25655583``)
-    # — they are NOT "a single number across paper and live" as the prior
-    # comment claimed. The broker's ``reqPositions`` / account view is keyed
-    # on the env-specific number, so we must resolve the ENV-SPECIFIC key
-    # FIRST (``ibkr.paper_account`` for paper/dev, ``ibkr.live_account`` for
-    # live), falling back to the generic ``ibkr.account_number`` only when the
-    # env-specific key is unset/placeholder (single-account setups).
-    #
-    # The prior logic took ``account_number`` FIRST, which on the paper
-    # gateway silently mis-keyed every account-filtered ``get_positions()`` to
-    # the LIVE account number -> 0 broker positions -> nightly false-positive
-    # recon ``position_qty`` breaks + kill-switch halts, and a position-blind
-    # order-worker margin pre-check. See decisions-log 2026-05-29.
-    #
-    # When the resolved value is unset / placeholder the worker still starts
-    # but the IBKR adapter falls back to the default account on the TWS
-    # session.
-    if "API_IBKR_ACCOUNT" not in os.environ:
-        ibkr = secrets.get("ibkr") or {}
-        env_tag = os.environ.get("API_ENVIRONMENT") or os.environ.get("ENVIRONMENT", "dev")
-        # Env-specific account FIRST; generic ``account_number`` as fallback.
-        if env_tag in ("paper", "dev"):
-            primary: Any = ibkr.get("paper_account")
-        else:
-            primary = ibkr.get("live_account")
-        fallback: Any = ibkr.get("account_number")
-        acc: Any = primary if (primary and not _looks_like_placeholder(primary)) else fallback
-        if acc and not _looks_like_placeholder(acc):
-            os.environ["API_IBKR_ACCOUNT"] = str(acc)
+    # Crypto-pivot C0-B2b (delta spec §3.1): CDP API credentials for the
+    # authenticated Coinbase Advanced Trade surface (orders/fills/
+    # positions/balance) consumed by SdkCoinbaseBrokerClient. Sourced
+    # from sops ``coinbase.api_key_name`` + ``coinbase.api_private_key``.
+    # When unset / placeholder, nothing that trades can start (the §3.3
+    # strategy worker fails closed at construction); the public-endpoint
+    # market-data worker is unaffected. The IBKR TWS account mapping
+    # (``API_IBKR_ACCOUNT``) that lived here died with the IBKR
+    # execution layer; ``ibkr.flex_query_*`` below survives until the
+    # §3.5 Coinbase recon fetcher lands.
+    coinbase = secrets.get("coinbase") or {}
+    if "API_COINBASE_API_KEY_NAME" not in os.environ:
+        key_name: Any = coinbase.get("api_key_name")
+        if key_name and not _looks_like_placeholder(key_name):
+            os.environ["API_COINBASE_API_KEY_NAME"] = str(key_name)
+    if "API_COINBASE_API_PRIVATE_KEY" not in os.environ:
+        private_key: Any = coinbase.get("api_private_key")
+        if private_key and not _looks_like_placeholder(private_key):
+            os.environ["API_COINBASE_API_PRIVATE_KEY"] = str(private_key)
 
     # Worker-PR-3b follow-up (post-pivot 2026-05-12): IBKR FlexQuery
     # credentials for the api-resident ReconciliationScheduler. Sourced
