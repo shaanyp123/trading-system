@@ -22,7 +22,7 @@ from §4.1.3 remain deferred (Phase 2 surfaces).
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import datetime
 from decimal import Decimal
 from typing import Literal
 
@@ -368,79 +368,9 @@ class HeartbeatsResponse(BaseModel):
     server_now: datetime
 
 
-class BarSyncMarketResult(BaseModel):
-    """One market's outcome in the most-recent bar_sync cycle.
-
-    Mirrors :class:`services.data.bar_sync.MarketSyncResult`. ``success``
-    and ``error`` are mutually exclusive — a failed market carries the
-    error string + null metadata; a successful one carries bar counts.
-
-    ``open_interest`` is the futures front-month OI snapshot (null for
-    ETFs + failed syncs). ``open_interest_was_sentinel`` is True only when
-    the OI fetch returned 0 and the sentinel substitution fired — the
-    operator-visible signal that a market (e.g. a sidelined /MCL) is
-    trading on a synthesized OI rather than a real entitlement.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    market: str
-    success: bool
-    bars_written: int
-    last_session_date: date | None
-    front_month_expiry: str | None
-    error: str | None
-    open_interest: int | None
-    open_interest_was_sentinel: bool
-
-
-class BarSyncStatusResponse(BaseModel):
-    """Backend response for ``GET /api/system/bar-sync``.
-
-    Read-only projection of the in-memory
-    :class:`services.data.bar_sync.BarSyncWorker` state (mirrors the
-    heartbeat surface — no DB persistence; survives only until the next
-    api restart). Lets the operator answer "how did the last bar_sync
-    cycle go?" from the System page / Discord without SSHing to grep
-    journald.
-
-    ``status`` collapses the cycle into one operator-readable label:
-
-      * ``ok`` — last cycle completed with zero failed markets
-      * ``degraded`` — last cycle had ≥1 failed market (inspect
-        ``failed_markets`` + ``consecutive_failure_count``)
-      * ``pending`` — no cycle has run since the api last started (worker
-        disabled, or first cycle of the day hasn't fired yet). NOT a
-        fault on its own; ``worker_running`` distinguishes "scheduled but
-        not yet fired" (True) from "worker not started" (False).
-
-    When ``status="pending"`` the per-cycle fields (``cycle_*``,
-    ``duration_seconds``, market lists) are null/empty.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    status: Literal["ok", "degraded", "pending"]
-    worker_running: bool
-    last_fired_session_date_et: date | None
-    cycle_started_at_utc: datetime | None
-    cycle_completed_at_utc: datetime | None
-    duration_seconds: float | None
-    successful_count: int
-    failed_count: int
-    total_markets: int
-    consecutive_failure_count: int
-    consecutive_sentinel_count: int
-    successful_markets: list[BarSyncMarketResult]
-    failed_markets: list[BarSyncMarketResult]
-    server_now: datetime
-
-
 __all__ = [
     "AuditLogEntry",
     "AuditLogPageResponse",
-    "BarSyncMarketResult",
-    "BarSyncStatusResponse",
     "HeartbeatItem",
     "HeartbeatsResponse",
     "KillSwitchInvokeRequest",

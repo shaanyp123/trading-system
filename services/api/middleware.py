@@ -31,18 +31,6 @@ Day 23 addition (IG §3 Week 6 Thu):
     rejects with 401 + canonical envelope. No header → falls through to
     downstream middleware unchanged.
 
-Pivot-PR-A addition (post-pivot 2026-05-12):
-
-  * `LeanAuthMiddleware` — bearer-token authentication for the LEAN
-    Local container that runs the v1 trend-following algorithm on the
-    operator's VPS. Mirrors `BotAuthMiddleware` exactly except for: (a)
-    different config field (`lean_local_bearer_token`), (b) different
-    service-account identity (`lean-local`), (c) different state flag
-    (`is_lean_authenticated`). Distinct middleware (not a shared base
-    class) because the two service accounts have separate sops secrets;
-    keeping them independent means a compromise of one container can't
-    grant access via the other.
-
     Why both middlewares share the same `is_*_authenticated` style flag
     rather than a single `is_service_account_authenticated` flag: it
     makes log lines + debug introspection unambiguous about which auth
@@ -174,7 +162,6 @@ class CSRFMiddleware(BaseHTTPMiddleware):
             request.method in ("POST", "PUT", "PATCH", "DELETE")
             and request.url.path not in _CSRF_EXEMPT_PATHS
             and not getattr(request.state, "is_bot_authenticated", False)
-            and not getattr(request.state, "is_lean_authenticated", False)
         ):
             cookie_val = request.cookies.get(self._cookie_name)
             header_val = request.headers.get(self._header_name)
@@ -324,13 +311,6 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 #: two paths apart at a glance.
 _BOT_SERVICE_ACCOUNT_USER_ID = "discord-bot"
 
-#: Same convention for LEAN Local (Pivot-PR-A; post-pivot 2026-05-12). The
-#: LEAN container POSTs signal events via shared bearer; the audit-log
-#: writer records `actor_user_id = "lean-local"` for events originating
-#: from this path so investigation distinguishes "operator action via web"
-#: from "Discord bot action" from "LEAN signal arrival".
-_LEAN_SERVICE_ACCOUNT_USER_ID = "lean-local"
-
 
 class BotAuthMiddleware(BaseHTTPMiddleware):
     """Bearer-token auth for the Discord bot per backend-spec §6.6 + §4.4.
@@ -376,15 +356,6 @@ class BotAuthMiddleware(BaseHTTPMiddleware):
         request: Request,
         call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
-        # Pivot-PR-A defer-check: if LeanAuthMiddleware already accepted
-        # this bearer, BotAuth must NOT re-evaluate (the same Bearer header
-        # would inevitably mismatch the bot's distinct token and return
-        # 401, breaking the LEAN auth path). The same defer applies in
-        # the reverse direction (LeanAuth checks ``is_bot_authenticated``)
-        # so middleware ordering doesn't change the outcome.
-        if getattr(request.state, "is_lean_authenticated", False):
-            return await call_next(request)
-
         auth_header = request.headers.get("authorization", "")
         if not auth_header.lower().startswith("bearer "):
             return await call_next(request)
@@ -436,102 +407,6 @@ class BotAuthMiddleware(BaseHTTPMiddleware):
         request.state.is_bot_authenticated = True
         log.debug(
             "bot_auth_accepted",
-            path=request.url.path,
-        )
-        return await call_next(request)
-
-
-class LeanAuthMiddleware(BaseHTTPMiddleware):
-    """Bearer-token auth for the LEAN Local container (Pivot-PR-A; post-pivot 2026-05-12).
-
-    Behavior mirrors :class:`BotAuthMiddleware` with a distinct token + identity:
-
-      * No ``Authorization: Bearer ...`` header → pass through unchanged.
-        Downstream middleware (BotAuth → SessionStub) handles other paths.
-      * ``Authorization: Bearer <valid-token>`` (constant-time matched
-        against ``settings.lean_local_bearer_token``) → set
-        ``request.state.session = SessionContext(...)`` with service-account
-        identity (user_id=``lean-local``, role=``owner``, auth_strength=
-        ``strong``, is_phase0_stub=False) + ``request.state.is_lean_authenticated
-        = True``. Bypasses CSRF + SessionStub on later middleware.
-      * ``Authorization: Bearer <invalid-token>`` → fall through to
-        ``BotAuthMiddleware``. We do NOT 401 on a non-matching LEAN token
-        because the bot's bearer would also be presented as "Bearer X" and
-        we don't know yet which middleware owns this request. If neither
-        token matches, ``BotAuthMiddleware`` will 401. (Order in the
-        request stack — LeanAuth runs BEFORE BotAuth — is set in
-        ``main.py``.)
-      * No LEAN bearer configured (``settings.lean_local_bearer_token`` is
-        None) → fall through unconditionally. The LEAN path is simply not
-        served until the operator wires the sops secret per
-        ``deploy/lean_local/README.md``.
-
-    Distinct from BotAuth (and not a shared base class) because each
-    service account has its own sops-encrypted secret. Compromise of the
-    LEAN container's bearer must not grant access via the bot's bearer
-    and vice-versa. Keeping the middleware classes independent enforces
-    the security boundary at the auth-validation layer.
-    """
-
-    def __init__(self, app: FastAPI, *, settings: APISettings) -> None:
-        super().__init__(app)
-        token_secret = settings.lean_local_bearer_token
-        self._expected_token: str | None = (
-            token_secret.get_secret_value() if token_secret is not None else None
-        )
-        self._idle_seconds = settings.session_idle_seconds
-
-    async def dispatch(
-        self,
-        request: Request,
-        call_next: Callable[[Request], Awaitable[Response]],
-    ) -> Response:
-        # Symmetric defer-check: if BotAuth already accepted this request,
-        # LeanAuth must NOT re-evaluate. See BotAuthMiddleware's matching
-        # defer-check for the rationale.
-        if getattr(request.state, "is_bot_authenticated", False):
-            return await call_next(request)
-
-        auth_header = request.headers.get("authorization", "")
-        if not auth_header.lower().startswith("bearer "):
-            return await call_next(request)
-
-        provided_token = auth_header[7:].strip()
-        if not provided_token:
-            return await call_next(request)
-
-        if self._expected_token is None:
-            # LEAN bearer not configured for this deployment. Defer to the
-            # next middleware (BotAuth) — the request might belong to the
-            # bot, the watchdog, or some other service. No 401 here.
-            return await call_next(request)
-
-        # Constant-time compare. On mismatch, do NOT 401 — fall through to
-        # let BotAuth (next middleware in the chain) try its own match.
-        # That way a "Bearer <bot-token>" request gets through LeanAuth
-        # cleanly even when both bearers are configured.
-        if not secrets.compare_digest(provided_token, self._expected_token):
-            return await call_next(request)
-
-        # Lazy import to avoid module-import-cycle (same pattern as
-        # BotAuthMiddleware — see its docstring).
-        from services.api.session import SessionContext
-
-        now = datetime.now(tz=UTC)
-        request.state.session = SessionContext(
-            user_id=_LEAN_SERVICE_ACCOUNT_USER_ID,
-            username=_LEAN_SERVICE_ACCOUNT_USER_ID,
-            role="owner",
-            auth_strength="strong",
-            last_uv_at=now,
-            session_expires_at=now + timedelta(seconds=self._idle_seconds),
-            webauthn_enrolled=False,
-            totp_enrolled=False,
-            is_phase0_stub=False,
-        )
-        request.state.is_lean_authenticated = True
-        log.debug(
-            "lean_auth_accepted",
             path=request.url.path,
         )
         return await call_next(request)
@@ -601,7 +476,6 @@ def register_middleware(app: FastAPI, settings: APISettings) -> None:
 __all__ = [
     "BotAuthMiddleware",
     "CSRFMiddleware",
-    "LeanAuthMiddleware",
     "RateLimitMiddleware",
     "RequestContextMiddleware",
     "register_middleware",

@@ -68,10 +68,6 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.api.auth import sessions as sessions_mod
-from services.api.bar_sync_status import (
-    BarSyncStatusSource,
-    get_bar_sync_status_provider,
-)
 from services.api.config import APISettings, get_settings
 from services.api.db import get_session
 from services.api.errors import AppError
@@ -97,8 +93,6 @@ from services.api.schemas.common import EPOCH_SENTINEL_UTC
 from services.api.schemas.system import (
     AuditLogEntry,
     AuditLogPageResponse,
-    BarSyncMarketResult,
-    BarSyncStatusResponse,
     HeartbeatItem,
     HeartbeatsResponse,
     KillSwitchInvokeRequest,
@@ -1075,123 +1069,6 @@ async def list_heartbeats(
             )
         )
     return HeartbeatsResponse(items=items, server_now=now)
-
-
-# ---------------------------------------------------------------------------
-# Bar-sync cycle status (read-only — "how did the last cycle go?")
-# ---------------------------------------------------------------------------
-
-
-def _get_bar_sync_status_source() -> BarSyncStatusSource | None:
-    """FastAPI dependency hook — the active worker handle, or None.
-
-    Returns ``None`` when the bar_sync worker isn't running (disabled via
-    setting, or a best-effort startup failure). Tests override this to
-    inject a stub source without standing up the worker + ib-async.
-    """
-    return get_bar_sync_status_provider().get_source()
-
-
-def _market_result_to_schema(result: object) -> BarSyncMarketResult:
-    """Project a :class:`services.data.bar_sync.MarketSyncResult` → wire schema.
-
-    Read via ``getattr`` so this route module stays decoupled from the
-    ``services.data.bar_sync`` import graph (it lazy-loads ib-async).
-    """
-    return BarSyncMarketResult(
-        market=result.market,  # type: ignore[attr-defined]
-        success=result.success,  # type: ignore[attr-defined]
-        bars_written=result.bars_written,  # type: ignore[attr-defined]
-        last_session_date=result.last_session_date,  # type: ignore[attr-defined]
-        front_month_expiry=result.front_month_expiry,  # type: ignore[attr-defined]
-        error=result.error,  # type: ignore[attr-defined]
-        open_interest=result.open_interest,  # type: ignore[attr-defined]
-        open_interest_was_sentinel=result.open_interest_was_sentinel,  # type: ignore[attr-defined]
-    )
-
-
-@router.get(
-    "/api/system/bar-sync",
-    tags=["system"],
-    response_model=BarSyncStatusResponse,
-)
-async def bar_sync_status(
-    session: SessionContext = Depends(get_session_context),
-    source: BarSyncStatusSource | None = Depends(_get_bar_sync_status_source),
-) -> BarSyncStatusResponse:
-    """Most-recent bar_sync cycle outcome for the System page + ``/barsync``.
-
-    Closes the same silent-failure surface the heartbeat endpoint does,
-    one layer up: bar_sync feeds LEAN's on-disk bars at 21:00 UTC; a
-    partial or failed cycle means LEAN reads stale data on its 21:30 UTC
-    signal run. Pre-this-endpoint the only way to see the outcome was to
-    SSH to the VPS and grep ``bar_sync_cycle_completed`` in journald.
-
-    Reads the in-memory worker state (no DB) — survives only until the api
-    restarts, after which ``status="pending"`` until the next cycle fires.
-    Pure read; no alerts, no audit/SSE events.
-    """
-    now = datetime.now(tz=UTC)
-    if source is None:
-        # Worker not started (disabled or startup failure).
-        return BarSyncStatusResponse(
-            status="pending",
-            worker_running=False,
-            last_fired_session_date_et=None,
-            cycle_started_at_utc=None,
-            cycle_completed_at_utc=None,
-            duration_seconds=None,
-            successful_count=0,
-            failed_count=0,
-            total_markets=0,
-            consecutive_failure_count=0,
-            consecutive_sentinel_count=0,
-            successful_markets=[],
-            failed_markets=[],
-            server_now=now,
-        )
-
-    last = source.last_cycle_result
-    if last is None:
-        # Worker running but no cycle has fired since the api started.
-        return BarSyncStatusResponse(
-            status="pending",
-            worker_running=source.is_running,
-            last_fired_session_date_et=source.last_fired_session_date_et,
-            cycle_started_at_utc=None,
-            cycle_completed_at_utc=None,
-            duration_seconds=None,
-            successful_count=0,
-            failed_count=0,
-            total_markets=0,
-            consecutive_failure_count=source.consecutive_failure_count,
-            consecutive_sentinel_count=source.consecutive_sentinel_count,
-            successful_markets=[],
-            failed_markets=[],
-            server_now=now,
-        )
-
-    duration = round(
-        (last.cycle_completed_at_utc - last.cycle_started_at_utc).total_seconds(),
-        2,
-    )
-    overall: Literal["ok", "degraded"] = "degraded" if last.failed_markets else "ok"
-    return BarSyncStatusResponse(
-        status=overall,
-        worker_running=source.is_running,
-        last_fired_session_date_et=source.last_fired_session_date_et,
-        cycle_started_at_utc=last.cycle_started_at_utc,
-        cycle_completed_at_utc=last.cycle_completed_at_utc,
-        duration_seconds=duration,
-        successful_count=len(last.successful_markets),
-        failed_count=len(last.failed_markets),
-        total_markets=last.total_markets,
-        consecutive_failure_count=source.consecutive_failure_count,
-        consecutive_sentinel_count=source.consecutive_sentinel_count,
-        successful_markets=[_market_result_to_schema(r) for r in last.successful_markets],
-        failed_markets=[_market_result_to_schema(r) for r in last.failed_markets],
-        server_now=now,
-    )
 
 
 __all__ = ["router"]

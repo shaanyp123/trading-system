@@ -7375,3 +7375,18 @@ Observed/operated by Claude (root SSH, operator-directed autonomy) across the fu
 ### 2026-07-08 (final numbers) — Production backtest re-run with real cash-yield economics; Amendment B numbers finalized
 
 **Decision/result:** `production` scenario added permanently to the backtest suite (Amendment B structure + cash yield 3.5% on unmargined equity + $4.99/mo Coinbase One Basic subscription drag). **Final validated numbers 2017→2026H1: +40.7% CAGR, Sharpe 1.14, max DD 58.6%, 2023+ Sharpe +0.73, worst year −4% (2024), 2×-cost stress +33.2%/Sharpe 0.98, no halt/bust; final equity $153,671 on $6,000.** All four §9 falsification criteria still PASS. Delta vs the 4%-yield estimate: −1.2 pts CAGR (subscription drag bites hardest at small equity). Strategy doc Amendment B and REPORT.md recommendation updated to these numbers. **Strategy design phase CLOSED; Phase C0 (decommission + build) cleared to start next session.**
+
+### 2026-07-08 (Phase C0 start) — §1 decommission executed (C0-D1 PR); split decision for forbidden-path deletions
+
+**Topic:** First build action of the crypto pivot: executing the delta spec §1 RETIRE list. Operator re-confirmed in-session: "we are ending the CME futures strategy and operation and replacing it with the crypto strat and operation."
+
+**Decision (split):** the §1 list splits cleanly into delete-now (no forbidden paths — landed in the C0-D1 PR) and delete-with-replacement (forbidden paths — deferred to their §3 build PRs under `risk-review-approved`):
+
+1. **Deleted now:** LEAN stack (lean/, infrastructure/lean_local/, deploy/lean_local+ibkr/), bar_sync + map-file synthesis + status surface, LEAN signals ingress (`/api/internal/lean/*` route + LeanAuthMiddleware + bearer config/sops keys), qc_adapter (code, compose, CI job; TABLE kept — its alembic seed revision is load-bearing in the migration chain), calendar_import, Discord /barsync, six IBKR operator tools, compose services ib_gateway/lean_local/qc_adapter/autoheal + lean_data volume.
+2. **Deferred to §3 PRs:** ibkr_client/adapter (§3.1 coinbase adapter PR), FlexQuery/intraday recon fetchers (§3.5), `strategies/v1_trend_following/` — discovered hard dependency: `services/risk/sizing.py` (forbidden) and `services/api/repos/exit_proximity.py` import it, so its deletion rides the §3.4 nano-sizing PR rather than a docs-scoped decommission PR.
+3. **position_mtm degraded-by-design:** marks fall back to avg_cost/PnL-0 until §3.2 Coinbase marks land (its LEAN-zip source is gone). Positions API contract unchanged.
+4. **Operator VPS ceremony** written at `deploy/cme-paper-decommission.md`: cancel paper orders → final EOD recon → `system_stopped` audit event with `reason=strategy_retired` free-text payload (no new enum, [A04] respected) → remove systemd timers → `docker compose up -d --remove-orphans` → optional lean_data archive. Coinbase One Basic subscription flagged as the operator prerequisite for the §3.6 cash-yield worker.
+
+**Verification:** full test suite green after the sweep (2109 unit + integration/golden; LEAN-dependent tests removed or converted to loud-failure contract asserts), `ruff format`/`ruff check` clean, `mypy --strict` clean across services/infrastructure/strategies/scripts/research.
+
+**Cost/scope impact:** CI drops the qc_adapter docker-build job. VPS load drops (three fewer containers + no nightly LEAN restart). No DB schema change in this PR.

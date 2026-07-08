@@ -28,29 +28,14 @@ ibkr:
   # socat at 4004 (paper) / 4003 (live) per gnzsnz convention; see
   # deploy/ibkr/README.md Step 4.
   #
-  # DATA-LAYER SUB-PIVOT 2026-05-20: LEAN now ALSO reads these fields
-  # (in addition to the gateway login). The `lean_local` entrypoint
-  # exports them as IB_USER_NAME / IB_PASSWORD / IB_ACCOUNT env vars
-  # which substitute into `lean.json`'s `${IB_USER_NAME}` / `${IB_PASSWORD}` /
-  # `${IB_ACCOUNT}` placeholders for the `InteractiveBrokersBrokerage`
-  # data-queue-handler config (clientId=10; delayed quotes + reqHistoricalData).
-  # PR #120 (2026-05-12) had dropped the LEAN-side reads; the 2026-05-20
-  # data-layer sub-pivot restores them for the DATA path only (LEAN's
-  # live-mode-brokerage stays PaperBrokerage — LEAN does NOT place
-  # orders; the api still owns the broker contract on clientId=1 via
-  # services/execution/ibkr_adapter.py).
   paper_username: <TODO_FROM_PIVOT_PR_B_BRINGUP>
   paper_password: <TODO_FROM_PIVOT_PR_B_BRINGUP>
   # Paper account ID (distinct from `account_number` above which is the
   # live account). Find this in the IB Gateway boot log line
   #     "<DUQ_account> Trader Workstation Configuration (Simulated Trading)"
   # or in the IBKR portal → Paper Trading → Account Profile.
-  # Read by:
-  #   * api's IBKR FlexQuery flow (services/api/entrypoint.py — falls
-  #     back to ibkr.account_number above when paper_account is empty)
-  #   * lean_local entrypoint (DATA-LAYER SUB-PIVOT 2026-05-20 —
-  #     infrastructure/lean_local/entrypoint.sh exports as IB_ACCOUNT
-  #     for the InteractiveBrokersBrokerage data-queue-handler)
+  # Read by the api's IBKR FlexQuery flow (services/api/entrypoint.py —
+  # falls back to ibkr.account_number above when paper_account is empty).
   paper_account: <TODO_FROM_PIVOT_PR_F_BRINGUP>
   # Live credentials. Empty (or placeholder) until Week 8 cutover ceremony.
   # The operator deliberately defers populating these until 30-paper-session
@@ -62,14 +47,6 @@ ibkr:
   # Reserve 2-7 for future expansion (multi-strategy or read-only telemetry
   # clients).
   client_id: 1
-
-quantconnect:
-  api_token: <TODO_FROM_DAY_3_QC_TOKEN_REGEN>      # QC token rotated post Day 1 leak
-  # Numeric QC User ID from quantconnect.com -> avatar -> My Account.
-  # NOT the organization slug (that's a hex string). The QC REST API uses
-  # this as the HTTP Basic auth username; the org slug is rejected with
-  # "UserID not valid" per DP-023.
-  user_id: <TODO_FROM_DAY_3_QC_USER_ID>
 
 anthropic:
   api_key: <TODO_FROM_WEEK_5_AGENT_BRINGUP>
@@ -89,19 +66,6 @@ discord:
     critical: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
     ops: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
     audit: <TODO_FROM_DAY_2_DISCORD_RUNBOOK>
-
-lean:
-  # Pivot-PR-A (post-pivot 2026-05-12): shared bearer for lean_local <-> api
-  # auth. 32-byte URL-safe base64; generate via:
-  #   python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
-  # The lean_local container's entrypoint.sh reads this field via PyYAML
-  # at boot, exports as LEAN_LOCAL_BEARER_TOKEN env var, and the algorithm's
-  # _post_event() function uses it on every POST to /api/internal/lean/signals.
-  # The api side reads the SAME field (services/api/entrypoint.py) into
-  # API_LEAN_LOCAL_BEARER_TOKEN; LeanAuthMiddleware constant-time-compares.
-  # Distinct from discord.api_bearer_token so compromise of one container
-  # can't grant access via the other (defense-in-depth).
-  api_bearer_token: <TODO_FROM_PIVOT_PR_A_BRINGUP>
 
 forex_factory:
   api_token: null                 # FF mostly free; leave null until /api hits a 429

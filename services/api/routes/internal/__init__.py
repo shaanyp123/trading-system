@@ -1,21 +1,16 @@
 """services/api/routes/internal/ — internal-only endpoints.
 
 Internal endpoints are reached only from inside the Docker `internal` network
-(LEAN Local container, watchdog, other backend services). They authenticate
+(watchdog, other backend services). They authenticate
 via shared bearer tokens (no cookies, no CSRF). The `internal` prefix is
 purely for code organization — Caddy does NOT additionally restrict the
 path (the auth bearer is the security boundary).
 
-Currently hosts:
-
-* ``lean.py`` — ``POST /api/internal/lean/signals`` (Pivot-PR-A; post-pivot
-  2026-05-12). Receives signal_emitted events from LEAN Local; shared-bearer
-  auth via ``LeanAuthMiddleware``.
-
-Future internal routes (not yet shipped):
-
-* ``ibkr_callback.py`` — IBKR-side event callbacks if Pivot-PR-B uses a
-  push-based pattern instead of polling.
+Currently hosts: nothing. The LEAN signals ingress (``lean.py``,
+``POST /api/internal/lean/signals``) was RETIRED in the crypto-pivot C0
+decommission (2026-07-08) — signals are generated in-process by the
+crypto strategy worker (delta spec §3.3). The package is kept as the
+mount point for future internal-only routes.
 """
 
 from __future__ import annotations

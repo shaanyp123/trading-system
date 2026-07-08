@@ -5,8 +5,8 @@
 #   default (no profile)  — Day 5 deploy subset: caddy, api, postgres.
 #   phase1                — services that ship Phase 0 Week 2+ (signal, risk,
 #                           execution, …). Activated with `--profile phase1`.
-#   phase2                — direct-IBKR services (ib_gateway, lean_local).
-#                           Activated with `--profile phase2`.
+#   phase2                — RETIRED profile (crypto-pivot C0 2026-07-08):
+#                           its services (ib_gateway, lean_local) are gone.
 #
 # Image tag substitution: GHCR_OWNER + RELEASE_SHA come from `deploy/.env` on
 # the VPS. Anti-pattern A18: never bare placeholders like <domain>; substitute
@@ -31,7 +31,6 @@ volumes:
   # operator can pre-populate this volume by mounting a directory of
   # downloaded LEAN data, or let LEAN download fresh at container start
   # (slower first cycle but no operator-side prep needed).
-  lean_data:
 
 # ---- Persistent log retention -----------------------------------------------
 # Forensic-data preservation across container recreate (2026-05-27).
@@ -108,13 +107,14 @@ volumes:
 #
 # **Applied to.** All stateful services that emit forensically useful
 # diagnostics in the default + phase2 profile (today's operational
-# surface): caddy, api, postgres, nextjs, discord_bot, webhook_pusher,
-# ib_gateway, lean_local, autoheal. Profile-gated `phase1` services
-# (signal, risk, execution, reconciliation, audit, calibration,
-# scheduler, monitoring, agent, prometheus, grafana, gitea) and the
-# dormant qc_adapter are skipped — they don't run on the active stack
-# today, so adding the driver field there is noise. They can adopt the
-# same pattern when their Dockerfiles land.
+# surface): caddy, api, postgres, nextjs, discord_bot, webhook_pusher.
+# Profile-gated `phase1` services (signal, risk, execution,
+# reconciliation, audit, calibration, scheduler, monitoring, agent,
+# prometheus, grafana, gitea) are skipped — they don't run on the
+# active stack today, so adding the driver field there is noise. They
+# can adopt the same pattern when their Dockerfiles land.
+# Crypto-pivot C0 (2026-07-08): ib_gateway, lean_local, autoheal, and
+# qc_adapter services RETIRED (delta spec §1).
 x-journald-logging: &journald-logging
   driver: journald
   options:
@@ -198,16 +198,6 @@ services:
       # "Error 326: client id is already in use" wedge that can persist 30+
       # minutes past container restart). See decisions-log 2026-05-17 entry.
       API_IBKR_CLIENT_ID: ${API_IBKR_CLIENT_ID:-1}
-      # Bar-sync worker clientId (data-layer-pivot-v2 Option C 2026-05-20).
-      # Default 2 per dev-guide §1.5 LOCKED (api worker=1, bar_sync=2,
-      # probes=80-99, reserve 3-7). When the operator has overridden
-      # API_IBKR_CLIENT_ID into the 2-7 range (e.g., 2026-05-17 prior-
-      # session-wedge workaround set order worker to 2), this MUST be set
-      # to a different non-overlapping value (e.g., 3) in deploy/.env to
-      # avoid Error 326 "client id is already in use" at the 17:00 ET
-      # bar_sync cycle. The api boot logs explicitly call out the
-      # configured value via `bar_sync_worker_spawned ibkr_client_id=N`.
-      API_BAR_SYNC_CLIENT_ID: ${API_BAR_SYNC_CLIENT_ID:-2}
       # EOD reconciliation position-quantity source (Option C recon-fix).
       # Default "flexquery" preserves prod behavior; set
       # API_EOD_RECON_POSITION_SOURCE=reqpositions in deploy/.env to cut
@@ -221,17 +211,8 @@ services:
     # decrypted.yaml — the api entrypoint reads it at /run/secrets/decrypted.yaml.
     # SECRETS_DIR is set in deploy/.env (default kept here for clarity).
     #
-    # `lean_data` mount (post data-layer-pivot-v2 2026-05-20 evening; Option C):
-    # the api's BarSyncWorker (services/data/bar_sync.py) needs WRITE access
-    # to /Lean/Data/ so it can populate equity-daily zips, futures-daily
-    # zips, per-day universe CSVs, and map_file sentinels. lean_local
-    # mounts the same volume READ-ONLY (see lean_local volumes block
-    # below). This is the canonical separation: api owns the data
-    # producer role on clientId=2; lean_local consumes via the original
-    # FakeDataQueue + SubscriptionDataReaderHistoryProvider path.
     volumes:
       - ${SECRETS_DIR:-/opt/trading/secrets-decrypted}:/run/secrets:ro
-      - lean_data:/Lean/Data:rw
     depends_on:
       postgres:
         condition: service_healthy
@@ -287,14 +268,14 @@ services:
     restart: unless-stopped
     networks: [internal, egress]   # Phase 1 needs QC ObjectStore reach
     profiles: ['phase1']
-    depends_on: [postgres, qc_adapter]
+    depends_on: [postgres]
 
   reconciliation:
     image: ghcr.io/${GHCR_OWNER}/trading-reconciliation:${RELEASE_SHA:-latest}
     restart: unless-stopped
     networks: [internal]
     profiles: ['phase1']
-    depends_on: [postgres, qc_adapter]
+    depends_on: [postgres]
 
   audit:
     image: ghcr.io/${GHCR_OWNER}/trading-audit:${RELEASE_SHA:-latest}
@@ -315,43 +296,6 @@ services:
     restart: unless-stopped
     networks: [internal]
     profiles: ['phase1']
-    depends_on: [postgres]
-
-  # qc_adapter — QC ObjectStore poll worker.
-  #
-  # POST-PIVOT 2026-05-12 (Pivot-PR-A): DORMANT under the `qc_adapter_backfill`
-  # docker-compose profile. Default `docker compose up -d` skips this service.
-  # Bring up only for ad-hoc historical replay via:
-  #
-  #     docker compose --profile qc_adapter_backfill up -d qc_adapter
-  #
-  # See backend-spec §1.4 + §2.11 (post-pivot) for the dormant role + spec
-  # `Docs/decisions-log.md` 2026-05-12 entry for the full pivot rationale.
-  # The container's 50 unit + integration tests still run in CI as a
-  # regression net against accidentally re-introducing ObjectStore polling.
-  #
-  # Pre-pivot description: "Polls QC's REST surface for signal_emitted +
-  # order_filled + reconciliation events at 60s/60s/5s cadences (per
-  # backend-spec §3.19 + §1.4); writes parsed events to audit_log + signals
-  # + data_quality_events." Retired because QC's `/object/get` endpoint is
-  # gated behind the Institutional subscription tier (DP-025).
-  qc_adapter:
-    image: ghcr.io/${GHCR_OWNER:?set GHCR_OWNER in deploy/.env}/trading-qc-adapter:${RELEASE_SHA:-latest}
-    build:
-      context: .
-      dockerfile: services/qc_adapter/Dockerfile
-    restart: unless-stopped
-    networks: [internal, egress]
-    profiles: ['qc_adapter_backfill']
-    environment:
-      ENVIRONMENT: ${ENVIRONMENT:-paper}
-      LOG_LEVEL: ${QC_ADAPTER_LOG_LEVEL:-INFO}
-      QC_ADAPTER_PHASE_AT_EMIT: ${QC_ADAPTER_PHASE_AT_EMIT:-0}
-      # QC_ADAPTER_DATABASE_URL, QC_ADAPTER_QC_USER_ID, QC_ADAPTER_QC_API_TOKEN
-      # come in via the sops-decrypted bundle volume below + the
-      # entrypoint reads them with the env_prefix QC_ADAPTER_.
-    volumes:
-      - ${SECRETS_DIR:-/opt/trading/secrets-decrypted}:/run/secrets:ro
     depends_on: [postgres]
 
   # Discord bot — Day 23 (Week 6 Thu) onwards. Default profile (no
@@ -415,7 +359,7 @@ services:
     environment:
       WEBHOOK_PUSHER_LOG_LEVEL: ${WEBHOOK_PUSHER_LOG_LEVEL:-INFO}
     volumes:
-      # Sops-decrypted bundle mount (same pattern as api + lean_local).
+      # Sops-decrypted bundle mount (same pattern as api).
       # entrypoint.sh reads /run/secrets/decrypted.yaml.
       - ${SECRETS_DIR:-/opt/trading/secrets-decrypted}:/run/secrets:ro
     depends_on: [postgres]
@@ -501,282 +445,3 @@ services:
     volumes:
       - ./deploy/grafana:/etc/grafana/provisioning:ro
       - grafana_data:/var/lib/grafana
-
-  # ---- IBKR Gateway (Pivot-PR-B; post-pivot 2026-05-12) ----------------
-  #
-  # gnzsnz/ib-gateway-docker hosts IB Gateway (IBKR's TWS API gateway) in
-  # a container. The `services/execution/ibkr_adapter.py` connects via
-  # `ib-async` to this container on port 4004 (paper) / 4003 (live) — the
-  # externally-published socat ports per gnzsnz convention. The internal
-  # IB Gateway listens on 127.0.0.1:4002 (paper) / :4001 (live) inside the
-  # container, but those ports are not reachable from outside; socat
-  # forwards from 0.0.0.0:4004/4003 to the internal listener. Discovered
-  # at Pivot-PR-B Step 5 smoke 2026-05-12.
-  #
-  # Networks: `internal` ONLY. NOT exposed to Caddy or the public internet.
-  # The TWS API protocol is unauthenticated at the network layer (auth is
-  # via username/password at session-open + the `clientId`); exposing 4003/4004
-  # publicly would let anyone with the credentials place orders. Keep on
-  # the internal Docker network only.
-  #
-  # Credentials: TWS_USERID + TWS_PASSWORD from sops `ibkr.paper_username`/
-  # `ibkr.paper_password` (paper) or `ibkr.live_username`/`ibkr.live_password`
-  # (live). The image's entrypoint reads them directly; we mount the sops
-  # bundle as a secret + the operator runbook
-  # (`deploy/ibkr/README.md`) walks through wiring.
-  #
-  # TRADING_MODE env var flips paper vs live (controls which port the
-  # gateway listens on + which IBKR account it connects to).
-  ib_gateway:
-    image: ghcr.io/gnzsnz/ib-gateway:stable
-    restart: unless-stopped
-    logging: *journald-logging
-    networks: [internal, egress]
-    labels:
-      # Mark this container as a target for the autoheal sidecar (see
-      # `deploy/autoheal/README.md` + the `autoheal:` service block
-      # later in this file). When the healthcheck above (which probes
-      # BOTH external socat + internal Java ports per drill 6 fix) reports
-      # `(unhealthy)`, autoheal invokes `docker restart ib_gateway` within
-      # ~30s, recovering from drill-5/drill-6-class stuck states without
-      # operator intervention. Remove this label to opt out.
-      autoheal: 'true'
-    environment:
-      # paper or live; flipped at deploy time via deploy/.env LEAN_LIVE_MODE
-      TWS_USERID: ${IB_GATEWAY_USERNAME:-}
-      TWS_PASSWORD: ${IB_GATEWAY_PASSWORD:-}
-      TRADING_MODE: ${IB_GATEWAY_MODE:-paper}
-      # gnzsnz image-specific config — read at boot.
-      VNC_SERVER_PASSWORD: ${IB_GATEWAY_VNC_PASSWORD:-}
-      TZ: America/New_York
-      # IBC (IB Controller) settings — auto-login + auto-restart at scheduled
-      # IBKR maintenance windows (which would otherwise need manual restart).
-      AUTO_RESTART_TIME: '11:59 PM'
-      RELOGIN_AFTER_TWOFA_TIMEOUT: 'yes'
-      TWOFA_DEVICE: 'YubiKey'  # operator's chosen 2FA device per Day 4 carryover
-      # TWS_ACCEPT_INCOMING + READ_ONLY_API populate gnzsnz's IBC config.ini
-      # template (verified at /home/ibgateway/ibc/config.ini.tmpl). Without
-      # TWS_ACCEPT_INCOMING=accept the gateway pops a headless "Accept incoming
-      # connection from <api-container-IP>" dialog on every TWS API connect
-      # and hangs the handshake (TCP socket open but apiStart never resolves).
-      # Discovered Pivot-PR-B Step 5 smoke 2026-05-12. READ_ONLY_API=no is
-      # required for placeOrder/cancelOrder; empty defaults to read-only.
-      TWS_ACCEPT_INCOMING: 'accept'
-      READ_ONLY_API: 'no'
-      # EXISTING_SESSION_DETECTED_ACTION populates IBC's config.ini
-      # `ExistingSessionDetectedAction` setting (same image template as
-      # TWS_ACCEPT_INCOMING). Without this, IBC defaults to `manual` and
-      # pops a headless "Existing session detected — keep this session or
-      # exit?" dialog whenever a second client logs into the same account
-      # (e.g., operator's TWS Desktop is open against DUQ825170 paper while
-      # the gateway tries to reconnect after IBKR's overnight maintenance
-      # window restart). The dialog hangs until clicked; meanwhile IBKR
-      # emits Error 1100 ("connectivity lost") and orderStatus events stop
-      # propagating to the api even though the API socket stays open.
-      # Discovered 2026-05-18 drill 5; see `Docs/decisions-log.md` entry.
-      #
-      # `primary` = this gateway session WINS, kicks the other client.
-      # The backend is authoritative; operator must reconnect TWS Desktop
-      # manually after each gateway restart. Documented tradeoff in
-      # `deploy/ibkr/README.md` "Existing session collisions" section.
-      EXISTING_SESSION_DETECTED_ACTION: 'primary'
-      # TWS_MASTER_CLIENT_ID populates IBC's `IbLoginId` / `MasterClientId`
-      # in the rendered config.ini. When set, IBKR Gateway permits the
-      # named clientId to cancel orders placed by ANY clientId on this
-      # session; without it, cross-clientId cancellation returns
-      # `Error 10147 "OrderId not found"` even though the order is
-      # visible in the cancelling client's local ib-async trade cache.
-      # See `Docs/decisions-log.md` 2026-05-27 entry "Cross-clientId
-      # IBKR cancellation: structural limitation, mitigation = Master
-      # Client ID" for the full chain. Mitigation B (worker post-cancel
-      # verification, PR #262) is the belt-and-suspenders for whatever
-      # is configured here.
-      #
-      # Empty default → IBC renders no Master designation; gateway runs
-      # in pre-mitigation mode. To opt in, set IBKR_MASTER_CLIENT_ID in
-      # deploy/.env to the worker's clientId (typically 1 or 2 per
-      # API_IBKR_CLIENT_ID), then `docker compose up -d --force-recreate
-      # ib_gateway`. Operator-coordinated; restart outside the
-      # 20:55-22:35 UTC abort window.
-      TWS_MASTER_CLIENT_ID: ${IBKR_MASTER_CLIENT_ID:-}
-    healthcheck:
-      # Probe BOTH the externally-published socat port (4004 paper / 4003
-      # live) AND the internal IBKR Gateway Java port (4002 paper / 4001
-      # live). Each port catches a distinct failure mode:
-      #
-      # - External port (4004/4003) catches: socat dies but the Java
-      #   process is OK. socat is the sidecar that forwards external
-      #   :4004 → internal :4002 inside the container; if socat crashes
-      #   while the Java listener is alive, the external caller would
-      #   silently fail (TCP RST from no listener on :4004). Original
-      #   2026-05-12 motivation per the prior healthcheck commit.
-      #
-      # - Internal port (4002/4001) catches: Java process is alive but
-      #   stuck. The IBC automation can hang after a nightly restart
-      #   (drill 5 2026-05-18 "Existing session detected" dialog hang;
-      #   drill 6 2026-05-25 unknown trigger leaving login dialog
-      #   unfilled for 18h). When the Java process is stuck, socat
-      #   accepts TCP connects on :4004 (it's still running) but the
-      #   forward to :4002 hits "connection refused" — visible as
-      #   `socat[...] E connect(5, AF=2 127.0.0.1:4002, 16): Connection
-      #   refused` in `docker compose logs ib_gateway`. The pre-drill-6
-      #   single-probe healthcheck reported healthy throughout the 18h
-      #   stuck state (drill 6 retrospective: `Docs/decisions-log.md`
-      #   2026-05-25 entry).
-      #
-      # Both-required composition: `(external_paper && internal_paper) ||
-      # (external_live && internal_live) || exit 1`. In paper mode
-      # (operational default per CLAUDE.md), only 4004 + 4002 are bound;
-      # 4003 + 4001 refuse connections so the second alternative fails
-      # naturally. In live mode (post live-money-cutover), only 4003 +
-      # 4001 are bound; the first alternative fails naturally.
-      #
-      # Bash's `</dev/tcp/host/port` pseudo-device is the probe primitive
-      # because `nc` is NOT in the gnzsnz/ib-gateway:stable image
-      # (verified 2026-05-12); bash IS at /usr/bin/bash.
-      test: ['CMD-SHELL', '( bash -c "</dev/tcp/localhost/4004" 2>/dev/null && bash -c "</dev/tcp/localhost/4002" 2>/dev/null ) || ( bash -c "</dev/tcp/localhost/4003" 2>/dev/null && bash -c "</dev/tcp/localhost/4001" 2>/dev/null ) || exit 1']
-      interval: 60s
-      timeout: 10s
-      retries: 3
-      start_period: 120s  # IBC takes ~90s to log in fresh
-
-  # ---- autoheal sidecar ------------------------------------------------
-  # Drill 6 follow-up #3 (2026-05-25; `Docs/decisions-log.md` entry
-  # "ib_gateway stuck-at-login recurrence + recovery"). Monitors all
-  # containers labeled `autoheal=true` (currently only `ib_gateway`) and
-  # invokes `docker restart <name>` whenever Docker's healthcheck
-  # reports `(unhealthy)`. Pairs with the drill-6 healthcheck fix
-  # (probes BOTH external socat + internal Java ports) so a stuck
-  # ib_gateway is auto-recovered within ~3-4 min instead of 18+ hours.
-  #
-  # Trade-off: requires the Docker socket mount, which gives this
-  # container root-equivalent access to the host. The willfarrell/
-  # autoheal image is small (~10MB Alpine + bash + curl + jq script);
-  # source at https://github.com/willfarrell/docker-autoheal. Treat
-  # any compromise of this container as host-root compromise. See
-  # `deploy/autoheal/README.md` for the operator runbook (debug
-  # commands, opt-out, tuning, deeper trust-boundary discussion).
-  autoheal:
-    image: willfarrell/autoheal:latest
-    restart: unless-stopped
-    logging: *journald-logging
-    # No networks needed — autoheal only uses the Docker socket
-    # (mounted below) to query container health + invoke restarts.
-    # Joining `internal` for consistency with other internal-only
-    # services + so it appears in the same `docker compose ps`
-    # network column.
-    networks: [internal]
-    environment:
-      # Only monitor containers explicitly labeled `autoheal=true`.
-      # Default ("autoheal") works for us but pinning it here is
-      # self-documenting + future-proof against image-default drift.
-      AUTOHEAL_CONTAINER_LABEL: autoheal
-      # Poll the Docker API every 30s (default 5s). The ib_gateway
-      # healthcheck cadence is `interval=60s × retries=3 = 180s` to
-      # detection, so a faster poll wouldn't shorten time-to-recovery
-      # meaningfully + adds Docker socket noise. Upper bound on
-      # time-to-restart from-stuck-state: 180s (detection) + 30s
-      # (autoheal poll) ≈ 3.5 min.
-      AUTOHEAL_INTERVAL: '30'
-      TZ: America/New_York
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-
-  # lean_local — LEAN algorithm engine (Pivot-PR-A; post-pivot 2026-05-12).
-  #
-  # Runs LEAN on the operator's Hetzner VPS. Mounts `./lean/` as the
-  # algorithm directory + `./strategies/` for shared Python. POSTs signal
-  # events to `http://api:8000/api/internal/lean/signals` using the shared
-  # bearer from sops `lean.api_bearer_token`.
-  #
-  # **Image tag rationale (2026-05-16 fix):** prior to today the `image:`
-  # field was `quantconnect/lean:latest` — the same tag as the upstream
-  # public LEAN image. Our `infrastructure/lean_local/Dockerfile` extends
-  # the upstream image (custom entrypoint that resolves sops bundle +
-  # deep-merges lean.json onto upstream config.json). When the local
-  # image gets re-tagged via our build, it overwrites the upstream tag in
-  # the local docker registry. But `docker compose up -d` without a
-  # preceding `docker compose build lean_local` will re-pull the pristine
-  # upstream image + clobber our custom layer. Discovered during the
-  # 2026-05-16 deploy: lean_local silently ran upstream's
-  # `BasicTemplateFrameworkAlgorithm` for hours instead of our
-  # `V1TrendFollowingAlgorithm` because the operator had `up -d`'d after
-  # `git pull` without rebuilding.
-  #
-  # Fix: image tag is now GHCR-namespaced (`ghcr.io/${GHCR_OWNER}/
-  # trading-lean-local:${RELEASE_SHA:-latest}`) matching the convention
-  # used by api/nextjs/discord_bot/webhook_pusher. `docker compose pull`
-  # won't ever collide with the upstream tag. The operator must
-  # `docker compose build lean_local` after upgrading the LEAN base
-  # image OR pushing strategy code changes (Phase 1+ CI publishes the
-  # built image to GHCR; today it's built locally on the VPS).
-  #
-  # Networks: `internal` only (no egress; QC bundled data is mounted as a
-  # volume; live market data flows via `ib_gateway` on the internal net
-  # when Pivot-PR-B lands).
-  #
-  # The container runs in BACKTEST mode by default until Pivot-PR-B wires
-  # `ib_gateway`. To switch to paper trading (live-mode against IBKR paper),
-  # the operator sets `LEAN_LIVE_MODE=true` in `deploy/.env` after
-  # Pivot-PR-B confirms IBKR paper account access.
-  #
-  # See `deploy/lean_local/README.md` for the operator runbook.
-  lean_local:
-    image: ghcr.io/${GHCR_OWNER:?set GHCR_OWNER in deploy/.env}/trading-lean-local:${RELEASE_SHA:-latest}
-    build:
-      context: .
-      dockerfile: infrastructure/lean_local/Dockerfile
-    restart: unless-stopped
-    logging: *journald-logging
-    # Internal-only network (post data-layer-pivot-v2 2026-05-20 evening;
-    # Option C). The v1 attempt at the 2026-05-20 sub-pivot added `egress`
-    # so the QC IBKR plugin could hit www.quantconnect.com:443 for
-    # ValidateSubscription(); the v2 architecture (api fetches bars on
-    # clientId=2 + writes to disk; LEAN reads via FakeDataQueue) does NOT
-    # need the QC plugin or any external HTTPS reach from lean_local.
-    # Reverted to `[internal]` only — LEAN talks to api over the internal
-    # Docker network (for the `POST /api/internal/lean/signals` path) +
-    # reads bars from the shared `lean_data` volume.
-    networks: [internal]
-    environment:
-      ENVIRONMENT: ${ENVIRONMENT:-paper}
-      LEAN_LIVE_MODE: ${LEAN_LIVE_MODE:-false}
-      LEAN_LOCAL_API_BASE_URL: ${LEAN_LOCAL_API_BASE_URL:-http://api:8000}
-      # LEAN_LOCAL_BEARER_TOKEN comes in via the sops-decrypted bundle
-      # volume below + the lean_local entrypoint reads sops yaml
-      # `lean.api_bearer_token` → env var.
-    volumes:
-      # Algorithm code + shared strategy package mount.
-      - ./lean:/Lean/Algorithm:ro
-      # Lowercase mount path — `strategies` is a Python package name; the
-      # internal absolute imports in the package use `from
-      # strategies.v1_trend_following.X import Y`, which requires the
-      # package directory to be reachable as `strategies` (lowercase) from
-      # PYTHONPATH. Pivot-PR-D 2026-05-12 fixup: mount was `Strategies`
-      # (uppercase) which exposed `v1_trend_following` at top level but
-      # not the `strategies.*` namespace, breaking sibling imports.
-      - ./strategies:/Lean/strategies:ro
-      # LEAN data directory (post data-layer-pivot-v2 2026-05-20 evening):
-      # READ-ONLY mount of the shared lean_data volume. The api's
-      # BarSyncWorker (services/data/bar_sync.py; api side has rw mount
-      # of the same volume) writes daily-resolution OHLCV bars +
-      # per-day universe CSVs + map_file sentinels here; lean_local
-      # consumes via FakeDataQueue + SubscriptionDataReaderHistoryProvider.
-      - lean_data:/Lean/Data:ro
-      # sops-decrypted bundle for bearer-token resolution at boot.
-      - ${SECRETS_DIR:-/opt/trading/secrets-decrypted}:/run/secrets:ro
-    depends_on:
-      api:
-        condition: service_healthy
-    # Probe the LEAN launcher process. The quantconnect/lean:latest
-    # image ships procps under the dotnet/Ubuntu base; pgrep is at
-    # /usr/bin/pgrep. The .dll path matches the CMD verbatim
-    # (`/Lean/Launcher/bin/Debug/QuantConnect.Lean.Launcher.dll`) so a
-    # crashed launcher trips the check while tini (PID 1) stays alive.
-    # start_period covers LEAN's ~60s warm-up before the first cycle.
-    healthcheck:
-      test: ['CMD-SHELL', 'pgrep -f QuantConnect.Lean.Launcher || exit 1']
-      interval: 60s
-      timeout: 5s
-      retries: 3
-      start_period: 90s

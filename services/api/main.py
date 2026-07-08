@@ -46,14 +46,13 @@ from services.api import sse as sse_multiplexer
 from services.api.config import APISettings, get_settings
 from services.api.db import close_pool, init_pool, session_scope
 from services.api.errors import register_error_handlers
-from services.api.middleware import BotAuthMiddleware, LeanAuthMiddleware, register_middleware
+from services.api.middleware import BotAuthMiddleware, register_middleware
 from services.api.repos.phase1 import PostgresPhase1QueryRepo
 from services.api.repos.setup_tokens import PostgresSetupTokenRepo
 from services.api.routes.alerts import router as alerts_router
 from services.api.routes.auth import router as auth_router
 from services.api.routes.fills import router as fills_router
 from services.api.routes.health import router as health_router
-from services.api.routes.internal.lean import router as lean_router
 from services.api.routes.orders import router as orders_router
 from services.api.routes.positions import router as positions_router
 from services.api.routes.setup import router as setup_router
@@ -1065,210 +1064,6 @@ def _build_task_death_alert_hook(
     return _hook
 
 
-def _build_bar_sync_alert_dispatch_hook(
-    settings: APISettings,
-) -> object | None:
-    """Construct the bar_sync ``partial_cycle_alert_hook`` closure or return None.
-
-    2026-05-21 OI saga follow-up batch (PR #211 deferred). The bar_sync
-    worker emits :class:`BarSyncAlertDescriptor` rows from
-    :func:`services.data.bar_sync.BarSyncWorker._evaluate_alerts` when
-    either (a) a partial cycle failure crosses
-    ``CONSECUTIVE_ALERT_THRESHOLD`` (= 2 consecutive cycles with at
-    least one failed market) or (b) the OI sentinel substitution
-    crosses the same threshold (LEAN's resolver picks the contract
-    because the sentinel is positive, but the value on disk is
-    synthetic — typically /MCL's paper-tier NYMEX entitlement gap).
-
-    Before this hook lands, the worker's ``_dispatch_alert`` path logs
-    ``bar_sync_alert_dropped_no_hook`` + drops the descriptor; with the
-    hook wired, each descriptor becomes:
-
-      1. INSERT one row into ``alerts`` (severity / category / message /
-         detail). ``triggering_audit_event_uuid`` stays NULL — bar_sync
-         alerts have no audit-event upstream (alembic 0004 schema
-         allows NULL on this column).
-      2. Invoke :func:`services.webhook_pusher.dispatcher.dispatch_alert`
-         with the newly minted alert_id so the operator-visible Discord
-         ``#alerts`` push fires.
-
-    Returns ``None`` (cleanly skipping the hook installation) when sops
-    ``discord.webhook_urls.alerts`` isn't populated. The worker still
-    fires alerts logging-only via ``bar_sync_alert_dropped_no_hook`` so
-    the operator can grep manually until the sops field lands. This
-    matches the recon + monitor hook-skip semantics.
-
-    Pattern mirror of ``_build_monitor_alert_dispatch_hook`` (not the
-    recon variant) because bar_sync alerts share the no-audit-upstream
-    + fire-time account_id resolution shape of the monitor surface.
-
-    Returns ``object | None`` to dodge a circular import — the actual
-    hook signature is :class:`services.data.bar_sync_alerts.BarSyncAlertDispatchHook`
-    and importing that at module-load would force a transitive load of
-    the bar_sync module (which loads ib_async lazily at first-cycle, so
-    the load itself is cheap, but the indirection keeps the module-top
-    consistent with the other hook builders).
-    """
-    # Lazy imports keep module-load fast + avoid the circular-import surface.
-    from services.data.bar_sync_alerts import BarSyncAlertDescriptor
-    from services.webhook_pusher.dispatcher import dispatch_alert
-    from services.webhook_pusher.payloads import (
-        AlertCategory,
-        AlertSeverity,
-        ChannelName,
-        EmailIdentity,
-    )
-
-    if settings.discord_webhook_url_alerts is None:
-        log.warning(
-            "bar_sync_alert_dispatch_hook_skipped_no_webhook_url",
-            note=(
-                "discord.webhook_urls.alerts not in sops; bar_sync cycles "
-                "will still emit structured `bar_sync_alert_dropped_no_hook` "
-                "WARNING logs on partial-cycle-failure + OI-sentinel "
-                "substitution at the consecutive_count >= 2 threshold, but "
-                "no Discord #alerts push will fire. Wire the sops field + "
-                "restart api to enable."
-            ),
-        )
-        return None
-
-    webhook_urls: dict[ChannelName, str] = {
-        ChannelName.DISCORD_ALERTS: settings.discord_webhook_url_alerts.get_secret_value(),
-    }
-    if settings.discord_webhook_url_critical is not None:
-        webhook_urls[ChannelName.DISCORD_CRITICAL] = (
-            settings.discord_webhook_url_critical.get_secret_value()
-        )
-
-    # bar_sync alerts are P2-only by spec (services.data.bar_sync_alerts
-    # BAR_SYNC_ALERT_SEVERITY = "P2"); P2 routes to #alerts only per
-    # webhook_pusher.payloads.SEVERITY_TO_CHANNELS. Email_identity is
-    # only required for P0 routing, so the construction here matches the
-    # recon hook's wire-it-if-the-fields-are-populated semantics rather
-    # than the P0-blocking "all-or-none" pattern. If a future bar_sync
-    # severity is added, the email path is already plumbed.
-    email_identity: EmailIdentity | None = None
-    if (
-        settings.resend_api_key is not None
-        and settings.resend_from_address is not None
-        and settings.resend_to_address is not None
-    ):
-        email_identity = EmailIdentity(
-            from_address=settings.resend_from_address,
-            to_address=settings.resend_to_address,
-            resend_api_key=settings.resend_api_key.get_secret_value(),
-        )
-
-    log.info(
-        "bar_sync_alert_dispatch_hook_constructed",
-        channels=[c.value for c in webhook_urls],
-        email_wired=email_identity is not None,
-    )
-
-    audit_env = _audit_env_from_settings(settings)
-
-    async def _hook(descriptor: BarSyncAlertDescriptor) -> None:
-        """Per-alert: INSERT alerts row + dispatch via webhook_pusher.
-
-        Resolves account_id at fire time so a missing-account-at-boot
-        path (operator hasn't run /setup yet) doesn't break hook
-        construction. If account_id is still unresolved at fire time,
-        log + skip the dispatch — the worker's structured
-        ``bar_sync_alert_dropped_no_hook`` path won't fire here because
-        the hook IS wired; instead we surface
-        ``bar_sync_alert_dispatch_skipped_no_account`` so the operator
-        can correlate against the worker's per-cycle log.
-
-        Two separate sessions per call mirror the recon + monitor hook
-        pattern:
-
-          1. INSERT into alerts using a fresh session_factory()-opened
-             session.
-          2. Open a fresh httpx.AsyncClient + session for the dispatch.
-
-        Hook failures propagate up to the worker's ``_dispatch_alert``
-        catch-and-log so a Discord 5xx doesn't wedge the cycle.
-        """
-        session_factory = api_db.get_session_factory()
-        async with session_factory() as repo_session:
-            repo = PostgresPhase1QueryRepo(repo_session)
-            account_id = await repo.fetch_active_account_id()
-        if account_id is None:
-            log.warning(
-                "bar_sync_alert_dispatch_skipped_no_account",
-                note=(
-                    "bar_sync fired a P2 alert descriptor but no active "
-                    "account is provisioned; alerts row INSERT would "
-                    "violate the NOT NULL FK to accounts. Run /setup to "
-                    "create the account row + restart api."
-                ),
-                severity=descriptor.severity,
-                category=descriptor.category,
-            )
-            return
-
-        # Defense-in-depth: validate severity + category map to the
-        # locked enums before attempting the INSERT (matches the
-        # recon + monitor hooks' enum cross-check). bar_sync_alerts
-        # already constrains via Literal types but enum validation
-        # raises early on the wire boundary if a future planner change
-        # leaks a non-canonical value.
-        AlertSeverity(descriptor.severity)
-        AlertCategory(descriptor.category)
-
-        message_text = f"{descriptor.title}\n\n{descriptor.body}"
-        async with session_factory() as ins_session:
-            row = (
-                await ins_session.execute(
-                    text(
-                        "INSERT INTO alerts ("
-                        "    account_id, severity, category, message, detail"
-                        ") VALUES ("
-                        "    :acct, :sev, :cat, :msg, CAST(:detail AS JSONB)"
-                        ") RETURNING id"
-                    ),
-                    {
-                        "acct": account_id,
-                        "sev": descriptor.severity,
-                        "cat": descriptor.category,
-                        "msg": message_text,
-                        "detail": json.dumps(descriptor.payload),
-                    },
-                )
-            ).fetchone()
-            assert row is not None
-            alert_id = UUID(str(row.id))
-            await ins_session.commit()
-
-        log.info(
-            "bar_sync_alert_inserted",
-            alert_id=str(alert_id),
-            severity=descriptor.severity,
-            category=descriptor.category,
-            account_id=str(account_id),
-            env=audit_env,
-        )
-
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as http_client:
-            async with session_factory() as disp_session:
-                report = await dispatch_alert(
-                    session=disp_session,
-                    alert_id=alert_id,
-                    http_client=http_client,
-                    webhook_urls=webhook_urls,
-                    email_identity=email_identity,
-                )
-        log.info(
-            "bar_sync_alert_dispatched",
-            alert_id=str(alert_id),
-            short_circuited=report.short_circuited,
-            delivery_status=dict(report.delivery_status),
-        )
-
-    return _hook
-
-
 def _build_state_transition_hook(
     settings: APISettings,
 ) -> object | None:
@@ -1494,11 +1289,11 @@ async def _start_reconciliation_scheduler(
         env=_audit_env_from_settings(settings),
         flex_query_id=settings.flex_query_id,
         flex_query_token=settings.flex_query_token.get_secret_value(),
-        # Option C (2026-05-28): EOD position source + the ib_gateway
+        # Option C (2026-05-28): EOD position source + the gateway
         # connection params the reqPositions path needs. Recon reuses the
         # worker's host/port/account (same gateway + account) but on its
         # own clientId=4 (the ibkr_intraday default), so it stays isolated
-        # from the order worker (clientId=1) and bar_sync (clientId=3).
+        # from the order worker (clientId=1).
         position_source=settings.eod_recon_position_source,
         ibkr_host=settings.ibkr_host,
         ibkr_port=settings.ibkr_port,
@@ -1657,132 +1452,12 @@ async def _stop_heartbeat_probe(state: tuple[object, object] | None) -> None:
         log.exception("heartbeat_probe_task_join_failed")
 
 
-async def _start_bar_sync_worker(
-    settings: APISettings,
-) -> tuple[object, object] | None:
-    """Construct + start the BarSyncWorker; return (worker, task) or None.
-
-    Option C of the 2026-05-20 data-layer pivot v2 (see
-    ``Docs/decisions-log.md`` 2026-05-20 evening entry). Fetches daily
-    OHLCV bars for the Phase 1 universe from IBKR via a dedicated
-    ib-async connection on ``clientId=3`` (locked code default since
-    PR #210; deploy reality; distinct from the OrderPlacementWorker's
-    ``clientId=1`` code default + the ``clientId=2`` deploy override
-    the order-worker currently runs with) and writes them to the
-    shared ``lean_data`` Docker volume in LEAN's expected on-disk
-    format. LEAN reads via FakeDataQueue +
-    SubscriptionDataReaderHistoryProvider on its 17:30 ET signal cycle.
-
-    Best-effort: when ``bar_sync_enabled=False`` returns None + logs a
-    structured warning. Other failure modes (ib-async dep missing, etc.)
-    log + return None without crashing the api boot.
-
-    Connection lifecycle is per-cycle (connect → fetch → disconnect)
-    inside ``BarSyncWorker.run_cycle``, not held across ticks. The
-    short-lived socket is intentional defense-in-depth: a bug or hang
-    in the read-only historical path cannot backpressure the long-lived
-    order socket on ``clientId=1`` (or the ``clientId=2`` deploy-
-    override variant).
-
-    PR #211 follow-up (this PR): the worker is now constructed with a
-    ``partial_cycle_alert_hook`` built via
-    :func:`_build_bar_sync_alert_dispatch_hook`. When sops
-    ``discord.webhook_urls.alerts`` is populated the hook fires on the
-    two P2 alert flavors (partial-cycle failure + OI-sentinel
-    substitution) at ``consecutive_count >= 2``. When the URL isn't
-    populated the hook is None and the worker logs
-    ``bar_sync_alert_dropped_no_hook`` instead — same operator-visible
-    descriptor fields, manual-grep workflow.
-    """
-    if not settings.bar_sync_enabled:
-        log.warning("bar_sync_worker_disabled_via_setting")
-        return None
-
-    # Lazy imports — keeps the rest of the api importable even if the
-    # services.data subpackage churns + avoids loading ib-async at
-    # module-load (the worker only needs it at first-cycle).
-    from datetime import time as _time
-    from pathlib import Path as _Path
-
-    from services.data.bar_sync import BarSyncConfig, BarSyncWorker
-
-    # Parse the HH:MM schedule string. The Pydantic field's regex
-    # constraint guarantees the shape; the split is safe.
-    hh_str, mm_str = settings.bar_sync_schedule_et.split(":", 1)
-    sync_time = _time(hour=int(hh_str), minute=int(mm_str))
-
-    config = BarSyncConfig(
-        data_root=_Path(settings.bar_sync_data_root),
-        bars_per_fetch=settings.bar_sync_bars_per_fetch,
-        sync_time_et=sync_time,
-        ibkr_host=settings.ibkr_host,
-        ibkr_port=settings.ibkr_port,
-        ibkr_client_id=settings.bar_sync_client_id,
-        ibkr_account=settings.ibkr_account,
-        ibkr_call_timeout_seconds=settings.bar_sync_ibkr_call_timeout_seconds,
-    )
-    alert_dispatch_hook = _build_bar_sync_alert_dispatch_hook(settings)
-    worker = BarSyncWorker(config=config, partial_cycle_alert_hook=alert_dispatch_hook)
-    # Register the worker with the read-only status provider so
-    # GET /api/system/bar-sync (+ the Discord /barsync command) can read
-    # the last cycle outcome without SSHing to grep journald. In-memory
-    # only; mirrors the heartbeat registry. See services/api/bar_sync_status.py.
-    from services.api.bar_sync_status import get_bar_sync_status_provider
-
-    get_bar_sync_status_provider().set_source(worker)
-    task = asyncio.create_task(worker.run_forever(), name="bar_sync_worker.run_forever")
-    log.info(
-        "bar_sync_worker_spawned",
-        env=_audit_env_from_settings(settings),
-        ibkr_host=settings.ibkr_host,
-        ibkr_port=settings.ibkr_port,
-        ibkr_client_id=settings.bar_sync_client_id,
-        bars_per_fetch=settings.bar_sync_bars_per_fetch,
-        sync_time_et=settings.bar_sync_schedule_et,
-        data_root=settings.bar_sync_data_root,
-        ibkr_call_timeout_seconds=settings.bar_sync_ibkr_call_timeout_seconds,
-        universe_size=len(config.markets),
-        alert_dispatch_hook_wired=alert_dispatch_hook is not None,
-    )
-    return worker, task
-
-
-async def _stop_bar_sync_worker(state: tuple[object, object] | None) -> None:
-    """Request stop + await the worker task. Best-effort."""
-    # Clear the status provider unconditionally so a stale worker handle
-    # can't outlive the lifespan (the next start re-registers a fresh one).
-    from services.api.bar_sync_status import get_bar_sync_status_provider
-
-    get_bar_sync_status_provider().clear()
-    if state is None:
-        return
-    worker, task = state
-    try:
-        worker.request_stop()  # type: ignore[attr-defined]
-    except Exception:
-        log.exception("bar_sync_worker_request_stop_failed")
-    try:
-        await asyncio.wait_for(task, timeout=15.0)  # type: ignore[arg-type]
-    except TimeoutError:
-        log.warning("bar_sync_worker_shutdown_timeout")
-        task.cancel()  # type: ignore[attr-defined]
-        try:
-            await task  # type: ignore[misc]
-        except asyncio.CancelledError:
-            log.info("bar_sync_worker_shutdown_cancelled")
-        except Exception:
-            log.exception("bar_sync_worker_shutdown_unclean")
-    except Exception:
-        log.exception("bar_sync_worker_task_join_failed")
-
-
 async def _start_async_task_monitor(
     settings: APISettings,
     *,
     order_placement: tuple[object, object] | None,
     reconciliation: tuple[object, object] | None,
     heartbeat_probe: tuple[object, object] | None,
-    bar_sync: tuple[object, object] | None = None,
     monitor_alert_hook: object | None = None,
     task_death_alert_hook: object | None = None,
 ) -> tuple[object, object] | None:
@@ -1809,7 +1484,6 @@ async def _start_async_task_monitor(
         order_placement=order_placement,
         reconciliation=reconciliation,
         heartbeat_probe=heartbeat_probe,
-        bar_sync=bar_sync,
     )
 
     ibkr_error_tracker = _build_ibkr_error_tracker(order_placement, monitor_alert_hook)
@@ -1970,7 +1644,6 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     worker_state: tuple[object, object] | None = None
     recon_state: tuple[object, object] | None = None
     heartbeat_probe_state: tuple[object, object] | None = None
-    bar_sync_state: tuple[object, object] | None = None
     async_task_monitor_state: tuple[object, object] | None = None
     try:
         try:
@@ -2004,17 +1677,6 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             # without the probe running.
             log.exception("heartbeat_probe_startup_failed")
         try:
-            # Bar-sync worker (Option C of the 2026-05-20 data-layer
-            # pivot v2). Reads from IBKR on clientId=2, writes to the
-            # lean_data Docker volume that lean_local mounts. Cycle
-            # fires at 17:00 ET daily.
-            bar_sync_state = await _start_bar_sync_worker(settings)
-        except Exception:
-            # Bar-sync startup is best-effort; without it LEAN reads stale
-            # bars on the next cycle. The api still serves the rest of
-            # its surface and the operator can restart to recover.
-            log.exception("bar_sync_worker_startup_failed")
-        try:
             # The monitor MUST start AFTER the other 4 so it can
             # capture their final `(worker, task)` tuples (or `None`
             # for ones that failed to spawn). The monitor itself is
@@ -2027,14 +1689,13 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             # monitor degrades gracefully (WARNING log fires, no
             # Discord push).
             monitor_alert_hook = _build_monitor_alert_dispatch_hook(settings)
-            # Recovery-agent task-death hook (drill 5/6 follow-up landed
-            # 2026-05-26). Audit-first emit of ASYNC_TASK_DIED +
-            # INSERT of an alerts row (category='worker_failure',
-            # severity='P0') when an allow-listed lifespan task
-            # transitions to .done(). The recovery agent at
-            # scripts/operator_tools/recovery_agent.py polls the
-            # alerts table every 60s and invokes replay_executions.py
-            # for transient failures. Hook returns None only when
+            # Task-death hook (drill 5/6 follow-up landed 2026-05-26).
+            # Audit-first emit of ASYNC_TASK_DIED + INSERT of an alerts
+            # row (category='worker_failure', severity='P0') when an
+            # allow-listed lifespan task transitions to .done(). The
+            # IBKR-era recovery agent that consumed these alerts was
+            # retired in the crypto-pivot C0 decommission; the alert +
+            # Discord push remain the operator signal. Hook returns None only when
             # explicitly disabled via setting; default is always-on.
             task_death_alert_hook = _build_task_death_alert_hook(settings)
             async_task_monitor_state = await _start_async_task_monitor(
@@ -2042,7 +1703,6 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 order_placement=worker_state,
                 reconciliation=recon_state,
                 heartbeat_probe=heartbeat_probe_state,
-                bar_sync=bar_sync_state,
                 monitor_alert_hook=monitor_alert_hook,
                 task_death_alert_hook=task_death_alert_hook,
             )
@@ -2055,7 +1715,6 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     finally:
         log.info("api_stopping")
         await _stop_async_task_monitor(async_task_monitor_state)
-        await _stop_bar_sync_worker(bar_sync_state)
         await _stop_heartbeat_probe(heartbeat_probe_state)
         await _stop_reconciliation_scheduler(recon_state)
         await _stop_order_placement_worker(worker_state)
@@ -2090,15 +1749,11 @@ def create_app() -> FastAPI:
     # See services/api/middleware.BotAuthMiddleware docstring for the
     # full request-flow diagram.
     app.add_middleware(BotAuthMiddleware, settings=settings)  # type: ignore[arg-type]
-    # Pivot-PR-A (post-pivot 2026-05-12): LeanAuthMiddleware sits
-    # outermost-of-outermost (added AFTER BotAuthMiddleware so Starlette's
-    # last-added-outermost convention puts it first in the request flow).
-    # Order: LeanAuth → BotAuth → SessionStub → RequestContext → RateLimit
-    # → CSRF → routes. The Lean container POSTs to /api/internal/lean/signals
-    # bearing its own token (sourced from sops `lean.api_bearer_token`); if
-    # it doesn't match, the request falls through to BotAuth which tries the
-    # bot's token, then to SessionStub which fails closed in production envs.
-    app.add_middleware(LeanAuthMiddleware, settings=settings)  # type: ignore[arg-type]
+    # Crypto-pivot C0 (2026-07-08): LeanAuthMiddleware + the
+    # /api/internal/lean/* ingress are RETIRED — signals are generated
+    # in-process by the crypto strategy worker (delta spec §3.3), not
+    # POSTed by an external LEAN container. Middleware order is now:
+    # BotAuth → SessionStub → RequestContext → RateLimit → CSRF → routes.
     # Day 5 routes
     app.include_router(health_router)
     app.include_router(setup_router)
@@ -2114,12 +1769,6 @@ def create_app() -> FastAPI:
     app.include_router(alerts_router)
     # Day 26 — Week 7 Tue Trades page surface (backend-spec §4.1.2).
     app.include_router(trades_router)
-    # Pivot-PR-A (post-pivot 2026-05-12): /api/internal/lean/signals — POST
-    # endpoint for LEAN Local to push signal_emitted events. Shared-bearer
-    # auth via LeanAuthMiddleware (outermost in the middleware stack);
-    # writes audit row via services.audit.writer.append_audit_event;
-    # INSERTs into signals table.
-    app.include_router(lean_router)
     return app
 
 

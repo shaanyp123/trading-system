@@ -32,8 +32,6 @@ import pytest
 
 from services.discord_bot.api_client import (
     ApiClientHTTPError,
-    BarSyncMarketResult,
-    BarSyncStatusResponse,
     HealthCheck,
     HealthResponse,
     PositionRow,
@@ -52,7 +50,6 @@ from services.discord_bot.embeds import (
     build_approve_error_embed,
     build_approve_invalid_uuid_embed,
     build_approve_success_embed,
-    build_bar_sync_embed,
     build_halt_confirm_embed,
     build_halt_invoke_error_embed,
     build_halt_invoke_success_embed,
@@ -67,83 +64,6 @@ from services.discord_bot.embeds import (
 
 
 _NOW = datetime(2026, 5, 19, 21, 5, tzinfo=UTC)
-
-
-def _bar_sync_response(**overrides: object) -> BarSyncStatusResponse:
-    base: dict[str, object] = dict(
-        status="ok",
-        worker_running=True,
-        last_fired_session_date_et="2026-05-19",
-        cycle_started_at_utc=datetime(2026, 5, 19, 21, 0, 0, tzinfo=UTC),
-        cycle_completed_at_utc=datetime(2026, 5, 19, 21, 0, 42, tzinfo=UTC),
-        duration_seconds=42.0,
-        successful_count=10,
-        failed_count=0,
-        total_markets=10,
-        consecutive_failure_count=0,
-        consecutive_sentinel_count=0,
-        successful_markets=[],
-        failed_markets=[],
-        server_now=_NOW,
-    )
-    base.update(overrides)
-    return BarSyncStatusResponse(**base)  # type: ignore[arg-type]
-
-
-class TestBuildBarSyncEmbed:
-    def test_ok_state_is_green(self) -> None:
-        embed = build_bar_sync_embed(_bar_sync_response(), environment="paper", now=_NOW)
-        assert embed.color is not None and embed.color.value == EMBED_COLOR_OK
-        assert "Bar sync OK" in (embed.title or "")
-        assert "paper" in (embed.title or "")
-
-    def test_pending_state_is_info_with_description(self) -> None:
-        resp = _bar_sync_response(
-            status="pending",
-            worker_running=True,
-            cycle_started_at_utc=None,
-            cycle_completed_at_utc=None,
-            duration_seconds=None,
-            successful_count=0,
-            failed_count=0,
-            total_markets=0,
-        )
-        embed = build_bar_sync_embed(resp, environment="paper", now=_NOW)
-        assert embed.color is not None and embed.color.value == EMBED_COLOR_INFO
-        assert "pending" in (embed.title or "").lower()
-        assert "No bar_sync cycle" in (embed.description or "")
-
-    def test_degraded_state_lists_failed_markets(self) -> None:
-        resp = _bar_sync_response(
-            status="degraded",
-            successful_count=9,
-            failed_count=1,
-            consecutive_failure_count=2,
-            failed_markets=[
-                BarSyncMarketResult(
-                    market="/MES",
-                    success=False,
-                    bars_written=0,
-                    last_session_date=None,
-                    front_month_expiry=None,
-                    error="no live front-month",
-                    open_interest=None,
-                    open_interest_was_sentinel=False,
-                ),
-            ],
-        )
-        embed = build_bar_sync_embed(resp, environment="paper", now=_NOW)
-        assert embed.color is not None and embed.color.value == EMBED_COLOR_WARNING
-        field_text = "\n".join(f"{f.name}\n{f.value}" for f in embed.fields)
-        assert "/MES" in field_text
-        assert "no live front-month" in field_text
-        assert "consecutive dirty cycles" in field_text
-
-    def test_rejects_naive_now(self) -> None:
-        with pytest.raises(ValueError):
-            build_bar_sync_embed(
-                _bar_sync_response(), environment="paper", now=datetime(2026, 5, 19, 21, 5)
-            )
 
 
 class TestColorConstants:

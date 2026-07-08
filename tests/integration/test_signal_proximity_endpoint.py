@@ -152,7 +152,6 @@ async def app_dev(
     monkeypatch.setenv("API_ENVIRONMENT", "dev")
     monkeypatch.setenv("API_VERSION", "test")
     monkeypatch.setenv("API_LOG_LEVEL", "INFO")
-    monkeypatch.setenv("API_LEAN_LOCAL_BEARER_TOKEN", "lean-bearer-secret-test-32-bytes")
     monkeypatch.setenv("API_DISCORD_BOT_BEARER_TOKEN", "bot-bearer-secret-test-32-bytes")
 
     from services.api import config as api_config
@@ -182,7 +181,6 @@ async def app_production(
     monkeypatch.setenv("API_ENVIRONMENT", "live-small")
     monkeypatch.setenv("API_VERSION", "test")
     monkeypatch.setenv("API_LOG_LEVEL", "INFO")
-    monkeypatch.setenv("API_LEAN_LOCAL_BEARER_TOKEN", "lean-bearer-secret-test-32-bytes")
     monkeypatch.setenv("API_DISCORD_BOT_BEARER_TOKEN", "bot-bearer-secret-test-32-bytes")
 
     from services.api import config as api_config
