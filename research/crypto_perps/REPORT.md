@@ -74,6 +74,22 @@ Sharpe is preserved (1.02 vs 1.04) — the 2× profile is the same edge at doubl
 
 **Halt disposition:** the $1,500 (−75%) halt and no-halt runs are *identical* — the deep halt never triggered in 9.5 years including the 48.5% drawdown. It was therefore **retained at $1,500 as a malfunction circuit-breaker and debit-risk backstop** (a system down 75% is far more likely broken than unlucky, and FCM accounts can gap into negative balances). It costs nothing in backtest and is not a risk-tolerance bound. Recorded as Amendment A in `Docs/crypto-perps-strategy.md`.
 
+## Exploration — CAGR levers within a Sharpe-similar / DD≤75% budget (2026-07-08, NOT yet adopted)
+
+Operator asked what raises CAGR while keeping Sharpe similar and max DD ≤ 75%. Method: pre-registered structural variants only (size, cost-drag, exposure blockers, dd-tiers) — **no signal/lookback tuning**, which is where overfitting lives. Results in `explore_results.json`:
+
+| Variant (on the Amendment A baseline) | CAGR | Sharpe | Max DD | Sharpe @2× costs | Verdict |
+|---|---|---|---|---|---|
+| Amendment A (current production) | +31.1% | 1.02 | 51.3% | 0.82 | reference |
+| hysteresis-hold (hold through unconfirmed flips) | +35.1% | **1.10** | **49.7%** | — | strict improvement |
+| no-dd-tiers | +36.9% | 1.06 | 58.9% | — | improvement, trades a safety feature |
+| ETH-always (drop $2k rule) | +35.9% | 0.98 | 51.4% | — | REJECT: 2023+ Sharpe 0.28, costs ×2.3 |
+| **combo2x = A + hold + no-tiers** | **+37.1%** | **1.07** | **60.2%** | **0.90** | **recommended** |
+| 3x+hold (tiers 30/55/80) | +43.2% | 0.99 | 66.0% | 0.78 | viable, thin DD headroom |
+| combo3x (3x + hold + no-tiers) | +44.8% | 0.96 | **75.6%** | 0.81 (DD 76.8%) | REJECT: breaches 75% budget |
+
+Notes: (1) hysteresis-hold is a genuine structural gain — going flat during 1-day trend wiggles paid a round trip of costs and forfeited exposure for nothing; holding recovers both, raising Sharpe AND lowering DD. (2) Removing dd-tiers is a real trade, not free: the tiers are the mechanism that turns a dead-regime bleed shallow (spec self-critique #1); without them the system holds full size while losing. (3) Selection-bias caveat: picking the best of 8 backtested variants inflates expected live performance — treat +37% as the optimistic edge of the range, not the central case. (4) A backtest max-DD is one draw of history; running the *backtest* to the DD budget (combo3x) means the *live* budget will be breached in a worse-than-history path. Leave headroom.
+
 ## Recommendation
 
 Deploy-gate **PASS**. Proceed to the backend/frontend delta spec and build **at the Amendment A profile**, with these riders: (1) expectations per Amendment A — ~30% CAGR central case with ~50% drawdowns and red years (2021/2025-shaped) as a normal part of the deal; (2) BTC-only at launch per F-2; (3) funding telemetry from day one and §7-over-§6 precedence in the sizing engine per F-3/F-4; (4) the $1,500 halt ships as a malfunction circuit-breaker — removing it entirely was evaluated and adds nothing (identical backtest) while removing the debit/runaway backstop.

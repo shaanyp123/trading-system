@@ -35,6 +35,7 @@ class Params:
     sma_slow: int = 200
     mom_lb: int = 20
     hysteresis_days: int = 2
+    hysteresis_hold: bool = False  # True: hold position during unconfirmed flip (vs go flat)
     # S2 vol estimate
     ewma_lambda: float = 0.94
     vol_floor: float = 0.20
@@ -310,7 +311,7 @@ def run_backtest(data: dict[str, pd.DataFrame], p: Params, start: str, end: str)
                         st.pending_dir = 0
                         st.pending_count = 0
                     else:
-                        targets[s] = 0.0  # unconfirmed flip: go flat
+                        targets[s] = st.contracts if p.hysteresis_hold else 0.0
                         continue
                 else:
                     st.pending_dir = 0
