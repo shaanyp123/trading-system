@@ -117,6 +117,19 @@ Notes: (1) **Cash yield is the material win** — the strategy averages ~0.4x gr
 
 \* backtest max DD vs the operator's 75% budget. Sharpe declines monotonically with scale (cost + volatility drag); CAGR still rises at 4× on this path, so the historical growth-optimal ("full-Kelly") scale is ≥4× — but betting at or near it produces 80%+ drawdowns and, on any live-worse-than-history path, the halt. Production at 2.0× ≈ half-Kelly: deliberately below growth-optimal per standard fractional-Kelly practice (parameter estimates are noisy; the penalty for over-betting is convex, the penalty for under-betting is linear). 2.5× was considered (Sharpe −0.02, +8 CAGR, headroom 16.5→8 pts) and deferred to the 6-month live review rather than taken on backtest evidence alone.
 
+### Exploration round 3b — fine sweep 1.5×–2.0×
+
+| Scale | CAGR | Sharpe | Max DD | Worst year | 2025 |
+|---|---|---|---|---|---|
+| 1.5× | +33.1% | 1.20 | 47.5% | +1.5% | +18.9% |
+| 1.6× | +34.9% | 1.19 | 50.3% | −0.1% | +19.4% |
+| 1.7× | +36.8% | 1.18 | 52.4% | −0.2% | +20.6% |
+| 1.8× | +38.5% | 1.17 | 54.5% | −1.2% | +21.5% |
+| 1.9× | +40.1% | 1.16 | 56.5% | −2.0% | +22.1% |
+| 2.0× | +41.9% | 1.16 | 58.5% | −2.9% | +23.3% |
+
+Perfectly monotone, no cliffs or sweet spots: each +0.1× buys ≈ +1.8 pts CAGR for ≈ +2.2 pts max DD and ≈ −0.01 Sharpe. Conclusion: within this band, scale is a pure preference slider — there is no statistically distinguishable "better" point, and selecting a decimal by best backtest number would be fitting to path noise. Natural anchors: 1.5× (every backtest year positive, DD < 50%) and 2.0× (production; max CAGR within ~16 pts of DD headroom). Production remains 2.0× per the operator's risk mandate.
+
 ## Recommendation
 
 Deploy-gate **PASS**. Proceed to the backend/frontend delta spec and build **at the Amendment B profile** (Amendment A knobs + hysteresis-hold + no dd-tiers + band-edge rebalancing + cash-yield layer; validated +41.9% CAGR / Sharpe 1.16 / DD 58.5%, operator-selected 2026-07-08 over the 3× alternative), with these riders: (1) expectations per Amendment A — ~30% CAGR central case with ~50% drawdowns and red years (2021/2025-shaped) as a normal part of the deal; (2) BTC-only at launch per F-2; (3) funding telemetry from day one and §7-over-§6 precedence in the sizing engine per F-3/F-4; (4) the $1,500 halt ships as a malfunction circuit-breaker — removing it entirely was evaluated and adds nothing (identical backtest) while removing the debit/runaway backstop.
