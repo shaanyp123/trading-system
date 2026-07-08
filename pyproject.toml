@@ -36,13 +36,11 @@ dependencies = [
   "resend>=2.4",
   "anthropic>=0.39",
   "pyyaml>=6.0",
-  # ib-async (Pivot-PR-B; post-pivot 2026-05-12): maintained fork of
-  # ib_insync. Async TWS API client wrapped by
-  # services/execution/ibkr_adapter.py to place + cancel + monitor IBKR
-  # orders. Talks to the ib_gateway Docker container on port 4002 (paper)
-  # / 4001 (live) using IBKR's TWS API protocol (NOT REST; binary framing).
-  # RETIRING: dies with the §3.1 coinbase adapter PR (crypto-pivot C0-B2b).
-  "ib-async>=1.0.3",
+  # coinbase-advanced-py (crypto-pivot C0-B2b, delta spec §3.1): official
+  # Coinbase Advanced Trade SDK. Sync REST client with CDP JWT (ES256)
+  # request signing, wrapped by services/execution/coinbase_client.py via
+  # asyncio.to_thread. Replaces ib-async (IBKR stack retired 2026-07-08).
+  "coinbase-advanced-py>=1.8.4",
   # websockets (crypto-pivot C0-B2a): async client for the public Coinbase
   # Advanced Trade WS ticker channel (services/data/coinbase_market_data.py
   # — marks for the 30s risk loop, delta spec §3.2). Fully typed (py.typed);
@@ -157,16 +155,15 @@ exclude = [
   "alembic/versions/",   # generated migration files
 ]
 
-# ib_async has no published type stubs as of v1.0.3. The adapter at
-# services/execution/ibkr_adapter.py imports from this library at runtime
-# (and via TYPE_CHECKING for static analysis) — let mypy treat it as Any
-# rather than failing. Once typeshed (or the upstream lib) adds stubs,
-# remove this override.
+# coinbase-advanced-py ships no py.typed marker as of 1.8.4. The broker
+# transport at services/execution/coinbase_client.py imports it lazily at
+# runtime and converts responses to dicts at the boundary — let mypy treat
+# the SDK as Any rather than failing. Remove once upstream ships types.
 [[tool.mypy.overrides]]
-module = "ib_async"
+module = "coinbase"
 ignore_missing_imports = true
 [[tool.mypy.overrides]]
-module = "ib_async.*"
+module = "coinbase.*"
 ignore_missing_imports = true
 
 # pandas is used only by the standalone crypto-perps research backtester

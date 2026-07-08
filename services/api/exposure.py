@@ -8,11 +8,9 @@ NAV percentages computed from ``positions_current`` rows + the latest
 The market→(cluster, multiplier) mapping is sourced from the locked V1 universe:
 
 * Cluster names mirror :data:`services.api.schemas.today.ExposureCluster`.
-* Multipliers mirror :func:`services.execution.ibkr_adapter._resolve_contract_ref`
-  (the IBKR-side multipliers used when contracts are placed). The ``/MYM``
-  multiplier here is :class:`~decimal.Decimal` ``"0.50"`` rather than the
-  integer ``0`` in the adapter (which is a known integer-quantization issue
-  on the order-placement side; this exposure path uses the correct value).
+* Multipliers mirror the retired IBKR adapter's contract multipliers
+  (the adapter itself was deleted in crypto-pivot C0-B2b; this whole V1
+  metadata surface is retired by the §3.4 sizing PR).
 * The ``contracts`` table is structurally meant to carry per-expiry rows
   (and has a ``multiplier`` column) but is empty today + has no ``cluster``
   column. Until that table is populated and extended, the static lookup

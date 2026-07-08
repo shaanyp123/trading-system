@@ -30,11 +30,8 @@ import logging
 import secrets
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Literal
 from uuid import UUID
-
-if TYPE_CHECKING:
-    from services.api.async_task_monitor import TrackedIbkrErrorState
 
 import httpx
 import structlog
@@ -131,118 +128,6 @@ def _audit_env_from_settings(settings: APISettings) -> Literal["paper", "live-sm
     if settings.environment in ("paper", "live-small", "live-scale"):
         return settings.environment
     return "paper"
-
-
-async def _start_order_placement_worker(settings: APISettings) -> tuple[object, object] | None:
-    """Construct + start the OrderPlacementWorker; return (worker, task) or None.
-
-    Best-effort: any failure to construct the worker (no active account,
-    ib_async unavailable, etc.) logs a warning and returns None. The api
-    still serves the rest of its surface.
-
-    The lifecycle of the IbkrClient connection is owned by the adapter
-    (auto-reconnect on transient disconnects). The connect() call here
-    is the initial best-effort handshake; if ib_gateway is down at boot
-    the worker.run_once() iterations will keep retrying with the
-    adapter's reconnect path.
-    """
-    if not settings.order_placement_worker_enabled:
-        log.warning("order_placement_worker_disabled_via_setting")
-        return None
-
-    # Lazy imports — keeps the rest of the api importable even when
-    # ib_async isn't installed (e.g., dev hosts running unit tests).
-    from services.execution.ibkr_adapter import IbAsyncIbkrClient
-    from services.execution.types import IbkrPlacementError
-    from services.risk.order_placement_worker import OrderPlacementWorker
-
-    # Resolve active account_id from the accounts table. If no account
-    # exists, defer startup — the operator must complete /setup before
-    # signals flow.
-    async with session_scope() as repo_session:
-        repo = PostgresPhase1QueryRepo(repo_session)
-        account_id = await repo.fetch_active_account_id()
-    if account_id is None:
-        log.warning(
-            "order_placement_worker_no_active_account",
-            note="run /setup before the worker can resolve an account_id",
-        )
-        return None
-
-    # Construct + best-effort connect. IBKR account number is optional —
-    # IbAsyncIbkrClient falls back to the default account on the TWS
-    # session when None is passed.
-    ibkr_account = settings.ibkr_account
-    ibkr_client = IbAsyncIbkrClient(
-        host=settings.ibkr_host,
-        port=settings.ibkr_port,
-        account_id=ibkr_account,
-        client_id=settings.ibkr_client_id,
-    )
-
-    try:
-        await ibkr_client.connect()
-    except IbkrPlacementError as exc:
-        log.warning(
-            "order_placement_worker_initial_ibkr_connect_failed",
-            host=settings.ibkr_host,
-            port=settings.ibkr_port,
-            error=str(exc),
-            note=(
-                "Worker will keep retrying via the adapter's reconnect "
-                "path on each run_once() iteration."
-            ),
-        )
-
-    # Exit-pipeline PR-C (2026-05-27): build the POSITION_UNPROTECTED
-    # P0 alert dispatch hook from sops Discord URLs + Resend identity.
-    # When sops isn't populated the hook stays None — the worker still
-    # writes the audit row + structured WARNING in logs; only the
-    # Discord/email push is skipped (operator should monitor the
-    # /audit page until the hook is wired).
-    #
-    # ``_build_position_unprotected_alert_hook`` returns ``object | None``
-    # for the same circular-import dodge as the recon + monitor hook
-    # builders (see their docstrings). The runtime type IS
-    # ``PositionUnprotectedAlertHook | None``; cast for mypy.
-    from typing import cast as _cast
-
-    from services.risk.order_placement_worker import (
-        OrderPlacementFailureAlertHook,
-        PositionUnprotectedAlertHook,
-    )
-
-    position_unprotected_hook = _cast(
-        "PositionUnprotectedAlertHook | None",
-        _build_position_unprotected_alert_hook(settings),
-    )
-    order_placement_failure_hook = _cast(
-        "OrderPlacementFailureAlertHook | None",
-        _build_order_placement_failure_alert_hook(settings),
-    )
-
-    worker = OrderPlacementWorker(
-        session_factory=api_db.get_session_factory(),
-        ibkr_client=ibkr_client,
-        account_id=account_id,
-        env=_audit_env_from_settings(settings),
-        poll_interval_seconds=settings.order_placement_poll_interval_seconds,
-        ibkr_call_timeout_seconds=settings.ibkr_call_timeout_seconds,
-        position_unprotected_alert_hook=position_unprotected_hook,
-        order_placement_failure_alert_hook=order_placement_failure_hook,
-    )
-    task = asyncio.create_task(worker.run_forever(), name="order_placement_worker.run_forever")
-    log.info(
-        "order_placement_worker_spawned",
-        account_id=str(account_id),
-        env=_audit_env_from_settings(settings),
-        ibkr_host=settings.ibkr_host,
-        ibkr_port=settings.ibkr_port,
-        ibkr_account=ibkr_account,
-        poll_interval=settings.order_placement_poll_interval_seconds,
-        ibkr_call_timeout_seconds=settings.ibkr_call_timeout_seconds,
-    )
-    return worker, task
 
 
 def _build_alert_dispatch_hook(
@@ -411,299 +296,18 @@ def _build_alert_dispatch_hook(
     return _hook
 
 
-def _build_position_unprotected_alert_hook(
-    settings: APISettings,
-) -> object | None:
-    """Construct the order_placement_worker's POSITION_UNPROTECTED P0
-    alert dispatch hook or return None.
-
-    Exit-pipeline PR-C (2026-05-27). The worker's exit branch invokes
-    this hook from the cancel-success+place-fail failure path; the hook
-    INSERTs an ``alerts`` row of category='position_unprotected' +
-    severity='P0' (linked via ``triggering_audit_event_uuid`` to the
-    POSITION_UNPROTECTED audit row that JUST landed), then invokes
-    :func:`services.webhook_pusher.dispatcher.dispatch_alert` for the
-    Discord #alerts + #critical + Resend email fan-out per
-    SEVERITY_TO_CHANNELS[P0].
-
-    Returns ``None`` when sops Discord URLs aren't populated (same
-    degradation contract as the recon + monitor hooks). The worker
-    still writes the audit row + a structured WARNING in logs so the
-    operator can monitor /audit until the hook is wired.
-
-    Pattern mirror of ``_build_alert_dispatch_hook`` but the hook
-    signature is ``PositionUnprotectedAlertHook`` taking a
-    :class:`PositionUnprotectedAlertDescriptor`. P0 routing requires
-    all of ``discord.webhook_urls.alerts``, ``discord.webhook_urls.critical``,
-    and the Resend identity fields; missing any → the
-    :func:`dispatch_alert` planner raises at fan-out time, the
-    worker's exception handler swallows + logs (failure-of-failure
-    handler tolerated since the audit row already records the durable
-    state). Recommend wiring ALL three before live cutover.
-
-    Returns ``object | None`` to dodge a circular import on the worker
-    side (same crutch as the other two hooks).
-    """
-    from services.risk.order_placement_worker import (
-        PositionUnprotectedAlertDescriptor,
-    )
-    from services.webhook_pusher.dispatcher import dispatch_alert
-    from services.webhook_pusher.payloads import (
-        AlertCategory,
-        AlertSeverity,
-        ChannelName,
-        EmailIdentity,
-    )
-
-    if settings.discord_webhook_url_alerts is None:
-        log.warning(
-            "position_unprotected_alert_hook_skipped_no_webhook_url",
-            note=(
-                "discord.webhook_urls.alerts not in sops; the exit-pipeline "
-                "POSITION_UNPROTECTED audit row will still land, but no "
-                "P0 Discord push will fire. Wire the sops field + restart "
-                "api to enable. THIS IS A LIVE-CUTOVER BLOCKER per "
-                "Docs/exit-pipeline-design.md §11 R3."
-            ),
-        )
-        return None
-
-    webhook_urls: dict[ChannelName, str] = {
-        ChannelName.DISCORD_ALERTS: settings.discord_webhook_url_alerts.get_secret_value(),
-    }
-    if settings.discord_webhook_url_critical is not None:
-        webhook_urls[ChannelName.DISCORD_CRITICAL] = (
-            settings.discord_webhook_url_critical.get_secret_value()
-        )
-    else:
-        log.warning(
-            "position_unprotected_alert_hook_missing_critical_channel",
-            note=(
-                "discord.webhook_urls.critical not in sops; P0 alerts will "
-                "fall back to #alerts only. The dispatcher's planner WILL "
-                "raise at fan-out time when SEVERITY_TO_CHANNELS[P0] "
-                "expects #critical. Wire before live cutover."
-            ),
-        )
-
-    email_identity: EmailIdentity | None = None
-    if (
-        settings.resend_api_key is not None
-        and settings.resend_from_address is not None
-        and settings.resend_to_address is not None
-    ):
-        email_identity = EmailIdentity(
-            from_address=settings.resend_from_address,
-            to_address=settings.resend_to_address,
-            resend_api_key=settings.resend_api_key.get_secret_value(),
-        )
-
-    log.info(
-        "position_unprotected_alert_hook_constructed",
-        channels=[c.value for c in webhook_urls],
-        email_wired=email_identity is not None,
-    )
-
-    async def _hook(descriptor: PositionUnprotectedAlertDescriptor) -> None:
-        """Per-failure: INSERT alerts row + dispatch P0 fan-out."""
-        session_factory = api_db.get_session_factory()
-        message_text = (
-            f"POSITION_UNPROTECTED · {descriptor.market} "
-            f"({descriptor.prior_position_direction} "
-            f"qty={abs(descriptor.prior_position_quantity)}) — bracket-stop "
-            f"cancel succeeded, close placement FAILED. "
-            f"close_failure_reason={descriptor.close_failure_reason}. "
-            f"last_known_stop_price={descriptor.last_known_stop_price}."
-        )
-        detail_payload: dict[str, Any] = {
-            "signal_id": str(descriptor.signal_id),
-            "market": descriptor.market,
-            "prior_position_direction": descriptor.prior_position_direction,
-            "prior_position_quantity": descriptor.prior_position_quantity,
-            "last_known_stop_price": str(descriptor.last_known_stop_price),
-            "close_client_order_id": descriptor.close_client_order_id,
-            "close_failure_reason": descriptor.close_failure_reason,
-        }
-        async with session_factory() as ins_session:
-            row = (
-                await ins_session.execute(
-                    text(
-                        "INSERT INTO alerts ("
-                        "    account_id, severity, category, message, detail, "
-                        "    triggering_audit_event_uuid"
-                        ") VALUES ("
-                        "    :acct, :sev, :cat, :msg, CAST(:detail AS JSONB), :tau"
-                        ") RETURNING id"
-                    ),
-                    {
-                        "acct": descriptor.account_id,
-                        "sev": AlertSeverity.P0.value,
-                        "cat": AlertCategory.POSITION_UNPROTECTED.value,
-                        "msg": message_text,
-                        "detail": json.dumps(detail_payload),
-                        "tau": descriptor.triggering_audit_event_uuid,
-                    },
-                )
-            ).fetchone()
-            assert row is not None
-            alert_id = UUID(str(row.id))
-            await ins_session.commit()
-
-        log.error(
-            "position_unprotected_alert_inserted",
-            alert_id=str(alert_id),
-            account_id=str(descriptor.account_id),
-            signal_id=str(descriptor.signal_id),
-            market=descriptor.market,
-            env=descriptor.env,
-            close_failure_reason=descriptor.close_failure_reason,
-        )
-
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as http_client:
-            async with session_factory() as disp_session:
-                report = await dispatch_alert(
-                    session=disp_session,
-                    alert_id=alert_id,
-                    http_client=http_client,
-                    webhook_urls=webhook_urls,
-                    email_identity=email_identity,
-                )
-        log.error(
-            "position_unprotected_alert_dispatched",
-            alert_id=str(alert_id),
-            short_circuited=report.short_circuited,
-            delivery_status=dict(report.delivery_status),
-        )
-
-    return _hook
-
-
-def _build_order_placement_failure_alert_hook(
-    settings: APISettings,
-) -> object | None:
-    """Construct the order_placement_worker's ORDER_PLACEMENT_FAILED P1
-    alert hook, or return None.
-
-    Silent-failure follow-up (2026-06-08). The worker invokes this from the
-    dispatch loop's ``IbkrPlacementError`` catch — broker unavailable OR a
-    contract rejection (e.g. the 2026-06-04 /MYM Error-200 wrong-exchange
-    case fixed in #327). The hook INSERTs an ``alerts`` row
-    category='order_placement_failed' + severity='P1', then invokes
-    :func:`services.webhook_pusher.dispatcher.dispatch_alert` for the
-    Discord ``#alerts`` push (``SEVERITY_TO_CHANNELS[P1]`` = #alerts only;
-    no #critical, no email — no money is at risk, the order simply didn't
-    place and the signal stays ``approved`` for the next poll).
-
-    Returns ``None`` when ``discord.webhook_urls.alerts`` isn't in sops —
-    the worker then logs-only (same degradation contract as the other
-    hooks; the failure is still in the structlog ``order_placement_broker_
-    unavailable`` line). Returns ``object | None`` to dodge the worker-side
-    circular import (same crutch as the position-unprotected hook).
-    """
-    from services.risk.order_placement_worker import (
-        OrderPlacementFailureAlertDescriptor,
-    )
-    from services.webhook_pusher.dispatcher import dispatch_alert
-    from services.webhook_pusher.payloads import (
-        AlertCategory,
-        AlertSeverity,
-        ChannelName,
-    )
-
-    if settings.discord_webhook_url_alerts is None:
-        log.warning(
-            "order_placement_failure_alert_hook_skipped_no_webhook_url",
-            note=(
-                "discord.webhook_urls.alerts not in sops; order-placement "
-                "failures stay log-only (no #alerts push). Wire the sops "
-                "field + restart api to enable the P1 alert."
-            ),
-        )
-        return None
-
-    webhook_urls: dict[ChannelName, str] = {
-        ChannelName.DISCORD_ALERTS: settings.discord_webhook_url_alerts.get_secret_value(),
-    }
-
-    log.info("order_placement_failure_alert_hook_constructed")
-
-    async def _hook(descriptor: OrderPlacementFailureAlertDescriptor) -> None:
-        """Per-failure: INSERT alerts row + dispatch the P1 #alerts push."""
-        session_factory = api_db.get_session_factory()
-        message_text = (
-            f"ORDER_PLACEMENT_FAILED · {descriptor.market} "
-            f"({descriptor.signal_type}) — IBKR order placement failed; the "
-            f"signal remains approved for the next poll cycle. "
-            f"reason={descriptor.failure_reason}"
-        )
-        detail_payload: dict[str, Any] = {
-            "signal_id": str(descriptor.signal_id),
-            "market": descriptor.market,
-            "signal_type": descriptor.signal_type,
-            "failure_reason": descriptor.failure_reason,
-        }
-        async with session_factory() as ins_session:
-            row = (
-                await ins_session.execute(
-                    text(
-                        "INSERT INTO alerts ("
-                        "    account_id, severity, category, message, detail"
-                        ") VALUES ("
-                        "    :acct, :sev, :cat, :msg, CAST(:detail AS JSONB)"
-                        ") RETURNING id"
-                    ),
-                    {
-                        "acct": descriptor.account_id,
-                        "sev": AlertSeverity.P1.value,
-                        "cat": AlertCategory.ORDER_PLACEMENT_FAILED.value,
-                        "msg": message_text,
-                        "detail": json.dumps(detail_payload),
-                    },
-                )
-            ).fetchone()
-            assert row is not None
-            alert_id = UUID(str(row.id))
-            await ins_session.commit()
-
-        log.error(
-            "order_placement_failure_alert_inserted",
-            alert_id=str(alert_id),
-            account_id=str(descriptor.account_id),
-            signal_id=str(descriptor.signal_id),
-            market=descriptor.market,
-            signal_type=descriptor.signal_type,
-        )
-
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as http_client:
-            async with session_factory() as disp_session:
-                report = await dispatch_alert(
-                    session=disp_session,
-                    alert_id=alert_id,
-                    http_client=http_client,
-                    webhook_urls=webhook_urls,
-                    email_identity=None,
-                )
-        log.error(
-            "order_placement_failure_alert_dispatched",
-            alert_id=str(alert_id),
-            short_circuited=report.short_circuited,
-            delivery_status=dict(report.delivery_status),
-        )
-
-    return _hook
-
-
 def _build_monitor_alert_dispatch_hook(
     settings: APISettings,
 ) -> object | None:
     """Construct the AsyncTaskMonitor's alert dispatch hook or return None.
 
-    Drill 5 follow-up #2-FU-1 (PR after #177 + #179). The
-    AsyncTaskMonitor's IBKR connectivity probe emits an
-    ``async_task_monitor_ibkr_connectivity_warn`` WARNING on fresh
-    1100/1101/1102 errors; this hook adds the Discord ``#alerts``
-    P1 push so the operator sees the event in-channel within 30s of
-    its first probe-tick observation.
+    Drill 5 follow-up #2-FU-1 (PR after #177 + #179). Turns a
+    :class:`MonitorAlertDescriptor` into an ``alerts`` row + Discord
+    ``#alerts`` push so the operator sees monitor-surfaced events
+    in-channel within ~30s of the probe tick that observed them.
+    (The IBKR connectivity probe that originally motivated this hook
+    was retired with the IBKR execution layer in crypto-pivot C0-B2b;
+    the hook remains the generic monitor→Discord seam.)
 
     Returns ``None`` (cleanly skipping the hook installation) when
     sops ``discord.webhook_urls.alerts`` isn't populated. The probe's
@@ -880,8 +484,8 @@ def _build_task_death_alert_hook(
     Recovery-agent follow-up to drill 5 (2026-05-18) + drill 7 (2026-05-18),
     landed 2026-05-26. When the AsyncTaskMonitor's
     ``_probe_tracked_tasks`` observes that an allow-listed lifespan
-    task transitioned to ``.done()`` unexpectedly (today: only
-    ``order_placement_worker.run_forever``), the monitor fires this
+    task transitioned to ``.done()`` unexpectedly (post-C0-B2b:
+    ``coinbase_market_data.run_forever``), the monitor fires this
     hook with a ``MonitorAlertDescriptor``. The hook closure performs
     two state mutations in audit-first order (backend-spec §2.10.1):
 
@@ -1289,15 +893,6 @@ async def _start_reconciliation_scheduler(
         env=_audit_env_from_settings(settings),
         flex_query_id=settings.flex_query_id,
         flex_query_token=settings.flex_query_token.get_secret_value(),
-        # Option C (2026-05-28): EOD position source + the gateway
-        # connection params the reqPositions path needs. Recon reuses the
-        # worker's host/port/account (same gateway + account) but on its
-        # own clientId=4 (the ibkr_intraday default), so it stays isolated
-        # from the order worker (clientId=1).
-        position_source=settings.eod_recon_position_source,
-        ibkr_host=settings.ibkr_host,
-        ibkr_port=settings.ibkr_port,
-        ibkr_account_id=settings.ibkr_account,
     )
     alert_dispatch_hook = _build_alert_dispatch_hook(settings)
     state_transition_hook = _build_state_transition_hook(settings)
@@ -1314,7 +909,6 @@ async def _start_reconciliation_scheduler(
         account_id=str(account_id),
         env=_audit_env_from_settings(settings),
         flex_query_id=settings.flex_query_id,
-        position_source=settings.eod_recon_position_source,
         alert_dispatch_hook_wired=alert_dispatch_hook is not None,
         state_transition_hook_wired=state_transition_hook is not None,
     )
@@ -1343,40 +937,6 @@ async def _stop_reconciliation_scheduler(state: tuple[object, object] | None) ->
             log.exception("reconciliation_scheduler_shutdown_unclean")
     except Exception:
         log.exception("reconciliation_scheduler_task_join_failed")
-
-
-async def _stop_order_placement_worker(state: tuple[object, object] | None) -> None:
-    """Request stop + await task + disconnect the IBKR client. Best-effort."""
-    if state is None:
-        return
-    worker, task = state
-    try:
-        worker.request_stop()  # type: ignore[attr-defined]
-    except Exception:
-        log.exception("order_placement_worker_request_stop_failed")
-    # Give the worker a few seconds to finish its in-flight run_once.
-    try:
-        await asyncio.wait_for(task, timeout=15.0)  # type: ignore[arg-type]
-    except TimeoutError:
-        log.warning("order_placement_worker_shutdown_timeout")
-        task.cancel()  # type: ignore[attr-defined]
-        try:
-            await task  # type: ignore[misc]
-        except asyncio.CancelledError:
-            log.info("order_placement_worker_shutdown_cancelled")
-        except Exception:
-            log.exception("order_placement_worker_shutdown_unclean")
-    except Exception:
-        log.exception("order_placement_worker_task_join_failed")
-    # Disconnect the IBKR client. The worker holds a reference; pull it
-    # out via the internal attribute (the worker class predates the
-    # need for a public accessor; surfacing one is a future tweak).
-    ibkr_client = getattr(worker, "_ibkr_client", None)
-    if ibkr_client is not None:
-        try:
-            await ibkr_client.disconnect()
-        except Exception:
-            log.exception("order_placement_worker_ibkr_disconnect_failed")
 
 
 async def _start_heartbeat_probe(
@@ -1682,7 +1242,6 @@ async def _stop_coinbase_market_data_worker(state: tuple[object, object] | None)
 async def _start_async_task_monitor(
     settings: APISettings,
     *,
-    order_placement: tuple[object, object] | None,
     reconciliation: tuple[object, object] | None,
     heartbeat_probe: tuple[object, object] | None,
     coinbase_market_data: tuple[object, object] | None = None,
@@ -1691,14 +1250,18 @@ async def _start_async_task_monitor(
 ) -> tuple[object, object] | None:
     """Construct + start the AsyncTaskMonitor; return (monitor, task) or None.
 
-    2026-05-17 follow-up to the silent-worker-death pattern. The 3
-    lifespan background tasks (worker, scheduler, probe) silently die
-    when they hit an uncaught BaseException OR hang indefinitely on an
-    unresponsive IBKR await. Without an observer, dead tasks are
-    invisible. The monitor ticks every
-    ``async_task_monitor_interval_seconds`` and logs
-    ``async_task_died`` events when a tracked task transitions to
+    2026-05-17 follow-up to the silent-worker-death pattern: lifespan
+    background tasks silently die when they hit an uncaught
+    BaseException. Without an observer, dead tasks are invisible. The
+    monitor ticks every ``async_task_monitor_interval_seconds`` and
+    logs ``async_task_died`` events when a tracked task transitions to
     ``.done()`` unexpectedly.
+
+    Crypto-pivot C0-B2b: the IBKR connectivity probe (1100/1101/1102
+    error tracker on the order-placement worker's client) was retired
+    with the IBKR execution layer; broker connectivity observability is
+    now the market-data staleness watchdog (§3.2) + the future strategy
+    worker's own error paths.
 
     Best-effort: the monitor is a debugging aid, not load-bearing. If
     construction fails the api still serves traffic.
@@ -1709,43 +1272,10 @@ async def _start_async_task_monitor(
     from services.api.async_task_monitor import AsyncTaskMonitor, collect_tracked_tasks
 
     tracked = collect_tracked_tasks(
-        order_placement=order_placement,
         reconciliation=reconciliation,
         heartbeat_probe=heartbeat_probe,
         coinbase_market_data=coinbase_market_data,
     )
-
-    ibkr_error_tracker = _build_ibkr_error_tracker(order_placement, monitor_alert_hook)
-    if ibkr_error_tracker is not None:
-        log.info(
-            "async_task_monitor_ibkr_probe_wired",
-            tracker_name=ibkr_error_tracker.name,
-            note=(
-                "IBKR connectivity probe is live. Fresh "
-                "1100/1101/1102 errors will emit "
-                "async_task_monitor_ibkr_connectivity_warn WARNING."
-            ),
-        )
-    elif order_placement is None:
-        log.info(
-            "async_task_monitor_ibkr_probe_not_wired",
-            reason="order_placement_worker_not_spawned",
-            note=(
-                "OrderPlacementWorker is None (likely no active account "
-                "or worker disabled via setting). IBKR connectivity "
-                "probe will not run; structured-log path via adapter "
-                "is unaffected."
-            ),
-        )
-    else:
-        log.warning(
-            "async_task_monitor_ibkr_probe_not_wired",
-            reason="worker_has_no_ibkr_client_attr",
-            note=(
-                "OrderPlacementWorker exists but exposes no "
-                "_ibkr_client. IBKR connectivity probe will not run."
-            ),
-        )
 
     # Recovery-agent task-death hook (drill 5/6 follow-up, 2026-05-26).
     # Typed as the concrete TaskDeathAlertHook for the monitor; the
@@ -1758,7 +1288,6 @@ async def _start_async_task_monitor(
     monitor = AsyncTaskMonitor(
         tracked,
         interval_seconds=settings.async_task_monitor_interval_seconds,
-        ibkr_error_state=ibkr_error_tracker,
         task_death_alert_hook=typed_task_death_hook,
     )
     task = asyncio.create_task(
@@ -1769,82 +1298,9 @@ async def _start_async_task_monitor(
         "async_task_monitor_spawned",
         interval_seconds=settings.async_task_monitor_interval_seconds,
         tracked_count=len(tracked),
-        ibkr_probe_wired=ibkr_error_tracker is not None,
         task_death_hook_wired=typed_task_death_hook is not None,
     )
     return monitor, task
-
-
-def _build_ibkr_error_tracker(
-    order_placement: tuple[object, object] | None,
-    monitor_alert_hook: object | None = None,
-) -> TrackedIbkrErrorState | None:
-    """Pure-policy: build a ``TrackedIbkrErrorState`` from lifespan state.
-
-    2026-05-18 drill 5 follow-up #2 — extracted from
-    ``_start_async_task_monitor`` so it can be unit-tested without
-    spawning a real ``AsyncTaskMonitor`` (whose ``run_forever`` task
-    would emit structlog log lines through the
-    ``services.api.async_task_monitor`` module logger, caching it
-    under ``cache_logger_on_first_use=True`` set by
-    ``_configure_structlog``, which then prevents downstream
-    ``test_async_task_monitor.py`` tests from intercepting via
-    ``capture_logs()``).
-
-    Resolves the IBKR adapter from the worker via
-    ``getattr(worker, "_ibkr_client", None)`` (same pattern as the
-    disconnect path in ``_stop_order_placement_worker``) and builds
-    a provider callable closing over the adapter instance. The
-    provider reads the adapter's ``last_ibkr_error`` property each
-    probe; the property returns ``None`` until the first errorEvent
-    fires.
-
-    Drill 5 follow-up #2-FU-1: optional ``monitor_alert_hook`` is the
-    Discord ``#alerts`` dispatch closure built by
-    ``_build_monitor_alert_dispatch_hook``. When wired, the monitor
-    fires the hook with a ``MonitorAlertDescriptor`` immediately
-    after emitting ``async_task_monitor_ibkr_connectivity_warn``. When
-    None, the WARNING fires but no Discord push is attempted.
-
-    Returns ``None`` when:
-    * ``order_placement`` is None (worker disabled / no active account).
-    * The worker exposes no ``_ibkr_client`` attribute (unexpected;
-      worker class shape changed).
-
-    Both branches leave the adapter's own ``ibkr_error_received``
-    structured-log path unaffected — only the monitor's per-cycle
-    WARNING surface is gated.
-    """
-    if order_placement is None:
-        return None
-    worker, _task = order_placement
-    ibkr_client = getattr(worker, "_ibkr_client", None)
-    if ibkr_client is None:
-        return None
-
-    # Lazy imports at function call time (mirror the pattern in
-    # _start_async_task_monitor). The TYPE_CHECKING-only quoted return
-    # type above keeps mypy happy without importing at module level.
-    from services.api.async_task_monitor import MonitorAlertHook, TrackedIbkrErrorState
-    from services.execution.ibkr_adapter import IbkrErrorState
-
-    captured_client = ibkr_client
-
-    def _ibkr_error_provider() -> IbkrErrorState | None:
-        return captured_client.last_ibkr_error  # type: ignore[no-any-return]
-
-    # The hook arg is `object | None` at this function's API boundary
-    # (dodges import-time circularity at module-load); narrow to the
-    # concrete callable type here for the dataclass field.
-    typed_hook: MonitorAlertHook | None = (
-        None if monitor_alert_hook is None else monitor_alert_hook  # type: ignore[assignment]
-    )
-
-    return TrackedIbkrErrorState(
-        name="ibkr_adapter",
-        provider=_ibkr_error_provider,
-        alert_dispatch_hook=typed_hook,
-    )
 
 
 async def _stop_async_task_monitor(state: tuple[object, object] | None) -> None:
@@ -1870,7 +1326,6 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     await init_pool(settings)
     sse_multiplexer.reset_state()
     sse_multiplexer.start_heartbeat()
-    worker_state: tuple[object, object] | None = None
     recon_state: tuple[object, object] | None = None
     heartbeat_probe_state: tuple[object, object] | None = None
     coinbase_market_data_state: tuple[object, object] | None = None
@@ -1883,14 +1338,10 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             # have run yet on this VPS. Log loudly and continue; operator
             # runs the bootstrap CLI after migrations finish.
             log.exception("setup_token_bootstrap_failed")
-        try:
-            worker_state = await _start_order_placement_worker(settings)
-        except Exception:
-            # Worker startup is best-effort; failure shouldn't take
-            # down the api. The operator can re-enable + restart once
-            # the underlying issue (ib_async install, accounts row,
-            # network) is resolved.
-            log.exception("order_placement_worker_startup_failed")
+        # Crypto-pivot C0-B2b: the IBKR OrderPlacementWorker was retired
+        # with the IBKR execution layer. Order placement moves in-process
+        # to the §3.3 strategy worker (C0-B3), which drives the Coinbase
+        # execution adapter directly — no approval queue (announce-only).
         try:
             recon_state = await _start_reconciliation_scheduler(settings)
         except Exception:
@@ -1914,17 +1365,16 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             # funding/metadata capture pauses until the next restart).
             log.exception("coinbase_market_data_worker_startup_failed")
         try:
-            # The monitor MUST start AFTER the other 4 so it can
+            # The monitor MUST start AFTER the other workers so it can
             # capture their final `(worker, task)` tuples (or `None`
             # for ones that failed to spawn). The monitor itself is
-            # a 5th task and is NOT in its own tracked set.
+            # NOT in its own tracked set.
             #
             # Drill 5 follow-up #2-FU-1: build the monitor's alert
-            # dispatch hook BEFORE starting the monitor so a fresh
-            # 1100 surfaces in Discord #alerts. Hook returns None if
-            # sops `discord.webhook_urls.alerts` is unpopulated;
-            # monitor degrades gracefully (WARNING log fires, no
-            # Discord push).
+            # dispatch hook BEFORE starting the monitor. Hook returns
+            # None if sops `discord.webhook_urls.alerts` is
+            # unpopulated; monitor degrades gracefully (WARNING log
+            # fires, no Discord push).
             monitor_alert_hook = _build_monitor_alert_dispatch_hook(settings)
             # Task-death hook (drill 5/6 follow-up landed 2026-05-26).
             # Audit-first emit of ASYNC_TASK_DIED + INSERT of an alerts
@@ -1937,7 +1387,6 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             task_death_alert_hook = _build_task_death_alert_hook(settings)
             async_task_monitor_state = await _start_async_task_monitor(
                 settings,
-                order_placement=worker_state,
                 reconciliation=recon_state,
                 heartbeat_probe=heartbeat_probe_state,
                 coinbase_market_data=coinbase_market_data_state,
@@ -1956,7 +1405,6 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await _stop_coinbase_market_data_worker(coinbase_market_data_state)
         await _stop_heartbeat_probe(heartbeat_probe_state)
         await _stop_reconciliation_scheduler(recon_state)
-        await _stop_order_placement_worker(worker_state)
         await sse_multiplexer.stop_heartbeat()
         await close_pool()
 
