@@ -79,6 +79,7 @@ RUN python -m venv /opt/venv \
         "resend>=2.4" \
         "anthropic>=0.39" \
         "pyyaml>=6.0" \
+        "pandas>=2.2" \
         "ib-async>=1.0.3" \
         "websockets>=12.0,<14.0" \
         "psycopg2-binary>=2.9"
