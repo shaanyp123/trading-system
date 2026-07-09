@@ -58,10 +58,11 @@ The ``server_now`` field is computed at response build time per spec
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Final, Literal
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import structlog
 from fastapi import APIRouter, Depends, Query
@@ -78,6 +79,7 @@ from services.api.heartbeats import (
     classify_freshness,
     get_heartbeat_registry,
 )
+from services.api.repos.cycle import CycleQueryRepo, PostgresCycleQueryRepo
 from services.api.repos.phase1 import (
     AuditLogRow,
     ParameterSetRow,
@@ -90,6 +92,11 @@ from services.api.schemas.capital_events import (
     CapitalEventInvokeResponse,
 )
 from services.api.schemas.common import EPOCH_SENTINEL_UTC
+from services.api.schemas.cycle import (
+    SystemCycleResponse,
+    decision_row_to_view,
+    worker_row_to_view,
+)
 from services.api.schemas.system import (
     AuditLogEntry,
     AuditLogPageResponse,
@@ -1069,6 +1076,86 @@ async def list_heartbeats(
             )
         )
     return HeartbeatsResponse(items=items, server_now=now)
+
+
+# ---------------------------------------------------------------------------
+# Crypto-pivot §3.7 — daily-cycle status (replaces bar-sync status)
+# ---------------------------------------------------------------------------
+
+#: CDE halts trading Fridays 17:00-18:00 America/New_York (strategy §1.6 /
+#: §7 weekly-close handling). The close is an ET wall-clock event, so the
+#: UTC instant shifts with DST (21:00Z summer / 22:00Z winter).
+_CDE_ET = ZoneInfo("America/New_York")
+_CDE_CLOSE_WEEKDAY: Final[int] = 4  # Friday
+_CDE_CLOSE_HOUR_ET: Final[int] = 17
+
+
+def next_friday_cde_close_utc(now: datetime) -> datetime:
+    """Next Friday 17:00 ET (CDE weekly close start), as a UTC instant.
+
+    Exactly at the close boundary rolls to next week's close (the current
+    one is no longer "next"). Naive input rejected per [A06].
+    """
+    if now.tzinfo is None:
+        raise ValueError("now must be tz-aware UTC; got naive datetime")
+    et_now = now.astimezone(_CDE_ET)
+    days_ahead = (_CDE_CLOSE_WEEKDAY - et_now.weekday()) % 7
+    candidate = (et_now + timedelta(days=days_ahead)).replace(
+        hour=_CDE_CLOSE_HOUR_ET, minute=0, second=0, microsecond=0
+    )
+    if candidate <= et_now:
+        candidate += timedelta(days=7)
+    return candidate.astimezone(UTC)
+
+
+def _get_cycle_repo(session: AsyncSession = Depends(get_session)) -> CycleQueryRepo:
+    return PostgresCycleQueryRepo(session)
+
+
+@router.get(
+    "/api/system/cycle",
+    tags=["system"],
+    response_model=SystemCycleResponse,
+)
+async def system_cycle(
+    session: SessionContext = Depends(get_session_context),
+    repo: Phase1QueryRepo = Depends(_get_repo),
+    cycle_repo: CycleQueryRepo = Depends(_get_cycle_repo),
+) -> SystemCycleResponse:
+    """Daily-cycle projection per delta spec §3.7 (read-only).
+
+    Composes three components:
+
+      * **Last decision outcome** — latest ``strategy_decisions`` row for
+        the active account: per-asset trend score → target → action →
+        est. costs from the worker's ``strategy_decision_v1`` outcome
+        JSONB. Skip/failed rows surface their ``skip_reason``.
+      * **Last risk-loop heartbeat** — ``strategy_worker_status`` row +
+        freshness classification (30 s loop; fresh ≤ 90 s).
+      * **Next Friday CDE close** — the weekly 17:00 ET halt, UTC-anchored.
+
+    Fresh DB / worker-never-ran contract: ``decision`` and ``worker`` are
+    null (HTTP 200, not an error) — consumers (the §3.8 ``/cycle`` Discord
+    digest, the §3.9 pipeline-freshness strip) render the no-decision-yet
+    state.
+    """
+    now = datetime.now(tz=UTC)
+    account_id = await repo.fetch_active_account_id()
+    decision_view = None
+    worker_view = None
+    if account_id is not None:
+        decision_row = await cycle_repo.fetch_latest_decision(account_id)
+        if decision_row is not None:
+            decision_view = decision_row_to_view(decision_row)
+        status_row = await cycle_repo.fetch_worker_status(account_id)
+        if status_row is not None:
+            worker_view = worker_row_to_view(status_row, now=now)
+    return SystemCycleResponse(
+        decision=decision_view,
+        worker=worker_view,
+        next_friday_close_utc=next_friday_cde_close_utc(now),
+        server_now=now,
+    )
 
 
 __all__ = ["router"]

@@ -11,9 +11,10 @@
 # in docker logs.
 #
 # Required secrets fields:
-#   discord.api_bearer_token        → WEBHOOK_PUSHER_API_BEARER_TOKEN
-#   discord.webhook_urls.signals    → WEBHOOK_PUSHER_SIGNALS_WEBHOOK_URL
-#   discord.webhook_urls.fills      → WEBHOOK_PUSHER_FILLS_WEBHOOK_URL
+#   discord.api_bearer_token          → WEBHOOK_PUSHER_API_BEARER_TOKEN
+#   discord.webhook_urls.signals      → WEBHOOK_PUSHER_SIGNALS_WEBHOOK_URL
+#   discord.webhook_urls.fills        → WEBHOOK_PUSHER_FILLS_WEBHOOK_URL
+#   discord.webhook_urls.daily_brief  → WEBHOOK_PUSHER_DAILY_BRIEF_WEBHOOK_URL
 #
 # Optional:
 #   WEBHOOK_PUSHER_API_BASE_URL   (defaults to http://api:8000)
@@ -80,9 +81,10 @@ if ! /opt/venv/bin/python -c "import yaml" >/dev/null 2>&1; then
 fi
 
 # Required fields. Each one fails-closed if missing.
-_require WEBHOOK_PUSHER_API_BEARER_TOKEN     "discord.api_bearer_token"
-_require WEBHOOK_PUSHER_SIGNALS_WEBHOOK_URL  "discord.webhook_urls.signals"
-_require WEBHOOK_PUSHER_FILLS_WEBHOOK_URL    "discord.webhook_urls.fills"
+_require WEBHOOK_PUSHER_API_BEARER_TOKEN         "discord.api_bearer_token"
+_require WEBHOOK_PUSHER_SIGNALS_WEBHOOK_URL      "discord.webhook_urls.signals"
+_require WEBHOOK_PUSHER_FILLS_WEBHOOK_URL        "discord.webhook_urls.fills"
+_require WEBHOOK_PUSHER_DAILY_BRIEF_WEBHOOK_URL  "discord.webhook_urls.daily_brief"
 
 # Optional defaults.
 : "${WEBHOOK_PUSHER_API_BASE_URL:=http://api:8000}"

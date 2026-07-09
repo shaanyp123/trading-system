@@ -54,6 +54,7 @@ from discord import app_commands
 from services.discord_bot.api_client import ApiClient
 from services.discord_bot.commands import (
     register_capital_event_commands,
+    register_cycle,
     register_halt,
     register_positions,
     register_status,
@@ -145,6 +146,12 @@ class TradingBotClient(discord.Client):
         # Crypto-pivot C0-B4 (delta spec §3.8): /approve RETIRED —
         # announce-only Discord per the operator mandate; trades are
         # announced in #fills with signal rationale, never approved.
+        # /cycle (§3.8) is the announce-only daily-decision digest.
+        register_cycle(
+            self._tree,
+            api_client=self._api_client,
+            guild=self._guild,
+        )
         register_capital_event_commands(
             self._tree,
             api_client=self._api_client,
