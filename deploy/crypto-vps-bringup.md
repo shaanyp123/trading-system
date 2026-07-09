@@ -195,3 +195,44 @@ re-issued), the sops age-key copy, and any secrets only ever filled
 server-side. Nothing live depended on any of it; the CME system was
 already fully decommissioned (decisions-log 2026-07-08/09). Docs/ +
 git history remain the only — and sufficient — record of that era.
+
+## Appendix C — Redeploying code changes (added 2026-07-09, post-C1-start)
+
+**`day5-bringup.sh` does NOT rebuild images on redeploy** — its build step
+is skip-if-cached, and its alembic step runs inside whatever image exists,
+so on a stale image new migrations silently no-op while the script reports
+success (this bit the 2026-07-09 launch three separate ways). Until the
+script grows a `--rebuild` flag, the redeploy ceremony is:
+
+```bash
+cd /opt/trading
+git pull
+docker compose --env-file deploy/.env build api discord_bot webhook_pusher 2>&1 | tail -3
+docker compose --env-file deploy/.env up -d --force-recreate api discord_bot webhook_pusher
+bash deploy/day5-bringup.sh   # now runs migrations inside the FRESH image
+docker compose --env-file deploy/.env restart strategy_worker   # shares the api image
+```
+
+Verify the running code actually changed (don't trust the build banner):
+
+```bash
+docker compose --env-file deploy/.env exec api git -C / rev-parse HEAD 2>/dev/null \
+  || docker compose --env-file deploy/.env exec api python -c "import services; print('probe a changed symbol instead')"
+```
+
+Heartbeat / DB smoke queries: `psql -U app_service` prompts for a password
+the operator doesn't have at hand — query via the api container instead
+(credentials from the mounted secrets file):
+
+```bash
+docker compose --env-file deploy/.env exec api python -c "
+import asyncio, asyncpg, yaml
+pw = yaml.safe_load(open('/run/secrets/secrets.yaml'))['postgres']['app_service_password']
+async def main():
+    conn = await asyncpg.connect(user='app_service', password=pw, database='trading', host='postgres')
+    for r in await conn.fetch('SELECT risk_loop_heartbeat_utc, risk_loop_tick_count, marks_stale FROM strategy_worker_status'):
+        print(dict(r))
+    await conn.close()
+asyncio.run(main())
+"
+```
