@@ -490,19 +490,27 @@ async def fetch_daily_bars(
     days: int,
     now_utc: datetime,
 ) -> list[DailyBar]:
-    """Fetch the last ``days`` daily bars for one product, ascending.
+    """Fetch the last ``days`` COMPLETED daily bars for one product, ascending.
 
     Paginates the public candles endpoint in ``CANDLES_PER_REQUEST``-day
     windows (the endpoint caps ~350/request), dedupes on session_date,
     and returns bars sorted ascending. The signal engine (§3.3) uses
     this for its 00:05 UTC decision input; the worker's daily pass uses
     it with a small ``days`` to keep the latest bars in memory.
+
+    The venue treats ``start``/``end`` as INCLUSIVE bounds on candle
+    start-time, so a window ending at today 00:00 UTC also returns the
+    in-progress "today" candle (verified live 2026-07-09 — it produced
+    a ``skipped_stale_bars`` false-skip on C1 night one). Both consumers
+    need completed sessions only, so bars whose session hasn't closed
+    (``session_date >= today``) are dropped here.
     """
     if now_utc.tzinfo is None:
         raise ValueError("now_utc must be tz-aware (dev-guide §3 / A06); got naive")
     if days <= 0:
         return []
     end = current_utc_hour(now_utc).replace(hour=0)  # today 00:00 UTC (bar-start of today)
+    first_incomplete_session = end.date()
     remaining = days
     window_end = end
     by_date: dict[date, DailyBar] = {}
@@ -516,7 +524,7 @@ async def fetch_daily_bars(
         )
         for raw in raw_candles:
             bar = parse_daily_candle(product_id, raw)
-            if bar is not None:
+            if bar is not None and bar.session_date < first_incomplete_session:
                 by_date[bar.session_date] = bar
         remaining -= window_days
         window_end = window_start
