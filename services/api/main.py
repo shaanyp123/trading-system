@@ -39,6 +39,7 @@ from fastapi import FastAPI
 from sqlalchemy import text
 
 from services.api import db as api_db
+from services.api import marks
 from services.api import sse as sse_multiplexer
 from services.api.config import APISettings, get_settings
 from services.api.db import close_pool, init_pool, session_scope
@@ -1213,6 +1214,10 @@ async def _start_coinbase_market_data_worker(
         alert_hook=alert_hook,  # type: ignore[arg-type]
     )
     task = asyncio.create_task(worker.run_forever(), name="coinbase_market_data.run_forever")
+    # Crypto-pivot §3.9: expose the worker's in-memory MarkStore to the
+    # route layer (positions mark ladder rung 1) via the module-level
+    # holder — see services/api/marks.py for the staleness contract.
+    marks.set_mark_store(worker.mark_store)
     log.info(
         "coinbase_market_data_worker_spawned",
         ws_url=settings.coinbase_ws_url,
@@ -1226,6 +1231,9 @@ async def _stop_coinbase_market_data_worker(state: tuple[object, object] | None)
     """Request stop + await the market-data worker task. Best-effort."""
     if state is None:
         return
+    # Drop the route-layer mark seam FIRST so no request reads a store
+    # whose feeding WS loop is winding down (absent > stale, per marks.py).
+    marks.clear_mark_store()
     worker, task = state
     try:
         worker.request_stop()  # type: ignore[attr-defined]

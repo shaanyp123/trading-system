@@ -80,6 +80,7 @@ from services.api.heartbeats import (
     get_heartbeat_registry,
 )
 from services.api.repos.cycle import CycleQueryRepo, PostgresCycleQueryRepo
+from services.api.repos.funding import FundingQueryRepo, PostgresFundingQueryRepo
 from services.api.repos.phase1 import (
     AuditLogRow,
     ParameterSetRow,
@@ -96,6 +97,10 @@ from services.api.schemas.cycle import (
     SystemCycleResponse,
     decision_row_to_view,
     worker_row_to_view,
+)
+from services.api.schemas.funding import (
+    SystemFundingResponse,
+    build_system_funding_response,
 )
 from services.api.schemas.system import (
     AuditLogEntry,
@@ -1155,6 +1160,73 @@ async def system_cycle(
         worker=worker_view,
         next_friday_close_utc=next_friday_cde_close_utc(now),
         server_now=now,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Crypto-pivot §3.7/§3.9 — funding + cash-yield telemetry
+# ---------------------------------------------------------------------------
+
+
+def _get_funding_repo(session: AsyncSession = Depends(get_session)) -> FundingQueryRepo:
+    return PostgresFundingQueryRepo(session)
+
+
+@router.get(
+    "/api/system/funding",
+    tags=["system"],
+    response_model=SystemFundingResponse,
+)
+async def system_funding(
+    session: SessionContext = Depends(get_session_context),
+    repo: Phase1QueryRepo = Depends(_get_repo),
+    funding_repo: FundingQueryRepo = Depends(_get_funding_repo),
+    settings: APISettings = Depends(get_settings),
+) -> SystemFundingResponse:
+    """Funding + cash-yield telemetry per delta spec §3.7/§3.9 (read-only).
+
+    Composes four components for the Today-page funding strip:
+
+      * **Per-product funding** — latest hourly ``funding_rates`` snapshot
+        per product (§3.2 logger) + annualized rate, joined against held
+        positions so the operator's book sorts first.
+      * **Estimated funding today** — summed from today's hourly rows per
+        held product. This is an ESTIMATE from telemetry, never venue-
+        settled truth — ``funding_basis`` labels it honestly on the wire
+        (delta spec §3.9's "accrued funding today" is an estimate strip).
+      * **Cash sweeps** — today's §3.6 ``cash_sweeps`` ledger rows +
+        completed to-yield/to-margin totals; empty until the C2
+        cash_manager activates. ``yield_apy`` is the interim manual
+        ``APISettings.cash_yield_apy`` (None renders as "—").
+      * **Liquidation buffer** — from the latest
+        ``balance_snapshot_recorded`` audit payload (00:15 UTC recon);
+        the venue's ``1000`` no-risk sentinel maps to None.
+
+    Fresh DB contract: empty lists + nulls, HTTP 200 — consumers render
+    the no-telemetry-yet state, never an error.
+    """
+    now = datetime.now(tz=UTC)
+    account_id = await repo.fetch_active_account_id()
+    held_positions = (
+        await funding_repo.fetch_held_positions_with_contract(account_id)
+        if account_id is not None
+        else []
+    )
+    latest_rates = await funding_repo.fetch_latest_funding_rates()
+    product_ids = sorted({r.product_id for r in latest_rates} | {p.market for p in held_positions})
+    today_rates = await funding_repo.fetch_funding_rates_today(product_ids)
+    metadata = await funding_repo.fetch_latest_product_metadata()
+    sweeps_today = await funding_repo.fetch_cash_sweeps_today()
+    balance_snapshot = await funding_repo.fetch_latest_balance_snapshot_audit()
+    return build_system_funding_response(
+        latest_rates=latest_rates,
+        today_rates=today_rates,
+        held_positions=held_positions,
+        metadata=metadata,
+        sweeps_today=sweeps_today,
+        balance_snapshot=balance_snapshot,
+        yield_apy=settings.cash_yield_apy,
+        now=now,
     )
 
 

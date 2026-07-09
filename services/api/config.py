@@ -20,6 +20,7 @@ See `deploy/api/README.md` for the canonical mapping (secrets key → env var).
 
 from __future__ import annotations
 
+from decimal import Decimal
 from functools import lru_cache
 from typing import Literal
 
@@ -406,6 +407,24 @@ class APISettings(BaseSettings):
         description=(
             "CDP API EC private key (PEM). Sourced from secrets "
             "`coinbase.api_private_key`. SecretStr keeps it out of repr/logs."
+        ),
+    )
+
+    # --- Cash-yield display rate (crypto-pivot §3.6/§3.9) ------------------
+    #
+    # Interim MANUAL value surfaced by ``GET /api/system/funding`` as
+    # ``yield_apy`` until the §3.6 cash_manager worker (C2 activation)
+    # lands and owns the real rate. The Coinbase One Basic USDC rewards
+    # rate (3.50% as of 2026-07, delta spec §3.6) is operator-entered via
+    # ``API_CASH_YIELD_APY=0.035``; None renders as "—" in the UI (no
+    # sweep worker → no yield claim). Decimal per [A05] — never float,
+    # serialized as a string on the wire.
+    cash_yield_apy: Decimal | None = Field(
+        default=None,
+        description=(
+            "Annualized cash-yield rate as a fraction (e.g. 0.035 for "
+            "3.5%). Interim manual value until the §3.6 cash_manager "
+            "worker lands; None renders as '—' in the UI."
         ),
     )
 

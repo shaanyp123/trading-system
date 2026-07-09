@@ -50,6 +50,8 @@ from uuid import UUID, uuid4
 import pytest
 from httpx import AsyncClient
 
+from services.api import marks as marks_mod
+from services.api.repos.cycle import WorkerStatusRow
 from services.api.repos.phase1 import (
     AlertCountRow,
     AuditLogRow,
@@ -87,6 +89,7 @@ from services.api.routes._pagination import (
     decode_cursor,
     encode_cursor,
 )
+from services.api.schemas.positions import Position
 
 # ---------------------------------------------------------------------------
 # Stub repo
@@ -151,10 +154,17 @@ class _StubRepo:
     last_audit_filter: dict[str, Any] | None = None
     signal_summary: dict[str, Any] | None = None
     last_signal_summary_args: tuple[UUID, UUID] | None = None
+    # Crypto-pivot §3.9: native-stop order lookup, keyed by client_order_id.
+    stop_orders: dict[str, dict[str, Any]] = None  # type: ignore[assignment]
+    last_stop_order_lookups: list[str] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         if self.positions_rows is None:
             self.positions_rows = []
+        if self.stop_orders is None:
+            self.stop_orders = {}
+        if self.last_stop_order_lookups is None:
+            self.last_stop_order_lookups = []
         if self.recon_row is None:
             self.recon_row = ReconciliationSummaryRow(
                 last_check_utc=None,
@@ -201,6 +211,21 @@ class _StubRepo:
         account_id: UUID,
     ) -> list[dict[str, Any]]:
         return self.positions_rows
+
+    async def fetch_positions_current_with_contract(
+        self,
+        account_id: UUID,
+    ) -> list[dict[str, Any]]:
+        # Rows without market_root/multiplier keys model the LEFT JOIN
+        # miss (contract_id IS NULL) — the route uses .get() throughout.
+        return self.positions_rows
+
+    async def fetch_latest_stop_order(
+        self,
+        client_order_id: str,
+    ) -> dict[str, Any] | None:
+        self.last_stop_order_lookups.append(client_order_id)
+        return self.stop_orders.get(client_order_id)
 
     async def fetch_orders_page(
         self,
@@ -1267,6 +1292,83 @@ class TestTodayDigest:
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class _StubPositionsCycleRepo:
+    """CycleQueryRepo stub for the positions route (engine_state source)."""
+
+    status: WorkerStatusRow | None = None
+
+    async def fetch_latest_decision(self, account_id: UUID) -> Any:
+        return None  # pragma: no cover — positions route never calls this
+
+    async def fetch_worker_status(self, account_id: UUID) -> WorkerStatusRow | None:
+        return self.status
+
+
+def _worker_status_with_engine_state(engine_state: dict[str, Any]) -> WorkerStatusRow:
+    return WorkerStatusRow(
+        risk_loop_heartbeat_utc=datetime.now(tz=UTC),
+        risk_loop_tick_count=1,
+        marks_stale=False,
+        last_decision_date=None,
+        updated_at_utc=datetime.now(tz=UTC),
+        engine_state=engine_state,
+    )
+
+
+def _bind_positions(
+    override_dep: Any,
+    repo: Phase1QueryRepo,
+    *,
+    worker_status: WorkerStatusRow | None = None,
+) -> None:
+    """Wire both deps the §3.9 positions route resolves."""
+    _bind_repo(override_dep, positions_route, repo)
+    override_dep(
+        positions_route._get_cycle_repo,
+        lambda: _StubPositionsCycleRepo(status=worker_status),
+    )
+
+
+@dataclass(frozen=True)
+class _FakeMark:
+    """Structural stand-in for coinbase_market_data.Mark (marks.MarkLike)."""
+
+    price: Decimal
+    observed_at_utc: datetime
+
+
+class _FakeMarkStore:
+    def __init__(self, marks_map: dict[str, _FakeMark]) -> None:
+        self._marks = marks_map
+
+    def latest(self, product_id: str) -> _FakeMark | None:
+        return self._marks.get(product_id)
+
+
+def _crypto_position_row(
+    *,
+    contract_id: UUID | None = None,
+    quantity: int = 2,
+    avg_cost: str = "60000.00",
+    unrealized_pnl: Decimal | None = None,
+) -> dict[str, Any]:
+    """A positions_current row + contracts JOIN enrichment (nano BTC)."""
+    return {
+        "id": uuid4(),
+        "market": "BIP-20DEC30-CDE",
+        "contract_id": contract_id if contract_id is not None else uuid4(),
+        "quantity": quantity,
+        "avg_cost": Decimal(avg_cost),
+        "margin_held": Decimal("500.00"),
+        "unrealized_pnl": unrealized_pnl,
+        "last_mark_ts": datetime(2026, 7, 9, 0, 15, tzinfo=UTC),
+        "managed_by_version": "b5237aed3f06288656a31510795a3ae3e76556ae",
+        "market_root": "BTC",
+        "multiplier": Decimal("0.01"),
+    }
+
+
 class TestPositionsCurrent:
     @pytest.mark.asyncio
     async def test_no_account_returns_empty_envelope_with_as_of(
@@ -1275,7 +1377,7 @@ class TestPositionsCurrent:
         override_dep: Any,
     ) -> None:
         repo = _StubRepo(account_id=None)
-        _bind_repo(override_dep, positions_route, repo)
+        _bind_positions(override_dep, repo)
         response = await api_client.get("/api/positions/current")
         assert response.status_code == 200
         body = response.json()
@@ -1288,14 +1390,16 @@ class TestPositionsCurrent:
         api_client: AsyncClient,
         override_dep: Any,
     ) -> None:
-        """Post-2026-05-27 fix: route maps positions_current rows into
-        Position objects with Phase 1 field defaults (cluster=None,
-        contract_month=None). Crypto-pivot C0: the LEAN on-disk price
-        source is retired, so the MTM helper ALWAYS falls back to
-        (avg_cost, unrealized_pnl=0) until the §3.2 Coinbase market-data
-        source lands. The positions_current.unrealized_pnl column is
-        IGNORED (no MTM writer populates it today — see
-        services.api.position_mtm docstring)."""
+        """Backwards-compat spine of the §3.9 mapper rewrite: legacy rows
+        (no contracts enrichment, no live mark, no engine state) keep the
+        exact pre-pivot wire shape — cluster/contract_month null, avg-cost
+        fallback pricing — with the additive fields all null/fallback.
+
+        One deliberate behavior CHANGE rides this PR: the old "route
+        ignores positions_current.unrealized_pnl (no writer exists)"
+        premise is STALE — the 00:15 UTC recon now writes the column
+        (services/reconciliation/eod_cycle.py), so the TLT row's 12.50
+        surfaces via mark ladder rung 2 (mark_source="recon_eod")."""
         account_id = uuid4()
         contract_id = uuid4()
         positions_rows = [
@@ -1317,7 +1421,7 @@ class TestPositionsCurrent:
                 "quantity": 5,
                 "avg_cost": Decimal("83.72"),
                 "margin_held": Decimal("0"),
-                # Stale legacy column; route ignores it post-Task-3.
+                # Recon-written EOD mark (ladder rung 2) — surfaced.
                 "unrealized_pnl": Decimal("12.50"),
                 "last_mark_ts": datetime(2026, 5, 27, 13, 31, tzinfo=UTC),
                 "managed_by_version": "c951158bdeadbeef" + "0" * 24,
@@ -1328,7 +1432,7 @@ class TestPositionsCurrent:
             positions_rows=positions_rows,
             nav=Decimal("100000"),
         )
-        _bind_repo(override_dep, positions_route, repo)
+        _bind_positions(override_dep, repo)
         response = await api_client.get("/api/positions/current")
         assert response.status_code == 200
         body = response.json()
@@ -1339,25 +1443,34 @@ class TestPositionsCurrent:
         assert m2k["instrument_id"] == str(contract_id)
         assert m2k["qty"] == 1
         assert Decimal(m2k["avg_entry_price"]) == Decimal("2925.00")
-        # MTM helper always falls back to avg_cost + unrealized_pnl=0
-        # post-C0 (no live price source until Coinbase marks land).
+        # No live mark + no recon uPnL → avg-cost fallback (ladder rung 3).
         assert Decimal(m2k["current_price"]) == Decimal("2925.00")
         assert Decimal(m2k["unrealized_pnl"]) == Decimal("0")
         assert Decimal(m2k["unrealized_pnl_pct_of_nav"]) == Decimal("0")
-        # Phase 1 fallback: contracts JOIN deferred
+        assert m2k["mark_source"] == "fallback_avg_cost"
+        assert m2k["mark_observed_at_utc"] is None
+        # No contracts enrichment → cluster/asset stay null (honest unknown)
         assert m2k["cluster"] is None
         assert m2k["contract_month"] is None
+        assert m2k["asset"] is None
+        # No worker engine state → every stop field null
+        assert m2k["client_stop_price"] is None
+        assert m2k["native_stop_price"] is None
+        assert m2k["native_stop_resting"] is None
         # First 7 chars of managed_by_version per spec §4.1.5b
         assert m2k["managed_by_strategy_version"] == "b5237ae"
 
         tlt = next(p for p in body["positions"] if p["symbol"] == "TLT")
         # ETF: instrument_id falls back to market symbol when contract_id IS NULL
         assert tlt["instrument_id"] == "TLT"
-        # Fallback path. positions_current.unrealized_pnl is intentionally
-        # ignored.
+        # Ladder rung 2: recon uPnL surfaces; current_price honestly stays
+        # at avg_cost (no venue mark price persisted on the row).
         assert Decimal(tlt["current_price"]) == Decimal("83.72")
-        assert Decimal(tlt["unrealized_pnl"]) == Decimal("0")
-        assert Decimal(tlt["unrealized_pnl_pct_of_nav"]) == Decimal("0")
+        assert Decimal(tlt["unrealized_pnl"]) == Decimal("12.50")
+        assert tlt["mark_source"] == "recon_eod"
+        assert tlt["mark_observed_at_utc"] is not None
+        # 12.50 / 100000 NAV, quantized to 0.0001
+        assert Decimal(tlt["unrealized_pnl_pct_of_nav"]) == Decimal("0.0001")
 
     @pytest.mark.asyncio
     async def test_zero_nav_falls_back_to_zero_pct(
@@ -1366,10 +1479,7 @@ class TestPositionsCurrent:
         override_dep: Any,
     ) -> None:
         """When NAV is unavailable / zero, the pct field returns 0
-        without raising a division error. Post-C0 the MTM helper always
-        returns unrealized_pnl=0 (fallback-only), so this now guards the
-        route's NAV=0 handling on the fallback path; the non-zero-pnl
-        variant returns with the §3.2 Coinbase mark source."""
+        without raising a division error (avg-cost fallback path)."""
         account_id = uuid4()
         positions_rows = [
             {
@@ -1389,12 +1499,207 @@ class TestPositionsCurrent:
             positions_rows=positions_rows,
             nav=Decimal("0"),  # zero NAV — must NOT divide
         )
-        _bind_repo(override_dep, positions_route, repo)
+        _bind_positions(override_dep, repo)
         response = await api_client.get("/api/positions/current")
         assert response.status_code == 200
         body = response.json()
         assert Decimal(body["positions"][0]["unrealized_pnl"]) == Decimal("0")
         assert Decimal(body["positions"][0]["unrealized_pnl_pct_of_nav"]) == Decimal("0")
+
+    @pytest.mark.asyncio
+    async def test_contracts_join_maps_asset_cluster_and_multiplier(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """§3.9: market_root drives asset + crypto cluster (fixing the
+        product-id misbucketing) and contracts.multiplier scales the
+        live-mark uPnL: (61000 - 60000) x 2 x 0.01 = 20.00."""
+        now = datetime.now(tz=UTC)
+        store = _FakeMarkStore(
+            {"BIP-20DEC30-CDE": _FakeMark(price=Decimal("61000.00"), observed_at_utc=now)}
+        )
+        monkeypatch.setattr(marks_mod, "_MARK_STORE", store)
+        repo = _StubRepo(
+            account_id=uuid4(),
+            positions_rows=[_crypto_position_row()],
+            nav=Decimal("10000"),
+        )
+        _bind_positions(override_dep, repo)
+        body = (await api_client.get("/api/positions/current")).json()
+        pos = body["positions"][0]
+        assert pos["asset"] == "BTC"
+        assert pos["cluster"] == "crypto"
+        assert pos["mark_source"] == "live_ws"
+        assert Decimal(pos["current_price"]) == Decimal("61000.00")
+        assert Decimal(pos["unrealized_pnl"]) == Decimal("20.00")
+        # 20 / 10000 NAV = 0.002
+        assert Decimal(pos["unrealized_pnl_pct_of_nav"]) == Decimal("0.0020")
+        assert pos["mark_observed_at_utc"] is not None
+
+    @pytest.mark.asyncio
+    async def test_stale_live_mark_falls_back_to_recon(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Ladder rung 1→2: a mark older than the 3-minute policy is
+        treated as absent; the recon-written column prices the row."""
+        stale_at = datetime.now(tz=UTC) - timedelta(minutes=10)
+        store = _FakeMarkStore(
+            {"BIP-20DEC30-CDE": _FakeMark(price=Decimal("61000.00"), observed_at_utc=stale_at)}
+        )
+        monkeypatch.setattr(marks_mod, "_MARK_STORE", store)
+        repo = _StubRepo(
+            account_id=uuid4(),
+            positions_rows=[_crypto_position_row(unrealized_pnl=Decimal("15.25"))],
+            nav=Decimal("10000"),
+        )
+        _bind_positions(override_dep, repo)
+        body = (await api_client.get("/api/positions/current")).json()
+        pos = body["positions"][0]
+        assert pos["mark_source"] == "recon_eod"
+        assert Decimal(pos["unrealized_pnl"]) == Decimal("15.25")
+        # current_price falls back to avg_cost on the recon rung.
+        assert Decimal(pos["current_price"]) == Decimal("60000.00")
+        # mark_observed_at is the recon's last_mark_ts, not the stale tick.
+        assert pos["mark_observed_at_utc"].startswith("2026-07-09T00:15:00")
+
+    @pytest.mark.asyncio
+    async def test_no_mark_no_recon_falls_back_to_avg_cost(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        """Ladder rung 3: no mark store registered + null recon column."""
+        repo = _StubRepo(
+            account_id=uuid4(),
+            positions_rows=[_crypto_position_row()],
+            nav=Decimal("10000"),
+        )
+        _bind_positions(override_dep, repo)
+        body = (await api_client.get("/api/positions/current")).json()
+        pos = body["positions"][0]
+        assert pos["mark_source"] == "fallback_avg_cost"
+        assert Decimal(pos["current_price"]) == Decimal("60000.00")
+        assert Decimal(pos["unrealized_pnl"]) == Decimal("0")
+        assert pos["mark_observed_at_utc"] is None
+
+    @pytest.mark.asyncio
+    async def test_stop_enrichment_from_engine_state(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        """Client stop from engine_state (Decimal-as-string), native stop
+        price via the latest orders row for its client_order_id, resting
+        flag from the tracked venue order id."""
+        engine_state = {
+            "BTC": {
+                "contracts": 2,
+                "client_stop_level": "58100.00",  # Decimal stored as string
+                "native_stop_order_id": "venue-abc",
+                "native_stop_client_order_id": "cde-stop-20260709-BTC-0",
+                "entry_vwap": "60000.00",
+            }
+        }
+        repo = _StubRepo(
+            account_id=uuid4(),
+            positions_rows=[_crypto_position_row()],
+            nav=Decimal("10000"),
+            stop_orders={
+                "cde-stop-20260709-BTC-0": {
+                    "stop_price": Decimal("57900.00"),
+                    "status": "working",
+                }
+            },
+        )
+        _bind_positions(
+            override_dep,
+            repo,
+            worker_status=_worker_status_with_engine_state(engine_state),
+        )
+        body = (await api_client.get("/api/positions/current")).json()
+        pos = body["positions"][0]
+        assert Decimal(pos["client_stop_price"]) == Decimal("58100.00")
+        assert Decimal(pos["native_stop_price"]) == Decimal("57900.00")
+        assert pos["native_stop_resting"] is True
+        assert repo.last_stop_order_lookups == ["cde-stop-20260709-BTC-0"]
+
+    @pytest.mark.asyncio
+    async def test_engine_state_without_native_stop(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        """Engine state present but no native stop tracked → resting is
+        False (known-absent), price None, no order lookup fired."""
+        engine_state = {
+            "BTC": {
+                "contracts": 2,
+                "client_stop_level": "58100.00",
+                "native_stop_order_id": None,
+                "native_stop_client_order_id": None,
+            }
+        }
+        repo = _StubRepo(
+            account_id=uuid4(),
+            positions_rows=[_crypto_position_row()],
+            nav=Decimal("10000"),
+        )
+        _bind_positions(
+            override_dep,
+            repo,
+            worker_status=_worker_status_with_engine_state(engine_state),
+        )
+        body = (await api_client.get("/api/positions/current")).json()
+        pos = body["positions"][0]
+        assert Decimal(pos["client_stop_price"]) == Decimal("58100.00")
+        assert pos["native_stop_price"] is None
+        assert pos["native_stop_resting"] is False
+        assert repo.last_stop_order_lookups == []
+
+    @pytest.mark.asyncio
+    async def test_absent_engine_state_leaves_stop_fields_none(
+        self,
+        api_client: AsyncClient,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(
+            account_id=uuid4(),
+            positions_rows=[_crypto_position_row()],
+            nav=Decimal("10000"),
+        )
+        _bind_positions(override_dep, repo, worker_status=None)
+        body = (await api_client.get("/api/positions/current")).json()
+        pos = body["positions"][0]
+        assert pos["client_stop_price"] is None
+        assert pos["native_stop_price"] is None
+        assert pos["native_stop_resting"] is None
+
+    def test_position_schema_backwards_compat_construction(self) -> None:
+        """Pre-§3.9 constructions (no additive kwargs) still validate."""
+        position = Position(
+            instrument_id="TLT",
+            symbol="TLT",
+            contract_month=None,
+            qty=5,
+            avg_entry_price=Decimal("83.72"),
+            current_price=Decimal("83.72"),
+            unrealized_pnl=Decimal("0"),
+            unrealized_pnl_pct_of_nav=Decimal("0"),
+            cluster=None,
+            managed_by_strategy_version="c951158",
+        )
+        assert position.asset is None
+        assert position.client_stop_price is None
+        assert position.native_stop_price is None
+        assert position.native_stop_resting is None
+        assert position.mark_observed_at_utc is None
+        assert position.mark_source is None
+        assert position.price_as_of is None
 
 
 class TestTodayDigestPnlAggregates:
