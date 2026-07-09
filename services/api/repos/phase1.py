@@ -34,14 +34,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 # ---------------------------------------------------------------------------
 
 #: ``balances.source`` written by the EOD-recon per-cycle balance snapshot
-#: (mirrors ``services/reconciliation/eod_cycle.py::BALANCE_SOURCE_FROM_FLEX``).
+#: (mirrors ``services/reconciliation/eod_cycle.py::BALANCE_SOURCE_FROM_COINBASE``).
 #: The reconciliation summary derives ``last_check_utc`` from the latest
 #: balances row carrying THIS source: every recon cycle writes one BEFORE the
 #: planner runs, so it lands whether or not the cycle finds a break — making it
 #: a faithful "when did recon last run" signal. The fill processor writes
 #: ``'tws_api'`` balances on every fill; filtering by this source keeps a fill
 #: from masquerading as a recon check.
-_RECON_BALANCE_SOURCE: str = "flexquery_eod"
+_RECON_BALANCE_SOURCE: str = "coinbase_eod"
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +310,7 @@ class PostgresPhase1QueryRepo:
 
     async def fetch_reconciliation_summary(self, account_id: UUID) -> ReconciliationSummaryRow:
         # ``last_check_utc`` is the timestamp of the latest EOD-recon balance
-        # snapshot (``balances.source = 'flexquery_eod'``), NOT
+        # snapshot (``balances.source = 'coinbase_eod'``), NOT
         # MAX(detected_at_utc) over breaks. Every recon cycle writes that
         # snapshot BEFORE the planner runs, so a clean cycle — which inserts NO
         # reconciliation_breaks row — still advances ``last_check_utc``. The

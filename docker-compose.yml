@@ -177,13 +177,15 @@ services:
       dockerfile: services/api/Dockerfile
     restart: unless-stopped
     logging: *journald-logging
-    # The api needs egress in addition to internal to reach IBKR's
-    # FlexQuery REST endpoint at ndcdyn.interactivebrokers.com (used
-    # by the reconciliation scheduler at services/reconciliation/**).
-    # Pre Worker-PR-3a (2026-05-12) the api was internal-only and
-    # FlexQuery calls failed at DNS resolution. The Caddy reverse-proxy
-    # path to /api remains via the internal network — egress only
-    # affects outbound DNS+TCP from the api container itself.
+    # The api needs egress in addition to internal to reach Coinbase's
+    # Advanced Trade REST + WS endpoints (api.coinbase.com /
+    # advanced-trade-ws.coinbase.com — the market-data worker, the
+    # reconciliation scheduler's EOD fetcher, and the execution layer).
+    # Historical origin: Worker-PR-3a (2026-05-12) added egress for the
+    # IBKR FlexQuery endpoint after DNS-resolution failures on an
+    # internal-only api. The Caddy reverse-proxy path to /api remains
+    # via the internal network — egress only affects outbound DNS+TCP
+    # from the api container itself.
     networks: [internal, egress]
     environment:
       API_ENVIRONMENT: ${ENVIRONMENT:-paper}

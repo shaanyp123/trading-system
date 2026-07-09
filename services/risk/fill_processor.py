@@ -102,11 +102,13 @@ log = structlog.get_logger()
 
 
 #: Source string for the ``balances`` row INSERTed per fill. Constrained
-#: by the table's CHECK in alembic 0002: ``qc_objectstore | tws_api |
-#: flexquery_eod``. ``tws_api`` is the post-pivot canonical source because
-#: the fill came from the IBKR adapter (which talks TWS API protocol via
-#: ib-async). The end-of-day FlexQuery reconciliation (PR-I) writes
-#: ``flexquery_eod`` instead.
+#: by the table's CHECK in alembic 0002 (extended by the 2026-07-09
+#: ``coinbase_recon_src`` migration): ``qc_objectstore | tws_api |
+#: flexquery_eod | coinbase_eod``. ``tws_api`` is the IBKR-era per-fill
+#: source string; the Coinbase re-feed of this processor (crypto-pivot
+#: C1 fill wiring) revisits it. The end-of-day reconciliation refresh
+#: writes ``coinbase_eod`` instead
+#: (``services/reconciliation/eod_cycle.py::BALANCE_SOURCE_FROM_COINBASE``).
 BALANCE_SOURCE_FROM_FILL: Final[str] = "tws_api"
 
 
@@ -979,7 +981,8 @@ def _plan_entry_fill_application(
     # cash=$-16,545 vs IBKR FlexQuery cash=$19,997.51 from drill 7+8
     # naked positions). The audit log in production already shows the
     # divergence; the fix here is forward-only — the EOD recon path
-    # restores authoritative cash on the next flexquery_eod snapshot.
+    # restores authoritative cash on the next EOD balance snapshot
+    # (``coinbase_eod`` post-pivot; ``flexquery_eod`` at the time).
     notional_decimal = payload.fill_price * Decimal(payload.fill_quantity)
     is_futures = context.contract_id is not None
     if is_futures:

@@ -214,47 +214,25 @@ class APISettings(BaseSettings):
     )
     # -- EOD reconciliation scheduler ---------------------------------------
     #
-    # Worker-PR-3b follow-up (post-pivot 2026-05-12). Wires the
-    # FlexQuery → recon planner → apply pipeline into the api lifespan
-    # so the 18:30 ET daily cycle fires automatically.
+    # Worker-PR-3b follow-up (post-pivot 2026-05-12); fetch path swapped
+    # to Coinbase in crypto-pivot C0 §3.5 (2026-07-09). Wires the
+    # Coinbase EOD fetcher → recon planner → apply pipeline into the api
+    # lifespan so the 00:15 UTC daily cycle (after the 00:05 UTC daily
+    # decision) fires automatically.
     #
     # The scheduler starts at api boot only when BOTH
-    # ``flex_query_id`` AND ``flex_query_token`` are configured AND
+    # ``coinbase_api_key_name`` AND ``coinbase_api_private_key`` (the
+    # same CDP key pair the execution layer uses — see the Coinbase
+    # credentials block below) are configured AND
     # ``reconciliation_scheduler_enabled`` is True. Missing either
     # secret → scheduler is skipped + a structured warning is logged
     # so the operator knows to populate the secrets file + restart the api.
-    #
-    # Operator workflow: pre-create the FlexQuery template in IBKR's
-    # portal (Reports → Flex Queries → Create), record the numeric ID +
-    # auto-generated token, then edit the host secrets file and
-    # set ``ibkr.flex_query_id`` + ``ibkr.flex_query_token``. The
-    # api's entrypoint (services/api/entrypoint.py) maps those onto
-    # ``API_FLEX_QUERY_ID`` + ``API_FLEX_QUERY_TOKEN`` env vars at
-    # container start.
     reconciliation_scheduler_enabled: bool = Field(
         default=True,
         description=(
             "When False, the api lifespan skips ReconciliationScheduler "
             "startup. Use to pause the EOD recon cycle without affecting "
-            "the rest of the api (e.g., during an IBKR-side outage)."
-        ),
-    )
-    flex_query_id: int | None = Field(
-        default=None,
-        gt=0,
-        description=(
-            "IBKR FlexQuery template ID. Sourced from secrets "
-            "`ibkr.flex_query_id`. When unset, the reconciliation "
-            "scheduler does not start (the api still serves requests; "
-            "a warning is logged at boot)."
-        ),
-    )
-    flex_query_token: SecretStr | None = Field(
-        default=None,
-        description=(
-            "IBKR FlexQuery auth token (per-template). Sourced from "
-            "secrets `ibkr.flex_query_token`. When unset, the "
-            "reconciliation scheduler does not start."
+            "the rest of the api (e.g., during a Coinbase-side outage)."
         ),
     )
     # --- Discord + Resend for the recon-break alert dispatch hook --------

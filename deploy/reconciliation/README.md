@@ -1,58 +1,57 @@
 # Reconciliation EOD scheduler — operator runbook
 
-The api process runs a daily 18:30 ET reconciliation cycle that:
+> Crypto-pivot C0 §3.5 (2026-07-09): the IBKR FlexQuery fetch path is
+> DELETED. EOD reconciliation now pulls positions + equity/margin from
+> the Coinbase Advanced Trade API and fires at **00:15 UTC** (ten
+> minutes after the 00:05 UTC daily strategy decision). The diff/apply
+> engine and the alert push pipeline are unchanged.
 
-1. Fetches an IBKR FlexQuery snapshot (positions + cash balances + NAV)
+The api process runs a daily 00:15 UTC reconciliation cycle that:
+
+1. Fetches a Coinbase snapshot via the CDP API key: CFM futures
+   positions (`list_positions`), equity/margin
+   (`get_futures_balance_summary`), and the last ~26h of fills
+   (informational, best-effort).
 2. Compares against the backend's `positions_current` + `balances` rows
+   (position markets are venue `product_id`s, e.g. the runtime-discovered
+   nano BTC/ETH CDE ids — never hardcoded).
 3. Writes `reconciliation_check_passed` audit on a clean match OR one
    `reconciliation_break_detected` audit + one `reconciliation_breaks` row
-   per metric that doesn't match within tolerance.
+   per metric that doesn't match within tolerance. Every cycle also writes
+   one `balances` row with `source='coinbase_eod'` (the /system tile's
+   "last check" freshness signal).
 
-**The scheduler does not start until the operator populates two secrets fields.**
-Until then, the api logs a startup warning + keeps serving requests
-normally; the cycle simply doesn't run.
+**The scheduler does not start until the Coinbase CDP credentials are
+populated in the host secrets file.** Until then, the api logs a startup
+warning + keeps serving requests normally; the cycle simply doesn't run.
 
-## Step 1 — Create the FlexQuery template in IBKR's portal
+## Step 1 — CDP API key
 
-1. Sign in to **Account Management** (the portal — separate from TWS).
-2. Navigate **Reports → Flex Queries → New Flex Query**.
-3. Configure (per backend-spec §2.6 reconciliation contract):
-   - **Sections to include:** `Open Positions`, `Cash Report`, `Equity Summary in Base`, `Account Information`. Trades + Dividends are useful future enhancements but not required Phase 1.
-   - **Format:** XML (`v=3`).
-   - **Period:** "Last Business Day" — runs end-of-day after CME's 17:00 ET settlement.
-   - **Account selection:** the operator's paper account (`DUQ...`) or live (`U...`) per env.
-4. Save. IBKR assigns a numeric **Query ID** + an auto-generated **Flex Web Service Token**. **Record both.**
+The recon fetcher uses the SAME CDP key pair as the execution layer —
+there is no separate recon credential. If you completed the Coinbase
+key ceremony from `deploy/crypto-vps-bringup.md` Step 3, there is
+nothing new to create. Otherwise: portal.cdp.coinbase.com → API keys →
+ECDSA (ES256) → **View + Trade only, no Transfer** → IP-allowlist the
+VPS.
 
 ## Step 2 — Populate the secrets file
 
-```bash
-cd ~/Documents/GitHub/Trading
-nano /opt/trading-secrets/secrets.yaml
-```
-
-Add under the existing `ibkr:` block (alongside `account_number`, etc.):
+On the VPS, edit `/opt/trading-secrets/secrets.yaml` (schema:
+`deploy/secrets.template.yaml`):
 
 ```yaml
-ibkr:
-  ...
-  flex_query_id: 991122        # the numeric ID from Step 1
-  flex_query_token: <paste>    # the auto-generated token from Step 1
-```
-
-Re-encrypt + commit + push:
-
-```bash
-git add /opt/trading-secrets/secrets.yaml
-
-git push
+coinbase:
+  api_key_name: "organizations/{org}/apiKeys/{key}"
+  api_private_key: |
+    -----BEGIN EC PRIVATE KEY-----
+    ...
+    -----END EC PRIVATE KEY-----
 ```
 
 ## Step 3 — Re-deploy the api
 
-SSH to the VPS + pull + recreate the api container:
-
 ```bash
-ssh root@178.156.239.84
+ssh root@<vps>
 cd /opt/trading
 git pull --ff-only
 docker compose up -d api
@@ -66,8 +65,8 @@ docker logs --tail 60 trading-api-1 | grep -E "reconciliation_scheduler"
 
 Expected:
 
-- `reconciliation_scheduler_spawned account_id=... env=paper flex_query_id=991122`
-- Within 60s of 18:30 ET on the next business day: `reconciliation_scheduler_firing session_date_et=...`
+- `reconciliation_scheduler_spawned account_id=... env=paper`
+- Within 60s of 00:15 UTC: `reconciliation_scheduler_firing session_date_utc=...`
 - Followed by either `reconciliation_eod_cycle_completed breaks_detected=0 ...` (clean) or `breaks_detected>=1 actionable_break_count=N` (operator triage needed)
 
 ## Step 4 — Verify cycle output
@@ -81,6 +80,9 @@ docker exec -i trading-postgres-1 psql -U app_owner -d trading -c "SELECT sequen
 # Inspect any new break rows:
 docker exec -i trading-postgres-1 psql -U app_owner -d trading -c "SELECT id, metric, market, expected, actual, delta, resolution_path FROM reconciliation_breaks ORDER BY detected_at_utc DESC LIMIT 10;"
 
+# Confirm the per-cycle balance snapshot landed:
+docker exec -i trading-postgres-1 psql -U app_owner -d trading -c "SELECT snapshot_ts, net_liquidation, cash_usd, source FROM balances WHERE source = 'coinbase_eod' ORDER BY snapshot_ts DESC LIMIT 3;"
+
 # Confirm audit chain integrity:
 docker exec -i trading-api-1 /opt/venv/bin/python -m services.audit.verify_chain --env paper
 ```
@@ -91,12 +93,13 @@ The chain should report `CHAIN OK: <N> rows verified`.
 
 | Symptom | Likely cause | Remedy |
 | ------- | ------------ | ------ |
-| `reconciliation_scheduler_flex_credentials_missing` at boot | secrets fields unset or still placeholders | Re-run Step 2 + Step 3 |
-| `reconciliation_scheduler_no_active_account` at boot | `accounts` table empty | Complete the `/setup` flow first |
-| `reconciliation_eod_cycle_flex_fetch_failed error_code=AUTH_INVALID` | wrong token or template ID; expired token | Regenerate the token in IBKR portal + re-populate the secrets file |
-| `reconciliation_eod_cycle_flex_fetch_failed error_code=MAX_ATTEMPTS_EXHAUSTED` | template generation taking >60s | One-shot retry next session day; if persistent, simplify the template (fewer sections) |
-| `breaks_detected >= 1` on first cycle | expected pre-population; the backend has zero positions/cash and FlexQuery shows real balances | Manual triage — the operator pre-populates `balances` + `positions_current` from the IBKR statement before the first cycle, OR accepts the first cycle's break as the initialization marker |
-| Scheduler logs no `firing` event after 18:30 ET | clock skew on VPS, or process restarted after 18:30 with `last_fired_session_date_et` reset | Verify VPS clock; restart the api to re-init the scheduler |
+| `reconciliation_scheduler_coinbase_credentials_missing` at boot | secrets fields unset or still placeholders | Re-run Step 2 + Step 3 |
+| `reconciliation_scheduler_no_active_account` at boot | `accounts` table empty | Complete the bootstrap (`bootstrap_live_account --mint-from-defaults`) first |
+| `reconciliation_eod_cycle_coinbase_fetch_failed operation=list_positions` (or `get_futures_balance_summary`) | venue outage, revoked/expired CDP key, IP allowlist miss | Check Coinbase status; verify the key in the CDP portal; one-shot retry is automatic next session day |
+| `reconciliation_eod_cycle_coinbase_fetch_failed ... total_usd_balance` | venue omitted the equity anchor | Transient venue payload issue — recurs ⇒ escalate; the cycle refuses to reconcile against a fabricated zero |
+| `coinbase_recon_fills_fetch_degraded` | fills endpoint degraded | Non-blocking (fills are informational); recurs ⇒ investigate key permissions |
+| `breaks_detected >= 1` on first cycle | expected pre-population; the backend has zero positions/cash and Coinbase shows real balances | Manual triage — accept the first cycle's break as the initialization marker, or pre-populate `balances` before the first cycle |
+| Scheduler logs no `firing` event after 00:15 UTC | clock skew on VPS, or process restarted after 00:15 with the fired marker reset | Verify VPS clock (`timedatectl`); restart the api to re-init the scheduler |
 
 ## Disable / pause
 
@@ -140,7 +143,7 @@ resend:
 ```
 
 `webhook_pusher` already consumes these (see
-`deploy/webhook_pusher/README.md`); the api now reads the SAME secrets
+`deploy/webhook_pusher/README.md`); the api reads the SAME secrets
 fields. No new secrets material if you've already deployed `webhook_pusher`.
 
 ### Wiring states
@@ -166,20 +169,18 @@ ssh root@<vps> 'docker compose logs api 2>&1 | grep -E "alert_dispatch_hook_(con
 #   expect:  alert_dispatch_hook_constructed channels=['discord_alerts', 'discord_critical'] email_wired=true
 #   OR:      alert_dispatch_hook_skipped_no_webhook_url
 
-# 2. Force a manual recon cycle break (test path; NOT for live):
-#    Use psql to insert a fake position into positions_current that
-#    diverges from FlexQuery, then wait for the 22:30 UTC cycle OR
-#    restart the api with API_RECONCILIATION_SCHEDULER_TEST_MODE if
-#    that escape hatch is wired (Phase 1+ follow-up; today the
-#    operator waits for natural cycle).
-
-# 3. After cycle fires, check #alerts channel for the embed:
+# 2. After the 00:15 UTC cycle fires, check #alerts for any break embed:
 #    Title: "Reconciliation break: <market> position divergence <N> contracts"
 #    Color: yellow (P2) or red (P0)
 ```
 
-## Phase 1+ follow-ups (not in this PR)
+## Phase C1 follow-ups (not in this PR)
 
+- **Diff tolerances:** carried over from the CME era unchanged;
+  re-based in Phase C1 config per `Docs/crypto-pivot-delta-spec.md` §3.5.
+- **Intraday probe:** §3.5 names an intraday position probe reusing the
+  REST position endpoint (the `positions_override` seam in
+  `eod_cycle.build_broker_view` is its entry point). Lands in C1.
 - **Kill-switch hook:** when `should_invoke_kill_switch` is True (actionable
   break outside grace period), the api today logs but does NOT auto-halt.
   Operator manually halts via the `/system` page. Auto-halt lands when the
@@ -189,11 +190,10 @@ ssh root@<vps> 'docker compose logs api 2>&1 | grep -E "alert_dispatch_hook_(con
   equity baseline) is a single planner edit when the absolute number
   proves operationally insufficient.
 - **Notional-based position threshold:** today's 5-contract threshold
-  is asymmetric between high-multiplier markets (/MES 50x SPX → ~$130k)
-  and low-multiplier markets (/MBT 0.1x BTC → ~$35k). Switch to
-  contract_multiplier-based notional once the planner has the contracts
-  table available.
-- **Friday-weekend grace window:** today's 36h prior-breaks lookup
-  doesn't span the weekend (Friday → Monday is ~72h). Switch to
-  business-days math or extend window unconditionally if a real
-  Friday-detected break trips this.
+  predates nano contracts (nano BTC ≈ $1.1k notional); switch to
+  contract_size × mark notional once `product_metadata` is wired into
+  the planner inputs.
+- **Per-position uPnL fallback:** when the venue omits a position's
+  `unrealized_pnl`, the mark refresh skips the row (no
+  contract-multiplier-safe local formula in C0); computing from
+  `product_metadata.contract_size` is the C1 fix.
