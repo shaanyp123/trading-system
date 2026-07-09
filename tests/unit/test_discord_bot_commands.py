@@ -22,6 +22,10 @@ Coverage matrix:
   * HaltConfirmView — second click after consume → rejected
   * ``/status`` — happy path → defer + followup with status embed
   * ``/status`` — api error → defer + followup with error embed
+  * ``/cycle`` — happy path → defer + followup with digest embed
+                 (announce-only: no view attached)
+  * ``/cycle`` — no-decision payload → graceful "none recorded" embed
+  * ``/cycle`` — api error → defer + followup with error embed
 """
 
 from __future__ import annotations
@@ -49,6 +53,7 @@ from services.discord_bot.commands.capital import (
     _validate_reason,
     register_capital_event_commands,
 )
+from services.discord_bot.commands.cycle import register_cycle
 from services.discord_bot.commands.halt import HaltConfirmView, register_halt
 from services.discord_bot.commands.positions import register_positions
 from services.discord_bot.commands.status import register_status
@@ -75,6 +80,7 @@ def _stub_api_client() -> ApiClient:
     client.get_positions_current = AsyncMock()  # type: ignore[method-assign]
     client.invoke_kill_switch = AsyncMock()  # type: ignore[method-assign]
     client.invoke_capital_event = AsyncMock()  # type: ignore[method-assign]
+    client.get_system_cycle = AsyncMock()  # type: ignore[method-assign]
     return client
 
 
@@ -432,6 +438,123 @@ class TestStatusCommand:
 
 
 # ---------------------------------------------------------------------------
+# /cycle (crypto-pivot §3.8 — announce-only daily-decision digest)
+# ---------------------------------------------------------------------------
+
+
+def _cycle_payload_completed() -> dict[str, Any]:
+    """Wire-shape mirror of ``GET /api/system/cycle`` (§3.7)."""
+    return {
+        "decision": {
+            "decision_date": "2026-07-09",
+            "decided_at_utc": "2026-07-09T00:05:12Z",
+            "status": "completed",
+            "env": "paper",
+            "equity_usd": "2000.00",
+            "weekly_halved": False,
+            "m_combined": "1.0",
+            "skip_reason": None,
+            "assets": [
+                {
+                    "asset": "BTC",
+                    "trend_score": "0.421337",
+                    "prior_contracts": 0,
+                    "engine_target": 2,
+                    "final_target": 2,
+                    "action": "buy",
+                    "est_cost_usd": "1.23",
+                    "mark": "64000.50",
+                    "stop_level": "58100.00",
+                },
+            ],
+        },
+        "worker": {
+            "risk_loop_heartbeat_utc": "2026-07-09T00:09:58Z",
+            "seconds_since_heartbeat": 2,
+            "heartbeat_fresh": True,
+            "risk_loop_tick_count": 2880,
+            "marks_stale": False,
+            "last_decision_date": "2026-07-09",
+        },
+        "next_friday_close_utc": "2026-07-10T21:00:00Z",
+        "server_now": "2026-07-09T00:10:00Z",
+    }
+
+
+class TestCycleCommand:
+    async def test_happy_path_defers_then_followup_with_digest(
+        self, stub_client: ApiClient
+    ) -> None:
+        stub_client.get_system_cycle.return_value = _cycle_payload_completed()  # type: ignore[attr-defined]
+        tree = _build_tree()
+        register_cycle(tree, api_client=stub_client)
+        callback = _command_callback(tree, "cycle")
+        interaction = _build_mock_interaction()
+
+        await callback(interaction)
+
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+        stub_client.get_system_cycle.assert_awaited_once()  # type: ignore[attr-defined]
+        interaction.followup.send.assert_awaited_once()
+        embed = interaction.followup.send.await_args.kwargs["embed"]
+        assert "Daily decision — 2026-07-09" in (embed.title or "")
+        field_names = [f.name for f in embed.fields]
+        assert "BTC" in field_names
+        assert "Risk loop" in field_names
+        assert "Next CDE Friday close" in field_names
+
+    async def test_announce_only_no_view_attached(self, stub_client: ApiClient) -> None:
+        """Dev-guide §1.5 locked: no buttons / approval affordances on /cycle."""
+        stub_client.get_system_cycle.return_value = _cycle_payload_completed()  # type: ignore[attr-defined]
+        tree = _build_tree()
+        register_cycle(tree, api_client=stub_client)
+        callback = _command_callback(tree, "cycle")
+        interaction = _build_mock_interaction()
+
+        await callback(interaction)
+
+        send_kwargs = interaction.followup.send.await_args.kwargs
+        assert "view" not in send_kwargs
+
+    async def test_no_decision_payload_renders_graceful_digest(
+        self, stub_client: ApiClient
+    ) -> None:
+        stub_client.get_system_cycle.return_value = {  # type: ignore[attr-defined]
+            "decision": None,
+            "worker": None,
+            "next_friday_close_utc": "2026-07-10T21:00:00Z",
+            "server_now": "2026-07-09T00:10:00Z",
+        }
+        tree = _build_tree()
+        register_cycle(tree, api_client=stub_client)
+        callback = _command_callback(tree, "cycle")
+        interaction = _build_mock_interaction()
+
+        await callback(interaction)
+
+        embed = interaction.followup.send.await_args.kwargs["embed"]
+        assert "none recorded yet" in (embed.title or "")
+
+    async def test_api_error_renders_error_embed(self, stub_client: ApiClient) -> None:
+        stub_client.get_system_cycle.side_effect = ApiClientHTTPError(  # type: ignore[attr-defined]
+            status_code=503,
+            error_code="SERVICE_UNAVAILABLE",
+            message="db down",
+        )
+        tree = _build_tree()
+        register_cycle(tree, api_client=stub_client)
+        callback = _command_callback(tree, "cycle")
+        interaction = _build_mock_interaction()
+
+        await callback(interaction)
+
+        interaction.followup.send.assert_awaited_once()
+        embed = interaction.followup.send.await_args.kwargs["embed"]
+        assert "SERVICE_UNAVAILABLE" in (embed.title or "")
+        assert "db down" in (embed.description or "")
+
+
+# ---------------------------------------------------------------------------
 # Registration sanity (crypto-pivot C0-B4: /approve RETIRED — announce-only)
 # ---------------------------------------------------------------------------
 
@@ -442,8 +565,9 @@ class TestRegistrationSanity:
         register_positions(tree, api_client=stub_client, environment="paper")
         register_halt(tree, api_client=stub_client, environment="paper")
         register_status(tree, api_client=stub_client)
+        register_cycle(tree, api_client=stub_client)
         names = {cmd.name for cmd in tree.get_commands()}
-        assert {"positions", "halt", "status"}.issubset(names)
+        assert {"positions", "halt", "status", "cycle"}.issubset(names)
         assert "approve" not in names  # C0-B4: announce-only, /approve retired
 
     def test_all_commands_register_with_guild(self, stub_client: ApiClient) -> None:
@@ -452,9 +576,10 @@ class TestRegistrationSanity:
         register_positions(tree, api_client=stub_client, environment="paper", guild=guild)
         register_halt(tree, api_client=stub_client, environment="paper", guild=guild)
         register_status(tree, api_client=stub_client, guild=guild)
+        register_cycle(tree, api_client=stub_client, guild=guild)
         # Guild-scoped commands aren't returned by get_commands() with no guild arg
         names = {cmd.name for cmd in tree.get_commands(guild=guild)}
-        assert {"positions", "halt", "status"}.issubset(names)
+        assert {"positions", "halt", "status", "cycle"}.issubset(names)
 
 
 # ---------------------------------------------------------------------------
@@ -486,6 +611,7 @@ class TestSlashCommandDescriptionLength:
         register_positions(tree, api_client=stub_client, environment="paper")
         register_halt(tree, api_client=stub_client, environment="paper")
         register_status(tree, api_client=stub_client)
+        register_cycle(tree, api_client=stub_client)
         register_capital_event_commands(tree, api_client=stub_client, environment="paper")
 
         too_long: list[tuple[str, int]] = []
@@ -510,6 +636,7 @@ class TestSlashCommandDescriptionLength:
         register_positions(tree, api_client=stub_client, environment="paper")
         register_halt(tree, api_client=stub_client, environment="paper")
         register_status(tree, api_client=stub_client)
+        register_cycle(tree, api_client=stub_client)
         register_capital_event_commands(tree, api_client=stub_client, environment="paper")
 
         for cmd in tree.get_commands():
