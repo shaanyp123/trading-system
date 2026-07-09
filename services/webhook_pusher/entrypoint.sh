@@ -1,16 +1,16 @@
 #!/bin/sh
 # services/webhook_pusher/entrypoint.sh — webhook_pusher container entrypoint.
 #
-# Reads sops-decrypted secrets bundle at /run/secrets/decrypted.yaml and
+# Reads the host secrets file at /run/secrets/secrets.yaml and
 # exports the keys the SSE subscriber needs as env vars, then exec()s
 # python -m services.webhook_pusher (or whatever argv is passed).
 #
-# Mirrors the api + lean_local entrypoint pattern (sops yaml → env via
+# Mirrors the api entrypoint pattern (secrets yaml → env via
 # stdlib python + pyyaml, then exec). Fail-closed: if a required field
 # is missing or placeholder, exit 2 with operator-readable diagnostics
 # in docker logs.
 #
-# Required sops fields:
+# Required secrets fields:
 #   discord.api_bearer_token        → WEBHOOK_PUSHER_API_BEARER_TOKEN
 #   discord.webhook_urls.signals    → WEBHOOK_PUSHER_SIGNALS_WEBHOOK_URL
 #   discord.webhook_urls.fills      → WEBHOOK_PUSHER_FILLS_WEBHOOK_URL
@@ -20,9 +20,9 @@
 
 set -eu
 
-SECRETS_PATH="${WEBHOOK_PUSHER_SECRETS_PATH:-/run/secrets/decrypted.yaml}"
+SECRETS_PATH="${WEBHOOK_PUSHER_SECRETS_PATH:-/run/secrets/secrets.yaml}"
 
-# Helper: read a sops yaml key via python (pyyaml is in the runtime
+# Helper: read a secrets yaml key via python (pyyaml is in the runtime
 # image). dot-notation supports nested keys (e.g., discord.webhook_urls.signals).
 read_secret() {
     key_path="$1"
@@ -63,7 +63,7 @@ _require() {
     value="$(read_secret "$key_path")"
     if _looks_placeholder "$value"; then
         echo "[webhook_pusher_entrypoint] FATAL: $key_path missing or placeholder in $SECRETS_PATH" >&2
-        echo "[webhook_pusher_entrypoint] populate via: sops secrets/<env>.enc.yaml" >&2
+        echo "[webhook_pusher_entrypoint] populate the host secrets file (deploy/secrets.template.yaml)" >&2
         echo "[webhook_pusher_entrypoint] see deploy/webhook_pusher/README.md." >&2
         exit 2
     fi

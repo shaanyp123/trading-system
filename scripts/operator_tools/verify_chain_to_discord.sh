@@ -61,29 +61,30 @@ cd "$TRADING_ROOT" || {
   exit 0
 }
 
-# Construct DATABASE_URL from sops (per deploy/audit/README.md §3 manual
-# ceremony). The api container's runtime env doesn't carry DATABASE_URL
-# directly; the api process loads it via sops at startup. For verify_chain
-# CLI to run, we replicate that path here.
+# Construct DATABASE_URL from the host secrets file (per
+# deploy/audit/README.md §3 manual ceremony). The api container's runtime
+# env doesn't carry DATABASE_URL directly; the api entrypoint loads it
+# from the secrets file at startup. For verify_chain CLI to run, we
+# replicate that path here.
 #
 # Per feedback_secret_handling.md: password lives in env var only, never
 # echoed; temp pw file is shredded immediately after read; DATABASE_URL is
 # unset after the docker exec returns.
 
-# Source deploy/.env to get SOPS_AGE_KEY_FILE
+# Source deploy/.env to get SECRETS_DIR (defaults preserved below)
 set -a
 # shellcheck disable=SC1091
 . /opt/trading/deploy/.env 2>/dev/null
 set +a
+SECRETS_YAML="${SECRETS_DIR:-/opt/trading-secrets}/secrets.yaml"
 
-# Decrypt + extract the app_service password
+# Extract the app_service password from the host secrets file
 PW_TMP="$(mktemp /tmp/verify-chain-pw.XXXXXX)"
 chmod 600 "$PW_TMP"
-if ! sops -d "/opt/trading/secrets/${ENV_TAG}.enc.yaml" 2>/dev/null \
-     | yq '.postgres.app_service_password' -r > "$PW_TMP" 2>/dev/null \
-     || ! [ -s "$PW_TMP" ]; then
+if ! yq '.postgres.app_service_password' -r "$SECRETS_YAML" > "$PW_TMP" 2>/dev/null \
+     || ! [ -s "$PW_TMP" ] || grep -q '^<TODO' "$PW_TMP"; then
   shred -u "$PW_TMP" 2>/dev/null || rm -f "$PW_TMP"
-  printf 'sops decrypt failed for /opt/trading/secrets/%s.enc.yaml; check SOPS_AGE_KEY_FILE\n' "$ENV_TAG" > "$TMP_OUTPUT"
+  printf 'cannot read postgres.app_service_password from %s; author it per deploy/secrets.template.yaml\n' "$SECRETS_YAML" > "$TMP_OUTPUT"
   EXIT=99
 else
   APP_SERVICE_PW="$(cat "$PW_TMP")"

@@ -52,7 +52,7 @@ docker compose logs api --since 24h | grep -E "reconciliation_(cycle_completed|b
 
 ```bash
 # Stage DATABASE_URL inline (NEVER echo $APP_SERVICE_PW)
-APP_SERVICE_PW=$(sops -d secrets/paper.enc.yaml | yq '.postgres.app_service_password' -r)
+APP_SERVICE_PW=$(yq '.postgres.app_service_password' -r /opt/trading-secrets/secrets.yaml)
 
 docker compose exec -T -e PGPASSWORD="$APP_SERVICE_PW" postgres \
   psql -U app_service -d trading \
@@ -87,8 +87,8 @@ systemctl status verify-chain-daily.service
 journalctl -u verify-chain-daily.service -n 30 --no-pager
 ```
 
-3. **Output anti-pattern reminders** (since some commands touch sops + docker logs):
-   - Per memory `feedback_secret_handling.md`: NEVER echo `$APP_SERVICE_PW`. NEVER `cat /tmp/sops-decrypt`. The `unset` at the end of the risk-state block is required hygiene.
+3. **Output anti-pattern reminders** (since some commands touch the secrets file + docker logs):
+   - Per memory `feedback_secret_handling.md`: NEVER echo `$APP_SERVICE_PW`. NEVER `cat` the secrets file. The `unset` at the end of the risk-state block is required hygiene.
    - The risk-path guard hook won't fire on operator-side SSH (it only watches in-session Edit/Write/MultiEdit on the local machine). On the VPS, the operator's discipline IS the guard.
 
 4. **Summary line**: emit a final block the operator can use as a mental checklist:

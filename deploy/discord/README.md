@@ -1,6 +1,6 @@
 # Discord — Operator Runbook
 
-Operator guide for creating the Discord server, the seven Phase 0–1 channels, the bot application, and the OAuth invite. The captured tokens + IDs feed into `secrets/{paper,live}.enc.yaml` on Day 3 sops setup.
+Operator guide for creating the Discord server, the seven Phase 0–1 channels, the bot application, and the OAuth invite. The captured tokens + IDs feed into the host secrets file (`/opt/trading-secrets/secrets.yaml`, schema `deploy/secrets.template.yaml`).
 
 This runbook is the **Day 2 14:00** task in `implementation-guide.md` §11. Execution time: ~30 minutes total. The canonical declaration is `manifest.json` in this directory; this file walks through the click-by-click to reproduce that state.
 
@@ -19,7 +19,7 @@ The eighth channel (`#ask-agent`, supporting `/ask` command) is **Phase 2 only**
 | Guild ID | not secret, but co-located with bot config | safe to commit |
 | 7 channel IDs (or webhook URLs) | `secrets/{paper,live}.enc.yaml` `discord.webhook_urls` | — |
 
-The token is the only sensitive piece. Channel IDs and the guild ID are not secrets; they're encrypted alongside only because sops + age is the canonical config store.
+The token is the only sensitive piece. Channel IDs and the guild ID are not secrets; they live alongside only because the host secrets file is the canonical config store.
 
 ---
 
@@ -76,7 +76,7 @@ trading-system Discord IDs (captured 2026-05-05):
   audit:         <paste>
 ```
 
-Day 3 sops setup will paste this block into `secrets/{paper,live}.enc.yaml` and encrypt it.
+Paste this block into the host secrets file under the `discord:` key.
 
 > **Note on webhook URLs vs channel IDs:** `manifest.json` and `backend-spec.md §8.1.1` reference `webhook_urls` per channel. Two posting modes exist: (a) the bot posts as itself via Channel ID, (b) per-channel webhooks post as named integrations. For Phase 0 we use mode (a) — bot posts via its token + Channel ID. The `webhook_urls` field in the secret schema is forward-compatible for Phase 2 if we add per-channel routing, but for Day 2 just capture Channel IDs and we'll wire either form on Day 3.
 
@@ -91,7 +91,7 @@ Day 3 sops setup will paste this block into `secrets/{paper,live}.enc.yaml` and 
 5. Left sidebar → **Bot**.
 6. **Reset Token** → confirm. **A token appears once — copy it immediately.**
    - Store in 1Password as a Secure Note: `discord-bot-token` (operator's choice of vault path).
-   - On Day 3 it migrates from 1Password to `secrets/paper.enc.yaml` (and the same value to `live.enc.yaml`; bot is single-token across envs per `manifest.json`).
+   - On Day 3 it migrates from 1Password to `/opt/trading-secrets/secrets.yaml` (and the same value to `live.enc.yaml`; bot is single-token across envs per `manifest.json`).
    - **Do NOT paste this token into chat, this file, or any commit.** The gitleaks CI gate scans for Discord-token-shaped strings; the operator's discipline is to never have one on disk outside the encrypted env files. (See `Docs/decisions-log.md` 2026-05-05 QC token incident.)
 7. Scroll to **Privileged Gateway Intents**:
    - **Presence Intent:** OFF (we don't track member presence)
@@ -145,7 +145,7 @@ discord:
     audit: <Step 2 channel_id>
 ```
 
-The schema lives at `deploy/sops/secret_schemas/paper.template.yaml` (and `live.template.yaml`) with `<TODO_FROM_DAY_2_DISCORD_RUNBOOK>` placeholders that get substituted with your captured values.
+The schema lives at `deploy/secrets.template.yaml` with `<TODO_DISCORD_...>` placeholders that get substituted with your captured values.
 
 ---
 
@@ -154,7 +154,7 @@ The schema lives at `deploy/sops/secret_schemas/paper.template.yaml` (and `live.
 If the bot token is ever leaked or you suspect compromise:
 
 1. discord.com/developers → application → Bot → **Reset Token**.
-2. Update `bot_token` in `secrets/paper.enc.yaml` AND `secrets/live.enc.yaml`. Both encrypt + commit.
+2. Update `bot_token` in `/opt/trading-secrets/secrets.yaml` AND `secrets/live.enc.yaml`. Both encrypt + commit.
 3. Restart the discord-bot service (`docker compose restart discord-bot` on each VPS).
 4. The OLD token is invalidated immediately on reset — there's no overlap window. Operator-side: ensure you have shell access to do step 3 within ~5 minutes so message delivery downtime is minimized.
 

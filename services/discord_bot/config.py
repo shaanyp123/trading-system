@@ -1,7 +1,7 @@
 """services/discord_bot/config.py — typed runtime configuration.
 
 Pydantic-Settings BaseSettings reading from environment variables. The
-container entrypoint (``services/api/entrypoint.py`` style — sops-decrypted
+container entrypoint (``services/api/entrypoint.py`` style — secrets
 secrets bundle → env vars at compose-up time) sets these before the bot
 process starts.
 

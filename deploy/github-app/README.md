@@ -63,7 +63,7 @@ You will land on the app settings page. **Capture the App ID** displayed near th
 2. Click **Generate a private key**. A `.pem` file downloads — name like `trading-system-pr-review.YYYY-MM-DD.private-key.pem`.
 3. **This file is a credential.** Treat it like the IBKR password.
    - Store it in 1Password as a Secure Note attachment with name `github-app-pr-review-private-key`.
-   - On Day 3 (sops setup) it will be migrated into `secrets/{dev,paper,live}.enc.yaml` under `github.app_private_key`. Until Day 3, keep it in 1Password only.
+   - It migrates into the host secrets file under `github.app_private_key`. Until then, keep it in 1Password only.
    - **Do NOT** save it to disk under the repo. The `secrets/.gitignore` blocks `*.pem` from being committed even by mistake; the gitleaks CI gate would catch it; but the discipline is "credentials never sit on disk".
 4. Once stored in 1Password, **delete the local download**.
 
@@ -79,11 +79,11 @@ You will land on the app settings page. **Capture the App ID** displayed near th
 
 ### Step 4 — Verify install (read-only smoke test)
 
-You can verify the install is healthy without writing any code by using `gh api` with a JWT. Skip this if you'd rather wait for the Day 3 sops setup; the app is reachable as long as the install is in place.
+You can verify the install is healthy without writing any code by using `gh api` with a JWT. Skip this if you'd rather wait for the secrets-file fill; the app is reachable as long as the install is in place.
 
-### Step 5 — Day 3 sops migration
+### Step 5 — Secrets-file migration
 
-When Day 3 sops setup runs (`Docs/decisions-log.md` follow-up), add:
+When filling the host secrets file, add:
 
 ```yaml
 github:
@@ -94,9 +94,9 @@ github:
      including the BEGIN/END header lines that the GitHub-issued file already wraps it in>
 ```
 
-to `secrets/dev.enc.yaml` and `secrets/paper.enc.yaml`. (The `live.enc.yaml` copy lands at Day 8 per the secrets/README.md schedule.) Backend-spec §8.1.1 expects only `app_id` + `app_private_key`; we add `installation_id` for caching (not strictly secret, but co-located by convention).
+to `secrets/dev.enc.yaml` and `/opt/trading-secrets/secrets.yaml`. (The `live.enc.yaml` copy lands at Day 8 per the secrets/README.md schedule.) Backend-spec §8.1.1 expects only `app_id` + `app_private_key`; we add `installation_id` for caching (not strictly secret, but co-located by convention).
 
-After all three env files are populated, **delete the 1Password copy** of the private key — sops + age becomes the single source of truth.
+Once populated, **delete the 1Password copy** of the private key — the host secrets file becomes the single source of truth.
 
 ### Step 6 — Annual rotation (calendar reminder)
 

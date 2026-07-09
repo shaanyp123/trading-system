@@ -131,7 +131,7 @@ def _resolve_database_url() -> str:
     """Resolve the SQLAlchemy async DB URL.
 
     Prefers ``API_DATABASE_URL`` from the environment; otherwise builds it
-    from the in-container sops bundle via the api entrypoint helpers (the
+    from the in-container secrets file via the api entrypoint helpers (the
     decrypted secrets are mounted at ``API_SECRETS_PATH``). The password is
     never logged.
     """
@@ -150,7 +150,7 @@ def _resolve_database_url() -> str:
     if not isinstance(pg_password, str) or not pg_password:
         raise RuntimeError(
             f"postgres.app_service_password missing in {secrets_path}; "
-            f"set {DATABASE_URL_ENV} or fix the sops bundle"
+            f"set {DATABASE_URL_ENV} or fix the secrets file"
         )
     return _build_database_url(pg_password)
 

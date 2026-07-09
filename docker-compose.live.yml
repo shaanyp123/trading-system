@@ -36,7 +36,7 @@
 #   * nextjs      — frontend at live.spratcapital.com. Same image as paper;
 #                   config differs (NEXT_PUBLIC_API_BASE).
 #   * discord_bot — slash commands target live api via different bearer token
-#                   (S10 in sops live template).
+#                   (S10 in the live secrets file).
 #
 # Anti-pattern A18 enforced — no bare `<your-domain>`; substitute via env.
 
@@ -80,10 +80,10 @@ services:
       # Crypto-pivot C0-B2b: the IBKR port/account/clientId + EOD
       # position-source passthroughs died with the IBKR execution layer.
     volumes:
-      # Live secrets-decrypted dir is DISTINCT from paper's so a paper-side
-      # sops accident can't bleed into live's runtime. Operator's pre-cutover
+      # Live secrets dir is DISTINCT from paper's so a paper-side
+      # secrets accident can't bleed into live's runtime. Operator's pre-cutover
       # ceremony populates SECRETS_DIR per deploy/.env.example.live.
-      - ${SECRETS_DIR:-/opt/trading/secrets-decrypted-live}:/run/secrets:ro
+      - ${SECRETS_DIR:-/opt/trading-secrets-live}:/run/secrets:ro
     depends_on:
       postgres:
         condition: service_healthy

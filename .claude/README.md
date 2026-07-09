@@ -34,7 +34,7 @@ This directory holds Claude Code configuration that is committed to the repo + s
 | Hook | Trigger | Behavior |
 |---|---|---|
 | `risk_path_guard.sh` | PreToolUse on Edit/Write/MultiEdit | Warns if file_path matches the A02 forbidden-without-label whitelist. Informational; exit 0. |
-| `secret_handling_guard.sh` | PreToolUse on Bash | Warns if command matches known secret-emitting patterns (sops, docker logs of secret-touching services, psql on credential tables) without a file redirect. Informational; exit 0. |
+| `secret_handling_guard.sh` | PreToolUse on Bash | Warns if command matches known secret-emitting patterns (host secrets file reads, docker logs of secret-touching services, psql on credential tables) without a file redirect. Informational; exit 0. |
 
 ## Phase 1+ extensions (not in this overhaul)
 

@@ -48,14 +48,13 @@ node_modules/
 .env.local
 .env.*.local
 
-# Secrets — only sops-encrypted files are allowed in `secrets/`
-# (see secrets/.gitignore for the inverted rule)
-
-# VPS-side sops-decrypted plaintext volume (e.g. /opt/trading/secrets-decrypted/)
-# Created by deploy/day5-bringup.sh; canonical pattern, NOT a leak. But blocking
-# at the repo root prevents a careless `git add -A` on the VPS from committing
-# plaintext credentials. See Day 11 carryover follow-up.
+# Secrets — the host secrets file lives OUTSIDE the repo
+# (/opt/trading-secrets/secrets.yaml per deploy/secrets.template.yaml;
+# sops retired 2026-07-09). Block any filled copy from a careless
+# `git add -A` anyway. The committed template is allowlisted.
+secrets.yaml
 secrets-decrypted/
+!deploy/secrets.template.yaml
 
 # Build artifacts
 *.log

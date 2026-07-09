@@ -3,7 +3,7 @@
 Wired in execution order:
 
   1. structlog configured for JSON output on production / Console on dev.
-  2. Settings loaded from env (sops-decrypted bundle exported by entrypoint).
+  2. Settings loaded from env (host secrets file exported by entrypoint).
   3. Lifespan:
        - Init asyncpg pool.
        - First-boot bootstrap: if no unconsumed/unexpired owner setup_token
@@ -141,7 +141,7 @@ def _build_alert_dispatch_hook(
     "INSERT alerts row + invoke `dispatch_alert`" — the operator-visible
     Discord push.
 
-    Returns ``None`` (cleanly skipping the hook installation) when sops
+    Returns ``None`` (cleanly skipping the hook installation) when the secrets
     Discord URLs aren't populated. The reconciliation cycle still runs
     end-to-end + alerts log a WARNING from
     :func:`services.reconciliation.apply._dispatch_alerts` ("hook not
@@ -173,9 +173,9 @@ def _build_alert_dispatch_hook(
         log.warning(
             "alert_dispatch_hook_skipped_no_webhook_url",
             note=(
-                "discord.webhook_urls.alerts not in sops; reconciliation "
+                "discord.webhook_urls.alerts not in the secrets file; reconciliation "
                 "cycle will run + alerts will log a 'hook not wired' "
-                "warning. Wire the sops field + restart api to enable."
+                "warning. Wire the secrets field + restart api to enable."
             ),
         )
         return None
@@ -310,7 +310,7 @@ def _build_monitor_alert_dispatch_hook(
     the hook remains the generic monitor→Discord seam.)
 
     Returns ``None`` (cleanly skipping the hook installation) when
-    sops ``discord.webhook_urls.alerts`` isn't populated. The probe's
+    secrets ``discord.webhook_urls.alerts`` isn't populated. The probe's
     WARNING log still fires unconditionally; only the Discord side
     degrades.
 
@@ -345,10 +345,10 @@ def _build_monitor_alert_dispatch_hook(
         log.warning(
             "monitor_alert_dispatch_hook_skipped_no_webhook_url",
             note=(
-                "discord.webhook_urls.alerts not in sops; the monitor's "
+                "discord.webhook_urls.alerts not in the secrets file; the monitor's "
                 "IBKR connectivity probe will still emit the structured "
                 "WARNING log on 1100/1101/1102 events but no Discord "
-                "#alerts push will fire. Wire the sops field + restart "
+                "#alerts push will fire. Wire the secrets field + restart "
                 "api to enable."
             ),
         )
@@ -848,11 +848,11 @@ async def _start_reconciliation_scheduler(
     """Construct + start the ReconciliationScheduler; return (sched, task) or None.
 
     Best-effort: requires both ``flex_query_id`` and ``flex_query_token``
-    populated in sops (mapped via ``services/api/entrypoint.py``). When
+    populated in the secrets file (mapped via ``services/api/entrypoint.py``). When
     either is missing — or the operator has flipped
     ``reconciliation_scheduler_enabled=False`` — the scheduler does not
     start + a structured warning is logged so the operator knows to
-    populate sops + restart the api.
+    populate the secrets file + restart the api.
 
     The cycle callback is built by :func:`services.reconciliation.eod_cycle.make_cycle_callback`
     and fires once per America/New_York calendar day at 18:30 ET (per
@@ -868,7 +868,7 @@ async def _start_reconciliation_scheduler(
         log.warning(
             "reconciliation_scheduler_flex_credentials_missing",
             note=(
-                "Set ibkr.flex_query_id + ibkr.flex_query_token in sops to "
+                "Set ibkr.flex_query_id + ibkr.flex_query_token in the secrets file to "
                 "enable the EOD reconciliation cycle. See "
                 "deploy/reconciliation/README.md."
             ),
@@ -955,7 +955,7 @@ async def _start_heartbeat_probe(
     logged. The api continues without it.
 
     Shares the same ``alert_dispatch_hook`` closure the reconciliation
-    scheduler uses — when sops Discord URLs aren't populated, the hook
+    scheduler uses — when secrets-file Discord URLs aren't populated, the hook
     is None and the probe still writes audit rows but skips the alert
     dispatch (the audit chain is the durable breadcrumb).
     """
@@ -1023,7 +1023,7 @@ def _build_coinbase_market_data_alert_dispatch_hook(
     "Coinbase WS/REST outage" per §3.8) and the hourly funding logger's
     consecutive-miss policy (P2 ``data_quality_reject``). With the hook
     wired, each descriptor becomes an ``alerts`` row INSERT + a
-    ``dispatch_alert`` Discord #alerts push. Without it (sops
+    ``dispatch_alert`` Discord #alerts push. Without it (secrets-file
     ``discord.webhook_urls.alerts`` unpopulated), the worker logs
     ``coinbase_market_data_alert_dropped_no_hook`` and drops — same
     skip semantics as the recon/monitor hooks (and the retired bar_sync
@@ -1046,11 +1046,11 @@ def _build_coinbase_market_data_alert_dispatch_hook(
         log.warning(
             "coinbase_market_data_alert_dispatch_hook_skipped_no_webhook_url",
             note=(
-                "discord.webhook_urls.alerts not in sops; the market-data "
+                "discord.webhook_urls.alerts not in the secrets file; the market-data "
                 "worker will still emit structured "
                 "`coinbase_market_data_alert_dropped_no_hook` WARNING logs "
                 "for staleness + funding-miss alerts, but no Discord "
-                "#alerts push will fire. Wire the sops field + restart api."
+                "#alerts push will fire. Wire the secrets field + restart api."
             ),
         )
         return None
@@ -1347,7 +1347,7 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         except Exception:
             # Scheduler startup is best-effort; failure shouldn't take
             # down the api. Most failure modes are config-time (missing
-            # sops fields, no active account) which we already log at
+            # secrets fields, no active account) which we already log at
             # WARNING from inside _start_reconciliation_scheduler.
             log.exception("reconciliation_scheduler_startup_failed")
         try:
@@ -1372,7 +1372,7 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             #
             # Drill 5 follow-up #2-FU-1: build the monitor's alert
             # dispatch hook BEFORE starting the monitor. Hook returns
-            # None if sops `discord.webhook_urls.alerts` is
+            # None if secrets `discord.webhook_urls.alerts` is
             # unpopulated; monitor degrades gracefully (WARNING log
             # fires, no Discord push).
             monitor_alert_hook = _build_monitor_alert_dispatch_hook(settings)

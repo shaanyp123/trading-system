@@ -23,13 +23,13 @@ Two smoke modes:
        python -m services.webhook_pusher.cli --severity P0 \\
            --message "smoke test P0 from $(hostname)" --with-db
 
-Required env vars (sourced from sops via the api container's entrypoint
+Required env vars (sourced from the secrets file via the api container's entrypoint
 on the VPS, or set manually for local dev):
 
-- ``WEBHOOK_PUSHER_DISCORD_ALERTS_URL`` — sops ``discord.webhook_urls.alerts``
-- ``WEBHOOK_PUSHER_DISCORD_CRITICAL_URL`` — sops ``discord.webhook_urls.critical``
-- ``WEBHOOK_PUSHER_RESEND_API_KEY`` — sops ``resend.api_key``
-- ``WEBHOOK_PUSHER_RESEND_FROM`` — sops ``resend.from_address``
+- ``WEBHOOK_PUSHER_DISCORD_ALERTS_URL`` — secrets ``discord.webhook_urls.alerts``
+- ``WEBHOOK_PUSHER_DISCORD_CRITICAL_URL`` — secrets ``discord.webhook_urls.critical``
+- ``WEBHOOK_PUSHER_RESEND_API_KEY`` — secrets ``resend.api_key``
+- ``WEBHOOK_PUSHER_RESEND_FROM`` — secrets ``resend.from_address``
 - ``WEBHOOK_PUSHER_OPERATOR_EMAIL`` — operator email (Phase 0 = same as `from`)
 - ``WEBHOOK_PUSHER_DATABASE_URL`` (only with ``--with-db``) —
   postgresql+asyncpg URL for the api container's ``app_service`` role
@@ -134,7 +134,7 @@ def _env_required(name: str) -> str:
     if not value:
         print(
             f"ERROR: required env var {name} not set or empty. "
-            "See deploy/webhook_pusher/README.md for the sops mapping.",
+            "See deploy/webhook_pusher/README.md for the secrets mapping.",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -142,7 +142,7 @@ def _env_required(name: str) -> str:
 
 
 def _load_webhook_urls(severity: AlertSeverity) -> dict[ChannelName, str]:
-    """Read Discord webhook URLs from env (sops-decrypted at deploy time).
+    """Read Discord webhook URLs from env (from the host secrets file at deploy time).
 
     Resend's URL is the constant ``RESEND_API_URL`` — only needed when
     severity routes to email (P0). The mapping is constructed minimally

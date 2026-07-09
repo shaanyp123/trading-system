@@ -61,7 +61,7 @@ class TrackedTask:
 
     The ``expected_alive`` flag distinguishes "we intentionally never
     spawned this task" (e.g., scheduler not configured due to missing
-    sops fields) from "we spawned this task and it died." Only the
+    secrets fields) from "we spawned this task and it died." Only the
     latter gets the ``async_task_died`` ERROR log; the former gets a
     one-shot ``async_task_not_spawned`` INFO at monitor startup.
     """
@@ -401,7 +401,7 @@ class AsyncTaskMonitor:
         a single ``async_task_monitor_started`` INFO with the count of
         spawned vs un-spawned tasks, plus a per-un-spawned ``async_
         task_not_spawned`` WARNING so the operator sees them explicitly
-        in the log stream (some "not spawned" reasons — missing sops
+        in the log stream (some "not spawned" reasons — missing secrets
         fields, no active account row — are recoverable; the
         WARNING is the operator's flag to revisit).
         """
@@ -421,7 +421,7 @@ class AsyncTaskMonitor:
                     task_name=tracked.name,
                     note=(
                         "Lifespan attempted to spawn this task but it "
-                        "returned None (typically: missing sops fields, "
+                        "returned None (typically: missing secrets fields, "
                         "no active account row, or a startup exception "
                         "logged separately). The monitor will not probe "
                         "this slot."

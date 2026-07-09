@@ -36,9 +36,9 @@ past it.
 
 - `secrets/paper.enc.yaml` decryption working. The age key lives at
   `/etc/credstore.encrypted/age_key` per `deploy/.env`'s
-  `SOPS_AGE_KEY_FILE`; every `sops --decrypt` invocation here needs
+  the host secrets file (`/opt/trading-secrets/secrets.yaml`); reads of it
   that env var exported in the current shell. Day 6 carryover
-  verified `wc -c == 64` on `app_service_password`; if `sops -d`
+  verified `wc -c == 64` on `app_service_password`; if the read
   errors, fix that before continuing.
 
 ### Architecture note (where this CLI runs)
@@ -52,42 +52,34 @@ We do NOT use the `webhook_pusher` container for this — it is on
 read `audit_log`. We do NOT run from the host because the `services`
 Python package lives inside the image, not on the VPS host filesystem.
 
-## Step 1 — Decrypt sops + extract `app_service` password
+## Step 1 — Extract `app_service` password from the host secrets file
 
 On the VPS:
 
 ```bash
-ssh root@178.156.239.84
+ssh root@<VPS_IP>
 cd /opt/trading
-
-# Required: point sops at the age key (per deploy/.env). Without this,
-# sops --decrypt errors with "failed to load age identities".
-export SOPS_AGE_KEY_FILE=/etc/credstore.encrypted/age_key
 
 # Confirm the api container has the new CLI module.
 docker compose --env-file deploy/.env exec -T api \
   test -f /app/services/audit/verify_chain.py || \
   { echo "MISSING: api image is older than Day 12 — rebuild via 'docker compose --env-file deploy/.env build api && docker compose --env-file deploy/.env up -d --force-recreate api'"; exit 1; }
 
-# Decrypt to a tmpfs path; never to disk.
-sops --decrypt secrets/paper.enc.yaml > /dev/shm/paper.decrypted.yaml
-chmod 600 /dev/shm/paper.decrypted.yaml
-
-# Sanity-check app_service_password is non-empty.
+# Sanity-check app_service_password is non-empty (secrets file is plain
+# YAML at /opt/trading-secrets/secrets.yaml; sops retired 2026-07-09).
 APP_SERVICE_PWD=$(awk '$1 == "app_service_password:" {print $2; exit}' \
-  /dev/shm/paper.decrypted.yaml)
+  /opt/trading-secrets/secrets.yaml)
 test -n "$APP_SERVICE_PWD" || \
-  { echo "MISSING: postgres.app_service_password not in /dev/shm/paper.decrypted.yaml"; exit 1; }
+  { echo "MISSING: postgres.app_service_password not in /opt/trading-secrets/secrets.yaml"; exit 1; }
 echo "app_service_password length: ${#APP_SERVICE_PWD}"
-# Expected: 64 (32-byte hex string from openssl rand -hex 32 at Day 5).
+# Expected: 64 (32-byte hex string from openssl rand -hex 32 at bringup).
 ```
 
 **On mismatch:** if `app_service_password` is empty or shorter than
-64 chars, the secret was never filled in `secrets/paper.enc.yaml`.
-Run `sops secrets/paper.enc.yaml`, locate `postgres.app_service_password`,
-and check whether it is still a `<TODO_FROM_DAY_3_POSTGRES_BOOTSTRAP>`
-placeholder. See `deploy/api/README.md` Step 4a for the canonical fill
-procedure.
+64 chars, the secret was never filled. Edit
+`/opt/trading-secrets/secrets.yaml` (schema: `deploy/secrets.template.yaml`)
+and check whether it is still a `<TODO_...>` placeholder. See
+`deploy/crypto-vps-bringup.md` Step 3 for the canonical fill procedure.
 
 ## Step 2 — Stage `DATABASE_URL` for the CLI
 
@@ -173,10 +165,10 @@ double-check via Step 4 below if you want belt-and-suspenders).
   environment.
 
 - `OperationalError: ... password authentication failed for user
-  "app_service"` — `app_service_password` in sops doesn't match the
+  "app_service"` — `app_service_password` in the secrets file doesn't match the
   Postgres role's actual password. Recovery: run `deploy/day5-bringup.sh`
   Step 6 (`ALTER ROLE app_service WITH PASSWORD ...`) to resync from
-  sops; or, if sops is the truth, run `sops secrets/paper.enc.yaml`
+  the secrets file; or, if the secrets file is the truth, re-run
   and confirm the password matches what Postgres has.
 
 - `OperationalError: ... could not translate host name "postgres" to
@@ -223,7 +215,7 @@ shred -u /dev/shm/paper.decrypted.yaml
 
 # Logout of the SSH session (env vars are subshell-local; closing the
 # shell discards them). Belt-and-suspenders:
-unset DATABASE_URL APP_SERVICE_PWD SOPS_AGE_KEY_FILE
+unset DATABASE_URL APP_SERVICE_PWD
 exit
 ```
 
@@ -546,7 +538,7 @@ sudo systemctl start recovery-agent-poll.timer
 |---|---|---|
 | Discord `#critical` silent after a known worker death | Either the monitor hook isn't wired OR the recovery agent timer isn't firing | Check Step 4 boot logs for `task_death_hook_wired=True`; then Step 6 to verify the timer; then `journalctl -u recovery-agent-poll.service` for the per-tick logs |
 | `recovery_agent_no_critical_webhook_url` WARNING in journal | Step 2 not done or perms wrong | Re-run Step 2 |
-| `recovery_agent_db_init_failed` ERROR | DATABASE_URL build failed | Check sops decrypt: `sops -d secrets/paper.enc.yaml | grep app_service_password`. Check `journalctl -u recovery-agent-poll.service` for the bash wrapper's error |
+| `recovery_agent_db_init_failed` ERROR | DATABASE_URL build failed | Check the secrets file: `grep -c app_service_password /opt/trading-secrets/secrets.yaml` (count only — never display). NOTE: the recovery agent was retired in the C0 decommission; this row is historical |
 | Synthetic alert in Step 7 stays acknowledged=FALSE | Timer firing but agent crashing per-tick | `journalctl -u recovery-agent-poll.service -n 100` for the traceback. Common cause: alembic migration in Step 3 was skipped; the `worker_failure` enum value doesn't exist yet |
 | `recovery_agent_alert_processing_failed` with FillProcessingError | Replay subprocess hit a terminal fill-processor error | Investigate via the replay script's exit code in the alert's `detail.recovery_outcome.replay_exit_code` — 3 = fill_processing_error per `scripts/operator_tools/replay_executions.py` docstring |
 | Replay subprocess timeout (exit 124 / `timed_out=True`) | ib_gateway wedged (drill 6 pattern) | Check `docker compose ps ib_gateway` + autoheal logs; the synchronous restart via autoheal should self-heal within ~5.5min |
@@ -587,7 +579,7 @@ state, systemd starts the template unit
 
 **Why direct-to-Discord (not the `alerts` table):** the notifier must fire
 exactly when infrastructure is broken, so it deliberately has **no
-docker / postgres / api / sops dependency** (routing through the `alerts`
+docker / postgres / api / secrets dependency** (routing through the `alerts`
 table would need postgres + api up — the very things that may be down — and
 a new `alert_category` enum value, i.e. an `alembic/**` migration requiring
 `risk-review-approved`). Same compounded-failure-silence reasoning as the

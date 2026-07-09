@@ -5,7 +5,7 @@ the Phase 0 surface: `/positions` + `/halt` + `/status` slash commands
 on the operator's Discord guild. This runbook satisfies dev-guide §6.8
 alternative (b) for A27 (third-party platform contract — Discord).
 
-The bot ↔ api auth model is **shared sops-decrypted Bearer token** per
+The bot ↔ api auth model is **shared secrets-file Bearer token** per
 backend-spec §6.6 + §4.4. The bot calls `http://api:8000/api/...` over
 the `trading_internal` Docker network with `Authorization: Bearer
 <token>`; the api validates via `services/api/middleware.BotAuthMiddleware`
@@ -19,26 +19,26 @@ and on match injects a service-account `SessionContext` (username
 | Step | Artifact | Sensitivity |
 | --- | --- | --- |
 | 1 | `discord.api_bearer_token` value (one secret, deployed twice — bot + api) | **Critical** — service-account auth |
-| 2 | Updated `secrets/paper.enc.yaml` (encrypted; committed to repo) | Encrypted |
+| 2 | Updated `/opt/trading-secrets/secrets.yaml` (encrypted; committed to repo) | Encrypted |
 | 3 | Bot container running on Hetzner Ashburn | — |
 | 4 | Live smoke: `/status` in the dev guild returns the api health embed | — |
 
 The bot token + guild ID + 7 channel IDs were captured during Day 2
 (`deploy/discord/README.md` Steps 1–4) and live in
-`secrets/paper.enc.yaml` `discord.bot_token` + `discord.guild_id`. Day 23
+`/opt/trading-secrets/secrets.yaml` `discord.bot_token` + `discord.guild_id`. Day 23
 adds ONE new key (`discord.api_bearer_token`) to that file.
 
 ---
 
 ## Prereqs
 
-- sops + age set up per `deploy/sops/README.md`. `SOPS_AGE_KEY_FILE`
+- Host secrets file authored per `deploy/secrets.template.yaml`. It
   exported in your shell.
 - VPS has the `services/api/Dockerfile` rebuilt from a commit at or after
   Day 23 PR merge (the api needs `BotAuthMiddleware` + the new
   `discord_bot_bearer_token` config field; the api-side mapping in
   `services/api/entrypoint.py` reads `discord.api_bearer_token` from the
-  sops bundle and exports it as `API_DISCORD_BOT_BEARER_TOKEN`).
+  secrets file and exports it as `API_DISCORD_BOT_BEARER_TOKEN`).
 - Discord bot already invited to the operator's guild (Day 2
   `deploy/discord/README.md` Step 4).
 
@@ -50,7 +50,7 @@ The bot ↔ api bearer is a fresh secret minted at runbook execution. It
 should be 32+ random bytes encoded as URL-safe base64 (matches the
 watchdog bearer + setup-token format precedent).
 
-On the operator laptop (NOT a shared shell — this value goes into sops
+On the operator laptop (NOT a shared shell — this value goes into the secrets file
 in Step 2):
 
 ```bash
@@ -60,7 +60,7 @@ python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
 ```
 
 Copy the value to your clipboard. It will appear under the `discord:`
-key in sops in Step 2.
+key in the secrets file in Step 2.
 
 **Do NOT paste this token into chat, this README, or any commit.** The
 gitleaks CI gate scans for high-entropy tokens; the operator's
@@ -70,11 +70,11 @@ template.)
 
 ---
 
-## Step 2 — Add the bearer to sops (paper env)
+## Step 2 — Add the bearer to the secrets file (paper env)
 
 ```bash
-# Open paper.enc.yaml for in-place edit (sops decrypts → editor → re-encrypts on save)
-sops secrets/paper.enc.yaml
+# Edit the host secrets file in place
+nano /opt/trading-secrets/secrets.yaml
 ```
 
 Add the new key under the existing `discord:` block:
@@ -94,11 +94,11 @@ discord:
   api_bearer_token: <paste your Step 1 value here>      # NEW for Day 23
 ```
 
-Save + exit your editor (sops re-encrypts on save). Verify the
+Save + exit your editor. Verify the
 encrypted file looks intact:
 
 ```bash
-sops -d secrets/paper.enc.yaml | grep -E 'api_bearer_token|bot_token|guild_id' | head -5
+yq -r ... /opt/trading-secrets/secrets.yaml | grep -E 'api_bearer_token|bot_token|guild_id' | head -5
 # Should print 3 lines (decrypt round-trip works; values are visible to
 # you locally because you have the age key).
 ```
@@ -106,7 +106,7 @@ sops -d secrets/paper.enc.yaml | grep -E 'api_bearer_token|bot_token|guild_id' |
 Commit the encrypted file (the plaintext NEVER leaves your laptop):
 
 ```bash
-git add secrets/paper.enc.yaml
+git add /opt/trading-secrets/secrets.yaml
 git commit -m "chore(secrets): add discord.api_bearer_token for Day 23 bot ↔ api auth"
 git push
 ```
@@ -125,10 +125,10 @@ carryover pattern). On the VPS:
 cd /opt/trading
 git pull --ff-only
 
-# Re-decrypt the sops bundle so the new api_bearer_token lands in
+# Re-decrypt the secrets file so the new api_bearer_token lands in
 # /opt/trading/secrets-decrypted/decrypted.yaml. Mirror the
 # day5-bringup.sh / Day-21-style decrypt step:
-sops -d secrets/paper.enc.yaml > /opt/trading/secrets-decrypted/decrypted.yaml
+yq -r ... /opt/trading-secrets/secrets.yaml > /opt/trading/secrets-decrypted/decrypted.yaml
 chmod 600 /opt/trading/secrets-decrypted/decrypted.yaml
 
 # Rebuild the api (picks up BotAuthMiddleware + entrypoint.py new mapping)
@@ -151,7 +151,7 @@ docker compose --env-file deploy/.env logs -f discord_bot
 
 If `discord_commands_synced` fails to log within ~10s, check:
 - `docker compose logs discord_bot 2>&1 | grep -i "login_failed\|notfound"` — the bot token may be invalid OR the guild ID wrong.
-- Discord developer portal → your application → Bot tab → confirm token matches what's in sops.
+- Discord developer portal → your application → Bot tab → confirm token matches what's in the secrets file.
 - Re-invite the bot to your guild via the Day 2 OAuth URL if `NotFound` fires on `tree.sync`.
 
 ---
@@ -178,7 +178,7 @@ Open Discord, navigate to your `trading-system` guild, click into the
 
 If `/status` returns an embed with `❌ /status failed — BOT_AUTH_INVALID`,
 the bot's bearer token doesn't match the api's. Re-run Step 2 + Step 3
-ensuring you pasted the same value into sops AND that the bot's
+ensuring you pasted the same value into the secrets file AND that the bot's
 container was restarted AFTER the bearer landed in
 `/opt/trading/secrets-decrypted/decrypted.yaml`.
 
@@ -309,7 +309,7 @@ Quarterly per backend-spec §6.6 ("rotated quarterly with 1h overlap
 window"). The rotation is two-step:
 
 1. Mint a new value via Step 1.
-2. Update `discord.api_bearer_token` in `secrets/paper.enc.yaml` (and
+2. Update `discord.api_bearer_token` in `/opt/trading-secrets/secrets.yaml` (and
    `live.enc.yaml`).
 3. Deploy api + bot together via Step 3 (single `docker compose up -d`
    restart for both).
@@ -325,7 +325,7 @@ implement true overlap when the bot moves to a separate cluster.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Bot logs `discord_bot_login_failed` | Wrong `discord.bot_token` | Re-mint in Discord developer portal → update sops → restart bot |
+| Bot logs `discord_bot_login_failed` | Wrong `discord.bot_token` | Re-mint in Discord developer portal → update the secrets file → restart bot |
 | Bot logs `tree.sync ... NotFound` | Bot not invited to guild OR wrong `guild_id` | Re-invite via Day 2 OAuth URL; verify guild ID |
 | `/status` returns `BOT_AUTH_INVALID` | Bot's `api_bearer_token` ≠ api's | Re-run Step 2 + Step 3, ensure both sides got the same value |
 | `/status` returns `CSRF_REJECTED` | Bot is sending POST without bearer (config bug) | Check `docker compose logs discord_bot` for missing-token errors at startup |
@@ -343,13 +343,13 @@ implement true overlap when the bot moves to a separate cluster.
 
 The bot's source code lives at `services/discord_bot/`; the api-side
 auth middleware at `services/api/middleware.py:BotAuthMiddleware`; the
-shared bearer-token sops key at `secrets/<env>.enc.yaml` `discord.api_bearer_token`.
+shared bearer-token secrets key at `/opt/trading-secrets/secrets.yaml` `discord.api_bearer_token`.
 
 ---
 
 ## Notes for future Claude sessions
 
-- Token rotation is a sops-edit + restart, no code change.
+- Token rotation is a secrets-file edit + restart, no code change.
 - If Phase 1 adds new slash commands, register them in
   `services/discord_bot/main.py:_register_commands` — the gateway
   resync happens automatically on next `setup_hook`.

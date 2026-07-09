@@ -2,12 +2,12 @@
 # deploy/day5-bringup.sh — idempotent end-to-end Day-5 bringup on the Ashburn VPS.
 #
 # Performs the full stack-up flow in one shot:
-#   1. Sanity-check prerequisites (deploy/.env, sops binary, age key, etc.)
-#   2. Decrypt sops yaml on the host (no sops container needed)
+#   1. Sanity-check prerequisites (deploy/.env, host secrets file, etc.)
+#   2. Validate the plain-YAML secrets file + set container-readable perms
 #   3. Build the api image (if not cached)
 #   4. Bring up postgres + wait healthy
 #   5. Run alembic migrations (idempotent — alembic skips applied)
-#   6. ALTER ROLE app_service / app_owner with sops-stored passwords
+#   6. ALTER ROLE app_service / app_owner with secrets-file passwords
 #   7. Bring up api + caddy
 #   8. Wait for api health + capture SETUP_TOKEN_EMITTED from logs
 #   9. Verify /api/health locally
@@ -30,13 +30,10 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 
 REPO_ROOT="${REPO_ROOT:-/opt/trading}"
-# Renamed from ENV_FILE to avoid collision with deploy/.env's own ENV_FILE
-# variable (older runbooks set ENV_FILE=paper.enc.yaml). When the script
-# `source`s deploy/.env, an ENV_FILE inside the file would clobber the path
-# stored here. DEPLOY_ENV_PATH is unique enough to never collide.
+# DEPLOY_ENV_PATH (not ENV_FILE) so `source deploy/.env` can never clobber it.
 DEPLOY_ENV_PATH="${REPO_ROOT}/deploy/.env"
-SECRETS_DIR_HOST="${SECRETS_DIR_HOST:-/opt/trading/secrets-decrypted}"
-DECRYPTED_YAML="${SECRETS_DIR_HOST}/decrypted.yaml"
+SECRETS_DIR_HOST="${SECRETS_DIR_HOST:-/opt/trading-secrets}"
+SECRETS_YAML="${SECRETS_DIR_HOST}/secrets.yaml"
 
 cd "${REPO_ROOT}"
 
@@ -62,12 +59,10 @@ source "${DEPLOY_ENV_PATH}"
 set +a
 
 : "${POSTGRES_SUPERUSER_PASSWORD:?missing in ${DEPLOY_ENV_PATH}}"
-: "${SOPS_AGE_KEY_FILE:?missing in ${DEPLOY_ENV_PATH}}"
-: "${ENV_FILE_NAME:=${ENV_FILE_NAME:-paper.enc.yaml}}"
 
-[[ -r "${SOPS_AGE_KEY_FILE}" ]] || die "age key file ${SOPS_AGE_KEY_FILE} not readable"
-command -v sops >/dev/null || die "sops binary not on PATH; install per deploy/api/README.md"
+[[ -f "${SECRETS_YAML}" ]] || die "${SECRETS_YAML} does not exist; author it per deploy/secrets.template.yaml (see deploy/crypto-vps-bringup.md Step 3)"
 command -v docker >/dev/null || die "docker not installed"
+python3 -c 'import yaml' 2>/dev/null || die "python3-yaml not installed (apt-get install -y python3-yaml)"
 
 # Defensive: stale docker-compose.override.yml from prior debug sessions
 # survives `git reset --hard` (gitignored, so untracked) and silently
@@ -78,95 +73,63 @@ if [[ -f "${REPO_ROOT}/docker-compose.override.yml" ]]; then
 fi
 
 ok "deploy/.env loaded"
-ok "age key + sops + docker available"
+ok "secrets file + docker + python3-yaml available"
 
 # ---------------------------------------------------------------------------
-# Step 0.5 — auto-restore sops backup (defensive; replaces operator's manual cp)
-# ---------------------------------------------------------------------------
-#
-# Latent bug from Day 5 close-out: secrets/<env>.enc.yaml is tracked in git,
-# so operator-side fills (postgres app-role passwords pasted via `sops` on
-# the VPS) get wiped by every `git reset --hard`. The runbook documents a
-# manual cp from /etc/credstore.encrypted/<env>.enc.yaml.backup before each
-# deploy; this step automates the dance.
-#
-# Decision rule:
-#   - No backup at the conventional path -> first deploy / laptop-side
-#     follow-up PR landed; nothing to restore.
-#   - Backup exists AND in-repo file's app_service_password is a <TODO>
-#     placeholder -> in-repo file was wiped, restore from backup.
-#   - Backup exists AND in-repo file already filled -> idempotent no-op.
-#
-# Note: the conventional backup path is parameterized via ENV_FILE_NAME so
-# `paper.enc.yaml.backup` (Phase 0) and `live.enc.yaml.backup` (Phase 1)
-# both work without script edits.
-
-step "Step 0.5 — auto-restore sops backup (defensive)"
-
-BACKUP_PATH="/etc/credstore.encrypted/${ENV_FILE_NAME:-paper.enc.yaml}.backup"
-LIVE_PATH="${REPO_ROOT}/secrets/${ENV_FILE_NAME:-paper.enc.yaml}"
-
-if [[ ! -f "${BACKUP_PATH}" ]]; then
-  ok "no backup at ${BACKUP_PATH} — skipping (first deploy or laptop-side fill landed)"
-else
-  # Probe the in-repo file's app_service_password. If sops can't decrypt
-  # (file structure broken) OR the value is a <TODO> placeholder, restore
-  # from the backup. The decrypt failure path covers the case where the
-  # in-repo yaml was reverted to the pre-encryption template.
-  in_repo_pwd="$(SOPS_AGE_KEY_FILE="${SOPS_AGE_KEY_FILE}" \
-    sops -d --extract '["postgres"]["app_service_password"]' \
-    "${LIVE_PATH}" 2>/dev/null || echo "<DECRYPT_FAILED>")"
-
-  case "${in_repo_pwd}" in
-    "<TODO"*|""|"<DECRYPT_FAILED>")
-      warn "in-repo ${LIVE_PATH} has placeholder / unreadable app_service_password"
-      warn "restoring from ${BACKUP_PATH}"
-      cp "${BACKUP_PATH}" "${LIVE_PATH}"
-      chmod 0640 "${LIVE_PATH}"
-      ok "restored ${LIVE_PATH} from backup"
-      ;;
-    *)
-      ok "in-repo ${LIVE_PATH} already has filled secrets (no restore needed)"
-      ;;
-  esac
-fi
-
-# ---------------------------------------------------------------------------
-# Step 1 — decrypt sops yaml on the host
+# Step 1 — validate the host secrets file + set container-readable perms
 # ---------------------------------------------------------------------------
 
-step "Step 1 — decrypt sops yaml → ${DECRYPTED_YAML}"
-
-mkdir -p "${SECRETS_DIR_HOST}"
-SOPS_AGE_KEY_FILE="${SOPS_AGE_KEY_FILE}" \
-  sops -d "${REPO_ROOT}/secrets/${ENV_FILE_NAME:-paper.enc.yaml}" > "${DECRYPTED_YAML}.new"
-mv "${DECRYPTED_YAML}.new" "${DECRYPTED_YAML}"
+step "Step 1 — validate ${SECRETS_YAML}"
 
 # Container runs as uid 1000 (`trading` user in the api Dockerfile);
 # bind-mount preserves host perms so file must be readable to that uid.
 chown -R 1000:1000 "${SECRETS_DIR_HOST}"
 chmod 0500 "${SECRETS_DIR_HOST}"
-chmod 0400 "${DECRYPTED_YAML}"
-ok "decrypted yaml ready (uid 1000, mode 0400)"
+chmod 0400 "${SECRETS_YAML}"
+ok "secrets file perms set (uid 1000, mode 0400)"
 
-# Sanity-check: extract postgres app_service_password and confirm it's not a placeholder.
-APP_SERVICE_PWD="$(SOPS_AGE_KEY_FILE="${SOPS_AGE_KEY_FILE}" \
-  sops -d --extract '["postgres"]["app_service_password"]' \
-  "${REPO_ROOT}/secrets/${ENV_FILE_NAME:-paper.enc.yaml}")"
-APP_OWNER_PWD="$(SOPS_AGE_KEY_FILE="${SOPS_AGE_KEY_FILE}" \
-  sops -d --extract '["postgres"]["app_owner_password"]' \
-  "${REPO_ROOT}/secrets/${ENV_FILE_NAME:-paper.enc.yaml}")"
+# Parse-check the YAML + extract the postgres app-role passwords.
+# Float leaves = YAML numeric coercion ate a long-digit string (quote it
+# in the file); the api entrypoint enforces the same rule at boot.
+mapfile -t PG_PWDS < <(python3 - "${SECRETS_YAML}" <<'PYVALIDATE'
+import sys
 
-case "${APP_SERVICE_PWD}" in
-  "<TODO"*|"")
-    die "postgres.app_service_password is still a placeholder in secrets/${ENV_FILE_NAME:-paper.enc.yaml} — run 'sops secrets/${ENV_FILE_NAME:-paper.enc.yaml}' and fill it"
-    ;;
-esac
-case "${APP_OWNER_PWD}" in
-  "<TODO"*|"")
-    die "postgres.app_owner_password is still a placeholder in secrets/${ENV_FILE_NAME:-paper.enc.yaml} — run 'sops secrets/${ENV_FILE_NAME:-paper.enc.yaml}' and fill it"
-    ;;
-esac
+import yaml
+
+with open(sys.argv[1], encoding="utf-8") as fh:
+    data = yaml.safe_load(fh) or {}
+
+
+def find_floats(node, path=()):
+    if isinstance(node, float):
+        yield ".".join(path) or "<root>"
+    elif isinstance(node, dict):
+        for key, value in node.items():
+            yield from find_floats(value, (*path, str(key)))
+    elif isinstance(node, list):
+        for idx, value in enumerate(node):
+            yield from find_floats(value, (*path, f"[{idx}]"))
+
+
+floats = sorted(find_floats(data))
+if floats:
+    sys.stderr.write(
+        "float-typed value(s) at: " + ", ".join(floats)
+        + " — wrap long all-digit values in double quotes\n"
+    )
+    raise SystemExit(1)
+
+for key in ("app_service_password", "app_owner_password"):
+    value = (data.get("postgres") or {}).get(key)
+    if not value or str(value).startswith("<TODO"):
+        sys.stderr.write(f"postgres.{key} missing or placeholder\n")
+        raise SystemExit(1)
+    print(value)
+PYVALIDATE
+) || die "secrets file invalid — fix ${SECRETS_YAML} per deploy/secrets.template.yaml"
+
+APP_SERVICE_PWD="${PG_PWDS[0]}"
+APP_OWNER_PWD="${PG_PWDS[1]}"
 ok "postgres app-role passwords extracted (${#APP_SERVICE_PWD} + ${#APP_OWNER_PWD} chars)"
 
 # ---------------------------------------------------------------------------

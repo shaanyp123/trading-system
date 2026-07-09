@@ -84,7 +84,7 @@ pnpm typecheck && pnpm lint && pnpm test
 
 No exceptions. If CI is the only gate, a broken test blocks the PR and wastes time. Run locally first.
 
-**Third-party platform integrations:** if your PR introduces a service file that talks to a third-party platform (QC LEAN, IBKR, Discord, Resend, Anthropic, S3, sops, FastAPI, alembic-against-real-Postgres), `make test` is necessary but NOT sufficient — see §6.8. The first commit MUST also include either a smoke-test fixture (CI/build-time) or an operator-runbook checklist. Anti-pattern `[A27]`. Local test passes don't prove the platform contract still matches the spec.
+**Third-party platform integrations:** if your PR introduces a service file that talks to a third-party platform (Coinbase, Discord, Resend, Anthropic, S3, FastAPI, alembic-against-real-Postgres), `make test` is necessary but NOT sufficient — see §6.8. The first commit MUST also include either a smoke-test fixture (CI/build-time) or an operator-runbook checklist. Anti-pattern `[A27]`. Local test passes don't prove the platform contract still matches the spec.
 
 ---
 
@@ -95,7 +95,7 @@ These are decisions you must NOT re-derive or contradict. Memorize:
 **Authentication & session:**
 - WebAuthn user-verification: **`required`** for register and login (NOT `preferred`)
 - Backup codes: **8 single-use codes**, format **10-char base32 in 2 groups of 5** (`ABCDE-FGHIJ`); Argon2id-hashed via `argon2-cffi` (NOT bcrypt)
-- TOTP: `pyotp`; secrets AES-encrypted at column-level (separate key from sops)
+- TOTP: `pyotp`; secrets AES-encrypted at column-level (dedicated key in the host secrets file)
 - Re-auth window: **5 min** of `last_uv_at` for risk-loosening actions; web-only by construction
 - Session lifetime: **30 min idle / 24h absolute / 7d refresh token**
 - CSRF: SameSite=Strict cookies + double-submit pattern with `X-CSRF-Token` header
@@ -209,7 +209,7 @@ If a session asks you to deviate from any of these, escalate per §1.3 — do NO
 │   ├── docker-compose.staging.yml
 │   └── Caddyfile
 ├── secrets/
-│   ├── dev.enc.yaml                  # sops-encrypted; NEVER commit plaintext
+│   ├── (RETIRED 2026-07-09)          # sops enc files deleted; host secrets file per deploy/secrets.template.yaml
 │   ├── paper.enc.yaml
 │   └── live.enc.yaml
 ├── tests/
@@ -1929,7 +1929,7 @@ CI runs unit + integration on every PR. Weekly cron runs golden-test + vectorbt-
 
 ## 6.8 Third-Party Platform Integration Smoke Tests (locked 2026-05-07 Day 5)
 
-**Rule:** the FIRST commit that introduces a service file talking to a third-party platform (QuantConnect LEAN, IBKR `ib-async`, Discord webhooks, Resend, Anthropic API, S3, sops, Cloudflare, FastAPI app construction, alembic against real Postgres, etc.) MUST include EITHER:
+**Rule:** the FIRST commit that introduces a service file talking to a third-party platform (Coinbase, Discord webhooks, Resend, Anthropic API, S3, Cloudflare, FastAPI app construction, alembic against real Postgres, etc.) MUST include EITHER:
 
 (a) **A smoke-test fixture** that exercises the platform's contract end-to-end. Must run as part of `make ci` OR as a Dockerfile RUN step OR as a CI workflow job. Examples below.
 
@@ -2473,7 +2473,7 @@ export function ParameterChangeForm() {
 
 ## 9.1 Secrets Workflow
 
-- sops decrypts `secrets/<env>.enc.yaml` at container start via init container.
+- Secrets: plain host file `/opt/trading-secrets/secrets.yaml` bind-mounted to `/run/secrets/secrets.yaml` (sops retired 2026-07-09; decisions-log).
 - Secrets are exposed as env vars only. Never written to disk in plaintext.
 - Never write secrets to source files, comments, logs, or tests.
 - Rotation: `scripts/rotate-secrets.sh` — rotates age key + re-encrypts all three env files.
@@ -2583,7 +2583,7 @@ async def approve_signal(
 | Week | Build first | Integration points | Test gate |
 |---|---|---|---|
 | 1 | Repo scaffold (pnpm workspace, ruff/mypy/pytest CI, pre-commit hooks); v1 strategy code authored on QC by Claude Code with operator review; Hetzner VPS provisioned (Ashburn primary + Falkenstein watchdog) | None (mostly setup) | Pre-commit passes; v1 strategy commits clean; VPS reachable via SSH; CI green on first PR |
-| 2 | Phase 1 sub-universe verification (data executability + 50% single-contract-notional rule per current equity); sops + age key generated, encrypted env files committed; QC paper trading kicks off (paper-day clock starts) | QC paper data | Active universe enumerated for current equity tier; `sops -d secrets/dev.enc.yaml` decrypts; first QC paper session logged |
+| 2 | Phase 1 sub-universe verification (data executability + 50% single-contract-notional rule per current equity); secrets file authored (HISTORICAL — sops retired 2026-07-09); QC paper trading kicks off (paper-day clock starts) | QC paper data | Active universe enumerated for current equity tier; first QC paper session logged |
 | 3 | FastAPI `/api/health` + `/internal/health/deep`; Postgres connection pool (asyncpg); structlog JSON setup; `audit_log` DDL migration with hash chain; `append_audit_event()` with advisory lock + SERIALIZABLE retry loop; immutability triggers (BEFORE UPDATE/DELETE per row + BEFORE TRUNCATE per statement on parent + every yearly partition; spec §2.10.2's EVENT TRIGGER pattern doesn't fire on TRUNCATE — see `Docs/decisions-log.md` 2026-05-05 Day 3) | DB connectivity | `GET /api/health` returns 200; `test_audit_append_concurrent_writers_serialize_correctly` passes; TRUNCATE on `audit_log` (parent + any yearly partition) blocked by `BEFORE TRUNCATE` trigger |
 | 4 | QC ObjectStore client scaffold; `qc_adapter_cursor` table; golden-test harness; QC parity fixtures for 5 session event types; JCS canonicalization helper | QC mock + ObjectStore | Golden test passes for all 5 fixtures byte-for-byte modulo `{ingest_clock_ts, ingest_uuid, sequence_no}` |
 | 5 | REST scaffolding for Phase 1 endpoints; SSE channel `/api/sse/events` with multiplexed event types; instruction round-trip processor (Phase 1); reconciliation service skeleton | DB + QC mock | SSE connection + 24h replay via `last-event-id` works; instruction round-trip < 20s p99 against mock |
@@ -2657,7 +2657,7 @@ Each entry: what NOT to do, why, what to do instead.
 
 **[A17]** DO NOT apply transformative Alembic migrations (rename, type change, DROP) outside the maintenance window (Saturday 17:00 ET → Sunday 18:00 ET). Add the CME-session-active check to the migration runner.
 
-**[A18]** DO NOT use the bare `<your-domain>`, `<operator_email>`, `<operator_username>`, `<discord_guild_id>`, or `<watchdog_static_ip>` placeholders in any code or config. Substitute actual values at deployment via sops env vars.
+**[A18]** DO NOT use the bare `<your-domain>`, `<operator_email>`, `<operator_username>`, `<discord_guild_id>`, or `<watchdog_static_ip>` placeholders in any code or config. Substitute actual values at deployment via the host secrets file / env vars.
 
 **[A19]** DO NOT call `audit.write()` from within the same SERIALIZABLE transaction that writes business data, unless the business data write and the audit write must be atomic. Usually audit writes are a separate transaction immediately after. Mixing them inside a long-running SERIALIZABLE transaction increases contention.
 
@@ -2675,7 +2675,7 @@ Each entry: what NOT to do, why, what to do instead.
 
 **[A26]** DO NOT compute metrics (Sharpe, drawdown, hit rate, health score, exposure pcts) in the frontend. Backend computes and returns pre-computed values. Frontend renders only. This is a hard architectural constraint for reader-redaction simplicity.
 
-**[A27]** DO NOT introduce a service file that talks to a third-party platform (QC LEAN, IBKR ib-async, Discord webhooks, Resend, Anthropic API, S3, sops, Cloudflare, FastAPI app construction, alembic against real Postgres) without a smoke test or runbook checklist (§6.8). The first commit MUST include either (a) a CI/build-time smoke fixture that exercises the platform's contract OR (b) an operator-runbook with N concrete fact-checks. Spec/docs and platform reality drift; mock-only integrations break at first contact. Five post-spec platform discoveries hit Days 4-5 alone — see §6.8 for the canonical examples.
+**[A27]** DO NOT introduce a service file that talks to a third-party platform (Coinbase, Discord webhooks, Resend, Anthropic API, S3, Cloudflare, FastAPI app construction, alembic against real Postgres) without a smoke test or runbook checklist (§6.8). The first commit MUST include either (a) a CI/build-time smoke fixture that exercises the platform's contract OR (b) an operator-runbook with N concrete fact-checks. Spec/docs and platform reality drift; mock-only integrations break at first contact. Five post-spec platform discoveries hit Days 4-5 alone — see §6.8 for the canonical examples.
 
 ---
 

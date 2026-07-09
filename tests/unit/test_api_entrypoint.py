@@ -1,4 +1,4 @@
-"""Unit tests for `services/api/entrypoint.py` (sops yaml → env vars).
+"""Unit tests for `services/api/entrypoint.py` (secrets yaml → env vars).
 
 The real entrypoint exec()s uvicorn, so tests inject a stub argv that
 echoes its environment back via `python -c` and assert against stdout. We
@@ -18,7 +18,7 @@ from services.api import entrypoint
 
 
 def _write_yaml(tmp_path: Path, content: str) -> Path:
-    path = tmp_path / "decrypted.yaml"
+    path = tmp_path / "secrets.yaml"
     path.write_text(textwrap.dedent(content))
     return path
 
@@ -108,7 +108,7 @@ def test_main_uses_existing_database_url_without_secrets_file(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """If API_DATABASE_URL is already set in the environment, the entrypoint
-    skips sops parsing entirely and exec()s the supplied argv. We replace
+    skips secrets parsing entirely and exec()s the supplied argv. We replace
     `os.execvp` with a stub so the test process survives."""
     monkeypatch.setenv("API_SECRETS_PATH", str(tmp_path / "absent.yaml"))
     monkeypatch.setenv(
@@ -169,7 +169,7 @@ def test_main_extracts_discord_bot_bearer_when_present(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Day 23: sops `discord.api_bearer_token` → `API_DISCORD_BOT_BEARER_TOKEN`."""
+    """Day 23: secrets `discord.api_bearer_token` → `API_DISCORD_BOT_BEARER_TOKEN`."""
     secrets_path = _write_yaml(
         tmp_path,
         """
@@ -199,7 +199,7 @@ def test_main_extracts_totp_encryption_key_when_present(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Day 21 carryover: sops `totp.encryption_key` → `API_TOTP_ENCRYPTION_KEY`."""
+    """Day 21 carryover: secrets `totp.encryption_key` → `API_TOTP_ENCRYPTION_KEY`."""
     secrets_path = _write_yaml(
         tmp_path,
         """
@@ -229,7 +229,7 @@ def test_main_extracts_webauthn_triplet_when_present(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Day 21 carryover: sops `webauthn.{rp_id,rp_name,origin}` → 3 env vars."""
+    """Day 21 carryover: secrets `webauthn.{rp_id,rp_name,origin}` → 3 env vars."""
     secrets_path = _write_yaml(
         tmp_path,
         """
@@ -267,11 +267,11 @@ def test_main_does_not_override_preset_day21_env_vars(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """If the Day-21 env vars are preset, sops values do NOT clobber them.
+    """If the Day-21 env vars are preset, secrets-file values do NOT clobber them.
 
     Same defensive pattern as `API_WATCHDOG_BEARER_TOKEN` — operator can
     override via docker-compose `environment:` block without round-tripping
-    through sops.
+    through the secrets file.
     """
     secrets_path = _write_yaml(
         tmp_path,
@@ -279,13 +279,13 @@ def test_main_does_not_override_preset_day21_env_vars(
         postgres:
           app_service_password: realhex123
         totp:
-          encryption_key: from-sops
+          encryption_key: from-file
         webauthn:
-          rp_id: from-sops.example
-          rp_name: from-sops-name
-          origin: https://from-sops.example
+          rp_id: from-file.example
+          rp_name: from-file-name
+          origin: https://from-file.example
         discord:
-          api_bearer_token: from-sops-bot
+          api_bearer_token: from-file-bot
         """,
     )
     monkeypatch.setenv("API_SECRETS_PATH", str(secrets_path))
@@ -316,11 +316,11 @@ def test_main_does_not_override_preset_day21_env_vars(
     assert captured["bot"] == "preset-bot"
 
 
-def test_main_skips_day21_env_vars_when_sops_key_placeholder(
+def test_main_skips_day21_env_vars_when_secrets_key_placeholder(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Placeholder sops values must NOT land in env (downstream code
+    """Placeholder secrets values must NOT land in env (downstream code
     catches the missing-key case at runtime; degrading gracefully here
     is consistent with the watchdog + bot bearer mapping pattern)."""
     secrets_path = _write_yaml(
@@ -375,7 +375,7 @@ def test_main_maps_coinbase_credentials(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Crypto-pivot C0-B2b: sops ``coinbase.api_key_name`` +
+    """Crypto-pivot C0-B2b: secrets ``coinbase.api_key_name`` +
     ``coinbase.api_private_key`` map to API_COINBASE_API_KEY_NAME /
     API_COINBASE_API_PRIVATE_KEY. (Replaces the retired API_IBKR_ACCOUNT
     resolution tests — that mapping died with the IBKR execution layer.)"""

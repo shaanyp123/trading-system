@@ -138,7 +138,7 @@ class CSRFMiddleware(BaseHTTPMiddleware):
     bypass this gate because:
 
       * The bot is a service-account caller using a bearer token sourced
-        from sops — not a browser session cookie.
+        from the secrets file — not a browser session cookie.
       * The double-submit CSRF pattern defends against cross-site form
         submissions; bearer auth has no equivalent threat (no cookies
         to forge, no browser context).
@@ -329,9 +329,9 @@ class BotAuthMiddleware(BaseHTTPMiddleware):
         an explicit auth attempt that the api should reject loudly).
       * No bot bearer configured (``settings.discord_bot_bearer_token`` is
         None) → fall through unconditionally. The bot path is simply not
-        served until the operator wires the sops secret per
+        served until the operator wires the secrets-file value per
         ``deploy/discord_bot/README.md``. This is the Day-23 dev-mode
-        default; production sets the token via sops.
+        default; production sets the token via the secrets file.
 
     The middleware imports ``SessionContext`` lazily inside ``dispatch``
     to avoid a top-of-module import cycle (services.api.session imports

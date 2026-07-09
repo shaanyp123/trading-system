@@ -20,7 +20,7 @@
 # Design — mirrors scripts/operator_tools/verify_chain_to_discord.sh:
 #   * Reads the webhook URL from a chmod-600 file (treated as a credential
 #     per feedback_secret_handling.md); never echoes it.
-#   * Pure curl POST — NO docker / postgres / api / sops dependency, so it
+#   * Pure curl POST — NO docker / postgres / api / secrets-file dependency, so it
 #     fires even when the failure IS an infrastructure outage (the whole
 #     point; routing via the alerts table would need postgres+api up exactly
 #     when they may be the thing that's down).
