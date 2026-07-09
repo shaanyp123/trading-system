@@ -78,14 +78,21 @@ Fill per the template's inline comments. Bringup minimum (everything
 else can stay `<TODO_...>` and the matching feature stays off):
 
 1. `postgres.*` — two fresh `openssl rand -hex 32` values.
-2. `coinbase.*` — the CDP key name + PEM (template shows the exact
-   block-style formatting; `|` then one PEM line per line).
+2. `coinbase.*` — the CDP key name + PEM. **Do NOT hand-type or paste
+   the PEM into an editor or chat** (2026-07-09 incident: a key pasted
+   into a Claude session had to be revoked). Instead: `scp` the
+   downloaded CDP JSON to the VPS and inject it script-assisted so the
+   key never renders on screen, then `shred -u` the temp file and
+   delete the JSON from the PC (password-manager file attachment is
+   the only surviving copy). Claude generates the inject script; it
+   validates PEM shape + YAML round-trip and prints only line counts.
 3. `discord.*` — bot token, guild id, a fresh `api_bearer_token`,
    webhook URLs (re-issue from Discord if the old ones were lost —
    Appendix A).
 4. `internal.*`, `totp.encryption_key` — fresh values per the template's
    generate commands.
-5. `resend.api_key`.
+5. `resend.api_key` — OPTIONAL (deferred 2026-07-09): placeholder =
+   email alerting off; Discord remains the alert channel.
 
 The generate commands are in the template comments next to each key.
 Save (Ctrl-O, Enter, Ctrl-X). Don't fix ownership — the bringup script
@@ -134,10 +141,22 @@ All containers healthy = bringup done.
 ## Step 7 — Seed the account (fresh DB, Amendment B)
 
 ```bash
-docker compose --env-file deploy/.env exec api \
-  python -m scripts.operator_tools.bootstrap_live_account \
-    --env paper --mint-from-defaults --no-dry-run --confirm
+docker compose --env-file deploy/.env exec api python -c "
+import os, sys, runpy, yaml
+pw = yaml.safe_load(open('/run/secrets/secrets.yaml'))['postgres']['app_service_password']
+os.environ['DATABASE_URL'] = f'postgresql+asyncpg://app_service:{pw}@postgres:5432/trading'
+sys.argv = ['bootstrap_live_account', '--env', 'paper', '--mint-from-defaults',
+            '--external-account-id', 'operator', '--no-dry-run', '--confirm']
+runpy.run_module('scripts.operator_tools.bootstrap_live_account', run_name='__main__')
+"
 ```
+
+Two things this wrapper gets right that a bare `docker compose exec …
+python -m scripts.operator_tools.bootstrap_live_account` does not (both
+bit the 2026-07-09 bringup): `docker compose exec` bypasses the
+entrypoint, so `DATABASE_URL` must be built in-process from the mounted
+secrets file; and the script's `--external-account-id` **default is the
+retired IBKR account number** — the paper convention is `operator`.
 
 (Full bootstrap — account + risk_state + parameter head row — is correct
 here because the DB is fresh. On an already-bootstrapped env you'd add
