@@ -221,6 +221,22 @@ lessons. The worker recreate is safe mid-day: startup recovery re-reads
 persisted state, sees an already-handled decision date, and resumes the
 30 s loop.
 
+**Caddyfile-only changes** don't need `--rebuild` (the config is
+bind-mounted). Ceremony — validate BEFORE restarting, and `sleep` before
+the smoke curl (a curl fired immediately after `restart` races the
+listener bind and reports a phantom outage; false-alarmed the #368 gate
+deploy):
+
+```bash
+cd /opt/trading && git pull
+docker run --rm -v /opt/trading/deploy/Caddyfile:/etc/caddy/Caddyfile:ro \
+  -e DOMAIN=spratcapital.com -e ACME_EMAIL=x@example.com -e WATCHDOG_IP=188.245.37.16 \
+  caddy:2-alpine caddy validate --config /etc/caddy/Caddyfile 2>&1 | tail -1  # expect: Valid configuration
+docker compose --env-file deploy/.env restart caddy
+sleep 8
+curl -fsS https://spratcapital.com/api/health >/dev/null && echo health-ok
+```
+
 Verify the running code actually changed (don't trust the build banner):
 
 ```bash
