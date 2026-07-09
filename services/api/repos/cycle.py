@@ -23,7 +23,7 @@ A02 N/A — ``services/api/**`` is on the §2.3 hot-fix whitelist.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Protocol
@@ -60,13 +60,21 @@ class StrategyDecisionRow:
 
 @dataclass(frozen=True, slots=True)
 class WorkerStatusRow:
-    """``strategy_worker_status`` row (one per account, UPSERTed each tick)."""
+    """``strategy_worker_status`` row (one per account, UPSERTed each tick).
+
+    ``engine_state`` (crypto-pivot §3.9 positions read surface) is the
+    worker's per-asset runtime JSONB verbatim — keyed by asset root
+    (BTC/ETH), shaped by ``strategy_worker.AssetRuntime.to_json`` with
+    Decimals stored as strings. Defaults to ``{}`` so pre-§3.9
+    constructions (tests, older callers) stay valid.
+    """
 
     risk_loop_heartbeat_utc: datetime | None
     risk_loop_tick_count: int
     marks_stale: bool
     last_decision_date: date | None
     updated_at_utc: datetime
+    engine_state: dict[str, Any] = field(default_factory=dict)
 
 
 class CycleQueryRepo(Protocol):
@@ -143,7 +151,7 @@ class PostgresCycleQueryRepo:
             await self._session.execute(
                 text(
                     "SELECT risk_loop_heartbeat_utc, risk_loop_tick_count, marks_stale,"
-                    "       last_decision_date, updated_at_utc "
+                    "       last_decision_date, updated_at_utc, engine_state "
                     "FROM strategy_worker_status "
                     "WHERE account_id = :account_id"
                 ),
@@ -158,6 +166,10 @@ class PostgresCycleQueryRepo:
             marks_stale=row.marks_stale,
             last_decision_date=row.last_decision_date,
             updated_at_utc=row.updated_at_utc,
+            # Same JSONB defense as ``outcome``: asyncpg hands back a
+            # dict; a string-returning driver (or corrupt payload)
+            # degrades to {} rather than a 500.
+            engine_state=_coerce_outcome(row.engine_state),
         )
 
 

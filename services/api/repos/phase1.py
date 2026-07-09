@@ -164,6 +164,16 @@ class Phase1QueryRepo(Protocol):
         account_id: UUID,
     ) -> list[dict[str, object]]: ...
 
+    async def fetch_positions_current_with_contract(
+        self,
+        account_id: UUID,
+    ) -> list[dict[str, object]]: ...
+
+    async def fetch_latest_stop_order(
+        self,
+        client_order_id: str,
+    ) -> dict[str, object] | None: ...
+
     async def fetch_positions_for_lean_cycle(
         self,
         account_id: UUID,
@@ -442,6 +452,64 @@ class PostgresPhase1QueryRepo:
             )
         ).fetchall()
         return [dict(r._mapping) for r in rows]
+
+    async def fetch_positions_current_with_contract(
+        self,
+        account_id: UUID,
+    ) -> list[dict[str, object]]:
+        """``positions_current`` rows enriched with their ``contracts`` row.
+
+        Crypto-pivot §3.9 positions read surface: the strategy worker's
+        ``ensure_contract_row`` writes ``market_root`` (BTC/ETH) +
+        ``multiplier`` (nano contract size, runtime-discovered per [A13])
+        per product — the asset label / cluster / uPnL-sizing inputs the
+        ``/api/positions/current`` mapper needs. LEFT JOIN so a row with
+        ``contract_id IS NULL`` (recon-seeded before contract resolution)
+        still renders, just without the enrichment. The un-joined
+        :meth:`fetch_positions_current` is kept untouched for its other
+        consumers (today digest exposure math).
+        """
+        rows = (
+            await self._session.execute(
+                text(
+                    "SELECT pc.id, pc.market, pc.contract_id, pc.quantity, "
+                    "       pc.avg_cost, pc.margin_held, pc.unrealized_pnl, "
+                    "       pc.last_mark_ts, pc.managed_by_version, "
+                    "       c.market_root, c.multiplier "
+                    "FROM positions_current pc "
+                    "LEFT JOIN contracts c ON c.id = pc.contract_id "
+                    "WHERE pc.account_id = :acc"
+                ),
+                {"acc": account_id},
+            )
+        ).fetchall()
+        return [dict(r._mapping) for r in rows]
+
+    async def fetch_latest_stop_order(
+        self,
+        client_order_id: str,
+    ) -> dict[str, object] | None:
+        """Latest ``orders`` row for a native-stop ``client_order_id``.
+
+        Crypto-pivot §3.9: the positions mapper resolves the resting
+        native backstop's price via the ``native_stop_client_order_id``
+        the worker persists in ``engine_state``. Latest by
+        ``placed_at_utc`` — a stop replace re-uses the deterministic
+        client_order_id lineage, and only the newest row reflects the
+        currently resting price. Columns per ``alembic/versions/
+        0002_core_tables.py`` (``stop_price``, ``status``).
+        """
+        row = (
+            await self._session.execute(
+                text(
+                    "SELECT stop_price, status FROM orders "
+                    "WHERE client_order_id = :coid "
+                    "ORDER BY placed_at_utc DESC LIMIT 1"
+                ),
+                {"coid": client_order_id},
+            )
+        ).fetchone()
+        return dict(row._mapping) if row is not None else None
 
     async def fetch_positions_for_lean_cycle(
         self,

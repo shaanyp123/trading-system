@@ -1,9 +1,11 @@
 """Unit tests for :mod:`services.api.position_mtm`.
 
-Crypto-pivot C0 (2026-07-08): the LEAN on-disk price source is retired
-(bar_sync deleted, delta spec §1), so the module is fallback-only until
-the §3.2 Coinbase market-data source lands. Covered:
+Crypto-pivot §3.9 (2026-07-09): the module is now the mark ladder's pure
+math — rung-1 live-mark uPnL + rung-3 avg-cost fallback. Covered:
 
+* :func:`unrealized_pnl` — the Decimal ``(mark - avg_cost) x qty x
+  multiplier`` formula the live-WS rung uses (long/short, nano
+  multiplier scaling).
 * :func:`compute_position_mtm` — known market → fallback (current_price=
   avg_cost, unrealized_pnl=0, source="fallback_avg_cost"); unknown
   market → same numbers with source="unknown_market"; ``price_as_of``
@@ -14,7 +16,30 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from services.api.position_mtm import PositionMtmResult, compute_position_mtm
+from services.api.position_mtm import (
+    PositionMtmResult,
+    compute_position_mtm,
+    unrealized_pnl,
+)
+
+
+class TestUnrealizedPnl:
+    def test_long_gain_scales_by_nano_multiplier(self) -> None:
+        # (61000 - 60000) x 2 x 0.01 = 20.00
+        assert unrealized_pnl(Decimal("61000"), Decimal("60000"), 2, Decimal("0.01")) == Decimal(
+            "20.00"
+        )
+
+    def test_short_gains_when_mark_drops(self) -> None:
+        # (3300 - 3400) x (-4) x 0.1 = +40.0
+        assert unrealized_pnl(Decimal("3300"), Decimal("3400"), -4, Decimal("0.1")) == Decimal(
+            "40.0"
+        )
+
+    def test_long_loss_is_negative(self) -> None:
+        assert unrealized_pnl(Decimal("59000"), Decimal("60000"), 1, Decimal("0.01")) == Decimal(
+            "-10.00"
+        )
 
 
 class TestComputePositionMtm:

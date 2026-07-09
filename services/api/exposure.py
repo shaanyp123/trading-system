@@ -82,6 +82,30 @@ _ZERO_CLUSTERS: Final[dict[ExposureCluster, Decimal]] = {
 }
 
 
+def lookup_market_meta(
+    market: str,
+    *,
+    market_root: str | None = None,
+) -> MarketExposureMeta | None:
+    """Exposure metadata for one position, keyed by root first.
+
+    Crypto-pivot §3.9: ``positions_current.market`` carries the raw CDE
+    product_id (e.g. ``BIP-20DEC30-CDE``) which is deliberately NOT in
+    the metadata table ([A13] — product IDs encode expiry and are never
+    hardcoded); the stable key is ``contracts.market_root`` (BTC/ETH)
+    written from runtime discovery. Pre-this-helper the positions mapper
+    looked up the raw market string and every crypto position fell
+    through to the ``equity_index`` fallback — misbucketed on the home
+    page. Returns None (not the fallback) when neither key matches so
+    callers can render an honest "unknown" instead of a wrong cluster.
+    """
+    if market_root is not None:
+        meta = CRYPTO_EXPOSURE_METADATA.get(market_root)
+        if meta is not None:
+            return meta
+    return CRYPTO_EXPOSURE_METADATA.get(market)
+
+
 def _fallback_meta(market: str) -> MarketExposureMeta:
     """Emit a structured warning + return an ``equity_index``/``1`` default.
 
@@ -174,7 +198,9 @@ def compute_exposure_breakdown(
 
 
 __all__ = [
+    "CRYPTO_EXPOSURE_METADATA",
     "V1_EXPOSURE_METADATA",
     "MarketExposureMeta",
     "compute_exposure_breakdown",
+    "lookup_market_meta",
 ]

@@ -1,24 +1,22 @@
-"""services/api/position_mtm.py — on-read mark-to-market for open positions.
+"""services/api/position_mtm.py — position mark-to-market helpers.
 
 Backend-spec §4.1.5b ``Position.current_price`` + ``Position.unrealized_pnl``.
 
-Crypto-pivot C0 (2026-07-08, delta spec §1/§3.2): the Phase-1 price source
-for this module was the LEAN on-disk daily zips written by the (now
-retired) ``services.data.bar_sync`` worker. With that data layer
-decommissioned there is no on-disk bar source, so every position marks at
-its ``avg_cost`` with ``unrealized_pnl=0`` — the module's long-standing
-fallback contract, now the only path. The Coinbase market-data service
-(delta spec §3.2, ``services/data/coinbase_market_data.py``) becomes the
-mark source in the C0 build and will replace this fallback with live perp
-marks.
+Crypto-pivot §3.9 (2026-07-09): the "§3.2 source will replace this"
+promise from the C0 decommission is now FULFILLED — the positions route
+(``services/api/routes/positions.py``) marks against the Coinbase
+market-data worker's live WS marks (rung 1 of the mark ladder, via
+``services/api/marks.py``) and the 00:15 UTC recon-written
+``positions_current.unrealized_pnl`` (rung 2, writer:
+``services/reconciliation/eod_cycle.py``). This module keeps only what
+that ladder still needs:
 
-Fallback semantics (unchanged from Phase 1):
-
-* ``current_price = avg_cost``, ``unrealized_pnl = 0``
-* ``source`` is the diagnostic string surfaced in structlog / the wire
-  payload: ``fallback_avg_cost`` for known-shape markets, or
-  ``unknown_market`` when the market has no exposure metadata.
-* ``price_as_of = None`` — no fresh bar was read.
+* :func:`unrealized_pnl` — the pure Decimal uPnL formula for a live mark
+  (rung 1), kept here so the route stays thin and tests pin the math.
+* :func:`compute_position_mtm` — the avg-cost fallback (rung 3, the
+  long-standing Phase-1 contract): ``current_price = avg_cost``,
+  ``unrealized_pnl = 0``, ``price_as_of = None``. Taken only when no
+  fresh live mark exists AND recon hasn't written a mark.
 """
 
 from __future__ import annotations
@@ -39,10 +37,10 @@ class PositionMtmResult:
 
     ``current_price`` falls back to ``avg_cost`` so the route caller can
     render the position row without a null. ``unrealized_pnl`` is signed.
-    ``source`` is the diagnostic string surfaced in structlog for
-    missing-data debugging. ``price_as_of`` is the priced bar's session
-    date (ISO ``YYYY-MM-DD``) — always ``None`` until the §3.2 Coinbase
-    market-data source lands.
+    ``source`` is the diagnostic string surfaced in structlog / the wire
+    payload's ``mark_source``. ``price_as_of`` is the retiring bar-date
+    field — always ``None`` on the fallback path (kept until the §3.9
+    frontend PR removes the wire field).
     """
 
     current_price: Decimal
@@ -51,18 +49,35 @@ class PositionMtmResult:
     price_as_of: str | None = None
 
 
+def unrealized_pnl(
+    mark: Decimal,
+    avg_cost: Decimal,
+    quantity: int,
+    multiplier: Decimal,
+) -> Decimal:
+    """Signed uPnL for one position at a live mark (§3.9 ladder rung 1).
+
+    ``(mark - avg_cost) x qty x multiplier`` — for CDE perps the
+    multiplier is ``contracts.multiplier`` (the nano contract size the
+    strategy worker wrote from runtime discovery, [A13]); omitting it is
+    the exact futures-math bug the recon writer refuses to risk (see
+    ``services/reconciliation/eod_cycle.py`` mark-source note). Pure
+    Decimal end to end ([A05]).
+    """
+    return (mark - avg_cost) * Decimal(quantity) * multiplier
+
+
 def compute_position_mtm(
     market: str,
     quantity: int,
     avg_cost: Decimal,
 ) -> PositionMtmResult:
-    """Compute (current_price, unrealized_pnl) for a single position.
+    """Avg-cost fallback mark (§3.9 ladder rung 3) for a single position.
 
-    C0 decommission state: no live price source exists (bar_sync/LEAN
-    retired; Coinbase marks not yet wired), so this always returns the
-    fallback (``current_price=avg_cost``, ``unrealized_pnl=0``). The
-    ``source`` field distinguishes a known market on the fallback path
-    from a market with no exposure metadata at all.
+    Returns ``current_price=avg_cost``, ``unrealized_pnl=0`` — the
+    honest "no price source reached this row" rendering. The ``source``
+    field distinguishes a known market on the fallback path from a
+    market with no exposure metadata at all.
     """
     if V1_EXPOSURE_METADATA.get(market) is None:
         log.warning("position_mtm_unknown_market", market=market)
@@ -82,4 +97,5 @@ def compute_position_mtm(
 __all__ = [
     "PositionMtmResult",
     "compute_position_mtm",
+    "unrealized_pnl",
 ]
