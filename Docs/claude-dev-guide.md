@@ -114,7 +114,16 @@ These are decisions you must NOT re-derive or contradict. Memorize:
 - Public health: `GET /api/health`
 - WebAuthn ceremonies are JS-driven via `navigator.credentials.*`; NO OAuth-style `/auth/callback`
 
-**Phase 1 architecture (CRITICAL — REVISED 2026-05-12 per DP-025 → Option 4; data-layer pivot v2 2026-05-21 Option C; bar_sync clientId synced to deploy reality in 2026-05-21 follow-up):**
+**Venue & architecture (CRITICAL — LOCKED 2026-07-08, crypto-perps pivot; supersedes the RETIRED Phase-1 IBKR block below; per `Docs/crypto-pivot-delta-spec.md` §6):**
+- **Venue = Coinbase CFM CDE perpetual-style futures (nano BTC, nano ETH) via the Coinbase Advanced Trade API. No offshore venues** — ever, regardless of funding-rate or fee arguments. Broker adapter: `services/execution/coinbase_client.py` + `coinbase_adapter.py` (forbidden whitelist — `[A02]` binds).
+- **NO per-trade approval — Discord is announce-only.** The `/approve` flow was RETIRED end-to-end at C0-B4 (PR #350; Discord command + confirm view + `POST /api/signals/:id/{approve,reject,defer}` all deleted). Trades are *announced* (`#fills` embed with signal rationale), never gated on operator action. Do not re-introduce approval affordances anywhere — API, Discord, or frontend.
+- **Strategy profile = Amendment B** (`Docs/crypto-perps-strategy.md` + Amendments). **Signal parameters are FROZEN.** Risk-preference knobs (vol target, loss limits, exposure caps) are changeable ONLY via a strategy-doc amendment + a `Docs/decisions-log.md` entry — never ad-hoc in a session.
+- **Daily cycle is UTC-anchored (24/7 market — no CME sessions, no ET anchors):** daily decision at **00:05 UTC**; EOD reconciliation at **00:15 UTC**; risk loop every **30 s** (client 2×ATR stops, liquidation-buffer check, halt check). The CME-era 17:00 ET bar_sync / 18:30 ET FlexQuery anchors are retired with the block below.
+- **Intraday-margin opt-in = NEVER.** One overnight margin regime, 24/7 (strategy §7). Do not opt the account into intraday margin for any reason.
+- **Halt = $1,500 equity floor.** Breach sets the existing persistent HALTED flag; restart is **manual flag-clear only** — no auto-resume, no auto-graduation out of a $1,500 halt.
+- **Cash sweeps must be same-day reclaimable.** Idle cash sweeps to USDC at CBI (Coinbase One rewards) with instant 1:1 USDC↔USD conversion back to CFM margin. Any instrument that cannot be reclaimed same-day (staking, lending, queued unstaking) is prohibited for system capital (decisions-log 2026-07-08).
+
+**Phase 1 architecture (RETIRED 2026-07-08 — crypto-perps pivot; kept verbatim below for history only. Do NOT implement against ANY of it: the direct-IBKR/`ib-async`/`ib_gateway` architecture, the IBKR clientId allocation table, the bar_sync block, and the LEAN signals ingress (`POST /api/internal/lean/signals`) are ALL retired per `Docs/crypto-pivot-delta-spec.md` §1/§6; replacement is the Venue & architecture block above. Original heading: REVISED 2026-05-12 per DP-025 → Option 4; data-layer pivot v2 2026-05-21 Option C; bar_sync clientId synced to deploy reality in 2026-05-21 follow-up):**
 - **Backend HAS direct IBKR connection** via `ib-async` to a Dockerized `ib_gateway` container on TWO distinct clientIds:
   - **`clientId=1`** — long-lived order-placement worker (`services/execution/ibkr_adapter.py::DEFAULT_CLIENT_ID = 1`; locked since PR #101). NOTE: VPS `deploy/.env` currently overrides this to `API_IBKR_CLIENT_ID=2`; the code default + this guide remain at `1` pending an operator decision to reconcile.
   - **`clientId=3`** — per-cycle bar-sync worker (`services/data/bar_sync.py::DEFAULT_BAR_SYNC_CLIENT_ID = 3`; synced to deploy reality 2026-05-21). The worker fires once per ET calendar day at 17:00 ET, opens a fresh ib-async connection, fetches `reqHistoricalData` for all 11 Phase 1 markets, writes to the shared `lean_data` Docker volume in LEAN's on-disk format, disconnects.
@@ -135,10 +144,18 @@ These are decisions you must NOT re-derive or contradict. Memorize:
 - **Historical context:** Pre-pivot Phase 1 plan was QC-mediated (algorithm ran on QC Cloud, backend polled `/events`, wrote `/instructions/<n>.json` for defensive trims). That architecture was infeasible on the operator's QC subscription tier — `/object/get` is Institutional-tier gated (DP-025 discovered Day 28). The `services/qc_adapter/**` code remains in the repo under the `qc_adapter_backfill` Phase 2+ profile gate per backend-spec §1.4 (preserved for institutional memory + ad-hoc historical replay; not active in production).
 - See `Docs/decisions-log.md` 2026-05-12 entry "Phase-1 architecture pivot — QC ObjectStore → LEAN Local + direct IBKR" + 2026-05-20 evening entry (v1 postmortem) + 2026-05-21 entry "Data-layer pivot v2 LANDS via Option C" for the full chain.
 
-**Backtest authority:**
-- LEAN authoritative for PR review surface backtest delta
-- vectorbt research-only (parameter sweeps, fast iteration)
-- Weekly cron parity test: per-trade slippage ≤5bps, aggregate cumulative P&L ≤0.5% starting equity, trade count within 5%
+**Backtest authority (REVISED 2026-07-08 — crypto-perps pivot):**
+- **`research/crypto_perps/backtest.py` (frozen Amendment B params) is authoritative** for the PR review surface backtest delta (§5.8 artifact generator points at it)
+- Live parity (trust bridge): weekly live-vs-sim job — live fills/costs/P&L vs simulated same-window; slippage gate B1, fee gate B2, funding gate B3 run permanently; tolerances re-based during Phase C1
+- Quarterly: extend data, re-run the strategy §9 falsification suite, log the verdict
+- Signal-engine parity gate: `services/signal/crypto_trend.py` must stay tuple-for-tuple identical to the reference (`tests/golden/test_crypto_trend_parity.py`, runs in CI)
+- **RETIRED 2026-07-08:** "LEAN authoritative for PR review surface backtest delta"; vectorbt research-only role; the weekly vbt-vs-LEAN parity cron (per-trade slippage ≤5bps / aggregate P&L ≤0.5% starting equity / trade count within 5%). §6.6 kept for history only.
+
+**Secrets model (AMENDED 2026-07-09 — sops/age pipeline RETIRED; operator-approved, see `Docs/decisions-log.md` 2026-07-09 post-C0-merge entry):**
+- **ONE plain-YAML host file:** `/opt/trading-secrets/secrets.yaml` (uid 1000, mode **0400**, OUTSIDE the repo working tree), bind-mounted to `/run/secrets/secrets.yaml`; schema + per-key generate commands at `deploy/secrets.template.yaml`
+- **Recovery = re-issue from provider dashboards, NOT restore** — no secret backups exist by design; per-key runbook at `deploy/crypto-vps-bringup.md` Appendix A
+- Guardrails that stay: `gitleaks` (pre-commit + CI), `.gitignore` blocks `secrets.yaml` repo-wide, secrets never pasted into chat / committed / logged
+- Do NOT recommend or re-introduce sops/age ceremonies (encrypted repo copies `secrets/*.enc.yaml`, age keys, sops-edit runbooks, safe-paper key recovery) for any new work — all deleted 2026-07-09
 
 **Domain placeholder:**
 - Use `<your-domain>` (NOT bare `<domain>`) — operator substitutes apex registrable domain at deployment
@@ -208,17 +225,13 @@ If a session asks you to deviate from any of these, escalate per §1.3 — do NO
 │   ├── docker-compose.yml
 │   ├── docker-compose.staging.yml
 │   └── Caddyfile
-├── secrets/
-│   ├── (RETIRED 2026-07-09)          # sops enc files deleted; host secrets file per deploy/secrets.template.yaml
-│   ├── paper.enc.yaml
-│   └── live.enc.yaml
+├── secrets/                          # RETIRED 2026-07-09 — sops enc files deleted; host secrets file per deploy/secrets.template.yaml + §9.1
 ├── tests/
 │   ├── unit/
 │   ├── integration/
 │   └── e2e/
 └── scripts/
-    ├── rotate-secrets.sh
-    └── verify_export.py
+    └── verify_export.py              # rotate-secrets.sh RETIRED 2026-07-09 with the sops pipeline
 ```
 
 ## 2.2 Forbidden Whitelist (require `risk-review-approved` PR label)
@@ -1044,6 +1057,8 @@ async def _route_alert(severity: KillSwitchSeverity, reason: str) -> None:
 ```
 
 ## 5.4 QC Instruction Processor
+
+> **RETIRED 2026-07-08 (crypto-perps pivot).** `services/qc_adapter/` was deleted at C0-D1 (`Docs/crypto-pivot-delta-spec.md` §1); this pattern is kept for history only. Do not implement against it.
 
 ```python
 # services/qc_adapter/instruction_processor.py
@@ -1876,6 +1891,8 @@ def test_qc_event_jcs_parity(fixture_file: Path):
 
 ## 6.6 vectorbt-vs-LEAN Parity Test
 
+> **RETIRED 2026-07-08 (crypto-perps pivot).** LEAN and the vbt↔LEAN parity tests are gone; kept for history only. The current parity discipline is the crypto signal-engine golden gate: `tests/golden/test_crypto_trend_parity.py` — `services/signal/crypto_trend.py` vs the `research/crypto_perps/backtest.py` reference, tuple-for-tuple over the full recorded bar history (see §1.5 Backtest authority).
+
 ```python
 # tests/integration/test_vbt_lean_parity.py
 """
@@ -1925,7 +1942,7 @@ def test_vectorbt_lean_parity(vbt_results, lean_results, starting_equity):
 | `services/execution/` | 90% |
 | All others | 70% |
 
-CI runs unit + integration on every PR. Weekly cron runs golden-test + vectorbt-vs-LEAN parity.
+CI runs unit + integration on every PR, including the crypto signal-engine parity gate (`tests/golden/test_crypto_trend_parity.py`). The weekly golden-test + vectorbt-vs-LEAN parity cron is RETIRED 2026-07-08 (see §6.6 note); its replacement is the weekly live-vs-sim parity job per §1.5 Backtest authority.
 
 ## 6.8 Third-Party Platform Integration Smoke Tests (locked 2026-05-07 Day 5)
 
@@ -2473,11 +2490,14 @@ export function ParameterChangeForm() {
 
 ## 9.1 Secrets Workflow
 
-- Secrets: plain host file `/opt/trading-secrets/secrets.yaml` bind-mounted to `/run/secrets/secrets.yaml` (sops retired 2026-07-09; decisions-log).
-- Secrets are exposed as env vars only. Never written to disk in plaintext.
-- Never write secrets to source files, comments, logs, or tests.
-- Rotation: `scripts/rotate-secrets.sh` — rotates age key + re-encrypts all three env files.
-- `gitleaks` pre-commit hook rejects any commit containing secret-like strings.
+**(AMENDED 2026-07-09 — sops/age pipeline RETIRED, operator-approved; full rationale in `Docs/decisions-log.md` 2026-07-09 post-C0-merge entry. Locked summary in §1.5.)**
+
+- Secrets live in **ONE plain-YAML host file**: `/opt/trading-secrets/secrets.yaml` (uid 1000, mode 0400, outside the repo working tree), bind-mounted to `/run/secrets/secrets.yaml`. Schema + per-key generate commands: `deploy/secrets.template.yaml`. `<TODO_...>` placeholder semantics, entrypoint env-var mappings, and the float-coercion guard are unchanged; `deploy/day5-bringup.sh` validates the file fail-closed.
+- App code sees secrets as env vars only (container entrypoint mappings). Never write secrets to source files, comments, logs, tests, or chat.
+- To add or rotate a key: edit the host file over SSH, restart the consuming container. No encryption ceremony, no age keys, no repo copy, no sync-back.
+- **Recovery = re-issue, not restore.** Every key re-issues from its provider dashboard in minutes; per-key runbook at `deploy/crypto-vps-bringup.md` Appendix A. No secret backups exist by design.
+- `gitleaks` (pre-commit hook + CI job) rejects any commit containing secret-like strings; `.gitignore` blocks `secrets.yaml` repo-wide.
+- **RETIRED 2026-07-09 (deleted — do not reference or recreate):** `secrets/{dev,paper,live}.enc.yaml`, `deploy/sops/` (runbook + schema templates), `.sops.yaml`, `scripts/sops_init.sh`, the `scripts/rotate-secrets.sh` age-key rotation, and the safe-paper age-key recovery instructions.
 
 ```python
 # services/api/config.py
@@ -2578,6 +2598,8 @@ async def approve_signal(
 
 # 10. Phase-Specific Dev Priorities
 
+> **HISTORICAL (pre-pivot).** This section describes the CME/IBKR/LEAN-era phase plan (Phase 0 completed; QC/LEAN/IBKR references retired 2026-07-08). The **current** build plan is `Docs/crypto-pivot-delta-spec.md` §5: C0 (decommission + build, offline gates) → C1 (small-live, 45+ days, strategy-doc §10 gates) → C2 (full size + polish). Kept for history; do not schedule work from the tables below.
+
 ## 10.1 Phase 0 (Weeks 0–8)
 
 | Week | Build first | Integration points | Test gate |
@@ -2647,7 +2669,7 @@ Each entry: what NOT to do, why, what to do instead.
 
 **[A12]** DO NOT manually edit `paper_days_completed` in the `strategy_versions` table to bypass the 30-paper-day gate. The CI gate is mechanical for a reason: live trading with an untested strategy version is a capital risk.
 
-**[A13]** **(REVISED 2026-05-12 — Phase-1 architecture pivot; inverts the original rule.)** DO write IBKR broker integration via `ib-async` from Phase 1 onward — direct TWS API path is now the canonical broker contract. The client lives at `services/execution/ibkr_client.py` (forbidden whitelist — `risk-review-approved` required). DO NOT re-introduce the QC ObjectStore instruction protocol (`/instructions/<n>.json` → poll ack); that path is RETIRED. The pre-pivot rule stated the opposite ("Phase 1 has no direct IBKR connection"); it was inverted when DP-025 surfaced that `/object/get` is QC-Institutional-tier-gated. See `Docs/decisions-log.md` 2026-05-12 entry. **Note** [A02] still binds — `services/execution/**` is on the forbidden whitelist; all changes require `risk-review-approved`.
+**[A13]** **(RE-REVISED 2026-07-08 — crypto-perps pivot; supersedes the 2026-05-12 revision.)** DO use `coinbase-advanced-py` against Coinbase CFM CDE products — the broker clients live at `services/execution/coinbase_client.py` + `coinbase_adapter.py` (forbidden whitelist — `risk-review-approved` required). DO NOT re-introduce IBKR/LEAN/QC paths — `ib-async`/`ib_gateway`, the LEAN signals ingress, bar_sync, the QC ObjectStore instruction protocol — ALL RETIRED 2026-07-08 per `Docs/crypto-pivot-delta-spec.md` §1. DO NOT hardcode CDE product IDs — they encode expiry and rotate; discover products at runtime (the daily `product_metadata` snapshot / product catalog). **Revision history:** the original rule ("Phase 1 has no direct IBKR connection") was inverted 2026-05-12 when DP-025 surfaced that QC `/object/get` is Institutional-tier-gated (direct IBKR via `ib-async` became canonical); that direct-IBKR rule was itself retired 2026-07-08 with the crypto-perps pivot. See `Docs/decisions-log.md` 2026-05-12 + 2026-07-08 entries. **Note** [A02] still binds — `services/execution/**` is on the forbidden whitelist; all changes require `risk-review-approved`.
 
 **[A14]** DO NOT use SES for email. Resend (`resend.com`) is locked. The `resend_api_key` in secrets; `Resend` Python SDK or HTTP client.
 
