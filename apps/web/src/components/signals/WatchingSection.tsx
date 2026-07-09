@@ -1,37 +1,31 @@
 'use client';
 
 /**
- * `WatchingSection` — daily proximity table for `/signals`.
+ * `WatchingSection` — per-asset hysteresis-flip proximity for `/signals`
+ * (crypto-pivot §3.9).
  *
- * Renders the V1 universe with at-a-glance per-gate state (Donchian /
- * Trend / Trend Quality) so the operator can see which markets are about to
- * fire on the next LEAN signal cycle (~21:30 UTC). Sits above the
- * existing pending-signals list on the `/signals` page.
+ * One row per asset (BTC / ETH) showing the direction the engine holds,
+ * how far a pending direction flip has progressed against the hysteresis
+ * window, and any entry blocks (post-stop lockout, vol-block). All
+ * derived numbers (`days_to_flip`, `lockout_days_left`) are computed
+ * SERVER-side; this component only renders them (frontend-spec §8.9
+ * LOCKED — no Decimal arithmetic in JS).
  *
- * Data source: `GET /api/signals/proximity` (PR-B). The response is
- * latest-per-market across the V1 universe; this component sorts +
- * groups + colors per `Docs/signal-proximity-design.md` §3.3 + §7.
+ * Data source: `GET /api/signals/proximity` — recomposed from the
+ * strategy worker's persisted engine state + the latest 00:05 UTC daily
+ * decision (`useSignalsProximity`).
  *
- * Refresh model (design D7): TanStack Query staleTime + the
- * existing `signal` SSE event handler in `lib/sse.ts` prefix-
- * invalidates `['signals']`, which transitively refetches this hook's
- * `['signals', 'proximity']` key. No new SSE event type is introduced
- * (forbidden by CLAUDE.md locked rules).
- *
- * Decimal handling: headroom + last_close arrive as Decimal-strings;
- * we never do arithmetic on them. `parseFloat` is used ONLY at the
- * display/sort layer where values are fractional + bounded — see the
- * top-of-file note in `lib/api/signals-proximity.ts`.
+ * Refresh model: TanStack Query staleTime + the existing `signal` SSE
+ * event handler in `lib/sse.ts` prefix-invalidates `['signals']`, which
+ * transitively refetches this hook's `['signals', 'proximity']` key. No
+ * new SSE event type is introduced (forbidden by CLAUDE.md locked rules).
  */
 
 import {
   bucketOf,
-  sortProximityMarkets,
+  sortProximityAssets,
   useSignalsProximity,
-  type GateStateLiteral,
-  type GateView,
-  type MarketProximityView,
-  type ProximityBucket,
+  type AssetProximityView,
 } from '@/lib/api/signals-proximity';
 import { formatTimeETShort } from '@/lib/format';
 import { cn } from '@/lib/utils';
@@ -54,13 +48,13 @@ export function WatchingSection(): JSX.Element {
         <CardTitle className="text-base">
           Watching{' '}
           {data !== undefined && (
-            <span className="text-text-muted">({data.markets.length})</span>
+            <span className="text-text-muted">({data.assets.length})</span>
           )}
         </CardTitle>
         <p className="text-xs text-text-muted">
-          Per-gate proximity for the V1 universe — updated each LEAN cycle
-          (~21:30&nbsp;UTC). PASS&nbsp;= cleared this session, CLOSE&nbsp;=
-          within the gate&apos;s band, FAIL&nbsp;= firmly below.
+          Distance to a hysteresis direction flip per asset — evaluated at the
+          daily 00:05&nbsp;UTC decision. A pending flip must persist for the
+          full hysteresis window before the engine changes direction.
         </p>
       </CardHeader>
       <CardContent>
@@ -73,7 +67,7 @@ export function WatchingSection(): JSX.Element {
           </p>
         )}
         {!isLoading && !isError && data !== undefined && (
-          <WatchingBody response={data} />
+          <WatchingBody assets={data.assets} />
         )}
       </CardContent>
     </Card>
@@ -81,238 +75,171 @@ export function WatchingSection(): JSX.Element {
 }
 
 function WatchingBody({
-  response,
+  assets,
 }: {
-  response: { as_of_cycle_ts_utc: string | null; markets: readonly MarketProximityView[] };
+  assets: readonly AssetProximityView[];
 }): JSX.Element {
-  if (response.markets.length === 0) {
+  if (assets.length === 0) {
     return (
       <p className="text-sm text-text-muted">
-        Waiting for first LEAN cycle today (next at 21:30&nbsp;UTC).
+        Waiting for the strategy worker&apos;s first daily decision (00:05&nbsp;UTC).
       </p>
     );
   }
-  const sorted = sortProximityMarkets(response.markets);
+  const sorted = sortProximityAssets(assets);
   return (
     <Table>
       <TableHeader>
         <TableRow>
-          <TableHead>Market</TableHead>
-          <TableHead>Donchian</TableHead>
-          <TableHead>Trend</TableHead>
-          <TableHead>Trend Quality</TableHead>
-          <TableHead>Closest gate</TableHead>
-          <TableHead className="text-right">Last close · cycle</TableHead>
+          <TableHead>Asset</TableHead>
+          <TableHead>Direction</TableHead>
+          <TableHead>Flip proximity</TableHead>
+          <TableHead>Blocks</TableHead>
+          <TableHead className="text-right">Trend score</TableHead>
+          <TableHead className="text-right">Mark · as of</TableHead>
         </TableRow>
       </TableHeader>
       <TableBody>
-        {sorted.map((m) => (
-          <WatchingRow key={m.market} market={m} />
+        {sorted.map((a) => (
+          <WatchingRow key={a.asset} asset={a} />
         ))}
       </TableBody>
     </Table>
   );
 }
 
-function WatchingRow({ market }: { market: MarketProximityView }): JSX.Element {
-  const bucket = bucketOf(market);
-  const warming = bucket === 'warming';
-  const rowTitle = warming
-    ? market.gate_status === 'decommissioned'
-      ? 'Strategy decommissioned — view-only'
-      : 'Warming up — insufficient daily bars'
-    : undefined;
+function WatchingRow({ asset }: { asset: AssetProximityView }): JSX.Element {
   return (
-    <TableRow className={cn(warming && 'opacity-60')}>
-      <TableCell className="font-mono">
-        <div className="flex items-center gap-2">
-          <span>{market.market}</span>
-          <BucketBadge bucket={bucket} />
-        </div>
+    <TableRow>
+      <TableCell className="font-mono">{asset.asset}</TableCell>
+      <TableCell>
+        <DirectionPill dir={asset.current_dir} />
       </TableCell>
       <TableCell>
-        <GateCell
-          long={market.long_donchian}
-          short={market.short_donchian}
-          kind="donchian"
-          warming={warming}
-        />
+        <FlipChip asset={asset} />
       </TableCell>
       <TableCell>
-        <GateCell
-          long={market.long_trend}
-          short={market.short_trend}
-          kind="trend"
-          warming={warming}
-        />
+        <BlockChips asset={asset} />
       </TableCell>
-      <TableCell>
-        <GateCell efficiency={market.efficiency} kind="efficiency" warming={warming} />
-      </TableCell>
-      <TableCell>
-        <span
-          className="rounded-md border border-border bg-bg-elevated px-2 py-0.5 text-xs font-mono"
-          title={rowTitle}
-        >
-          {market.closest_gate}
-        </span>
+      <TableCell className="text-right font-mono tabular-nums text-xs">
+        {formatTrendScore(asset.trend_score)}
       </TableCell>
       <TableCell className="text-right text-xs text-text-muted">
-        <div className="font-mono tabular-nums">
-          {formatLastClose(market.last_close)}
+        <div className="font-mono tabular-nums" title="Mark at the last 00:05 UTC decision (not a live tick)">
+          {formatMark(asset.mark)}
         </div>
-        <div className="font-mono">{formatTimeETShort(market.cycle_ts_utc)}</div>
+        <div className="font-mono">{formatTimeETShort(asset.as_of_utc)}</div>
       </TableCell>
     </TableRow>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Sub-components
+// Sub-components — chip shape mirrors the pre-pivot GateChip visual pattern
+// (`bg-{token}/20 text-{token}` rounded font-mono chips).
 // ---------------------------------------------------------------------------
 
-function BucketBadge({ bucket }: { bucket: ProximityBucket }): JSX.Element | null {
-  if (bucket === 'fired') {
+function DirectionPill({ dir }: { dir: number }): JSX.Element {
+  if (dir > 0) {
     return (
-      <span className="rounded-md bg-health-green/20 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-health-green">
-        fired
+      <span className="inline-flex items-center rounded-md bg-health-green/20 px-2 py-0.5 text-xs font-medium uppercase tracking-wide text-health-green">
+        LONG
       </span>
     );
   }
-  if (bucket === 'warming') {
+  if (dir < 0) {
     return (
-      <span className="rounded-md bg-bg-elevated px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-text-muted">
-        warming up
-      </span>
-    );
-  }
-  return null;
-}
-
-type GateKind = 'donchian' | 'trend' | 'efficiency';
-
-interface GateCellProps {
-  readonly kind: GateKind;
-  readonly long?: GateView;
-  readonly short?: GateView;
-  readonly efficiency?: GateView;
-  readonly warming: boolean;
-}
-
-/**
- * Render a single gate cell. For directional gates (donchian, trend) we
- * pick the BETTER of the two sides — that's the side closer to firing
- * and therefore the operator-relevant view. Per §3.2 the underlying
- * value of the other direction is still in the wire payload (long_/short_
- * pair) so future iterations can surface it on hover; V0 shows the
- * better side only to keep the table narrow.
- */
-function GateCell({ kind, long, short, efficiency, warming }: GateCellProps): JSX.Element {
-  if (warming) {
-    return <GateChip state="fail" label="—" muted />;
-  }
-  if (kind === 'efficiency') {
-    if (efficiency === undefined) return <GateChip state="fail" label="—" muted />;
-    return (
-      <GateChip state={efficiency.state} label={formatEfficiencyHeadroom(efficiency.headroom)} />
-    );
-  }
-  // Directional: prefer the better of long/short, falling back to either if
-  // the other is missing (shouldn't happen in practice — the schema sends
-  // both — but render defensively).
-  const better = pickBetterGate(long, short);
-  if (better === null) return <GateChip state="fail" label="—" muted />;
-  const label =
-    kind === 'donchian'
-      ? formatDonchianHeadroom(better.headroom)
-      : formatTrendHeadroom(better.headroom);
-  return <GateChip state={better.state} label={label} />;
-}
-
-interface GateChipProps {
-  readonly state: GateStateLiteral;
-  readonly label: string;
-  readonly muted?: boolean;
-}
-
-function GateChip({ state, label, muted = false }: GateChipProps): JSX.Element {
-  if (muted) {
-    return (
-      <span className="inline-flex items-center rounded-md bg-bg-elevated px-2 py-0.5 font-mono text-xs text-text-muted">
-        {label}
+      <span className="inline-flex items-center rounded-md bg-health-red/20 px-2 py-0.5 text-xs font-medium uppercase tracking-wide text-health-red">
+        SHORT
       </span>
     );
   }
   return (
-    <span
-      className={cn(
-        'inline-flex items-center gap-1 rounded-md px-2 py-0.5 font-mono text-xs',
-        state === 'pass' && 'bg-health-green/20 text-health-green',
-        state === 'close' && 'bg-health-yellow/20 text-health-yellow',
-        state === 'fail' && 'bg-health-red/20 text-health-red',
-      )}
-    >
-      <span className="uppercase tracking-wide">{state}</span>
-      <span className="tabular-nums">{label}</span>
+    <span className="inline-flex items-center rounded-md bg-bg-elevated px-2 py-0.5 text-xs font-medium uppercase tracking-wide text-text-secondary">
+      FLAT
     </span>
   );
 }
 
+/**
+ * Flip-progress chip. A pending flip renders yellow with the server-computed
+ * days-to-flip countdown ("flips short in 1d · 1/2"); a flip due at the next
+ * decision renders red; no pending flip renders a muted "steady" chip.
+ */
+function FlipChip({ asset }: { asset: AssetProximityView }): JSX.Element {
+  if (asset.days_to_flip === null || asset.pending_dir === null) {
+    return (
+      <span className="inline-flex items-center rounded-md bg-bg-elevated px-2 py-0.5 font-mono text-xs text-text-muted">
+        steady
+      </span>
+    );
+  }
+  const target = asset.pending_dir > 0 ? 'long' : 'short';
+  const dueNext = asset.days_to_flip <= 0;
+  return (
+    <span
+      className={cn(
+        'inline-flex items-center gap-1 rounded-md px-2 py-0.5 font-mono text-xs',
+        dueNext
+          ? 'bg-health-red/20 text-health-red'
+          : 'bg-health-yellow/20 text-health-yellow',
+      )}
+      title={`Pending ${target} has persisted ${asset.pending_count} of ${asset.hysteresis_days} hysteresis days`}
+    >
+      <span>
+        {dueNext ? `flips ${target} next decision` : `flips ${target} in ${asset.days_to_flip}d`}
+      </span>
+      <span className="tabular-nums">
+        {asset.pending_count}/{asset.hysteresis_days}
+      </span>
+    </span>
+  );
+}
+
+/** Lockout / vol-block chips; "—" when no block gates the asset. */
+function BlockChips({ asset }: { asset: AssetProximityView }): JSX.Element {
+  if (!asset.lockout_active && !asset.vol_blocked) {
+    return <span className="text-text-muted">—</span>;
+  }
+  return (
+    <div className="flex flex-wrap items-center gap-1">
+      {asset.lockout_active && (
+        <span
+          className="inline-flex items-center rounded-md bg-health-red/20 px-2 py-0.5 font-mono text-xs text-health-red"
+          title="Post-stop re-entry lockout — no new entry until it clears"
+        >
+          lockout
+          {asset.lockout_days_left !== null && (
+            <span className="ml-1 tabular-nums">{asset.lockout_days_left}d</span>
+          )}
+        </span>
+      )}
+      {asset.vol_blocked && (
+        <span
+          className="inline-flex items-center rounded-md bg-health-yellow/20 px-2 py-0.5 font-mono text-xs text-health-yellow"
+          title="Vol-ratio block latched — entries resume when the ratio recovers"
+        >
+          vol block
+        </span>
+      )}
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
-// Formatters — Decimal-string in, display-string out. parseFloat per the
-// precision note in signals-proximity.ts (fractional values, no rounding).
+// Formatters — Decimal-string in, display-string out. parseFloat only at the
+// display layer on bounded values (frontend-spec §8.9; no arithmetic).
 // ---------------------------------------------------------------------------
 
-const STATE_RANK: Readonly<Record<GateStateLiteral, number>> = {
-  pass: 2,
-  close: 1,
-  fail: 0,
-};
-
-function pickBetterGate(
-  a: GateView | undefined,
-  b: GateView | undefined,
-): GateView | null {
-  if (a === undefined && b === undefined) return null;
-  if (a === undefined) return b ?? null;
-  if (b === undefined) return a;
-  return STATE_RANK[a.state] >= STATE_RANK[b.state] ? a : b;
-}
-
-function formatDonchianHeadroom(decimalStr: string | null): string {
+function formatTrendScore(decimalStr: string | null): string {
   if (decimalStr === null || decimalStr === '') return '—';
   const n = parseFloat(decimalStr);
   if (Number.isNaN(n)) return '—';
-  // PASS-side headroom comes through negative (already broke the channel);
-  // FAIL/CLOSE-side comes through positive (distance still to travel).
-  // Display the signed value as a percent of last close.
-  const pct = n * 100;
-  const sign = pct > 0 ? '+' : pct < 0 ? '−' : '';
-  return `${sign}${Math.abs(pct).toFixed(2)}%`;
-}
-
-function formatTrendHeadroom(decimalStr: string | null): string {
-  if (decimalStr === null || decimalStr === '') return '—';
-  const n = parseFloat(decimalStr);
-  if (Number.isNaN(n)) return '—';
-  // Trend gap_pct: positive when passing, negative when failing. Symmetric
-  // display to Donchian.
-  const pct = n * 100;
-  const sign = pct > 0 ? '+' : pct < 0 ? '−' : '';
-  return `${sign}${Math.abs(pct).toFixed(2)}%`;
-}
-
-function formatEfficiencyHeadroom(decimalStr: string | null): string {
-  if (decimalStr === null || decimalStr === '') return '—';
-  const n = parseFloat(decimalStr);
-  if (Number.isNaN(n)) return '—';
-  // Efficiency-Ratio headroom is value-minus-threshold in ER units (~0..1
-  // range). Not a percentage — 3 sig digits is enough for the operator.
   const sign = n > 0 ? '+' : n < 0 ? '−' : '';
   return `${sign}${Math.abs(n).toFixed(3)}`;
 }
 
-function formatLastClose(decimalStr: string | null): string {
+function formatMark(decimalStr: string | null): string {
   if (decimalStr === null || decimalStr === '') return '—';
   const n = parseFloat(decimalStr);
   if (Number.isNaN(n)) return '—';

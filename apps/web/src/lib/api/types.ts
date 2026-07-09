@@ -113,10 +113,14 @@ export interface SystemStatus {
 
 export type PositionCluster = 'equity_index' | 'commodity' | 'rates_bonds' | 'crypto' | 'fx';
 
+/** Provenance of `current_price`/`unrealized_pnl` — the §3.9 mark ladder,
+ *  best rung first: live WS mark → recon-written EOD mark → avg-cost fallback. */
+export type MarkSource = 'live_ws' | 'recon_eod' | 'fallback_avg_cost';
+
 export interface Position {
   readonly instrument_id: string;
+  /** CDE product id post-pivot (e.g. `BIP-20DEC30-CDE`). */
   readonly symbol: string;
-  readonly contract_month: string | null;
   readonly qty: number;
   readonly avg_entry_price: string;
   readonly current_price: string;
@@ -124,18 +128,117 @@ export interface Position {
   readonly unrealized_pnl_pct_of_nav: string;
   readonly cluster: PositionCluster | null;
   readonly managed_by_strategy_version: string;
-  /** Session date (ET, YYYY-MM-DD) of the bar `current_price` came from — i.e.
-   *  when bar_sync last produced data for this market. null on the avg_cost
-   *  fallback (no fresh bar). */
-  readonly price_as_of: string | null;
+  /** Base-asset label (BTC/ETH); null without contracts enrichment. */
+  readonly asset: string | null;
+  /** Worker's client-side 2×ATR soft stop; null when none armed. */
+  readonly client_stop_price: string | null;
+  /** Resting venue stop-limit backstop price; null when not tracked. */
+  readonly native_stop_price: string | null;
+  /** True when the worker tracks a venue-resting native stop order id;
+   *  null when engine state is absent. */
+  readonly native_stop_resting: boolean | null;
+  /** RFC 3339 UTC — when the price behind `current_price` was observed. */
+  readonly mark_observed_at_utc: string | null;
+  readonly mark_source: MarkSource | null;
 }
 
 export interface PositionsResponse {
   readonly positions: readonly Position[];
   readonly as_of: string;
-  /** Most-recent bar date across positions (YYYY-MM-DD) — the "prices as of"
-   *  headline. null when no position has a fresh bar. */
-  readonly prices_as_of: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Daily cycle (services/api/schemas/cycle.py — crypto-pivot §3.7)
+// ---------------------------------------------------------------------------
+
+/** One asset's slice of the 00:05 UTC decision outcome. Decimals are strings. */
+export interface CycleAssetView {
+  readonly asset: string;
+  readonly trend_score: string | null;
+  readonly prior_contracts: number | null;
+  readonly engine_target: number | null;
+  readonly final_target: number | null;
+  readonly action: string | null;
+  readonly est_cost_usd: string | null;
+  readonly mark: string | null;
+  readonly stop_level: string | null;
+}
+
+export interface CycleDecisionView {
+  /** ISO date (UTC decision day). */
+  readonly decision_date: string;
+  readonly decided_at_utc: string;
+  /** `dispatching` | `completed` | `failed` | `skipped_*`. */
+  readonly status: string;
+  readonly env: string;
+  readonly equity_usd: string | null;
+  readonly weekly_halved: boolean;
+  readonly m_combined: string | null;
+  readonly skip_reason: string | null;
+  readonly assets: readonly CycleAssetView[];
+}
+
+export interface CycleWorkerView {
+  readonly risk_loop_heartbeat_utc: string | null;
+  readonly seconds_since_heartbeat: number | null;
+  readonly heartbeat_fresh: boolean;
+  readonly risk_loop_tick_count: number;
+  readonly marks_stale: boolean;
+  /** ISO date. */
+  readonly last_decision_date: string | null;
+}
+
+/** `decision`/`worker` are null on a fresh DB (worker never ran). */
+export interface SystemCycleResponse {
+  readonly decision: CycleDecisionView | null;
+  readonly worker: CycleWorkerView | null;
+  readonly next_friday_close_utc: string;
+  readonly server_now: string;
+}
+
+// ---------------------------------------------------------------------------
+// Funding + cash yield (services/api/schemas/funding.py — crypto-pivot §3.7/§3.9)
+// ---------------------------------------------------------------------------
+
+export interface FundingProductView {
+  readonly product_id: string;
+  readonly asset: string | null;
+  readonly rate_per_interval: string | null;
+  readonly interval_hours: string | null;
+  /** rate × (8760 / interval_hours) — annualized funding fraction. */
+  readonly annualized_rate: string | null;
+  readonly mark_price: string | null;
+  readonly observed_at_utc: string | null;
+  /** Signed net contracts currently held (0 = telemetry-only). */
+  readonly held_contracts: number;
+  readonly contract_size: string | null;
+  /** Estimated funding paid/received today (negative = the position pays). */
+  readonly est_funding_today_usd: string | null;
+}
+
+export interface CashSweepView {
+  readonly requested_at_utc: string;
+  readonly completed_at_utc: string | null;
+  readonly direction: string; // 'to_yield' | 'to_margin'
+  readonly amount_usd: string;
+  readonly status: string; // 'requested' | 'completed' | 'failed'
+  readonly reason: string;
+}
+
+export interface SystemFundingResponse {
+  readonly products: readonly FundingProductView[];
+  readonly est_funding_today_total_usd: string | null;
+  /** Honesty label — every per-day number is an estimate from hourly
+   *  telemetry, NOT the venue's settled funding ledger. */
+  readonly funding_basis: 'estimated_from_hourly_telemetry';
+  readonly sweeps_today: readonly CashSweepView[];
+  readonly swept_to_yield_today_usd: string;
+  readonly reclaimed_to_margin_today_usd: string;
+  /** Fraction (e.g. "0.035"); null renders as "—". */
+  readonly yield_apy: string | null;
+  readonly liquidation_buffer_pct: string | null;
+  readonly liquidation_buffer_as_of_utc: string | null;
+  readonly server_now: string;
 }
 
 // ---------------------------------------------------------------------------

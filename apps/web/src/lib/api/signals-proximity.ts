@@ -1,31 +1,28 @@
 /**
  * apps/web/src/lib/api/signals-proximity.ts — typed client for GET /api/signals/proximity.
  *
- * Wire contract: mirrors `services/api/schemas/signal_proximity.py`
- * (Pydantic v2 `BaseModel` with `extra='forbid'`). See
- * `Docs/signal-proximity-design.md` §6.4 for the canonical response shape.
+ * Crypto-pivot §3.9 rewrite: the entry-side "Watching" view is now
+ * per-ASSET hysteresis-flip proximity (how close BTC / ETH are to a
+ * direction flip at the next 00:05 UTC daily decision), not the retired
+ * CME per-gate table. Wire contract mirrors
+ * `services/api/schemas/signal_proximity.py` (Pydantic v2 `BaseModel`
+ * with `extra='forbid'`) FIELD-BY-FIELD.
  *
- * Decimal-on-wire convention: every numeric field (`last_close`,
- * gate `headroom` values) arrives as a Decimal-as-string per
- * backend-spec §4.1.6 + dev-guide §3.8. Per the design doc constraint
- * (PR-C kickoff prompt + frontend-spec §8.9 LOCKED), we DO NOT do
- * Decimal arithmetic in JS. The frontend treats the strings as opaque
- * for storage + transit. For sort-key comparison and display formatting,
- * we use `parseFloat` ONLY — values are fractional percentages bounded
- * to ~[-1, 1], which is well within IEEE 754 precision; no rounding
- * occurs. No `bignumber.js` / `decimal.js` dep is added (matching
- * `apps/web/src/lib/format.ts`'s existing convention; `decimal.js` is
- * documented as a future Phase 1 add when arithmetic becomes
- * unavoidable).
+ * Decimal-on-wire convention (A05 / dev-guide §3.8): `trend_score` and
+ * `mark` arrive as Decimal-as-strings. Per frontend-spec §8.9 (LOCKED)
+ * we DO NOT do Decimal arithmetic in JS — every derived number
+ * (days_to_flip, lockout_days_left) is computed server-side; this file
+ * only buckets/sorts on the provided integers and formats strings at
+ * the display layer via `parseFloat` (bounded fractional values, well
+ * within IEEE 754 precision).
  *
- * Refresh model (design D7 + §7.2): TanStack Query with `staleTime`,
- * keyed under `['signals', 'proximity']` so the existing `signal` SSE
- * event handler in `lib/sse.ts` (which prefix-invalidates `['signals']`)
- * also refreshes this view when a market fires mid-session. Daily-
- * resolution data so a 60s `staleTime` is conservative; combined with
- * TanStack's default `refetchOnWindowFocus` + `refetchOnMount`, this
- * satisfies the "on-load + on-visibility-change refetch is sufficient"
- * note in §7.2.
+ * Refresh model: TanStack Query with `staleTime`, keyed under
+ * `['signals', 'proximity']` so the existing `signal` SSE event handler
+ * in `lib/sse.ts` (which prefix-invalidates `['signals']`) also
+ * refreshes this view. No new SSE event type is introduced (forbidden
+ * by CLAUDE.md locked rules). Daily-resolution data (the engine state
+ * changes at the 00:05 UTC decision) so a 60s `staleTime` is
+ * conservative.
  */
 
 import { useQuery, type UseQueryResult } from '@tanstack/react-query';
@@ -36,150 +33,85 @@ import { apiCall } from '../api';
 // Wire types (1:1 with services/api/schemas/signal_proximity.py)
 // ---------------------------------------------------------------------------
 
-export type GateStateLiteral = 'pass' | 'close' | 'fail';
-
-export type GateStatusLiteral = 'ok' | 'warming_up' | 'decommissioned';
-
-// 'hurst' retained for historic rows pre-dating the 2026-06-02 gate swap;
-// new rows emit 'efficiency'.
-export type ClosestGateLiteral = 'donchian' | 'trend' | 'hurst' | 'efficiency' | 'history';
-
-export interface GateView {
-  readonly state: GateStateLiteral;
-  /** Decimal-as-string. `null` when warming up. */
-  readonly headroom: string | null;
-}
-
-export interface MarketProximityView {
-  readonly market: string;
-  /** RFC 3339 UTC. The cycle this row was emitted on. */
-  readonly cycle_ts_utc: string;
-  /** CME session date (ET wall-clock), YYYY-MM-DD. */
-  readonly session_date_et: string;
-  /** Decimal-as-string. `null` when warming up. */
-  readonly last_close: string | null;
-  readonly long_donchian: GateView;
-  readonly short_donchian: GateView;
-  readonly long_trend: GateView;
-  readonly short_trend: GateView;
-  readonly efficiency: GateView;
-  readonly overall_state: GateStateLiteral;
-  readonly closest_gate: ClosestGateLiteral;
-  readonly gate_status: GateStatusLiteral;
+export interface AssetProximityView {
+  readonly asset: string;
+  /** Decimal-as-string. S1 trend score at the last decision; `null` while
+   *  warming up or before the first decision. */
+  readonly trend_score: string | null;
+  /** Applied direction the engine is holding: -1 / 0 / +1. */
+  readonly current_dir: number;
+  /** Direction awaiting hysteresis confirmation; `null` = none pending. */
+  readonly pending_dir: number | null;
+  readonly pending_count: number;
+  /** hysteresis_days − pending_count while a flip is pending; `null` = steady.
+   *  Server-computed — never derive it client-side. */
+  readonly days_to_flip: number | null;
+  readonly hysteresis_days: number;
+  readonly lockout_active: boolean;
+  readonly lockout_days_left: number | null;
+  readonly vol_blocked: boolean;
+  /** Decimal-as-string. Mark recorded at the last 00:05 UTC decision
+   *  (informational — NOT a live tick). */
+  readonly mark: string | null;
+  /** ISO date (UTC). */
+  readonly last_decision_date: string | null;
+  /** RFC 3339 UTC — when the worker last persisted this engine state. */
+  readonly as_of_utc: string;
 }
 
 export interface SignalProximityResponse {
-  /** RFC 3339 UTC. `null` when pre-first-cycle (empty `markets`). */
-  readonly as_of_cycle_ts_utc: string | null;
-  readonly markets: readonly MarketProximityView[];
+  readonly assets: readonly AssetProximityView[];
+  readonly server_now: string;
 }
 
 // ---------------------------------------------------------------------------
-// Pure helpers — extracted so the sort logic is unit-test-able + reusable
+// Pure helpers — bucket + sort (flipping-soon → blocked → steady ordering)
 // ---------------------------------------------------------------------------
 
 /**
  * Three rendering buckets for the Watching table, ordered top-to-bottom:
  *
- *   - `fired` — `overall_state === 'pass'` AND `gate_status === 'ok'`.
- *     The market cleared all three gates this cycle; a signal fired.
- *   - `watching` — `overall_state === 'close'` AND `gate_status === 'ok'`.
- *     One or more gates within the CLOSE band; about to fire.
- *   - `inactive` — `overall_state === 'fail'` AND `gate_status === 'ok'`.
- *     At least one gate firmly failing; most-likely-to-fire-next-session
- *     sorts to the top of this bucket.
- *   - `warming` — `gate_status === 'warming_up' | 'decommissioned'`.
- *     Bottom group per §7.3.
+ *   - `flipping` — a hysteresis flip is pending (`days_to_flip !== null`);
+ *     the operator-relevant rows sort to the top, soonest flip first.
+ *   - `blocked` — no flip pending but entries are gated (post-stop
+ *     lockout active or vol-block latched).
+ *   - `steady` — direction confirmed, nothing pending.
  */
-export type ProximityBucket = 'fired' | 'watching' | 'inactive' | 'warming';
+export type ProximityBucket = 'flipping' | 'blocked' | 'steady';
 
-export function bucketOf(market: MarketProximityView): ProximityBucket {
-  if (market.gate_status !== 'ok') return 'warming';
-  if (market.overall_state === 'pass') return 'fired';
-  if (market.overall_state === 'close') return 'watching';
-  return 'inactive';
-}
-
-/**
- * Return the absolute gap on the closest_gate, used as the secondary
- * sort key within the `watching` and `inactive` buckets per §3.3.
- *
- * For directional gates (donchian, trend), we take the closer of the two
- * sides — that's the side actually driving the worst-gate state, mirroring
- * the strategy module's `_worst()` selection.
- *
- * Returns `+Infinity` for warming-up rows (`closest_gate === 'history'`)
- * so they sort to the bottom of any bucket they happen to land in (defence
- * in depth — the bucket grouping above already separates them).
- *
- * Parse via `parseFloat` per the precision note at the top of this file —
- * headroom values are fractional, well within IEEE 754 range.
- */
-export function closestGateAbsGap(market: MarketProximityView): number {
-  switch (market.closest_gate) {
-    case 'donchian':
-      return Math.min(
-        absParseOrInfinity(market.long_donchian.headroom),
-        absParseOrInfinity(market.short_donchian.headroom),
-      );
-    case 'trend':
-      return Math.min(
-        absParseOrInfinity(market.long_trend.headroom),
-        absParseOrInfinity(market.short_trend.headroom),
-      );
-    case 'efficiency':
-      return absParseOrInfinity(market.efficiency.headroom);
-    case 'hurst':
-      // Legacy rows pre-dating the 2026-06-02 gate swap carry no `efficiency`
-      // headroom to compare on; sort them to the bottom of their bucket. Such
-      // rows are stale by definition (a market not re-evaluated since the
-      // swap) and age out after the next cycle.
-      return Number.POSITIVE_INFINITY;
-    case 'history':
-      return Number.POSITIVE_INFINITY;
-  }
-}
-
-function absParseOrInfinity(decimalStr: string | null): number {
-  if (decimalStr === null || decimalStr === '') return Number.POSITIVE_INFINITY;
-  const n = parseFloat(decimalStr);
-  if (Number.isNaN(n)) return Number.POSITIVE_INFINITY;
-  return Math.abs(n);
+export function bucketOf(asset: AssetProximityView): ProximityBucket {
+  if (asset.days_to_flip !== null) return 'flipping';
+  if (asset.lockout_active || asset.vol_blocked) return 'blocked';
+  return 'steady';
 }
 
 const BUCKET_RANK: Readonly<Record<ProximityBucket, number>> = {
-  fired: 0,
-  watching: 1,
-  inactive: 2,
-  warming: 3,
+  flipping: 0,
+  blocked: 1,
+  steady: 2,
 };
 
 /**
- * Sort markets per design §3.3 + §7.3:
+ * Sort assets flipping-soon-first:
  *
- *   1. By bucket (fired > watching > inactive > warming).
- *   2. Within `watching` + `inactive` buckets: ascending by abs gap on
- *      `closest_gate` (smallest gap first = closest to firing).
- *   3. Within `fired` + `warming` buckets: alphabetical by market symbol
- *      (deterministic; no operator-meaningful order beyond the bucket).
+ *   1. By bucket (flipping > blocked > steady).
+ *   2. Within `flipping`: ascending `days_to_flip` (soonest flip first).
+ *   3. Alphabetical by asset for a stable, deterministic order.
  *
  * Returns a NEW sorted array; does not mutate input.
  */
-export function sortProximityMarkets(
-  markets: readonly MarketProximityView[],
-): readonly MarketProximityView[] {
-  const out = [...markets];
+export function sortProximityAssets(
+  assets: readonly AssetProximityView[],
+): readonly AssetProximityView[] {
+  const out = [...assets];
   out.sort((a, b) => {
     const bucketA = BUCKET_RANK[bucketOf(a)];
     const bucketB = BUCKET_RANK[bucketOf(b)];
     if (bucketA !== bucketB) return bucketA - bucketB;
-    const bucket = bucketOf(a);
-    if (bucket === 'watching' || bucket === 'inactive') {
-      const gapA = closestGateAbsGap(a);
-      const gapB = closestGateAbsGap(b);
-      if (gapA !== gapB) return gapA - gapB;
+    if (a.days_to_flip !== null && b.days_to_flip !== null && a.days_to_flip !== b.days_to_flip) {
+      return a.days_to_flip - b.days_to_flip;
     }
-    return a.market.localeCompare(b.market);
+    return a.asset.localeCompare(b.asset);
   });
   return out;
 }

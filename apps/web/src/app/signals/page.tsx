@@ -1,25 +1,18 @@
 'use client';
 
 /**
- * `/signals` — dedicated pending-signal approval surface.
+ * `/signals` — announce-only signal visibility surface (crypto-pivot §3.9).
  *
- * The signals UI also lives as the "Queued Signals" tile on the Today
- * page (`/`); this route is a focused view of the same data with more
- * vertical space + a page-level explanation of the approve/reject/defer
- * decision context. Used by the operator during the daily 17:30 ET
- * cycle review.
+ * The per-trade approval ceremony is RETIRED (delta spec §3.8 — operator
+ * mandate: no approve/reject/defer). The strategy worker trades on its
+ * own 00:05 UTC daily decisions; this page is pure visibility:
  *
- * Data source: backend-spec §4.1.2 `GET /api/signals?status=pending`
- * via the same `useSignalsPending` hook the Today tile uses. Approve /
- * reject / defer go through the same mutation hooks; the only
- * difference is the page layout (full-width Card + explanatory header
- * row + Decision Diary modal stub same as the Today tile).
+ *   - `WatchingSection` — per-asset hysteresis-flip proximity (how close
+ *     BTC / ETH are to a direction change at the next daily decision).
+ *   - `QueuedSignals` — today's announced signals, read-only.
  *
- * Phase 0 / Phase 1-onset behavior: when no signals are pending the
- * page renders the empty state. When LEAN's daily cycle starts emitting
- * signals (Phase 1 Pivot-PR-D + the 17:30 ET ceremony), this view
- * populates and the operator approves from here OR from the Today
- * tile — both work, both go through the same mutation path.
+ * The same signals table also renders on the Today page (`/`); this
+ * route gives it vertical space + the Watching context.
  */
 
 import Link from 'next/link';
@@ -33,10 +26,11 @@ export default function SignalsPage(): JSX.Element {
       <div className="space-y-1">
         <h1 className="font-mono text-2xl">Signals</h1>
         <p className="text-sm text-text-muted">
-          Pending signals from the daily strategy cycle. Approve to dispatch
-          to IBKR, reject with a diary entry, or defer to the next cycle. Also
-          accessible from the <Link href="/" className="underline">Today</Link>{' '}
-          page&apos;s Queued Signals tile.
+          Announce-only: the strategy worker trades its own 00:05&nbsp;UTC
+          daily decision on Coinbase and announces fills in Discord — there is
+          no approval step. Below: how close each asset is to a direction
+          flip, and the signals announced today. Also visible on the{' '}
+          <Link href="/" className="underline">Today</Link> page.
         </p>
       </div>
       <WatchingSection />

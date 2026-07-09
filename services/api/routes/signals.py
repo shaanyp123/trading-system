@@ -3,7 +3,9 @@
 Backend-spec §4.1.2, post-crypto-pivot:
 
   * ``GET /api/signals?status=&limit=&cursor=`` — list signals.
-  * ``GET /api/signals`` proximity surface (latest per market).
+  * ``GET /api/signals/proximity`` — per-asset hysteresis-flip proximity
+    (crypto-pivot §3.9 "Watching" view; composed from the strategy
+    worker's engine state + latest decision outcome, not a table read).
 
 Crypto-pivot C0-B4 (delta spec §3.8/§3.9): the per-trade approval
 endpoints (``POST /api/signals/:id/{approve,reject,defer}``) are
@@ -16,6 +18,7 @@ the locked taxonomy (history stays readable; no enum migration).
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any, Final, Literal
 from uuid import UUID
 
@@ -25,15 +28,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.api.db import get_session
 from services.api.errors import AppError
+from services.api.repos.cycle import CycleQueryRepo, PostgresCycleQueryRepo
 from services.api.repos.phase1 import (
     Phase1QueryRepo,
     PostgresPhase1QueryRepo,
 )
-from services.api.repos.signal_proximity import fetch_latest_per_market
 from services.api.routes._pagination import clamp_limit
 from services.api.schemas.signal_proximity import (
     SignalProximityResponse,
-    row_to_view,
+    build_signal_proximity_response,
+    hysteresis_days_from_parameters,
 )
 from services.api.schemas.signals import (
     SignalListResponse,
@@ -48,6 +52,10 @@ router = APIRouter()
 
 def _get_repo(session: AsyncSession = Depends(get_session)) -> Phase1QueryRepo:
     return PostgresPhase1QueryRepo(session)
+
+
+def _get_cycle_repo(session: AsyncSession = Depends(get_session)) -> CycleQueryRepo:
+    return PostgresCycleQueryRepo(session)
 
 
 @router.get(
@@ -175,33 +183,51 @@ def _row_to_signal_summary(row: dict[str, Any]) -> SignalSummary:
 )
 async def list_signal_proximity(
     session: SessionContext = Depends(get_session_context),
-    db: AsyncSession = Depends(get_session),
+    repo: Phase1QueryRepo = Depends(_get_repo),
+    cycle_repo: CycleQueryRepo = Depends(_get_cycle_repo),
 ) -> SignalProximityResponse:
-    """Return latest-per-market proximity for the /signals "Watching" view.
+    """Per-asset hysteresis-flip proximity for the /signals "Watching" view.
 
-    PR-B of ``Docs/signal-proximity-design.md`` (signed off 2026-05-28).
-    Daily-resolution data: each row is the most recent ``signal_proximity``
-    entry for the named market, written by the LEAN cycle heartbeat
-    handler (``services/api/routes/internal/lean.py``).
+    Crypto-pivot §3.9 recomposition (URL preserved, shape rewritten):
+
+      * **Engine runtime** — ``strategy_worker_status.engine_state`` (the
+        worker's ``AssetRuntime.to_json`` per asset: applied/pending
+        direction, pending count, lockout, vol-block).
+      * **Trend score + decision-time mark** — the latest
+        ``strategy_decisions`` outcome JSONB for the active account.
+      * **HYSTERESIS_DAYS** — the active ``parameter_sets`` row, falling
+        back to the Amendment B canonical constant
+        (``services/risk/crypto_parameters``, import-only).
 
     **Auth.** Mirrors ``GET /api/signals`` — the same
     ``Depends(get_session_context)`` dependency enforces the operator
     session cookie / bearer. No special service-account or role check.
 
-    **Empty-state contract.** When the table has no rows (pre-first-cycle
-    or post-truncate), returns ``{"as_of_cycle_ts_utc": null, "markets": []}``
-    so the frontend can render the "Waiting for first LEAN cycle today"
-    empty state cleanly per design §7.3.
+    **Empty-state contract.** No active account, or the worker has never
+    persisted state, returns ``{"assets": [], "server_now": ...}`` —
+    HTTP 200, never a 5xx (fresh-DB contract).
 
     The session variable is unused; binding it keeps the auth dependency
     in the function signature (FastAPI resolves dependencies for side
     effects even when the result isn't used).
     """
     _ = session  # auth enforced via the dependency above; result unused
-    as_of, rows = await fetch_latest_per_market(db)
-    return SignalProximityResponse(
-        as_of_cycle_ts_utc=as_of,
-        markets=[row_to_view(row) for row in rows],
+    now = datetime.now(tz=UTC)
+    worker = None
+    decision = None
+    account_id = await repo.fetch_active_account_id()
+    if account_id is not None:
+        worker = await cycle_repo.fetch_worker_status(account_id)
+        decision = await cycle_repo.fetch_latest_decision(account_id)
+    param_row = await repo.fetch_active_parameter_set()
+    hysteresis_days = hysteresis_days_from_parameters(
+        param_row.parameters if param_row is not None else None
+    )
+    return build_signal_proximity_response(
+        worker=worker,
+        decision=decision,
+        hysteresis_days=hysteresis_days,
+        now=now,
     )
 
 

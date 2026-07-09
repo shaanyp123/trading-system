@@ -1,45 +1,39 @@
 /**
  * apps/web/src/lib/api/exit-proximity.ts — typed client for
- * GET /api/today/exit-proximity (the Today page's "Exits" view).
+ * GET /api/today/exit-proximity (the Today page's "Stops" view).
  *
- * Wire contract: mirrors `services/api/schemas/exit_proximity.py`
- * (Pydantic v2 `BaseModel` with `extra='forbid'`) FIELD-BY-FIELD. See
- * `Docs/exit-proximity-design.md` §6 + §7 for the canonical shape, and
- * PR-B (#309) for the implementation. This is the exit-side mirror of
- * `signals-proximity.ts` (entry-side, #286).
+ * Crypto-pivot §3.9 rewrite: the exit-side view is now per-open-position
+ * STOP proximity — distance to the client 2×ATR soft stop (enforced by
+ * the strategy worker's 30 s risk loop) and the native 3×ATR venue
+ * backstop — not the retired CME exit-trigger table. Wire contract
+ * mirrors `services/api/schemas/exit_proximity.py` (Pydantic v2
+ * `BaseModel` with `extra='forbid'`) FIELD-BY-FIELD.
  *
  * Decimal-on-wire convention (A05 / dev-guide §3.8): every numeric field
- * (`last_close`, `stop_price`, each trigger's `headroom`) arrives as a
- * Decimal-as-string. Per the design constraint + frontend-spec §8.9
- * (LOCKED) we DO NOT do Decimal arithmetic in JS — the strings are opaque
- * for storage + transit. For display formatting we use `parseFloat` ONLY,
- * and only on the bounded fractional headroom/percent values (well within
- * IEEE 754 precision; no rounding). No `bignumber.js` / `decimal.js` dep is
- * added (matching `apps/web/src/lib/format.ts`).
+ * (`entry_vwap`, `mark`, stop prices, headroom fractions) arrives as a
+ * Decimal-as-string. Per frontend-spec §8.9 (LOCKED) we DO NOT do
+ * Decimal arithmetic in JS — the headroom fractions are computed
+ * SERVER-SIDE; this file only classifies rows on booleans and formats
+ * the provided strings at the display layer (`parseFloat` on bounded
+ * fractional values only).
  *
- * ⚠️ TWO THINGS DIFFER FROM THE ENTRY-SIDE CLIENT — read before editing:
+ * ⚠️ TWO THINGS CARRIED OVER FROM THE PRE-PIVOT CLIENT — read before editing:
  *
  *   1. NO CLIENT-SIDE SORT. The endpoint returns `positions` ALREADY
- *      ordered closest-to-closing (PR-B does the canonical
- *      TRIGGERED → NEAR-asc-by-headroom → HOLDING sort server-side, design
- *      §3.3). We render in RECEIPT ORDER. `signals-proximity.ts` exported a
- *      `sortProximityMarkets`; this file deliberately does NOT — re-sorting
- *      here would risk disagreeing with the server's canonical order.
+ *      ordered closest-to-stop (stopped/unprotected rows first, then
+ *      ascending min headroom, server-side). We render in RECEIPT ORDER.
  *
- *   2. INVERTED COLOR VALENCE (design Q4). The exit states are
- *      HOLDING / NEAR / TRIGGERED, and green = HOLDING = "position SAFE",
- *      red = TRIGGERED = "CLOSING this cycle" — the OPPOSITE valence of the
- *      entry side (where green = PASS = "firing"). We keep a SEPARATE
- *      state→token map (`exitStateChipClass`) so a shared chip component can
- *      never paint a closing position green.
+ *   2. INVERTED COLOR VALENCE. green = HOLDING = "position SAFE",
+ *      red = TRIGGERED = "stop fired / unprotected" — the OPPOSITE
+ *      valence of the entry side. We keep a SEPARATE state→token map
+ *      (`exitStateChipClass`) so a shared chip component can never paint
+ *      a stopped position green.
  *
- * Refresh model (design ED8 + §7): TanStack Query with `staleTime`, keyed
- * under `['positions', 'exit-proximity']` so the existing `position` AND
- * `fill` SSE event handlers in `lib/sse.ts` (both prefix-invalidate
- * `['positions']`) also refresh this view when a position opens / closes or
- * a fill lands. No new SSE event type is introduced (forbidden by CLAUDE.md
- * locked rules). Daily-resolution data so a 60s `staleTime` is conservative
- * (matches `useHealthScore`).
+ * Refresh model: TanStack Query with `staleTime`, keyed under
+ * `['positions', 'exit-proximity']` so the existing `position` AND `fill`
+ * SSE event handlers in `lib/sse.ts` (both prefix-invalidate
+ * `['positions']`) also refresh this view. No new SSE event type is
+ * introduced (forbidden by CLAUDE.md locked rules).
  */
 
 import { useQuery, type UseQueryResult } from '@tanstack/react-query';
@@ -50,73 +44,43 @@ import { apiCall } from '../api';
 // Wire types (1:1 with services/api/schemas/exit_proximity.py)
 // ---------------------------------------------------------------------------
 
-/** Per-trigger exit state. Mirrors `exit_proximity.ExitState`. INVERTED
- *  valence vs the entry-side `GateStateLiteral` — see the file header. */
-export type ExitStateLiteral = 'holding' | 'near' | 'triggered';
-
-/** Which exit trigger drives the overall state. */
-export type ClosestExitLiteral = 'stop' | 'reversal' | 'trend_flip' | 'decommission';
-
-/** Position-level discriminator. `min_holding_blocked` = the trend-flip
- *  exit cannot fire yet (held < MIN_HOLDING); `decommissioned` = operator
- *  kill switch armed. */
-export type ExitGateStatusLiteral =
-  | 'active'
-  | 'warming_up'
-  | 'min_holding_blocked'
-  | 'decommissioned';
-
 export type DirectionLiteral = 'long' | 'short';
 
-export interface ExitTriggerView {
-  readonly state: ExitStateLiteral;
-  /**
-   * Decimal-as-string. `null` for the binary reversal / decommission
-   * triggers, when warming up, or (for `stop`) when no working stop is on
-   * record. `trend_flip` carries the deterioration pct (close vs MA_FAST);
-   * `stop` carries `(mark − stop)/mark` for a long (mirrored for a short).
-   */
-  readonly headroom: string | null;
-}
-
-export interface PositionExitProximityView {
-  readonly market: string;
+export interface PositionStopProximityView {
+  /** CDE product id (e.g. `BIP-20DEC30-CDE`). */
+  readonly product_id: string;
+  /** Base-asset label (BTC/ETH); `null` without contracts enrichment. */
+  readonly asset: string | null;
   readonly direction: DirectionLiteral;
-  /** RFC 3339 UTC. The LEAN cycle this row was emitted on. */
-  readonly cycle_ts_utc: string;
-  /** CME session date (ET wall-clock), YYYY-MM-DD. */
-  readonly session_date_et: string;
-  /** Calendar days held. `null` when `opened_at` is unknown. */
-  readonly held_days: number | null;
-  /**
-   * `MIN_HOLDING_DAYS − held_days`. `> 0` = the trend-flip exit is still
-   * blocked by the MIN_HOLDING floor (N days left); `<= 0` = the floor has
-   * cleared. `null` when `held_days` is unknown.
-   */
-  readonly held_days_headroom: number | null;
-  /** Decimal-as-string. `null` when warming up. */
-  readonly last_close: string | null;
-  /**
-   * Decimal-as-string. The joined working `stop_market` order's stop price
-   * (Q1 = (B)). `null` when no working stop is on record — a latent
-   * POSITION_UNPROTECTED signal (render "no stop on record"; see
-   * `isStopUnprotected`).
-   */
-  readonly stop_price: string | null;
-  readonly trend_flip: ExitTriggerView;
-  readonly stop: ExitTriggerView;
-  readonly reversal: ExitTriggerView;
-  readonly decommission: ExitTriggerView;
-  readonly overall_state: ExitStateLiteral;
-  readonly closest_exit: ClosestExitLiteral;
-  readonly gate_status: ExitGateStatusLiteral;
+  /** Signed net contracts held in this product (never 0 — flat rows are
+   *  filtered server-side). */
+  readonly contracts: number;
+  /** Decimal-as-string. Quantity-weighted average entry price. */
+  readonly entry_vwap: string | null;
+  /** Decimal-as-string. Live WS mark; `null` when the mark store is absent
+   *  or the mark exceeds the 3-minute staleness policy. */
+  readonly mark: string | null;
+  /** The worker's marks-stale flag (true — conservative — when the worker
+   *  has never reported). */
+  readonly marks_stale: boolean;
+  /** Decimal-as-string. Client-side 2×ATR soft stop (risk-loop enforced). */
+  readonly client_stop_price: string | null;
+  /** Decimal-as-string fraction, SERVER-computed: (mark−stop)/mark for a
+   *  long, (stop−mark)/mark for a short. `null` when mark or stop missing. */
+  readonly client_stop_headroom_frac: string | null;
+  /** Decimal-as-string. Venue-resting 3×ATR stop-limit backstop price. */
+  readonly native_stop_price: string | null;
+  readonly native_stop_headroom_frac: string | null;
+  /** True when the worker tracks a venue-resting native stop order id.
+   *  False with non-zero contracts = UNPROTECTED (see `isUnprotected`). */
+  readonly native_stop_resting: boolean;
+  /** True when the engine's stop fired on today's UTC bar-day. */
+  readonly stopped_today: boolean;
 }
 
 export interface ExitProximityResponse {
-  /** RFC 3339 UTC. `null` when `positions` is empty (no open positions /
-   *  pre-first-cycle empty state — design §7). */
-  readonly as_of_cycle_ts_utc: string | null;
-  readonly positions: readonly PositionExitProximityView[];
+  readonly positions: readonly PositionStopProximityView[];
+  readonly server_now: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -125,11 +89,16 @@ export interface ExitProximityResponse {
 // thin renderer. (No client-side sort — see the file header.)
 // ---------------------------------------------------------------------------
 
+/** Row-level stop status. INVERTED valence vs the entry side — see the
+ *  file header. `holding` = protected, `near` = attention (marks stale),
+ *  `triggered` = stop fired today. */
+export type ExitStateLiteral = 'holding' | 'near' | 'triggered';
+
 /**
- * Tailwind chip classes per exit state — the INVERTED-valence map (design
- * Q4). HOLDING = green ("safe"), NEAR = yellow ("attention"), TRIGGERED =
- * red ("closing this cycle"). Deliberately NOT shared with the entry-side
- * `GateStateLiteral` map, whose green means the opposite ("firing").
+ * Tailwind chip classes per exit state — the INVERTED-valence map.
+ * HOLDING = green ("safe"), NEAR = yellow ("attention"), TRIGGERED = red.
+ * Deliberately NOT shared with the entry-side chip map, whose green means
+ * the opposite ("firing").
  */
 export function exitStateChipClass(state: ExitStateLiteral): string {
   switch (state) {
@@ -143,41 +112,26 @@ export function exitStateChipClass(state: ExitStateLiteral): string {
 }
 
 /**
- * A held position with no working protective stop on record. The stop
- * dimension comes back HOLDING (LEAN's NULL-state placeholder survived the
- * api join because no working `stop_market` order was found) AND
- * `stop_price` is null. This is NOT benign "missing data" — it is a latent
- * POSITION_UNPROTECTED risk (design §3.4 / §11), so the stop chip renders
- * "no stop on record" and cross-links the alert.
+ * A held position with NO native stop resting at the venue. The client
+ * 2×ATR stop may still be armed (risk-loop enforced) but the venue-side
+ * backstop is missing — a latent POSITION_UNPROTECTED risk (delta spec
+ * §3.1 requires the 3×ATR backstop within 10 s of any position-opening
+ * fill), so the row renders alert styling, not a calm green chip.
  */
-export function isStopUnprotected(p: PositionExitProximityView): boolean {
-  return p.stop.state === 'holding' && p.stop_price === null;
+export function isUnprotected(p: PositionStopProximityView): boolean {
+  return p.native_stop_resting === false && p.contracts !== 0;
 }
 
 /**
- * The strategy kill switch is armed for this position — close next cycle
- * regardless of indicators (design §1 (d)). Either the position-level
- * `gate_status` is `decommissioned` or the decommission trigger itself
- * fired; both are checked because the combiner sets the gate_status while
- * the trigger carries the state.
+ * Row status without inventing client-side thresholds: `triggered` when
+ * the engine's stop fired today, `near` when the mark feed is stale
+ * (headroom can't be trusted), else `holding`. The unprotected case is
+ * surfaced separately via `isUnprotected` (alert-row styling).
  */
-export function isDecommissionArmed(p: PositionExitProximityView): boolean {
-  return p.gate_status === 'decommissioned' || p.decommission.state === 'triggered';
-}
-
-/** The `ExitTriggerView` named by `closest_exit` — the limiting trigger
- *  whose state == `overall_state` (design §3.3). */
-export function closestExitTrigger(p: PositionExitProximityView): ExitTriggerView {
-  switch (p.closest_exit) {
-    case 'stop':
-      return p.stop;
-    case 'reversal':
-      return p.reversal;
-    case 'trend_flip':
-      return p.trend_flip;
-    case 'decommission':
-      return p.decommission;
-  }
+export function stopRowStatus(p: PositionStopProximityView): ExitStateLiteral {
+  if (p.stopped_today) return 'triggered';
+  if (p.marks_stale) return 'near';
+  return 'holding';
 }
 
 // ---------------------------------------------------------------------------

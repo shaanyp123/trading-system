@@ -7,12 +7,9 @@
  * Week 7 Mon these hooks need NO changes -- the empty-state UX naturally
  * transitions to populated-state UX as the payloads fill in.
  *
- * staleTime values match the spec's table for an active CME session. The
- * "off-session" cadence (longer staleTime when markets are closed) lands
- * Phase 1+ via `useSessionAware` -- Day 22 picks the session-active value
- * unconditionally, which is conservative (more frequent refetches than
- * needed off-session, but never less frequent than needed during a
- * session).
+ * staleTime values match the spec's §8.1 table. Crypto trades 24/7
+ * (post-pivot there is no session/off-session cadence split), so the
+ * session-active values apply unconditionally.
  */
 
 import { useQuery, type UseQueryResult } from '@tanstack/react-query';
@@ -29,6 +26,8 @@ import type {
   PositionsResponse,
   RiskEnvelopeResponse,
   SignalListResponse,
+  SystemCycleResponse,
+  SystemFundingResponse,
   SystemStatus,
   TodayDigestResponse,
   TradeDetail,
@@ -51,6 +50,8 @@ const KEYS = {
   killSwitch: ['system', 'kill-switch'] as const,
   riskEnvelope: ['system', 'risk-envelope'] as const,
   watchdog: ['system', 'watchdog'] as const,
+  systemCycle: ['system', 'cycle'] as const,
+  systemFunding: ['system', 'funding'] as const,
   auditLog: (filters: AuditLogFilters) => ['system', 'audit', filters] as const,
 };
 
@@ -235,6 +236,37 @@ export function useWatchdogStatus(): UseQueryResult<WatchdogStatus> {
     queryFn: ({ signal }) =>
       apiCall<WatchdogStatus>('/api/system/watchdog', { signal }),
     staleTime: 30_000,
+  });
+}
+
+/**
+ * `/api/system/cycle` — daily-cycle status (crypto-pivot §3.7): last 00:05 UTC
+ * decision + 30 s risk-loop heartbeat + next Friday CDE close. Feeds the Today
+ * pipeline-freshness strip. 30 s staleTime tracks the heartbeat cadence; SSE
+ * position/pnl/risk_state events also invalidate `['system','cycle']`.
+ */
+export function useSystemCycle(): UseQueryResult<SystemCycleResponse> {
+  return useQuery({
+    queryKey: KEYS.systemCycle,
+    queryFn: ({ signal }) =>
+      apiCall<SystemCycleResponse>('/api/system/cycle', { signal }),
+    staleTime: 30_000,
+  });
+}
+
+/**
+ * `/api/system/funding` — funding + cash-yield telemetry (crypto-pivot
+ * §3.7/§3.9): per-product funding rates, estimated funding today (from hourly
+ * telemetry, not venue-settled), sweep totals, yield rate, liquidation buffer.
+ * Hourly-resolution data so a 60 s staleTime is conservative; SSE
+ * pnl/position/fill events also invalidate `['system','funding']`.
+ */
+export function useSystemFunding(): UseQueryResult<SystemFundingResponse> {
+  return useQuery({
+    queryKey: KEYS.systemFunding,
+    queryFn: ({ signal }) =>
+      apiCall<SystemFundingResponse>('/api/system/funding', { signal }),
+    staleTime: 60_000,
   });
 }
 
