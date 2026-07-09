@@ -35,10 +35,31 @@ raised `STRATEGY_WORKER_MAX_*_CONTRACTS`) — never a code edit.
 3. **Slippage-calibration head row**: signals rows FK into
    `slippage_calibration_versions`. On a fresh DB no head exists and the
    worker logs `strategy_worker_no_slippage_head_fail_closed` and will
-   NOT dispatch. Seed the bootstrap calibration first (operator ceremony;
-   the calibration module's BOOTSTRAP trigger — see
-   `services/calibration/calibration.py`). **This is a deliberate
-   fail-closed gate, not a bug.**
+   NOT dispatch. **This is a deliberate fail-closed gate, not a bug.**
+   Seed the zero-prior bootstrap calibration with
+   `scripts/operator_tools/bootstrap_slippage_calibration.py` (audit-first
+   per the `CalibrationPlan` contract in
+   `services/calibration/calibration.py`; idempotent — an existing head is
+   a no-op). Run inside the api container with the same in-container
+   `DATABASE_URL` wrapper as `deploy/crypto-vps-bringup.md` Step 7
+   (`docker compose exec` bypasses the entrypoint, so the URL must be
+   built in-process from the mounted secrets file). Dry-run first (drop
+   `--no-dry-run`/`--confirm`), then:
+
+   ```bash
+   docker compose --env-file deploy/.env exec api python -c "
+   import os, sys, runpy, yaml
+   pw = yaml.safe_load(open('/run/secrets/secrets.yaml'))['postgres']['app_service_password']
+   os.environ['DATABASE_URL'] = f'postgresql+asyncpg://app_service:{pw}@postgres:5432/trading'
+   sys.argv = ['bootstrap_slippage_calibration', '--env', 'paper', '--no-dry-run', '--confirm']
+   runpy.run_module('scripts.operator_tools.bootstrap_slippage_calibration', run_name='__main__')
+   "
+   ```
+
+   Verify: `psql ... -c "SELECT id, version_no, trigger, is_head FROM
+   slippage_calibration_versions WHERE is_head = TRUE;"` → one row,
+   `trigger='bootstrap'`, and the audit chain still verifies
+   (`python -m services.audit.verify_chain --env paper`).
 4. Migrations at head (`deploy/day5-bringup.sh` Step 4 /
    `alembic upgrade head`) — this PR adds `strategy_decisions` +
    `strategy_worker_status`.
