@@ -32,19 +32,6 @@ machine does, on a 30-second clock.
 
 ---
 
-## Where this system came from (history, one paragraph)
-
-From May to July 2026 this same software platform ran an earlier strategy: trend
-following on CME stock-index and commodity micro-futures through Interactive Brokers, in
-paper-trading (simulated money) mode. That system was deliberately retired on
-2026-07-08 — never having traded real money — when the operator pivoted the project to
-the crypto strategy described here. The platform "chassis" (the tamper-evident audit log,
-the risk state machine, the monitoring, the Discord alerting) carried over; the strategy,
-broker, and data layer were replaced and re-validated from scratch. The rest of this
-document describes only the current system.
-
----
-
 ## What we trade
 
 **The venue.** Coinbase Financial Markets (CFM), the US-regulated futures arm of
@@ -569,9 +556,9 @@ falsification suite — if the edge is gone, the plan is to find out cheaply and
 
 The build plan runs in three gated phases:
 
-- **C0 — build + offline validation (COMPLETE, 2026-07-08 → 07-09).** The old system was
-  decommissioned; the Coinbase execution layer, market data + funding telemetry, signal
-  engine, risk deltas, reconciliation, and Discord digest were built and merged. Exit
+- **C0 — build + offline validation (COMPLETE, 2026-07-08 → 07-09).** The Coinbase
+  execution layer, market data + funding telemetry, signal engine, risk deltas,
+  reconciliation, and Discord digest were built and merged. Exit
   gates passed: the live signal engine reproduces the validated backtest **trade-for-
   trade with bit-exact final equity** over the full 2016–2026 history (the "parity
   gate"), and live 1-contract canary drills against the real venue passed all seven
