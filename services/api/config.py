@@ -390,9 +390,10 @@ class APISettings(BaseSettings):
     # (ES256 EC private key in PEM form, as issued by the CDP portal) and
     # mapped to env vars by ``services/api/entrypoint.py``. When unset,
     # nothing that trades can start — the strategy worker (§3.3, C0-B3)
-    # fails closed at construction, mirroring the flex-credentials
-    # pattern above. The market-data worker (§3.2) is unaffected (public
-    # endpoints only).
+    # fails closed at construction, and the api lifespan skips the recon
+    # scheduler (same fail-closed contract the deleted flex-credential
+    # pair used to carry). The market-data worker (§3.2) is unaffected
+    # (public endpoints only).
     coinbase_api_key_name: SecretStr | None = Field(
         default=None,
         description=(

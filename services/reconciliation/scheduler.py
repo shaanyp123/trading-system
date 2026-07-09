@@ -7,7 +7,12 @@ minutes after the 00:05 UTC daily strategy decision (delta spec §3.5),
 so the recon snapshot sees the decision's fills. Crypto trades 24/7 —
 there is no exchange session; the UTC calendar day IS the session day
 (the same convention the §3.4 CONVALESCENT "5 clean UTC calendar days"
-criterion counts on, with this cycle as its tick source). The CME-era
+criterion counts on — this cycle is the *intended* tick source, but the
+tick is NOT yet wired: nothing calls ``plan_session_close`` / increments
+``convalescent_session_count`` in production. Wiring it is a tracked
+pre-C1 residual (risk review of the §3.5 PR, 2026-07-09); until it lands,
+CONVALESCENT cannot auto-graduate — fail-safe, but do not claim
+otherwise). The CME-era
 18:30-ET / America-New_York anchoring died with the IBKR/LEAN stack.
 
 This module provides a stdlib-asyncio scheduler that:
