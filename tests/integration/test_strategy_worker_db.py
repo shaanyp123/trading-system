@@ -53,7 +53,9 @@ testcontainers = pytest.importorskip("testcontainers.postgres")
 PostgresContainer: Any = testcontainers.PostgresContainer
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-_PRIOR_REVISION = "20260708_crypto_pivot_tables"
+_PRIOR_REVISION = (
+    "20260709_coinbase_recon_src"  # re-parented by the post-#354/#355 re-chain (PR #357)
+)
 _WORKER_REVISION = "20260709_strategy_worker"
 _WORKER_TABLES: tuple[str, ...] = ("strategy_decisions", "strategy_worker_status")
 NOW = datetime(2026, 7, 9, 0, 6, tzinfo=UTC)
