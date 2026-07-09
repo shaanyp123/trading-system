@@ -531,6 +531,33 @@ class TestFetchDailyBars:
             assert e0 > s1 or True  # ordering sanity below
         assert windows[0][1] > windows[1][1] > windows[2][1]
 
+    def test_drops_in_progress_today_bar(self) -> None:
+        # The venue's start/end bounds are INCLUSIVE on candle start-time:
+        # a window ending at today 00:00 UTC also returns the in-progress
+        # "today" candle. Regression for the 2026-07-09 C1 night-one
+        # false-skip (skipped_stale_bars with 401 bars for days=400).
+        candles = [
+            _candle_raw(date(2026, 7, 7), close="1"),
+            _candle_raw(date(2026, 7, 8), close="2"),
+            _candle_raw(date(2026, 7, 9), close="3"),  # in-progress (NOW is 07-09)
+        ]
+        rest = _FakeRest(candles=candles)
+        bars = asyncio.run(fetch_daily_bars(rest, "BTC-USD", days=10, now_utc=NOW))
+        assert [b.session_date for b in bars] == [date(2026, 7, 7), date(2026, 7, 8)]
+
+    def test_drops_in_progress_bar_just_after_midnight(self) -> None:
+        # The 00:05 UTC decision path: minutes into a new session the
+        # venue already serves that session's partial candle; the last
+        # COMPLETED bar (yesterday) must be what bars[-1] yields.
+        just_past_midnight = datetime(2026, 7, 10, 0, 5, 0, tzinfo=UTC)
+        candles = [
+            _candle_raw(date(2026, 7, 9), close="2"),
+            _candle_raw(date(2026, 7, 10), close="3"),  # 5 minutes old
+        ]
+        rest = _FakeRest(candles=candles)
+        bars = asyncio.run(fetch_daily_bars(rest, "BTC-USD", days=10, now_utc=just_past_midnight))
+        assert [b.session_date for b in bars] == [date(2026, 7, 9)]
+
     def test_zero_days_no_calls(self) -> None:
         rest = _FakeRest()
         bars = asyncio.run(fetch_daily_bars(rest, "BTC-USD", days=0, now_utc=NOW))
