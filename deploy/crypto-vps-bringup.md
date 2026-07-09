@@ -210,8 +210,16 @@ git pull
 docker compose --env-file deploy/.env build api discord_bot webhook_pusher 2>&1 | tail -3
 docker compose --env-file deploy/.env up -d --force-recreate api discord_bot webhook_pusher
 bash deploy/day5-bringup.sh   # now runs migrations inside the FRESH image
-docker compose --env-file deploy/.env restart strategy_worker   # shares the api image
+docker compose --env-file deploy/.env up -d --force-recreate strategy_worker   # shares the api image
 ```
+
+**Why `up -d --force-recreate` and not `restart` for the worker:**
+`docker compose restart` reboots the EXISTING container on its OLD image —
+it never adopts a freshly built one. This bit the 2026-07-09 #364 hotfix
+deploy (the post-ceremony probe still showed pre-fix behavior until the
+worker was force-recreated). The recreate is safe mid-day: startup recovery
+re-reads persisted state, sees an already-handled decision date, and
+resumes the 30 s loop.
 
 Verify the running code actually changed (don't trust the build banner):
 
