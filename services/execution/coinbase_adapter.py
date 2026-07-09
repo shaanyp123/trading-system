@@ -90,13 +90,15 @@ def deterministic_client_order_id(
     decision_date: date,
     asset: str,
     decision_seq: int,
-    purpose: Literal["entry", "stop"],
+    purpose: Literal["entry", "stop", "flatten"],
     stage: int = 0,
 ) -> str:
     """§3.1 deterministic order ID: hash of (date, asset, decision-seq).
 
     ``purpose`` separates the ladder's entry orders from protective
-    stops; ``stage`` separates ladder stages (0 = post-only, 1 = IOC,
+    stops and risk-loop market flattens (C1 strategy worker: client-stop
+    / loss-limit / halt / outage-policy exits per strategy §5 Layer 2 +
+    §7); ``stage`` separates ladder stages (0 = post-only, 1 = IOC,
     2 = market) and stop re-arms (version counter). Same inputs ⇒ same
     ID, across process restarts — the idempotency key for gate A3.
     """
@@ -666,6 +668,81 @@ class CoinbaseExecutionAdapter:
             contracts=contracts,
             verified_resting=True,
         )
+
+    # -- risk-loop market flatten ---------------------------------------------------
+
+    async def execute_market_flatten(
+        self,
+        *,
+        product: PerpProductRef,
+        position_contracts: Decimal,
+        decision_date: date,
+        decision_seq: int,
+        stage: int = 0,
+    ) -> LadderStageResult:
+        """Immediate market-order flatten of an open position (strategy §5
+        Layer-2 client stop + §7 flatten paths: loss limits, halt, outage
+        policy). Deliberately NOT the §5 ladder — a protective exit must
+        not wait 10 minutes at the touch.
+
+        ``decision_seq`` must be unique per (date, asset, purpose) — the
+        C1 strategy worker persists a monotonic flatten counter BEFORE
+        placing so a crash-restart reuses the same deterministic
+        client_order_id and recovers the original order instead of
+        double-flattening (gate A3 discipline).
+        """
+        if position_contracts == 0:
+            raise ValueError("no position to flatten")
+        if position_contracts != position_contracts.to_integral_value():
+            raise ValueError(f"position must be integer-valued; got {position_contracts}")
+        side: OrderSide = "sell" if position_contracts > 0 else "buy"
+        contracts = abs(position_contracts)
+        cid = deterministic_client_order_id(
+            decision_date=decision_date,
+            asset=product.base_asset,
+            decision_seq=decision_seq,
+            purpose="flatten",
+            stage=stage,
+        )
+        order_id, rejection = await self._place_or_recover(
+            BrokerOrderRequest(
+                client_order_id=cid,
+                product_id=product.product_id,
+                side=side,
+                contracts=contracts,
+                kind="market",
+            )
+        )
+        filled = Decimal(0)
+        avg_price: Decimal | None = None
+        fees = Decimal(0)
+        if order_id:
+            state = await self._await_order_terminal_or_deadline(
+                order_id, deadline_s=self._poll_interval_s * 4
+            )
+            filled = state.filled_contracts
+            avg_price = state.avg_fill_price
+            fees = state.total_fees_usd
+        result = LadderStageResult(
+            stage="market",
+            client_order_id=cid,
+            order_id=order_id,
+            requested_contracts=contracts,
+            filled_contracts=filled,
+            avg_fill_price=avg_price,
+            fees_usd=fees,
+        )
+        self._log.info(
+            "coinbase_market_flatten_executed",
+            product_id=product.product_id,
+            side=side,
+            requested=str(contracts),
+            filled=str(filled),
+            order_id=order_id or None,
+            rejection=rejection,
+            client_order_id=cid,
+        )
+        return result
 
     # -- restart recovery ------------------------------------------------------------
 
