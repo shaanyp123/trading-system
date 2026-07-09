@@ -2,9 +2,9 @@
 #
 # - Auto-cert via Let's Encrypt (HTTP-01 / TLS-ALPN). Requires DNS A record +
 #   ports 80/443 open.
-# - Anti-pattern A18: no bare `<your-domain>` or `<watchdog_static_ip>`;
+# - Anti-pattern A18: no bare `<your-domain>`;
 #   substituted at deploy time via Caddy's env-var support (`{$VAR}`). The
-#   docker-compose `caddy` service exports DOMAIN, ACME_EMAIL, WATCHDOG_IP
+#   docker-compose `caddy` service exports DOMAIN, ACME_EMAIL
 #   from `deploy/.env` per backend-spec §9.2.1.
 {
 	email {$ACME_EMAIL}
@@ -42,8 +42,7 @@
 # WebAuthn session middleware lands, this edge gate IS the auth boundary:
 # every /api/* path except the public health probe requires these
 # credentials. Internal consumers (discord_bot, webhook_pusher, workers)
-# talk to api:8000 on the Docker network and never pass through Caddy;
-# the watchdog push keeps its own IP-allowlisted handle.
+# talk to api:8000 on the Docker network and never pass through Caddy.
 #
 # Password hash generated via:
 #   docker run --rm caddy:2-alpine caddy hash-password --plaintext '<pw>'
@@ -97,16 +96,6 @@
 		}
 	}
 
-	# Watchdog push endpoint — IP-allowlisted to the Hetzner Nuremberg static IP.
-	# WATCHDOG_IP is set in deploy/.env on the VPS (Day 4: 188.245.37.16).
-	@watchdog {
-		path /api/internal/watchdog
-		remote_ip {$WATCHDOG_IP}
-	}
-	handle @watchdog {
-		reverse_proxy api:8000
-	}
-
 	# All other API traffic — basic_auth-gated (see the snippet header for
 	# why this is currently the ONLY auth boundary in front of real money).
 	handle /api/* {
@@ -130,7 +119,7 @@
 	handle_errors {
 		@5xx expression `{http.error.status_code} >= 500`
 		handle @5xx {
-			respond "Service temporarily unavailable. Watchdog has been notified." 503
+			respond "Service temporarily unavailable." 503
 		}
 	}
 
@@ -208,16 +197,6 @@ live.{$DOMAIN} {
 		}
 	}
 
-	# Watchdog push endpoint — IP-allowlisted to the Hetzner Nuremberg static
-	# IP. The watchdog polls BOTH live + paper per cutover plan §9.
-	@watchdog {
-		path /api/internal/watchdog
-		remote_ip {$WATCHDOG_IP}
-	}
-	handle @watchdog {
-		reverse_proxy trading-live-api-1:8000
-	}
-
 	# All other API traffic
 	handle /api/* {
 		reverse_proxy trading-live-api-1:8000
@@ -227,7 +206,7 @@ live.{$DOMAIN} {
 	handle_errors {
 		@5xx expression `{http.error.status_code} >= 500`
 		handle @5xx {
-			respond "Live service temporarily unavailable. Watchdog has been notified." 503
+			respond "Live service temporarily unavailable." 503
 		}
 	}
 

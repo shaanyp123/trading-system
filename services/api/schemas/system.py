@@ -13,8 +13,11 @@ Backend-spec §4.1.3 endpoints:
     surface per frontend-spec §2.6.3 (Day 27).
   * ``AuditLogEntry`` + ``AuditLogPageResponse`` — audit explorer wire shape
     per frontend-spec §2.6.4 (Day 27).
-  * ``WatchdogStatusResponse`` — last-ping summary per frontend-spec §2.6.6
-    (Day 27).
+  * ``WatchdogStatusResponse`` — REMOVED 2026-07-09 with the dedicated
+    ``GET /api/system/watchdog`` route (external Nuremberg watchdog
+    retired for a hosted uptime monitor; Docs/decisions-log.md
+    2026-07-09). ``SystemStatus.watchdog_last_ping_utc`` stays for
+    wire-compat.
 
 The `vacation_*`, `deployments`, `agent-activity`, and `costs` endpoints
 from §4.1.3 remain deferred (Phase 2 surfaces).
@@ -58,6 +61,11 @@ class SystemStatus(BaseModel):
     frontend uses it to anchor relative-time renderings. RFC 3339 UTC ms-
     precision per §4.1.6 conventions; FastAPI default ISO serialization
     handles this.
+
+    ``watchdog_last_ping_utc``: the external watchdog was retired
+    2026-07-09 (hosted uptime monitor replaced it). The field is retained
+    for wire-compat and is permanently the epoch sentinel until/unless a
+    future liveness writer populates ``liveness_probes``.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -288,43 +296,6 @@ class AuditLogPageResponse(BaseModel):
     has_more: bool
 
 
-# ---------------------------------------------------------------------------
-# Watchdog status (Day 27 — read-only tile per frontend-spec §2.6.6)
-# ---------------------------------------------------------------------------
-
-
-class WatchdogStatusResponse(BaseModel):
-    """Backend-spec §4.1.3 ``GET /api/system/watchdog`` response.
-
-    Phase 0 surfaces only the columns that ``liveness_probes`` carries
-    (``sent_at_utc`` + ``channel``); the richer fields from the watchdog
-    push payload (``watchdog_id``, ``consecutive_failures_observed``,
-    ``region``) land in the response when the ingestion writer plumbs them
-    onto a future ``liveness_probes`` extension column or the audit-log
-    payload lookup. Today those fields are null + the frontend falls back
-    to a baseline "healthy / stale / unhealthy" pill driven purely by
-    ``last_ping_utc`` age.
-
-    ``has_ever_pinged`` distinguishes "table empty → render as 'Watchdog
-    not yet wired'" from "table populated but last ping is old → render
-    stale/unhealthy pill". When False the ``last_ping_utc`` field carries
-    the canonical ``EPOCH_SENTINEL_UTC`` (1970-01-01); the frontend
-    interprets epoch + ``has_ever_pinged=False`` as the "never pinged"
-    branch.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    last_ping_utc: datetime
-    has_ever_pinged: bool
-    seconds_since_last_ping: int | None
-    last_check_status_code: int | None
-    consecutive_failures_observed: int | None
-    watchdog_id: str | None
-    region: str | None
-    server_now: datetime
-
-
 class HeartbeatItem(BaseModel):
     """One service's heartbeat snapshot for ``GET /api/system/heartbeats``.
 
@@ -381,5 +352,4 @@ __all__ = [
     "RiskEnvelopeResponse",
     "RiskParameterItem",
     "SystemStatus",
-    "WatchdogStatusResponse",
 ]

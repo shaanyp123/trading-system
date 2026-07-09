@@ -33,7 +33,6 @@ import type {
   TradeDetail,
   TradesListResponse,
   TradesQueryFilters,
-  WatchdogStatus,
 } from './types';
 
 const KEYS = {
@@ -49,7 +48,6 @@ const KEYS = {
   authMe: ['auth-me'] as const,
   killSwitch: ['system', 'kill-switch'] as const,
   riskEnvelope: ['system', 'risk-envelope'] as const,
-  watchdog: ['system', 'watchdog'] as const,
   systemCycle: ['system', 'cycle'] as const,
   systemFunding: ['system', 'funding'] as const,
   auditLog: (filters: AuditLogFilters) => ['system', 'audit', filters] as const,
@@ -220,22 +218,6 @@ export function useRiskEnvelope(): UseQueryResult<RiskEnvelopeResponse> {
     queryFn: ({ signal }) =>
       apiCall<RiskEnvelopeResponse>('/api/system/risk-envelope', { signal }),
     staleTime: 60_000,
-  });
-}
-
-/**
- * `/api/system/watchdog` — last-ping summary per spec §2.6.6.
- *
- * 30-second staleTime aligned with the watchdog poll cadence (5 min from
- * the external VPS; the frontend refreshing every 30s is fast enough to
- * catch a stale-ping transition without thrashing).
- */
-export function useWatchdogStatus(): UseQueryResult<WatchdogStatus> {
-  return useQuery({
-    queryKey: KEYS.watchdog,
-    queryFn: ({ signal }) =>
-      apiCall<WatchdogStatus>('/api/system/watchdog', { signal }),
-    staleTime: 30_000,
   });
 }
 

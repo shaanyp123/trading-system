@@ -230,7 +230,7 @@ deploy):
 ```bash
 cd /opt/trading && git pull
 docker run --rm -v /opt/trading/deploy/Caddyfile:/etc/caddy/Caddyfile:ro \
-  -e DOMAIN=spratcapital.com -e ACME_EMAIL=x@example.com -e WATCHDOG_IP=188.245.37.16 \
+  -e DOMAIN=spratcapital.com -e ACME_EMAIL=x@example.com \
   caddy:2-alpine caddy validate --config /etc/caddy/Caddyfile 2>&1 | tail -1  # expect: Valid configuration
 docker compose --env-file deploy/.env restart caddy
 sleep 8
