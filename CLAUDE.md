@@ -66,6 +66,7 @@ For pattern ambiguity within already-allowed scope (naming, file organization wi
 | `Docs/decisions-log.md` | Append-only log of decisions + deviations from specs as the build progresses |
 | `Docs/live-money-cutover-plan.md` | Phase-future plan for live-small env tag — not currently active |
 | `Docs/ai-and-strategy-overview.md` | High-level system context |
+| `Docs/strategy-explainer.md` | Plain-English strategy + rules explainer (operator memory-jogger + investor-facing). Derived doc — spec + Amendments win on conflict; **keep in sync (incl. its change-log table) whenever strategy/risk rules or phase status change** |
 | `Prompts/` | Generation prompts (archived; do not reference for current work) |
 | `Archive/` | Reserved for superseded versions |
 

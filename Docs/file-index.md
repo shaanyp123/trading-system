@@ -22,6 +22,7 @@ Snapshot of code + ops surfaces with current status, recent PR history, and forb
 | `Docs/frontend-spec.md` | Frontend architecture: pages, components, real-time, auth |
 | `Docs/claude-dev-guide.md` | YOUR canonical patterns + conventions + anti-patterns + session protocol |
 | `Docs/decisions-log.md` | Append-only log of decisions + deviations from specs as the build progresses |
+| `Docs/strategy-explainer.md` | Plain-English strategy + rules explainer (operator + investor audiences). Derived from `Docs/crypto-perps-strategy.md` + Amendments, `research/crypto_perps/REPORT.md`, the delta spec, and decisions-log; keep in sync (incl. its change-log table) on any strategy/risk-rule or phase-status change. Added 2026-07-09. |
 | `Prompts/` | Generation prompts (archived; do not reference for current work) |
 | `Archive/` | Reserved for superseded versions |
 
