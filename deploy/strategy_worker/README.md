@@ -86,6 +86,38 @@ raised `STRATEGY_WORKER_MAX_*_CONTRACTS`) — never a code edit.
 - `STRATEGY_WORKER_RISK_TICK_SECONDS` — locked at 30 by strategy §5;
   changing it is a strategy amendment, not tuning.
 
+## Known deferrals (operator awareness)
+
+- **Quarterly-maintenance de-risking (§7: gross ≤ 1.0x before the CDE
+  3-hour maintenance window) is NOT implemented yet.** It needs the
+  venue's maintenance calendar (strategy §11 open question 9); it lands
+  as a C1 follow-up once the calendar source is confirmed. Until then,
+  de-risk manually before a published window (`/halt` + resume after),
+  or accept the exposure at the ≤2/≤4 nano-contract Phase-A book.
+- **Friday-close no-entry rule (§7: no entries 60 min pre-halt)** is
+  satisfied structurally: the only entry path is the 00:05 UTC daily
+  decision, ~21 h from the Friday 21:00-22:00 UTC close; the risk loop
+  places exits only. No code enforces it separately — revisit if an
+  intraday entry path is ever added.
+- **Capital-event vol multiplier** is unevaluated until the §3.5 recon
+  PR wires the UTC-day session counter (worker logs when an active
+  window is skipped).
+
+## Alerting (risk-review F1a)
+
+Every worker-driven protective action lands an `alerts` row (existing
+categories only; specifics ride the `detail` JSONB):
+
+| Event | Category | Severity |
+|---|---|---|
+| Daily-loss halt / floor halt / repeated-loop-failure halt / venue-failed ladder halt | `kill_switch_invoked` | P1 (floor: P0) |
+| Client 2xATR stop flatten | `margin_auto_trim` | P2 |
+| §7 outage flatten (no resting stop) | `position_unprotected` | P1 |
+| Liquidation-buffer force-reduce | `margin_warn` | P1 |
+
+Alert writes are after-action and never block the protective action; a
+failed insert logs `strategy_worker_alert_insert_failed`.
+
 ## Failure modes worth knowing
 
 - **`strategy_worker_no_slippage_head_fail_closed`** — prerequisite 3.

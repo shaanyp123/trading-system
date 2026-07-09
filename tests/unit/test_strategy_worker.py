@@ -352,6 +352,7 @@ class FakeStore(StrategyWorkerStore):
         self.fill_fallbacks: list[str] = []
         self.terminals: list[tuple[str, str]] = []
         self.kill_switch_calls: list[TransitionTrigger] = []
+        self.alerts: list[tuple[str, str, str]] = []  # (severity, category, message)
         self.equity_history: dict[date, Decimal] = {}
         self._contract_ids: dict[str, UUID] = {}
         self.process_fill_supported = True
@@ -491,6 +492,18 @@ class FakeStore(StrategyWorkerStore):
         self.terminals.append((client_order_id, status_kind))
         if client_order_id in self.order_rows:
             self.order_rows[client_order_id]["status"] = status_kind
+
+    async def insert_alert(
+        self,
+        account_id: UUID,
+        *,
+        severity: Literal["P0", "P1", "P2"],
+        category: str,
+        message: str,
+        detail: dict[str, Any],
+        now_utc: datetime,
+    ) -> None:
+        self.alerts.append((severity, category, message))
 
     async def invoke_kill_switch(
         self, account_id: UUID, *, trigger: TransitionTrigger, now_utc: datetime
@@ -992,6 +1005,8 @@ class TestClientStop:
         assert rt.stopped_on_date == TODAY.isoformat()
         # Stops are routine strategy exits — NOT kill-switch material.
         assert store.kill_switch_calls == []
+        # ... but the flatten IS alerted (F1a; existing category, remapped).
+        assert ("P2", "margin_auto_trim") in {(a[0], a[1]) for a in store.alerts}
         # The exit propagated downstream (signal + order + fill records).
         assert any(s.get("signal_type") == "exit" for s in store.signals.values())
 
@@ -1026,6 +1041,8 @@ class TestLossLimits:
         assert store.kill_switch_calls == [TransitionTrigger.DAILY_LOSS_BREACH]
         assert worker.state["BTC"].contracts == 0
         assert any(c.kind == "market" for c in broker.create_calls)
+        # F1a: the halt reached the operator alert surface.
+        assert ("P1", "kill_switch_invoked") in {(a[0], a[1]) for a in store.alerts}
 
     async def test_daily_loss_within_limit_no_action(self) -> None:
         worker, store, broker = await _started_worker()
@@ -1063,6 +1080,7 @@ class TestLossLimits:
 
         assert store.kill_switch_calls == [TransitionTrigger.DECOMMISSION_FLOOR]
         assert worker.state["BTC"].contracts == 0
+        assert ("P0", "kill_switch_invoked") in {(a[0], a[1]) for a in store.alerts}
 
     async def test_already_halted_does_not_retrip(self) -> None:
         store = FakeStore()
@@ -1084,6 +1102,7 @@ class TestLossLimits:
         # Halved (4 → 2), not flattened, not halted.
         assert worker.state["BTC"].contracts == 2
         assert store.kill_switch_calls == []
+        assert ("P1", "margin_warn") in {(a[0], a[1]) for a in store.alerts}
 
 
 class TestOutagePolicy:
@@ -1121,6 +1140,7 @@ class TestOutagePolicy:
 
         assert worker.state["BTC"].contracts == 0
         assert [c for c in broker.create_calls if c.kind == "market"]
+        assert ("P1", "position_unprotected") in {(a[0], a[1]) for a in _store.alerts}
 
     async def test_native_stop_fill_detected_and_locked_out(self) -> None:
         worker, store, broker = await _started_worker()
@@ -1355,3 +1375,65 @@ class TestWorkerMainConfig:
 
         monkeypatch.delenv("API_DATABASE_URL", raising=False)
         assert await worker_main._amain() == 2
+
+
+# ---------------------------------------------------------------------------
+# Protective-exit preemption of an in-flight decision (risk-review F6)
+# ---------------------------------------------------------------------------
+
+
+class TestProtectiveExitPreemption:
+    async def test_flatten_preempts_in_flight_decision_task(self) -> None:
+        """A protective flatten must not queue behind a ladder stage: the
+        in-flight decision task is cancelled (its leg-grain crash-resume
+        + deterministic client_order_ids make the interruption safe)."""
+        import asyncio
+
+        worker, _store, broker = await _started_worker()
+        rt = _open_long(worker, broker, "BTC", contracts=2)
+
+        started = asyncio.Event()
+
+        async def _stuck_decision() -> None:
+            async with worker._trade_lock:
+                started.set()
+                await asyncio.sleep(3600)  # a stage-1 post-only window
+
+        worker._decision_task = asyncio.create_task(_stuck_decision())
+        await started.wait()
+
+        # The flatten completes promptly instead of waiting behind the lock.
+        await asyncio.wait_for(
+            worker._flatten_position("BTC", reason="client_stop", now_utc=NOW, lockout=True),
+            timeout=5.0,
+        )
+        assert worker._decision_task.cancelled()
+        assert rt.contracts == 0
+        assert [c for c in broker.create_calls if c.kind == "market"]
+
+    async def test_preempted_decision_resumes_next_tick(self) -> None:
+        """After preemption the decision row stays 'dispatching' and the
+        next attempt resumes it (dedupe never marks it done)."""
+        worker, store, _broker = await _started_worker()
+        # Seed a dispatching row as if the preempted run persisted it.
+        store.decisions[TODAY] = {
+            "status": "dispatching",
+            "equity_usd": Decimal("6000"),
+            "outcome": {
+                "schema_version": "strategy_decision_v1",
+                "assets": {
+                    "BTC": {
+                        "final_target": 1,
+                        "action": "buy",
+                        "legs": [{"seq": 0, "kind": "open", "delta": 1, "status": "pending"}],
+                    },
+                    "ETH": {"final_target": 0, "action": "hold", "legs": []},
+                },
+            },
+            "engine_state": serialize_engine_state(
+                {"BTC": AssetRuntime(applied_dir=1), "ETH": AssetRuntime()}
+            ),
+        }
+        await worker.run_daily_decision(TODAY)
+        assert store.decisions[TODAY]["status"] == "completed"
+        assert worker.state["BTC"].contracts == 1

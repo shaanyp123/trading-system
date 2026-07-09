@@ -173,6 +173,23 @@ DecisionStatus = Literal[
     "dispatching", "completed", "failed", "skipped_risk_state", "skipped_stale_bars"
 ]
 
+#: Risk-review F1a: per-reason alert mapping for protective flattens.
+#: EXISTING ``alert_category`` enum members ONLY (no enum migration —
+#: delta spec §3.8's free-text-payload remap convention):
+#:   * ``margin_auto_trim``  — risk-engine auto position reduction; the
+#:     closest existing semantic for a client-2xATR-stop exit.
+#:   * ``position_unprotected`` — §7 outage flatten of a position with
+#:     no confirmed venue-resting stop.
+#:   * ``margin_warn`` — liquidation-buffer breach (§3.8's explicit
+#:     remap for this category).
+#: ``daily_loss`` / ``halt_floor`` flatten reasons are deliberately
+#: absent: their FSM transitions emit the ``kill_switch_invoked`` alert.
+_FLATTEN_ALERTS: Final[dict[str, tuple[Literal["P0", "P1", "P2"], str]]] = {
+    "client_stop": ("P2", "margin_auto_trim"),
+    "outage_unprotected": ("P1", "position_unprotected"),
+    "liq_buffer": ("P1", "margin_warn"),
+}
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -287,6 +304,13 @@ def params_from_canonical(canonical: Mapping[str, str]) -> CryptoTrendParams:
         dd_tiers=dd_tiers,
         eth_min_price=f("ETH_MIN_PRICE"),
     )
+
+
+def _new_uuid7() -> UUID:
+    """UUIDv7 for row ids minted client-side (dev-guide §3.9)."""
+    import uuid_utils
+
+    return UUID(str(uuid_utils.uuid7()))
 
 
 def _dec(value: object) -> Decimal | None:
@@ -1092,51 +1116,17 @@ class StrategyWorkerStore:
         parameter_set_hash: str,
         audit_payload: dict[str, Any],
     ) -> UUID:
-        """INSERT the orders row + ORDER_PLACED audit event.
+        """Audit-first ORDER_PLACED event, then the orders row (§2.10.1).
 
         One row per execution LEG (the §5 ladder's per-stage venue
         orders are recorded in the audit payload's ``stages``) so the
         fill-processor's per-order filled/partially_filled semantics
-        stay truthful against the leg's requested quantity.
+        stay truthful against the leg's requested quantity. The row id
+        is minted client-side (uuid7 per dev-guide §3.9) so the audit
+        event can carry it while still committing FIRST — risk-review
+        F9 (matches :meth:`insert_signal_row`'s ordering).
         """
-        async with self._sf() as session:
-            async with session.begin():
-                row = (
-                    await session.execute(
-                        text(
-                            "INSERT INTO orders ("
-                            "    account_id, env, signal_id, client_order_id, broker_order_id,"
-                            "    market, contract_id, direction, order_type, quantity,"
-                            "    limit_price, stop_price, placed_at_utc, status, retry_n,"
-                            "    strategy_hash, parameter_set_hash"
-                            ") VALUES ("
-                            "    :acct, :env, :sig, :cid, :boid,"
-                            "    :market, :contract, :dir, :otype, :qty,"
-                            "    :lim, :stop, :now, 'pending', 0,"
-                            "    :shash, :phash"
-                            ") RETURNING id"
-                        ),
-                        {
-                            "acct": account_id,
-                            "env": self._env,
-                            "sig": signal_id,
-                            "cid": client_order_id,
-                            "boid": broker_order_id,
-                            "market": market,
-                            "contract": contract_id,
-                            "dir": direction,
-                            "otype": order_type,
-                            "qty": quantity,
-                            "lim": limit_price,
-                            "stop": stop_price,
-                            "now": now_utc,
-                            "shash": strategy_hash,
-                            "phash": parameter_set_hash,
-                        },
-                    )
-                ).fetchone()
-        assert row is not None
-        order_id = UUID(str(row.id))
+        order_id = _new_uuid7()
         async with self._sf() as audit_session:
             await append_audit_event(
                 audit_session,
@@ -1157,6 +1147,42 @@ class StrategyWorkerStore:
                 env=self._env,
                 phase_at_emit=self._phase,
             )
+        async with self._sf() as session:
+            async with session.begin():
+                await session.execute(
+                    text(
+                        "INSERT INTO orders ("
+                        "    id, account_id, env, signal_id, client_order_id,"
+                        "    broker_order_id,"
+                        "    market, contract_id, direction, order_type, quantity,"
+                        "    limit_price, stop_price, placed_at_utc, status, retry_n,"
+                        "    strategy_hash, parameter_set_hash"
+                        ") VALUES ("
+                        "    :oid, :acct, :env, :sig, :cid, :boid,"
+                        "    :market, :contract, :dir, :otype, :qty,"
+                        "    :lim, :stop, :now, 'pending', 0,"
+                        "    :shash, :phash"
+                        ")"
+                    ),
+                    {
+                        "oid": order_id,
+                        "acct": account_id,
+                        "env": self._env,
+                        "sig": signal_id,
+                        "cid": client_order_id,
+                        "boid": broker_order_id,
+                        "market": market,
+                        "contract": contract_id,
+                        "dir": direction,
+                        "otype": order_type,
+                        "qty": quantity,
+                        "lim": limit_price,
+                        "stop": stop_price,
+                        "now": now_utc,
+                        "shash": strategy_hash,
+                        "phash": parameter_set_hash,
+                    },
+                )
         return order_id
 
     async def process_fill(
@@ -1305,6 +1331,64 @@ class StrategyWorkerStore:
             env=self._env,
             phase_at_emit=self._phase,
         )
+
+    async def insert_alert(
+        self,
+        account_id: UUID,
+        *,
+        severity: Literal["P0", "P1", "P2"],
+        category: str,
+        message: str,
+        detail: dict[str, Any],
+        now_utc: datetime,
+    ) -> None:
+        """INSERT an ``alerts`` row — the operator-visibility surface the
+        Discord alert path + alerts API read (risk-review F1a: a
+        worker-driven halt/flatten must never be silent).
+
+        ``category`` is an EXISTING ``alert_category`` enum member ONLY
+        (no enum migration; delta spec §3.8's free-text-payload remap
+        convention — specifics ride ``detail``). **Alert-after-action +
+        never raises:** a failed alert write must not block or unwind
+        the protective action it reports; failure logs loudly and the
+        audit chain remains the durable record.
+        """
+        try:
+            async with self._sf() as session:
+                async with session.begin():
+                    await session.execute(
+                        text(
+                            "INSERT INTO alerts ("
+                            "    account_id, fired_at_utc, severity, category,"
+                            "    message, detail"
+                            ") VALUES ("
+                            "    :acct, :ts, :sev, CAST(:cat AS alert_category),"
+                            "    :msg, CAST(:detail AS JSONB)"
+                            ")"
+                        ),
+                        {
+                            "acct": account_id,
+                            "ts": now_utc,
+                            "sev": severity,
+                            "cat": category,
+                            "msg": message,
+                            "detail": json.dumps(detail, default=str),
+                        },
+                    )
+            self._log.info(
+                "strategy_worker_alert_inserted",
+                severity=severity,
+                category=category,
+                message=message,
+            )
+        except Exception:
+            self._log.exception(
+                "strategy_worker_alert_insert_failed",
+                severity=severity,
+                category=category,
+                message=message,
+                detail=detail,
+            )
 
     async def invoke_kill_switch(
         self,
@@ -1471,12 +1555,28 @@ class StrategyWorker:
             and self.account_id is not None
         ):
             self._tick_failure_halt_fired = True
+            now = self._clock()
             with contextlib.suppress(Exception):
                 await self._store.invoke_kill_switch(
                     self.account_id,
                     trigger=TransitionTrigger.UNHANDLED_EXCEPTION,
-                    now_utc=self._clock(),
+                    now_utc=now,
                 )
+            await self._store.insert_alert(
+                self.account_id,
+                severity="P1",
+                category="kill_switch_invoked",
+                message=(
+                    f"risk loop failed {self._consecutive_tick_failures} consecutive "
+                    "ticks — HALT_NEW (unhandled_exception); see worker logs"
+                ),
+                detail={
+                    "trigger": TransitionTrigger.UNHANDLED_EXCEPTION.value,
+                    "consecutive_failures": self._consecutive_tick_failures,
+                    "source": "strategy_worker_risk_loop",
+                },
+                now_utc=now,
+            )
 
     async def startup_recovery(self) -> None:
         """§7 restart rule: reconcile venue state, re-arm missing stops,
@@ -1656,18 +1756,60 @@ class StrategyWorker:
         # 5a) Hard halt — the $1,500 malfunction circuit-breaker (§7 /
         # Amendment A). DECOMMISSION_FLOOR is the existing incident-review
         # trigger for the equity floor; restart is manual-flag-removal.
-        if equity <= halt_floor and not already_halted:
-            self._log.error(
-                "strategy_worker_hard_halt_floor_breached",
-                equity_usd=str(equity),
-                halt_floor_usd=str(halt_floor),
-            )
-            await self._flatten_all(reason="halt_floor", now_utc=now_utc)
-            await self._store.invoke_kill_switch(
-                self.account_id,
-                trigger=TransitionTrigger.DECOMMISSION_FLOOR,
-                now_utc=now_utc,
-            )
+        # Risk-review F4: the flatten runs even when ALREADY halted (a
+        # halted book sliding through the floor must still be flattened);
+        # only the FSM transition itself is retrip-guarded.
+        if equity <= halt_floor:
+            has_positions = any(self.state[a].contracts != 0 for a in ASSETS)
+            if has_positions:
+                self._log.error(
+                    "strategy_worker_hard_halt_floor_breached",
+                    equity_usd=str(equity),
+                    halt_floor_usd=str(halt_floor),
+                    already_halted=already_halted,
+                )
+                await self._flatten_all(reason="halt_floor", now_utc=now_utc)
+            if not already_halted:
+                await self._store.invoke_kill_switch(
+                    self.account_id,
+                    trigger=TransitionTrigger.DECOMMISSION_FLOOR,
+                    now_utc=now_utc,
+                )
+                await self._store.insert_alert(
+                    self.account_id,
+                    severity="P0",
+                    category="kill_switch_invoked",
+                    message=(
+                        f"hard-halt equity floor breached: equity {equity} <= "
+                        f"{halt_floor} — flattened + HALT_NEW (decommission_floor)"
+                    ),
+                    detail={
+                        "trigger": TransitionTrigger.DECOMMISSION_FLOOR.value,
+                        "equity_usd": str(equity),
+                        "halt_floor_usd": str(halt_floor),
+                        "source": "strategy_worker_risk_loop",
+                    },
+                    now_utc=now_utc,
+                )
+            elif has_positions:
+                # Already halted, but positions existed below the floor —
+                # the flatten itself must still be visible (F1a + F4).
+                await self._store.insert_alert(
+                    self.account_id,
+                    severity="P0",
+                    category="kill_switch_invoked",
+                    message=(
+                        f"equity {equity} <= floor {halt_floor} while already "
+                        "HALT_NEW — open positions flattened (no FSM retrip)"
+                    ),
+                    detail={
+                        "equity_usd": str(equity),
+                        "halt_floor_usd": str(halt_floor),
+                        "already_halted": True,
+                        "source": "strategy_worker_risk_loop",
+                    },
+                    now_utc=now_utc,
+                )
             return
 
         # 5b) Daily loss limit (from 00:00 UTC baseline).
@@ -1685,6 +1827,24 @@ class StrategyWorker:
                 await self._store.invoke_kill_switch(
                     self.account_id,
                     trigger=TransitionTrigger.DAILY_LOSS_BREACH,
+                    now_utc=now_utc,
+                )
+                await self._store.insert_alert(
+                    self.account_id,
+                    severity="P1",
+                    category="kill_switch_invoked",
+                    message=(
+                        f"daily loss limit breached ({daily_pnl_frac:.4f} < "
+                        f"{daily_limit}) — flattened + HALT_NEW (daily_loss_breach)"
+                    ),
+                    detail={
+                        "trigger": TransitionTrigger.DAILY_LOSS_BREACH.value,
+                        "daily_pnl_frac": str(daily_pnl_frac),
+                        "limit": str(daily_limit),
+                        "equity_usd": str(equity),
+                        "day_start_equity_usd": str(self._day_start_equity),
+                        "source": "strategy_worker_risk_loop",
+                    },
                     now_utc=now_utc,
                 )
                 return
@@ -1797,7 +1957,11 @@ class StrategyWorker:
         locked for 2 daily closes; direction/hysteresis state resets."""
         bar_day = now_utc.astimezone(UTC).date()
         rt.lockout_dir = 1 if rt.contracts > 0 else -1
-        rt.lockout_until_ord = bar_day.toordinal() + 2  # LOCKOUT_DAYS (locked §5)
+        # `+ 2` intentionally mirrors the parity-locked engine's
+        # `lockout_days` / the Amendment B seed's LOCKOUT_DAYS=2 (§5,
+        # locked). A parameter amendment changing LOCKOUT_DAYS must touch
+        # this literal too (and the twin in `_flatten_position`).
+        rt.lockout_until_ord = bar_day.toordinal() + 2
         rt.stopped_on_date = bar_day.isoformat()
         rt.contracts = 0
         self._clear_position_state(rt)
@@ -1893,9 +2057,28 @@ class StrategyWorker:
                 asset, reason="liq_buffer", now_utc=now_utc, contracts=reduce_by
             )
 
+    async def _preempt_decision_dispatch(self, *, reason: str) -> None:
+        """Cancel an in-flight decision task so a protective exit never
+        queues behind a ladder stage (risk-review F6: a stop waiting up
+        to 10 min behind stage-1's post-only window would stall the
+        heartbeat and cycle the container). The decision's leg-grain
+        crash-resume machinery + deterministic client_order_ids make the
+        interruption safe — the next tick resumes (or the halt gate
+        turns the resume into a recorded skip)."""
+        task = self._decision_task
+        if task is not None and not task.done():
+            self._log.warning(
+                "strategy_worker_decision_preempted_by_protective_exit",
+                reason=reason,
+            )
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+
     async def _flatten_all(self, *, reason: str, now_utc: datetime) -> None:
         """§7 flatten path: cancel everything first (a resting stop must
         not fill concurrently with the flatten), then market-flatten."""
+        await self._preempt_decision_dispatch(reason=reason)
         with contextlib.suppress(Exception):
             await self._adapter.cancel_all_orders()
         for asset in ASSETS:
@@ -1917,7 +2100,8 @@ class StrategyWorker:
         """Market-flatten (fully or partially) with full DB propagation.
 
         Protective exits deliberately bypass the dispatch halt gate —
-        HALT_NEW halts NEW exposure, not risk-reducing exits.
+        HALT_NEW halts NEW exposure, not risk-reducing exits — and
+        PREEMPT any in-flight decision dispatch (risk-review F6).
         """
         rt = self.state[asset]
         product = self.products.get(asset)
@@ -1925,6 +2109,7 @@ class StrategyWorker:
             return
         if self.account_id is None:
             return
+        await self._preempt_decision_dispatch(reason=reason)
         flatten_contracts = (
             abs(rt.contracts) if contracts is None else min(contracts, abs(rt.contracts))
         )
@@ -2003,7 +2188,11 @@ class StrategyWorker:
             rt.contracts = rt.contracts - filled * (1 if rt.contracts > 0 else -1)
             if lockout and reason == "client_stop":
                 # lockout applies to the stopped direction irrespective of
-                # how much actually filled.
+                # how much actually filled. The `+ 2` intentionally mirrors
+                # the parity-locked engine's `lockout_days` (LOCKOUT_DAYS=2
+                # in the Amendment B seed) — a parameter amendment that
+                # changes LOCKOUT_DAYS must touch this literal too (and
+                # `_apply_stop_lockout` below).
                 stopped_dir = 1 if signed > 0 else -1
                 bar_day = now_utc.astimezone(UTC).date()
                 rt.lockout_dir = stopped_dir
@@ -2014,6 +2203,36 @@ class StrategyWorker:
             else:
                 await self._arm_native_stop(asset, reason=f"{reason}_resize")
             await self._persist_status(now_utc=now_utc, tick_increment=False)
+
+        # Alert-after-action (risk-review F1a): a protective flatten must
+        # reach the operator's alert surface. daily_loss / halt_floor
+        # flattens are covered by the kill_switch_invoked alert their FSM
+        # transition emits — no per-position duplicate for those.
+        alert_spec = _FLATTEN_ALERTS.get(reason)
+        if alert_spec is not None:
+            severity, category = alert_spec
+            await self._store.insert_alert(
+                self.account_id,
+                severity=severity,
+                category=category,
+                message=(
+                    f"strategy worker protective flatten: {asset} "
+                    f"{flatten_contracts} contract(s), reason={reason}"
+                ),
+                detail={
+                    "asset": asset,
+                    "product_id": product.product_id,
+                    "reason": reason,
+                    "requested_contracts": flatten_contracts,
+                    "filled_contracts": filled,
+                    "remaining_contracts": rt.contracts,
+                    "avg_fill_price": str(result.avg_fill_price)
+                    if result.avg_fill_price is not None
+                    else None,
+                    "source": "strategy_worker_risk_loop",
+                },
+                now_utc=now_utc,
+            )
 
     # -- daily decision ----------------------------------------------------------
 
@@ -2519,6 +2738,24 @@ class StrategyWorker:
                 trigger=TransitionTrigger.UNHANDLED_EXCEPTION,
                 now_utc=now_utc,
             )
+            await self._store.insert_alert(
+                self.account_id,
+                severity="P1",
+                category="kill_switch_invoked",
+                message=(
+                    f"execution ladder incomplete on {asset} (venue failed the "
+                    "market stage) — HALT_NEW (unhandled_exception)"
+                ),
+                detail={
+                    "trigger": TransitionTrigger.UNHANDLED_EXCEPTION.value,
+                    "asset": asset,
+                    "product_id": product.product_id,
+                    "requested_contracts": str(result.requested_contracts),
+                    "filled_contracts": str(result.filled_contracts),
+                    "source": "strategy_worker_decision_dispatch",
+                },
+                now_utc=now_utc,
+            )
 
     def _update_entry_ref_and_stop(
         self,
@@ -2749,7 +2986,13 @@ class StrategyWorker:
             rt.atrp_at_stop_set = str(atrp)
         if rt.client_stop_level is None and entry_ref is not None:
             sign = 1 if rt.contracts > 0 else -1
-            client_atr = Decimal("2.0")  # CLIENT_STOP_ATR (locked §5)
+            # Decimal("2.0") intentionally mirrors the parity-locked
+            # engine's `client_stop_atr` / the Amendment B seed's
+            # CLIENT_STOP_ATR="2.0" (§5, locked). Only used in this
+            # startup-rearm fallback where no CryptoTrendParams is in
+            # scope; a parameter amendment changing CLIENT_STOP_ATR must
+            # touch this literal too.
+            client_atr = Decimal("2.0")
             rt.client_stop_level = str(entry_ref * (Decimal(1) - sign * client_atr * atrp))
         if result.action in ("placed", "replaced"):
             await self._record_stop_order_row(
