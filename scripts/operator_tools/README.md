@@ -15,6 +15,7 @@ service-side write paths (never raw SQL).
 | `replace_protective_stop.py` | POSITION_UNPROTECTED recovery: places a fresh bracket-stop for a position whose protective stop was cancelled but never replaced (PR-C exit-pipeline failure mode) | Yes (when `--no-dry-run --confirm`) — writes ORDER_PLACED audit + INSERTs orders row + places stop_market at IBKR. **--dry-run default = ON; two-flag gate.** |
 | `master_client_id_probe.py` | Empirical validation of the IBKR Master Client ID configuration (`TWS_MASTER_CLIENT_ID`). Three sequential stages on distinct clientIds: place a safe stop at `$1` on /MES from clientId=86, cancel via the master clientId, `reqGlobalCancel` cleanup from clientId=87. | Yes — places a single safe (stop=$1, DAY TIF, /MES) order at IBKR. Cancels itself end-to-end on success. No DB writes; no audit chain. **Operator-coordinated; runs post `docker compose up -d --force-recreate ib_gateway`.** |
 | `bootstrap_live_account.py` | Idempotent DB bootstrap: `accounts` + `risk_state` (live cutover) and — via `--mint-from-defaults` — seeds the baseline `parameter_sets` head row from the canonical V1 defaults, minting the `parameter_set_hash` (PR #294). **For the paper seed (already-bootstrapped env) ALWAYS add `--seed-params-only`** to skip the account/risk_state inserts (without it the full bootstrap creates a duplicate account because paper's account id is `operator`, not the IBKR number — the 2026-05-30 incident; full path now refuses on mismatch). See the **parameter-set seeding** + **decommission ceremony** sections below. | Yes (when `--no-dry-run --confirm`) — parameterized INSERTs via `ON CONFLICT DO NOTHING`. **--dry-run default = ON; two-flag gate; idempotent re-runs are no-ops.** |
+| `bootstrap_slippage_calibration.py` | Idempotent seed of the `slippage_calibration_versions` HEAD row (zero-prior bootstrap, `trigger='bootstrap'`) via the pure planner `services/calibration/calibration.py::plan_calibration_fit` + the audit-first `CalibrationPlan` persistence contract. Unblocks the strategy worker's `strategy_worker_no_slippage_head_fail_closed` gate on a fresh DB (`deploy/strategy_worker/README.md` prerequisite 3). Existing HEAD = no-op; `--force-new-version` appends a successor parented on the current HEAD. | Yes (when `--no-dry-run --confirm`) — writes one `slippage_calibration_recalibrated` audit event + one version row + the HEAD-pointer swap (swap transactional with the INSERT). **--dry-run default = ON; two-flag gate; idempotent re-runs are no-ops.** |
 | `apply_parameter_change.py` | Operator-driven **audited** change to an operator-only flag (`STRATEGY_DECOMMISSIONED` / `EXIT_AUTO_APPROVE`): audit-first `parameter_change_applied`/`_reverted` event → `parameters` history row (`prev == hash`, hash-stable) → in-place `parameter_sets` flip (PR-D, design §13). Replaces the raw decommission UPDATE. | Yes (when `--no-dry-run --confirm`) — writes the audit chain + `parameters` + `parameter_sets`. **--dry-run default = ON; two-flag gate; no-op when already at value.** |
 | `cancel_orphan_order.py` | Cancel a stuck/orphan `orders` row left at `status='pending'` with `broker_order_id IS NULL` — pre-inserted but never placed at IBKR (e.g. the 2026-06-04 /MYM Error-200 failure; exchange bug fixed in #327). Reuses the audit-first `process_terminal_status_event`. **Refuses** if `broker_order_id` is set (may be live at IBKR — use an IBKR cancel instead). | Yes (when `--execute`) — writes `ORDER_CANCELLED`/`ORDER_REJECTED` audit + UPDATEs the orders row via the tested terminal-status processor (no hand-rolled SQL). **--dry-run default = ON.** |
 
@@ -793,6 +794,114 @@ content-addressed and has no operator-facing write endpoint (design F10/L1); no
 audit row is written (A01 N/A). `services/version/**` and
 `scripts/operator_tools/**` are NOT on the [A02] forbidden whitelist — regular
 PR review, no `risk-review-approved` label (PR #294).
+
+---
+
+## `bootstrap_slippage_calibration.py` — slippage-calibration HEAD seed
+
+### When to use
+
+- Fresh DB (crypto-pivot bringup): the strategy worker fails closed with
+  `strategy_worker_no_slippage_head_fail_closed` and will NOT dispatch until a
+  `slippage_calibration_versions` HEAD row exists (`signals` rows FK into it —
+  `deploy/strategy_worker/README.md` prerequisite 3). Run this once, after the
+  Step 7 account bootstrap (`bootstrap_live_account.py`) — the audit event
+  needs an active `accounts` row (exit 4 otherwise).
+- One-time per environment. Idempotent — an existing HEAD row is a logged
+  no-op (`bootstrap_slippage_calibration_head_exists`, exit 0). To append a
+  successor zero-prior version on top of an existing HEAD (rare; e.g. a
+  deliberate re-baseline), pass `--force-new-version`.
+
+### What it writes (wet run)
+
+The `CalibrationPlan` persistence contract from
+`services/calibration/calibration.py`, verbatim:
+
+1. One `slippage_calibration_recalibrated` audit event via
+   `services.audit.writer.append_audit_event` (audit-first; the writer owns
+   its own SERIALIZABLE + advisory-lock txn); the returned uuid is captured.
+2. One `slippage_calibration_versions` row referencing that uuid —
+   `version_no=1` (fresh DB), `trigger='bootstrap'`, empty zero-prior
+   `per_market_coefficients` (backend-spec §2.14 "Bootstrap"; Decimals as
+   strings, byte-identical to the audit payload).
+3. The HEAD-pointer swap, in ONE transaction with the INSERT (the
+   `slippage_head` partial unique index enforces single-HEAD).
+
+All calibration policy lives in the pure planner
+(`plan_calibration_fit(trigger=BOOTSTRAP, fills=())`); this tool is only the
+dispatcher I/O.
+
+### Run command (paper env, dry-run — REQUIRED FIRST)
+
+Default is `--dry-run`; the plan (version_no, coefficients, becomes_head) is
+logged with **no DB access**. Uses the in-container `DATABASE_URL` wrapper
+from `deploy/crypto-vps-bringup.md` Step 7 (`docker compose exec` bypasses
+the entrypoint, so the URL is built in-process from the mounted secrets
+file):
+
+```bash
+docker compose --env-file deploy/.env exec api python -c "
+import os, sys, runpy, yaml
+pw = yaml.safe_load(open('/run/secrets/secrets.yaml'))['postgres']['app_service_password']
+os.environ['DATABASE_URL'] = f'postgresql+asyncpg://app_service:{pw}@postgres:5432/trading'
+sys.argv = ['bootstrap_slippage_calibration', '--env', 'paper']
+runpy.run_module('scripts.operator_tools.bootstrap_slippage_calibration', run_name='__main__')
+"
+```
+
+Inspect `bootstrap_slippage_calibration_dry_run_complete` — expect
+`version_no=1`, `trigger='bootstrap'`, `fit_method='zero_prior'`, empty
+coefficients, `becomes_head=True`.
+
+### Run command (paper env, wet — committing)
+
+Same wrapper plus the two-flag gate (`--env paper` needs no
+`--allow-non-paper`; live envs do):
+
+```bash
+docker compose --env-file deploy/.env exec api python -c "
+import os, sys, runpy, yaml
+pw = yaml.safe_load(open('/run/secrets/secrets.yaml'))['postgres']['app_service_password']
+os.environ['DATABASE_URL'] = f'postgresql+asyncpg://app_service:{pw}@postgres:5432/trading'
+sys.argv = ['bootstrap_slippage_calibration', '--env', 'paper', '--no-dry-run', '--confirm']
+runpy.run_module('scripts.operator_tools.bootstrap_slippage_calibration', run_name='__main__')
+"
+```
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Success (row seeded, HEAD already present no-op, or dry-run plan printed) |
+| 4 | No active `accounts` row — run `bootstrap_live_account.py` first (bringup Step 7) |
+| 5 | DB init failure — `DATABASE_URL` missing/unreachable |
+| 6 | Invalid CLI args (live env without `--allow-non-paper`; `--no-dry-run` without `--confirm`) |
+| 99 | Unexpected exception |
+
+### Verification (post-success)
+
+```bash
+# 1. Exactly one HEAD row, trigger='bootstrap':
+psql -U app_service -d trading -h postgres -c "
+SELECT id, version_no, trigger, is_head, audit_event_uuid
+FROM slippage_calibration_versions WHERE is_head = TRUE;
+"
+
+# 2. Audit chain extends + still verifies (api container):
+/opt/venv/bin/python -m services.audit.verify_chain --env paper
+# Expected: CHAIN OK: <N> rows verified
+
+# 3. The worker gate clears on next strategy_worker start (no more
+#    strategy_worker_no_slippage_head_fail_closed).
+```
+
+### Architecture note
+
+`scripts/operator_tools/**` is NOT on the dev-guide §11 [A02] forbidden
+whitelist. The tool CALLS `services/calibration` (pure planner, unmodified)
+and `services/audit` (writer) — regular PR review applies, same posture as
+`apply_parameter_change.py`. It writes the audit chain, so a voluntary
+risk-review at PR time is recommended.
 
 ---
 
