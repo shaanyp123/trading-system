@@ -27,6 +27,7 @@ import { useSSE } from '@/lib/sse';
 import { ActiveAlerts } from '@/components/today/active-alerts';
 import { ExitWatchingSection } from '@/components/today/ExitWatchingSection';
 import { ExposureBreakdown } from '@/components/today/exposure-breakdown';
+import { FundingStrip } from '@/components/today/funding-strip';
 import { HealthScoreTile } from '@/components/today/health-score-tile';
 import { PipelineFreshnessStrip } from '@/components/today/pipeline-freshness-strip';
 import { PnLSummary } from '@/components/today/pnl-summary';
@@ -45,6 +46,7 @@ export default function TodayPage(): JSX.Element {
         <SSEStatusPill status={status} lastSequenceNo={lastSequenceNo} />
       </header>
       <PipelineFreshnessStrip />
+      <FundingStrip />
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
         <div className="lg:col-span-6">
           <HealthScoreTile />

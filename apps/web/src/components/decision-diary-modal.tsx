@@ -2,21 +2,19 @@
 
 /**
  * DecisionDiaryModal — collects `{entry_class, tag, reasoning_text}`
- * from the operator on signal Reject + Defer (frontend-spec §3.1).
+ * from the operator (frontend-spec §3.1).
  *
- * Replaces the Phase-0 placeholder diary entry that QueuedSignals was
- * sending (`tag: manual_judgment, reasoning_text: 'Phase-0 placeholder…'`).
- * With this modal in place, the operator now actually annotates why a
- * signal was rejected or deferred — which is the entire point of the
- * decision diary surface per spec §3.1 (operator-authored reasoning is
- * what makes the Phase-2 Trades queryable by tag and full-text searchable
- * by reasoning_text).
+ * Crypto-pivot §3.9: the `signal_reject` / `signal_defer` context kinds
+ * are RETIRED with the per-trade approval ceremony (delta spec §3.8 —
+ * announce-only; the reject/defer mutations and their backend endpoints
+ * are gone). What remains is the `standalone` path — the operator-
+ * authored general diary entry (Phase 2 surface) that makes Trades
+ * queryable by tag and full-text searchable by reasoning_text.
  *
  * Validation matches spec §3.1:
  *   - reasoning_text: 10-2000 chars
  *   - tag: one of the 5 locked values
- *   - entry_class: 'signal_response' for reject/defer; 'general' for
- *     the standalone path (Phase 2)
+ *   - entry_class: 'general' for the standalone path
  *
  * Phase-0 ergonomics: backed by ModalShell which lacks a focus trap (no
  * @radix-ui/react-dialog dep yet). Acceptable for a single-operator
@@ -29,10 +27,7 @@ import { ModalShell } from '@/components/system/modal-shell';
 import { Button } from '@/components/ui/button';
 import type { DecisionDiaryEntry } from '@/lib/api/types';
 
-export type DecisionDiaryContextKind =
-  | 'signal_reject'
-  | 'signal_defer'
-  | 'standalone';
+export type DecisionDiaryContextKind = 'standalone';
 
 export interface DecisionDiaryContext {
   readonly kind: DecisionDiaryContextKind;
@@ -63,31 +58,19 @@ const MAX_LEN = 2000;
 
 function titleFor(context: DecisionDiaryContext): string {
   const subject = context.subjectLabel?.trim();
-  switch (context.kind) {
-    case 'signal_reject':
-      return subject ? `Reject signal: ${subject}` : 'Reject signal';
-    case 'signal_defer':
-      return subject ? `Defer signal: ${subject}` : 'Defer signal';
-    case 'standalone':
-      return 'New diary entry';
-  }
+  return subject ? `New diary entry: ${subject}` : 'New diary entry';
 }
 
 function entryClassFor(
   kind: DecisionDiaryContextKind,
 ): DecisionDiaryEntry['entry_class'] {
-  return kind === 'standalone' ? 'general' : 'signal_response';
+  void kind; // single 'standalone' kind post-pivot; kept for the Phase-2 surface
+  return 'general';
 }
 
 function submitLabelFor(kind: DecisionDiaryContextKind): string {
-  switch (kind) {
-    case 'signal_reject':
-      return 'Reject';
-    case 'signal_defer':
-      return 'Defer';
-    case 'standalone':
-      return 'Save';
-  }
+  void kind;
+  return 'Save';
 }
 
 export function DecisionDiaryModal({

@@ -71,16 +71,20 @@ export interface UseSSEResult {
  */
 const INVALIDATE_KEYS: Readonly<Record<SSEEventType, readonly (readonly string[])[]>> = {
   signal: [['signals'], ['today-digest']],
-  fill: [['fills'], ['positions'], ['today-digest']],
+  // ['system','cycle'] / ['system','funding'] rows (crypto-pivot §3.9): a
+  // fill / position / pnl / risk-state change means the worker acted — the
+  // daily-cycle status and funding telemetry re-fetch on the existing event
+  // types (no new SSE event types, per the locked §3.7 rule).
+  fill: [['fills'], ['positions'], ['today-digest'], ['system', 'funding']],
   // 'order' is the terminal-without-fill path (cancellation, rejection) per
   // PR-epsilon / drill 6 defect #5. Invalidates orders + trades + today-digest;
   // 'signals' too because an entry-cancel can transition the signal status
   // back to a non-pending state. PR-G full-close path emits 'fill' so we
   // don't need positions here.
   order: [['orders'], ['trades'], ['signals'], ['today-digest']],
-  position: [['positions'], ['today-digest']],
-  pnl: [['today-digest']],
-  risk_state: [['system-status'], ['today-digest']],
+  position: [['positions'], ['today-digest'], ['system', 'cycle'], ['system', 'funding']],
+  pnl: [['today-digest'], ['system', 'cycle'], ['system', 'funding']],
+  risk_state: [['system-status'], ['today-digest'], ['system', 'cycle']],
   health: [['health-score'], ['today-digest']],
   alert: [['alerts'], ['today-digest']],
   audit: [['audit-log']],

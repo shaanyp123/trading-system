@@ -1,23 +1,26 @@
 'use client';
 
 /**
- * Positions Table -- frontend-spec §2.2.2 E.
+ * Positions Table -- frontend-spec §2.2.2 E, crypto-pivot §3.9 columns.
  *
- * Columns: Market | Qty | Avg Cost | Mark | uPnL | Cluster | Strategy Version.
- * Phase 0 returns positions=[] so the table renders the empty state.
+ * Columns: Product | Asset | Contracts | Entry VWAP | Mark | uPnL |
+ * Client stop | Native stop.
  *
- * Virtualization (TanStack Table + react-virtual) kicks in at >50 rows per
- * spec §2.2.2 E -- deferred since Phase 0 never exceeds 50. When live data
- * lands the virtualization wrapper layers on without changing the cell
- * rendering logic.
+ * Mark provenance: the header shows "Marks as of {time} ({source})" from
+ * the newest per-position `mark_observed_at_utc` + its `mark_source`
+ * (the backend's §3.9 mark ladder: live_ws → recon_eod →
+ * fallback_avg_cost). The retired bar-lag warning + `prices_as_of`
+ * tooltip died with bar_sync.
  *
- * Row click -> `/trades/:id` per spec; Day 22 just renders the row, no
- * navigation. The `/trades/:id` page is itself a Day 20 placeholder until
- * Week 7 Tue.
+ * The native-stop cell carries a warning affordance when the worker
+ * reports NO venue-resting native stop for a non-flat position
+ * (`native_stop_resting === false`) — the §3.1 3×ATR backstop should
+ * rest within 10 s of any position-opening fill.
  */
 
 import { usePositionsCurrent } from '@/lib/api/queries';
-import { formatPrice, formatPnL, pnlSignClass } from '@/lib/format';
+import type { Position } from '@/lib/api/types';
+import { formatPrice, formatPnL, formatTimeETShort, pnlSignClass } from '@/lib/format';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import {
   Table,
@@ -28,9 +31,27 @@ import {
   TableRow,
 } from '@/components/ui/table';
 
+/** The position with the newest observed mark — drives the header's
+ *  "Marks as of" line. Timestamp comparison only (no arithmetic). */
+function newestMarked(positions: readonly Position[]): Position | null {
+  let best: Position | null = null;
+  for (const p of positions) {
+    if (p.mark_observed_at_utc == null) continue;
+    if (
+      best?.mark_observed_at_utc == null ||
+      new Date(p.mark_observed_at_utc).getTime() >
+        new Date(best.mark_observed_at_utc).getTime()
+    ) {
+      best = p;
+    }
+  }
+  return best;
+}
+
 export function PositionsTable(): JSX.Element {
   const { data, isLoading, isError } = usePositionsCurrent();
   const positions = data?.positions ?? [];
+  const marked = newestMarked(positions);
 
   return (
     <Card>
@@ -39,9 +60,13 @@ export function PositionsTable(): JSX.Element {
           <CardTitle className="text-base">
             Positions <span className="text-text-muted">({positions.length})</span>
           </CardTitle>
-          {data?.prices_as_of != null && (
-            <span className="text-xs text-text-muted" title="Session date of the bars the marks were read from (bar_sync output)">
-              Prices as of {data.prices_as_of}
+          {marked?.mark_observed_at_utc != null && (
+            <span
+              className="text-xs text-text-muted"
+              title="When the newest mark behind these prices was observed, and which mark-ladder rung supplied it"
+            >
+              Marks as of {formatTimeETShort(marked.mark_observed_at_utc)}
+              {marked.mark_source != null && ` (${marked.mark_source})`}
             </span>
           )}
         </div>
@@ -62,19 +87,23 @@ export function PositionsTable(): JSX.Element {
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>Market</TableHead>
-                <TableHead className="text-right">Qty</TableHead>
-                <TableHead className="text-right">Avg Cost</TableHead>
+                <TableHead>Product</TableHead>
+                <TableHead>Asset</TableHead>
+                <TableHead className="text-right">Contracts</TableHead>
+                <TableHead className="text-right">Entry VWAP</TableHead>
                 <TableHead className="text-right">Mark</TableHead>
                 <TableHead className="text-right">uPnL</TableHead>
-                <TableHead>Cluster</TableHead>
-                <TableHead>Strategy</TableHead>
+                <TableHead className="text-right">Client stop</TableHead>
+                <TableHead className="text-right">Native stop</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {positions.map((p) => (
                 <TableRow key={p.instrument_id}>
                   <TableCell className="font-mono">{p.symbol}</TableCell>
+                  <TableCell className="text-text-secondary">
+                    {p.asset ?? '—'}
+                  </TableCell>
                   <TableCell className="text-right font-mono tabular-nums">
                     {p.qty}
                   </TableCell>
@@ -83,16 +112,6 @@ export function PositionsTable(): JSX.Element {
                   </TableCell>
                   <TableCell className="text-right font-mono tabular-nums">
                     {formatPrice(p.current_price)}
-                    {p.price_as_of != null &&
-                      data?.prices_as_of != null &&
-                      p.price_as_of !== data.prices_as_of && (
-                        <div
-                          className="text-[10px] font-sans text-severity-p1"
-                          title={`This market's bar lags the others (bar_sync may have skipped it)`}
-                        >
-                          ⚠ {p.price_as_of}
-                        </div>
-                      )}
                   </TableCell>
                   <TableCell
                     className={`text-right font-mono tabular-nums ${
@@ -101,11 +120,11 @@ export function PositionsTable(): JSX.Element {
                   >
                     {formatPnL(p.unrealized_pnl)}
                   </TableCell>
-                  <TableCell className="text-text-secondary">
-                    {p.cluster ?? '—'}
+                  <TableCell className="text-right font-mono tabular-nums">
+                    {formatPrice(p.client_stop_price)}
                   </TableCell>
-                  <TableCell className="font-mono text-text-muted">
-                    {p.managed_by_strategy_version}
+                  <TableCell className="text-right font-mono tabular-nums">
+                    <NativeStopCell position={p} />
                   </TableCell>
                 </TableRow>
               ))}
@@ -115,4 +134,26 @@ export function PositionsTable(): JSX.Element {
       </CardContent>
     </Card>
   );
+}
+
+/**
+ * Native-stop cell: the resting 3×ATR backstop price, with a warning
+ * affordance when the worker tracks NO venue-resting native stop for a
+ * non-flat position — a latent unprotected-position risk, not benign
+ * missing data. `native_stop_resting === null` (worker never ran) stays
+ * a plain "—": unknown, not alarmed.
+ */
+function NativeStopCell({ position }: { position: Position }): JSX.Element {
+  if (position.native_stop_resting === false && position.qty !== 0) {
+    return (
+      <span
+        className="inline-flex items-center gap-1 text-severity-p1"
+        title="No native stop resting at venue — the 3×ATR backstop is missing for this position"
+      >
+        <span aria-hidden>⚠</span>
+        <span>not resting</span>
+      </span>
+    );
+  }
+  return <>{formatPrice(position.native_stop_price)}</>;
 }

@@ -6,14 +6,15 @@
  * Per-row: time (ET) | market | qty | price | realized P&L. Phase 0 returns
  * fills=[] so the empty state renders.
  *
- * Spec §2.2.2 F: "ARIA: new fill → aria-live=polite announces 'Fill: /MES +1
- * at 5234.75'". Phase 1 SSE-driven announcements layer on once the
- * `<LiveRegion>` component lands. Day 22 ships the static rendering only.
+ * Spec §2.2.2 F: "ARIA: new fill → aria-live=polite announces 'Fill:
+ * BIP-20DEC30-CDE +1 at 64,120.00'". Phase 1 SSE-driven announcements layer
+ * on once the `<LiveRegion>` component lands. Day 22 ships the static
+ * rendering only.
  *
- * Stale threshold: 10s session / 60s off (spec §2.2.2 F). The query's 10s
- * staleTime in queries.ts matches; the stale yellow-corner-badge UX lands
- * when the SSE connection-status pill wires that into per-card badges (Day
- * 23+).
+ * Stale threshold: 10s (spec §2.2.2 F; crypto trades 24/7 so the
+ * session/off-session split is gone). The query's 10s staleTime in
+ * queries.ts matches; the stale yellow-corner-badge UX lands when the SSE
+ * connection-status pill wires that into per-card badges (Day 23+).
  */
 
 import { useRecentFills } from '@/lib/api/queries';

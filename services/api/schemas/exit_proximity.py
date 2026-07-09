@@ -1,204 +1,218 @@
 """services/api/schemas/exit_proximity.py — response models for /api/today/exit-proximity.
 
-PR-B of ``Docs/exit-proximity-design.md``. Mirrors ``signal_proximity``'s
-schema: a top-level ``as_of_cycle_ts_utc`` + a list of per-OPEN-POSITION records
-with one sub-object per exit trigger (stop / trend_flip / reversal /
-decommission).
+Crypto-pivot §3.9 (``Docs/crypto-pivot-delta-spec.md``): the exit-side
+"Stops" projection. The pre-pivot CME exit-trigger table (stop /
+trend-flip / reversal / decommission chips off the ``exit_proximity``
+table, ``Docs/exit-proximity-design.md``) died with the LEAN cycle;
+exit proximity is now **distance to the client 2xATR stop and the
+native 3xATR venue backstop** per open position, composed from
+``positions_current`` (+ ``contracts`` enrichment), the strategy
+worker's ``engine_state`` stops, the latest native-stop ``orders`` row,
+and the api-resident live mark store (``services/api/marks``).
 
-The internal repo model (``ExitProximityRow``) is flat for SQL efficiency; the
-API response is nested for frontend ergonomics — the Today page's "Exits"
-section (PR-C) renders a chip per trigger + a "Closest exit" column. This file
-owns the mapping.
+The URL is preserved; the response SHAPE is wire-breaking by design —
+the §3.9 PR swaps both sides atomically.
 
-The categorical Literals are imported from ``services.api.schemas.lean`` (the
-canonical wire-shape definitions, which PR-A pinned to the strategy enums) so
-there is one source of truth shared by the inbound heartbeat schema, the
-``exit_proximity`` CHECK constraints, and this outbound response.
+**Headroom convention** (server-computed; the frontend only formats):
+``(mark - stop) / mark`` for a long, ``(stop - mark) / mark`` for a
+short — a positive fraction is distance-to-stop remaining; None when
+either the mark or the stop is missing (no honest number to show).
+Decimal throughout per [A05]; quantized to 6 dp for a deterministic
+wire string.
 
-All numeric fields are emitted as Decimal-as-string per A05 / dev-guide §3.8.
-None values survive as JSON null (warming-up, no stop on record, or the binary
-triggers' absent headroom).
+**Ordering**: closest-to-stop first (smallest non-null headroom across
+the two stops), with stopped-today / unprotected rows (non-zero
+contracts but no native stop resting at the venue) sorted to the very
+top — the rows the operator must see first.
+
+Every mapper below is a pure function so the unit tests pin the math
+(``tests/unit/test_api_exit_proximity_route.py``) — no clock reads,
+no I/O.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Literal
+from typing import Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from services.api.repos.exit_proximity import ExitProximityRow
-from services.api.schemas.lean import (
-    ClosestExitLiteral,
-    ExitGateStatusLiteral,
-    ExitStateLiteral,
-)
-
 DirectionLiteral = Literal["long", "short"]
 
+#: Wire-determinism quantum for the headroom fractions (Decimal division
+#: otherwise widens the scale unpredictably).
+_HEADROOM_QUANTUM: Final[Decimal] = Decimal("0.000001")
 
-class ExitTriggerView(BaseModel):
-    """Per-trigger response sub-object — state + numeric headroom.
 
-    ``headroom`` is the deterioration pct for ``trend_flip``, the mark-vs-stop
-    pct for ``stop``, and always None for the binary ``reversal`` /
-    ``decommission`` triggers (and for the warming-up / no-stop-on-record
-    cases).
-    """
+class PositionStopProximityView(BaseModel):
+    """One open position's stop-proximity row (delta spec §3.9)."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    state: ExitStateLiteral
-    headroom: Decimal | None = Field(
+    product_id: str = Field(description="CDE product id (positions_current.market).")
+    asset: str | None = Field(
         default=None,
         description=(
-            "Numeric headroom. trend_flip: deterioration pct (close vs MA_FAST); "
-            "stop: (mark - stop)/mark for a long, mirrored for a short. None for "
-            "the binary reversal/decommission triggers, when warming up, or when "
-            "no working stop is on record."
+            "Base-asset label (BTC/ETH) from contracts.market_root; None "
+            "when the row has no contracts enrichment."
         ),
     )
-
-
-class PositionExitProximityView(BaseModel):
-    """One open position's row in the /api/today/exit-proximity response.
-
-    The Today page's "Exits" section renders one row per item; the closest-to-
-    closing position sorts to the top (the endpoint returns rows already ordered
-    per design §3.3, so the frontend can render in receipt order).
-    """
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    market: str
     direction: DirectionLiteral
-    cycle_ts_utc: datetime = Field(
-        ...,
-        description=(
-            "The LEAN cycle this row was emitted on. The top-level "
-            "``as_of_cycle_ts_utc`` is the MAX across all returned rows; per-row "
-            "cycle_ts_utc lets the frontend show 'last seen N hours ago'."
-        ),
-    )
-    session_date_et: str = Field(
-        ...,
-        pattern=r"^\d{4}-\d{2}-\d{2}$",
-        description="CME session date (ET wall-clock) — YYYY-MM-DD.",
-    )
-    held_days: int | None = Field(
+    contracts: int = Field(description="Signed net contracts held in this product.")
+    entry_vwap: Decimal | None = Field(
         default=None,
-        description="Calendar days held (None when opened_at is unknown).",
+        description="Quantity-weighted average entry price (positions_current.avg_cost).",
     )
-    held_days_headroom: int | None = Field(
+    mark: Decimal | None = Field(
         default=None,
         description=(
-            "MIN_HOLDING_DAYS - held_days. Positive = the trend-flip exit is "
-            "still blocked by the MIN_HOLDING floor (N days left); <= 0 = the "
-            "floor has cleared. None when held_days is unknown."
+            "Live WS mark from the api-resident mark store; None when the "
+            "store is absent or the mark exceeds the 3-minute staleness "
+            "policy (services/api/marks)."
         ),
     )
-    last_close: Decimal | None
-    stop_price: Decimal | None = Field(
+    marks_stale: bool = Field(
+        description=(
+            "The strategy worker's marks_stale flag; True (conservative) "
+            "when the worker has never reported."
+        ),
+    )
+    client_stop_price: Decimal | None = Field(
         default=None,
         description=(
-            "The joined working stop_market order's stop price (Q1 = (B)). None "
-            "when no working stop is on record — a latent POSITION_UNPROTECTED "
-            "signal (the stop chip renders 'no stop on record')."
+            "The worker's client-side 2xATR soft stop "
+            "(engine_state.client_stop_level); enforced by the 30 s risk loop."
         ),
     )
-    trend_flip: ExitTriggerView
-    stop: ExitTriggerView
-    reversal: ExitTriggerView
-    decommission: ExitTriggerView
-    overall_state: ExitStateLiteral
-    closest_exit: ClosestExitLiteral
-    gate_status: ExitGateStatusLiteral
+    client_stop_headroom_frac: Decimal | None = Field(
+        default=None,
+        description="Distance-to-client-stop fraction (module docstring convention).",
+    )
+    native_stop_price: Decimal | None = Field(
+        default=None,
+        description=(
+            "Resting venue 3xATR stop-limit backstop price (latest orders "
+            "row for the worker's native_stop_client_order_id)."
+        ),
+    )
+    native_stop_headroom_frac: Decimal | None = Field(
+        default=None,
+        description="Distance-to-native-stop fraction (module docstring convention).",
+    )
+    native_stop_resting: bool = Field(
+        description=(
+            "True when the worker tracks a venue-resting native stop order "
+            "id for this asset. False with non-zero contracts = UNPROTECTED."
+        ),
+    )
+    stopped_today: bool = Field(
+        description="True when the engine's stop fired on today's UTC bar-day.",
+    )
 
 
 class ExitProximityResponse(BaseModel):
-    """Top-level response for ``GET /api/today/exit-proximity``.
+    """``GET /api/today/exit-proximity`` envelope.
 
-    ``as_of_cycle_ts_utc`` is None when ``positions`` is empty — the
-    no-open-positions / pre-first-cycle empty state (design §7).
+    Fresh-DB / no-open-positions contract: ``positions`` is empty —
+    HTTP 200, never an error.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    as_of_cycle_ts_utc: datetime | None
-    positions: list[PositionExitProximityView]
+    positions: list[PositionStopProximityView]
+    server_now: datetime
 
 
-def row_to_view(row: ExitProximityRow) -> PositionExitProximityView:
-    """Map a repo row to the response sub-object.
+# ---------------------------------------------------------------------------
+# Pure mappers (math pinned by tests)
+# ---------------------------------------------------------------------------
 
-    The repo row is flat (one column per trigger state + one per headroom) so
-    SQL stays readable; this function does the small nesting walk so the API
-    contract matches the design. The binary reversal/decommission triggers carry
-    no headroom column, so their ``ExitTriggerView.headroom`` is always None.
+
+def stop_headroom_frac(
+    *,
+    mark: Decimal | None,
+    stop: Decimal | None,
+    direction: DirectionLiteral,
+) -> Decimal | None:
+    """Distance-to-stop as a fraction of the mark (module docstring).
+
+    ``(mark - stop)/mark`` for longs, ``(stop - mark)/mark`` for shorts;
+    None when either input is missing or the mark is non-positive (no
+    honest denominator).
     """
-    return PositionExitProximityView(
-        market=row.market,
-        direction=_direction_literal(row.direction),
-        cycle_ts_utc=row.cycle_ts_utc,
-        session_date_et=row.session_date_et,
-        held_days=row.held_days,
-        held_days_headroom=row.held_days_headroom,
-        last_close=row.last_close,
-        stop_price=row.stop_price,
-        trend_flip=ExitTriggerView(
-            state=_exit_state_literal(row.trend_flip_state),
-            headroom=row.trend_flip_headroom,
+    if mark is None or stop is None or mark <= 0:
+        return None
+    raw = (mark - stop) / mark if direction == "long" else (stop - mark) / mark
+    return raw.quantize(_HEADROOM_QUANTUM)
+
+
+def build_position_stop_view(
+    *,
+    product_id: str,
+    asset: str | None,
+    contracts: int,
+    entry_vwap: Decimal | None,
+    mark: Decimal | None,
+    marks_stale: bool,
+    client_stop_price: Decimal | None,
+    native_stop_price: Decimal | None,
+    native_stop_resting: bool,
+    stopped_today: bool,
+) -> PositionStopProximityView:
+    """Compose one row: direction from the sign of ``contracts`` + the two
+    server-computed headroom fractions. ``contracts`` must be non-zero
+    (flat rows are filtered by the caller)."""
+    direction: DirectionLiteral = "long" if contracts > 0 else "short"
+    return PositionStopProximityView(
+        product_id=product_id,
+        asset=asset,
+        direction=direction,
+        contracts=contracts,
+        entry_vwap=entry_vwap,
+        mark=mark,
+        marks_stale=marks_stale,
+        client_stop_price=client_stop_price,
+        client_stop_headroom_frac=stop_headroom_frac(
+            mark=mark, stop=client_stop_price, direction=direction
         ),
-        stop=ExitTriggerView(
-            state=_exit_state_literal(row.stop_state),
-            headroom=row.stop_headroom_pct,
+        native_stop_price=native_stop_price,
+        native_stop_headroom_frac=stop_headroom_frac(
+            mark=mark, stop=native_stop_price, direction=direction
         ),
-        reversal=ExitTriggerView(
-            state=_exit_state_literal(row.reversal_state),
-            headroom=None,
-        ),
-        decommission=ExitTriggerView(
-            state=_exit_state_literal(row.decommission_state),
-            headroom=None,
-        ),
-        overall_state=_exit_state_literal(row.overall_state),
-        closest_exit=_closest_exit_literal(row.closest_exit),
-        gate_status=_gate_status_literal(row.gate_status),
+        native_stop_resting=native_stop_resting,
+        stopped_today=stopped_today,
     )
 
 
-def _exit_state_literal(value: str) -> ExitStateLiteral:
-    """Narrow a DB string to ExitStateLiteral. The CHECK constraint on
-    ``exit_proximity`` already restricts the universe; this is the type-narrow
-    for mypy + a defense-in-depth re-validation."""
-    if value not in ("holding", "near", "triggered"):
-        raise ValueError(f"unexpected exit state in exit_proximity row: {value!r}")
-    return value  # type: ignore[return-value]
+def _sort_key(view: PositionStopProximityView) -> tuple[int, Decimal, str]:
+    """Closest-to-stop first; stopped/unprotected rows before everything.
+
+    Primary: attention group (stopped today OR no native stop resting =
+    0, else 1). Secondary: MIN non-null headroom ascending (rows with no
+    computable headroom sort last within their group via +Infinity).
+    Tertiary: product_id for a stable, deterministic order.
+    """
+    attention = 0 if (view.stopped_today or not view.native_stop_resting) else 1
+    headrooms = [
+        h for h in (view.client_stop_headroom_frac, view.native_stop_headroom_frac) if h is not None
+    ]
+    min_headroom = min(headrooms) if headrooms else Decimal("Infinity")
+    return (attention, min_headroom, view.product_id)
 
 
-def _closest_exit_literal(value: str) -> ClosestExitLiteral:
-    if value not in ("stop", "reversal", "trend_flip", "decommission"):
-        raise ValueError(f"unexpected closest_exit in exit_proximity row: {value!r}")
-    return value  # type: ignore[return-value]
-
-
-def _gate_status_literal(value: str) -> ExitGateStatusLiteral:
-    if value not in ("active", "warming_up", "min_holding_blocked", "decommissioned"):
-        raise ValueError(f"unexpected gate_status in exit_proximity row: {value!r}")
-    return value  # type: ignore[return-value]
-
-
-def _direction_literal(value: str) -> DirectionLiteral:
-    if value not in ("long", "short"):
-        raise ValueError(f"unexpected direction in exit_proximity row: {value!r}")
-    return value  # type: ignore[return-value]
+def sort_stop_views(
+    views: list[PositionStopProximityView],
+) -> list[PositionStopProximityView]:
+    """Return a NEW list ordered per :func:`_sort_key` (input unmutated)."""
+    return sorted(views, key=_sort_key)
 
 
 __all__ = [
     "DirectionLiteral",
     "ExitProximityResponse",
-    "ExitTriggerView",
-    "PositionExitProximityView",
-    "row_to_view",
+    "PositionStopProximityView",
+    "build_position_stop_view",
+    "sort_stop_views",
+    "stop_headroom_frac",
 ]

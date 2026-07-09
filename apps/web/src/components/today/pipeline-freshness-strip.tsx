@@ -1,23 +1,34 @@
 'use client';
 
 /**
- * Pipeline Freshness Strip — "did the backend run today?" at a glance.
+ * Pipeline Freshness Strip — "did the backend run today?" at a glance
+ * (crypto-pivot §3.9).
  *
- * Shows the three daily cycle timestamps in order — bar_sync (price date) →
- * LEAN cycle (signals + exits) → EOD recon (balances) — each with a coloured
- * dot: green = ran recently, amber = stale (didn't run in the last cycle),
- * grey = unknown / no data yet.
+ * Four stages of the 24/7 crypto daily cycle, in order:
  *
- * Assembled purely from data the Today page already fetches — no new endpoint:
- *   - bar_sync  ← positions `prices_as_of` (the latest synced bar's date)
- *   - LEAN      ← exit-proximity `as_of_cycle_ts_utc` (the strategy cycle ts)
- *   - recon     ← system-status `reconciliation_summary.last_check_utc`
- * "now" is the server clock (`system_status.server_now`), so freshness is
- * judged against backend time, not the browser's.
+ *   Market data → 00:05 decision → Risk loop → 00:15 recon
+ *
+ * each with a coloured dot: green = fresh, amber = stale, grey = unknown
+ * (worker never reported / no data yet).
+ *
+ *   - Market data ← `useSystemCycle().worker.marks_stale` (the strategy
+ *     worker's own 3-minute mark-staleness watchdog; grey when the
+ *     worker row is absent).
+ *   - 00:05 decision ← `decision.decided_at_utc` within 26h (one daily
+ *     decision + 2h grace), labelled with the decision status
+ *     (completed vs skipped_*).
+ *   - Risk loop ← `worker.heartbeat_fresh` (30 s loop; fresh ≤ 90 s,
+ *     classified server-side).
+ *   - 00:15 recon ← system-status `reconciliation_summary.last_check_utc`
+ *     within 30h.
+ *
+ * Thresholds are UTC-anchored (the cycle is a UTC-clock creature);
+ * timestamps render America/New_York via `formatDateTimeET` per [A07].
+ * "now" is the server clock, so freshness is judged against backend
+ * time, not the browser's.
  */
 
-import { useExitProximity } from '@/lib/api/exit-proximity';
-import { usePositionsCurrent, useSystemStatus } from '@/lib/api/queries';
+import { useSystemCycle, useSystemStatus } from '@/lib/api/queries';
 import { formatDateTimeET, isWithinHours } from '@/lib/format';
 
 type Fresh = boolean | null;
@@ -48,47 +59,66 @@ function FreshnessItem({
 }
 
 export function PipelineFreshnessStrip(): JSX.Element {
-  const { data: positions } = usePositionsCurrent();
-  const { data: exitProximity } = useExitProximity();
+  const { data: cycle } = useSystemCycle();
   const { data: systemStatus } = useSystemStatus();
 
-  const now = systemStatus?.server_now ?? null;
+  const worker = cycle?.worker ?? null;
+  const decision = cycle?.decision ?? null;
+  const cycleNow = cycle?.server_now ?? null;
+  const statusNow = systemStatus?.server_now ?? null;
 
-  // bar_sync: prices_as_of is a YYYY-MM-DD date; anchor it at ~21:00 UTC (the
-  // bar_sync fire time) to judge recency. Wider window (50h) tolerates a
-  // Monday viewing Friday's bar over a weekend gap.
-  const barDate = positions?.prices_as_of ?? null;
-  const barTs = barDate != null ? `${barDate}T21:00:00Z` : null;
+  // Market data: the worker's own staleness watchdog; grey until the
+  // worker has ever reported.
+  const marksFresh: Fresh = worker == null ? null : !worker.marks_stale;
+  const marksValue = worker == null ? '—' : worker.marks_stale ? 'stale' : 'live';
 
-  const leanTs = exitProximity?.as_of_cycle_ts_utc ?? null;
+  // 00:05 decision: one per UTC day; 26h = one cycle + 2h grace.
+  const decidedAt = decision?.decided_at_utc ?? null;
+  const decisionValue =
+    decision == null
+      ? '—'
+      : `${decision.status} · ${formatDateTimeET(decidedAt)}`;
+
+  // Risk loop: server-side freshness classification (30 s loop, fresh ≤ 90 s).
+  const heartbeatFresh: Fresh = worker == null ? null : worker.heartbeat_fresh;
+
   const reconTs = systemStatus?.reconciliation_summary?.last_check_utc ?? null;
 
   return (
     <div className="mb-4 flex flex-wrap items-center gap-x-6 gap-y-2 rounded-md border border-border bg-bg-surface px-4 py-2 text-xs">
       <span className="font-mono uppercase tracking-wide text-text-muted">Today’s pipeline</span>
       <FreshnessItem
-        label="Bars"
-        value={barDate ?? '—'}
-        fresh={isWithinHours(barTs, 50, now)}
-        title="bar_sync — session date of the latest synced bars (drives the marks)"
+        label="Market data"
+        value={marksValue}
+        fresh={marksFresh}
+        title="Coinbase WS marks — the strategy worker's 3-minute staleness watchdog"
       />
       <span className="text-text-muted" aria-hidden>
         →
       </span>
       <FreshnessItem
-        label="LEAN cycle"
-        value={formatDateTimeET(leanTs)}
-        fresh={isWithinHours(leanTs, 30, now)}
-        title="The daily strategy cycle — emits signals + evaluates exits"
+        label="00:05 decision"
+        value={decisionValue}
+        fresh={isWithinHours(decidedAt, 26, cycleNow)}
+        title="The daily strategy decision at 00:05 UTC — per-asset score → target → action"
       />
       <span className="text-text-muted" aria-hidden>
         →
       </span>
       <FreshnessItem
-        label="EOD recon"
+        label="Risk loop"
+        value={formatDateTimeET(worker?.risk_loop_heartbeat_utc ?? null)}
+        fresh={heartbeatFresh}
+        title="The 30 s risk loop — client stops, liquidation buffer, halt checks"
+      />
+      <span className="text-text-muted" aria-hidden>
+        →
+      </span>
+      <FreshnessItem
+        label="00:15 recon"
         value={formatDateTimeET(reconTs)}
-        fresh={isWithinHours(reconTs, 30, now)}
-        title="Reconciliation — positions/balances checked against the broker"
+        fresh={isWithinHours(reconTs, 30, statusNow)}
+        title="Reconciliation — positions/balances checked against Coinbase at 00:15 UTC"
       />
     </div>
   );
