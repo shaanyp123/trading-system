@@ -365,33 +365,84 @@ class TestOtherParsers:
         assert summary.liquidation_buffer_percentage == Decimal("85")
         assert summary.initial_margin is None  # omitted → None, never zero
 
-    def test_parse_perp_product_ref(self) -> None:
-        raw = {
+    @staticmethod
+    def _live_perp_raw() -> dict[str, Any]:
+        """Trimmed REAL-SHAPE BIP-20DEC30-CDE payload (live probes
+        2026-07-09): EXPIRING label + far expiry, funding directly on
+        future_product_details, EMPTY base_display_symbol /
+        base_currency_id (contract_root_unit is the populated one),
+        perpetual_details non-null but funding-empty (the trap)."""
+        return {
             "product_id": "BIP-20DEC30-CDE",
             "product_type": "FUTURE",
-            "product_venue": "CDE",
+            "product_venue": "FCM",
             "price_increment": "5",
+            "base_display_symbol": "",
+            "base_currency_id": "",
+            "display_name": "Bitcoin Perpetual",
+            "trading_disabled": False,
+            "view_only": False,
+            "future_product_details": {
+                "venue": "cde",
+                "contract_size": "0.01",
+                "contract_expiry": "2030-12-20T16:00:00Z",
+                "contract_expiry_type": "EXPIRING",
+                "contract_root_unit": "BTC",
+                "funding_interval": "3600s",
+                "funding_rate": "0.000005",
+                "funding_time": "2026-07-09T16:00:00Z",
+                "perpetual_details": {"open_interest": "12345", "funding_rate": ""},
+            },
+        }
+
+    def test_parse_perp_product_ref_live_shape(self) -> None:
+        ref = parse_perp_product_ref(self._live_perp_raw())
+        assert ref is not None
+        assert ref.product_id == "BIP-20DEC30-CDE"
+        # base extracted via the contract_root_unit fallback (the
+        # base_display_symbol/base_currency_id fields are empty live)
+        assert ref.base_asset == "BTC"
+        assert ref.contract_size == Decimal("0.01")
+        assert ref.tick_size == Decimal("5")
+        assert ref.trading_disabled is False
+
+    def test_parse_perp_product_ref_dated_is_none(self) -> None:
+        raw = self._live_perp_raw()
+        raw["product_id"] = "BIT-28AUG26-CDE"
+        raw["view_only"] = True
+        details = raw["future_product_details"]
+        details["contract_expiry"] = "2026-08-28T16:00:00Z"
+        details["funding_interval"] = None
+        details["funding_rate"] = ""
+        details["funding_time"] = None
+        assert parse_perp_product_ref(raw) is None  # dated: no funding mechanics
+
+    def test_parse_perp_product_ref_intx_is_none(self) -> None:
+        # Offshore INTX perp: the only place the literal PERPETUAL label
+        # lives. Rejected by venue even with funding + spec populated
+        # (locked: no offshore venues, [A13] revised).
+        raw = {
+            "product_id": "BTC-PERP-INTX",
+            "product_type": "FUTURE",
+            "product_venue": "INTX",
+            "price_increment": "1",
             "base_display_symbol": "BTC",
             "trading_disabled": False,
             "future_product_details": {
-                "contract_size": "0.01",
+                "venue": "intx",
+                "contract_size": "1",
                 "contract_expiry_type": "PERPETUAL",
-                "perpetual_details": {"funding_rate": "0.00001"},
+                "funding_interval": "3600s",
+                "funding_rate": "0.0000021",
+                "perpetual_details": {"funding_rate": "0.0000021"},
             },
         }
-        ref = parse_perp_product_ref(raw)
-        assert ref is not None
-        assert ref.base_asset == "BTC"
-        assert ref.contract_size == Decimal("0.01")
+        assert parse_perp_product_ref(raw) is None
 
     def test_parse_perp_product_ref_missing_spec_is_none(self) -> None:
-        raw = {
-            "product_id": "BIP-20DEC30-CDE",
-            "product_type": "FUTURE",
-            "product_venue": "CDE",
-            "base_display_symbol": "BTC",
-            "future_product_details": {"contract_expiry_type": "PERPETUAL"},
-        }
+        raw = self._live_perp_raw()
+        del raw["price_increment"]
+        raw["future_product_details"].pop("contract_size")
         assert parse_perp_product_ref(raw) is None  # no contract/tick size
 
     def test_parse_perp_product_ref_spot_is_none(self) -> None:

@@ -26,7 +26,10 @@ Root-cause discipline per dev-guide §1.3.
    then log-and-drop as `coinbase_market_data_alert_dropped_no_hook`).
 2. **WS connect.** `... logs api | grep coinbase_ws_connected` → shows the
    subscribed `product_ids` (must include `BTC-USD`, `ETH-USD`, plus every
-   discovered `*-CDE` perp; discovery failure logs
+   discovered perp-style CDE product — e.g. `BIP-20DEC30-CDE` /
+   `ETP-20DEC30-CDE`, the EXPIRING-labeled 2030-expiry contracts with
+   hourly funding — and must NOT be the whole dated `*-CDE` futures
+   list; discovery failure logs
    `coinbase_ws_product_discovery_failed` and subscribes spot only — that
    is a degraded state worth investigating, not a pass).
 3. **Public REST reachability** (from the VPS, outside the container is fine):

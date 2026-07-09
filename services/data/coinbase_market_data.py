@@ -111,6 +111,20 @@ CDE_FUNDING_INTERVAL_HOURS: Final[Decimal] = Decimal("1")
 #: ``BIP-20DEC30-CDE``). A structural venue marker, not a product ID.
 CDE_PRODUCT_ID_SUFFIX: Final[str] = "-CDE"
 
+#: ``product_venue`` values marking the US CDE/FCM futures listing.
+#: Live venue truth (operator probes, 2026-07-09): the FUTURE products
+#: payload reports ``product_venue: "FCM"`` with
+#: ``future_product_details.venue: "cde"``; either field, or the
+#: ``-CDE`` product-id suffix, marks a US CDE listing.
+US_CDE_VENUE_FIELD_VALUES: Final[frozenset[str]] = frozenset({"CDE", "FCM"})
+
+#: Coinbase International (INTX) markers — offshore, non-US venue.
+#: Locked decision: no offshore venues ([A13] revised). Checked
+#: *negatively* so a ``*-PERP-INTX`` product can never classify, even
+#: though INTX is the only place the venue's literal ``PERPETUAL``
+#: expiry label exists.
+INTX_PRODUCT_ID_SUFFIX: Final[str] = "-INTX"
+
 
 # --------------------------------------------------------------------------
 # DTOs + pure parsers
@@ -174,37 +188,79 @@ def _coerce_decimal(value: object) -> Decimal | None:
 
 
 def parse_perp_product(raw: Mapping[str, Any]) -> PerpProductSnapshot | None:
-    """Classify + parse one products-endpoint entry as a CDE perp product.
+    """Classify + parse one products-endpoint entry as a CDE perp-style product.
 
-    Returns ``None`` for anything that isn't a CDE perpetual-style
-    future. Filters are structural (venue suffix / venue field /
-    perpetual marker), never an ID whitelist ([A13] revised — product
-    IDs encode expiry and new series appear).
+    Returns ``None`` for anything that isn't a US CDE perpetual-style
+    future. Filters are structural, never an ID whitelist ([A13]
+    revised — product IDs encode expiry and new series appear).
+
+    Live venue truth (operator probes, 2026-07-09):
+
+    * US perpetual-style futures (e.g. ``BIP-20DEC30-CDE``) are
+      API-labeled ``contract_expiry_type: "EXPIRING"`` with a far
+      (2030) expiry — the literal ``PERPETUAL`` label exists only on
+      offshore ``*-PERP-INTX`` products (Coinbase International),
+      which are excluded here by venue (locked: no offshore venues).
+    * What distinguishes perp-style from dated CDE futures is funding
+      mechanics directly on ``future_product_details``:
+      ``funding_interval`` non-empty (``"3600s"``, the stable marker)
+      and/or a non-empty ``funding_rate`` string. Dated contracts
+      carry ``funding_interval: null`` + ``funding_rate: ""``.
+    * ``perpetual_details`` is present as a non-null object on BOTH
+      perp-style AND dated products (its own funding fields are empty
+      even on true perps) — its presence/truthiness is deliberately
+      NOT used as a discriminator.
     """
     product_id = str(raw.get("product_id") or "")
     if not product_id:
         return None
     if str(raw.get("product_type") or "").upper() != "FUTURE":
         return None
-    venue = str(raw.get("product_venue") or "").upper()
-    if venue != "CDE" and not product_id.upper().endswith(CDE_PRODUCT_ID_SUFFIX):
-        return None
+
     details = raw.get("future_product_details")
     details_map: Mapping[str, Any] = details if isinstance(details, Mapping) else {}
+
+    # Venue gate (locked: no offshore venues, [A13] revised). Reject
+    # anything marked INTX outright — even a literal PERPETUAL label
+    # must never let a Coinbase International product classify — then
+    # require a positive US CDE/FCM marker.
+    venue = str(raw.get("product_venue") or "").upper()
+    details_venue = str(details_map.get("venue") or "").upper()
+    pid_upper = product_id.upper()
+    if venue == "INTX" or details_venue == "INTX" or pid_upper.endswith(INTX_PRODUCT_ID_SUFFIX):
+        return None
+    is_us_cde = (
+        venue in US_CDE_VENUE_FIELD_VALUES
+        or details_venue == "CDE"
+        or pid_upper.endswith(CDE_PRODUCT_ID_SUFFIX)
+    )
+    if not is_us_cde:
+        return None
+
     perp_details = details_map.get("perpetual_details")
     perp_map: Mapping[str, Any] = perp_details if isinstance(perp_details, Mapping) else {}
-    # Perpetual marker: an explicit perpetual_details block, or the
-    # contract_expiry_type saying PERPETUAL. Dated CDE futures (also
-    # product_type=FUTURE, same venue) are excluded here.
+
+    # Perp-style gate: funding mechanics on future_product_details.
+    # Either funding field suffices (robust to one briefly blanking
+    # between funding cycles; funding_interval is the stable one). The
+    # literal PERPETUAL expiry label is kept for forward-compat should
+    # the US listing ever adopt it — INTX products carrying it are
+    # already excluded by the venue gate above.
+    funding_interval = str(details_map.get("funding_interval") or "").strip()
+    funding_rate_str = str(details_map.get("funding_rate") or "").strip()
     expiry_type = str(details_map.get("contract_expiry_type") or "").upper()
-    if not perp_map and expiry_type != "PERPETUAL":
+    if not funding_interval and not funding_rate_str and expiry_type != "PERPETUAL":
         return None
 
     trading_disabled_raw = raw.get("trading_disabled")
     is_disabled_raw = raw.get("is_disabled")
+    view_only_raw = raw.get("view_only")
+    disabled_flags = (trading_disabled_raw, is_disabled_raw, view_only_raw)
     trading_disabled: bool | None
-    if isinstance(trading_disabled_raw, bool) or isinstance(is_disabled_raw, bool):
-        trading_disabled = bool(trading_disabled_raw) or bool(is_disabled_raw)
+    if any(isinstance(flag, bool) for flag in disabled_flags):
+        # view_only counts as not-tradable: live dated contracts carry
+        # view_only=true while trading_disabled=false.
+        trading_disabled = any(bool(flag) for flag in disabled_flags)
     else:
         trading_disabled = None
 
@@ -218,7 +274,12 @@ def parse_perp_product(raw: Mapping[str, Any]) -> PerpProductSnapshot | None:
         ),
         maintenance_margin_requirement=_coerce_decimal(details_map.get("maintenance_margin_rate")),
         trading_disabled=trading_disabled,
-        funding_rate_per_interval=_coerce_decimal(perp_map.get("funding_rate")),
+        # Live truth: the real funding rate lives directly on
+        # future_product_details; perpetual_details.funding_rate is
+        # empty even on true perps (kept only as a legacy fallback).
+        funding_rate_per_interval=_coerce_decimal(
+            details_map.get("funding_rate") or perp_map.get("funding_rate")
+        ),
         mark_price=_coerce_decimal(perp_map.get("mark_price") or raw.get("price")),
         raw=dict(raw),
     )
@@ -1007,7 +1068,9 @@ __all__ = [
     "CDE_PRODUCT_ID_SUFFIX",
     "DEFAULT_REST_BASE_URL",
     "DEFAULT_WS_URL",
+    "INTX_PRODUCT_ID_SUFFIX",
     "SPOT_SIGNAL_PRODUCT_IDS",
+    "US_CDE_VENUE_FIELD_VALUES",
     "CoinbaseMarketDataConfig",
     "CoinbaseMarketDataWorker",
     "CoinbaseRestError",

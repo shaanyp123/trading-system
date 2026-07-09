@@ -97,20 +97,26 @@ async def session_factory(pg_url: str) -> AsyncIterator[async_sessionmaker[Async
 
 
 def _perp_raw(product_id: str, funding: str | None = "0.0000125") -> dict[str, Any]:
-    perp_details: dict[str, Any] = {}
-    if funding is not None:
-        perp_details = {"funding_rate": funding}
+    """Trimmed REAL-SHAPE US perp-style payload (live probes 2026-07-09):
+    EXPIRING label + far expiry + funding directly on future_product_details;
+    perpetual_details non-null but funding-empty (the classifier trap)."""
     return {
         "product_id": product_id,
         "product_type": "FUTURE",
-        "product_venue": "CDE",
+        "product_venue": "FCM",
         "price": "100000.5",
         "price_increment": "5",
         "trading_disabled": False,
+        "view_only": False,
         "future_product_details": {
+            "venue": "cde",
             "contract_size": "0.01",
-            "contract_expiry_type": "PERPETUAL",
-            "perpetual_details": perp_details,
+            "contract_expiry": "2030-12-20T16:00:00Z",
+            "contract_expiry_type": "EXPIRING",
+            "contract_root_unit": "BTC",
+            "funding_interval": "3600s",
+            "funding_rate": funding if funding is not None else "",
+            "perpetual_details": {"open_interest": "12345", "funding_rate": ""},
             "initial_margin_rate": "0.2",
             "maintenance_margin_rate": "0.1",
         },
