@@ -7,8 +7,9 @@ Runs during the live-money cutover ceremony (per
 ``--mint-from-defaults`` — to seed paper's baseline ``parameter_sets`` head row
 (``Docs/parameter-sets-bootstrap-design.md`` §7 PR-A). Writes up to three rows:
 
-  1. ``accounts`` — the live IBKR account row (default external_account_id
-     ``U25655583`` per operator memory + cutover plan §10 step 1).
+  1. ``accounts`` — the broker account row. ``--external-account-id`` is
+     REQUIRED (2026-07-09: the old ``U25655583`` IBKR default was a CME-era
+     fossil; the crypto paper convention is ``operator``).
   2. ``risk_state`` — bootstrap row at state=``NORMAL``, severity=NULL,
      reason=``live_cutover``, is_current=TRUE. The audit_event_uuid slot
      is filled with a fresh UUID4 — matches the test-fixture pattern in
@@ -86,14 +87,14 @@ Usage::
 
     # Stage 1 — minimum: account row + risk_state row.
     python -m scripts.operator_tools.bootstrap_live_account \\
-        --external-account-id U25655583 \\
+        --external-account-id <broker-account-id> \\
         --env live-small \\
         --allow-non-paper \\
         --no-dry-run --confirm
 
     # Stage 2 — also seed parameter_sets head row from paper extract:
     python -m scripts.operator_tools.bootstrap_live_account \\
-        --external-account-id U25655583 \\
+        --external-account-id <broker-account-id> \\
         --env live-small \\
         --parameter-set-json /tmp/paper_param_set_head.json \\
         --allow-non-paper \\
@@ -175,9 +176,6 @@ EXIT_UNEXPECTED: Final[int] = 99
 _ALLOWED_ENVS: Final[tuple[str, ...]] = ("paper", "live-small", "live-scale")
 EnvName = Literal["paper", "live-small", "live-scale"]
 
-#: Operator's live IBKR account number per memory + cutover plan §10 step 1.
-DEFAULT_LIVE_EXTERNAL_ACCOUNT_ID: Final[str] = "U25655583"
-
 #: DB connection env var. Mirrors other operator_tools scripts.
 DATABASE_URL_ENV: Final[str] = "DATABASE_URL"
 
@@ -188,7 +186,8 @@ class ParsedArgs:
     through argparse so they don't have to fight stderr capture.
     """
 
-    external_account_id: str
+    #: None only in --seed-params-only mode (validated in parse_args).
+    external_account_id: str | None
     env: EnvName
     parameter_set_json: Path | None
     mint_from_defaults: bool
@@ -209,10 +208,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--external-account-id",
-        default=DEFAULT_LIVE_EXTERNAL_ACCOUNT_ID,
+        default=None,
         help=(
-            f"IBKR account number (default: {DEFAULT_LIVE_EXTERNAL_ACCOUNT_ID!r}). "
-            "Persisted to accounts.external_account_id."
+            "Broker account identifier persisted to "
+            "accounts.external_account_id. REQUIRED unless "
+            "--seed-params-only (which never touches accounts). The old "
+            "default was the retired IBKR number ('U25655583', a CME-era "
+            "fossil); the crypto paper convention is 'operator' "
+            "(decisions-log 2026-07-09). Requiring it explicitly prevents "
+            "a silent wrong-account bootstrap."
         ),
     )
     parser.add_argument(
@@ -319,8 +323,14 @@ def parse_args(argv: list[str]) -> ParsedArgs:
             "--parameter-set-json <file> (load a pre-extracted row). Without one "
             "there is nothing to seed."
         )
+    if parsed.external_account_id is None and not parsed.seed_params_only:
+        raise ValueError(
+            "--external-account-id is required for a full bootstrap (it is "
+            "persisted to accounts.external_account_id; the crypto paper "
+            "convention is 'operator'). Only --seed-params-only may omit it."
+        )
     return ParsedArgs(
-        external_account_id=str(parsed.external_account_id),
+        external_account_id=parsed.external_account_id,
         env=parsed.env,
         parameter_set_json=parsed.parameter_set_json,
         mint_from_defaults=bool(parsed.mint_from_defaults),
@@ -627,6 +637,8 @@ async def _amain(args: ParsedArgs) -> int:
             # + a second is_current risk_state row. The operator almost
             # certainly wants --seed-params-only (already-bootstrapped env) or
             # to pass --external-account-id matching the existing account.
+            if args.external_account_id is None:  # parse_args guarantees this
+                raise AssertionError("external_account_id is None outside --seed-params-only")
             existing_owners = await _fetch_active_owner_accounts(session_factory)
             mismatched = [
                 (aid, ext) for aid, ext in existing_owners if ext != args.external_account_id
@@ -712,7 +724,6 @@ if __name__ == "__main__":
 
 __all__ = [
     "DATABASE_URL_ENV",
-    "DEFAULT_LIVE_EXTERNAL_ACCOUNT_ID",
     "EXIT_ACCOUNT_MISMATCH",
     "EXIT_BAD_ARGS",
     "EXIT_BAD_PARAM_SET_JSON",
