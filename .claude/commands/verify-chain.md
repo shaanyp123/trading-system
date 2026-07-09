@@ -17,9 +17,8 @@ Generates the exact operator-side SSH ceremony for running `services/audit/verif
 3. **Output the ceremony** in a copy-paste-ready block:
 
 ```bash
-# Step 1: Decrypt sops + extract app_service password
-export SOPS_AGE_KEY_FILE="$HOME/.config/sops/age/keys.txt"
-APP_SERVICE_PW=$(sops -d secrets/<env>.enc.yaml | yq '.postgres.app_service_password' -r)
+# Step 1: Extract app_service password from the host secrets file
+APP_SERVICE_PW=$(yq '.postgres.app_service_password' -r /opt/trading-secrets/secrets.yaml)
 
 # Step 2: Stage DATABASE_URL (subshell-local; never displayed)
 export DATABASE_URL="postgresql://app_service:${APP_SERVICE_PW}@postgres:5432/trading"
@@ -47,7 +46,7 @@ unset APP_SERVICE_PW DATABASE_URL PSQL_PW
 4. **Substitute `<env>`** with the actual env arg in all 5 occurrences.
 
 5. **Anti-pattern reminders:**
-   - Per memory `feedback_secret_handling.md`: NEVER display the sops decrypt output. NEVER `echo $APP_SERVICE_PW`. NEVER `cat /tmp/decrypted`.
+   - Per memory `feedback_secret_handling.md`: NEVER display the secrets file content. NEVER `echo $APP_SERVICE_PW`. NEVER `cat` the secrets file.
    - Per memory `feedback_no_destructive_shortcuts.md`: if `verify_chain` exits 1 (CHAIN BREAK), DO NOT try to "fix" the chain — escalate immediately. Audit-chain breaks are incident-level events per `Docs/backend-spec.md` §2.10.
 
 6. **Output expected timing:** for a clean chain at current row count (~64 rows as of 2026-05-18 per file-index.md), verify_chain completes in <2s. For 100K+ rows, expect ~30s.

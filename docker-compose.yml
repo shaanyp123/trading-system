@@ -193,15 +193,15 @@ services:
       API_DB_NAME: trading
       # Crypto-pivot C0-B2b: the IBKR clientId + EOD position-source
       # passthroughs died with the IBKR execution layer. Coinbase
-      # execution credentials arrive via the sops-decrypted bundle
+      # execution credentials arrive via the host secrets file
       # (services/api/entrypoint.py), not compose env.
-    # Bind-mount the host-decrypted secrets directory. `deploy/day5-bringup.sh`
-    # runs `sops -d` on the host and writes /opt/trading/secrets-decrypted/
-    # decrypted.yaml — the api entrypoint reads it at /run/secrets/decrypted.yaml.
-    # SECRETS_DIR is set in deploy/.env (default kept here for clarity).
+    # Bind-mount the host secrets directory (plain-YAML secrets.yaml,
+    # authored per deploy/secrets.template.yaml — the sops pipeline is
+    # retired, decisions-log 2026-07-09). Entrypoints read it at
+    # /run/secrets/secrets.yaml. SECRETS_DIR is set in deploy/.env.
     #
     volumes:
-      - ${SECRETS_DIR:-/opt/trading/secrets-decrypted}:/run/secrets:ro
+      - ${SECRETS_DIR:-/opt/trading-secrets}:/run/secrets:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -293,7 +293,7 @@ services:
   #   internal — bot calls api over http://api:8000 (no Caddy hop)
   #   egress   — Discord gateway WebSocket (gateway.discord.gg) needs
   #              outbound TLS
-  # Auth: shared sops-decrypted bearer token per backend-spec §6.6 +
+  # Auth: shared secrets-file bearer token per backend-spec §6.6 +
   # §4.4. The api-side validator is services/api/middleware.BotAuthMiddleware.
   # See deploy/discord_bot/README.md for the operator runbook.
   discord_bot:
@@ -309,11 +309,11 @@ services:
       LOG_LEVEL: ${BOT_LOG_LEVEL:-INFO}
       API_BASE_URL: ${BOT_API_BASE_URL:-http://api:8000}
       # DISCORD_BOT_TOKEN, DISCORD_GUILD_ID, DISCORD_BOT_API_BEARER_TOKEN
-      # come in via the sops-decrypted bundle volume below + the bot's
+      # come in via the secrets volume below + the bot's
       # entrypoint reads them as bare DISCORD_*/* env vars (no API_*
       # prefix — bot's pydantic-settings uses env_prefix="").
     volumes:
-      - ${SECRETS_DIR:-/opt/trading/secrets-decrypted}:/run/secrets:ro
+      - ${SECRETS_DIR:-/opt/trading-secrets}:/run/secrets:ro
     depends_on:
       api:
         condition: service_healthy
@@ -334,7 +334,7 @@ services:
     # PR #106 follow-up (2026-05-12): long-lived SSE subscriber. Drains
     # the api's /api/sse/events stream and POSTs Discord embeds to the
     # #signals + #fills channels (via discord.webhook_urls.signals /
-    # .fills from sops). The operator's alert smoke runbook
+    # .fills from the secrets file). The operator's alert smoke runbook
     # (deploy/webhook_pusher/README.md) still works via `docker compose
     # exec webhook_pusher /opt/venv/bin/python -m services.webhook_pusher.cli ...`
     # because the cli module is intact.
@@ -348,9 +348,9 @@ services:
     environment:
       WEBHOOK_PUSHER_LOG_LEVEL: ${WEBHOOK_PUSHER_LOG_LEVEL:-INFO}
     volumes:
-      # Sops-decrypted bundle mount (same pattern as api).
-      # entrypoint.sh reads /run/secrets/decrypted.yaml.
-      - ${SECRETS_DIR:-/opt/trading/secrets-decrypted}:/run/secrets:ro
+      # Secrets-file mount (same pattern as api).
+      # entrypoint.sh reads /run/secrets/secrets.yaml.
+      - ${SECRETS_DIR:-/opt/trading-secrets}:/run/secrets:ro
     depends_on: [postgres]
     # Process-existence probe. The SSE subscriber is a long-lived Python
     # loop with no HTTP listener — pgrep is the closest signal we have

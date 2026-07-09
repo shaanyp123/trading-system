@@ -1,7 +1,7 @@
 """services/discord_bot/entrypoint.py — container entrypoint.
 
-Reads the sops-decrypted secrets bundle (``/run/secrets/decrypted.yaml``,
-written by the host-side sops -d step in ``deploy/day5-bringup.sh``),
+Reads the host secrets file (``/run/secrets/secrets.yaml``, plain YAML
+authored per ``deploy/secrets.template.yaml``; sops retired 2026-07-09),
 exports the fields the bot needs as bare ``DISCORD_*`` / ``API_*`` env
 vars, then exec()s ``python -m services.discord_bot.main`` so signals
 (SIGTERM from docker stop) flow correctly to the asyncio gateway loop.
@@ -10,8 +10,8 @@ Why a separate entrypoint (mirrors ``services/api/entrypoint.py``):
 
   * The bot reads ``DISCORD_BOT_TOKEN``, ``DISCORD_GUILD_ID``, and
     ``DISCORD_BOT_API_BEARER_TOKEN`` as bare env vars per its
-    ``BotSettings`` pydantic-settings config (no env_prefix). The sops
-    bundle stores these under ``discord.bot_token``,
+    ``BotSettings`` pydantic-settings config (no env_prefix). The secrets
+    file stores these under ``discord.bot_token``,
     ``discord.guild_id``, ``discord.api_bearer_token`` — yaml-to-env
     translation happens here so the bot module never has to parse yaml.
   * Failing fast at startup (missing required key → exit code 2) is
@@ -31,7 +31,7 @@ from typing import Any
 
 import yaml
 
-DEFAULT_SECRETS_PATH = Path("/run/secrets/decrypted.yaml")
+DEFAULT_SECRETS_PATH = Path("/run/secrets/secrets.yaml")
 
 
 def _looks_like_placeholder(value: str | int | None) -> bool:
@@ -67,7 +67,7 @@ def main(argv: list[str] | None = None) -> int:
         if _looks_like_placeholder(bot_token):
             return _exit(
                 f"discord.bot_token missing or placeholder in {secrets_path}; "
-                "fill via `sops secrets/<env>.enc.yaml` per deploy/discord_bot/README.md",
+                "fill the host secrets file per deploy/discord_bot/README.md",
             )
         os.environ["DISCORD_BOT_TOKEN"] = str(bot_token)
 
@@ -77,7 +77,7 @@ def main(argv: list[str] | None = None) -> int:
         if _looks_like_placeholder(guild_id):
             return _exit(
                 f"discord.guild_id missing or placeholder in {secrets_path}; "
-                "fill via `sops secrets/<env>.enc.yaml` per deploy/discord_bot/README.md",
+                "fill the host secrets file per deploy/discord_bot/README.md",
             )
         os.environ["DISCORD_GUILD_ID"] = str(guild_id)
 

@@ -2,7 +2,7 @@
 # .claude/hooks/secret_handling_guard.sh
 #
 # PreToolUse guard for Bash commands that may emit secret values to stdout
-# (sops decrypt, docker compose logs against api/ib_gateway/webhook_pusher,
+# (host secrets file reads, docker compose logs against api/webhook_pusher,
 # psql against credential tables). Per memory feedback_secret_handling.md,
 # all such output must be routed to a file with chmod 600 + verified via
 # wc -l only — never head/cat/grep displayed.
@@ -22,7 +22,9 @@ COMMAND="$(printf '%s' "$INPUT" | jq -r '.tool_input.command // empty')"
 [ -z "$COMMAND" ] && exit 0
 
 LEAK_PATTERNS=(
-  "sops -d"
+  "cat.*trading-secrets"
+  "cat.*secrets.yaml"
+  "yq.*secrets.yaml"
   "docker compose config"
   "docker compose logs.*api"
   "docker compose logs.*ib_gateway"

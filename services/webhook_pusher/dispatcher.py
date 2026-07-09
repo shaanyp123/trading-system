@@ -150,7 +150,7 @@ async def dispatch_alert(
         own client lifecycle — caller wraps with ``async with`` per
         request.
     webhook_urls:
-        Discord channel webhook URLs (sourced from sops). Must cover
+        Discord channel webhook URLs (sourced from the secrets file). Must cover
         every channel routed by the alert's severity (see
         ``SEVERITY_TO_CHANNELS``); missing entries raise
         :class:`WebhookPusherError` at plan time.
@@ -421,7 +421,7 @@ async def dispatch_event_push(
     Channel routing: :attr:`EventPushPlan.channel` (signals/fills) is
     treated as informational metadata; the caller is responsible for
     passing the matching webhook_url. The function does NOT consult
-    sops or any URL registry — that wiring is the caller's concern.
+    the secrets file or any URL registry — that wiring is the caller's concern.
 
     Returns
     -------

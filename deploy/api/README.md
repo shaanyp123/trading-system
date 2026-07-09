@@ -1,5 +1,15 @@
 # Day 5 — Paper VPS deploy runbook
 
+> **⚠️ SUPERSEDED FOR FRESH BRINGUPS (2026-07-09).** The original Ashburn
+> VPS was cancelled and the sops/age secrets pipeline is RETIRED
+> (operator-approved amendment, `Docs/decisions-log.md` 2026-07-09).
+> For a new host, follow **`deploy/crypto-vps-bringup.md`** — secrets are
+> now a single plain-YAML file at `/opt/trading-secrets/secrets.yaml`
+> (schema: `deploy/secrets.template.yaml`). The sops/age ceremonies below
+> (Steps 3, 4a, 4a.1) are historical; the Caddy/DNS/GHCR material remains
+> accurate.
+
+
 The Day 5 deploy brings up the first stack on the **Hetzner Ashburn primary
 VPS** (CCX13, `178.156.239.84`). Goal: `curl https://spratcapital.com/api/health`
 returns `{"status":"ok",...}` from the operator's laptop.
@@ -186,10 +196,8 @@ ENVIRONMENT=paper
 DOMAIN=spratcapital.com
 ACME_EMAIL=shaanrpatel2@gmail.com
 WATCHDOG_IP=188.245.37.16
-SOPS_AGE_KEY_FILE=/etc/credstore.encrypted/age_key
-ENV_FILE_NAME=paper.enc.yaml
 POSTGRES_SUPERUSER_PASSWORD=$(openssl rand -hex 32)
-SECRETS_DIR=/opt/trading/secrets-decrypted
+SECRETS_DIR=/opt/trading-secrets
 API_LOG_LEVEL=INFO
 EOF
 chmod 0400 /opt/trading/deploy/.env
@@ -197,7 +205,8 @@ chmod 0400 /opt/trading/deploy/.env
 
 The `POSTGRES_SUPERUSER_PASSWORD` is a one-time bootstrap secret used only
 for the postgres container's built-in `postgres` superuser. The app-level
-roles (`app_service`, `app_owner`) authenticate with passwords from sops.
+roles (`app_service`, `app_owner`) authenticate with passwords from the
+host secrets file.
 
 ## Step 5 — Run the bringup script
 
@@ -212,12 +221,12 @@ bash deploy/day5-bringup.sh
 
 What it does, in order:
 
-1. Sanity-check `deploy/.env`, sops binary, age key
-2. Decrypt sops yaml on the host → `/opt/trading/secrets-decrypted/decrypted.yaml`
+1. Sanity-check `deploy/.env` + the host secrets file
+2. Validate `/opt/trading-secrets/secrets.yaml` + set container-readable perms
 3. Build the api image (skip if already cached)
 4. Bring up postgres + wait for healthy
 5. Run `alembic upgrade head` (idempotent — alembic skips applied migrations)
-6. `ALTER ROLE` `app_service` + `app_owner` with sops-stored passwords
+6. `ALTER ROLE` `app_service` + `app_owner` with secrets-file passwords
 7. Bring up api + caddy
 8. Print the `SETUP_TOKEN_EMITTED` line — **copy this into 1Password**
 9. Verify `/api/health` returns `{"status":"ok","db_connected":true,...}`
@@ -275,8 +284,7 @@ know about Ashburn. Test once api is up:
 
 ```bash
 ssh root@178.156.239.84
-WEBHOOK_URL=$(SOPS_AGE_KEY_FILE=/etc/credstore.encrypted/age_key \
-  sops -d --extract '["discord"]["webhook_urls"]["ops"]' /opt/trading/secrets/paper.enc.yaml)
+WEBHOOK_URL=$(yq -r '.discord.webhook_urls.ops' /opt/trading-secrets/secrets.yaml)
 curl -sS -X POST -H 'content-type: application/json' \
   --user-agent 'trading-day5-test/1.0 (+spratcapital.com)' \
   -d '{"content": "[day5] Ashburn → Discord webhook test"}' \

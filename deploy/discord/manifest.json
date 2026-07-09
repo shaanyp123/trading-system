@@ -89,5 +89,5 @@
       "GUILD_PRESENCES, GUILD_MEMBERS (privileged; not used)"
     ]
   },
-  "secrets_schema_target": "deploy/sops/secret_schemas/{paper,live}.template.yaml under the `discord:` key. The operator captures values during Day 2 14:00 runbook execution and they're encrypted into secrets/{paper,live}.enc.yaml on Day 3."
+  "secrets_schema_target": "deploy/secrets.template.yaml under the `discord:` key of the host secrets file (/opt/trading-secrets/secrets.yaml)."
 }

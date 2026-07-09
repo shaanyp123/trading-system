@@ -38,7 +38,7 @@ To opt another service in:
 `api`, `lean_local`, `postgres`, `discord_bot`, `webhook_pusher`, `nextjs`, `caddy`, and all profile-gated services are NOT labeled. Reasons:
 
 - **`postgres`** — a stuck Postgres is rare and almost always indicates a real problem (disk full, OOM, deadlock) that benefits from operator triage rather than blind restart
-- **`api`** — lifespan startup errors (bad sops bundle, alembic mismatch) are best surfaced via operator alert, not papered over by restart loops
+- **`api`** — lifespan startup errors (bad secrets file, alembic mismatch) are best surfaced via operator alert, not papered over by restart loops
 - **`lean_local`** — already restarted daily by the host-side `lean-local-daily-restart.timer` systemd timer (post-bar_sync data-layer cache refresh); double-restart cadence would be noisy
 - **`caddy`, `nextjs`, `discord_bot`, `webhook_pusher`** — operator hasn't observed stuck-state failure modes on these; their existing healthchecks + `restart: unless-stopped` policy is sufficient
 

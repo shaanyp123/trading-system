@@ -4,18 +4,18 @@ Pydantic-settings loads from environment variables (12-factor) with the
 following precedence (highest → lowest):
 
   1. Explicit env vars set by docker-compose / systemd (incl. those exported
-     from the sops-decrypted bundle by the entrypoint).
+     from the host secrets file by the entrypoint).
   2. `.env` file in the working directory (development only — never present
      on the production VPS).
   3. Field defaults defined here.
 
 Phase 0 reads sensitive values (Postgres password, watchdog bearer) out of
-sops by way of the `sops_init` sidecar (docker-compose.yml) which decrypts
+the host secrets file (bind-mounted by docker-compose.yml) which carries
 `secrets/<env>.enc.yaml` to `/run/secrets/decrypted.yaml`. The api container's
 entrypoint resolves yaml-keys → env vars before launching uvicorn so this
 module never has to parse yaml at runtime.
 
-See `deploy/api/README.md` for the canonical mapping (sops key → env var).
+See `deploy/api/README.md` for the canonical mapping (secrets key → env var).
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ class APISettings(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARN", "ERROR"] = Field(default="INFO")
 
     # --- postgres ---------------------------------------------------------
-    # Built by the entrypoint from sops keys postgres.app_service_password +
+    # Built by the entrypoint from secrets keys postgres.app_service_password +
     # the docker-compose hostname `postgres`. Format:
     #   postgresql+asyncpg://app_service:<pwd>@postgres:5432/trading
     database_url: SecretStr = Field(
@@ -58,7 +58,7 @@ class APISettings(BaseSettings):
         description="SQLAlchemy async URL for the app_service role.",
     )
 
-    # --- bearer tokens (sops-sourced; SecretStr to keep them out of repr) -
+    # --- bearer tokens (secrets-file-sourced; SecretStr to keep them out of repr) -
     # Reserved for the watchdog POST endpoint (Week 5+; backend-spec §4.5.3).
     # If unset on Day 5, the future `/api/internal/watchdog` route fails closed
     # at the auth dependency.
@@ -119,9 +119,9 @@ class APISettings(BaseSettings):
 
     # --- TOTP encryption key (Day 21) -------------------------------------
     # Column-encryption key for ``totp_secrets.encrypted_secret`` per backend-
-    # spec §8.5.2 ("separate from sops; column-encrypted"). The key itself
-    # ships via sops -- ``totp.encryption_key`` in ``secrets/<env>.enc.yaml``
-    # -- but the sops master key (age key) protects the file at rest;
+    # spec §8.5.2 ("separate storage; column-encrypted"). The key itself
+    # ships via the host secrets file -- ``totp.encryption_key``
+    # -- but the TOTP key file (age key) protects the file at rest;
     # operationally these are two different keys.
     #
     # Encoded as base64url-no-padding of a 32-byte key (AES-256-GCM key).
@@ -131,7 +131,7 @@ class APISettings(BaseSettings):
         default=None,
         description=(
             "Base64url-encoded 32-byte AES-256-GCM key for column encryption "
-            "of totp_secrets.encrypted_secret. Sourced from sops per env."
+            "of totp_secrets.encrypted_secret. Sourced from the per-env secrets file."
         ),
     )
 
@@ -145,7 +145,7 @@ class APISettings(BaseSettings):
 
     # --- Discord bot bearer auth (Day 23 — IG §3 Week 6 Thu) --------------
     # Shared bearer token between the api and the discord bot per backend-
-    # spec §6.6 + §4.4 ("shared sops-decrypted Bearer token; rotated
+    # spec §6.6 + §4.4 ("shared secrets-file Bearer token; rotated
     # quarterly with 1h overlap"). When the bot makes an HTTP request to
     # the api over the trading_internal Docker network, it sets
     # ``Authorization: Bearer <token>``; ``BotAuthMiddleware`` validates
@@ -158,7 +158,7 @@ class APISettings(BaseSettings):
     # close in live envs would otherwise reject the bot's calls before
     # any handler runs.
     #
-    # Sourced from sops yaml ``discord.api_bearer_token`` per
+    # Sourced from secrets ``discord.api_bearer_token`` per
     # ``deploy/discord_bot/README.md``. Token format: 32-byte URL-safe
     # base64 (``secrets.token_urlsafe(32)``); operator can rotate by
     # generating a fresh value, deploying both api + discord_bot with the
@@ -222,11 +222,11 @@ class APISettings(BaseSettings):
     # ``flex_query_id`` AND ``flex_query_token`` are configured AND
     # ``reconciliation_scheduler_enabled`` is True. Missing either
     # secret → scheduler is skipped + a structured warning is logged
-    # so the operator knows to populate sops + restart the api.
+    # so the operator knows to populate the secrets file + restart the api.
     #
     # Operator workflow: pre-create the FlexQuery template in IBKR's
     # portal (Reports → Flex Queries → Create), record the numeric ID +
-    # auto-generated token, then `sops secrets/<env>.enc.yaml` and
+    # auto-generated token, then edit the host secrets file and
     # set ``ibkr.flex_query_id`` + ``ibkr.flex_query_token``. The
     # api's entrypoint (services/api/entrypoint.py) maps those onto
     # ``API_FLEX_QUERY_ID`` + ``API_FLEX_QUERY_TOKEN`` env vars at
@@ -243,7 +243,7 @@ class APISettings(BaseSettings):
         default=None,
         gt=0,
         description=(
-            "IBKR FlexQuery template ID. Sourced from sops "
+            "IBKR FlexQuery template ID. Sourced from secrets "
             "`ibkr.flex_query_id`. When unset, the reconciliation "
             "scheduler does not start (the api still serves requests; "
             "a warning is logged at boot)."
@@ -253,7 +253,7 @@ class APISettings(BaseSettings):
         default=None,
         description=(
             "IBKR FlexQuery auth token (per-template). Sourced from "
-            "sops `ibkr.flex_query_token`. When unset, the "
+            "secrets `ibkr.flex_query_token`. When unset, the "
             "reconciliation scheduler does not start."
         ),
     )
@@ -264,9 +264,9 @@ class APISettings(BaseSettings):
     # row + invokes `services.webhook_pusher.dispatcher.dispatch_alert`
     # which fans out to the Discord webhook URLs + Resend email below.
     #
-    # All four fields are sops-sourced (per `deploy/webhook_pusher/README.md`
+    # All four fields are secrets-file-sourced (per `deploy/webhook_pusher/README.md`
     # which already documents these for the standalone webhook_pusher
-    # smoke; the api now consumes the SAME sops fields):
+    # smoke; the api now consumes the SAME secrets fields):
     #
     #   - discord.webhook_urls.alerts    → Discord #alerts channel
     #     (P2 + P1 + P0 alerts ALL hit this channel)
@@ -279,7 +279,7 @@ class APISettings(BaseSettings):
     #   - resend.to_address              → "To" header on the email
     #
     # When `discord.webhook_urls.alerts` is unset (Phase 1 day-1 boot
-    # before sops fields are populated), the api skips constructing the
+    # before secrets fields are populated), the api skips constructing the
     # hook — recon still runs end-to-end + alerts log a WARNING from
     # `services.reconciliation.apply._dispatch_alerts` ("hook not wired").
     #
@@ -292,7 +292,7 @@ class APISettings(BaseSettings):
         default=None,
         description=(
             "Discord webhook URL for the #alerts channel. Sourced from "
-            "sops `discord.webhook_urls.alerts`. Required for the "
+            "secrets `discord.webhook_urls.alerts`. Required for the "
             "reconciliation alert_dispatch_hook to fire; when unset the "
             "hook is skipped (recon still runs)."
         ),
@@ -301,7 +301,7 @@ class APISettings(BaseSettings):
         default=None,
         description=(
             "Discord webhook URL for the #critical channel. Sourced "
-            "from sops `discord.webhook_urls.critical`. Required for P0 "
+            "from secrets `discord.webhook_urls.critical`. Required for P0 "
             "escalation; if unset, P0 alerts will hit dispatcher "
             "validation (SEVERITY_TO_CHANNELS includes #critical for P0)."
         ),
@@ -309,7 +309,7 @@ class APISettings(BaseSettings):
     resend_api_key: SecretStr | None = Field(
         default=None,
         description=(
-            "Resend HTTP API key. Sourced from sops `resend.api_key`. "
+            "Resend HTTP API key. Sourced from secrets `resend.api_key`. "
             "Required for P0 email escalation; missing → "
             "email_identity stays None + P0 alerts trip dispatcher "
             "validation."
@@ -318,7 +318,7 @@ class APISettings(BaseSettings):
     resend_from_address: str | None = Field(
         default=None,
         description=(
-            "Resend `from` address. Sourced from sops "
+            "Resend `from` address. Sourced from secrets "
             "`resend.from_address`. See resend_api_key for the "
             "missing-value semantics."
         ),
@@ -326,7 +326,7 @@ class APISettings(BaseSettings):
     resend_to_address: str | None = Field(
         default=None,
         description=(
-            "Resend `to` address. Sourced from sops `resend.to_address`. "
+            "Resend `to` address. Sourced from secrets `resend.to_address`. "
             "See resend_api_key for the missing-value semantics."
         ),
     )
@@ -408,7 +408,7 @@ class APISettings(BaseSettings):
     # CDP API key for the AUTHENTICATED Advanced Trade surface (orders,
     # fills, positions, futures balance summary) consumed by
     # ``services/execution/coinbase_client.SdkCoinbaseBrokerClient``.
-    # Sourced from sops ``coinbase.api_key_name`` + ``coinbase.api_private_key``
+    # Sourced from secrets ``coinbase.api_key_name`` + ``coinbase.api_private_key``
     # (ES256 EC private key in PEM form, as issued by the CDP portal) and
     # mapped to env vars by ``services/api/entrypoint.py``. When unset,
     # nothing that trades can start — the strategy worker (§3.3, C0-B3)
@@ -419,13 +419,13 @@ class APISettings(BaseSettings):
         default=None,
         description=(
             "CDP API key name (organizations/{org}/apiKeys/{key}). "
-            "Sourced from sops `coinbase.api_key_name`."
+            "Sourced from secrets `coinbase.api_key_name`."
         ),
     )
     coinbase_api_private_key: SecretStr | None = Field(
         default=None,
         description=(
-            "CDP API EC private key (PEM). Sourced from sops "
+            "CDP API EC private key (PEM). Sourced from secrets "
             "`coinbase.api_private_key`. SecretStr keeps it out of repr/logs."
         ),
     )

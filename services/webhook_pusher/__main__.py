@@ -6,7 +6,7 @@ CMD at the Phase-0 ``sleep infinity`` placeholder. This module is the
 runtime entrypoint that:
 
   1. Reads config from env vars (set by ``entrypoint.sh`` from the
-     sops-decrypted bundle at ``/run/secrets/decrypted.yaml``).
+     host secrets file at ``/run/secrets/secrets.yaml``).
   2. Builds a :class:`SSESubscriberConfig` and constructs a
      :class:`SSESubscriber`.
   3. Installs SIGTERM/SIGINT handlers so ``docker compose stop`` /
@@ -17,7 +17,7 @@ Invoke via ``python -m services.webhook_pusher``. The Dockerfile's
 CMD wires this.
 
 **Auth model:** the subscriber sends ``Authorization: Bearer <token>``
-where the token is the discord-bot bearer (sops ``discord.api_bearer_token``).
+where the token is the discord-bot bearer (secrets ``discord.api_bearer_token``).
 This bearer is already accepted by the api's ``BotAuthMiddleware``
 (outermost in the middleware stack), which injects a strong-auth
 ``SessionContext`` so the SSE multiplexer accepts the long-lived
@@ -25,14 +25,14 @@ connection. Phase 2+ may issue webhook_pusher its own bearer for
 finer-grained blast-radius — for Phase 1 single-operator, sharing
 is acceptable.
 
-**Required env vars** (set by ``entrypoint.sh`` from sops):
+**Required env vars** (set by ``entrypoint.sh`` from the secrets file):
 
-  * ``WEBHOOK_PUSHER_API_BEARER_TOKEN`` — sops ``discord.api_bearer_token``.
+  * ``WEBHOOK_PUSHER_API_BEARER_TOKEN`` — secrets ``discord.api_bearer_token``.
     Fail-close exit 2 if missing — without it, every SSE connect
     returns 401 and consumed=0 forever (no observability loop close).
-  * ``WEBHOOK_PUSHER_SIGNALS_WEBHOOK_URL`` — sops
+  * ``WEBHOOK_PUSHER_SIGNALS_WEBHOOK_URL`` — secrets
     ``discord.webhook_urls.signals``. Fail-close exit 2 if missing.
-  * ``WEBHOOK_PUSHER_FILLS_WEBHOOK_URL`` — sops
+  * ``WEBHOOK_PUSHER_FILLS_WEBHOOK_URL`` — secrets
     ``discord.webhook_urls.fills``. Fail-close exit 2 if missing.
 
 **Optional env vars** (defaults sane):
@@ -89,7 +89,7 @@ def _require(name: str) -> str:
             flush=True,
         )
         print(
-            "[webhook_pusher_sse_runner] verify sops decryption + the entrypoint.sh "
+            "[webhook_pusher_sse_runner] verify the secrets file + the entrypoint.sh "
             "yaml→env mapping; see deploy/webhook_pusher/README.md.",
             file=sys.stderr,
             flush=True,

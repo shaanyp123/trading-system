@@ -5,8 +5,8 @@ Backend-spec §8.5.2 contract:
   * Library: ``pyotp``.
   * Secret length: 160 bits (32-char base32; matches the de-facto RFC 6238
     default + the ``pyotp.random_base32()`` length).
-  * Storage: AES-encrypted at the app layer via a key separate from the
-    sops master key. The DB stores ciphertext bytes only.
+  * Storage: AES-encrypted at the app layer via a dedicated key from
+    the host secrets file. The DB stores ciphertext bytes only.
   * 30-second time-step, 6-digit code (pyotp defaults).
   * Verify allows ``+/-1`` step (a single 30s window of clock drift).
 

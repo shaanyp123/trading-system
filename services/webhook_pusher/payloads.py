@@ -271,16 +271,16 @@ class EmailIdentity:
 
     All three fields source from ``secrets/paper.enc.yaml``:
 
-    - ``from_address`` — sops ``resend.from_address`` (locked:
+    - ``from_address`` — secrets ``resend.from_address`` (locked:
       ``shaanrpatel2@gmail.com`` per identifiers memory).
     - ``to_address`` — operator email (same value on Phase 0; Phase 1
       may add a second recipient).
-    - ``resend_api_key`` — sops ``resend.api_key``. Used to build the
+    - ``resend_api_key`` — secrets ``resend.api_key``. Used to build the
       ``Authorization: Bearer <key>`` header on the OutboundMessage.
 
     The planner reads these fields but does NOT log them. The frozen
     dataclass + ``__repr__`` redaction would be defense-in-depth; for now
-    the API key is treated as caller-managed (loaded from sops at process
+    the API key is treated as caller-managed (loaded from the secrets file at process
     start).
     """
 
@@ -373,7 +373,7 @@ def plan_alert_dispatch(
     webhook_urls:
         Mapping from channel to URL. Keys MUST cover every channel in the
         severity-routing set or :class:`WebhookPusherError` is raised.
-        For Discord channels: the full webhook URL (sops
+        For Discord channels: the full webhook URL (secrets-file
         ``discord.webhook_urls.alerts`` / ``.critical``). For EMAIL: the
         Resend API URL constant :data:`RESEND_API_URL`.
     email_identity:

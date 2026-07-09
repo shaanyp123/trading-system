@@ -157,18 +157,18 @@ def load_config() -> WatchdogConfig:
     """Read env vars; fail-closed on missing required values.
 
     Required env vars (set by systemd `EnvironmentFile=/opt/trading-watchdog/watchdog.env`,
-    sourced from sops-decrypted `secrets/paper.enc.yaml`):
+    sourced from the host secrets file):
 
     - `WATCHDOG_HEALTH_URL`           e.g. `https://paper.spratcapital.com/api/health`
     - `WATCHDOG_OPERATOR_EMAIL`       recipient of the alert email (used by Resend
                                       when email path is enabled; ignored otherwise)
-    - `WATCHDOG_DISCORD_WEBHOOK_URL`  Discord `#critical` webhook (sops `discord.webhook_urls.critical`)
+    - `WATCHDOG_DISCORD_WEBHOOK_URL`  Discord `#critical` webhook (secrets `discord.webhook_urls.critical`)
 
     Optional (Phase 0 = Discord-only is fully supported; Resend path activates when
     these are populated; see `Docs/decisions-log.md` 2026-05-06 "Resend deferred"):
 
-    - `WATCHDOG_RESEND_API_KEY`   Resend API key (sops `resend.api_key`)
-    - `WATCHDOG_RESEND_FROM`      Resend "from" address (sops `resend.from_address`)
+    - `WATCHDOG_RESEND_API_KEY`   Resend API key (secrets `resend.api_key`)
+    - `WATCHDOG_RESEND_FROM`      Resend "from" address (secrets `resend.from_address`)
     - `WATCHDOG_ID`               identifier for this watchdog instance; default `hetzner-nuremberg-1`
     - `WATCHDOG_STATE_PATH`       state-file path; default `/var/lib/trading-watchdog/state.json`
 
@@ -236,7 +236,7 @@ def save_state(path: Path, state: WatchdogState) -> None:
 # ---------------------------------------------------------------------------
 def perform_check(config: WatchdogConfig) -> CheckResult:
     """One GET to `health_url`. Anything other than 2xx is a failure."""
-    request = urllib.request.Request(  # noqa: S310 — URL is from sops-validated config
+    request = urllib.request.Request(  # noqa: S310 — URL is from entrypoint-validated config
         config.health_url,
         method="GET",
         headers={"User-Agent": f"trading-watchdog/{config.watchdog_id}"},
@@ -343,7 +343,7 @@ def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str]) -> tu
         "User-Agent": WATCHDOG_USER_AGENT,
         **headers,
     }
-    req = urllib.request.Request(  # noqa: S310 — URLs are sops-validated
+    req = urllib.request.Request(  # noqa: S310 — URLs are entrypoint-validated
         url, data=body, method="POST", headers=final_headers
     )
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:  # noqa: S310

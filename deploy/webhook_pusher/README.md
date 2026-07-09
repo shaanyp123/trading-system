@@ -31,11 +31,11 @@ past it.
   `docker compose --env-file deploy/.env ps webhook_pusher` shows
   `Up`. The container's CMD is a `sleep infinity` placeholder that logs
   one line at boot — operator runbook execs the CLI into it.
-- `secrets/paper.enc.yaml` decryption working. The age key lives at
-  `/etc/credstore.encrypted/age_key` per `deploy/.env`'s `SOPS_AGE_KEY_FILE`;
-  every sops invocation in this runbook needs that env var exported in
+- `/opt/trading-secrets/secrets.yaml` decryption working. The age key lives at
+  the host secrets file at `/opt/trading-secrets/secrets.yaml`;
+  every read in this runbook uses that file directly in
   the current shell. Day 6 carryover verified `wc -c == 64` on
-  `app_service_password`; if `sops -d` errors, fix that before continuing.
+  `app_service_password`; if the file is unreadable, fix that before continuing.
 
 ### Architecture note (Day 11 carryover #2 + PR #50)
 
@@ -51,7 +51,7 @@ Day 11 carryover #2 (decisions-log 2026-05-12) used a temporary
 because the `webhook_pusher` container didn't exist yet. PR #50
 landed the dedicated container; that workaround is gone.
 
-## Step 1 — Decrypt sops + extract webhook URLs
+## Step 1 — Extract webhook URLs from the secrets file
 
 On the VPS:
 
@@ -59,9 +59,6 @@ On the VPS:
 ssh root@178.156.239.84
 cd /opt/trading
 
-# Required: point sops at the age key (per deploy/.env). Without this,
-# sops --decrypt errors with "failed to load age identities".
-export SOPS_AGE_KEY_FILE=/etc/credstore.encrypted/age_key
 
 # Confirm webhook_pusher container is running with the CLI baked in.
 docker compose --env-file deploy/.env exec -T webhook_pusher \
@@ -69,7 +66,7 @@ docker compose --env-file deploy/.env exec -T webhook_pusher \
   { echo "MISSING: webhook_pusher container or cli.py inside it — rebuild via 'docker compose --env-file deploy/.env build webhook_pusher && docker compose --env-file deploy/.env up -d webhook_pusher'"; exit 1; }
 
 # Decrypt to a tmpfs path; never to disk.
-sops --decrypt secrets/paper.enc.yaml > /dev/shm/paper.decrypted.yaml
+cp /opt/trading-secrets/secrets.yaml /dev/shm/paper.decrypted.yaml
 chmod 600 /dev/shm/paper.decrypted.yaml
 
 # Sanity-check the four discord channels we need are populated:
@@ -78,7 +75,7 @@ grep -E '^\s+(alerts|critical):' /dev/shm/paper.decrypted.yaml
 ```
 
 **On mismatch:** if `alerts:` or `critical:` shows `<TODO_FROM_DAY_2_DISCORD_RUNBOOK>`,
-sops the file (`sops secrets/paper.enc.yaml`) and paste the URLs from
+edit the file (`nano /opt/trading-secrets/secrets.yaml`) and paste the URLs from
 the Discord guild settings → Webhooks. See `deploy/discord/README.md`
 for the canonical webhook-creation flow if any are missing.
 
@@ -171,7 +168,7 @@ test from ..."`, and a footer carrying the alert id + UTC timestamp.
   parse; check the URL's path token matches what Discord shows in
   Server Settings → Integrations → Webhooks → `#alerts`.
 - `status=failed_not_found` → the channel was deleted or the webhook
-  was rotated. Re-create the webhook in Discord and update sops.
+  was rotated. Re-create the webhook in Discord and update the secrets file.
 - `status=failed_network` (DNS, connection refused) → the Ashburn VPS
   egress to `discord.com` is blocked. Ashburn → Discord works as of
   Day 6 carryover (HTTP 204 verified); if it stops working, that's a
@@ -337,7 +334,7 @@ shred -u /dev/shm/paper.decrypted.yaml
 unset WEBHOOK_PUSHER_DISCORD_ALERTS_URL WEBHOOK_PUSHER_DISCORD_CRITICAL_URL \
       WEBHOOK_PUSHER_RESEND_API_KEY WEBHOOK_PUSHER_RESEND_FROM \
       WEBHOOK_PUSHER_OPERATOR_EMAIL WEBHOOK_PUSHER_DATABASE_URL \
-      APP_SERVICE_PWD SOPS_AGE_KEY_FILE
+      APP_SERVICE_PWD
 exit
 ```
 

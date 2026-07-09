@@ -117,7 +117,7 @@ def _require_totp_key(settings: APISettings) -> bytes:
             error_code="TOTP_KEY_MISSING",
             message=(
                 "TOTP enrollment requires API_TOTP_ENCRYPTION_KEY to be "
-                "configured. Operator must populate the sops bundle before "
+                "configured. Operator must populate the host secrets file before "
                 "running the setup wizard."
             ),
             status_code=503,

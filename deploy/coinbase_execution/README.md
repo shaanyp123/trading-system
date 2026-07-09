@@ -16,8 +16,8 @@ things to code around.
 ## Prerequisites
 
 - CDP API key created (portal.cdp.coinbase.com → API keys, trade
-  permission) and populated in sops: `coinbase.api_key_name` +
-  `coinbase.api_private_key` (see `deploy/sops/secret_schemas/paper.template.yaml`).
+  permission) and populated in the host secrets file: `coinbase.api_key_name` +
+  `coinbase.api_private_key` (see `deploy/secrets.template.yaml`).
 - CFM futures account approved + funded with the C1 float.
 - **Do NOT enable intraday margin anywhere in the Coinbase UI** — the
   system assumes the overnight margin regime 24/7 (locked; strategy §7).
@@ -59,7 +59,7 @@ things to code around.
 
 ## Config
 
-- sops `coinbase.api_key_name` / `coinbase.api_private_key` →
+- secrets `coinbase.api_key_name` / `coinbase.api_private_key` →
   `API_COINBASE_API_KEY_NAME` / `API_COINBASE_API_PRIVATE_KEY`
   (mapped by `services/api/entrypoint.py`).
 - Locked constants (strategy §5 — amendment required to change):

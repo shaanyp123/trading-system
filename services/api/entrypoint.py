@@ -1,13 +1,14 @@
 """services/api/entrypoint.py — container entrypoint.
 
-Reads the sops-decrypted secrets bundle (`/run/secrets/decrypted.yaml`,
-written by the `sops_init` sidecar at compose-up time), exports the
-fields the api needs as `API_*` env vars, then exec()s uvicorn so signals
-flow correctly to the asgi worker.
+Reads the host secrets file (`/run/secrets/secrets.yaml`, a plain-YAML
+file authored per `deploy/secrets.template.yaml` and bind-mounted by
+compose — the sops pipeline is retired, decisions-log 2026-07-09),
+exports the fields the api needs as `API_*` env vars, then exec()s
+uvicorn so signals flow correctly to the asgi worker.
 
 Fail-closed mode: if Postgres password is missing or still a `<TODO_*>`
 placeholder, the container exits 2 immediately. Operators see the message
-in `docker compose logs api` and patch via `sops secrets/<env>.enc.yaml`.
+in `docker compose logs api` and patch the host secrets file.
 
 This file deliberately uses stdlib + pyyaml only — every other api module
 depends on settings being configured first.
@@ -22,14 +23,14 @@ from typing import Any
 
 import yaml
 
-DEFAULT_SECRETS_PATH = Path("/run/secrets/decrypted.yaml")
+DEFAULT_SECRETS_PATH = Path("/run/secrets/secrets.yaml")
 
 
 def _looks_like_placeholder(value: Any) -> bool:
     if value is None or value == "":
         return True
     if not isinstance(value, str):
-        # Non-string sops values (e.g., yaml-int flex_query_id) cannot
+        # Non-string YAML values (e.g., yaml-int flex_query_id) cannot
         # be `<TODO_...>` placeholders by construction; treat as real.
         return False
     return value.startswith("<TODO") or value == "null"
@@ -44,15 +45,15 @@ def _load_secrets(path: Path) -> dict[str, Any]:
 
 
 def _find_float_secret_paths(node: Any, *, path: tuple[str, ...] = ()) -> list[str]:
-    """Walk a sops-decrypted dict tree; return dotted paths of any float leaves.
+    """Walk the secrets dict tree; return dotted paths of any float leaves.
 
     Catches the YAML numeric-coercion gotcha documented in
-    ``Docs/decisions-log.md`` 2026-05-12 (late) — IBKR's 24-digit FlexQuery
-    token, when stored unquoted in sops yaml, round-trips through sops's
-    internal float-aware writer as ``"1.527484903607521e+23"`` (scientific
-    notation = float64 approximation; precision-loss silently mangles the
-    token). The float→str coercion on next `sops -d` read produces a
-    Python ``float`` where the api expected a ``str``.
+    ``Docs/decisions-log.md`` 2026-05-12 (late) — a long all-digit value
+    (e.g., IBKR's 24-digit FlexQuery token), when stored unquoted in
+    YAML, loads as a float64 approximation ("1.527484903607521e+23");
+    precision loss silently mangles the token. Originally a sops writer
+    round-trip bug; a hand-authored plain-YAML secrets file hits the
+    exact same PyYAML coercion, so the guard stays.
 
     Fix: catch floats in secret context at boot, exit with operator-readable
     hint pointing at the quote-the-value fix + the decisions-log entry.
@@ -70,9 +71,9 @@ def _find_float_secret_paths(node: Any, *, path: tuple[str, ...] = ()) -> list[s
         no floats found. Sorted for deterministic exit output.
 
     Edge cases:
-      * Ints are allowed (sops yaml legitimately carries int values like
-        ``ibkr.flex_query_id: 1505530`` — confirmed via the existing
-        ``_looks_like_placeholder`` carve-out for non-string sops values).
+      * Ints are allowed (the secrets file legitimately carries int
+        values like ``ibkr.flex_query_id: 1505530`` — confirmed via the
+        ``_looks_like_placeholder`` carve-out for non-string values).
       * Bools are allowed (yaml-loaded as bool, not float).
       * NoneType is allowed (covered by ``_looks_like_placeholder``).
       * Lists are walked recursively (a yaml list-of-numbers would expose
@@ -112,20 +113,19 @@ def main(argv: list[str] | None = None) -> int:
 
     # Defensive guard against the YAML numeric-coercion gotcha documented
     # in Docs/decisions-log.md 2026-05-12 (late). PyYAML's safe_load turns
-    # unquoted scientific-notation values into Python floats; if any leaf
-    # secret is a float, sops likely round-tripped a long-digit string
-    # through float64 and lost precision. Fail loud + tell the operator
-    # the fix is to quote the value in sops.
+    # unquoted long-digit / scientific-notation values into Python floats,
+    # silently losing precision. Fail loud + tell the operator the fix is
+    # to quote the value in the secrets file.
     float_paths = _find_float_secret_paths(secrets)
     if float_paths:
         path_list = ", ".join(f"`{p}`" for p in sorted(float_paths))
         return _exit(
-            f"sops bundle at {secrets_path} contains float-typed value(s) at: "
+            f"secrets file at {secrets_path} contains float-typed value(s) at: "
             f"{path_list}. "
             "This usually means YAML numeric coercion ate a long-digit "
-            "string secret (e.g., IBKR FlexQuery token). Edit "
-            "`secrets/<env>.enc.yaml` via `sops` and wrap the value in "
-            'double quotes (e.g., `flex_query_token: "152748490360752094531342"`), '
+            "string secret (e.g., IBKR FlexQuery token). Edit the host "
+            "secrets file and wrap the value in double quotes (e.g., "
+            '`flex_query_token: "152748490360752094531342"`), '
             "then re-deploy. See Docs/decisions-log.md 2026-05-12 (late) "
             "'FlexQuery debug journey' for the full root cause + fix.",
         )
@@ -135,7 +135,7 @@ def main(argv: list[str] | None = None) -> int:
         if _looks_like_placeholder(pg_password):
             return _exit(
                 f"postgres.app_service_password missing or placeholder in {secrets_path}; "
-                "fill via `sops secrets/<env>.enc.yaml` and redeploy",
+                "fill the host secrets file (deploy/secrets.template.yaml) and redeploy",
             )
         assert isinstance(pg_password, str)  # narrowed by _looks_like_placeholder above
         os.environ["API_DATABASE_URL"] = _build_database_url(pg_password)
@@ -145,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
         if wb and not _looks_like_placeholder(wb):
             os.environ["API_WATCHDOG_BEARER_TOKEN"] = wb
 
-    # Day 23: Discord-bot bearer (sops yaml `discord.api_bearer_token`).
+    # Day 23: Discord-bot bearer (secrets `discord.api_bearer_token`).
     # When unset the api still boots — BotAuthMiddleware degrades to a
     # noop and the bot path is simply not served until the operator
     # adds the secret per `deploy/discord_bot/README.md`.
@@ -154,7 +154,7 @@ def main(argv: list[str] | None = None) -> int:
         if bb and not _looks_like_placeholder(bb):
             os.environ["API_DISCORD_BOT_BEARER_TOKEN"] = bb
 
-    # Day 21 carryover: TOTP column-encryption key (sops yaml
+    # Day 21 carryover: TOTP column-encryption key (secrets
     # `totp.encryption_key`). Base64url-encoded 32-byte AES-256-GCM key
     # per services/api/config.py `totp_encryption_key`. When unset the
     # TOTP-touching endpoints fail closed with `TOTP_KEY_MISSING` —
@@ -164,7 +164,7 @@ def main(argv: list[str] | None = None) -> int:
         if tk and not _looks_like_placeholder(tk):
             os.environ["API_TOTP_ENCRYPTION_KEY"] = tk
 
-    # Day 21 carryover: WebAuthn relying-party identity (sops yaml
+    # Day 21 carryover: WebAuthn relying-party identity (secrets
     # `webauthn.rp_id` + `.rp_name` + `.origin`). Defaults in
     # services/api/config.py are dev-only (localhost rp_id) — production
     # MUST override via these env vars so credentials register against
@@ -189,7 +189,7 @@ def main(argv: list[str] | None = None) -> int:
     # Crypto-pivot C0-B2b (delta spec §3.1): CDP API credentials for the
     # authenticated Coinbase Advanced Trade surface (orders/fills/
     # positions/balance) consumed by SdkCoinbaseBrokerClient. Sourced
-    # from sops ``coinbase.api_key_name`` + ``coinbase.api_private_key``.
+    # from secrets ``coinbase.api_key_name`` + ``coinbase.api_private_key``.
     # When unset / placeholder, nothing that trades can start (the §3.3
     # strategy worker fails closed at construction); the public-endpoint
     # market-data worker is unaffected. The IBKR TWS account mapping
@@ -208,10 +208,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # Worker-PR-3b follow-up (post-pivot 2026-05-12): IBKR FlexQuery
     # credentials for the api-resident ReconciliationScheduler. Sourced
-    # from sops `ibkr.flex_query_id` + `ibkr.flex_query_token`. When
+    # from secrets `ibkr.flex_query_id` + `ibkr.flex_query_token`. When
     # unset / placeholder, the scheduler does NOT start at api boot —
     # the api still serves requests + the warning is visible in api
-    # logs at startup. Operator populates the sops fields once the
+    # logs at startup. Operator populates the secrets fields once the
     # IBKR-portal FlexQuery template is created.
     if "API_FLEX_QUERY_ID" not in os.environ or "API_FLEX_QUERY_TOKEN" not in os.environ:
         ibkr = secrets.get("ibkr") or {}
@@ -232,7 +232,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Reconciliation alert_dispatch_hook (PR for follow-up #2; closes the
     # operator-visibility seam from PR #135). Sources Discord webhook URLs
-    # + Resend identity from sops — same fields the standalone
+    # + Resend identity from the secrets file — same fields the standalone
     # webhook_pusher uses (per `deploy/webhook_pusher/README.md`). When
     # `discord.webhook_urls.alerts` is unset, the api skips constructing
     # the hook entirely + recon still runs (see services/api/main.py

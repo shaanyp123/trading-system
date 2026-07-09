@@ -22,7 +22,7 @@ Root-cause discipline per dev-guide §1.3.
 
 1. **Boot log.** `docker compose --env-file deploy/.env logs api | grep coinbase_market_data_worker_spawned`
    → one line with `ws_url=wss://advanced-trade-ws.coinbase.com` and
-   `alert_dispatch_hook_wired=true` (false is acceptable pre-sops; alerts
+   `alert_dispatch_hook_wired=true` (false is acceptable pre-secrets-fill; alerts
    then log-and-drop as `coinbase_market_data_alert_dropped_no_hook`).
 2. **WS connect.** `... logs api | grep coinbase_ws_connected` → shows the
    subscribed `product_ids` (must include `BTC-USD`, `ETH-USD`, plus every

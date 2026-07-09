@@ -8,7 +8,7 @@ The api process runs a daily 18:30 ET reconciliation cycle that:
    `reconciliation_break_detected` audit + one `reconciliation_breaks` row
    per metric that doesn't match within tolerance.
 
-**The scheduler does not start until the operator populates two sops fields.**
+**The scheduler does not start until the operator populates two secrets fields.**
 Until then, the api logs a startup warning + keeps serving requests
 normally; the cycle simply doesn't run.
 
@@ -23,11 +23,11 @@ normally; the cycle simply doesn't run.
    - **Account selection:** the operator's paper account (`DUQ...`) or live (`U...`) per env.
 4. Save. IBKR assigns a numeric **Query ID** + an auto-generated **Flex Web Service Token**. **Record both.**
 
-## Step 2 — Populate sops
+## Step 2 — Populate the secrets file
 
 ```bash
 cd ~/Documents/GitHub/Trading
-sops secrets/paper.enc.yaml
+nano /opt/trading-secrets/secrets.yaml
 ```
 
 Add under the existing `ibkr:` block (alongside `account_number`, etc.):
@@ -42,8 +42,8 @@ ibkr:
 Re-encrypt + commit + push:
 
 ```bash
-git add secrets/paper.enc.yaml
-git commit -m "chore(sops): populate ibkr.flex_query_id + flex_query_token"
+git add /opt/trading-secrets/secrets.yaml
+
 git push
 ```
 
@@ -91,16 +91,16 @@ The chain should report `CHAIN OK: <N> rows verified`.
 
 | Symptom | Likely cause | Remedy |
 | ------- | ------------ | ------ |
-| `reconciliation_scheduler_flex_credentials_missing` at boot | sops fields unset or still placeholders | Re-run Step 2 + Step 3 |
+| `reconciliation_scheduler_flex_credentials_missing` at boot | secrets fields unset or still placeholders | Re-run Step 2 + Step 3 |
 | `reconciliation_scheduler_no_active_account` at boot | `accounts` table empty | Complete the `/setup` flow first |
-| `reconciliation_eod_cycle_flex_fetch_failed error_code=AUTH_INVALID` | wrong token or template ID; expired token | Regenerate the token in IBKR portal + re-populate sops |
+| `reconciliation_eod_cycle_flex_fetch_failed error_code=AUTH_INVALID` | wrong token or template ID; expired token | Regenerate the token in IBKR portal + re-populate the secrets file |
 | `reconciliation_eod_cycle_flex_fetch_failed error_code=MAX_ATTEMPTS_EXHAUSTED` | template generation taking >60s | One-shot retry next session day; if persistent, simplify the template (fewer sections) |
 | `breaks_detected >= 1` on first cycle | expected pre-population; the backend has zero positions/cash and FlexQuery shows real balances | Manual triage — the operator pre-populates `balances` + `positions_current` from the IBKR statement before the first cycle, OR accepts the first cycle's break as the initialization marker |
 | Scheduler logs no `firing` event after 18:30 ET | clock skew on VPS, or process restarted after 18:30 with `last_fired_session_date_et` reset | Verify VPS clock; restart the api to re-init the scheduler |
 
 ## Disable / pause
 
-To pause the scheduler without removing the sops fields:
+To pause the scheduler without removing the secrets fields:
 
 ```bash
 # in deploy/.env on the VPS:
@@ -126,7 +126,7 @@ once per ACTIONABLE break (grace-period continuations are skipped):
    - **P2:** Discord `#alerts` channel only.
    - **P0:** `#alerts` + `#critical` + Resend email.
 
-### Sops fields the hook consumes
+### The secrets file fields the hook consumes
 
 ```yaml
 discord:
@@ -140,8 +140,8 @@ resend:
 ```
 
 `webhook_pusher` already consumes these (see
-`deploy/webhook_pusher/README.md`); the api now reads the SAME sops
-fields. No new sops material if you've already deployed `webhook_pusher`.
+`deploy/webhook_pusher/README.md`); the api now reads the SAME secrets
+fields. No new secrets material if you've already deployed `webhook_pusher`.
 
 ### Wiring states
 

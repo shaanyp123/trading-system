@@ -15,7 +15,7 @@ Public surface (Phase 0 per implementation-guide §3 Week 6 Thu + frontend-spec
 
 Bot architecture matches frontend-spec §6.7 (gateway WS + REST calls to
 backend over the internal Docker network) with an auth model that follows
-spec §6.6 + §4.4 (shared sops-decrypted Bearer token) — see
+spec §6.6 + §4.4 (shared secrets-file Bearer token) — see
 ``services/api/middleware.BotAuthMiddleware`` for the api-side validator.
 
 Phase 0 commands (frontend-spec §6.1 LOCKED — only these three for Day 23):

@@ -2,7 +2,7 @@
 
 How to add view-only members to the operator's Discord guild so trusted people can follow the operator's progress without being able to type, invoke slash commands, or interact with the trading bot.
 
-This runbook is Discord-side configuration only — no code changes, no sops updates, no VPS deploy. Execution time: ~10 minutes for the role setup + a few seconds per friend added.
+This runbook is Discord-side configuration only — no code changes, no secrets updates, no VPS deploy. Execution time: ~10 minutes for the role setup + a few seconds per friend added.
 
 ## When to use this
 
@@ -19,7 +19,7 @@ This runbook is Discord-side configuration only — no code changes, no sops upd
 
 - Slash command responses (all ephemeral; only the invoker sees them — and viewers can't invoke at all)
 - Each other's interactions (because they can't message at all)
-- Operator's WebAuthn credentials, TOTP secret, backup codes, age key, sops bundle (none of those touch Discord)
+- Operator's WebAuthn credentials, TOTP secret, backup codes, host secrets file (none of those touch Discord)
 
 ## What viewers WILL see in Phase 1+ (when channels go live)
 
@@ -152,4 +152,4 @@ If you don't, two clean options:
 - The viewer role is a Discord-only construct; the bot has no awareness of viewer-vs-operator distinction at the code level
 - Phase 0 today: viewers see nothing trading-related (all bot output ephemeral)
 - Phase 1+ (post-dispatcher): viewers see EVERYTHING that posts to channels
-- If a Phase-2 requirement emerges where viewers should see a high-level subset (e.g., daily P&L but not per-trade fills), the cleanest path is a second guild with a different channel set + the bot configured to fan out per-channel routing via `secrets/<env>.enc.yaml` `discord.webhook_urls`. The current single-guild design assumes uniform visibility for all members.
+- If a Phase-2 requirement emerges where viewers should see a high-level subset (e.g., daily P&L but not per-trade fills), the cleanest path is a second guild with a different channel set + the bot configured to fan out per-channel routing via `/opt/trading-secrets/secrets.yaml` `discord.webhook_urls`. The current single-guild design assumes uniform visibility for all members.
