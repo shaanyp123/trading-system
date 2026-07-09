@@ -26,9 +26,20 @@ things to code around.
 
 1. **Auth + discovery.** From the repo venv:
    `python3 -c "import asyncio; from services.execution.coinbase_client import SdkCoinbaseBrokerClient; import os; c = SdkCoinbaseBrokerClient(api_key_name=os.environ['CB_KEY'], api_private_key=os.environ['CB_PEM']); print(asyncio.run(c.list_perp_products()))"`
-   → one `PerpProductRef` per CDE perp product with non-None
-   `contract_size`/`tick_size`. Record the discovered product IDs —
-   never hardcode them anywhere.
+   → one `PerpProductRef` per US perp-style product with non-None
+   `contract_size`/`tick_size` — expect products like `BIP-20DEC30-CDE`
+   (nano BTC) and `ETP-20DEC30-CDE` (nano ETH) among them. **Live venue
+   truth (2026-07-09 probes):** US perpetual-style futures are
+   API-labeled `contract_expiry_type: "EXPIRING"` with a far 2030
+   `contract_expiry` plus hourly funding on `future_product_details`
+   (`funding_interval: "3600s"`, non-empty `funding_rate`) — that
+   funding-mechanics shape is what "perp-style" means here. It is NOT
+   the API's literal `PERPETUAL` label, which exists only on offshore
+   `*-PERP-INTX` (Coinbase International) products the classifier
+   rejects by venue (locked: no offshore venues). Dated CDE futures
+   (e.g. `BIT-28AUG26-CDE`: `funding_interval: null`, near expiry,
+   often `view_only`) must NOT appear in the result. Record the
+   discovered product IDs — never hardcode them anywhere.
 2. **Balance summary.** Same pattern with `get_futures_balance_summary()`
    → Decimals for total/cfm balances; note which margin fields the venue
    actually populates (strategy §11 open question 1).

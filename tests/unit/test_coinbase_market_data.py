@@ -52,31 +52,97 @@ NOW = datetime(2026, 7, 9, 12, 34, 56, tzinfo=UTC)
 def _perp_raw(
     product_id: str = "BIP-20DEC30-CDE",
     *,
+    funding_interval: str | None = "3600s",
     funding: str | None = "0.0000125",
-    venue: str = "CDE",
-    expiry_type: str = "PERPETUAL",
+    venue: str = "FCM",
+    details_venue: str = "cde",
+    expiry_type: str = "EXPIRING",
+    root_unit: str = "BTC",
     **overrides: Any,
 ) -> dict[str, Any]:
-    perp_details: dict[str, Any] = {}
-    if funding is not None:
-        perp_details = {"funding_rate": funding, "funding_time": "2026-07-09T13:00:00Z"}
+    """Trimmed REAL-SHAPE US perp-style payload (live probes 2026-07-09).
+
+    Live venue truth: US perpetual-style futures are API-labeled
+    ``contract_expiry_type: "EXPIRING"`` with a far (2030) expiry and
+    ``product_venue: "FCM"`` / details ``venue: "cde"``; funding lives
+    directly on ``future_product_details``; ``base_display_symbol`` /
+    ``base_currency_id`` are EMPTY strings (``contract_root_unit`` is
+    the populated one); ``perpetual_details`` is a non-null object with
+    EMPTY funding fields even on true perps (the classifier trap).
+    """
     raw: dict[str, Any] = {
         "product_id": product_id,
         "product_type": "FUTURE",
         "product_venue": venue,
         "price": "100000.5",
         "price_increment": "5",
+        "base_display_symbol": "",
+        "base_currency_id": "",
+        "display_name": "Bitcoin Perpetual",
         "trading_disabled": False,
+        "view_only": False,
         "future_product_details": {
+            "venue": details_venue,
             "contract_size": "0.01",
+            "contract_expiry": "2030-12-20T16:00:00Z",
             "contract_expiry_type": expiry_type,
-            "perpetual_details": perp_details,
+            "contract_root_unit": root_unit,
+            "funding_interval": funding_interval,
+            "funding_rate": funding if funding is not None else "",
+            "funding_time": "2026-07-09T16:00:00Z" if funding is not None else None,
+            # TRAP (live truth): present on dated products too; its own
+            # funding fields are empty even on true perps.
+            "perpetual_details": {
+                "open_interest": "12345",
+                "funding_rate": "",
+                "funding_time": None,
+            },
             "initial_margin_rate": "0.2",
             "maintenance_margin_rate": "0.1",
         },
     }
     raw.update(overrides)
     return raw
+
+
+def _dated_raw(product_id: str = "BIT-28AUG26-CDE") -> dict[str, Any]:
+    """Trimmed REAL-SHAPE dated CDE future (``BIT-28AUG26-CDE`` probe).
+
+    Same venue/labels as the perp-style contracts (EXPIRING, FCM/cde,
+    non-null ``perpetual_details``) — distinguished only by absent
+    funding mechanics (``funding_interval: null``, ``funding_rate: ""``)
+    and a near expiry. Live payload also carries ``view_only: true``.
+    """
+    raw = _perp_raw(product_id, funding_interval=None, funding=None)
+    raw["display_name"] = "Bitcoin Futures (Aug 2026)"
+    raw["view_only"] = True
+    details: dict[str, Any] = raw["future_product_details"]
+    details["contract_expiry"] = "2026-08-28T16:00:00Z"
+    return raw
+
+
+def _intx_raw(product_id: str = "BTC-PERP-INTX") -> dict[str, Any]:
+    """Coinbase International (offshore) perp — the only place the API's
+    literal ``PERPETUAL`` label lives. Must NEVER classify (locked: no
+    offshore venues, [A13] revised), even with funding mechanics present.
+    """
+    return {
+        "product_id": product_id,
+        "product_type": "FUTURE",
+        "product_venue": "INTX",
+        "price": "100000.5",
+        "price_increment": "1",
+        "base_display_symbol": "BTC",
+        "trading_disabled": False,
+        "future_product_details": {
+            "venue": "intx",
+            "contract_size": "1",
+            "contract_expiry_type": "PERPETUAL",
+            "funding_interval": "3600s",
+            "funding_rate": "0.0000021",
+            "perpetual_details": {"open_interest": "999", "funding_rate": "0.0000021"},
+        },
+    }
 
 
 def _spot_raw(product_id: str = "BTC-USD") -> dict[str, Any]:
@@ -198,43 +264,91 @@ def _worker(
 
 
 class TestParsePerpProduct:
-    def test_accepts_cde_perp_with_venue_field(self) -> None:
+    def test_accepts_live_shape_bip_perp(self) -> None:
+        """Real-shape BIP-20DEC30-CDE: EXPIRING label + funding mechanics."""
         snap = parse_perp_product(_perp_raw())
         assert snap is not None
         assert snap.product_id == "BIP-20DEC30-CDE"
         assert snap.contract_size == Decimal("0.01")
         assert snap.tick_size == Decimal("5")
+        # funding read from future_product_details, NOT perpetual_details
         assert snap.funding_rate_per_interval == Decimal("0.0000125")
         assert snap.initial_margin_requirement == Decimal("0.2")
         assert snap.maintenance_margin_requirement == Decimal("0.1")
         assert snap.trading_disabled is False
         assert snap.raw["product_id"] == "BIP-20DEC30-CDE"
 
-    def test_accepts_cde_suffix_when_venue_field_absent(self) -> None:
-        raw = _perp_raw(venue="")
+    def test_accepts_live_shape_etp_perp(self) -> None:
+        raw = _perp_raw("ETP-20DEC30-CDE", funding="0.000001", root_unit="ETH")
+        raw["future_product_details"]["contract_size"] = "0.1"
+        snap = parse_perp_product(raw)
+        assert snap is not None
+        assert snap.contract_size == Decimal("0.1")
+        assert snap.funding_rate_per_interval == Decimal("0.000001")
+
+    def test_rejects_live_shape_dated_bit(self) -> None:
+        """Real-shape BIT-28AUG26-CDE: same labels, no funding mechanics."""
+        assert parse_perp_product(_dated_raw()) is None
+
+    def test_perpetual_details_presence_is_not_a_discriminator(self) -> None:
+        # The dated fixture carries a non-null perpetual_details object
+        # (live truth) — presence alone must never classify.
+        dated = _dated_raw()
+        assert isinstance(dated["future_product_details"]["perpetual_details"], dict)
+        assert parse_perp_product(dated) is None
+
+    def test_rejects_intx_perp_despite_perpetual_label_and_funding(self) -> None:
+        """Locked: no offshore venues. INTX never classifies ([A13] revised)."""
+        assert parse_perp_product(_intx_raw()) is None
+
+    def test_rejects_intx_by_id_suffix_even_with_us_venue_field(self) -> None:
+        raw = _intx_raw()
+        raw["product_venue"] = "FCM"  # belt-and-braces: suffix alone rejects
+        assert parse_perp_product(raw) is None
+
+    def test_accepts_cde_suffix_when_venue_fields_absent(self) -> None:
+        raw = _perp_raw(venue="", details_venue="")
         assert parse_perp_product(raw) is not None
 
-    def test_accepts_expiry_type_perpetual_without_perp_details(self) -> None:
+    def test_rejects_when_no_us_cde_marker(self) -> None:
+        raw = _perp_raw(product_id="BIP-20DEC30", venue="", details_venue="")
+        assert parse_perp_product(raw) is None
+
+    def test_forward_compat_literal_perpetual_label_on_us_venue(self) -> None:
+        # If the US listing ever adopts the literal PERPETUAL label with
+        # no funding fields, classification must not break.
+        raw = _perp_raw(funding_interval=None, funding=None, expiry_type="PERPETUAL")
+        snap = parse_perp_product(raw)
+        assert snap is not None
+        assert snap.funding_rate_per_interval is None
+
+    def test_funding_rate_blank_between_cycles_still_classifies(self) -> None:
+        # funding_interval is the stable marker; a briefly-blank rate
+        # must not drop the product from discovery.
         raw = _perp_raw(funding=None)
         snap = parse_perp_product(raw)
         assert snap is not None
         assert snap.funding_rate_per_interval is None
 
+    def test_funding_interval_blank_but_rate_present_still_classifies(self) -> None:
+        raw = _perp_raw(funding_interval=None)
+        snap = parse_perp_product(raw)
+        assert snap is not None
+        assert snap.funding_rate_per_interval == Decimal("0.0000125")
+
     def test_rejects_spot_product(self) -> None:
         assert parse_perp_product(_spot_raw()) is None
-
-    def test_rejects_dated_cde_future(self) -> None:
-        raw = _perp_raw(funding=None, expiry_type="EXPIRING")
-        assert parse_perp_product(raw) is None
-
-    def test_rejects_non_cde_future(self) -> None:
-        raw = _perp_raw(product_id="BTC-PERP-INTX", venue="INTX")
-        assert parse_perp_product(raw) is None
 
     def test_rejects_missing_product_id(self) -> None:
         raw = _perp_raw()
         raw["product_id"] = ""
         assert parse_perp_product(raw) is None
+
+    def test_view_only_counts_as_trading_disabled(self) -> None:
+        raw = _perp_raw(view_only=True)
+        snap = parse_perp_product(raw)
+        assert snap is not None
+        assert snap.trading_disabled is True
 
     def test_garbage_numerics_become_none_not_raise(self) -> None:
         raw = _perp_raw(funding="not-a-number")
@@ -249,7 +363,8 @@ class TestParsePerpProduct:
             _spot_raw(),
             _perp_raw(),
             _perp_raw("EIP-20DEC30-CDE"),
-            _perp_raw(funding=None, expiry_type="EXPIRING"),
+            _dated_raw(),
+            _intx_raw(),
         ]
         snaps = discover_perp_products(products)  # type: ignore[arg-type]
         assert [s.product_id for s in snaps] == ["BIP-20DEC30-CDE", "EIP-20DEC30-CDE"]
