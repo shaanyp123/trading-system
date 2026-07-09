@@ -110,9 +110,12 @@ COPY services/ services/
 RUN /opt/venv/bin/python -c \
     "from services.discord_bot.main import TradingBotClient; \
      from services.discord_bot.entrypoint import main as ep_main; \
-     from services.discord_bot.commands import register_positions, register_halt, register_status; \
+     from services.discord_bot.commands import register_positions, register_halt, register_status, register_cycle; \
      from services.discord_bot.api_client import ApiClient; \
      from services.discord_bot.embeds import build_positions_embed, build_halt_confirm_embed, build_status_embed; \
+     from services.discord_shared.cycle_digest import build_cycle_digest_embed; \
+     import sys; \
+     assert not [m for m in sys.modules if m.split('.')[0] in ('sqlalchemy', 'asyncpg') or m.startswith('services.webhook_pusher')], 'bot image import graph pulled webhook_pusher/sqlalchemy'; \
      import discord; print(f'discord_bot import sanity OK; discord.py={discord.__version__}')"
 
 # ---- runtime ---------------------------------------------------------------

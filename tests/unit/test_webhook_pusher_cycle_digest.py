@@ -1,9 +1,11 @@
 """Unit tests for the §3.8 cycle digest — builder, planner, scheduler.
 
-Covers ``services/webhook_pusher/cycle_digest.py`` (pure builder +
-planner, shared with the bot's ``/cycle``) and
-``services/webhook_pusher/cycle_digest_scheduler.py`` (00:10 UTC push
-loop). No live HTTP — the httpx client is a MagicMock with AsyncMock
+Covers ``services/discord_shared/cycle_digest.py`` (the dependency-neutral
+pure builder shared with the bot's ``/cycle``),
+``services/webhook_pusher/cycle_digest.py`` (the EventPushPlan-typed
+planner) and ``services/webhook_pusher/cycle_digest_scheduler.py``
+(00:10 UTC push loop). Import-graph hygiene for the shared package is
+locked separately in ``tests/unit/test_discord_shared_import_hygiene.py``. No live HTTP — the httpx client is a MagicMock with AsyncMock
 ``get``/``post`` returning real ``httpx.Response`` objects.
 
 Task-locked semantics under test:
@@ -25,13 +27,15 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
-from services.webhook_pusher.cycle_digest import (
+from services.discord_shared.cycle_digest import (
     COLOR_DIGEST_FAIL,
     COLOR_DIGEST_OK,
     COLOR_DIGEST_WARN,
+    build_cycle_digest_embed,
+)
+from services.webhook_pusher.cycle_digest import (
     DIGEST_FIRE_HOUR_UTC,
     DIGEST_FIRE_MINUTE_UTC,
-    build_cycle_digest_embed,
     plan_cycle_digest_push,
 )
 from services.webhook_pusher.cycle_digest_scheduler import (

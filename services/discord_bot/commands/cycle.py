@@ -9,12 +9,18 @@ via ``GET /api/system/cycle`` (§3.7) through the same bearer-auth
 ANNOUNCE-ONLY (dev-guide §1.5 locked; operator mandate 2026-07-08): the
 reply is a bare embed — NO buttons, NO confirm views, NO approval
 affordances of any kind. The embed is rendered by the SHARED builder
-``services.webhook_pusher.cycle_digest.build_cycle_digest_embed`` (the
+``services.discord_shared.cycle_digest.build_cycle_digest_embed`` (the
 same function behind the scheduled 00:10 UTC #daily-brief push), so the
-on-demand and scheduled digests are identical. The import is safe for
-the bot container: ``cycle_digest``'s import graph is httpx + structlog
-only (both already bot deps) and both images COPY the full services/
-tree.
+on-demand and scheduled digests are identical.
+
+IMPORT-GRAPH CONSTRAINT: this module (and the whole discord_bot package)
+must import NOTHING under ``services.webhook_pusher.*`` — that package's
+``__init__`` eagerly imports its sqlalchemy-touching dispatcher, and the
+slim bot image ships no sqlalchemy (the exact ImportError that failed
+the discord_bot docker-build CI job when the builder briefly lived
+there). The shared builder therefore lives in the dependency-neutral
+``services.discord_shared`` package (stdlib-only import graph; locked by
+``tests/unit/test_discord_shared_import_hygiene.py``).
 
 The no-decision-yet / worker-down states render as a digest that says so
 (amber embed) — never an error reply.
@@ -33,7 +39,7 @@ from services.discord_bot.api_client import (
     ApiClientHTTPError,
 )
 from services.discord_bot.embeds import EMBED_COLOR_CRITICAL
-from services.webhook_pusher.cycle_digest import build_cycle_digest_embed
+from services.discord_shared.cycle_digest import build_cycle_digest_embed
 
 log = structlog.get_logger()
 

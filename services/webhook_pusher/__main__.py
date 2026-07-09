@@ -37,7 +37,7 @@ is acceptable.
   * ``WEBHOOK_PUSHER_DAILY_BRIEF_WEBHOOK_URL`` — secrets
     ``discord.webhook_urls.daily_brief``. Fail-close exit 2 if missing.
     Target of the crypto-pivot §3.8 00:10 UTC cycle-digest push
-    (``services/webhook_pusher/cycle_digest.py``), which runs as a
+    (``services/webhook_pusher/cycle_digest_scheduler.py``), which runs as a
     second long-lived loop alongside the SSE subscriber.
 
 **Optional env vars** (defaults sane):

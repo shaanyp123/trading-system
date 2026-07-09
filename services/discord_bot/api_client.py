@@ -309,7 +309,7 @@ class ApiClient:
 
         Deliberately returns the parsed JSON dict rather than a bot-side
         Pydantic mirror: the sole consumer is the SHARED digest renderer
-        ``services.webhook_pusher.cycle_digest.build_cycle_digest_embed``,
+        ``services.discord_shared.cycle_digest.build_cycle_digest_embed``,
         which parses the payload defensively (it also consumes the raw
         JSON on the scheduled-push path). Re-typing the nested schema
         here would create a third copy of the contract that can only

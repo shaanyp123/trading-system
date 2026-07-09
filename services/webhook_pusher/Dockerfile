@@ -101,7 +101,7 @@ COPY services/ services/
 # inside the container (the gap that bit Day 11 / PR #47 with the api
 # image's transitive-import blind spot).
 RUN /opt/venv/bin/python -c \
-    "import services.webhook_pusher.cli, services.webhook_pusher.dispatcher, services.webhook_pusher.payloads, services.webhook_pusher.sender, services.webhook_pusher.sse_subscriber, services.webhook_pusher.__main__; import httpx, yaml; print('webhook_pusher import sanity OK')"
+    "import services.webhook_pusher.cli, services.webhook_pusher.dispatcher, services.webhook_pusher.payloads, services.webhook_pusher.sender, services.webhook_pusher.sse_subscriber, services.webhook_pusher.cycle_digest, services.webhook_pusher.cycle_digest_scheduler, services.webhook_pusher.__main__; import sys; assert not [m for m in sys.modules if m.split('.')[0] == 'discord' or m.startswith('services.discord_bot')], 'pusher image import graph pulled discord_bot/discord.py'; import httpx, yaml; print('webhook_pusher import sanity OK')"
 
 # ---- runtime ---------------------------------------------------------------
 FROM python:3.11-slim AS runtime

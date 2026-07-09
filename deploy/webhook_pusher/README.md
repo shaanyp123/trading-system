@@ -392,7 +392,9 @@ Smoke checks after deploying this build (A27 fact-checks):
    `cycle_digest_skipped_no_decision` and posts NOTHING — that is the
    designed skip, not a fault.
 4. On-demand parity: `/cycle` in Discord renders the same embed
-   (ephemeral) — same builder, `services/webhook_pusher/cycle_digest.py`.
+   (ephemeral) — same builder, `services/discord_shared/cycle_digest.py`
+   (dependency-neutral shared package; the planner half stays in
+   `services/webhook_pusher/cycle_digest.py`).
 5. C0 exit gate (delta spec §5): the digest fires 3 consecutive days —
    three `cycle_digest_pushed` (or `_skipped_no_decision`) lines on
    three consecutive UTC dates.
