@@ -75,3 +75,39 @@ class TestBuildConfig:
         with pytest.raises(SystemExit) as exc:
             runner._build_config()
         assert exc.value.code == 2
+
+
+class TestBuildCycleDigestConfig:
+    """Crypto-pivot §3.8 — env mapping for the 00:10 UTC digest scheduler."""
+
+    def _set_base(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("WEBHOOK_PUSHER_API_BEARER_TOKEN", "my-bearer")
+        monkeypatch.setenv("WEBHOOK_PUSHER_DAILY_BRIEF_WEBHOOK_URL", "https://d/brief")
+
+    def test_all_env_vars_set_builds_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._set_base(monkeypatch)
+        monkeypatch.setenv("WEBHOOK_PUSHER_API_BASE_URL", "http://api-test:8000")
+        cfg = runner._build_cycle_digest_config()
+        assert cfg.api_bearer_token == "my-bearer"
+        assert cfg.daily_brief_webhook_url == "https://d/brief"
+        assert cfg.api_base_url == "http://api-test:8000"
+
+    def test_api_base_url_defaults_to_internal_dns(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._set_base(monkeypatch)
+        monkeypatch.delenv("WEBHOOK_PUSHER_API_BASE_URL", raising=False)
+        cfg = runner._build_cycle_digest_config()
+        assert cfg.api_base_url == "http://api:8000"
+
+    def test_missing_daily_brief_url_exits_2(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("WEBHOOK_PUSHER_API_BEARER_TOKEN", "my-bearer")
+        monkeypatch.delenv("WEBHOOK_PUSHER_DAILY_BRIEF_WEBHOOK_URL", raising=False)
+        with pytest.raises(SystemExit) as exc:
+            runner._build_cycle_digest_config()
+        assert exc.value.code == 2
+
+    def test_missing_bearer_exits_2(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("WEBHOOK_PUSHER_API_BEARER_TOKEN", raising=False)
+        monkeypatch.setenv("WEBHOOK_PUSHER_DAILY_BRIEF_WEBHOOK_URL", "https://d/brief")
+        with pytest.raises(SystemExit) as exc:
+            runner._build_cycle_digest_config()
+        assert exc.value.code == 2

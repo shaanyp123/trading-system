@@ -34,6 +34,11 @@ is acceptable.
     ``discord.webhook_urls.signals``. Fail-close exit 2 if missing.
   * ``WEBHOOK_PUSHER_FILLS_WEBHOOK_URL`` — secrets
     ``discord.webhook_urls.fills``. Fail-close exit 2 if missing.
+  * ``WEBHOOK_PUSHER_DAILY_BRIEF_WEBHOOK_URL`` — secrets
+    ``discord.webhook_urls.daily_brief``. Fail-close exit 2 if missing.
+    Target of the crypto-pivot §3.8 00:10 UTC cycle-digest push
+    (``services/webhook_pusher/cycle_digest.py``), which runs as a
+    second long-lived loop alongside the SSE subscriber.
 
 **Optional env vars** (defaults sane):
 
@@ -52,6 +57,10 @@ import sys
 
 import structlog
 
+from services.webhook_pusher.cycle_digest_scheduler import (
+    CycleDigestConfig,
+    CycleDigestScheduler,
+)
 from services.webhook_pusher.sse_subscriber import (
     SSESubscriber,
     SSESubscriberConfig,
@@ -107,10 +116,26 @@ def _build_config() -> SSESubscriberConfig:
     )
 
 
+def _build_cycle_digest_config() -> CycleDigestConfig:
+    """Crypto-pivot §3.8 — the 00:10 UTC daily-decision digest scheduler.
+
+    Reuses the same api base + bearer as the SSE subscriber; the target
+    webhook is the existing #daily-brief channel (secrets
+    ``discord.webhook_urls.daily_brief`` — fail-close exit 2 if missing,
+    same policy as the signals/fills URLs).
+    """
+    return CycleDigestConfig(
+        api_base_url=os.environ.get("WEBHOOK_PUSHER_API_BASE_URL", "http://api:8000"),
+        api_bearer_token=_require("WEBHOOK_PUSHER_API_BEARER_TOKEN"),
+        daily_brief_webhook_url=_require("WEBHOOK_PUSHER_DAILY_BRIEF_WEBHOOK_URL"),
+    )
+
+
 async def _run() -> None:
     log = structlog.get_logger()
     config = _build_config()
     subscriber = SSESubscriber(config)
+    digest_scheduler = CycleDigestScheduler(_build_cycle_digest_config())
     log.info(
         "webhook_pusher_sse_runner_starting",
         api_base_url=config.api_base_url,
@@ -118,13 +143,17 @@ async def _run() -> None:
         reconnect_max_seconds=config.reconnect_max_seconds,
     )
 
-    # SIGTERM / SIGINT → subscriber.request_stop(). Docker sends SIGTERM
-    # on `docker compose stop`; we want a graceful exit at the next loop
-    # iteration boundary rather than mid-frame.
+    # SIGTERM / SIGINT → request_stop() on both loops. Docker sends
+    # SIGTERM on `docker compose stop`; we want a graceful exit at the
+    # next loop iteration boundary rather than mid-frame.
+    def _request_stop() -> None:
+        subscriber.request_stop()
+        digest_scheduler.request_stop()
+
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
-            loop.add_signal_handler(sig, subscriber.request_stop)
+            loop.add_signal_handler(sig, _request_stop)
         except NotImplementedError:
             # Signal handlers can't be installed on some platforms (e.g.,
             # Windows asyncio default loop). Fall back to no-op; docker
@@ -132,7 +161,14 @@ async def _run() -> None:
             pass
 
     try:
-        await subscriber.run_forever()
+        # Two long-lived loops in one container: the SSE subscriber
+        # (#signals/#fills event pushes) + the 00:10 UTC cycle-digest
+        # scheduler (#daily-brief). Both are stop-responsive and never
+        # raise out; gather propagates only genuine bugs.
+        await asyncio.gather(
+            subscriber.run_forever(),
+            digest_scheduler.run_forever(),
+        )
     finally:
         log.info("webhook_pusher_sse_runner_stopped")
 

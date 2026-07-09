@@ -62,6 +62,10 @@ class EventChannel(StrEnum):
 
     SIGNALS = "signals"
     FILLS = "fills"
+    #: Crypto-pivot §3.8 — the 00:10 UTC daily-decision digest lands on the
+    #: existing #daily-brief channel (webhook already in the locked 7-webhook
+    #: secrets schema; #reports is a C2 governance-report surface, not this).
+    DAILY_BRIEF = "daily_brief"
 
 
 @dataclass(frozen=True, slots=True)
