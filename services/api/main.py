@@ -847,34 +847,38 @@ async def _start_reconciliation_scheduler(
 ) -> tuple[object, object] | None:
     """Construct + start the ReconciliationScheduler; return (sched, task) or None.
 
-    Best-effort: requires both ``flex_query_id`` and ``flex_query_token``
-    populated in the secrets file (mapped via ``services/api/entrypoint.py``). When
-    either is missing — or the operator has flipped
-    ``reconciliation_scheduler_enabled=False`` — the scheduler does not
-    start + a structured warning is logged so the operator knows to
-    populate the secrets file + restart the api.
+    Best-effort: requires both ``coinbase_api_key_name`` and
+    ``coinbase_api_private_key`` populated in the secrets file (mapped
+    via ``services/api/entrypoint.py`` — the same CDP key pair the
+    execution layer uses). When either is missing — or the operator has
+    flipped ``reconciliation_scheduler_enabled=False`` — the scheduler
+    does not start + a structured warning is logged so the operator
+    knows to populate the secrets file + restart the api.
 
     The cycle callback is built by :func:`services.reconciliation.eod_cycle.make_cycle_callback`
-    and fires once per America/New_York calendar day at 18:30 ET (per
-    backend-spec §2.6). Errors inside the callback are logged + swallowed
-    by the scheduler so a transient FlexQuery outage doesn't kill the
-    scheduler — tomorrow's cycle still fires.
+    over a :class:`services.reconciliation.coinbase_fetcher.CoinbaseEodFetcher`
+    and fires once per UTC calendar day at 00:15 UTC (delta spec §3.5 —
+    after the 00:05 UTC daily decision). Errors inside the callback are
+    logged + swallowed by the scheduler so a transient venue outage
+    doesn't kill the scheduler — tomorrow's cycle still fires.
     """
     if not settings.reconciliation_scheduler_enabled:
         log.warning("reconciliation_scheduler_disabled_via_setting")
         return None
 
-    if settings.flex_query_id is None or settings.flex_query_token is None:
+    if settings.coinbase_api_key_name is None or settings.coinbase_api_private_key is None:
         log.warning(
-            "reconciliation_scheduler_flex_credentials_missing",
+            "reconciliation_scheduler_coinbase_credentials_missing",
             note=(
-                "Set ibkr.flex_query_id + ibkr.flex_query_token in the secrets file to "
-                "enable the EOD reconciliation cycle. See "
+                "Set coinbase.api_key_name + coinbase.api_private_key in the "
+                "secrets file to enable the EOD reconciliation cycle. See "
                 "deploy/reconciliation/README.md."
             ),
         )
         return None
 
+    from services.execution.coinbase_client import SdkCoinbaseBrokerClient
+    from services.reconciliation.coinbase_fetcher import CoinbaseEodFetcher
     from services.reconciliation.eod_cycle import EodCycleConfig, make_cycle_callback
     from services.reconciliation.scheduler import ReconciliationScheduler
 
@@ -888,17 +892,21 @@ async def _start_reconciliation_scheduler(
         )
         return None
 
+    broker_client = SdkCoinbaseBrokerClient(
+        api_key_name=settings.coinbase_api_key_name.get_secret_value(),
+        api_private_key=settings.coinbase_api_private_key.get_secret_value(),
+    )
+    fetcher = CoinbaseEodFetcher(client=broker_client)
     config = EodCycleConfig(
         account_id=account_id,
         env=_audit_env_from_settings(settings),
-        flex_query_id=settings.flex_query_id,
-        flex_query_token=settings.flex_query_token.get_secret_value(),
     )
     alert_dispatch_hook = _build_alert_dispatch_hook(settings)
     state_transition_hook = _build_state_transition_hook(settings)
     callback = make_cycle_callback(
         config=config,
         session_factory=api_db.get_session_factory(),
+        fetcher=fetcher,
         alert_dispatch_hook=alert_dispatch_hook,  # type: ignore[arg-type]
         state_transition_hook=state_transition_hook,  # type: ignore[arg-type]
     )
@@ -908,7 +916,6 @@ async def _start_reconciliation_scheduler(
         "reconciliation_scheduler_spawned",
         account_id=str(account_id),
         env=_audit_env_from_settings(settings),
-        flex_query_id=settings.flex_query_id,
         alert_dispatch_hook_wired=alert_dispatch_hook is not None,
         state_transition_hook_wired=state_transition_hook is not None,
     )

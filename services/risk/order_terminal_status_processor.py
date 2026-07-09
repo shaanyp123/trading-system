@@ -79,11 +79,13 @@ _STATUS_AUDIT_EVENT_TYPE: Final[dict[TerminalOrderStatus, AuditEventType]] = {
 class TerminalStatusPayload:
     """Inputs to :func:`process_terminal_status_event`.
 
-    ``broker_order_id`` is the broker-side numeric order id.
-    ``status_kind`` is one of the three locked terminal kinds. (The
-    IBKR order-placement worker that produced these events was retired
-    in crypto-pivot C0-B2b; the Coinbase strategy worker re-feeds this
-    processor from venue order states in C0-B3.)
+    ``broker_order_id`` is the broker-side order id — numeric for the
+    retired IBKR producer, an opaque UUID string for Coinbase venue
+    orders (widened ``int | str`` with the C1 strategy worker, which
+    re-feeds this processor from Coinbase order states; the field is
+    observability-only — audit payload + logs — never used as a lookup
+    key, so the widening is behavior-neutral).
+    ``status_kind`` is one of the three locked terminal kinds.
 
     ``rejection_reason`` carries any IBKR-side error code + message (e.g.,
     "321 - Please enter a local symbol or an expiry"). May be None for
@@ -94,7 +96,7 @@ class TerminalStatusPayload:
     timestamp is not surfaced through the ib-async callback).
     """
 
-    broker_order_id: int
+    broker_order_id: int | str
     status_kind: TerminalOrderStatus
     rejection_reason: str | None
     observed_at_utc: datetime

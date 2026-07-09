@@ -177,13 +177,15 @@ services:
       dockerfile: services/api/Dockerfile
     restart: unless-stopped
     logging: *journald-logging
-    # The api needs egress in addition to internal to reach IBKR's
-    # FlexQuery REST endpoint at ndcdyn.interactivebrokers.com (used
-    # by the reconciliation scheduler at services/reconciliation/**).
-    # Pre Worker-PR-3a (2026-05-12) the api was internal-only and
-    # FlexQuery calls failed at DNS resolution. The Caddy reverse-proxy
-    # path to /api remains via the internal network — egress only
-    # affects outbound DNS+TCP from the api container itself.
+    # The api needs egress in addition to internal to reach Coinbase's
+    # Advanced Trade REST + WS endpoints (api.coinbase.com /
+    # advanced-trade-ws.coinbase.com — the market-data worker, the
+    # reconciliation scheduler's EOD fetcher, and the execution layer).
+    # Historical origin: Worker-PR-3a (2026-05-12) added egress for the
+    # IBKR FlexQuery endpoint after DNS-resolution failures on an
+    # internal-only api. The Caddy reverse-proxy path to /api remains
+    # via the internal network — egress only affects outbound DNS+TCP
+    # from the api container itself.
     networks: [internal, egress]
     environment:
       API_ENVIRONMENT: ${ENVIRONMENT:-paper}
@@ -234,16 +236,64 @@ services:
       retries: 5
       start_period: 15s
 
+  # ---- Strategy worker (crypto-pivot §3.3 runtime container) ------------
+  # The 00:05 UTC daily decision + 30 s risk loop. Reuses the api IMAGE
+  # (same code tree + deps: pandas/numpy engine, coinbase-advanced-py
+  # transport, websockets marks feed — one dep-drift surface, no second
+  # Dockerfile) with the entrypoint overridden to the worker shim:
+  # secrets→env mapping is inherited from services/api/entrypoint.py,
+  # then it exec()s python -m services.signal.worker_main.
+  # Networks: internal (postgres) + egress (Coinbase REST + WS).
+  # Announce-only mandate: this container places orders autonomously —
+  # there is no approval surface anywhere in its path.
+  strategy_worker:
+    image: ghcr.io/${GHCR_OWNER:?set GHCR_OWNER in deploy/.env}/trading-api:${RELEASE_SHA:-latest}
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    restart: unless-stopped
+    logging: *journald-logging
+    networks: [internal, egress]
+    entrypoint: ["/usr/bin/tini", "--", "python", "-m", "services.signal.worker_entrypoint"]
+    environment:
+      API_ENVIRONMENT: ${ENVIRONMENT:-paper}
+      API_DB_HOST: postgres
+      API_DB_NAME: trading
+      STRATEGY_WORKER_LOG_LEVEL: ${STRATEGY_WORKER_LOG_LEVEL:-INFO}
+      # Phase-A small-live clamps (strategy §10 / delta spec §5 C1).
+      # Scale-up to C2 is a deploy/.env change, not a code change:
+      #   STRATEGY_WORKER_E_EFFECTIVE_CAP_USD=none  (full equity)
+      #   STRATEGY_WORKER_MAX_BTC_CONTRACTS / _MAX_ETH_CONTRACTS raised.
+      STRATEGY_WORKER_E_EFFECTIVE_CAP_USD: ${STRATEGY_WORKER_E_EFFECTIVE_CAP_USD:-1500}
+      STRATEGY_WORKER_MAX_BTC_CONTRACTS: ${STRATEGY_WORKER_MAX_BTC_CONTRACTS:-2}
+      STRATEGY_WORKER_MAX_ETH_CONTRACTS: ${STRATEGY_WORKER_MAX_ETH_CONTRACTS:-4}
+    volumes:
+      - ${SECRETS_DIR:-/opt/trading-secrets}:/run/secrets:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    # Liveness = the risk LOOP is ticking, not merely the process being
+    # alive (closes the 2026-05-17 silent-worker pattern): the worker
+    # touches the heartbeat file every 30 s tick; stale > 5 min fails
+    # the healthcheck and compose restarts the container (restart is
+    # crash-safe: deterministic client_order_ids + startup reconcile).
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >
+          test $(( $(date +%s) - $(stat -c %Y /tmp/strategy-worker.heartbeat
+          2>/dev/null || echo 0) )) -lt 300 || exit 1
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+
   # ---- Phase 0 Week 2+ services (profile-gated until Dockerfile lands) -
   # Each ships its own Dockerfile + tests in a follow-on PR; until then,
   # the `phase1` profile keeps `docker compose up` from trying to pull
   # ghcr.io tags that don't exist.
-  signal:
-    image: ghcr.io/${GHCR_OWNER}/trading-signal:${RELEASE_SHA:-latest}
-    restart: unless-stopped
-    networks: [internal]
-    profiles: ['phase1']
-    depends_on: [postgres]
 
   risk:
     image: ghcr.io/${GHCR_OWNER}/trading-risk:${RELEASE_SHA:-latest}

@@ -159,18 +159,16 @@ class AlertCategory(StrEnum):
     # ``AuditEventType.POSITION_UNPROTECTED``. Operator's runbook is
     # ``scripts/operator_tools/replace_protective_stop.py`` (deferred PR).
     POSITION_UNPROTECTED = "position_unprotected"
-    # Option C recon-fix follow-up (2026-05-29). INSERTed by
-    # ``services.reconciliation.eod_cycle.run_eod_cycle`` when the
-    # ``position_source="reqpositions"`` per-cycle reqPositions fetch
-    # (real-time TWS, clientId=4) fails terminally and recon falls back
-    # to the FlexQuery position list for the cycle. P1-severity routing —
-    # ``#alerts`` only (NO #critical, NO email: the degradation is a
-    # single-cycle coverage downgrade, not money at risk). Paired with
-    # audit event type
-    # ``AuditEventType.RECONCILIATION_DATA_SOURCE_DEGRADED``. The recon
-    # cycle still runs cash/NAV + position checks on the FlexQuery
-    # snapshot, so the operator-facing effect is "same-day-fill false
-    # breaks may reappear this cycle" — actionable but not P0.
+    # Option C recon-fix follow-up (2026-05-29). Historically INSERTed
+    # by the IBKR-era EOD cycle when its per-cycle reqPositions fetch
+    # failed and recon fell back to the FlexQuery position list. That
+    # producer died with the IBKR stack (crypto-pivot C0-B2b) and the
+    # FlexQuery path itself was deleted in C0 §3.5 — the value is
+    # DORMANT but stays per the locked alert taxonomy ([A03]-adjacent:
+    # Postgres enum values are not removable pre-PG15; the Phase C1
+    # intraday-probe fallback is its natural future producer). Paired
+    # with audit event type
+    # ``AuditEventType.RECONCILIATION_DATA_SOURCE_DEGRADED``.
     RECONCILIATION_DATA_SOURCE_DEGRADED = "reconciliation_data_source_degraded"
     # Silent-failure follow-up (2026-06-08, P1). INSERTed by the
     # ``order_placement_worker`` when an approved signal's IBKR order

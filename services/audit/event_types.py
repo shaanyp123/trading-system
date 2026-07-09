@@ -127,20 +127,16 @@ class AuditEventType(StrEnum):
     RECONCILIATION_CHECK_PASSED = "reconciliation_check_passed"
     RECONCILIATION_BREAK_DETECTED = "reconciliation_break_detected"
     RECONCILIATION_BREAK_RESOLVED = "reconciliation_break_resolved"
-    # Option C recon-fix follow-up (2026-05-29). Emitted by
-    # ``services/reconciliation/eod_cycle.py::run_eod_cycle`` when the
-    # ``position_source="reqpositions"`` per-cycle reqPositions (real-time
-    # TWS, clientId=4) fetch fails terminally and the cycle silently falls
-    # back to the FlexQuery position list. The fallback restores the
-    # known same-day-fill settlement-lag false-break behavior for one
-    # cycle, so the operator needs a durable breadcrumb (this row) + an
-    # active push (the paired ``alerts`` row of category
-    # ``reconciliation_data_source_degraded``, severity ``P1`` → Discord
-    # #alerts). Payload carries ``degraded_source`` ('reqpositions'),
-    # ``fallback_source`` ('flexquery'), ``operation`` (the failed TWS op),
-    # ``reason`` (the ReconPositionsFetchError detail), and
-    # ``underlying_exception_class``. Audit-first per backend-spec §2.10.1;
-    # the emit is fully defensive so the FlexQuery fallback always runs.
+    # Option C recon-fix follow-up (2026-05-29). Historically emitted by
+    # the IBKR-era EOD cycle when its per-cycle reqPositions fetch
+    # failed terminally and the cycle silently fell back to the
+    # FlexQuery position list (durable breadcrumb + paired ``alerts``
+    # row of category ``reconciliation_data_source_degraded``, P1 →
+    # Discord #alerts). That producer died with the IBKR stack
+    # (crypto-pivot C0-B2b) and the FlexQuery path was deleted in C0
+    # §3.5 — the value is DORMANT but stays per the locked audit
+    # taxonomy ([A04]); the Phase C1 intraday-probe fallback is its
+    # natural future producer.
     RECONCILIATION_DATA_SOURCE_DEGRADED = "reconciliation_data_source_degraded"
     DATA_QUALITY_REJECT = "data_quality_reject"
     DATA_QUALITY_QUARANTINE = "data_quality_quarantine"
