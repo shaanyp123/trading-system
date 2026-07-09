@@ -7,6 +7,9 @@ Phase 0 + post-pivot surface (the four endpoints the bot hits):
     per backend-spec §7.3).
   * :meth:`ApiClient.get_positions_current` → ``GET /api/positions/current``
     Returns :class:`PositionsResponse`. Requires bot bearer auth.
+  * :meth:`ApiClient.get_system_cycle` → ``GET /api/system/cycle``
+    Returns the raw JSON dict (consumed by the shared §3.8 digest
+    renderer — see the method docstring). Requires bot bearer auth.
   * :meth:`ApiClient.invoke_kill_switch` → ``POST /api/system/kill-switch/invoke``
     Returns :class:`KillSwitchInvokeResponse` on 200 OR raises
     :class:`ApiClientHTTPError` on non-2xx (carrying the canonical
@@ -300,6 +303,30 @@ class ApiClient:
         if response.status_code != 200:
             self._raise_for_response(response)
         return PositionsResponse.model_validate(response.json())
+
+    async def get_system_cycle(self) -> dict[str, Any]:
+        """``GET /api/system/cycle`` — daily-cycle projection (§3.7).
+
+        Deliberately returns the parsed JSON dict rather than a bot-side
+        Pydantic mirror: the sole consumer is the SHARED digest renderer
+        ``services.discord_shared.cycle_digest.build_cycle_digest_embed``,
+        which parses the payload defensively (it also consumes the raw
+        JSON on the scheduled-push path). Re-typing the nested schema
+        here would create a third copy of the contract that can only
+        drift. Raises :class:`ApiClientHTTPError` on non-200.
+        """
+        response = await self._client.get("/api/system/cycle")
+        if response.status_code != 200:
+            self._raise_for_response(response)
+        body = response.json()
+        if not isinstance(body, dict):
+            raise ApiClientHTTPError(
+                status_code=response.status_code,
+                error_code="UNEXPECTED_SHAPE",
+                message="GET /api/system/cycle returned a non-object JSON body.",
+                raw_body=str(body)[:4096],
+            )
+        return body
 
     async def invoke_kill_switch(
         self,

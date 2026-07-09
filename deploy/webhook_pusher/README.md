@@ -371,6 +371,34 @@ Capture for the Day 10 close-out in `Docs/decisions-log.md`:
   Future edits go through regular PR review, no `risk-review-approved`
   label needed, no auto-deploy.
 
+## Crypto-pivot §3.8 addendum (2026-07-09) — 00:10 UTC cycle digest
+
+The webhook_pusher container now runs a SECOND long-lived loop next to
+the SSE subscriber: `services/webhook_pusher/cycle_digest_scheduler.py`
+fetches `GET /api/system/cycle` at 00:10 UTC daily and pushes the
+daily-decision digest embed to the **#daily-brief** webhook
+(`discord.webhook_urls.daily_brief` in the host secrets file — now a
+REQUIRED field; the entrypoint fails closed exit-2 without it).
+
+Smoke checks after deploying this build (A27 fact-checks):
+
+1. `docker compose logs webhook_pusher | grep cycle_digest_scheduler_started`
+   — one line at container start with `fire_time_utc=00:10`.
+2. The morning after the strategy worker's first decision:
+   `docker compose logs webhook_pusher | grep cycle_digest_pushed` shows
+   `delivery_status=ok` + `http_status=204`, and #daily-brief carries
+   the embed (title `Daily decision — <date> · <status>`).
+3. Before the first decision ever lands the 00:10 firing logs
+   `cycle_digest_skipped_no_decision` and posts NOTHING — that is the
+   designed skip, not a fault.
+4. On-demand parity: `/cycle` in Discord renders the same embed
+   (ephemeral) — same builder, `services/discord_shared/cycle_digest.py`
+   (dependency-neutral shared package; the planner half stays in
+   `services/webhook_pusher/cycle_digest.py`).
+5. C0 exit gate (delta spec §5): the digest fires 3 consecutive days —
+   three `cycle_digest_pushed` (or `_skipped_no_decision`) lines on
+   three consecutive UTC dates.
+
 ## Module surface (for next agent)
 
 | Function | File | Purpose |
