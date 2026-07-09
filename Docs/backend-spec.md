@@ -689,6 +689,7 @@ stateDiagram-v2
 **Implementation notes:**
 - State stored in `risk_state` table (single-row + history); all transitions write `state_transition_*` audit events
 - CONVALESCENT counter: `convalescent_session_count` integer in `risk_state`; incremented at each CME session close while in CONVALESCENT; reset on any trigger
+- **SUPERSEDED (2026-07-09, decisions-log "C1 night one, CONVALESCENT amendment"):** the criterion is now **3 clean UTC calendar days** (crypto has no CME sessions), the resume day counts, the breach day never counts, and the tick source is the 00:15 UTC recon cycle with a `convalescent_last_counted_day_utc` once-per-day marker. The mermaid "5 CME sessions" above is retained as history; the decisions-log entry wins.
 - Capital-event timer is independent of CONVALESCENT counter; both run in parallel, vol multipliers compose via `MIN`
 
 ### 2.4.4 Vol-Target Multiplier Composition

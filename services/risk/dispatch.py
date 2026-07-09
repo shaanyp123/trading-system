@@ -62,16 +62,21 @@ A06 enforced — all timestamps are tz-aware UTC.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
-from typing import Literal
+from datetime import UTC, datetime, timedelta
+from typing import Any, Literal
 from uuid import UUID
 
 import structlog
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from services.audit.writer import Environment, PhaseAtEmit, append_audit_event
-from services.risk.state_machine import StateTransitionPlan
+from services.risk.state_machine import (
+    RiskState,
+    StateTransitionPlan,
+    clean_day_skip_reason,
+    plan_session_close,
+)
 
 log = structlog.get_logger()
 
@@ -232,7 +237,200 @@ async def apply_state_transition(
     )
 
 
+async def apply_convalescent_clean_day_tick(
+    *,
+    session_factory: async_sessionmaker[Any],
+    account_id: UUID,
+    env: Environment,
+    phase_at_emit: PhaseAtEmit,
+    now_utc: datetime,
+) -> AppliedStateTransition | None:
+    """Count one clean UTC day toward CONVALESCENT graduation, if due.
+
+    The production caller is the 00:15 UTC recon EOD cycle (via the api
+    lifespan's convalescent-tick hook): the tick running on UTC day T
+    evaluates day T-1 against :func:`~services.risk.state_machine.
+    clean_day_skip_reason` (resume day counts, breach day never counts,
+    once per day — the 2026-07-09 operator amendment; 3 clean days
+    graduate).
+
+    Write shapes (policy in ``state_machine``, I/O here, per the module
+    docstring):
+
+    * **Non-graduating day** — a plain UPDATE of
+      ``convalescent_session_count`` + the ``convalescent_last_counted_
+      day_utc`` marker in ONE transaction. Deliberately NO audit row:
+      the locked taxonomy has no per-tick event type (documented
+      deferral in ``plan_session_close``); the graduation event carries
+      ``convalescent_sessions_completed`` so the chain still shows the
+      journey. Returns None.
+    * **Graduating day** — audit-first per backend-spec §2.10.1: the
+      ``state_transition_convalescent_to_normal`` event is appended (via
+      :func:`append_audit_event`, its own session/transaction) BEFORE
+      the ``risk_state`` flip+INSERT, mirroring
+      :func:`apply_state_transition`'s two-step shape. Returns the
+      :class:`AppliedStateTransition` so the caller can fan out SSE.
+
+    Locking: the current row is read ``FOR UPDATE`` and held across the
+    decision + write, so a concurrent auto-halt (risk loop / recon
+    kill-switch hook, which rewrites the same row) serializes against
+    the tick instead of racing it. The audit write happens on a separate
+    session while the lock is held — different tables (audit_log vs
+    risk_state), so no lock-order inversion is possible. The reviewed
+    alternative (release the lock and reuse ``apply_state_transition``)
+    accepts a microscopic halt-vs-graduate race; this variant closes it
+    at the cost of a slightly longer row-lock hold (~one audit write).
+
+    Fail-safe by construction: every early return leaves the counter
+    untouched; a skipped or failed tick can only DELAY graduation,
+    never accelerate it.
+    """
+    if now_utc.tzinfo is None:
+        raise ValueError(f"now_utc must be tz-aware (dev-guide §3 / A06); got naive {now_utc!r}")
+    counted_day = now_utc.astimezone(UTC).date() - timedelta(days=1)
+
+    async with session_factory() as session:
+        async with session.begin():
+            row = (
+                await session.execute(
+                    text(
+                        "SELECT id, state, convalescent_session_count, entered_at_utc, "
+                        "       convalescent_last_counted_day_utc "
+                        "FROM risk_state "
+                        "WHERE account_id = :acc AND is_current = TRUE "
+                        "FOR UPDATE"
+                    ),
+                    {"acc": account_id},
+                )
+            ).fetchone()
+            if row is None:
+                log.info(
+                    "convalescent_tick_skipped",
+                    account_id=str(account_id),
+                    reason="no_current_risk_state_row",
+                    counted_day=counted_day.isoformat(),
+                )
+                return None
+
+            # Breach-day guard input: the most recent HALT_NEW row is
+            # necessarily the halt preceding the current CONVALESCENT
+            # stint (a newer halt would make the CURRENT state HALT_NEW,
+            # failing the predicate anyway).
+            halt_row = (
+                await session.execute(
+                    text(
+                        "SELECT entered_at_utc FROM risk_state "
+                        "WHERE account_id = :acc AND state = 'HALT_NEW' "
+                        "ORDER BY entered_at_utc DESC LIMIT 1"
+                    ),
+                    {"acc": account_id},
+                )
+            ).fetchone()
+            halt_day = halt_row.entered_at_utc.date() if halt_row is not None else None
+
+            entered_at = row.entered_at_utc
+            if entered_at.tzinfo is None:  # asyncpg returns tz-aware; defensive
+                entered_at = entered_at.replace(tzinfo=UTC)
+            skip_reason = clean_day_skip_reason(
+                current_state=RiskState(row.state),
+                entered_at_utc=entered_at,
+                last_counted_day_utc=row.convalescent_last_counted_day_utc,
+                halt_day_utc=halt_day,
+                counted_day_utc=counted_day,
+            )
+            if skip_reason is not None:
+                log.info(
+                    "convalescent_tick_skipped",
+                    account_id=str(account_id),
+                    reason=skip_reason,
+                    state=row.state,
+                    counted_day=counted_day.isoformat(),
+                )
+                return None
+
+            counter_before = int(row.convalescent_session_count or 0)
+            plan = plan_session_close(
+                current_state=RiskState.CONVALESCENT,
+                convalescent_counter=counter_before,
+                timestamp_utc=now_utc.isoformat(),
+            )
+
+            if plan is None:
+                await session.execute(
+                    text(
+                        "UPDATE risk_state SET "
+                        "    convalescent_session_count = :counter, "
+                        "    convalescent_last_counted_day_utc = :day "
+                        "WHERE id = :row_id"
+                    ),
+                    {"counter": counter_before + 1, "day": counted_day, "row_id": row.id},
+                )
+                log.info(
+                    "convalescent_clean_day_counted",
+                    account_id=str(account_id),
+                    counted_day=counted_day.isoformat(),
+                    counter_before=counter_before,
+                    counter_after=counter_before + 1,
+                )
+                return None
+
+            # Graduation: audit-first on a SEPARATE session while the row
+            # lock is held (see docstring), then the flip+INSERT.
+            last_event_uuid: UUID | None = None
+            async with session_factory() as audit_session:
+                for pending in plan.audit_events:
+                    record = await append_audit_event(
+                        audit_session,
+                        pending.event_type,
+                        pending.payload,
+                        account_id=account_id,
+                        env=env,
+                        phase_at_emit=phase_at_emit,
+                    )
+                    last_event_uuid = record.event_uuid
+            assert last_event_uuid is not None  # plan always carries the transition event
+
+            await session.execute(
+                text("UPDATE risk_state SET is_current = FALSE WHERE id = :row_id"),
+                {"row_id": row.id},
+            )
+            await session.execute(
+                text(
+                    "INSERT INTO risk_state ("
+                    "    account_id, state, severity, reason, entered_at_utc, "
+                    "    convalescent_session_count, vacation_active, "
+                    "    audit_event_uuid, is_current"
+                    ") VALUES ("
+                    "    :acc, :state, NULL, :reason, :entered, "
+                    "    :counter, FALSE, :audit_uuid, TRUE"
+                    ")"
+                ),
+                {
+                    "acc": account_id,
+                    "state": plan.new_state.value,
+                    "reason": plan.reason,
+                    "entered": now_utc,
+                    "counter": plan.new_convalescent_counter,
+                    "audit_uuid": last_event_uuid,
+                },
+            )
+
+    log.info(
+        "convalescent_graduated",
+        account_id=str(account_id),
+        counted_day=counted_day.isoformat(),
+        sessions_completed=counter_before + 1,
+        audit_event_uuid=str(last_event_uuid),
+    )
+    return AppliedStateTransition(
+        state_transition_audit_event_uuid=last_event_uuid,
+        new_state=plan.new_state.value,
+        new_severity=None,
+    )
+
+
 __all__ = [
     "AppliedStateTransition",
+    "apply_convalescent_clean_day_tick",
     "apply_state_transition",
 ]

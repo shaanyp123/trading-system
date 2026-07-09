@@ -329,8 +329,10 @@ a risk loop that re-checks marks, margin, and limits **every 30 seconds**.
    hits −8% — $480 on a $6,000 account — the machine **flattens every position, cancels
    every order, and halts new entries**. As implemented live (operator-approved
    2026-07-09, deliberately *stricter* than the spec's automatic 24-hour pause), resuming
-   requires **manual operator action**, and the first 5 days back run at **half size**
-   (the "convalescent" state).
+   requires **manual operator action**, and the first **3 clean UTC days** back run at
+   **half size** (the "convalescent" state). The resume day itself counts toward the 3 —
+   but the day of the breach never does, and a day only counts if no new trigger fired
+   (amended from 5 days, operator directive 2026-07-09 late session).
 5. **Weekly loss limit −16%:** if rolling 7-day P&L is worse than −16% of equity, the
    volatility target is **halved for 7 days** — the system automatically de-risks after a
    bad week.
@@ -651,3 +653,4 @@ Plain-English definitions of every term of art used above.
 | Date | Change | Reason |
 |---|---|---|
 | 2026-07-09 | Initial version. | Documents the Amendment B production profile as validated and built (spec + Amendments, REPORT.md, delta spec), status as of C1 small-live start. |
+| 2026-07-09 (later) | Convalescent probation shortened: 3 clean UTC days (was 5), resume day counts, breach day never counts. | Operator amendment at C1 night one; decisions-log "C1 night one, CONVALESCENT amendment". |

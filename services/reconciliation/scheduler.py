@@ -6,14 +6,13 @@ once-per-UTC-calendar-day at the EOD cutover: **00:15 UTC**, ten
 minutes after the 00:05 UTC daily strategy decision (delta spec §3.5),
 so the recon snapshot sees the decision's fills. Crypto trades 24/7 —
 there is no exchange session; the UTC calendar day IS the session day
-(the same convention the §3.4 CONVALESCENT "5 clean UTC calendar days"
-criterion counts on — this cycle is the *intended* tick source, but the
-tick is NOT yet wired: nothing calls ``plan_session_close`` / increments
-``convalescent_session_count`` in production. Wiring it is a tracked
-pre-C1 residual (risk review of the §3.5 PR, 2026-07-09); until it lands,
-CONVALESCENT cannot auto-graduate — fail-safe, but do not claim
-otherwise). The CME-era
-18:30-ET / America-New_York anchoring died with the IBKR/LEAN stack.
+(the same convention the §3.4 CONVALESCENT clean-day criterion counts
+on — 3 days per the 2026-07-09 operator amendment. The tick IS wired:
+``eod_cycle.run_eod_cycle`` invokes the api lifespan's
+``convalescent_tick`` hook after the apply step, which drives
+``services/risk/dispatch.py::apply_convalescent_clean_day_tick``).
+The CME-era 18:30-ET / America-New_York anchoring died with the
+IBKR/LEAN stack.
 
 This module provides a stdlib-asyncio scheduler that:
 

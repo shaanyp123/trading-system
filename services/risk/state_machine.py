@@ -23,7 +23,7 @@ Valid transitions (backend-spec §2.4.3 mermaid diagram):
     NORMAL       -> HALT_NEW       (any trigger; severity per trigger taxonomy)
     HALT_NEW     -> CONVALESCENT   (human resume; re-auth web-only)
     CONVALESCENT -> HALT_NEW       (any trigger; counter resets to 0)
-    CONVALESCENT -> NORMAL         (after EXACTLY 5 clean UTC calendar days)
+    CONVALESCENT -> NORMAL         (after EXACTLY 3 clean UTC calendar days)
 
 Invalid transitions (raise ``IllegalTransitionError``):
     NORMAL       -> CONVALESCENT       (must go through HALT_NEW)
@@ -43,10 +43,15 @@ Severity rules:
   decommission floor.
 
 CONVALESCENT counter rules:
-- Increments once per clean UTC calendar day while in CONVALESCENT
-  (crypto-pivot C0-B4: was "at each CME session close"; the daily
-  00:15 UTC recon cycle is the tick source).
-- Reaches 5 -> transition CONVALESCENT -> NORMAL (audit:
+- Increments once per clean UTC calendar day while in CONVALESCENT.
+  The production tick source is the daily 00:15 UTC recon cycle
+  (``services/reconciliation/eod_cycle.py`` -> the api lifespan's
+  convalescent-tick hook -> ``services/risk/dispatch.py::
+  apply_convalescent_clean_day_tick``); "clean" is defined by
+  :func:`should_count_clean_day` (resume day counts, breach day never
+  counts, once per day — 2026-07-09 operator amendment).
+- Reaches :data:`CONVALESCENT_SESSIONS_TO_NORMAL` (3 per the amendment)
+  -> transition CONVALESCENT -> NORMAL (audit:
   ``state_transition_convalescent_to_normal``).
 - Any new trigger while in CONVALESCENT -> transition CONVALESCENT -> HALT_NEW;
   emits BOTH a ``state_transition_*`` audit event AND a separate
@@ -57,7 +62,7 @@ Tests in ``tests/unit/test_state_machine.py`` cover the §10.1 inventory:
 - NORMAL -> HALT_NEW (each trigger x each severity)
 - HALT_NEW -> CONVALESCENT (routine resume)
 - HALT_NEW -> CONVALESCENT (incident_review resume requires ``incident_review_id``)
-- CONVALESCENT -> NORMAL after EXACTLY 5 clean UTC days (4 doesn't graduate; 5 does)
+- CONVALESCENT -> NORMAL after EXACTLY 3 clean UTC days (2 doesn't graduate; 3 does)
 - CONVALESCENT -> HALT_NEW resets counter to 0
 - Invalid transitions raise ``IllegalTransitionError``
 """
@@ -65,6 +70,7 @@ Tests in ``tests/unit/test_state_machine.py`` cover the §10.1 inventory:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, datetime
 from enum import StrEnum
 from typing import Any, Final, Literal
 
@@ -145,12 +151,15 @@ TRIGGER_SEVERITY: Final[dict[TransitionTrigger, HaltSeverity]] = {
 
 
 #: CONVALESCENT graduates to NORMAL after exactly this many clean UTC
-#: calendar days (crypto-pivot C0-B4, delta spec §3.4: the pre-pivot
-#: criterion was "5 clean CME sessions" per backend-spec §2.4.3 — crypto
-#: trades 24/7 with no sessions, so the daily 00:15 UTC recon cycle's
-#: session-close call now marks one clean UTC day). Counter/reset
-#: machinery unchanged; only the calendar the caller ticks on changed.
-CONVALESCENT_SESSIONS_TO_NORMAL: Final[int] = 5
+#: calendar days. History: backend-spec §2.4.3's CME-era criterion was
+#: "5 clean CME sessions"; crypto-pivot C0-B4 (delta spec §3.4) recast
+#: the unit as UTC calendar days ticked by the 00:15 UTC recon cycle;
+#: the 2026-07-09 operator amendment (decisions-log "C1 night one,
+#: CONVALESCENT amendment") shortened 5 -> 3 AND made the resume day
+#: itself countable (see :func:`should_count_clean_day` for the full
+#: clean-day predicate incl. the breach-day guard). Decisions-log wins
+#: over the older spec text per the standing convention.
+CONVALESCENT_SESSIONS_TO_NORMAL: Final[int] = 3
 
 
 # ---------------------------------------------------------------------------
@@ -409,15 +418,20 @@ def plan_session_close(
 
     - NORMAL: no-op (returns None).
     - HALT_NEW: no-op (counter doesn't tick during halt; returns None).
-    - CONVALESCENT counter < 4: increment to counter+1, stay in CONVALESCENT.
-      Returns a plan with audit event ``convalescent_session_close_tick`` —
-      EXCEPT we don't have that audit type in the locked taxonomy, so we
-      defer and return None for non-graduating ticks. The caller updates
+    - CONVALESCENT, counter below graduation-1: increment to counter+1,
+      stay in CONVALESCENT. Returns a plan with audit event
+      ``convalescent_session_close_tick`` — EXCEPT we don't have that
+      audit type in the locked taxonomy, so we defer and return None for
+      non-graduating ticks. The caller updates
       ``risk_state.convalescent_session_count`` directly without an audit
       write (low-noise; the graduate-to-NORMAL event captures the journey).
-    - CONVALESCENT counter == 4: this close brings counter to 5 -> graduate
-      to NORMAL. Returns a plan with the
+    - CONVALESCENT, counter == :data:`CONVALESCENT_SESSIONS_TO_NORMAL`-1:
+      this tick graduates to NORMAL. Returns a plan with the
       ``state_transition_convalescent_to_normal`` event.
+
+    Whether a given UTC day is COUNTABLE at all is the caller's question,
+    answered by :func:`should_count_clean_day` — this function only maps
+    "one countable day happened" to counter/transition mechanics.
 
     Returns ``None`` when no state transition occurs. The caller still
     increments the in-DB counter via a simple UPDATE.
@@ -430,7 +444,7 @@ def plan_session_close(
         # Caller updates counter via UPDATE; no audit/SSE for this tick.
         return None
 
-    # new_counter == 5: graduate.
+    # new_counter == CONVALESCENT_SESSIONS_TO_NORMAL: graduate.
     audit_events = (
         PendingAuditEvent(
             event_type="state_transition_convalescent_to_normal",
@@ -464,6 +478,84 @@ def plan_session_close(
     )
 
 
+def should_count_clean_day(
+    *,
+    current_state: RiskState,
+    entered_at_utc: datetime,
+    last_counted_day_utc: date | None,
+    halt_day_utc: date | None,
+    counted_day_utc: date,
+) -> bool:
+    """Pure clean-day predicate for the 00:15 UTC CONVALESCENT tick.
+
+    The tick running on UTC day T evaluates ``counted_day_utc = T-1``.
+    Day D counts as clean iff ALL of:
+
+    1. The current risk state is CONVALESCENT at tick time. Any breach or
+       halt during D would have transitioned to HALT_NEW (resetting the
+       counter), so surviving in CONVALESCENT is itself the "no breach"
+       evidence.
+    2. The stint covered day D: ``entered_at_utc.date() <= D``. The
+       RESUME DAY COUNTS even when the operator resumed mid-day —
+       2026-07-09 operator amendment (was strictly-before; decisions-log
+       "C1 night one, CONVALESCENT amendment").
+    3. The breach-day guard: D is not the day the preceding halt was
+       entered (``halt_day_utc``). Without this, a same-UTC-day
+       breach->halt->resume would count the loss day itself as clean
+       day 1 — contrary to the amendment's intent, confirmed explicitly
+       by the operator. ``halt_day_utc=None`` (no prior halt row found,
+       e.g. a hand-seeded CONVALESCENT in tests) skips the guard.
+    4. Once per day: ``last_counted_day_utc`` (the durable marker column)
+       is NULL or strictly before D. A scheduler re-fire or crash-restart
+       re-running the cycle on the same day is a no-op.
+
+    Days with no tick at all (host down at 00:15) are simply never
+    counted — graduation slips a day rather than auto-crediting an
+    unwatched day (fail-safe default, operator-endorsed).
+    """
+    return (
+        clean_day_skip_reason(
+            current_state=current_state,
+            entered_at_utc=entered_at_utc,
+            last_counted_day_utc=last_counted_day_utc,
+            halt_day_utc=halt_day_utc,
+            counted_day_utc=counted_day_utc,
+        )
+        is None
+    )
+
+
+def clean_day_skip_reason(
+    *,
+    current_state: RiskState,
+    entered_at_utc: datetime,
+    last_counted_day_utc: date | None,
+    halt_day_utc: date | None,
+    counted_day_utc: date,
+) -> str | None:
+    """Reason the day does NOT count, or None when it counts.
+
+    The reason-string variant of :func:`should_count_clean_day` (same
+    predicate, single source of truth — the boolean form delegates
+    here). The dispatch layer logs the reason verbatim in
+    ``convalescent_tick_skipped`` so the operator can read WHY a day
+    didn't advance the counter without decoding predicate internals.
+    """
+    if entered_at_utc.tzinfo is None:
+        raise ValueError(
+            f"entered_at_utc must be tz-aware (dev-guide §3 / A06); got naive {entered_at_utc!r}"
+        )
+    if current_state != RiskState.CONVALESCENT:
+        return "not_convalescent"
+    if entered_at_utc.date() > counted_day_utc:
+        return "stint_started_after_counted_day"
+    if halt_day_utc is not None and halt_day_utc == counted_day_utc:
+        return "breach_day"
+    if last_counted_day_utc is not None and last_counted_day_utc >= counted_day_utc:
+        return "already_counted"
+    return None
+
+
 __all__ = [
     "CONVALESCENT_SESSIONS_TO_NORMAL",
     "TRIGGER_SEVERITY",
@@ -478,4 +570,5 @@ __all__ = [
     "plan_invoke_kill_switch",
     "plan_resume_from_halt",
     "plan_session_close",
+    "should_count_clean_day",
 ]

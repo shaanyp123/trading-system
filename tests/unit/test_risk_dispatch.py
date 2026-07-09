@@ -501,6 +501,7 @@ class TestModuleContract:
     def test_all_exports(self) -> None:
         assert set(dispatch_module.__all__) == {
             "AppliedStateTransition",
+            "apply_convalescent_clean_day_tick",
             "apply_state_transition",
         }
 

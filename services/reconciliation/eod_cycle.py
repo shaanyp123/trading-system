@@ -30,14 +30,22 @@ the scheduler can consume. The diff/apply engine itself (``recon.py``,
      (audit-first per backend-spec §2.10.1).
   6. Log + return the apply result.
 
-**Kill-switch hook deliberately NOT wired in Phase 1:** the apply layer
-accepts an optional ``state_transition_hook`` callback that fires when
-``plan.should_invoke_kill_switch`` is True. Wiring that up requires
-threading the risk-state machine into this module; the cleaner cut is
-to ship the read+write pipeline first and add the hook in a follow-up
-once the dispatcher's state-transition contract is exercised. Until
-then, an actionable break still lands in audit + reconciliation_breaks;
-the operator can manually halt via the System page kill-switch UI.
+**Kill-switch hook (PR-J) wired via the api lifespan:** the apply layer's
+optional ``state_transition_hook`` fires when
+``plan.should_invoke_kill_switch`` is True; ``services/api/main.py``
+builds the closure over the risk dispatcher so this module stays free
+of risk-layer imports.
+
+**CONVALESCENT clean-day tick (2026-07-09 amendment):** after the apply
+step, the cycle invokes the optional ``convalescent_tick`` hook — the
+production wiring for the 3-clean-UTC-days graduation counter
+(``services/risk/dispatch.py::apply_convalescent_clean_day_tick``,
+built as a closure in the api lifespan, same decoupling as the
+kill-switch hook). Ordering is load-bearing: the tick runs AFTER
+``apply_reconciliation_plan`` so a break detected by THIS cycle has
+already halted the account before the tick reads state — a breach day
+can never count as clean. Tick failures are best-effort (logged, never
+fail the cycle); a missed tick only delays graduation.
 
 **Alert dispatch hook:** the ``alert_dispatch_hook`` parameter flows
 through to :func:`services.reconciliation.apply.apply_reconciliation_plan`
@@ -162,6 +170,16 @@ _METRIC_BY_STRING: Final[dict[str, ReconciliationMetric]] = {
 
 CycleCallback = Callable[[date], Awaitable[None]]
 """Re-export of the scheduler's callback shape for convenience."""
+
+
+ConvalescentTickHook = Callable[[], Awaitable[bool]]
+"""Post-apply CONVALESCENT clean-day tick (module docstring).
+
+Built by the api lifespan as a closure over
+``services.risk.dispatch.apply_convalescent_clean_day_tick`` + the SSE
+fan-out, keeping this module free of risk-layer imports (the
+``StateTransitionHook`` precedent). Returns True when the tick GRADUATED
+the account back to NORMAL — surfaced in the cycle-completed log line."""
 
 
 def _dec_str_or_none(value: Decimal | None) -> str | None:
@@ -669,6 +687,7 @@ async def run_eod_cycle(
     fetcher: ReconSnapshotFetcher,
     alert_dispatch_hook: AlertDispatchHook | None = None,
     state_transition_hook: StateTransitionHook | None = None,
+    convalescent_tick: ConvalescentTickHook | None = None,
 ) -> ReconciliationApplyResult | None:
     """Execute one EOD reconciliation cycle end-to-end.
 
@@ -785,6 +804,23 @@ async def run_eod_cycle(
         state_transition_hook=state_transition_hook,
     )
 
+    # CONVALESCENT clean-day tick (2026-07-09 amendment; module docstring).
+    # MUST run after apply_reconciliation_plan: the apply's kill-switch
+    # hook has already halted on any actionable break, so the tick sees
+    # post-halt state and a break day never counts as clean. Best-effort:
+    # a tick failure only delays graduation (fail-safe), never fails the
+    # cycle.
+    convalescent_graduated = False
+    if convalescent_tick is not None:
+        try:
+            convalescent_graduated = await convalescent_tick()
+        except Exception:
+            log.exception(
+                "reconciliation_eod_cycle_convalescent_tick_failed",
+                account_id=str(config.account_id),
+                env=config.env,
+            )
+
     # PR-K wiring (2026-05-16): roll up today's closed-trade attribution.
     # Fires AFTER recon so cash + position state has already been
     # refreshed + diffed. Emits one ATTRIBUTION_ROLLUP_RECORDED audit
@@ -825,6 +861,7 @@ async def run_eod_cycle(
         breaks_resolved=len(plan.breaks_resolved),
         actionable_break_count=plan.actionable_break_count,
         kill_switch_invoked=result.kill_switch_invoked,
+        convalescent_graduated=convalescent_graduated,
         attribution_rows_inserted=attribution_count,
         duration_seconds=round(duration_s, 2),
     )
@@ -1001,6 +1038,7 @@ def make_cycle_callback(
     fetcher: ReconSnapshotFetcher,
     alert_dispatch_hook: AlertDispatchHook | None = None,
     state_transition_hook: StateTransitionHook | None = None,
+    convalescent_tick: ConvalescentTickHook | None = None,
 ) -> CycleCallback:
     """Build the :class:`CycleCallback` the scheduler invokes per session day.
 
@@ -1030,6 +1068,7 @@ def make_cycle_callback(
             fetcher=fetcher,
             alert_dispatch_hook=alert_dispatch_hook,
             state_transition_hook=state_transition_hook,
+            convalescent_tick=convalescent_tick,
         )
 
     return _cycle
@@ -1040,6 +1079,7 @@ __all__ = [
     "DEFAULT_PRIOR_BREAKS_WINDOW_HOURS",
     "PNL_QUANTIZER",
     "BackendRefreshResult",
+    "ConvalescentTickHook",
     "CycleCallback",
     "EodCycleConfig",
     "ReconPosition",

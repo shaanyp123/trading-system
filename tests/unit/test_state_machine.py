@@ -16,6 +16,8 @@ pure function and ``audit_events`` is asserted as data on the
 
 from __future__ import annotations
 
+from datetime import UTC, date, datetime
+
 import pytest
 
 from services.risk.state_machine import (
@@ -25,9 +27,11 @@ from services.risk.state_machine import (
     IllegalTransitionError,
     RiskState,
     TransitionTrigger,
+    clean_day_skip_reason,
     plan_invoke_kill_switch,
     plan_resume_from_halt,
     plan_session_close,
+    should_count_clean_day,
 )
 
 # ---------------------------------------------------------------------------
@@ -266,10 +270,11 @@ class TestHaltToConvalescent:
 
 
 class TestConvalescentSessionCounter:
-    """Crypto-pivot C0-B4 (delta spec §3.4): the graduation criterion is
-    5 clean UTC calendar DAYS (was: 5 clean CME sessions). The counter
-    machinery is calendar-agnostic — these tests pin that the threshold
-    stays exactly 5 and the tick/reset behavior is unchanged; the daily
+    """The graduation criterion is 3 clean UTC calendar DAYS — 2026-07-09
+    operator amendment (decisions-log "C1 night one, CONVALESCENT
+    amendment"), superseding both the CME-era backend-spec §2.4.3
+    "5 sessions" and the C0-B4 "5 UTC days" recast. These tests pin the
+    threshold at exactly 3 and the tick/reset mechanics; the daily
     00:15 UTC recon cycle is the tick source."""
 
     def test_session_close_in_normal_returns_none(self) -> None:
@@ -288,9 +293,9 @@ class TestConvalescentSessionCounter:
         )
         assert plan is None
 
-    @pytest.mark.parametrize("counter_before", [0, 1, 2, 3])
+    @pytest.mark.parametrize("counter_before", [0, 1])
     def test_convalescent_counter_below_threshold_returns_none(self, counter_before: int) -> None:
-        """Sessions 1-4 don't graduate. The caller still increments the
+        """Days 1-2 don't graduate. The caller still increments the
         counter via UPDATE; the policy returns None (no transition)."""
         plan = plan_session_close(
             current_state=RiskState.CONVALESCENT,
@@ -299,20 +304,20 @@ class TestConvalescentSessionCounter:
         )
         assert plan is None
 
-    def test_convalescent_counter_reaches_4_does_not_graduate(self) -> None:
-        """Boundary: counter=3 BEFORE this close increments to 4. Still not 5."""
+    def test_convalescent_counter_reaches_2_does_not_graduate(self) -> None:
+        """Boundary: counter=1 BEFORE this tick increments to 2. Still not 3."""
         plan = plan_session_close(
             current_state=RiskState.CONVALESCENT,
-            convalescent_counter=3,
+            convalescent_counter=1,
             timestamp_utc="2026-05-08T22:00:00Z",
         )
         assert plan is None
 
-    def test_convalescent_counter_reaches_5_graduates_to_normal(self) -> None:
-        """Boundary: counter=4 BEFORE this close increments to 5 -> graduate."""
+    def test_convalescent_counter_reaches_3_graduates_to_normal(self) -> None:
+        """Boundary: counter=2 BEFORE this tick increments to 3 -> graduate."""
         plan = plan_session_close(
             current_state=RiskState.CONVALESCENT,
-            convalescent_counter=4,
+            convalescent_counter=2,
             timestamp_utc="2026-05-08T22:00:00Z",
         )
         assert plan is not None
@@ -320,13 +325,14 @@ class TestConvalescentSessionCounter:
         assert plan.new_state == RiskState.NORMAL
         assert plan.new_convalescent_counter == 0
         assert plan.audit_events[0].event_type == "state_transition_convalescent_to_normal"
-        assert plan.audit_events[0].payload["convalescent_sessions_completed"] == 5
+        assert plan.audit_events[0].payload["convalescent_sessions_completed"] == 3
         assert plan.sse_event.data["state"] == "NORMAL"
         assert plan.sse_event.data["reason"] == "convalescent_graduated"
 
-    def test_convalescent_constant_matches_spec(self) -> None:
-        """Lock-in: backend-spec §2.4.3 specifies "5 CME sessions"."""
-        assert CONVALESCENT_SESSIONS_TO_NORMAL == 5
+    def test_convalescent_constant_matches_amendment(self) -> None:
+        """Lock-in: 3 clean UTC days per the 2026-07-09 operator amendment
+        (decisions-log wins over backend-spec §2.4.3's CME-era "5")."""
+        assert CONVALESCENT_SESSIONS_TO_NORMAL == 3
 
 
 # ---------------------------------------------------------------------------
@@ -390,3 +396,121 @@ class TestPlanShape:
         )
         assert plan.audit_events[0].payload["prior_severity"] == "defensive_envelope"
         assert plan.new_severity is None
+
+
+# ---------------------------------------------------------------------------
+# Clean-day predicate (2026-07-09 CONVALESCENT amendment)
+# ---------------------------------------------------------------------------
+
+
+class TestCleanDayPredicate:
+    """Pins the amended clean-day semantics: resume day counts, breach day
+    never counts, once per day, CONVALESCENT only. The dispatch tick at
+    00:15 UTC on day T evaluates counted_day = T-1."""
+
+    COUNTED = date(2026, 7, 15)
+
+    def _entered(self, day: date, hour: int = 14) -> datetime:
+        return datetime(day.year, day.month, day.day, hour, tzinfo=UTC)
+
+    def test_full_day_in_convalescent_counts(self) -> None:
+        assert should_count_clean_day(
+            current_state=RiskState.CONVALESCENT,
+            entered_at_utc=self._entered(date(2026, 7, 13)),
+            last_counted_day_utc=date(2026, 7, 14),
+            halt_day_utc=date(2026, 7, 13),
+            counted_day_utc=self.COUNTED,
+        )
+
+    def test_resume_day_itself_counts(self) -> None:
+        """Amendment: mid-day resume on the counted day still counts,
+        provided the halt was a PRIOR day."""
+        assert should_count_clean_day(
+            current_state=RiskState.CONVALESCENT,
+            entered_at_utc=self._entered(self.COUNTED, hour=14),
+            last_counted_day_utc=None,
+            halt_day_utc=date(2026, 7, 14),
+            counted_day_utc=self.COUNTED,
+        )
+
+    def test_breach_day_never_counts_even_with_same_day_resume(self) -> None:
+        """Same-UTC-day breach->halt->resume: the loss day is not clean."""
+        assert (
+            clean_day_skip_reason(
+                current_state=RiskState.CONVALESCENT,
+                entered_at_utc=self._entered(self.COUNTED, hour=20),
+                last_counted_day_utc=None,
+                halt_day_utc=self.COUNTED,
+                counted_day_utc=self.COUNTED,
+            )
+            == "breach_day"
+        )
+
+    def test_stint_started_after_counted_day_rejected(self) -> None:
+        assert (
+            clean_day_skip_reason(
+                current_state=RiskState.CONVALESCENT,
+                entered_at_utc=self._entered(date(2026, 7, 16)),
+                last_counted_day_utc=None,
+                halt_day_utc=None,
+                counted_day_utc=self.COUNTED,
+            )
+            == "stint_started_after_counted_day"
+        )
+
+    def test_already_counted_day_rejected(self) -> None:
+        """Idempotency: a scheduler re-fire on the same day is a no-op."""
+        assert (
+            clean_day_skip_reason(
+                current_state=RiskState.CONVALESCENT,
+                entered_at_utc=self._entered(date(2026, 7, 13)),
+                last_counted_day_utc=self.COUNTED,
+                halt_day_utc=None,
+                counted_day_utc=self.COUNTED,
+            )
+            == "already_counted"
+        )
+
+    @pytest.mark.parametrize("state", [RiskState.NORMAL, RiskState.HALT_NEW])
+    def test_non_convalescent_states_rejected(self, state: RiskState) -> None:
+        assert (
+            clean_day_skip_reason(
+                current_state=state,
+                entered_at_utc=self._entered(date(2026, 7, 13)),
+                last_counted_day_utc=None,
+                halt_day_utc=None,
+                counted_day_utc=self.COUNTED,
+            )
+            == "not_convalescent"
+        )
+
+    def test_no_prior_halt_row_skips_guard(self) -> None:
+        """halt_day_utc=None (hand-seeded CONVALESCENT) -> guard skipped."""
+        assert should_count_clean_day(
+            current_state=RiskState.CONVALESCENT,
+            entered_at_utc=self._entered(self.COUNTED),
+            last_counted_day_utc=None,
+            halt_day_utc=None,
+            counted_day_utc=self.COUNTED,
+        )
+
+    def test_entered_at_midnight_of_counted_day_counts(self) -> None:
+        """Boundary: entered exactly 00:00:00 of the counted day — the
+        resume-day-counts rule includes it (<=, not <)."""
+        assert should_count_clean_day(
+            current_state=RiskState.CONVALESCENT,
+            entered_at_utc=datetime(2026, 7, 15, 0, 0, 0, tzinfo=UTC),
+            last_counted_day_utc=None,
+            halt_day_utc=date(2026, 7, 14),
+            counted_day_utc=self.COUNTED,
+        )
+
+    def test_naive_entered_at_raises(self) -> None:
+        with pytest.raises(ValueError, match="tz-aware"):
+            should_count_clean_day(
+                current_state=RiskState.CONVALESCENT,
+                entered_at_utc=datetime(2026, 7, 13, 14, 0, 0),
+                last_counted_day_utc=None,
+                halt_day_utc=None,
+                counted_day_utc=self.COUNTED,
+            )
