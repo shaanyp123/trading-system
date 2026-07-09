@@ -26,9 +26,12 @@ ceremony, no age key, nothing to keep in a safe.
   idles well under 1 GB now; resize later if Postgres wants more.
 * SSH key: add your Mac's public key (`cat ~/.ssh/id_ed25519.pub`;
   generate with `ssh-keygen -t ed25519` if you don't have one).
-* Note the server IP. Point DNS `A` records for the apex + `paper.`
-  subdomain at it (same registrar panel as before). TLS (Step 6) needs
-  DNS resolving first — do this early, it can take a few minutes.
+* Note the server IP. Point the apex `A` record (`spratcapital.com`) at it
+  (same registrar panel as before). The paper env is served at the APEX —
+  there is no `paper.` subdomain (Caddyfile has apex + `www.` + reserved
+  `live.` blocks only; see the Day-5 watchdog incident in decisions-log).
+  TLS (Step 6) needs DNS resolving first — do this early, it can take a
+  few minutes.
 
 ```bash
 ssh root@<NEW_IP>
@@ -115,8 +118,8 @@ login), and gates on `/api/health`.
 ## Step 6 — Verify from outside + bring up the rest
 
 ```bash
-# from your Mac:
-curl -fsS https://paper.spratcapital.com/api/health
+# from your laptop:
+curl -fsS https://spratcapital.com/api/health
 ```
 
 Then back on the VPS:
