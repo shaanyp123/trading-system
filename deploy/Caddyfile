@@ -31,6 +31,29 @@
 	}
 }
 
+# Operator basic-auth gate — shared by the frontend AND all /api/* traffic.
+#
+# SECURITY (2026-07-09, C1 night one): the api's session layer is still the
+# Phase-0 stub (services/api/session.py), which injects a strong-auth
+# operator session into every request in non-live-tagged environments. The
+# VPS runs env=paper while managing REAL MONEY (C1 small-live), so before
+# this gate the entire API — including risk-loosening POSTs like
+# kill-switch resume — was publicly reachable on the apex. Until the real
+# WebAuthn session middleware lands, this edge gate IS the auth boundary:
+# every /api/* path except the public health probe requires these
+# credentials. Internal consumers (discord_bot, webhook_pusher, workers)
+# talk to api:8000 on the Docker network and never pass through Caddy;
+# the watchdog push keeps its own IP-allowlisted handle.
+#
+# Password hash generated via:
+#   docker run --rm caddy:2-alpine caddy hash-password --plaintext '<pw>'
+# To rotate: regenerate the hash and replace the second token below.
+(operator_basic_auth) {
+	basic_auth {
+		spratcapital2026! $2a$14$.tOJT3KwonivfSDdTeoZEe2bvYmFvxDg8uCv6SA.v9iQRt4lmdFTO
+	}
+}
+
 # Apex domain. {$DOMAIN} is set in deploy/.env on the VPS (e.g. spratcapital.com).
 {$DOMAIN} {
 	encode gzip zstd
@@ -55,8 +78,17 @@
 		Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; connect-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'"
 	}
 
+	# Public health probe — the ONLY unauthenticated API path (runbook curls,
+	# uptime checks). Matched before the gated /api/* handle below.
+	handle /api/health {
+		reverse_proxy api:8000
+	}
+
 	# Server-Sent Events — must not buffer; long read timeout for 24h replay window.
+	# Gated: the browser re-sends the cached basic-auth credentials for
+	# same-origin EventSource requests.
 	handle /api/sse/events {
+		import operator_basic_auth
 		reverse_proxy api:8000 {
 			flush_interval -1
 			transport http {
@@ -75,8 +107,10 @@
 		reverse_proxy api:8000
 	}
 
-	# All other API traffic
+	# All other API traffic — basic_auth-gated (see the snippet header for
+	# why this is currently the ONLY auth boundary in front of real money).
 	handle /api/* {
+		import operator_basic_auth
 		reverse_proxy api:8000
 	}
 
@@ -100,24 +134,11 @@
 		}
 	}
 
-	# Default → Next.js frontend (lands Phase 0 Week 4+). Until the upstream
-	# exists, /` falls through to handle_errors. /api/* routes above are
-	# served independently and are not affected.
-	#
-	# Temporary "simple auth" gate (operator request 2026-05-19): HTTP Basic
-	# Auth on the frontend only. /api/* paths above are NOT gated so the
-	# watchdog poll, SSE multiplexer, and bot bearer-auth path keep working.
-	# This is a stopgap until the spec'd WebAuthn + TOTP flow at /login is
-	# wired end-to-end (backend-spec §8.5; routes already shipped Day 21 but
-	# operator wants entry gated NOW).
-	#
-	# Password hash generated via:
-	#   docker run --rm caddy:2-alpine caddy hash-password --plaintext '<pw>'
-	# To rotate: regenerate the hash and replace the second token below.
+	# Default → Next.js frontend. Same operator gate as /api/* (2026-07-09:
+	# the old "frontend only" stopgap became the full edge auth boundary —
+	# see the snippet header at the top of this file).
 	handle {
-		basic_auth {
-			spratcapital2026! $2a$14$.tOJT3KwonivfSDdTeoZEe2bvYmFvxDg8uCv6SA.v9iQRt4lmdFTO
-		}
+		import operator_basic_auth
 		reverse_proxy nextjs:3000
 	}
 }
