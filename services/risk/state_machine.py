@@ -70,7 +70,7 @@ Tests in ``tests/unit/test_state_machine.py`` cover the §10.1 inventory:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from enum import StrEnum
 from typing import Any, Final, Literal
 
@@ -547,7 +547,9 @@ def clean_day_skip_reason(
         )
     if current_state != RiskState.CONVALESCENT:
         return "not_convalescent"
-    if entered_at_utc.date() > counted_day_utc:
+    # astimezone(UTC) before .date(): a tz-aware-but-non-UTC datetime would
+    # otherwise silently bucket into the wrong UTC day (risk-review note).
+    if entered_at_utc.astimezone(UTC).date() > counted_day_utc:
         return "stint_started_after_counted_day"
     if halt_day_utc is not None and halt_day_utc == counted_day_utc:
         return "breach_day"

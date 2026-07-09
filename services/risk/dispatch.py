@@ -276,10 +276,24 @@ async def apply_convalescent_clean_day_tick(
     kill-switch hook, which rewrites the same row) serializes against
     the tick instead of racing it. The audit write happens on a separate
     session while the lock is held — different tables (audit_log vs
-    risk_state), so no lock-order inversion is possible. The reviewed
-    alternative (release the lock and reuse ``apply_state_transition``)
-    accepts a microscopic halt-vs-graduate race; this variant closes it
-    at the cost of a slightly longer row-lock hold (~one audit write).
+    risk_state), so no lock-order inversion is possible. What the lock
+    buys, precisely (2026-07-09 risk review): if the HALT wins the lock,
+    the tick re-reads and skips (fail-safe); if the TICK wins, a halt
+    blocked behind it fails LOUDLY on the ``risk_state_current`` partial
+    unique index and the worker's next 30 s risk tick re-fires it —
+    fail-loud-with-retry rather than a silent stomp. It does NOT make
+    the pair atomic. Known follow-up (own [A02] PR): the worker's
+    ``_tick_failure_halt_fired`` latch is set before its suppressed
+    ``invoke_kill_switch`` call and would swallow that retry for the
+    tick-failure halt path specifically.
+
+    Failure forensics: if the ``risk_state`` write fails AFTER the
+    graduation audit event committed (the documented audit-canonical
+    direction), the row stays CONVALESCENT with the marker unset and the
+    NEXT day's tick re-runs graduation — the chain may then carry TWO
+    ``state_transition_convalescent_to_normal`` events for one
+    graduation. Self-healing, not corruption; read the risk_state row's
+    ``audit_event_uuid`` linkage to identify the effective one.
 
     Fail-safe by construction: every early return leaves the counter
     untouched; a skipped or failed tick can only DELAY graduation,
@@ -326,7 +340,9 @@ async def apply_convalescent_clean_day_tick(
                     {"acc": account_id},
                 )
             ).fetchone()
-            halt_day = halt_row.entered_at_utc.date() if halt_row is not None else None
+            halt_day = (
+                halt_row.entered_at_utc.astimezone(UTC).date() if halt_row is not None else None
+            )
 
             entered_at = row.entered_at_utc
             if entered_at.tzinfo is None:  # asyncpg returns tz-aware; defensive
