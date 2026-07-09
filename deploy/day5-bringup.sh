@@ -17,13 +17,30 @@
 #
 # Usage:
 #   cd /opt/trading
-#   bash deploy/day5-bringup.sh
+#   bash deploy/day5-bringup.sh              # first bringup / idempotent re-run
+#   bash deploy/day5-bringup.sh --rebuild    # REDEPLOY: rebuild images + recreate
+#
+# --rebuild (added 2026-07-09 after the #364 hotfix deploy needed three
+# hand-applied corrections): rebuilds ALL app images even when cached — so
+# the alembic step runs inside the fresh image — and force-recreates every
+# RUNNING app container afterwards (compose `restart` alone re-uses the old
+# image; decisions-log 2026-07-09 "C1 night one"). This makes
+#   git pull && bash deploy/day5-bringup.sh --rebuild
+# the complete Appendix C redeploy ceremony.
 #
 # To force a clean rebuild from a destroyed state:
 #   docker compose --env-file deploy/.env down -v
 #   bash deploy/day5-bringup.sh
 
 set -euo pipefail
+
+REBUILD=0
+for arg in "$@"; do
+  case "${arg}" in
+    --rebuild) REBUILD=1 ;;
+    *) printf 'unknown argument: %s (supported: --rebuild)\n' "${arg}" >&2; exit 64 ;;
+  esac
+done
 
 # ---------------------------------------------------------------------------
 # Constants + sanity checks
@@ -138,7 +155,14 @@ ok "postgres app-role passwords extracted (${#APP_SERVICE_PWD} + ${#APP_OWNER_PW
 
 step "Step 2 — build api image"
 
-if docker image inspect "ghcr.io/${GHCR_OWNER}/trading-api:${RELEASE_SHA:-latest}" >/dev/null 2>&1; then
+if [[ "${REBUILD}" -eq 1 ]]; then
+  # Redeploy path: rebuild ALL app images unconditionally. The skip-if-cached
+  # branch below is bringup-only — on a redeploy it reuses the stale image and
+  # the alembic step (Step 4) then no-ops without the new migration files
+  # while reporting success (the 2026-07-09 launch tripled on this).
+  docker compose --env-file "${DEPLOY_ENV_PATH}" build api discord_bot webhook_pusher nextjs
+  ok "app images rebuilt (--rebuild): api, discord_bot, webhook_pusher, nextjs"
+elif docker image inspect "ghcr.io/${GHCR_OWNER}/trading-api:${RELEASE_SHA:-latest}" >/dev/null 2>&1; then
   ok "image already cached: ghcr.io/${GHCR_OWNER}/trading-api:${RELEASE_SHA:-latest}"
 else
   docker compose --env-file "${DEPLOY_ENV_PATH}" build api
@@ -253,6 +277,26 @@ if echo "${HEALTH}" | grep -q '"status":"ok"' && echo "${HEALTH}" | grep -q '"db
   ok "verification gate PASSED — /api/health returned ok + db_connected:true"
 else
   die "verification gate FAILED — health response above does not match expected shape"
+fi
+
+# ---------------------------------------------------------------------------
+# Step 9 (--rebuild only) — force-recreate running app containers onto the
+# fresh images. `restart` is NOT sufficient: it reboots the existing
+# container on its OLD image (decisions-log 2026-07-09 "C1 night one").
+# Only containers that are already running are recreated — this step never
+# starts a service the operator hasn't brought up.
+# ---------------------------------------------------------------------------
+
+if [[ "${REBUILD}" -eq 1 ]]; then
+  step "Step 9 — force-recreate running app containers (--rebuild)"
+  for svc in strategy_worker discord_bot webhook_pusher nextjs; do
+    if docker compose --env-file "${DEPLOY_ENV_PATH}" ps --status running "${svc}" 2>/dev/null | grep -q "${svc}"; then
+      docker compose --env-file "${DEPLOY_ENV_PATH}" up -d --force-recreate "${svc}"
+      ok "${svc} recreated on the fresh image"
+    else
+      ok "${svc} not running — skipped (start it explicitly when ready)"
+    fi
+  done
 fi
 
 # ---------------------------------------------------------------------------

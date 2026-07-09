@@ -198,28 +198,44 @@ git history remain the only — and sufficient — record of that era.
 
 ## Appendix C — Redeploying code changes (added 2026-07-09, post-C1-start)
 
-**`day5-bringup.sh` does NOT rebuild images on redeploy** — its build step
-is skip-if-cached, and its alembic step runs inside whatever image exists,
-so on a stale image new migrations silently no-op while the script reports
-success (this bit the 2026-07-09 launch three separate ways). Until the
-script grows a `--rebuild` flag, the redeploy ceremony is:
+The redeploy ceremony is one command (the script's `--rebuild` flag, added
+2026-07-09 evening, rebuilds ALL app images even when cached — so the
+alembic step runs inside the fresh image — then force-recreates every
+RUNNING app container onto the new images):
 
 ```bash
 cd /opt/trading
 git pull
-docker compose --env-file deploy/.env build api discord_bot webhook_pusher 2>&1 | tail -3
-docker compose --env-file deploy/.env up -d --force-recreate api discord_bot webhook_pusher
-bash deploy/day5-bringup.sh   # now runs migrations inside the FRESH image
-docker compose --env-file deploy/.env up -d --force-recreate strategy_worker   # shares the api image
+bash deploy/day5-bringup.sh --rebuild
 ```
 
-**Why `up -d --force-recreate` and not `restart` for the worker:**
-`docker compose restart` reboots the EXISTING container on its OLD image —
-it never adopts a freshly built one. This bit the 2026-07-09 #364 hotfix
-deploy (the post-ceremony probe still showed pre-fix behavior until the
-worker was force-recreated). The recreate is safe mid-day: startup recovery
-re-reads persisted state, sees an already-handled decision date, and
-resumes the 30 s loop.
+History (why the flag exists): the original script's build step was
+skip-if-cached and its alembic step ran inside whatever image existed, so
+on a stale image new migrations silently no-op'd while the script reported
+success (this bit the 2026-07-09 launch three separate ways). The interim
+hand ceremony (explicit `docker compose build` + `up -d --force-recreate`
+per service) had its own trap: `docker compose restart` reboots the
+EXISTING container on its OLD image — it never adopts a freshly built one
+(bit the #364 hotfix deploy the same evening). `--rebuild` encodes both
+lessons. The worker recreate is safe mid-day: startup recovery re-reads
+persisted state, sees an already-handled decision date, and resumes the
+30 s loop.
+
+**Caddyfile-only changes** don't need `--rebuild` (the config is
+bind-mounted). Ceremony — validate BEFORE restarting, and `sleep` before
+the smoke curl (a curl fired immediately after `restart` races the
+listener bind and reports a phantom outage; false-alarmed the #368 gate
+deploy):
+
+```bash
+cd /opt/trading && git pull
+docker run --rm -v /opt/trading/deploy/Caddyfile:/etc/caddy/Caddyfile:ro \
+  -e DOMAIN=spratcapital.com -e ACME_EMAIL=x@example.com -e WATCHDOG_IP=188.245.37.16 \
+  caddy:2-alpine caddy validate --config /etc/caddy/Caddyfile 2>&1 | tail -1  # expect: Valid configuration
+docker compose --env-file deploy/.env restart caddy
+sleep 8
+curl -fsS https://spratcapital.com/api/health >/dev/null && echo health-ok
+```
 
 Verify the running code actually changed (don't trust the build banner):
 

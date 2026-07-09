@@ -28,7 +28,6 @@ import pytest
 
 import scripts.operator_tools.bootstrap_live_account as boot
 from scripts.operator_tools.bootstrap_live_account import (
-    DEFAULT_LIVE_EXTERNAL_ACCOUNT_ID,
     EXIT_ACCOUNT_MISMATCH,
     EXIT_BAD_ARGS,
     EXIT_BAD_PARAM_SET_JSON,
@@ -50,9 +49,9 @@ _HEX = set("0123456789abcdef")
 
 class TestParseArgs:
     def test_paper_dry_run_defaults(self) -> None:
-        result = parse_args(["--env", "paper"])
+        result = parse_args(["--env", "paper", "--external-account-id", "operator"])
         assert isinstance(result, ParsedArgs)
-        assert result.external_account_id == DEFAULT_LIVE_EXTERNAL_ACCOUNT_ID
+        assert result.external_account_id == "operator"
         assert result.env == "paper"
         assert result.dry_run is True
         assert result.confirm is False
@@ -69,7 +68,9 @@ class TestParseArgs:
             parse_args(["--env", "live-scale"])
 
     def test_live_small_with_allow_non_paper_accepted(self) -> None:
-        result = parse_args(["--env", "live-small", "--allow-non-paper"])
+        result = parse_args(
+            ["--env", "live-small", "--allow-non-paper", "--external-account-id", "operator"]
+        )
         assert result.env == "live-small"
         assert result.allow_non_paper is True
 
@@ -78,7 +79,9 @@ class TestParseArgs:
             parse_args(["--env", "paper", "--no-dry-run"])
 
     def test_no_dry_run_with_confirm_accepted(self) -> None:
-        result = parse_args(["--env", "paper", "--no-dry-run", "--confirm"])
+        result = parse_args(
+            ["--env", "paper", "--no-dry-run", "--confirm", "--external-account-id", "operator"]
+        )
         assert result.dry_run is False
         assert result.confirm is True
 
@@ -97,11 +100,22 @@ class TestParseArgs:
     def test_parameter_set_json_path_propagates(self, tmp_path: Path) -> None:
         path = tmp_path / "ps.json"
         path.write_text('{"x": 1}')
-        result = parse_args(["--env", "paper", "--parameter-set-json", str(path)])
+        result = parse_args(
+            [
+                "--env",
+                "paper",
+                "--external-account-id",
+                "operator",
+                "--parameter-set-json",
+                str(path),
+            ]
+        )
         assert result.parameter_set_json == path
 
     def test_mint_from_defaults_flag(self) -> None:
-        result = parse_args(["--env", "paper", "--mint-from-defaults"])
+        result = parse_args(
+            ["--env", "paper", "--external-account-id", "operator", "--mint-from-defaults"]
+        )
         assert result.mint_from_defaults is True
         assert result.parameter_set_json is None
 
@@ -192,7 +206,7 @@ class TestMainExits:
         proves the dry-run short-circuit fires before DB init.
         """
         monkeypatch.delenv("DATABASE_URL", raising=False)
-        result = main(["--env", "paper"])
+        result = main(["--env", "paper", "--external-account-id", "operator"])
         assert result == EXIT_OK
 
     def test_mint_from_defaults_dry_run_returns_ok_without_db(
@@ -205,7 +219,9 @@ class TestMainExits:
         + logged) but the dry-run short-circuit fires before any DB write.
         """
         monkeypatch.delenv("DATABASE_URL", raising=False)
-        result = main(["--env", "paper", "--mint-from-defaults"])
+        result = main(
+            ["--env", "paper", "--external-account-id", "operator", "--mint-from-defaults"]
+        )
         assert result == EXIT_OK
 
     def test_bad_param_set_json_returns_exit_1(
@@ -219,6 +235,8 @@ class TestMainExits:
             [
                 "--env",
                 "paper",
+                "--external-account-id",
+                "operator",
                 "--parameter-set-json",
                 str(path),
             ]
@@ -362,8 +380,18 @@ class TestInsertParameterSetIdempotent:
 
 class TestSeedParamsOnlyArgs:
     def test_flag_defaults_false(self) -> None:
-        result = parse_args(["--env", "paper"])
+        result = parse_args(["--env", "paper", "--external-account-id", "operator"])
         assert result.seed_params_only is False
+
+    def test_full_bootstrap_without_account_id_rejected(self) -> None:
+        # 2026-07-09: the U25655583 IBKR default was a CME-era fossil; a
+        # full bootstrap must name its account explicitly.
+        with pytest.raises(ValueError, match="--external-account-id is required"):
+            parse_args(["--env", "paper"])
+
+    def test_seed_params_only_may_omit_account_id(self) -> None:
+        result = parse_args(["--env", "paper", "--seed-params-only", "--mint-from-defaults"])
+        assert result.external_account_id is None
 
     def test_seed_params_only_with_mint_accepted(self) -> None:
         result = parse_args(["--env", "paper", "--seed-params-only", "--mint-from-defaults"])
