@@ -1,8 +1,9 @@
 """Unit tests for ``services.reconciliation.scheduler``.
 
-Worker-PR-3b (post-pivot 2026-05-12). Tests the pure-policy decision
-helper (``should_fire_now``) + the long-lived scheduler with an
-injected clock so tests don't wait wall-clock time.
+Worker-PR-3b (post-pivot 2026-05-12); re-anchored onto UTC at 00:15 in
+crypto-pivot C0 §3.5. Tests the pure-policy decision helper
+(``should_fire_now``) + the long-lived scheduler with an injected
+clock so tests don't wait wall-clock time.
 
 A06 enforced — every datetime tz-aware UTC; naive datetimes raise.
 """
@@ -16,15 +17,12 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from services.reconciliation.scheduler import (
-    DEFAULT_EOD_RECON_TIME_ET,
+    DEFAULT_EOD_RECON_TIME_UTC,
     DEFAULT_TICK_INTERVAL_SECONDS,
     ReconciliationScheduler,
-    current_session_date_et,
+    current_session_date_utc,
     should_fire_now,
 )
-
-_ET = ZoneInfo("America/New_York")
-
 
 # ---------------------------------------------------------------------------
 # should_fire_now
@@ -33,78 +31,91 @@ _ET = ZoneInfo("America/New_York")
 
 class TestShouldFireNow:
     def test_before_eod_time_returns_false(self) -> None:
-        # 18:00 ET on 2026-05-12 = 22:00 UTC (EDT offset -4)
-        now_utc = datetime(2026, 5, 12, 22, 0, tzinfo=UTC)
+        now_utc = datetime(2026, 7, 10, 0, 10, tzinfo=UTC)
         assert (
             should_fire_now(
                 now_utc=now_utc,
-                eod_recon_time_et=time(18, 30),
-                last_fired_session_date_et=None,
+                eod_recon_time_utc=time(0, 15),
+                last_fired_session_date_utc=None,
             )
             is False
         )
 
     def test_at_eod_time_returns_true(self) -> None:
-        # 18:30 ET = 22:30 UTC (EDT)
-        now_utc = datetime(2026, 5, 12, 22, 30, tzinfo=UTC)
+        now_utc = datetime(2026, 7, 10, 0, 15, tzinfo=UTC)
         assert (
             should_fire_now(
                 now_utc=now_utc,
-                eod_recon_time_et=time(18, 30),
-                last_fired_session_date_et=None,
+                eod_recon_time_utc=time(0, 15),
+                last_fired_session_date_utc=None,
             )
             is True
         )
 
     def test_after_eod_time_returns_true(self) -> None:
-        now_utc = datetime(2026, 5, 12, 23, 0, tzinfo=UTC)
+        now_utc = datetime(2026, 7, 10, 13, 0, tzinfo=UTC)
         assert (
             should_fire_now(
                 now_utc=now_utc,
-                eod_recon_time_et=time(18, 30),
-                last_fired_session_date_et=None,
+                eod_recon_time_utc=time(0, 15),
+                last_fired_session_date_utc=None,
             )
             is True
         )
 
     def test_already_fired_today_returns_false(self) -> None:
         """Re-checking after the cycle fired for today's date is a no-op."""
-        now_utc = datetime(2026, 5, 12, 23, 0, tzinfo=UTC)
-        today_et = date(2026, 5, 12)
+        now_utc = datetime(2026, 7, 10, 23, 0, tzinfo=UTC)
+        today_utc = date(2026, 7, 10)
         assert (
             should_fire_now(
                 now_utc=now_utc,
-                eod_recon_time_et=time(18, 30),
-                last_fired_session_date_et=today_et,
+                eod_recon_time_utc=time(0, 15),
+                last_fired_session_date_utc=today_utc,
             )
             is False
         )
 
     def test_fires_again_next_day(self) -> None:
-        """After midnight ET, a new session date — fires again."""
-        # 19:00 ET on 2026-05-13 = 23:00 UTC (EDT)
-        now_utc = datetime(2026, 5, 13, 23, 0, tzinfo=UTC)
-        yesterday_et = date(2026, 5, 12)
+        """After midnight UTC, a new session date — fires again."""
+        now_utc = datetime(2026, 7, 11, 0, 15, tzinfo=UTC)
+        yesterday_utc = date(2026, 7, 10)
         assert (
             should_fire_now(
                 now_utc=now_utc,
-                eod_recon_time_et=time(18, 30),
-                last_fired_session_date_et=yesterday_et,
+                eod_recon_time_utc=time(0, 15),
+                last_fired_session_date_utc=yesterday_utc,
             )
             is True
         )
 
-    def test_dst_transition_respected(self) -> None:
-        """Around DST cutover, the ET wall-clock controls — not UTC."""
-        # 2025-03-09 02:00 local is DST start. 18:30 ET on 2025-03-09:
-        # before the transition we're at EST (UTC-5); after we're EDT (UTC-4).
-        # 2025-03-09 18:30 EDT = 2025-03-09 22:30 UTC.
-        now_utc = datetime(2025, 3, 9, 22, 30, tzinfo=UTC)
+    def test_non_utc_tz_input_normalized_to_utc(self) -> None:
+        """Any tz-aware input works; the comparison is UTC wall-clock.
+
+        20:15 ET on 2026-07-09 == 00:15 UTC on 2026-07-10 (EDT) — fires,
+        and the session date is the UTC day (the 10th), not the ET day.
+        """
+        et = ZoneInfo("America/New_York")
+        now_et = datetime(2026, 7, 9, 20, 15, tzinfo=et)
+        assert (
+            should_fire_now(
+                now_utc=now_et,
+                eod_recon_time_utc=time(0, 15),
+                last_fired_session_date_utc=None,
+            )
+            is True
+        )
+        assert current_session_date_utc(now_et) == date(2026, 7, 10)
+
+    def test_no_dst_sensitivity(self) -> None:
+        """UTC anchoring: the US DST cutover does not move the fire time."""
+        # 2026-03-08 is the US spring-forward date; 00:15 UTC still fires.
+        now_utc = datetime(2026, 3, 8, 0, 15, tzinfo=UTC)
         assert (
             should_fire_now(
                 now_utc=now_utc,
-                eod_recon_time_et=time(18, 30),
-                last_fired_session_date_et=None,
+                eod_recon_time_utc=time(0, 15),
+                last_fired_session_date_utc=None,
             )
             is True
         )
@@ -112,26 +123,26 @@ class TestShouldFireNow:
     def test_naive_datetime_raises(self) -> None:
         with pytest.raises(ValueError, match="tz-aware"):
             should_fire_now(
-                now_utc=datetime(2026, 5, 12, 22, 0),  # naive
-                eod_recon_time_et=time(18, 30),
-                last_fired_session_date_et=None,
+                now_utc=datetime(2026, 7, 10, 0, 20),  # naive
+                eod_recon_time_utc=time(0, 15),
+                last_fired_session_date_utc=None,
             )
 
 
-class TestCurrentSessionDateET:
-    def test_pre_midnight_utc_returns_same_day_in_et(self) -> None:
-        # 23:00 UTC = 19:00 EDT on 2026-05-12
-        now_utc = datetime(2026, 5, 12, 23, 0, tzinfo=UTC)
-        assert current_session_date_et(now_utc) == date(2026, 5, 12)
+class TestCurrentSessionDateUtc:
+    def test_returns_utc_calendar_date(self) -> None:
+        now_utc = datetime(2026, 7, 10, 0, 15, tzinfo=UTC)
+        assert current_session_date_utc(now_utc) == date(2026, 7, 10)
 
-    def test_post_midnight_utc_returns_prior_day_in_et(self) -> None:
-        # 02:00 UTC on 2026-05-13 = 22:00 EDT on 2026-05-12
-        now_utc = datetime(2026, 5, 13, 2, 0, tzinfo=UTC)
-        assert current_session_date_et(now_utc) == date(2026, 5, 12)
+    def test_non_utc_input_converted(self) -> None:
+        # 22:00 EDT on 2026-07-09 = 02:00 UTC on 2026-07-10.
+        et = ZoneInfo("America/New_York")
+        now_et = datetime(2026, 7, 9, 22, 0, tzinfo=et)
+        assert current_session_date_utc(now_et) == date(2026, 7, 10)
 
     def test_naive_datetime_raises(self) -> None:
         with pytest.raises(ValueError):
-            current_session_date_et(datetime(2026, 5, 12, 12, 0))
+            current_session_date_utc(datetime(2026, 7, 10, 12, 0))
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +158,7 @@ class TestReconciliationSchedulerMaybeFire:
         async def cb(session_date: date) -> None:
             called.append(session_date)
 
-        now_utc = datetime(2026, 5, 12, 21, 0, tzinfo=UTC)  # 17:00 ET
+        now_utc = datetime(2026, 7, 10, 0, 10, tzinfo=UTC)  # pre-00:15 UTC
         sched = ReconciliationScheduler(callback=cb, clock=lambda: now_utc)
         fired = await sched.maybe_fire()
         assert fired is False
@@ -160,11 +171,11 @@ class TestReconciliationSchedulerMaybeFire:
         async def cb(session_date: date) -> None:
             called.append(session_date)
 
-        now_utc = datetime(2026, 5, 12, 22, 30, tzinfo=UTC)  # 18:30 ET
+        now_utc = datetime(2026, 7, 10, 0, 15, tzinfo=UTC)
         sched = ReconciliationScheduler(callback=cb, clock=lambda: now_utc)
         fired = await sched.maybe_fire()
         assert fired is True
-        assert called == [date(2026, 5, 12)]
+        assert called == [date(2026, 7, 10)]
 
     @pytest.mark.asyncio
     async def test_does_not_refire_same_day(self) -> None:
@@ -173,23 +184,23 @@ class TestReconciliationSchedulerMaybeFire:
         async def cb(session_date: date) -> None:
             called.append(session_date)
 
-        now_utc = datetime(2026, 5, 12, 22, 30, tzinfo=UTC)
+        now_utc = datetime(2026, 7, 10, 0, 15, tzinfo=UTC)
         sched = ReconciliationScheduler(callback=cb, clock=lambda: now_utc)
         await sched.maybe_fire()
         await sched.maybe_fire()  # second tick same day
-        assert called == [date(2026, 5, 12)]
+        assert called == [date(2026, 7, 10)]
 
     @pytest.mark.asyncio
     async def test_callback_exception_is_swallowed(self) -> None:
         async def cb(session_date: date) -> None:
-            raise RuntimeError("FlexQuery down")
+            raise RuntimeError("venue down")
 
-        now_utc = datetime(2026, 5, 12, 22, 30, tzinfo=UTC)
+        now_utc = datetime(2026, 7, 10, 0, 15, tzinfo=UTC)
         sched = ReconciliationScheduler(callback=cb, clock=lambda: now_utc)
         fired = await sched.maybe_fire()
         assert fired is True
         # Last-fired marker still bumps so we don't retry-storm on next tick.
-        assert sched.snapshot().last_fired_session_date_et == date(2026, 5, 12)
+        assert sched.snapshot().last_fired_session_date_utc == date(2026, 7, 10)
 
     @pytest.mark.asyncio
     async def test_initial_fired_date_skips_first_day(self) -> None:
@@ -199,11 +210,11 @@ class TestReconciliationSchedulerMaybeFire:
         async def cb(session_date: date) -> None:
             called.append(session_date)
 
-        now_utc = datetime(2026, 5, 12, 22, 30, tzinfo=UTC)
+        now_utc = datetime(2026, 7, 10, 0, 15, tzinfo=UTC)
         sched = ReconciliationScheduler(
             callback=cb,
             clock=lambda: now_utc,
-            initial_fired_date=date(2026, 5, 12),
+            initial_fired_date=date(2026, 7, 10),
         )
         await sched.maybe_fire()
         assert called == []
@@ -211,7 +222,7 @@ class TestReconciliationSchedulerMaybeFire:
     @pytest.mark.asyncio
     async def test_next_day_fires_again(self) -> None:
         called: list[date] = []
-        clock_value = [datetime(2026, 5, 12, 22, 30, tzinfo=UTC)]
+        clock_value = [datetime(2026, 7, 10, 0, 15, tzinfo=UTC)]
 
         async def cb(session_date: date) -> None:
             called.append(session_date)
@@ -221,7 +232,7 @@ class TestReconciliationSchedulerMaybeFire:
         # advance to next day after EOD
         clock_value[0] = clock_value[0] + timedelta(days=1)
         await sched.maybe_fire()  # day 2
-        assert called == [date(2026, 5, 12), date(2026, 5, 13)]
+        assert called == [date(2026, 7, 10), date(2026, 7, 11)]
 
 
 class TestReconciliationSchedulerRunForever:
@@ -249,7 +260,7 @@ class TestReconciliationSchedulerRunForever:
         async def cb(session_date: date) -> None:
             called.append(session_date)
 
-        clock_value = [datetime(2026, 5, 12, 21, 0, tzinfo=UTC)]  # pre-EOD
+        clock_value = [datetime(2026, 7, 10, 0, 10, tzinfo=UTC)]  # pre-EOD
 
         def fake_clock() -> datetime:
             return clock_value[0]
@@ -264,7 +275,7 @@ class TestReconciliationSchedulerRunForever:
             # Let the scheduler tick a couple of times before EOD
             await asyncio.sleep(0.05)
             # Now jump the clock past EOD
-            clock_value[0] = datetime(2026, 5, 12, 22, 30, tzinfo=UTC)
+            clock_value[0] = datetime(2026, 7, 10, 0, 15, tzinfo=UTC)
             # Give it a tick to fire
             await asyncio.sleep(0.1)
             sched.request_stop()
@@ -273,12 +284,13 @@ class TestReconciliationSchedulerRunForever:
             sched.run_forever(),
             advance_then_stop(),
         )
-        assert called == [date(2026, 5, 12)]
+        assert called == [date(2026, 7, 10)]
 
 
 class TestDefaults:
-    def test_default_eod_is_18_30_et(self) -> None:
-        assert DEFAULT_EOD_RECON_TIME_ET == time(18, 30)
+    def test_default_eod_is_00_15_utc(self) -> None:
+        # Delta spec §3.5: 00:15 UTC, after the 00:05 UTC daily decision.
+        assert DEFAULT_EOD_RECON_TIME_UTC == time(0, 15)
 
     def test_default_tick_interval_is_60s(self) -> None:
         assert DEFAULT_TICK_INTERVAL_SECONDS == 60.0

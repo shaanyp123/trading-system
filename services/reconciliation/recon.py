@@ -160,6 +160,13 @@ class BrokerSource(StrEnum):
     QC_OBJECTSTORE = "qc_objectstore"
     FLEXQUERY_EOD = "flexquery_eod"
     TWS_API = "tws_api"
+    # Crypto-pivot C0 §3.5 (2026-07-09): the Coinbase EOD recon fetcher's
+    # source stamp. Taxonomy addition only — the diff/apply engine is
+    # otherwise unchanged by the fetcher swap. The balances-table CHECK
+    # constraint gains the same value via the 2026-07-09
+    # ``coinbase_recon_src`` migration; ``reconciliation_breaks.source``
+    # is free TEXT.
+    COINBASE_EOD = "coinbase_eod"
 
 
 # Locked-taxonomy event types (backend-spec §3.30, mirrored in

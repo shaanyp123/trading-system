@@ -3,10 +3,10 @@
 Pure-policy tests against the glue between
 :func:`services.reconciliation.recon.plan_reconciliation_check`,
 :func:`services.reconciliation.apply.apply_reconciliation_plan`, and
-the FlexQuery fetcher. No testcontainers — the DB-touching path
-(``build_backend_view``) is exercised at integration-test time when
-the first live cycle lands; this file locks the orchestrator contract
-+ the pure-policy view builders.
+the Coinbase EOD fetcher (crypto-pivot C0 §3.5 — the FlexQuery fetch
+path is deleted). No testcontainers — the DB-touching path
+(``build_backend_view``) is exercised at integration-test time; this
+file locks the orchestrator contract + the pure-policy view builders.
 """
 
 from __future__ import annotations
@@ -21,8 +21,16 @@ from uuid import UUID, uuid4
 import pytest
 
 from services.audit.event_types import AuditEventType
+from services.execution.types import BrokerPosition, FuturesBalanceSummary
 from services.reconciliation.apply import AlertDispatchContext
+from services.reconciliation.coinbase_fetcher import (
+    CoinbaseReconFetchError,
+    CoinbaseReconSnapshot,
+    ReconPosition,
+    recon_positions_from_broker,
+)
 from services.reconciliation.eod_cycle import (
+    BALANCE_SOURCE_FROM_COINBASE,
     DEFAULT_PRIOR_BREAKS_WINDOW_HOURS,
     BackendRefreshResult,
     EodCycleConfig,
@@ -34,14 +42,15 @@ from services.reconciliation.eod_cycle import (
 from services.reconciliation.eod_cycle import (
     refresh_backend_from_broker_snapshot as _real_refresh,
 )
-from services.reconciliation.flex_query_fetcher import (
-    FlexAccountSummary,
-    FlexCashBalance,
-    FlexPosition,
-    FlexQueryFetchError,
-    ReconciliationSnapshot,
-)
 from services.reconciliation.recon import BrokerSource, PriorBreak, ReconciliationMetric
+
+_PULLED_AT = datetime(2026, 7, 10, 0, 15, tzinfo=UTC)
+
+# Test-fixture product ids (fakes; production discovers real ids at
+# runtime per [A13]). These double as the ``positions_current.market``
+# convention post-pivot: the venue product_id verbatim.
+_BTC = "BTC-PERP-CDE"
+_ETH = "ETH-PERP-CDE"
 
 
 @pytest.fixture(autouse=True)
@@ -68,303 +77,169 @@ def _patch_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+def _bpos(
+    *,
+    product_id: str = _BTC,
+    contracts: str = "1",
+    entry_vwap: str | None = "109000",
+    mark_price: str | None = "110000",
+    unrealized_pnl: str | None = "20",
+) -> BrokerPosition:
+    return BrokerPosition(
+        product_id=product_id,
+        contracts=Decimal(contracts),
+        entry_vwap=Decimal(entry_vwap) if entry_vwap is not None else None,
+        mark_price=Decimal(mark_price) if mark_price is not None else None,
+        unrealized_pnl_usd=Decimal(unrealized_pnl) if unrealized_pnl is not None else None,
+    )
+
+
+def _bal_summary(
+    *,
+    total: str = "100000",
+    unrealized: str | None = "0",
+    available_margin: str | None = None,
+    initial_margin: str | None = None,
+) -> FuturesBalanceSummary:
+    def _d(v: str | None) -> Decimal | None:
+        return Decimal(v) if v is not None else None
+
+    return FuturesBalanceSummary(
+        total_usd_balance=Decimal(total),
+        cbi_usd_balance=None,
+        cfm_usd_balance=None,
+        available_margin=_d(available_margin),
+        initial_margin=_d(initial_margin),
+        unrealized_pnl=_d(unrealized),
+        daily_realized_pnl=None,
+        liquidation_threshold=None,
+        liquidation_buffer_amount=None,
+        liquidation_buffer_percentage=None,
+        snapshot_at_utc=_PULLED_AT,
+    )
+
+
 def _build_snapshot(
     *,
-    positions: tuple[FlexPosition, ...] = (),
-    cash_balances: tuple[FlexCashBalance, ...] = (),
-    nav: str = "100000.00",
-    account_summary_cash_usd: str = "0",
-) -> ReconciliationSnapshot:
-    summary = FlexAccountSummary(
-        account_id="DUQ825170",
-        report_date=datetime(2026, 5, 12).date(),
-        net_liquidation_usd=Decimal(nav),
-        cash_usd=Decimal(account_summary_cash_usd),
-        stock_market_value_usd=Decimal(0),
-        bond_market_value_usd=Decimal(0),
-        futures_pnl_usd=Decimal(0),
-    )
-    return ReconciliationSnapshot(
-        pulled_at_utc=datetime(2026, 5, 12, 22, 30, tzinfo=UTC),
-        account_summary=summary,
-        positions=positions,
-        cash_balances=cash_balances,
+    positions: tuple[BrokerPosition, ...] = (),
+    cash: str = "100000",
+    nlv: str | None = None,
+    summary: FuturesBalanceSummary | None = None,
+    pulled_at_utc: datetime = _PULLED_AT,
+) -> CoinbaseReconSnapshot:
+    """Assemble a venue snapshot the way the fetcher would.
+
+    ``positions`` are venue rows; the planner-ready ``ReconPosition``
+    tuple is derived via the fetcher's own mapping function so the two
+    can never drift in tests.
+    """
+    return CoinbaseReconSnapshot(
+        positions=recon_positions_from_broker(positions),
+        position_details=positions,
+        balance_summary=summary if summary is not None else _bal_summary(total=cash),
+        cash_usd=Decimal(cash),
+        net_liquidation_usd=Decimal(nlv) if nlv is not None else Decimal(cash),
+        fills=(),
+        pulled_at_utc=pulled_at_utc,
     )
 
 
-def _flex_pos(
+def _fake_fetcher(
+    snapshot: CoinbaseReconSnapshot | None = None,
     *,
-    symbol: str = "MES",
-    sec_type: str = "FUT",
-    quantity: str = "1",
-    underlying_symbol: str | None = None,
-) -> FlexPosition:
-    return FlexPosition(
-        account_id="DUQ825170",
-        symbol=symbol,
-        sec_type=sec_type,
-        quantity=Decimal(quantity),
-        avg_cost_usd=Decimal("5230"),
-        market_price_usd=Decimal("5234"),
-        market_value_usd=Decimal("26170"),
-        unrealized_pnl_usd=Decimal("20"),
-        underlying_symbol=underlying_symbol,
-    )
+    error: CoinbaseReconFetchError | None = None,
+) -> MagicMock:
+    fetcher = MagicMock()
+    if error is not None:
+        fetcher.fetch_snapshot = AsyncMock(side_effect=error)
+    else:
+        fetcher.fetch_snapshot = AsyncMock(return_value=snapshot)
+    return fetcher
+
+
+def _config() -> EodCycleConfig:
+    return EodCycleConfig(account_id=uuid4(), env="paper")
 
 
 class TestEodCycleConfig:
     def test_shape_and_defaults(self) -> None:
-        config = EodCycleConfig(
-            account_id=uuid4(),
-            env="paper",
-            flex_query_id=12345,
-            flex_query_token="token-redacted",
-        )
+        config = _config()
         assert config.phase_at_emit == 1
 
     def test_frozen(self) -> None:
-        config = EodCycleConfig(
-            account_id=uuid4(),
-            env="paper",
-            flex_query_id=1,
-            flex_query_token="t",
-        )
+        config = _config()
         with pytest.raises(AttributeError):
             config.env = "live-small"  # type: ignore[misc]
+
+    def test_no_venue_credentials_on_config(self) -> None:
+        # §3.5: venue credentials belong to the injected fetcher's
+        # transport, not to the cycle config.
+        field_names = set(EodCycleConfig.__dataclass_fields__)
+        assert field_names == {"account_id", "env", "phase_at_emit"}
 
 
 class TestBuildBrokerView:
     def test_empty_snapshot_returns_empty_view(self) -> None:
-        snap = _build_snapshot()
-        view = build_broker_view(snap)
+        view = build_broker_view(_build_snapshot(cash="0"))
         assert view.positions == {}
-        assert view.cash_usd == Decimal(0)
-        assert view.source == BrokerSource.FLEXQUERY_EOD
+        assert view.cash_usd == Decimal("0")
+        assert view.source == BrokerSource.COINBASE_EOD
 
-    def test_futures_get_slash_prefix(self) -> None:
-        snap = _build_snapshot(positions=(_flex_pos(symbol="MES", sec_type="FUT", quantity="2"),))
-        view = build_broker_view(snap)
-        assert view.positions == {"/MES": Decimal("2")}
-
-    def test_etf_no_slash_prefix(self) -> None:
-        snap = _build_snapshot(positions=(_flex_pos(symbol="TLT", sec_type="STK", quantity="100"),))
-        view = build_broker_view(snap)
-        assert view.positions == {"TLT": Decimal("100")}
+    def test_market_is_product_id_verbatim(self) -> None:
+        view = build_broker_view(
+            _build_snapshot(positions=(_bpos(product_id=_BTC, contracts="2"),))
+        )
+        assert view.positions == {_BTC: Decimal("2")}
 
     def test_zero_quantity_dropped(self) -> None:
-        snap = _build_snapshot(
-            positions=(
-                _flex_pos(symbol="MES", quantity="1"),
-                _flex_pos(symbol="ES", quantity="0"),
+        view = build_broker_view(
+            _build_snapshot(
+                positions=(
+                    _bpos(product_id=_BTC, contracts="0"),
+                    _bpos(product_id=_ETH, contracts="1"),
+                )
             )
         )
-        view = build_broker_view(snap)
-        assert view.positions == {"/MES": Decimal("1")}
+        assert view.positions == {_ETH: Decimal("1")}
 
     def test_same_market_sum_aggregates(self) -> None:
-        # FlexQuery may report multiple rows per symbol (e.g., front +
-        # next contract during a roll). Phase 1 backend aggregates by
-        # market only, so the broker view must aggregate the same way.
-        snap = _build_snapshot(
-            positions=(
-                _flex_pos(symbol="MES", quantity="1"),
-                _flex_pos(symbol="MES", quantity="2"),
+        view = build_broker_view(
+            _build_snapshot(
+                positions=(
+                    _bpos(product_id=_BTC, contracts="2"),
+                    _bpos(product_id=_BTC, contracts="3"),
+                )
             )
         )
-        view = build_broker_view(snap)
-        assert view.positions == {"/MES": Decimal("3")}
-
-    def test_usd_cash_summed(self) -> None:
-        snap = _build_snapshot(
-            cash_balances=(
-                FlexCashBalance(currency="USD", balance=Decimal("10000")),
-                FlexCashBalance(currency="USD", balance=Decimal("2500.50")),
-                FlexCashBalance(currency="EUR", balance=Decimal("500")),
-            )
-        )
-        view = build_broker_view(snap)
-        assert view.cash_usd == Decimal("12500.50")  # non-USD excluded
+        assert view.positions == {_BTC: Decimal("5")}
 
     def test_short_position_negative_qty(self) -> None:
-        snap = _build_snapshot(positions=(_flex_pos(symbol="MES", quantity="-1"),))
-        view = build_broker_view(snap)
-        assert view.positions == {"/MES": Decimal("-1")}
-
-
-class TestBuildBrokerViewFuturesNormalization:
-    """Tests for the 2026-05-27 fix: prefer ``underlying_symbol`` over
-    ``symbol`` for FUT positions so the broker view's market key matches
-    the backend's root-ticker convention.
-
-    Failure mode this locks down: pre-fix, a FlexQuery template emitting
-    ``symbol="M2KM6"`` (contract-month form, June 2026 micro Russell
-    2000) produced a broker-view market of ``"/M2KM6"``, which never
-    matched backend's ``"/M2K"`` → false-positive ``position_qty`` break
-    every EOD cycle. The 2026-05-27 22:30 UTC recon fired this exact case.
-    """
-
-    def test_fut_with_underlying_symbol_uses_underlying(self) -> None:
-        # The production-shape XML: symbol=M2KM6 (contract month),
-        # underlyingSymbol=M2K (root ticker). The broker view's market
-        # MUST normalize to /M2K so it matches backend's positions_current.
-        snap = _build_snapshot(
-            positions=(
-                _flex_pos(
-                    symbol="M2KM6",
-                    sec_type="FUT",
-                    quantity="1",
-                    underlying_symbol="M2K",
-                ),
-            )
+        view = build_broker_view(
+            _build_snapshot(positions=(_bpos(product_id=_ETH, contracts="-4"),))
         )
-        view = build_broker_view(snap)
-        assert view.positions == {"/M2K": Decimal("1")}
+        assert view.positions == {_ETH: Decimal("-4")}
 
-    def test_fut_without_underlying_symbol_falls_back_to_symbol(self) -> None:
-        # Older templates (and the sample XML in our test corpus) emit
-        # symbol=MES (root) with no underlyingSymbol attribute → parser
-        # defaults underlying_symbol to None → view builder falls back to
-        # symbol. Backwards-compat contract.
-        snap = _build_snapshot(
-            positions=(
-                _flex_pos(symbol="MES", sec_type="FUT", quantity="1", underlying_symbol=None),
-            )
+    def test_cash_from_snapshot(self) -> None:
+        view = build_broker_view(_build_snapshot(cash="12345.6789"))
+        assert view.cash_usd == Decimal("12345.6789")
+
+    def test_positions_override_seam(self) -> None:
+        # The seam preserved for the Phase C1 intraday probe: supplied
+        # ReconPositions replace the snapshot's, and the caller stamps
+        # the true source.
+        snapshot = _build_snapshot(positions=(_bpos(product_id=_BTC, contracts="2"),))
+        override = (
+            ReconPosition(market=_ETH, quantity=Decimal("7")),
+            ReconPosition(market=_BTC, quantity=Decimal("0")),  # re-guarded
         )
-        view = build_broker_view(snap)
-        assert view.positions == {"/MES": Decimal("1")}
-
-    def test_fut_with_empty_underlying_symbol_falls_back_to_symbol(self) -> None:
-        # The parser converts empty-string underlyingSymbol to None, so
-        # this case shouldn't reach the view builder in practice. But
-        # the view builder is defensive: an empty/falsy underlying_symbol
-        # also falls back to ``symbol``.
-        snap = _build_snapshot(
-            positions=(_flex_pos(symbol="MES", sec_type="FUT", quantity="1", underlying_symbol=""),)
+        view = build_broker_view(
+            snapshot,
+            positions_override=override,
+            source=BrokerSource.COINBASE_EOD,
         )
-        view = build_broker_view(snap)
-        assert view.positions == {"/MES": Decimal("1")}
-
-    def test_stk_ignores_underlying_symbol(self) -> None:
-        # STK rows (ETFs / equities) have no derivative root; their
-        # ``symbol`` IS the canonical identifier. Even if the FlexQuery
-        # template somehow populates underlyingSymbol on a STK row, the
-        # view builder must NOT prepend the slash + must NOT use
-        # underlyingSymbol (that would silently break ETF reconciliation).
-        snap = _build_snapshot(
-            positions=(
-                _flex_pos(
-                    symbol="TLT",
-                    sec_type="STK",
-                    quantity="100",
-                    underlying_symbol="NOT_USED",
-                ),
-            )
-        )
-        view = build_broker_view(snap)
-        assert view.positions == {"TLT": Decimal("100")}
-
-    def test_fut_contract_month_rows_aggregate_on_root(self) -> None:
-        # A roll-window snapshot could carry both M2KM6 + M2KU6 (June +
-        # September 2026 contracts) — both underlyingSymbol=M2K. After
-        # normalization, both rows aggregate onto the single ``/M2K``
-        # market. Mirrors the test_same_market_sum_aggregates contract
-        # but exercises the normalization path.
-        snap = _build_snapshot(
-            positions=(
-                _flex_pos(
-                    symbol="M2KM6",
-                    sec_type="FUT",
-                    quantity="1",
-                    underlying_symbol="M2K",
-                ),
-                _flex_pos(
-                    symbol="M2KU6",
-                    sec_type="FUT",
-                    quantity="2",
-                    underlying_symbol="M2K",
-                ),
-            )
-        )
-        view = build_broker_view(snap)
-        assert view.positions == {"/M2K": Decimal("3")}
-
-
-class TestBuildBrokerViewCashFallback:
-    """Tests for the 2026-05-16 fix: fall back to account_summary.cash_usd
-    when cash_balances is empty.
-
-    Real-world FlexQuery templates often have the AccountInformation
-    section (populates account_summary.cash_usd) enabled but NOT the
-    Cash Report section (populates cash_balances). Without the
-    fallback, the recon planner sees backend_cash from PR-I (=
-    account_summary.cash_usd) vs broker_cash from build_broker_view
-    (= sum of cash_balances = 0) and emits a false-positive break
-    every cycle.
-    """
-
-    def test_empty_cash_balances_falls_back_to_account_summary(self) -> None:
-        import structlog
-
-        snap = _build_snapshot(
-            cash_balances=(),
-            account_summary_cash_usd="19997.51",
-        )
-        with structlog.testing.capture_logs() as captured:
-            view = build_broker_view(snap)
-        assert view.cash_usd == Decimal("19997.51")
-        # Fallback emits a structured log so the operator can see why we
-        # diverged from the Cash Report path.
-        events = [c.get("event") for c in captured]
-        assert "recon_broker_view_cash_fallback_to_account_summary" in events
-        fallback = next(
-            c
-            for c in captured
-            if c.get("event") == "recon_broker_view_cash_fallback_to_account_summary"
-        )
-        assert fallback["cash_balances_count"] == 0
-        assert fallback["account_summary_cash_usd"] == "19997.51"
-
-    def test_empty_cash_balances_with_zero_account_summary_still_zero(self) -> None:
-        # When BOTH sources are 0 (truly no cash), fallback returns 0;
-        # no false-positive triggered.
-        snap = _build_snapshot(cash_balances=(), account_summary_cash_usd="0")
-        view = build_broker_view(snap)
-        assert view.cash_usd == Decimal("0")
-
-    def test_non_usd_only_balances_falls_back(self) -> None:
-        # A template with Cash Report enabled but the account holds
-        # only EUR cash — no USD row. We still fall back to the
-        # account_summary's USD value (which may be the USD-converted
-        # NAV from the AccountInformation section).
-        snap = _build_snapshot(
-            cash_balances=(FlexCashBalance(currency="EUR", balance=Decimal("500")),),
-            account_summary_cash_usd="1000.00",
-        )
-        view = build_broker_view(snap)
-        assert view.cash_usd == Decimal("1000.00")  # not the EUR balance
-
-    def test_populated_usd_cash_balances_does_not_fall_back(self) -> None:
-        # When cash_balances HAS a USD row, that's the source — the
-        # account_summary value is ignored (the per-currency Cash Report
-        # is more granular + the spec-canonical source).
-        snap = _build_snapshot(
-            cash_balances=(FlexCashBalance(currency="USD", balance=Decimal("5000")),),
-            account_summary_cash_usd="9999",  # different value; must be ignored
-        )
-        view = build_broker_view(snap)
-        assert view.cash_usd == Decimal("5000")
-
-    def test_zero_usd_cash_balance_is_authoritative_not_fallback(self) -> None:
-        # If the template has Cash Report enabled AND the account
-        # actually has $0 USD (recorded as a USD row with balance=0),
-        # we trust that — don't fall back. The fallback fires ONLY when
-        # there's no USD row at all.
-        snap = _build_snapshot(
-            cash_balances=(FlexCashBalance(currency="USD", balance=Decimal("0")),),
-            account_summary_cash_usd="9999",  # ignored — USD row is authoritative
-        )
-        view = build_broker_view(snap)
-        assert view.cash_usd == Decimal("0")
+        assert view.positions == {_ETH: Decimal("7")}
+        # Cash still comes from the snapshot regardless of the override.
+        assert view.cash_usd == snapshot.cash_usd
 
 
 def _stub_session_factory(
@@ -376,7 +251,7 @@ def _stub_session_factory(
     """Build a fake session_factory that returns the supplied snapshot rows.
 
     ``prior_breaks`` defaults to ``[]`` — the empty list models the
-    Phase 1 day-1 boot path (no prior cycles have populated
+    day-1 boot path (no prior cycles have populated
     ``reconciliation_breaks`` yet) and is the right default for tests
     that don't care about grace classification.
     """
@@ -413,41 +288,25 @@ def _stub_session_factory(
 
 
 class TestRunEodCycleOrchestrator:
-    async def test_flex_fetch_failure_returns_none_no_db_writes(self) -> None:
-        config = EodCycleConfig(
-            account_id=uuid4(),
-            env="paper",
-            flex_query_id=1,
-            flex_query_token="t",
-        )
-        bad_client = MagicMock()
-        bad_client.fetch_snapshot = AsyncMock(
-            side_effect=FlexQueryFetchError(error_code="AUTH_INVALID", message="bad")
+    async def test_fetch_failure_returns_none_no_db_writes(self) -> None:
+        fetcher = _fake_fetcher(
+            error=CoinbaseReconFetchError(operation="list_positions", detail="venue 503")
         )
         result = await run_eod_cycle(
-            config=config,
+            config=_config(),
             session_factory=_stub_session_factory(positions=[], balance=None),
-            flex_client_factory=lambda: bad_client,
+            fetcher=fetcher,
         )
         assert result is None
 
     async def test_happy_path_with_no_breaks(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        config = EodCycleConfig(
-            account_id=uuid4(),
-            env="paper",
-            flex_query_id=1,
-            flex_query_token="t",
-        )
-        # FlexQuery + backend agree exactly on positions + cash.
+        # Venue + backend agree exactly on positions + cash.
         snap = _build_snapshot(
-            positions=(_flex_pos(symbol="MES", quantity="1"),),
-            cash_balances=(FlexCashBalance(currency="USD", balance=Decimal("100000")),),
+            positions=(_bpos(product_id=_BTC, contracts="1"),),
+            cash="100000",
         )
-        client = MagicMock()
-        client.fetch_snapshot = AsyncMock(return_value=snap)
-
         factory = _stub_session_factory(
-            positions=[{"market": "/MES", "qty": 1}],
+            positions=[{"market": _BTC, "qty": 1}],
             balance={"cash_usd": Decimal("100000"), "net_liquidation": Decimal("105000")},
         )
 
@@ -469,7 +328,7 @@ class TestRunEodCycleOrchestrator:
         )
 
         result = await run_eod_cycle(
-            config=config, session_factory=factory, flex_client_factory=lambda: client
+            config=_config(), session_factory=factory, fetcher=_fake_fetcher(snap)
         )
         assert result is not None
         # No breaks because backend and broker match exactly.
@@ -478,23 +337,14 @@ class TestRunEodCycleOrchestrator:
         assert len(captured["plan"].audit_events) == 1
 
     async def test_position_break_detected(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        config = EodCycleConfig(
-            account_id=uuid4(),
-            env="paper",
-            flex_query_id=1,
-            flex_query_token="t",
-        )
         # Broker has 1 contract; backend has 2. Position tolerance is
         # exact-match per recon planner so this is an actionable break.
         snap = _build_snapshot(
-            positions=(_flex_pos(symbol="MES", quantity="1"),),
-            cash_balances=(FlexCashBalance(currency="USD", balance=Decimal("100000")),),
+            positions=(_bpos(product_id=_BTC, contracts="1"),),
+            cash="100000",
         )
-        client = MagicMock()
-        client.fetch_snapshot = AsyncMock(return_value=snap)
-
         factory = _stub_session_factory(
-            positions=[{"market": "/MES", "qty": 2}],
+            positions=[{"market": _BTC, "qty": 2}],
             balance={"cash_usd": Decimal("100000"), "net_liquidation": Decimal("105000")},
         )
 
@@ -510,12 +360,10 @@ class TestRunEodCycleOrchestrator:
             "services.reconciliation.eod_cycle.apply_reconciliation_plan", fake_apply
         )
 
-        await run_eod_cycle(
-            config=config, session_factory=factory, flex_client_factory=lambda: client
-        )
+        await run_eod_cycle(config=_config(), session_factory=factory, fetcher=_fake_fetcher(snap))
         assert len(captured["plan"].breaks_detected) == 1
         b = captured["plan"].breaks_detected[0]
-        assert b.market == "/MES"
+        assert b.market == _BTC
         assert b.expected == Decimal("2")
         assert b.actual == Decimal("1")
         assert b.delta == Decimal("1")  # |expected - actual|
@@ -523,17 +371,7 @@ class TestRunEodCycleOrchestrator:
     async def test_no_balance_row_treats_cash_as_zero(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        config = EodCycleConfig(
-            account_id=uuid4(),
-            env="paper",
-            flex_query_id=1,
-            flex_query_token="t",
-        )
-        snap = _build_snapshot(
-            cash_balances=(FlexCashBalance(currency="USD", balance=Decimal("5000")),),
-        )
-        client = MagicMock()
-        client.fetch_snapshot = AsyncMock(return_value=snap)
+        snap = _build_snapshot(cash="5000")
         factory = _stub_session_factory(positions=[], balance=None)
 
         captured: dict[str, Any] = {}
@@ -548,51 +386,31 @@ class TestRunEodCycleOrchestrator:
             "services.reconciliation.eod_cycle.apply_reconciliation_plan", fake_apply
         )
 
-        await run_eod_cycle(
-            config=config, session_factory=factory, flex_client_factory=lambda: client
-        )
+        await run_eod_cycle(config=_config(), session_factory=factory, fetcher=_fake_fetcher(snap))
         # Backend cash=0, broker cash=5000 → cash_usd break expected
         # (delta > tolerance since equity_baseline=0 means bps tolerance=0).
         plan = captured["plan"]
         assert any(b.metric.value == "cash_usd" for b in plan.breaks_detected)
 
 
-class TestRunEodCycleBrokerMissingFuturesWarning:
-    """Tests for the 2026-05-27 resilience signal: when backend has open
-    FUT positions but the broker view returned ZERO FUT rows, emit a
-    structured warning naming the suspected root cause (FlexQuery template
-    missing OpenPositions FUT section).
-
-    Without this signal, the recon planner emits a position_qty break per
-    backend FUT market every cycle + the operator sees "false break" with
-    no pointer at the underlying template-config issue. The 2026-05-27
-    22:30 UTC false-positive landed in audit + reconciliation_breaks with
-    no log line naming the suspected cause — operator had to read the
-    flex_query_fetcher source to triage.
+class TestRunEodCycleBrokerMissingPositionsWarning:
+    """Resilience signal (venue-neutral successor of the 2026-05-27
+    missing-FUT warning): when backend has open positions but the venue
+    returned ZERO position rows, emit a structured warning naming the
+    suspected root causes so triage doesn't require reading fetcher
+    source. Non-blocking — the planner still runs + breaks still land.
     """
 
-    async def test_warning_fires_when_backend_fut_but_no_broker_fut(
+    async def test_warning_fires_when_backend_has_positions_but_broker_empty(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import structlog
 
-        config = EodCycleConfig(
-            account_id=uuid4(),
-            env="paper",
-            flex_query_id=1,
-            flex_query_token="t",
-        )
-        # Broker snapshot: ZERO positions (template missing FUT section).
-        snap = _build_snapshot(
-            cash_balances=(FlexCashBalance(currency="USD", balance=Decimal("100000")),),
-        )
-        client = MagicMock()
-        client.fetch_snapshot = AsyncMock(return_value=snap)
-
-        # Backend: one /M2K futures position (mirrors the 2026-05-27 EOD
-        # break shape exactly).
+        # Venue snapshot: ZERO positions.
+        snap = _build_snapshot(cash="100000")
+        # Backend: one open BTC perp position.
         factory = _stub_session_factory(
-            positions=[{"market": "/M2K", "qty": 1}],
+            positions=[{"market": _BTC, "qty": 1}],
             balance={"cash_usd": Decimal("100000"), "net_liquidation": Decimal("105000")},
         )
 
@@ -607,49 +425,37 @@ class TestRunEodCycleBrokerMissingFuturesWarning:
 
         with structlog.testing.capture_logs() as captured:
             await run_eod_cycle(
-                config=config, session_factory=factory, flex_client_factory=lambda: client
+                config=_config(), session_factory=factory, fetcher=_fake_fetcher(snap)
             )
 
         events = [c.get("event") for c in captured]
-        assert "reconciliation_eod_cycle_broker_view_missing_futures" in events
+        assert "reconciliation_eod_cycle_broker_view_missing_positions" in events
         warning = next(
             c
             for c in captured
-            if c.get("event") == "reconciliation_eod_cycle_broker_view_missing_futures"
+            if c.get("event") == "reconciliation_eod_cycle_broker_view_missing_positions"
         )
-        assert warning["backend_futures_markets"] == ["/M2K"]
-        assert warning["backend_futures_count"] == 1
+        assert warning["backend_markets"] == [_BTC]
+        assert warning["backend_position_count"] == 1
         assert warning["broker_position_count"] == 0
         assert warning["log_level"] == "warning"
-        # The hint string should name the suspected root cause so triage
-        # is fast — operator can read structlog output + immediately know
-        # to check the FlexQuery template config in IBKR portal.
-        assert "FlexQuery template" in warning["hint"]
-        assert "OpenPositions" in warning["hint"]
+        # The hint names suspected root causes for fast triage.
+        assert "CDP key" in warning["hint"]
+        assert "list_positions" in warning["hint"]
 
-    async def test_warning_silent_when_broker_has_fut(
+    async def test_warning_silent_when_broker_has_positions(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Happy path: broker view has FUT rows (M2K), so the resilience
-        # signal stays silent. We must not log on every healthy cycle.
+        # Happy path: venue has position rows, so the resilience signal
+        # stays silent. We must not log on every healthy cycle.
         import structlog
 
-        config = EodCycleConfig(
-            account_id=uuid4(),
-            env="paper",
-            flex_query_id=1,
-            flex_query_token="t",
-        )
         snap = _build_snapshot(
-            positions=(
-                _flex_pos(symbol="M2KM6", sec_type="FUT", quantity="1", underlying_symbol="M2K"),
-            ),
-            cash_balances=(FlexCashBalance(currency="USD", balance=Decimal("100000")),),
+            positions=(_bpos(product_id=_BTC, contracts="1"),),
+            cash="100000",
         )
-        client = MagicMock()
-        client.fetch_snapshot = AsyncMock(return_value=snap)
         factory = _stub_session_factory(
-            positions=[{"market": "/M2K", "qty": 1}],
+            positions=[{"market": _BTC, "qty": 1}],
             balance={"cash_usd": Decimal("100000"), "net_liquidation": Decimal("105000")},
         )
 
@@ -664,36 +470,21 @@ class TestRunEodCycleBrokerMissingFuturesWarning:
 
         with structlog.testing.capture_logs() as captured:
             await run_eod_cycle(
-                config=config, session_factory=factory, flex_client_factory=lambda: client
+                config=_config(), session_factory=factory, fetcher=_fake_fetcher(snap)
             )
 
         events = [c.get("event") for c in captured]
-        assert "reconciliation_eod_cycle_broker_view_missing_futures" not in events
+        assert "reconciliation_eod_cycle_broker_view_missing_positions" not in events
 
-    async def test_warning_silent_when_backend_has_no_fut(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # When backend has only ETFs (no FUT), the warning must NOT fire
-        # even if broker view also has no FUT. (Backend has no FUT means
-        # there's nothing for the FlexQuery template to omit; absence is
-        # the correct behavior, not a misconfig.)
+    async def test_warning_silent_when_backend_flat(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Flat backend book + empty venue book: absence is the correct
+        # state, not a fetch degradation — no warning.
         import structlog
 
-        config = EodCycleConfig(
-            account_id=uuid4(),
-            env="paper",
-            flex_query_id=1,
-            flex_query_token="t",
-        )
-        snap = _build_snapshot(
-            positions=(_flex_pos(symbol="TLT", sec_type="STK", quantity="50"),),
-            cash_balances=(FlexCashBalance(currency="USD", balance=Decimal("5000")),),
-        )
-        client = MagicMock()
-        client.fetch_snapshot = AsyncMock(return_value=snap)
+        snap = _build_snapshot(cash="5000")
         factory = _stub_session_factory(
-            positions=[{"market": "TLT", "qty": 50}],
-            balance={"cash_usd": Decimal("5000"), "net_liquidation": Decimal("10000")},
+            positions=[],
+            balance={"cash_usd": Decimal("5000"), "net_liquidation": Decimal("5000")},
         )
 
         async def fake_apply(plan: Any, **kwargs: Any) -> MagicMock:
@@ -707,30 +498,27 @@ class TestRunEodCycleBrokerMissingFuturesWarning:
 
         with structlog.testing.capture_logs() as captured:
             await run_eod_cycle(
-                config=config, session_factory=factory, flex_client_factory=lambda: client
+                config=_config(), session_factory=factory, fetcher=_fake_fetcher(snap)
             )
 
         events = [c.get("event") for c in captured]
-        assert "reconciliation_eod_cycle_broker_view_missing_futures" not in events
+        assert "reconciliation_eod_cycle_broker_view_missing_positions" not in events
 
 
 class TestMakeCycleCallback:
     async def test_callback_invokes_run_eod_cycle(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        config = EodCycleConfig(
-            account_id=uuid4(),
-            env="paper",
-            flex_query_id=1,
-            flex_query_token="t",
-        )
+        config = _config()
         factory = _stub_session_factory(positions=[], balance=None)
+        fetcher = _fake_fetcher(_build_snapshot())
         invoked = AsyncMock(return_value=None)
         monkeypatch.setattr("services.reconciliation.eod_cycle.run_eod_cycle", invoked)
-        cb = make_cycle_callback(config=config, session_factory=factory)
-        await cb(datetime(2026, 5, 12, tzinfo=UTC).date())
+        cb = make_cycle_callback(config=config, session_factory=factory, fetcher=fetcher)
+        await cb(datetime(2026, 7, 10, tzinfo=UTC).date())
         invoked.assert_awaited_once()
         kwargs = invoked.await_args.kwargs  # type: ignore[union-attr]
         assert kwargs["config"] is config
         assert kwargs["session_factory"] is factory
+        assert kwargs["fetcher"] is fetcher
 
     async def test_callback_threads_alert_dispatch_hook(
         self, monkeypatch: pytest.MonkeyPatch
@@ -738,12 +526,7 @@ class TestMakeCycleCallback:
         # make_cycle_callback accepts an alert_dispatch_hook and threads
         # it through to run_eod_cycle so the api lifespan glue can inject
         # a Discord-fan-out hook at scheduler construction time.
-        config = EodCycleConfig(
-            account_id=uuid4(),
-            env="paper",
-            flex_query_id=1,
-            flex_query_token="t",
-        )
+        config = _config()
         factory = _stub_session_factory(positions=[], balance=None)
         invoked = AsyncMock(return_value=None)
         monkeypatch.setattr("services.reconciliation.eod_cycle.run_eod_cycle", invoked)
@@ -752,9 +535,12 @@ class TestMakeCycleCallback:
             return None
 
         cb = make_cycle_callback(
-            config=config, session_factory=factory, alert_dispatch_hook=my_hook
+            config=config,
+            session_factory=factory,
+            fetcher=_fake_fetcher(_build_snapshot()),
+            alert_dispatch_hook=my_hook,
         )
-        await cb(datetime(2026, 5, 12, tzinfo=UTC).date())
+        await cb(datetime(2026, 7, 10, tzinfo=UTC).date())
         kwargs = invoked.await_args.kwargs  # type: ignore[union-attr]
         assert kwargs["alert_dispatch_hook"] is my_hook
 
@@ -778,21 +564,14 @@ class TestAlertDispatchHookEndToEnd:
     """
 
     async def test_actionable_break_fires_hook_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        config = EodCycleConfig(
-            account_id=uuid4(),
-            env="paper",
-            flex_query_id=1,
-            flex_query_token="t",
-        )
-        # 1-contract position divergence on /MES → 1 actionable break.
+        config = _config()
+        # 1-contract position divergence on BTC → 1 actionable break.
         snap = _build_snapshot(
-            positions=(_flex_pos(symbol="MES", quantity="1"),),
-            cash_balances=(FlexCashBalance(currency="USD", balance=Decimal("100000")),),
+            positions=(_bpos(product_id=_BTC, contracts="1"),),
+            cash="100000",
         )
-        client = MagicMock()
-        client.fetch_snapshot = AsyncMock(return_value=snap)
         factory = _stub_session_factory(
-            positions=[{"market": "/MES", "qty": 2}],
+            positions=[{"market": _BTC, "qty": 2}],
             balance={"cash_usd": Decimal("100000"), "net_liquidation": Decimal("105000")},
         )
 
@@ -834,7 +613,7 @@ class TestAlertDispatchHookEndToEnd:
         await run_eod_cycle(
             config=config,
             session_factory=factory,
-            flex_client_factory=lambda: client,
+            fetcher=_fake_fetcher(snap),
             alert_dispatch_hook=hook,
         )
 
@@ -844,7 +623,7 @@ class TestAlertDispatchHookEndToEnd:
         # Hook received the descriptor for the break.
         assert ctx.descriptor.severity == "P2"
         assert ctx.descriptor.category == "reconciliation_break"
-        assert ctx.descriptor.payload["market"] == "/MES"
+        assert ctx.descriptor.payload["market"] == _BTC
         assert ctx.descriptor.payload["delta"] == "1"
         # Hook received the context fields populated.
         assert ctx.account_id == config.account_id
@@ -853,21 +632,14 @@ class TestAlertDispatchHookEndToEnd:
         assert captured_plan["kwargs"]["alert_dispatch_hook"] is hook
 
     async def test_no_breaks_no_hook_fires(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        config = EodCycleConfig(
-            account_id=uuid4(),
-            env="paper",
-            flex_query_id=1,
-            flex_query_token="t",
-        )
-        # FlexQuery + backend agree exactly on positions + cash.
+        config = _config()
+        # Venue + backend agree exactly on positions + cash.
         snap = _build_snapshot(
-            positions=(_flex_pos(symbol="MES", quantity="1"),),
-            cash_balances=(FlexCashBalance(currency="USD", balance=Decimal("100000")),),
+            positions=(_bpos(product_id=_BTC, contracts="1"),),
+            cash="100000",
         )
-        client = MagicMock()
-        client.fetch_snapshot = AsyncMock(return_value=snap)
         factory = _stub_session_factory(
-            positions=[{"market": "/MES", "qty": 1}],
+            positions=[{"market": _BTC, "qty": 1}],
             balance={"cash_usd": Decimal("100000"), "net_liquidation": Decimal("105000")},
         )
 
@@ -897,7 +669,7 @@ class TestAlertDispatchHookEndToEnd:
         await run_eod_cycle(
             config=config,
             session_factory=factory,
-            flex_client_factory=lambda: client,
+            fetcher=_fake_fetcher(snap),
             alert_dispatch_hook=hook,
         )
         # No breaks → no alerts → no hook calls.
@@ -907,23 +679,16 @@ class TestAlertDispatchHookEndToEnd:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # Three actionable breaks → three hook invocations, in order.
-        config = EodCycleConfig(
-            account_id=uuid4(),
-            env="paper",
-            flex_query_id=1,
-            flex_query_token="t",
-        )
+        config = _config()
         snap = _build_snapshot(
-            positions=(_flex_pos(symbol="MES", quantity="1"),),
-            cash_balances=(FlexCashBalance(currency="USD", balance=Decimal("100000")),),
+            positions=(_bpos(product_id=_BTC, contracts="1"),),
+            cash="100000",
         )
-        client = MagicMock()
-        client.fetch_snapshot = AsyncMock(return_value=snap)
-        # Backend says different positions on /MES + /MCL + cash mismatch.
+        # Backend says different positions on BTC + ETH and cash mismatch.
         factory = _stub_session_factory(
             positions=[
-                {"market": "/MES", "qty": 3},
-                {"market": "/MCL", "qty": 1},
+                {"market": _BTC, "qty": 3},
+                {"market": _ETH, "qty": 1},
             ],
             balance={"cash_usd": Decimal("100150"), "net_liquidation": Decimal("105000")},
         )
@@ -954,34 +719,27 @@ class TestAlertDispatchHookEndToEnd:
         await run_eod_cycle(
             config=config,
             session_factory=factory,
-            flex_client_factory=lambda: client,
+            fetcher=_fake_fetcher(snap),
             alert_dispatch_hook=hook,
         )
-        # Three breaks (MCL, MES, cash) → three hook invocations.
+        # Three breaks (BTC, ETH, cash) → three hook invocations.
         assert len(hook_calls) == 3
         markets = [ctx.descriptor.payload["market"] for ctx in hook_calls]
-        # /MCL sorted alphabetically before /MES; cash break has market=None.
-        assert markets == ["/MCL", "/MES", None]
+        # Position breaks sorted by market; cash break has market=None.
+        assert markets == [_BTC, _ETH, None]
 
     async def test_hook_optional_when_no_hook_supplied(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # Pre-wiring boot: no hook supplied → cycle still completes
         # (audit + reconciliation_breaks rows still land via apply).
-        config = EodCycleConfig(
-            account_id=uuid4(),
-            env="paper",
-            flex_query_id=1,
-            flex_query_token="t",
-        )
+        config = _config()
         snap = _build_snapshot(
-            positions=(_flex_pos(symbol="MES", quantity="1"),),
-            cash_balances=(FlexCashBalance(currency="USD", balance=Decimal("100000")),),
+            positions=(_bpos(product_id=_BTC, contracts="1"),),
+            cash="100000",
         )
-        client = MagicMock()
-        client.fetch_snapshot = AsyncMock(return_value=snap)
         factory = _stub_session_factory(
-            positions=[{"market": "/MES", "qty": 2}],
+            positions=[{"market": _BTC, "qty": 2}],
             balance={"cash_usd": Decimal("100000"), "net_liquidation": Decimal("105000")},
         )
 
@@ -999,7 +757,7 @@ class TestAlertDispatchHookEndToEnd:
         result = await run_eod_cycle(
             config=config,
             session_factory=factory,
-            flex_client_factory=lambda: client,
+            fetcher=_fake_fetcher(snap),
         )
         assert result is not None
         # Plan still went through apply.
@@ -1022,10 +780,10 @@ class TestPriorBreaksLookup:
     (the ``NOW() - INTERVAL '<N> hour'`` filter) are exercised at
     integration-test time. Here we assert:
 
-    * Empty table → ``()`` (Phase 1 day-1 boot).
+    * Empty table → ``()`` (day-1 boot).
     * Populated table → mapped to ``PriorBreak(metric, market, delta)``.
     * Unknown metric → skipped + warning emitted (defensive against a
-      Phase-2 metric value landing before the planner enum is updated).
+      future metric value landing before the planner enum is updated).
     * Window-hours param threads through to the SQL params dict.
     """
 
@@ -1044,13 +802,13 @@ class TestPriorBreaksLookup:
         factory = _stub_session_factory(
             positions=[],
             balance=None,
-            prior_breaks=[{"metric": "position_qty", "market": "/MES", "delta": Decimal("1")}],
+            prior_breaks=[{"metric": "position_qty", "market": _BTC, "delta": Decimal("1")}],
         )
         prior = await fetch_prior_breaks_within_grace_window(factory, account_id=uuid4())
         assert prior == (
             PriorBreak(
                 metric=ReconciliationMetric.POSITION_QTY,
-                market="/MES",
+                market=_BTC,
                 delta=Decimal("1"),
             ),
         )
@@ -1070,15 +828,15 @@ class TestPriorBreaksLookup:
         assert prior[0].delta == Decimal("250.00")
 
     async def test_unknown_metric_skipped(self) -> None:
-        # A future Phase 2 metric (e.g., 'net_liquidation') landing in
-        # the schema before the planner enum is updated should be
-        # silently dropped — never crash the cycle.
+        # A future metric (e.g., 'net_liquidation') landing in the
+        # schema before the planner enum is updated should be silently
+        # dropped — never crash the cycle.
         factory = _stub_session_factory(
             positions=[],
             balance=None,
             prior_breaks=[
                 {"metric": "net_liquidation", "market": None, "delta": Decimal("100.00")},
-                {"metric": "position_qty", "market": "/MES", "delta": Decimal("1")},
+                {"metric": "position_qty", "market": _BTC, "delta": Decimal("1")},
             ],
         )
         prior = await fetch_prior_breaks_within_grace_window(factory, account_id=uuid4())
@@ -1104,8 +862,7 @@ class TestPriorBreaksLookup:
 
     async def test_default_window_hours_constant(self) -> None:
         # Locked default: T+1 (24h) + half-day buffer (12h) = 36h.
-        # Friday-detected breaks need weekend coverage through Monday;
-        # documented limitation, see eod_cycle.py docstring.
+        # Crypto trades 24/7 so there is no weekend gap to bridge.
         assert DEFAULT_PRIOR_BREAKS_WINDOW_HOURS == 36
 
     async def test_run_eod_cycle_threads_prior_breaks_to_planner(
@@ -1114,27 +871,19 @@ class TestPriorBreaksLookup:
         # End-to-end: run_eod_cycle calls the helper + threads the result
         # into plan_reconciliation_check. Verifies the prior-break is
         # classified as grace continuation (no alert fires).
-        config = EodCycleConfig(
-            account_id=uuid4(),
-            env="paper",
-            flex_query_id=1,
-            flex_query_token="t",
-        )
-        # FlexQuery + backend disagree on /MES by 1 contract — same delta
+        config = _config()
+        # Venue + backend disagree on BTC by 1 contract — same delta
         # as the prior break we'll seed below.
         snap = _build_snapshot(
-            positions=(_flex_pos(symbol="MES", quantity="1"),),
-            cash_balances=(FlexCashBalance(currency="USD", balance=Decimal("100000")),),
+            positions=(_bpos(product_id=_BTC, contracts="1"),),
+            cash="100000",
         )
-        client = MagicMock()
-        client.fetch_snapshot = AsyncMock(return_value=snap)
-
         factory = _stub_session_factory(
-            positions=[{"market": "/MES", "qty": 2}],
+            positions=[{"market": _BTC, "qty": 2}],
             balance={"cash_usd": Decimal("100000"), "net_liquidation": Decimal("105000")},
             # Prior break with same (metric, market, delta) as today's
             # break — should classify as grace, drop the alert.
-            prior_breaks=[{"metric": "position_qty", "market": "/MES", "delta": Decimal("1")}],
+            prior_breaks=[{"metric": "position_qty", "market": _BTC, "delta": Decimal("1")}],
         )
 
         captured: dict[str, Any] = {}
@@ -1150,9 +899,7 @@ class TestPriorBreaksLookup:
             "services.reconciliation.eod_cycle.apply_reconciliation_plan", fake_apply
         )
 
-        await run_eod_cycle(
-            config=config, session_factory=factory, flex_client_factory=lambda: client
-        )
+        await run_eod_cycle(config=config, session_factory=factory, fetcher=_fake_fetcher(snap))
 
         plan = captured["plan"]
         # The break is detected (it's still in breaks_detected) but
@@ -1167,23 +914,16 @@ class TestPriorBreaksLookup:
     ) -> None:
         # Prior delta=1; today delta=2 → mismatch → today's break is
         # actionable + alert fires.
-        config = EodCycleConfig(
-            account_id=uuid4(),
-            env="paper",
-            flex_query_id=1,
-            flex_query_token="t",
-        )
+        config = _config()
         snap = _build_snapshot(
-            positions=(_flex_pos(symbol="MES", quantity="1"),),
-            cash_balances=(FlexCashBalance(currency="USD", balance=Decimal("100000")),),
+            positions=(_bpos(product_id=_BTC, contracts="1"),),
+            cash="100000",
         )
-        client = MagicMock()
-        client.fetch_snapshot = AsyncMock(return_value=snap)
         factory = _stub_session_factory(
-            positions=[{"market": "/MES", "qty": 3}],
+            positions=[{"market": _BTC, "qty": 3}],
             balance={"cash_usd": Decimal("100000"), "net_liquidation": Decimal("105000")},
             # Prior delta=1, today delta=2 — different → not grace.
-            prior_breaks=[{"metric": "position_qty", "market": "/MES", "delta": Decimal("1")}],
+            prior_breaks=[{"metric": "position_qty", "market": _BTC, "delta": Decimal("1")}],
         )
 
         captured: dict[str, Any] = {}
@@ -1196,9 +936,7 @@ class TestPriorBreaksLookup:
             "services.reconciliation.eod_cycle.apply_reconciliation_plan", fake_apply
         )
 
-        await run_eod_cycle(
-            config=config, session_factory=factory, flex_client_factory=lambda: client
-        )
+        await run_eod_cycle(config=config, session_factory=factory, fetcher=_fake_fetcher(snap))
 
         plan = captured["plan"]
         # Today's delta=2 ≠ prior's delta=1 → actionable + alert fires.
@@ -1214,6 +952,16 @@ class TestModuleContract:
 
         for name in mod.__all__:
             assert hasattr(mod, name), f"__all__ contains {name!r} but module lacks it"
+
+    def test_balance_source_matches_api_repo_filter(self) -> None:
+        # The /system tile's freshness signal filters balances rows on
+        # the same source string the recon cycle writes — keep in sync.
+        from services.api.repos.phase1 import _RECON_BALANCE_SOURCE
+
+        assert BALANCE_SOURCE_FROM_COINBASE == _RECON_BALANCE_SOURCE == "coinbase_eod"
+
+    def test_balance_source_matches_broker_source_enum(self) -> None:
+        assert BALANCE_SOURCE_FROM_COINBASE == BrokerSource.COINBASE_EOD.value
 
 
 # ---------------------------------------------------------------------------
@@ -1295,27 +1043,20 @@ def _audit_record_mock(event_uuid: UUID | None = None) -> MagicMock:
 
 
 class TestRefreshBackendFromBrokerSnapshot:
-    """PR-I: writes balance + position marks from broker snapshot
+    """PR-I: writes balance + position marks from the venue snapshot
     BEFORE the recon planner runs."""
 
     async def test_naive_pulled_at_rejected(self) -> None:
         refresh_backend_from_broker_snapshot = _real_refresh  # captured before autouse monkeypatch
 
-        # Build a snapshot with a naive datetime — we hand-craft the
-        # dataclass so the constructor's TZ-aware default doesn't kick in.
-        naive_snapshot = ReconciliationSnapshot(
-            pulled_at_utc=datetime(2026, 5, 12, 22, 30),  # naive
-            account_summary=FlexAccountSummary(
-                account_id="DUQ825170",
-                report_date=datetime(2026, 5, 12).date(),
-                net_liquidation_usd=Decimal("100000"),
-                cash_usd=Decimal("100000"),
-                stock_market_value_usd=Decimal(0),
-                bond_market_value_usd=Decimal(0),
-                futures_pnl_usd=Decimal(0),
-            ),
+        naive_snapshot = CoinbaseReconSnapshot(
             positions=(),
-            cash_balances=(),
+            position_details=(),
+            balance_summary=_bal_summary(),
+            cash_usd=Decimal("100000"),
+            net_liquidation_usd=Decimal("100000"),
+            fills=(),
+            pulled_at_utc=datetime(2026, 7, 10, 0, 15),  # naive
         )
         factory, _, _ = _refresh_session_factory(position_rows_by_market={})
 
@@ -1360,19 +1101,136 @@ class TestRefreshBackendFromBrokerSnapshot:
         # No positions_current UPDATE happened.
         assert not any("UPDATE positions_current" in s for s in executed_sql)
 
+    async def test_balance_insert_params_coinbase_semantics(self) -> None:
+        # source='coinbase_eod'; NLV/cash from the snapshot; excess from
+        # available_margin; used_margin_pct = initial_margin / NLV.
+        from unittest.mock import patch
+
+        refresh_backend_from_broker_snapshot = _real_refresh  # captured before autouse monkeypatch
+
+        snapshot = CoinbaseReconSnapshot(
+            positions=(),
+            position_details=(),
+            balance_summary=_bal_summary(
+                total="100000",
+                unrealized="150",
+                available_margin="35000",
+                initial_margin="5000",
+            ),
+            cash_usd=Decimal("100000"),
+            net_liquidation_usd=Decimal("100150"),
+            fills=(),
+            pulled_at_utc=_PULLED_AT,
+        )
+        factory, executed_sql, executed_params = _refresh_session_factory(
+            position_rows_by_market={}
+        )
+        with patch(
+            "services.reconciliation.eod_cycle.append_audit_event",
+            new=AsyncMock(side_effect=lambda *a, **k: _audit_record_mock()),
+        ):
+            await refresh_backend_from_broker_snapshot(
+                snapshot,
+                session_factory=factory,
+                account_id=uuid4(),
+                env="paper",
+            )
+        insert_params = next(
+            p
+            for s, p in zip(executed_sql, executed_params, strict=True)
+            if "INSERT INTO balances" in s
+        )
+        assert insert_params["source"] == BALANCE_SOURCE_FROM_COINBASE
+        assert insert_params["nlv"] == Decimal("100150")
+        assert insert_params["cash"] == Decimal("100000")
+        assert insert_params["excess"] == Decimal("35000")
+        # 5000 / 100150 quantized to NUMERIC(10, 8).
+        assert insert_params["margin"] == Decimal("0.04992511")
+
+    async def test_balance_insert_margin_fallbacks(self) -> None:
+        # Venue omits available_margin + initial_margin → excess falls
+        # back to cash; used_margin_pct falls back to 0.
+        from unittest.mock import patch
+
+        refresh_backend_from_broker_snapshot = _real_refresh  # captured before autouse monkeypatch
+
+        snapshot = _build_snapshot(cash="50000")
+        factory, executed_sql, executed_params = _refresh_session_factory(
+            position_rows_by_market={}
+        )
+        with patch(
+            "services.reconciliation.eod_cycle.append_audit_event",
+            new=AsyncMock(side_effect=lambda *a, **k: _audit_record_mock()),
+        ):
+            await refresh_backend_from_broker_snapshot(
+                snapshot,
+                session_factory=factory,
+                account_id=uuid4(),
+                env="paper",
+            )
+        insert_params = next(
+            p
+            for s, p in zip(executed_sql, executed_params, strict=True)
+            if "INSERT INTO balances" in s
+        )
+        assert insert_params["excess"] == Decimal("50000")
+        assert insert_params["margin"] == Decimal(0)
+
+    async def test_balance_audit_payload_carries_raw_venue_fields(self) -> None:
+        # The audit payload stamps the raw venue money fields as strings
+        # ([A05]) so venue semantics surprises are forensically visible.
+        from unittest.mock import patch
+
+        refresh_backend_from_broker_snapshot = _real_refresh  # captured before autouse monkeypatch
+
+        snapshot = CoinbaseReconSnapshot(
+            positions=(),
+            position_details=(),
+            balance_summary=_bal_summary(
+                total="100000",
+                unrealized="150",
+                available_margin=None,
+                initial_margin=None,
+            ),
+            cash_usd=Decimal("100000"),
+            net_liquidation_usd=Decimal("100150"),
+            fills=(),
+            pulled_at_utc=_PULLED_AT,
+        )
+        factory, _, _ = _refresh_session_factory(position_rows_by_market={})
+        append = AsyncMock(side_effect=lambda *a, **k: _audit_record_mock())
+        with patch(
+            "services.reconciliation.eod_cycle.append_audit_event",
+            new=append,
+        ):
+            await refresh_backend_from_broker_snapshot(
+                snapshot,
+                session_factory=factory,
+                account_id=uuid4(),
+                env="paper",
+            )
+        payload = append.await_args_list[0].args[2]
+        assert payload["source"] == BALANCE_SOURCE_FROM_COINBASE
+        assert payload["broker_cash_usd"] == "100000"
+        assert payload["broker_net_liquidation_usd"] == "100150"
+        assert payload["broker_total_usd_balance"] == "100000"
+        assert payload["broker_unrealized_pnl"] == "150"
+        assert payload["broker_available_margin"] is None
+        assert payload["fill_count_in_snapshot"] == 0
+
     async def test_matching_position_marked_and_audit_emitted(self) -> None:
         from unittest.mock import patch
 
         refresh_backend_from_broker_snapshot = _real_refresh  # captured before autouse monkeypatch
 
         position_id = uuid4()
-        snapshot = _build_snapshot(positions=(_flex_pos(symbol="MES", quantity="2"),))
+        snapshot = _build_snapshot(positions=(_bpos(product_id=_BTC, contracts="2"),))
         factory, executed_sql, executed_params = _refresh_session_factory(
             position_rows_by_market={
-                "/MES": {
+                _BTC: {
                     "id": position_id,
                     "quantity": 2,
-                    "avg_cost": Decimal("5230"),
+                    "avg_cost": Decimal("109000"),
                 }
             }
         )
@@ -1416,9 +1274,9 @@ class TestRefreshBackendFromBrokerSnapshot:
 
         refresh_backend_from_broker_snapshot = _real_refresh  # captured before autouse monkeypatch
 
-        # Broker has /MES position; backend has NO row for /MES → skip.
-        snapshot = _build_snapshot(positions=(_flex_pos(symbol="MES", quantity="2"),))
-        factory, executed_sql, _ = _refresh_session_factory(position_rows_by_market={"/MES": None})
+        # Broker has a BTC position; backend has NO row for it → skip.
+        snapshot = _build_snapshot(positions=(_bpos(product_id=_BTC, contracts="2"),))
+        factory, executed_sql, _ = _refresh_session_factory(position_rows_by_market={_BTC: None})
 
         with patch(
             "services.reconciliation.eod_cycle.append_audit_event",
@@ -1441,7 +1299,7 @@ class TestRefreshBackendFromBrokerSnapshot:
 
         refresh_backend_from_broker_snapshot = _real_refresh  # captured before autouse monkeypatch
 
-        snapshot = _build_snapshot(positions=(_flex_pos(symbol="MES", quantity="0"),))
+        snapshot = _build_snapshot(positions=(_bpos(product_id=_BTC, contracts="0"),))
         factory, executed_sql, _ = _refresh_session_factory(position_rows_by_market={})
 
         with patch(
@@ -1461,20 +1319,21 @@ class TestRefreshBackendFromBrokerSnapshot:
             "SELECT id, quantity, avg_cost FROM positions_current" in s for s in executed_sql
         )
 
-    async def test_broker_supplied_upnl_used_directly(self) -> None:
+    async def test_broker_supplied_upnl_used_and_quantized(self) -> None:
         from unittest.mock import patch
 
         refresh_backend_from_broker_snapshot = _real_refresh  # captured before autouse monkeypatch
 
         position_id = uuid4()
-        # FlexPos sets unrealized_pnl_usd=20 by default.
-        snapshot = _build_snapshot(positions=(_flex_pos(symbol="MES", quantity="2"),))
+        snapshot = _build_snapshot(
+            positions=(_bpos(product_id=_BTC, contracts="2", unrealized_pnl="20.123456"),)
+        )
         factory, executed_sql, executed_params = _refresh_session_factory(
             position_rows_by_market={
-                "/MES": {
+                _BTC: {
                     "id": position_id,
                     "quantity": 2,
-                    "avg_cost": Decimal("5230"),
+                    "avg_cost": Decimal("109000"),
                 }
             }
         )
@@ -1493,110 +1352,31 @@ class TestRefreshBackendFromBrokerSnapshot:
             for s, p in zip(executed_sql, executed_params, strict=True)
             if "UPDATE positions_current" in s
         )
-        assert update_params["upnl"] == Decimal("20.0000")
+        # Quantized half-even to NUMERIC(20, 4).
+        assert update_params["upnl"] == Decimal("20.1235")
 
-    async def test_computed_upnl_when_broker_omits_it(self) -> None:
+    async def test_missing_upnl_skips_mark_with_warning(self) -> None:
+        """Venue omits unrealized_pnl → the mark is SKIPPED (the
+        FlexQuery-era price-minus-cost fallback is deliberately gone —
+        it is wrong for futures without the contract multiplier)."""
         from unittest.mock import patch
 
-        refresh_backend_from_broker_snapshot = _real_refresh  # captured before autouse monkeypatch
-
-        # FlexPos but unrealized_pnl_usd = None.
-        pos = FlexPosition(
-            account_id="DUQ825170",
-            symbol="MES",
-            sec_type="FUT",
-            quantity=Decimal("2"),
-            avg_cost_usd=Decimal("5230"),
-            market_price_usd=Decimal("5240"),  # mark
-            market_value_usd=None,
-            unrealized_pnl_usd=None,  # not supplied
-        )
-        snapshot = _build_snapshot(positions=(pos,))
-        position_id = uuid4()
-        factory, executed_sql, executed_params = _refresh_session_factory(
-            position_rows_by_market={
-                "/MES": {
-                    "id": position_id,
-                    "quantity": 2,
-                    "avg_cost": Decimal("5230"),
-                }
-            }
-        )
-        with patch(
-            "services.reconciliation.eod_cycle.append_audit_event",
-            new=AsyncMock(side_effect=lambda *a, **k: _audit_record_mock()),
-        ):
-            await refresh_backend_from_broker_snapshot(
-                snapshot,
-                session_factory=factory,
-                account_id=uuid4(),
-                env="paper",
-            )
-        # uPnL = (5240 - 5230) * 2 = 20
-        update_params = next(
-            p
-            for s, p in zip(executed_sql, executed_params, strict=True)
-            if "UPDATE positions_current" in s
-        )
-        assert update_params["upnl"] == Decimal("20.0000")
-
-    async def test_no_mark_skips_silently(self) -> None:
-        """Both market_price_usd and unrealized_pnl_usd None → skip."""
-        from unittest.mock import patch
-
-        refresh_backend_from_broker_snapshot = _real_refresh  # captured before autouse monkeypatch
-
-        pos = FlexPosition(
-            account_id="DUQ825170",
-            symbol="MES",
-            sec_type="FUT",
-            quantity=Decimal("2"),
-            avg_cost_usd=Decimal("5230"),
-            market_price_usd=None,
-            market_value_usd=None,
-            unrealized_pnl_usd=None,
-        )
-        snapshot = _build_snapshot(positions=(pos,))
-        position_id = uuid4()
-        factory, executed_sql, _ = _refresh_session_factory(
-            position_rows_by_market={
-                "/MES": {
-                    "id": position_id,
-                    "quantity": 2,
-                    "avg_cost": Decimal("5230"),
-                }
-            }
-        )
-        with patch(
-            "services.reconciliation.eod_cycle.append_audit_event",
-            new=AsyncMock(side_effect=lambda *a, **k: _audit_record_mock()),
-        ):
-            result = await refresh_backend_from_broker_snapshot(
-                snapshot,
-                session_factory=factory,
-                account_id=uuid4(),
-                env="paper",
-            )
-        assert result.positions_marked_count == 0
-        # 1 balance audit only.
-        assert len(result.audit_event_uuids) == 1
-        # No UPDATE.
-        assert not any("UPDATE positions_current" in s for s in executed_sql)
-
-    async def test_etf_no_slash_prefix(self) -> None:
-        from unittest.mock import patch
+        import structlog
 
         refresh_backend_from_broker_snapshot = _real_refresh  # captured before autouse monkeypatch
 
         snapshot = _build_snapshot(
-            positions=(_flex_pos(symbol="TLT", sec_type="STK", quantity="100"),)
+            positions=(
+                _bpos(product_id=_BTC, contracts="2", mark_price="110000", unrealized_pnl=None),
+            )
         )
-        factory, executed_sql, executed_params = _refresh_session_factory(
+        position_id = uuid4()
+        factory, executed_sql, _ = _refresh_session_factory(
             position_rows_by_market={
-                "TLT": {
-                    "id": uuid4(),
-                    "quantity": 100,
-                    "avg_cost": Decimal("85"),
+                _BTC: {
+                    "id": position_id,
+                    "quantity": 2,
+                    "avg_cost": Decimal("109000"),
                 }
             }
         )
@@ -1604,21 +1384,21 @@ class TestRefreshBackendFromBrokerSnapshot:
             "services.reconciliation.eod_cycle.append_audit_event",
             new=AsyncMock(side_effect=lambda *a, **k: _audit_record_mock()),
         ):
-            result = await refresh_backend_from_broker_snapshot(
-                snapshot,
-                session_factory=factory,
-                account_id=uuid4(),
-                env="paper",
-            )
-        # TLT (ETF) matched without slash prefix.
-        assert result.positions_marked_count == 1
-        # Lookup used market='TLT' (no slash).
-        lookup_params = next(
-            p
-            for s, p in zip(executed_sql, executed_params, strict=True)
-            if "SELECT id, quantity, avg_cost FROM positions_current" in s
-        )
-        assert lookup_params["market"] == "TLT"
+            with structlog.testing.capture_logs() as captured:
+                result = await refresh_backend_from_broker_snapshot(
+                    snapshot,
+                    session_factory=factory,
+                    account_id=uuid4(),
+                    env="paper",
+                )
+        assert result.positions_marked_count == 0
+        # 1 balance audit only.
+        assert len(result.audit_event_uuids) == 1
+        # No UPDATE — even though a mark price exists, we refuse the
+        # multiplier-less computation.
+        assert not any("UPDATE positions_current" in s for s in executed_sql)
+        events = [c.get("event") for c in captured]
+        assert "reconciliation_refresh_no_broker_upnl" in events
 
     async def test_two_matching_positions_emit_three_audits(self) -> None:
         from unittest.mock import patch
@@ -1627,14 +1407,14 @@ class TestRefreshBackendFromBrokerSnapshot:
 
         snapshot = _build_snapshot(
             positions=(
-                _flex_pos(symbol="MES", quantity="2"),
-                _flex_pos(symbol="MNQ", quantity="1"),
+                _bpos(product_id=_BTC, contracts="2"),
+                _bpos(product_id=_ETH, contracts="-1", unrealized_pnl="-3.5"),
             )
         )
         factory, _, _ = _refresh_session_factory(
             position_rows_by_market={
-                "/MES": {"id": uuid4(), "quantity": 2, "avg_cost": Decimal("5230")},
-                "/MNQ": {"id": uuid4(), "quantity": 1, "avg_cost": Decimal("18000")},
+                _BTC: {"id": uuid4(), "quantity": 2, "avg_cost": Decimal("109000")},
+                _ETH: {"id": uuid4(), "quantity": -1, "avg_cost": Decimal("3900")},
             }
         )
         with patch(
@@ -1686,7 +1466,7 @@ class TestFetchClosedTradesForSessionDate:
             factory,
             account_id=uuid4(),
             env="paper",
-            session_date_et=date(2026, 5, 16),
+            session_date_et=date(2026, 7, 9),
         )
         assert result == ()
 
@@ -1698,8 +1478,8 @@ class TestFetchClosedTradesForSessionDate:
 
         trade_id = uuid4()
         signal_id = uuid4()
-        opened_at = datetime(2026, 5, 16, 14, 0, tzinfo=UTC)
-        closed_at = datetime(2026, 5, 16, 20, 30, tzinfo=UTC)
+        opened_at = datetime(2026, 7, 9, 14, 0, tzinfo=UTC)
+        closed_at = datetime(2026, 7, 9, 20, 30, tzinfo=UTC)
         row = MagicMock()
         row.trade_id = trade_id
         row.entry_signal_id = signal_id
@@ -1728,7 +1508,7 @@ class TestFetchClosedTradesForSessionDate:
             factory,
             account_id=uuid4(),
             env="paper",
-            session_date_et=date(2026, 5, 16),
+            session_date_et=date(2026, 7, 9),
         )
         assert len(result) == 1
         trade = result[0]
@@ -1758,11 +1538,11 @@ class TestFetchClosedTradesForSessionDate:
         row.avg_exit_price = None  # incomplete
         row.realized_pnl_usd = Decimal("0.50")
         row.realized_commission_usd = Decimal("0.05")
-        row.opened_at_utc = datetime(2026, 5, 16, 14, 0, tzinfo=UTC)
-        row.closed_at_utc = datetime(2026, 5, 16, 20, 30, tzinfo=UTC)
+        row.opened_at_utc = datetime(2026, 7, 9, 14, 0, tzinfo=UTC)
+        row.closed_at_utc = datetime(2026, 7, 9, 20, 30, tzinfo=UTC)
         row.expected_entry_price = Decimal("85.40")
         row.expected_slippage_bps = Decimal("1.2")
-        row.expected_at_utc = datetime(2026, 5, 16, 14, 0, tzinfo=UTC)
+        row.expected_at_utc = datetime(2026, 7, 9, 14, 0, tzinfo=UTC)
 
         @asynccontextmanager
         async def _session_cm() -> Any:
@@ -1777,7 +1557,7 @@ class TestFetchClosedTradesForSessionDate:
             factory,
             account_id=uuid4(),
             env="paper",
-            session_date_et=date(2026, 5, 16),
+            session_date_et=date(2026, 7, 9),
         )
         assert result == ()  # skipped
 
@@ -1827,7 +1607,7 @@ class TestEmitDailyAttributionRollup:
             account_id=uuid4(),
             env="paper",
             phase_at_emit=1,
-            snapshot_pulled_at_utc=datetime(2026, 5, 16, 22, 30, tzinfo=UTC),
+            snapshot_pulled_at_utc=datetime(2026, 7, 10, 0, 15, tzinfo=UTC),
         )
         # Zero rows inserted (no closed trades)
         assert count == 0
@@ -1845,36 +1625,11 @@ class TestEmitDailyAttributionRollup:
 class TestRunEodCycleAttributionIntegration:
     """Verify the attribution rollup is invoked at the end of run_eod_cycle."""
 
-    @pytest.mark.asyncio
-    async def test_attribution_helper_called_from_run_eod_cycle(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The new wiring must call _emit_daily_attribution_rollup from
-        inside run_eod_cycle after apply_reconciliation_plan succeeds."""
+    @staticmethod
+    def _stub_recon_stages(monkeypatch: pytest.MonkeyPatch) -> Any:
+        """Stub backend view / prior breaks / apply; return apply_result."""
         from services.reconciliation import eod_cycle as mod
-        from services.reconciliation.eod_cycle import EodCycleConfig
-
-        # Mock the recon stages so we focus on attribution wiring
-        snapshot_mock = MagicMock()
-        snapshot_mock.pulled_at_utc = datetime(2026, 5, 16, 22, 30, tzinfo=UTC)
-        snapshot_mock.positions = ()
-        snapshot_mock.cash_balances = ()
-        snapshot_mock.account_summary = MagicMock(
-            cash_usd=Decimal("0"),
-            net_liquidation_usd=Decimal("0"),
-            stock_market_value_usd=Decimal("0"),
-            bond_market_value_usd=Decimal("0"),
-            futures_pnl_usd=Decimal("0"),
-        )
-
-        flex_client_mock = MagicMock()
-        flex_client_mock.fetch_snapshot = AsyncMock(return_value=snapshot_mock)
-
-        def factory() -> Any:
-            return flex_client_mock
-
-        # The autouse fixture _patch_refresh already no-ops refresh_backend_from_broker_snapshot
-        # Stub build_backend_view + apply_reconciliation_plan since they need a real DB
+        from services.reconciliation.apply import ReconciliationApplyResult
         from services.reconciliation.recon import BackendView
 
         monkeypatch.setattr(
@@ -1891,9 +1646,6 @@ class TestRunEodCycleAttributionIntegration:
             "fetch_prior_breaks_within_grace_window",
             AsyncMock(return_value=()),
         )
-        # Stub apply_reconciliation_plan to return a result
-        from services.reconciliation.apply import ReconciliationApplyResult
-
         apply_result = ReconciliationApplyResult(
             audit_event_uuids=(),
             inserted_break_ids=(),
@@ -1906,6 +1658,18 @@ class TestRunEodCycleAttributionIntegration:
             "apply_reconciliation_plan",
             AsyncMock(return_value=apply_result),
         )
+        return apply_result
+
+    @pytest.mark.asyncio
+    async def test_attribution_helper_called_from_run_eod_cycle(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The wiring must call _emit_daily_attribution_rollup from
+        inside run_eod_cycle after apply_reconciliation_plan succeeds."""
+        from services.reconciliation import eod_cycle as mod
+
+        snap = _build_snapshot(cash="0")
+        self._stub_recon_stages(monkeypatch)
 
         # Spy on the attribution helper
         emit_spy = AsyncMock(return_value=0)
@@ -1918,16 +1682,10 @@ class TestRunEodCycleAttributionIntegration:
 
         session_factory = MagicMock(side_effect=lambda: _session_cm())
 
-        config = EodCycleConfig(
-            account_id=uuid4(),
-            env="paper",
-            flex_query_id=1,
-            flex_query_token="token",
-        )
         await mod.run_eod_cycle(
-            config=config,
+            config=_config(),
             session_factory=session_factory,
-            flex_client_factory=factory,
+            fetcher=_fake_fetcher(snap),
         )
 
         # Attribution helper was called
@@ -1935,7 +1693,7 @@ class TestRunEodCycleAttributionIntegration:
         kwargs = emit_spy.await_args.kwargs
         assert kwargs["env"] == "paper"
         # snapshot_pulled_at_utc was forwarded
-        assert kwargs["snapshot_pulled_at_utc"] == snapshot_mock.pulled_at_utc
+        assert kwargs["snapshot_pulled_at_utc"] == snap.pulled_at_utc
 
     @pytest.mark.asyncio
     async def test_attribution_failure_does_not_fail_cycle(
@@ -1944,53 +1702,9 @@ class TestRunEodCycleAttributionIntegration:
         """If _emit_daily_attribution_rollup raises, run_eod_cycle still
         returns the recon apply result. PR-K is best-effort."""
         from services.reconciliation import eod_cycle as mod
-        from services.reconciliation.eod_cycle import EodCycleConfig
 
-        snapshot_mock = MagicMock()
-        snapshot_mock.pulled_at_utc = datetime(2026, 5, 16, 22, 30, tzinfo=UTC)
-        snapshot_mock.positions = ()
-        snapshot_mock.cash_balances = ()
-        snapshot_mock.account_summary = MagicMock(
-            cash_usd=Decimal("0"),
-            net_liquidation_usd=Decimal("0"),
-            stock_market_value_usd=Decimal("0"),
-            bond_market_value_usd=Decimal("0"),
-            futures_pnl_usd=Decimal("0"),
-        )
-
-        flex_client_mock = MagicMock()
-        flex_client_mock.fetch_snapshot = AsyncMock(return_value=snapshot_mock)
-
-        from services.reconciliation.recon import BackendView
-
-        monkeypatch.setattr(
-            mod,
-            "build_backend_view",
-            AsyncMock(
-                return_value=BackendView(
-                    positions={}, cash_usd=Decimal("0"), equity_baseline=Decimal("0")
-                )
-            ),
-        )
-        monkeypatch.setattr(
-            mod,
-            "fetch_prior_breaks_within_grace_window",
-            AsyncMock(return_value=()),
-        )
-        from services.reconciliation.apply import ReconciliationApplyResult
-
-        apply_result = ReconciliationApplyResult(
-            audit_event_uuids=(),
-            inserted_break_ids=(),
-            resolved_break_count=0,
-            kill_switch_invoked=False,
-            alerts_dispatched_count=0,
-        )
-        monkeypatch.setattr(
-            mod,
-            "apply_reconciliation_plan",
-            AsyncMock(return_value=apply_result),
-        )
+        snap = _build_snapshot(cash="0")
+        apply_result = self._stub_recon_stages(monkeypatch)
 
         # Attribution helper raises
         monkeypatch.setattr(
@@ -2005,16 +1719,10 @@ class TestRunEodCycleAttributionIntegration:
 
         session_factory = MagicMock(side_effect=lambda: _session_cm())
 
-        config = EodCycleConfig(
-            account_id=uuid4(),
-            env="paper",
-            flex_query_id=1,
-            flex_query_token="token",
-        )
         # Cycle still returns successfully (apply_result)
         result = await mod.run_eod_cycle(
-            config=config,
+            config=_config(),
             session_factory=session_factory,
-            flex_client_factory=lambda: flex_client_mock,
+            fetcher=_fake_fetcher(snap),
         )
         assert result is apply_result

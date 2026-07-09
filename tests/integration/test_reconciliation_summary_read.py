@@ -6,7 +6,7 @@ the route + mapper against a stub repo; they cannot catch the regression this
 module targets:
 
   * ``last_check_utc`` is sourced from the latest EOD-recon balance snapshot
-    (``balances.source = 'flexquery_eod'``), NOT MAX(detected_at_utc) over
+    (``balances.source = 'coinbase_eod'``), NOT MAX(detected_at_utc) over
     ``reconciliation_breaks``. A passing recon cycle writes a balance snapshot
     but NO break row, so a break-derived ``last_check_utc`` froze on the last
     detected break and the tile looked stale ("Last check" stuck in the past)
@@ -160,7 +160,7 @@ def _insert_break(
                 "  account_id, detected_at_utc, metric, source, "
                 "  audit_event_uuid, resolved_at_utc"
                 ") VALUES ("
-                "  :acc, :det, 'position_qty', 'flexquery_eod', :aud, :res"
+                "  :acc, :det, 'position_qty', 'coinbase_eod', :aud, :res"
                 ")"
             ),
             {
@@ -201,7 +201,7 @@ class TestLastCheckSource:
         break_ts = now - timedelta(hours=2)
         recon_ts = now - timedelta(hours=1)
         _insert_break(sync_engine, fresh_account_id, detected_at_utc=break_ts)
-        _insert_balance(sync_engine, fresh_account_id, snapshot_ts=recon_ts, source="flexquery_eod")
+        _insert_balance(sync_engine, fresh_account_id, snapshot_ts=recon_ts, source="coinbase_eod")
 
         summary = await _fetch(async_session_factory, fresh_account_id)
 
@@ -233,7 +233,7 @@ class TestLastCheckSource:
             sync_engine,
             fresh_account_id,
             snapshot_ts=clean_run_ts,
-            source="flexquery_eod",
+            source="coinbase_eod",
         )
 
         summary = await _fetch(async_session_factory, fresh_account_id)
@@ -252,8 +252,8 @@ class TestLastCheckSource:
         now = datetime.now(tz=UTC)
         older = now - timedelta(days=1)
         newest = now - timedelta(minutes=5)
-        _insert_balance(sync_engine, fresh_account_id, snapshot_ts=older, source="flexquery_eod")
-        _insert_balance(sync_engine, fresh_account_id, snapshot_ts=newest, source="flexquery_eod")
+        _insert_balance(sync_engine, fresh_account_id, snapshot_ts=older, source="coinbase_eod")
+        _insert_balance(sync_engine, fresh_account_id, snapshot_ts=newest, source="coinbase_eod")
 
         summary = await _fetch(async_session_factory, fresh_account_id)
 

@@ -30,8 +30,9 @@ def _looks_like_placeholder(value: Any) -> bool:
     if value is None or value == "":
         return True
     if not isinstance(value, str):
-        # Non-string YAML values (e.g., yaml-int flex_query_id) cannot
-        # be `<TODO_...>` placeholders by construction; treat as real.
+        # Non-string YAML values (e.g., a yaml-int discord.guild_id)
+        # cannot be `<TODO_...>` placeholders by construction; treat as
+        # real.
         return False
     return value.startswith("<TODO") or value == "null"
 
@@ -49,11 +50,12 @@ def _find_float_secret_paths(node: Any, *, path: tuple[str, ...] = ()) -> list[s
 
     Catches the YAML numeric-coercion gotcha documented in
     ``Docs/decisions-log.md`` 2026-05-12 (late) — a long all-digit value
-    (e.g., IBKR's 24-digit FlexQuery token), when stored unquoted in
-    YAML, loads as a float64 approximation ("1.527484903607521e+23");
-    precision loss silently mangles the token. Originally a sops writer
-    round-trip bug; a hand-authored plain-YAML secrets file hits the
-    exact same PyYAML coercion, so the guard stays.
+    (historically IBKR's 24-digit FlexQuery token; any long numeric
+    token/webhook id hits it), when stored unquoted in YAML, loads as a
+    float64 approximation ("1.527484903607521e+23"); precision loss
+    silently mangles the token. Originally a sops writer round-trip
+    bug; a hand-authored plain-YAML secrets file hits the exact same
+    PyYAML coercion, so the guard stays.
 
     Fix: catch floats in secret context at boot, exit with operator-readable
     hint pointing at the quote-the-value fix + the decisions-log entry.
@@ -67,13 +69,13 @@ def _find_float_secret_paths(node: Any, *, path: tuple[str, ...] = ()) -> list[s
     Returns
     -------
     list[str]
-        Dotted paths (e.g., ``["ibkr.flex_query_token"]``). Empty list if
-        no floats found. Sorted for deterministic exit output.
+        Dotted paths (e.g., ``["discord.api_bearer_token"]``). Empty
+        list if no floats found. Sorted for deterministic exit output.
 
     Edge cases:
-      * Ints are allowed (the secrets file legitimately carries int
-        values like ``ibkr.flex_query_id: 1505530`` — confirmed via the
-        ``_looks_like_placeholder`` carve-out for non-string values).
+      * Ints are allowed (the secrets file may legitimately carry int
+        values, e.g. an unquoted ``discord.guild_id`` — confirmed via
+        the ``_looks_like_placeholder`` carve-out for non-string values).
       * Bools are allowed (yaml-loaded as bool, not float).
       * NoneType is allowed (covered by ``_looks_like_placeholder``).
       * Lists are walked recursively (a yaml list-of-numbers would expose
@@ -123,9 +125,9 @@ def main(argv: list[str] | None = None) -> int:
             f"secrets file at {secrets_path} contains float-typed value(s) at: "
             f"{path_list}. "
             "This usually means YAML numeric coercion ate a long-digit "
-            "string secret (e.g., IBKR FlexQuery token). Edit the host "
+            "string secret (a numeric token or webhook id). Edit the host "
             "secrets file and wrap the value in double quotes (e.g., "
-            '`flex_query_token: "152748490360752094531342"`), '
+            '`api_bearer_token: "152748490360752094531342"`), '
             "then re-deploy. See Docs/decisions-log.md 2026-05-12 (late) "
             "'FlexQuery debug journey' for the full root cause + fix.",
         )
@@ -188,14 +190,16 @@ def main(argv: list[str] | None = None) -> int:
 
     # Crypto-pivot C0-B2b (delta spec §3.1): CDP API credentials for the
     # authenticated Coinbase Advanced Trade surface (orders/fills/
-    # positions/balance) consumed by SdkCoinbaseBrokerClient. Sourced
+    # positions/balance) consumed by SdkCoinbaseBrokerClient — including
+    # the §3.5 EOD reconciliation fetcher (the api-resident
+    # ReconciliationScheduler does not start without them). Sourced
     # from secrets ``coinbase.api_key_name`` + ``coinbase.api_private_key``.
     # When unset / placeholder, nothing that trades can start (the §3.3
     # strategy worker fails closed at construction); the public-endpoint
     # market-data worker is unaffected. The IBKR TWS account mapping
-    # (``API_IBKR_ACCOUNT``) that lived here died with the IBKR
-    # execution layer; ``ibkr.flex_query_*`` below survives until the
-    # §3.5 Coinbase recon fetcher lands.
+    # (``API_IBKR_ACCOUNT``) and the ``ibkr.flex_query_*`` pair that
+    # lived here died with the IBKR execution layer + FlexQuery recon
+    # path (crypto-pivot C0-B2b + C0 §3.5).
     coinbase = secrets.get("coinbase") or {}
     if "API_COINBASE_API_KEY_NAME" not in os.environ:
         key_name: Any = coinbase.get("api_key_name")
@@ -205,30 +209,6 @@ def main(argv: list[str] | None = None) -> int:
         private_key: Any = coinbase.get("api_private_key")
         if private_key and not _looks_like_placeholder(private_key):
             os.environ["API_COINBASE_API_PRIVATE_KEY"] = str(private_key)
-
-    # Worker-PR-3b follow-up (post-pivot 2026-05-12): IBKR FlexQuery
-    # credentials for the api-resident ReconciliationScheduler. Sourced
-    # from secrets `ibkr.flex_query_id` + `ibkr.flex_query_token`. When
-    # unset / placeholder, the scheduler does NOT start at api boot —
-    # the api still serves requests + the warning is visible in api
-    # logs at startup. Operator populates the secrets fields once the
-    # IBKR-portal FlexQuery template is created.
-    if "API_FLEX_QUERY_ID" not in os.environ or "API_FLEX_QUERY_TOKEN" not in os.environ:
-        ibkr = secrets.get("ibkr") or {}
-        flex_id: Any = ibkr.get("flex_query_id")
-        flex_token: Any = ibkr.get("flex_query_token")
-        if (
-            "API_FLEX_QUERY_ID" not in os.environ
-            and flex_id
-            and not _looks_like_placeholder(flex_id)
-        ):
-            os.environ["API_FLEX_QUERY_ID"] = str(flex_id)
-        if (
-            "API_FLEX_QUERY_TOKEN" not in os.environ
-            and flex_token
-            and not _looks_like_placeholder(flex_token)
-        ):
-            os.environ["API_FLEX_QUERY_TOKEN"] = str(flex_token)
 
     # Reconciliation alert_dispatch_hook (PR for follow-up #2; closes the
     # operator-visibility seam from PR #135). Sources Discord webhook URLs

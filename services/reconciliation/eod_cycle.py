@@ -1,22 +1,29 @@
-"""services/reconciliation/eod_cycle.py — wire FlexQuery → planner → apply.
+"""services/reconciliation/eod_cycle.py — wire Coinbase fetch → planner → apply.
 
-Worker-PR-3b follow-up (post-pivot 2026-05-12). The pure-policy planner
+Worker-PR-3b follow-up (post-pivot 2026-05-12); fetch path swapped to
+Coinbase in crypto-pivot C0 §3.5 (2026-07-09). The pure-policy planner
 in :mod:`services.reconciliation.recon` consumes a ``BackendView`` and
 a ``BrokerView``; the apply orchestrator in
 :mod:`services.reconciliation.apply` flushes the plan to the database;
 the EOD scheduler in :mod:`services.reconciliation.scheduler` fires a
-``CycleCallback`` at the 18:30 ET cutover. This module is the glue
-that builds the views + ties the three pieces together into a single
-callable ``run_eod_cycle`` callback the scheduler can consume.
+``CycleCallback`` at the 00:15 UTC cutover (after the 00:05 UTC daily
+decision). This module is the glue that builds the views + ties the
+three pieces together into a single callable ``run_eod_cycle`` callback
+the scheduler can consume. The diff/apply engine itself (``recon.py``,
+``apply.py``) is deliberately UNCHANGED by the §3.5 fetcher swap.
 
 **Pipeline at fire time:**
 
-  1. Fetch IBKR FlexQuery snapshot via :class:`IbkrFlexQueryClient`.
+  1. Fetch the venue snapshot via the injected
+     :class:`~services.reconciliation.coinbase_fetcher.ReconSnapshotFetcher`
+     (production: :class:`~services.reconciliation.coinbase_fetcher.CoinbaseEodFetcher`
+     over the ``CoinbaseBrokerClient`` transport — ``list_positions`` +
+     ``get_futures_balance_summary`` + best-effort ``list_fills``).
   2. Build :class:`BackendView` by reading ``positions_current`` +
      latest ``balances`` row for the account.
-  3. Build :class:`BrokerView` by aggregating FlexQuery positions by
-     market + summing USD cash balances. Market symbols are prefixed
-     with ``/`` for futures (FUT) per backend-spec §2.6.
+  3. Build :class:`BrokerView` from the snapshot's venue-neutral
+     :class:`ReconPosition` rows (``market`` = venue ``product_id``
+     verbatim) + the balance summary's aggregate USD cash.
   4. Call :func:`services.reconciliation.recon.plan_reconciliation_check`
      to produce a :class:`ReconciliationPlan`.
   5. Flush via :func:`services.reconciliation.apply.apply_reconciliation_plan`
@@ -59,9 +66,9 @@ operator has manually closed a break.
 whitelist; `risk-review-approved` required.
 **A01 enforced** — audit writes flow through the apply orchestrator
 which uses ``append_audit_event``.
-**A05 enforced** — Decimals throughout; FlexQuery's XML parser already
-returns Decimals.
-**A06 enforced** — every datetime tz-aware UTC; FlexQuery's
+**A05 enforced** — Decimals throughout; the Coinbase transport already
+coerces at the venue boundary.
+**A06 enforced** — every datetime tz-aware UTC; the fetcher's
 ``pulled_at_utc`` is the recon ``detected_at_utc``.
 """
 
@@ -87,10 +94,11 @@ from services.reconciliation.apply import (
     StateTransitionHook,
     apply_reconciliation_plan,
 )
-from services.reconciliation.flex_query_fetcher import (
-    FlexQueryFetchError,
-    IbkrFlexQueryClient,
-    ReconciliationSnapshot,
+from services.reconciliation.coinbase_fetcher import (
+    CoinbaseReconFetchError,
+    CoinbaseReconSnapshot,
+    ReconPosition,
+    ReconSnapshotFetcher,
 )
 from services.reconciliation.recon import (
     BackendView,
@@ -104,35 +112,25 @@ from services.reconciliation.recon import (
 log = structlog.get_logger()
 
 
-#: Map FlexQuery's ``assetCategory`` enum onto the canonical market-symbol
-#: convention used by ``positions_current.market``: futures get a leading
-#: slash (``MES`` → ``/MES``), everything else (STK / FUND / CASH) stays
-#: as-is. Matches the convention enforced in
-#: ``strategies.v1_trend_following.parameters.V1_CANDIDATE_UNIVERSE``.
-_FUTURES_ASSET_CATEGORIES: Final[frozenset[str]] = frozenset({"FUT"})
-
-
 #: Default lookback window for prior-break classification. T+1 (24h) +
 #: a half-day buffer (12h) = 36h. Covers the operationally common case:
-#: an EOD recon at 18:30 ET on day N detects a break; tomorrow's EOD at
-#: 18:30 ET on day N+1 (~24h later) classifies the same break as a
+#: an EOD recon at 00:15 UTC on day N detects a break; tomorrow's EOD at
+#: 00:15 UTC on day N+1 (~24h later) classifies the same break as a
 #: grace-period continuation, not a fresh break worth re-alerting on.
-#:
-#: Friday-detected breaks need weekend coverage through Monday's recon
-#: (~72h elapsed). The 36h window does NOT cover that case — Monday's
-#: cycle would treat Friday's break as fresh. Documented as a known
-#: limitation; operators monitor weekend breaks via the system page +
-#: re-classify manually if needed. Phase 2 follow-up could switch the
-#: window to business-days math (skip weekends) or extend to 72h
-#: unconditionally if operator demand emerges.
+#: Crypto trades 24/7 so there is no weekend gap to bridge (the CME-era
+#: Friday→Monday limitation no longer applies — the cycle fires every
+#: UTC calendar day).
 DEFAULT_PRIOR_BREAKS_WINDOW_HOURS: Final[int] = 36
 
 
 #: Source string for the per-recon ``balances`` row INSERTed by
 #: :func:`refresh_backend_from_broker_snapshot`. Constrained by the
-#: table CHECK constraint in alembic 0002. ``flexquery_eod`` is the
-#: canonical post-pivot source for the daily snapshot.
-BALANCE_SOURCE_FROM_FLEX: Final[str] = "flexquery_eod"
+#: table CHECK constraint in alembic 0002 (extended by the 2026-07-09
+#: ``coinbase_recon_src`` migration). ``coinbase_eod`` is the canonical
+#: crypto-pivot source for the daily snapshot; the api's reconciliation
+#: summary (``services/api/repos/phase1.py::_RECON_BALANCE_SOURCE``)
+#: filters on the same string — keep them in sync.
+BALANCE_SOURCE_FROM_COINBASE: Final[str] = "coinbase_eod"
 
 
 #: Quantization for the ``positions_current.unrealized_pnl`` UPDATE.
@@ -166,23 +164,28 @@ CycleCallback = Callable[[date], Awaitable[None]]
 """Re-export of the scheduler's callback shape for convenience."""
 
 
-@dataclass(frozen=True, slots=True)
-class ReconPosition:
-    """Minimal position shape the reconciliation planner ingests.
+def _dec_str_or_none(value: Decimal | None) -> str | None:
+    """Decimal-as-string for audit payloads ([A05]); None passes through."""
+    return str(value) if value is not None else None
 
-    Venue-neutral (moved in-module from the deleted IBKR intraday
-    fetcher, crypto-pivot C0-B2b): just the two fields the
-    position-quantity check needs. The §3.5 Coinbase recon fetcher
-    supplies these through :func:`build_broker_view`'s
-    ``positions_override`` seam.
 
-    * ``market`` — canonical symbol matching
-      ``positions_current.market``.
-    * ``quantity`` — signed (positive = long, negative = short).
+#: Quantization for the ``balances.used_margin_pct`` column — NUMERIC(10, 8).
+_MARGIN_PCT_QUANTIZER: Final[Decimal] = Decimal("0.00000001")
+
+
+def _used_margin_pct(*, initial_margin: Decimal | None, net_liquidation: Decimal) -> Decimal:
+    """``initial_margin / NLV`` as a fraction; 0 when un-derivable.
+
+    Pure policy. Returns ``Decimal(0)`` when the venue omitted
+    ``initial_margin`` or NLV is non-positive (dividing by <= 0 would
+    produce nonsense; the raw fields are in the audit payload either
+    way). Quantized half-even to the column's NUMERIC(10, 8) scale.
     """
-
-    market: str
-    quantity: Decimal
+    if initial_margin is None or net_liquidation <= 0:
+        return Decimal(0)
+    return (initial_margin / net_liquidation).quantize(
+        _MARGIN_PCT_QUANTIZER, rounding=ROUND_HALF_EVEN
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,22 +199,15 @@ class EodCycleConfig:
       :class:`services.api.repos.phase1.PostgresPhase1QueryRepo.fetch_active_account_id`.
     * ``env`` — audit ``env`` enum (``paper`` / ``live-small`` /
       ``live-scale``). Mirrors the api's environment setting.
-    * ``flex_query_id`` / ``flex_query_token`` — IBKR-portal template
-      credentials (operator pre-creates the template + records both into
-      sops as ``ibkr.flex_query_id`` + ``ibkr.flex_query_token``).
 
-    Crypto-pivot C0-B2b note: the Option-C ``position_source`` flag and
-    its ``reqpositions`` (direct TWS API, clientId=4) branch were
-    RETIRED with the IBKR execution layer — the position-quantity check
-    reads the FlexQuery snapshot until the §3.5 Coinbase recon fetcher
-    replaces this whole fetch path (delta spec §3.5; EOD moves to
-    00:15 UTC there).
+    Crypto-pivot C0 §3.5 note: the FlexQuery template credentials that
+    lived here died with the FlexQuery fetch path. Venue credentials
+    (the CDP key pair) belong to the injected fetcher's transport, not
+    to this config — the cycle itself is venue-credential-free.
     """
 
     account_id: UUID
     env: Environment
-    flex_query_id: int
-    flex_query_token: str
     phase_at_emit: PhaseAtEmit = 1
 
 
@@ -282,136 +278,47 @@ async def build_backend_view(
 
 
 def build_broker_view(
-    snapshot: ReconciliationSnapshot,
+    snapshot: CoinbaseReconSnapshot,
     *,
     positions_override: tuple[ReconPosition, ...] | None = None,
-    source: BrokerSource = BrokerSource.FLEXQUERY_EOD,
+    source: BrokerSource = BrokerSource.COINBASE_EOD,
 ) -> BrokerView:
-    """Map a :class:`ReconciliationSnapshot` to a :class:`BrokerView`.
+    """Map a :class:`CoinbaseReconSnapshot` to a :class:`BrokerView`.
 
-    Pure policy — no I/O. The FlexQuery snapshot carries per-currency
-    cash balances; we sum the USD balance (Phase 1 universe is USD-
-    denominated, so non-USD balances would be a data-quality concern
-    surfaced separately). Positions are SUM-aggregated by market with
-    the futures ``/`` prefix applied to the FlexQuery root ticker so the
-    backend's ``/M2K`` matches the broker's ``M2K`` ``assetCategory=FUT``.
+    Pure policy — no I/O. Positions are SUM-aggregated by market from
+    the snapshot's venue-neutral :class:`ReconPosition` rows (``market``
+    is the venue ``product_id`` verbatim — the fetcher already applied
+    the canonical convention, so no symbol normalization runs here; the
+    FlexQuery-era ``/`` root-ticker prefixing died with the CME
+    universe). Zero-quantity rows are re-guarded for symmetry with
+    ``build_backend_view`` even though the fetcher already drops them.
 
     **Position override seam.** When ``positions_override`` is ``None``
-    (the default), the position dict is built from the FlexQuery
-    snapshot's ``OpenPositions`` rows as described above. When a tuple
-    of :class:`ReconPosition` is supplied, THOSE positions populate the
-    dict instead (their ``market`` must already be canonical; no
-    FlexQuery symbol normalization runs) and ``source`` should stamp
-    the real origin onto :class:`BrokerView.source`. The IBKR-era
-    ``reqpositions`` caller of this seam was retired in crypto-pivot
-    C0-B2b; the §3.5 Coinbase recon fetcher is its replacement
-    consumer. Cash is ALWAYS sourced from the FlexQuery snapshot until
-    §3.5 lands.
+    (the default), ``snapshot.positions`` populates the dict. When a
+    tuple of :class:`ReconPosition` is supplied, THOSE positions
+    populate it instead (their ``market`` must already be canonical)
+    and ``source`` should stamp the real origin onto
+    :class:`BrokerView.source`. The seam was deliberately preserved
+    through crypto-pivot C0-B2b for the §3.5 Coinbase fetcher and stays
+    for the Phase C1 intraday probe (delta spec §3.5: "intraday probe
+    reuses the REST position endpoint").
 
-    **Futures symbol normalization (post-2026-05-27 fix):** the FlexQuery
-    XML reports two attributes that can identify a FUT position:
-
-    * ``symbol`` — what the template is configured to print; can be
-      EITHER the root (``"M2K"``) or the contract-month form
-      (``"M2KM6"``, where ``M6`` = June 2026 expiry).
-    * ``underlyingSymbol`` — IBKR's root ticker, populated unconditionally
-      on derivative rows in standard templates. Parsed into
-      :attr:`FlexPosition.underlying_symbol`.
-
-    The backend's ``positions_current.market`` convention is root-only
-    with a leading slash (``"/M2K"``). When the FlexQuery template uses
-    contract-month symbols (the common configuration), comparing
-    ``f"/{symbol}"`` (= ``"/M2KM6"``) against backend's ``"/M2K"`` produces
-    a false-positive break every cycle (the EOD recon at 2026-05-27 22:30
-    UTC fired this exact failure mode: broker view showed market
-    ``"/M2K"`` qty 0, backend showed qty 1, a routine break landed).
-
-    Fix: for FUT (and OPT) positions, prefer ``pos.underlying_symbol``
-    when populated; fall back to ``pos.symbol`` when it's None. For
-    non-derivative rows (STK / CASH / FUND) the ``symbol`` is already
-    the canonical identifier so the underlying_symbol field is ignored.
-
-    Zero-quantity positions are dropped (matches ``build_backend_view``)
-    so the recon's symmetric-difference comparison doesn't generate
-    false-positive breaks for closed positions FlexQuery still includes
-    in the snapshot.
-
-    **Cash source selection (post-2026-05-16 fix):** the FlexQuery XML
-    response carries cash in TWO independent sections:
-
-    * ``EquitySummaryByReportDateInBase.cash`` → parsed into
-      ``snapshot.account_summary.cash_usd``. Populated unconditionally
-      by any FlexQuery template with the AccountInformation section
-      enabled (the default).
-    * ``CashReportCurrency.endingCash`` per-currency rows → parsed into
-      ``snapshot.cash_balances``. Populated ONLY when the template has
-      the "Cash Report" section explicitly enabled.
-
-    ``refresh_backend_from_broker_snapshot`` (PR-I) writes to the
-    backend ``balances`` table from ``account_summary.cash_usd``; this
-    function was reading ``cash_balances``. When the operator's template
-    is missing the Cash Report section, the two sources disagree —
-    backend gets the correct cash, but the recon planner sees broker
-    cash = 0 and flags a false-positive break every cycle.
-
-    Fix: ``cash_balances`` remains the primary source (more granular,
-    per-currency, preferred when available). When ``cash_balances`` is
-    empty AND ``account_summary.cash_usd`` is non-zero, fall back to
-    the account-summary value with a structured log line so the
-    operator knows the template is producing partial data + can update
-    the template if desired. The fallback ensures recon converges
-    even with a partially-configured FlexQuery template.
+    Cash is the snapshot's ``cash_usd`` — the venue balance summary's
+    ``total_usd_balance`` (aggregate USD across CFM + CBI; see the
+    fetcher module docstring for the field-semantics rationale).
     """
     positions: dict[str, Decimal] = {}
-    if positions_override is None:
-        for pos in snapshot.positions:
-            if pos.quantity == 0:
-                continue
-            market = _market_from_flex_symbol(
-                pos.symbol, pos.sec_type, underlying_symbol=pos.underlying_symbol
-            )
-            positions[market] = positions.get(market, Decimal(0)) + pos.quantity
-    else:
-        # reqPositions path: markets are already canonical (the adapter
-        # prefixed FUT roots with "/"); zero-qty rows are already dropped
-        # by fetch_recon_positions but we re-guard for symmetry with the
-        # FlexQuery branch + build_backend_view.
-        for recon_pos in positions_override:
-            if recon_pos.quantity == 0:
-                continue
-            positions[recon_pos.market] = (
-                positions.get(recon_pos.market, Decimal(0)) + recon_pos.quantity
-            )
-
-    cash_usd = Decimal(0)
-    cash_balances_had_usd_row = False
-    for bal in snapshot.cash_balances:
-        if bal.currency == "USD":
-            cash_usd += bal.balance
-            cash_balances_had_usd_row = True
-
-    if not cash_balances_had_usd_row:
-        # FlexQuery template is missing the Cash Report section (or it
-        # returned no USD row). Fall back to the account summary's cash
-        # value, which is populated by AccountInformation in every
-        # template. Log so the operator can see why we fell back.
-        fallback_cash = snapshot.account_summary.cash_usd
-        log.info(
-            "recon_broker_view_cash_fallback_to_account_summary",
-            cash_balances_count=len(snapshot.cash_balances),
-            account_summary_cash_usd=str(fallback_cash),
-            hint=(
-                "FlexQuery template appears to be missing the 'Cash Report' "
-                "section. Backend will use account_summary.cash_usd; consider "
-                "updating the template to include Cash Report for granular "
-                "per-currency reconciliation."
-            ),
+    rows = snapshot.positions if positions_override is None else positions_override
+    for recon_pos in rows:
+        if recon_pos.quantity == 0:
+            continue
+        positions[recon_pos.market] = (
+            positions.get(recon_pos.market, Decimal(0)) + recon_pos.quantity
         )
-        cash_usd = fallback_cash
 
     return BrokerView(
         positions=positions,
-        cash_usd=cash_usd,
+        cash_usd=snapshot.cash_usd,
         source=source,
     )
 
@@ -514,35 +421,8 @@ class BackendRefreshResult:
     [BALANCE_SNAPSHOT_RECORDED, POSITION_MARK_TO_MARKET x N]."""
 
 
-def _market_from_flex_symbol(
-    symbol: str, sec_type: str, *, underlying_symbol: str | None = None
-) -> str:
-    """Map a FlexQuery ``symbol`` + ``sec_type`` (+ optional
-    ``underlying_symbol``) to the backend's ``positions_current.market``
-    convention.
-
-    For FUT (and OPT-like derivative categories in ``_FUTURES_ASSET_CATEGORIES``),
-    prefer ``underlying_symbol`` when populated — IBKR's FlexQuery reports
-    the contract-month form (``"M2KM6"``) in ``symbol`` when the template
-    is configured that way, while ``underlyingSymbol`` carries the root
-    ticker (``"M2K"``). Falls back to ``symbol`` when ``underlying_symbol``
-    is None (older templates / parser samples that pre-date the
-    underlyingSymbol field).
-
-    Futures get a leading ``/`` (matches the backend's
-    ``positions_current.market`` convention + the
-    ``V1_CANDIDATE_UNIVERSE`` strings). Everything else (STK / FUND /
-    CASH) passes through as-is. Mirrors the convention used by
-    :func:`build_broker_view`.
-    """
-    if sec_type in _FUTURES_ASSET_CATEGORIES:
-        root = underlying_symbol if underlying_symbol else symbol
-        return f"/{root}"
-    return symbol
-
-
 async def refresh_backend_from_broker_snapshot(
-    snapshot: ReconciliationSnapshot,
+    snapshot: CoinbaseReconSnapshot,
     *,
     session_factory: async_sessionmaker[Any],
     account_id: UUID,
@@ -557,8 +437,8 @@ async def refresh_backend_from_broker_snapshot(
       1. Append BALANCE_SNAPSHOT_RECORDED audit row (own SERIALIZABLE
          transaction via append_audit_event). Capture event_uuid.
       2. INSERT new ``balances`` row carrying the audit_event_uuid + the
-         snapshot's NLV + cash. Source = ``flexquery_eod``.
-      3. For each FlexQuery position with non-zero quantity:
+         snapshot's NLV + cash. Source = ``coinbase_eod``.
+      3. For each venue position with non-zero contracts:
          a. If a matching ``positions_current`` row exists for
             ``(account_id, market, contract_id=NULL)`` — append a
             POSITION_MARK_TO_MARKET audit row + UPDATE the row's
@@ -579,9 +459,18 @@ async def refresh_backend_from_broker_snapshot(
     :func:`apply_reconciliation_plan` after the planner runs against
     the refreshed backend view. PR-J wires the state hook there.
 
+    Mark source: only the venue-supplied ``unrealized_pnl_usd`` is
+    written. The FlexQuery-era fallback that computed uPnL as
+    ``(market_price - avg_cost) * qty`` is deliberately NOT ported —
+    for futures that formula omits the contract multiplier
+    (``contract_size``), which this module does not have; a wrong mark
+    is worse than a skipped mark. When the venue omits uPnL the row is
+    skipped with a WARNING (product-metadata-based computation is a
+    Phase C1 follow-up once the §3.7 ``product_metadata`` snapshot is
+    wired into the cycle).
+
     A05 enforced: Decimals throughout. A06 enforced:
-    ``snapshot.pulled_at_utc`` is tz-aware (asserted at module load
-    of the flex_query_fetcher).
+    ``snapshot.pulled_at_utc`` tz-awareness re-asserted here.
     """
     if snapshot.pulled_at_utc.tzinfo is None:
         raise ValueError("snapshot.pulled_at_utc must be tz-aware UTC per [A06]")
@@ -589,17 +478,27 @@ async def refresh_backend_from_broker_snapshot(
     audit_uuids: list[UUID] = []
 
     # Step 1+2: balance snapshot audit + INSERT.
-    summary = snapshot.account_summary
+    summary = snapshot.balance_summary
     balance_audit_payload: dict[str, Any] = {
         "account_id": str(account_id),
         "snapshot_ts": snapshot.pulled_at_utc.isoformat(),
         "trigger": "eod_recon_refresh",
-        "source": BALANCE_SOURCE_FROM_FLEX,
-        "broker_cash_usd": str(summary.cash_usd),
-        "broker_net_liquidation_usd": str(summary.net_liquidation_usd),
-        "broker_stock_market_value_usd": str(summary.stock_market_value_usd),
-        "broker_bond_market_value_usd": str(summary.bond_market_value_usd),
-        "broker_futures_pnl_usd": str(summary.futures_pnl_usd),
+        "source": BALANCE_SOURCE_FROM_COINBASE,
+        "broker_cash_usd": str(snapshot.cash_usd),
+        "broker_net_liquidation_usd": str(snapshot.net_liquidation_usd),
+        # Raw venue fields (Decimal-as-string or None) so any venue-side
+        # semantics surprise in total/CBI/CFM/uPnL is forensically
+        # visible from the audit chain alone.
+        "broker_total_usd_balance": _dec_str_or_none(summary.total_usd_balance),
+        "broker_cbi_usd_balance": _dec_str_or_none(summary.cbi_usd_balance),
+        "broker_cfm_usd_balance": _dec_str_or_none(summary.cfm_usd_balance),
+        "broker_unrealized_pnl": _dec_str_or_none(summary.unrealized_pnl),
+        "broker_available_margin": _dec_str_or_none(summary.available_margin),
+        "broker_initial_margin": _dec_str_or_none(summary.initial_margin),
+        "broker_liquidation_buffer_percentage": _dec_str_or_none(
+            summary.liquidation_buffer_percentage
+        ),
+        "fill_count_in_snapshot": len(snapshot.fills),
     }
     async with session_factory() as audit_session:
         bal_record = await append_audit_event(
@@ -629,13 +528,20 @@ async def refresh_backend_from_broker_snapshot(
                     {
                         "acct": account_id,
                         "ts": snapshot.pulled_at_utc,
-                        "nlv": summary.net_liquidation_usd,
-                        "cash": summary.cash_usd,
-                        # Phase 1 placeholder: equals cash until broker-side
-                        # excess_liquidity calc is wired (Phase 2+).
-                        "excess": summary.cash_usd,
-                        "margin": Decimal("0"),
-                        "source": BALANCE_SOURCE_FROM_FLEX,
+                        "nlv": snapshot.net_liquidation_usd,
+                        "cash": snapshot.cash_usd,
+                        # Venue-native excess-liquidity analogue; falls
+                        # back to cash when the venue omits it.
+                        "excess": (
+                            summary.available_margin
+                            if summary.available_margin is not None
+                            else snapshot.cash_usd
+                        ),
+                        "margin": _used_margin_pct(
+                            initial_margin=summary.initial_margin,
+                            net_liquidation=snapshot.net_liquidation_usd,
+                        ),
+                        "source": BALANCE_SOURCE_FROM_COINBASE,
                     },
                 )
             ).fetchone()
@@ -644,13 +550,13 @@ async def refresh_backend_from_broker_snapshot(
 
     # Step 3: per-position mark-to-market.
     positions_marked = 0
-    for pos in snapshot.positions:
-        if pos.quantity == 0:
+    for pos in snapshot.position_details:
+        if pos.contracts == 0:
             continue  # closed; recon ignores zero-qty rows anyway
+        if not pos.product_id:
+            continue  # already warned by the fetcher's mapping pass
 
-        market = _market_from_flex_symbol(
-            pos.symbol, pos.sec_type, underlying_symbol=pos.underlying_symbol
-        )
+        market = pos.product_id
 
         # Phase 1 contract_id=NULL match. If/when contract resolution
         # lands (Phase 2+), this query expands to take a contract_id.
@@ -671,28 +577,29 @@ async def refresh_backend_from_broker_snapshot(
                 account_id=str(account_id),
                 env=env,
                 market=market,
-                broker_quantity=str(pos.quantity),
+                broker_quantity=str(pos.contracts),
             )
             continue
 
         prior_qty = int(row.quantity)
         prior_avg = Decimal(str(row.avg_cost))
 
-        # Prefer broker-supplied unrealized_pnl; fall back to compute
-        # from (market_price - avg_cost) * qty when missing.
-        if pos.unrealized_pnl_usd is not None:
-            new_upnl = pos.unrealized_pnl_usd
-        elif pos.market_price_usd is not None:
-            new_upnl = (pos.market_price_usd - prior_avg) * Decimal(prior_qty)
-        else:
+        # Venue-supplied unrealized_pnl only — no local recomputation
+        # (see docstring: the price-minus-cost formula is wrong for
+        # futures without the contract multiplier).
+        if pos.unrealized_pnl_usd is None:
             log.warning(
-                "reconciliation_refresh_no_mark_price",
+                "reconciliation_refresh_no_broker_upnl",
                 account_id=str(account_id),
                 env=env,
                 market=market,
-                note="broker snapshot has neither market_price_usd nor unrealized_pnl_usd",
+                note=(
+                    "venue position row omitted unrealized_pnl; mark skipped "
+                    "(no contract-multiplier-safe local fallback in Phase C0)"
+                ),
             )
             continue
+        new_upnl = pos.unrealized_pnl_usd
 
         new_upnl_q = new_upnl.quantize(PNL_QUANTIZER, rounding=ROUND_HALF_EVEN)
 
@@ -701,15 +608,13 @@ async def refresh_backend_from_broker_snapshot(
             "position_id": str(row.id),
             "market": market,
             "trigger": "eod_recon_refresh",
-            "source": BALANCE_SOURCE_FROM_FLEX,
+            "source": BALANCE_SOURCE_FROM_COINBASE,
             "quantity": prior_qty,
             "avg_cost": str(prior_avg),
-            "broker_market_price_usd": (
-                str(pos.market_price_usd) if pos.market_price_usd is not None else None
-            ),
-            "broker_unrealized_pnl_usd": (
-                str(pos.unrealized_pnl_usd) if pos.unrealized_pnl_usd is not None else None
-            ),
+            "broker_contracts": str(pos.contracts),
+            "broker_entry_vwap": _dec_str_or_none(pos.entry_vwap),
+            "broker_mark_price_usd": _dec_str_or_none(pos.mark_price),
+            "broker_unrealized_pnl_usd": str(pos.unrealized_pnl_usd),
             "computed_unrealized_pnl_usd": str(new_upnl_q),
             "last_mark_ts": snapshot.pulled_at_utc.isoformat(),
         }
@@ -761,50 +666,41 @@ async def run_eod_cycle(
     *,
     config: EodCycleConfig,
     session_factory: async_sessionmaker[Any],
-    flex_client_factory: Callable[[], IbkrFlexQueryClient] | None = None,
+    fetcher: ReconSnapshotFetcher,
     alert_dispatch_hook: AlertDispatchHook | None = None,
     state_transition_hook: StateTransitionHook | None = None,
 ) -> ReconciliationApplyResult | None:
     """Execute one EOD reconciliation cycle end-to-end.
 
     Returns the :class:`ReconciliationApplyResult` on success. Returns
-    ``None`` when the FlexQuery fetch failed (logged at WARNING; the
-    scheduler keeps running so tomorrow's cycle still fires). Other
+    ``None`` when the venue snapshot fetch failed (logged at WARNING;
+    the scheduler keeps running so tomorrow's cycle still fires). Other
     errors propagate — the scheduler's surrounding try/except logs +
     swallows so the loop doesn't die.
 
-    ``flex_client_factory`` is injectable for tests; production passes
-    ``None`` and we construct the default :class:`IbkrFlexQueryClient`
-    from config.
+    ``fetcher`` is the injected snapshot source (production: a
+    :class:`~services.reconciliation.coinbase_fetcher.CoinbaseEodFetcher`
+    constructed by the api lifespan over the ``SdkCoinbaseBrokerClient``
+    transport; tests inject fakes at the
+    :class:`~services.reconciliation.coinbase_fetcher.ReconSnapshotFetcher`
+    Protocol seam).
     """
     started_at = datetime.now(tz=UTC)
     log.info(
         "reconciliation_eod_cycle_starting",
         account_id=str(config.account_id),
         env=config.env,
-        flex_query_id=config.flex_query_id,
     )
 
-    if flex_client_factory is None:
-
-        def _default_factory() -> IbkrFlexQueryClient:
-            return IbkrFlexQueryClient(
-                flex_query_id=config.flex_query_id,
-                token=config.flex_query_token,
-            )
-
-        flex_client_factory = _default_factory
-
     try:
-        flex_client = flex_client_factory()
-        snapshot = await flex_client.fetch_snapshot()
-    except FlexQueryFetchError as exc:
+        snapshot = await fetcher.fetch_snapshot()
+    except CoinbaseReconFetchError as exc:
         log.warning(
-            "reconciliation_eod_cycle_flex_fetch_failed",
+            "reconciliation_eod_cycle_coinbase_fetch_failed",
             account_id=str(config.account_id),
             env=config.env,
-            error_code=exc.error_code,
-            message=exc.message,
+            operation=exc.operation,
+            detail=exc.detail,
         )
         return None
 
@@ -835,37 +731,30 @@ async def run_eod_cycle(
     )
 
     backend_view = await build_backend_view(session_factory, account_id=config.account_id)
-    # Crypto-pivot C0-B2b: the Option-C reqpositions branch (direct TWS
-    # API position source, 2026-05-28/29) was retired with the IBKR
-    # execution layer. The FlexQuery snapshot is the sole broker view
-    # until the §3.5 Coinbase recon fetcher replaces this path.
     broker_view = build_broker_view(snapshot)
 
-    # Resilience signal: backend has futures positions but the broker view
-    # returned ZERO futures positions. Non-blocking: the planner still runs +
-    # the breaks still land in audit + reconciliation_breaks; the log line
-    # just names the suspected root cause so triage is faster.
-    backend_fut_markets = {m for m in backend_view.positions if m.startswith("/")}
-    broker_fut_markets = {m for m in broker_view.positions if m.startswith("/")}
-    if backend_fut_markets and not broker_fut_markets:
-        missing_futures_hint = (
-            "Backend has open FUT positions but the broker view returned "
-            "zero FUT rows. Likely root cause: the FlexQuery template is "
-            "missing the OpenPositions section for futures, or the "
-            "section is configured to filter out FUT rows. Update the "
-            "template in IBKR portal (Reports → Flex Queries) to include "
-            "OpenPositions for Futures. Recon will continue to flag a "
-            "position_qty break per backend FUT market until fixed."
+    # Resilience signal: backend has open positions but the broker view
+    # returned ZERO positions. Non-blocking: the planner still runs +
+    # the breaks still land in audit + reconciliation_breaks; the log
+    # line just names the suspected root cause so triage is faster.
+    if backend_view.positions and not broker_view.positions:
+        missing_positions_hint = (
+            "Backend has open positions but the venue returned zero "
+            "position rows. Likely root causes: the CDP key lacks the "
+            "View permission for CFM futures, the venue liquidated/"
+            "expired the positions, or list_positions is degraded. "
+            "Recon will continue to flag a position_qty break per "
+            "backend market until resolved."
         )
         log.warning(
-            "reconciliation_eod_cycle_broker_view_missing_futures",
+            "reconciliation_eod_cycle_broker_view_missing_positions",
             account_id=str(config.account_id),
             env=config.env,
-            broker_view_source="flexquery",
-            backend_futures_markets=sorted(backend_fut_markets),
-            backend_futures_count=len(backend_fut_markets),
+            broker_view_source=str(broker_view.source),
+            backend_markets=sorted(backend_view.positions),
+            backend_position_count=len(backend_view.positions),
             broker_position_count=len(broker_view.positions),
-            hint=missing_futures_hint,
+            hint=missing_positions_hint,
         )
 
     prior_breaks = await fetch_prior_breaks_within_grace_window(
@@ -958,6 +847,13 @@ async def _emit_daily_attribution_rollup(
     Anchors session_date on America/New_York wall clock per dev-guide
     §3.7 — the recon cycle's snapshot_pulled_at_utc is the natural
     "as-of" timestamp for today's rollup.
+
+    Crypto-pivot §3.5 note: the recon now fires at 00:15 UTC, which is
+    19:15/20:15 ET the *prior* calendar day — so the ET-anchored rollup
+    covers the day that just ended, which is the intent. Re-anchoring
+    attribution itself onto UTC days is a Phase C1 decision (the
+    attribution module's API is ET-dated); today the query returns zero
+    closed trades either way (exit-fill path pending).
     """
     from services.risk.attribution import (
         apply_attribution_plan,
@@ -1102,13 +998,14 @@ def make_cycle_callback(
     *,
     config: EodCycleConfig,
     session_factory: async_sessionmaker[Any],
+    fetcher: ReconSnapshotFetcher,
     alert_dispatch_hook: AlertDispatchHook | None = None,
     state_transition_hook: StateTransitionHook | None = None,
 ) -> CycleCallback:
     """Build the :class:`CycleCallback` the scheduler invokes per session day.
 
     The returned callable closes over ``config`` + ``session_factory`` +
-    (optional) ``alert_dispatch_hook`` + (optional)
+    ``fetcher`` + (optional) ``alert_dispatch_hook`` + (optional)
     ``state_transition_hook`` so the scheduler doesn't need to know
     about any of them. It signals to the scheduler by raising on
     terminal failure (which the scheduler catches + logs) or returning
@@ -1130,6 +1027,7 @@ def make_cycle_callback(
         await run_eod_cycle(
             config=config,
             session_factory=session_factory,
+            fetcher=fetcher,
             alert_dispatch_hook=alert_dispatch_hook,
             state_transition_hook=state_transition_hook,
         )
@@ -1138,12 +1036,13 @@ def make_cycle_callback(
 
 
 __all__ = [
-    "BALANCE_SOURCE_FROM_FLEX",
+    "BALANCE_SOURCE_FROM_COINBASE",
     "DEFAULT_PRIOR_BREAKS_WINDOW_HOURS",
     "PNL_QUANTIZER",
     "BackendRefreshResult",
     "CycleCallback",
     "EodCycleConfig",
+    "ReconPosition",
     "build_backend_view",
     "build_broker_view",
     "fetch_prior_breaks_within_grace_window",

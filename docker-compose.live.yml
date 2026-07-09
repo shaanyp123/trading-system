@@ -3,7 +3,7 @@
 # STANDALONE compose file (NOT an overlay on docker-compose.yml). Runs as a
 # SEPARATE compose project (`trading-live`) on the same VPS, alongside the
 # existing paper project (`trading`). Paper continues uninterrupted; live
-# runs in parallel with isolated networks + volumes + IBKR session.
+# runs in parallel with isolated networks + volumes + broker credentials.
 #
 # Operator command at cutover (per Docs/live-money-cutover-plan.md §10):
 #
@@ -14,7 +14,7 @@
 # `trading-live_`, so:
 #   * `trading-live_postgres_data` — live's Postgres data (isolated from paper)
 #   * `trading-live_internal`      — live private network
-#   * `trading-live_egress`        — live's internet egress (for IBKR FlexQuery)
+#   * `trading-live_egress`        — live's internet egress (Coinbase REST/WS)
 #
 # SCOPE — what this file currently DOES include:
 #   * postgres    — live database (isolated volume)
