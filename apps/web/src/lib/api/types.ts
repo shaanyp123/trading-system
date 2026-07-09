@@ -581,21 +581,6 @@ export interface AuditLogFilters {
 }
 
 // ---------------------------------------------------------------------------
-// Watchdog (services/api/schemas/system.py — Day 27)
-// ---------------------------------------------------------------------------
-
-export interface WatchdogStatus {
-  readonly last_ping_utc: string;
-  readonly has_ever_pinged: boolean;
-  readonly seconds_since_last_ping: number | null;
-  readonly last_check_status_code: number | null;
-  readonly consecutive_failures_observed: number | null;
-  readonly watchdog_id: string | null;
-  readonly region: string | null;
-  readonly server_now: string;
-}
-
-// ---------------------------------------------------------------------------
 // Backup codes regenerate (services/api/schemas/auth.py)
 // ---------------------------------------------------------------------------
 

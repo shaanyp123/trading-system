@@ -138,7 +138,6 @@ services:
     environment:
       DOMAIN: ${DOMAIN:?set DOMAIN in deploy/.env}
       ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in deploy/.env}
-      WATCHDOG_IP: ${WATCHDOG_IP:?set WATCHDOG_IP in deploy/.env}
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

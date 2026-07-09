@@ -90,7 +90,10 @@ const INVALIDATE_KEYS: Readonly<Record<SSEEventType, readonly (readonly string[]
   audit: [['audit-log']],
   agent: [['system-status']],
   vacation: [['system-status'], ['today-digest']],
-  watchdog: [['watchdog']],
+  // 'watchdog' is a LOCKED SSE event type; no emitter exists since the
+  // external watchdog retirement (2026-07-09) and its query surface was
+  // removed, so there is nothing to invalidate.
+  watchdog: [],
   session_evicted: [],
   job: [],
   version: [],

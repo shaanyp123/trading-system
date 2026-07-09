@@ -33,8 +33,11 @@ Day 27 (Week 7 Wed) adds three read-only surfaces consumed by the
   * ``GET /api/system/audit`` — audit explorer with filter + cursor.
     Reads the partition-pruned ``audit_log`` heap and returns canonical
     payload + chain metadata.
-  * ``GET /api/system/watchdog`` — last-ping summary keyed off the
-    ``liveness_probes`` table.
+  * ``GET /api/system/watchdog`` — RETIRED 2026-07-09 (route + schema
+    removed): the external Nuremberg watchdog box was cancelled in favor
+    of a hosted uptime monitor (see Docs/decisions-log.md 2026-07-09).
+    ``SystemStatus.watchdog_last_ping_utc`` is retained as a permanent
+    epoch sentinel for wire-compat.
 
 Conflict handling on the POST endpoints (Day 25):
 
@@ -115,7 +118,6 @@ from services.api.schemas.system import (
     RiskEnvelopeResponse,
     RiskParameterItem,
     SystemStatus,
-    WatchdogStatusResponse,
 )
 from services.api.session import SessionContext, get_session_context
 from services.api.sse import emit_sse
@@ -175,6 +177,10 @@ async def _load_status_components(
     When ``account_id`` is None (Phase 0, no operator yet), every component
     falls back to its empty-data shape: NORMAL state, recon summary with
     epoch sentinel + zero counters, watchdog ping = epoch sentinel.
+
+    External watchdog retired 2026-07-09 (hosted uptime monitor replaced
+    it); with no liveness writer, the watchdog ping component is
+    permanently the epoch sentinel until/unless a future writer exists.
     """
     if account_id is None:
         return (
@@ -951,64 +957,6 @@ async def audit_log_page(
         entries=[_audit_row_to_entry(r) for r in rows],
         next_cursor=str(next_seq) if next_seq is not None else None,
         has_more=has_more,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Day 27 — Watchdog status (read-only)
-# ---------------------------------------------------------------------------
-
-
-@router.get(
-    "/api/system/watchdog",
-    tags=["system"],
-    response_model=WatchdogStatusResponse,
-)
-async def watchdog_status(
-    session: SessionContext = Depends(get_session_context),
-    repo: Phase1QueryRepo = Depends(_get_repo),
-) -> WatchdogStatusResponse:
-    """Watchdog last-ping projection per frontend-spec §2.6.6.
-
-    Phase 0: liveness_probes is empty until the external watchdog VPS
-    starts posting; the response carries ``has_ever_pinged=False`` +
-    ``last_ping_utc=EPOCH_SENTINEL_UTC`` so the frontend renders the
-    "Watchdog not yet wired" state. Once the table populates the
-    response auto-flips to the real ping + the frontend's age formatter
-    renders healthy/stale/unhealthy per the spec thresholds.
-
-    The richer fields (``watchdog_id``, ``consecutive_failures_observed``,
-    ``last_check_status_code``, ``region``) are all null Phase 0 — they
-    plumb through when the ingestion writer adds them to the
-    ``liveness_probes`` schema or the audit-log payload lookup.
-    """
-    now = datetime.now(tz=UTC)
-    account_id = await repo.fetch_active_account_id()
-    last_ping: datetime | None = None
-    if account_id is not None:
-        last_ping = await repo.fetch_watchdog_last_ping_utc(account_id)
-
-    if last_ping is None:
-        return WatchdogStatusResponse(
-            last_ping_utc=EPOCH_SENTINEL_UTC,
-            has_ever_pinged=False,
-            seconds_since_last_ping=None,
-            last_check_status_code=None,
-            consecutive_failures_observed=None,
-            watchdog_id=None,
-            region=None,
-            server_now=now,
-        )
-    age_seconds = max(int((now - last_ping).total_seconds()), 0)
-    return WatchdogStatusResponse(
-        last_ping_utc=last_ping,
-        has_ever_pinged=True,
-        seconds_since_last_ping=age_seconds,
-        last_check_status_code=None,
-        consecutive_failures_observed=None,
-        watchdog_id=None,
-        region=None,
-        server_now=now,
     )
 
 

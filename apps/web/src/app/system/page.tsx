@@ -8,8 +8,11 @@
  *   - Risk envelope tile (read-only Phase 1 view of the parameter set)
  *   - Audit log table (filterable by event_type + env + date window)
  *   - Reconciliation status tile
- *   - Watchdog status tile
  *   - Account section (regenerate backup codes — re-auth gated)
+ *
+ * The watchdog status tile was removed 2026-07-09 with the external
+ * watchdog retirement (hosted uptime monitor replaced it; see
+ * Docs/decisions-log.md 2026-07-09).
  *
  * Phase 2 surfaces from spec §2.6 (NOT in scope today):
  *   - Operating cost dashboard (§2.6.7)
@@ -20,8 +23,8 @@
  *
  * Layout: 2-column grid on lg screens; stacks vertically below `lg:`.
  * Kill switch + risk envelope on the top row (operationally critical
- * pair). Reconciliation + watchdog on row 2. Audit log full-width on
- * row 3. Account section full-width on row 4.
+ * pair). Reconciliation on row 2. Audit log full-width on row 3.
+ * Account section full-width on row 4.
  *
  * Re-auth flow: the Account section's "Regenerate backup codes" button
  * receives an `onRequireReauth` callback that opens the page-level
@@ -39,7 +42,6 @@ import { KillSwitchTile } from '@/components/system/kill-switch-tile';
 import { ReauthModal } from '@/components/system/reauth-modal';
 import { ReconciliationTile } from '@/components/system/reconciliation-tile';
 import { RiskEnvelopeTile } from '@/components/system/risk-envelope-tile';
-import { WatchdogTile } from '@/components/system/watchdog-tile';
 import { useAuthMe } from '@/lib/api/queries';
 
 const UV_FRESHNESS_MS = 4.5 * 60 * 1000;
@@ -78,7 +80,7 @@ export default function SystemPage(): JSX.Element {
         <header>
           <h1 className="text-2xl font-semibold">System</h1>
           <p className="mt-1 text-sm text-text-muted">
-            Kill switch, risk envelope, audit log, reconciliation, watchdog, and
+            Kill switch, risk envelope, audit log, reconciliation, and
             account management.
           </p>
         </header>
@@ -90,7 +92,6 @@ export default function SystemPage(): JSX.Element {
 
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
           <ReconciliationTile />
-          <WatchdogTile />
         </div>
 
         <AuditLogTable />

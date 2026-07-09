@@ -359,6 +359,14 @@ class PostgresPhase1QueryRepo:
     # --- liveness_probes (watchdog last ping) ------------------------------
 
     async def fetch_watchdog_last_ping_utc(self, account_id: UUID) -> datetime | None:
+        """MAX(sent_at_utc) from ``liveness_probes`` for the account.
+
+        External watchdog retired 2026-07-09 (replaced by a hosted uptime
+        monitor); no liveness writer exists, so this returns ``None``
+        (→ epoch sentinel in ``SystemStatus.watchdog_last_ping_utc``, which
+        is retained for wire-compat) permanently until/unless a future
+        liveness writer populates the table.
+        """
         row = (
             await self._session.execute(
                 text(

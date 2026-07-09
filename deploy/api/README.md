@@ -195,7 +195,6 @@ RELEASE_SHA=$(cd /opt/trading && git rev-parse --short HEAD)
 ENVIRONMENT=paper
 DOMAIN=spratcapital.com
 ACME_EMAIL=shaanrpatel2@gmail.com
-WATCHDOG_IP=188.245.37.16
 POSTGRES_SUPERUSER_PASSWORD=$(openssl rand -hex 32)
 SECRETS_DIR=/opt/trading-secrets
 API_LOG_LEVEL=INFO
