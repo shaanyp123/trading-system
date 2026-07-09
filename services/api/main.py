@@ -843,6 +843,68 @@ def _build_state_transition_hook(
     return _hook
 
 
+def _build_convalescent_tick_hook(
+    settings: APISettings,
+    account_id: UUID,
+) -> object:
+    """Construct the recon cycle's CONVALESCENT clean-day tick closure.
+
+    2026-07-09 CONVALESCENT amendment wiring: the 00:15 UTC recon cycle
+    is the production tick source for the 3-clean-UTC-days graduation
+    counter. The closure wraps
+    :func:`services.risk.dispatch.apply_convalescent_clean_day_tick`
+    (which owns the predicate, counter UPDATE, and audit-first
+    graduation) + the ``risk_state`` SSE fan-out on graduation — the
+    same layering as :func:`_build_state_transition_hook` (risk-layer
+    call in the closure; recon module stays free of risk imports).
+
+    Returns ``object`` to dodge the circular-import shape (actual type:
+    :class:`services.reconciliation.eod_cycle.ConvalescentTickHook`,
+    ``Callable[[], Awaitable[bool]]`` — True = graduated).
+    """
+    from datetime import UTC
+    from datetime import datetime as _dt
+
+    from services.api.db import get_session_factory
+    from services.risk.dispatch import apply_convalescent_clean_day_tick
+
+    log.info("convalescent_tick_hook_constructed")
+
+    async def _tick() -> bool:
+        applied = await apply_convalescent_clean_day_tick(
+            session_factory=get_session_factory(),
+            account_id=account_id,
+            env=_audit_env_from_settings(settings),
+            phase_at_emit=1,
+            now_utc=_dt.now(tz=UTC),
+        )
+        if applied is None:
+            return False
+        # Graduation: fan out the risk_state SSE envelope (existing event
+        # type — no [A03] migration) so /system updates immediately.
+        try:
+            await sse_multiplexer.emit_sse(
+                "risk_state",
+                {
+                    "state": applied.new_state,
+                    "severity": applied.new_severity,
+                    "reason": "convalescent_graduated",
+                    "audit_event_uuid": str(applied.state_transition_audit_event_uuid),
+                    "triggered_by": "convalescent_clean_day_tick",
+                    "environment": _audit_env_from_settings(settings),
+                },
+            )
+        except Exception:
+            log.exception(
+                "convalescent_tick_sse_emit_failed",
+                account_id=str(account_id),
+            )
+            # SSE failure doesn't undo the graduation; consumers catch up.
+        return True
+
+    return _tick
+
+
 async def _start_reconciliation_scheduler(
     settings: APISettings,
 ) -> tuple[object, object] | None:
@@ -904,12 +966,14 @@ async def _start_reconciliation_scheduler(
     )
     alert_dispatch_hook = _build_alert_dispatch_hook(settings)
     state_transition_hook = _build_state_transition_hook(settings)
+    convalescent_tick = _build_convalescent_tick_hook(settings, account_id)
     callback = make_cycle_callback(
         config=config,
         session_factory=api_db.get_session_factory(),
         fetcher=fetcher,
         alert_dispatch_hook=alert_dispatch_hook,  # type: ignore[arg-type]
         state_transition_hook=state_transition_hook,  # type: ignore[arg-type]
+        convalescent_tick=convalescent_tick,  # type: ignore[arg-type]
     )
     scheduler = ReconciliationScheduler(callback=callback)
     task = asyncio.create_task(scheduler.run_forever(), name="reconciliation_scheduler.run_forever")
@@ -919,6 +983,7 @@ async def _start_reconciliation_scheduler(
         env=_audit_env_from_settings(settings),
         alert_dispatch_hook_wired=alert_dispatch_hook is not None,
         state_transition_hook_wired=state_transition_hook is not None,
+        convalescent_tick_wired=True,
     )
     return scheduler, task
 

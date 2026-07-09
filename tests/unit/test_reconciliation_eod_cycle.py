@@ -393,6 +393,109 @@ class TestRunEodCycleOrchestrator:
         assert any(b.metric.value == "cash_usd" for b in plan.breaks_detected)
 
 
+class TestConvalescentTickWiring:
+    """2026-07-09 amendment wiring: the cycle invokes the optional
+    convalescent_tick hook AFTER apply_reconciliation_plan (so a break
+    detected by this cycle has already halted before the tick reads
+    state), best-effort (a tick failure never fails the cycle), and
+    never on the fetch-failure path."""
+
+    async def test_tick_called_once_after_apply(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        snap = _build_snapshot(cash="100000")
+        factory = _stub_session_factory(
+            positions=[],
+            balance={"cash_usd": Decimal("100000"), "net_liquidation": Decimal("100000")},
+        )
+        call_order: list[str] = []
+
+        async def fake_apply(plan: Any, **kwargs: Any) -> MagicMock:
+            call_order.append("apply")
+            mock_result = MagicMock()
+            mock_result.kill_switch_invoked = False
+            return mock_result
+
+        async def fake_tick() -> bool:
+            call_order.append("tick")
+            return False
+
+        monkeypatch.setattr(
+            "services.reconciliation.eod_cycle.apply_reconciliation_plan", fake_apply
+        )
+        result = await run_eod_cycle(
+            config=_config(),
+            session_factory=factory,
+            fetcher=_fake_fetcher(snap),
+            convalescent_tick=fake_tick,
+        )
+        assert result is not None
+        assert call_order == ["apply", "tick"]
+
+    async def test_tick_failure_does_not_fail_cycle(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        snap = _build_snapshot(cash="100000")
+        factory = _stub_session_factory(
+            positions=[],
+            balance={"cash_usd": Decimal("100000"), "net_liquidation": Decimal("100000")},
+        )
+
+        async def fake_apply(plan: Any, **kwargs: Any) -> MagicMock:
+            mock_result = MagicMock()
+            mock_result.kill_switch_invoked = False
+            return mock_result
+
+        async def exploding_tick() -> bool:
+            raise RuntimeError("tick DB unreachable")
+
+        monkeypatch.setattr(
+            "services.reconciliation.eod_cycle.apply_reconciliation_plan", fake_apply
+        )
+        result = await run_eod_cycle(
+            config=_config(),
+            session_factory=factory,
+            fetcher=_fake_fetcher(snap),
+            convalescent_tick=exploding_tick,
+        )
+        assert result is not None  # cycle completed despite the tick failure
+
+    async def test_no_hook_path_is_noop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        snap = _build_snapshot(cash="100000")
+        factory = _stub_session_factory(
+            positions=[],
+            balance={"cash_usd": Decimal("100000"), "net_liquidation": Decimal("100000")},
+        )
+
+        async def fake_apply(plan: Any, **kwargs: Any) -> MagicMock:
+            mock_result = MagicMock()
+            mock_result.kill_switch_invoked = False
+            return mock_result
+
+        monkeypatch.setattr(
+            "services.reconciliation.eod_cycle.apply_reconciliation_plan", fake_apply
+        )
+        result = await run_eod_cycle(
+            config=_config(), session_factory=factory, fetcher=_fake_fetcher(snap)
+        )
+        assert result is not None  # default convalescent_tick=None path
+
+    async def test_fetch_failure_never_ticks(self) -> None:
+        ticked: list[bool] = []
+
+        async def fake_tick() -> bool:
+            ticked.append(True)
+            return False
+
+        fetcher = _fake_fetcher(
+            error=CoinbaseReconFetchError(operation="list_positions", detail="venue 503")
+        )
+        result = await run_eod_cycle(
+            config=_config(),
+            session_factory=_stub_session_factory(positions=[], balance=None),
+            fetcher=fetcher,
+            convalescent_tick=fake_tick,
+        )
+        assert result is None
+        assert ticked == []
+
+
 class TestRunEodCycleBrokerMissingPositionsWarning:
     """Resilience signal (venue-neutral successor of the 2026-05-27
     missing-FUT warning): when backend has open positions but the venue
