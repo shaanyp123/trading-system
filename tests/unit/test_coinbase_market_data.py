@@ -19,6 +19,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+from structlog.testing import capture_logs
 
 from services.data.coinbase_market_data import (
     CANDLES_PER_REQUEST,
@@ -34,6 +35,7 @@ from services.data.coinbase_market_data import (
     parse_perp_product,
     should_fire_daily,
     should_fire_hourly,
+    spot_base_assets,
 )
 from services.data.coinbase_market_data_alerts import (
     CONSECUTIVE_ALERT_THRESHOLD,
@@ -357,6 +359,29 @@ class TestParsePerpProduct:
         assert snap is not None
         assert snap.funding_rate_per_interval is None
         assert snap.tick_size is None
+
+    def test_base_asset_from_contract_root_unit(self) -> None:
+        snap = parse_perp_product(_perp_raw())
+        assert snap is not None
+        assert snap.base_asset == "BTC"
+        eth = parse_perp_product(_perp_raw("ETP-20DEC30-CDE", root_unit="ETH"))
+        assert eth is not None
+        assert eth.base_asset == "ETH"
+
+    def test_base_asset_falls_back_to_spot_style_fields(self) -> None:
+        raw = _perp_raw()
+        raw["future_product_details"]["contract_root_unit"] = ""
+        raw["base_currency_id"] = "btc"
+        snap = parse_perp_product(raw)
+        assert snap is not None
+        assert snap.base_asset == "BTC"  # normalized upper
+
+    def test_base_asset_none_when_all_labels_absent(self) -> None:
+        raw = _perp_raw()
+        raw["future_product_details"]["contract_root_unit"] = ""
+        snap = parse_perp_product(raw)
+        assert snap is not None
+        assert snap.base_asset is None
 
     def test_discover_filters_mixed_payload(self) -> None:
         products: list[dict[str, Any]] = [
@@ -812,6 +837,167 @@ class TestStalenessWatchdog:
             is False
         )
         assert worker.status.stale_since_utc is None
+
+
+# ---------------------------------------------------------------------------
+# worker: staleness tiering (decisions-log 2026-07-09 "C1 night one")
+# ---------------------------------------------------------------------------
+
+
+class TestStalenessTiers:
+    """Critical tier (spot + traded-asset perps) alerts; telemetry tier
+    (illiquid alt perps) is log-only. Regression for the 2026-07-09 C1
+    night-one alert fatigue: alt perps >180 s quiet re-fired the P2
+    every cooldown window.
+    """
+
+    CRITICAL_PERPS = ("BIP-20DEC30-CDE", "ETP-20DEC30-CDE")
+    TELEMETRY_PERPS = ("CHP-20DEC30-CDE", "SHP-20DEC30-CDE")
+
+    def _tiered_worker(self, *, alert_hook: Any = None) -> CoinbaseMarketDataWorker:
+        products = [
+            _perp_raw("BIP-20DEC30-CDE", root_unit="BTC"),
+            _perp_raw("ETP-20DEC30-CDE", root_unit="ETH"),
+            _perp_raw("CHP-20DEC30-CDE", root_unit="CHN"),
+            _perp_raw("SHP-20DEC30-CDE", root_unit="SHP"),
+        ]
+        worker = _worker(rest=_FakeRest(products=products), alert_hook=alert_hook)
+        worker._started_at_utc = NOW - timedelta(minutes=30)
+        asyncio.run(worker._refresh_products_for_subscription())
+        return worker
+
+    def _mark(self, worker: CoinbaseMarketDataWorker, pids: tuple[str, ...], *, age_s: int) -> None:
+        for pid in pids:
+            worker.mark_store.record(
+                pid, Decimal("1"), observed_at_utc=NOW - timedelta(seconds=age_s)
+            )
+
+    def test_spot_base_assets_derived_from_spot_pairs(self) -> None:
+        assert spot_base_assets(SPOT_SIGNAL_PRODUCT_IDS) == frozenset({"BTC", "ETH"})
+        assert spot_base_assets(()) == frozenset()
+
+    def test_discovery_derives_critical_tier_membership(self) -> None:
+        worker = self._tiered_worker()
+        assert worker._critical_perp_product_ids == self.CRITICAL_PERPS
+        assert worker.status.critical_product_ids == tuple(
+            sorted(set(SPOT_SIGNAL_PRODUCT_IDS) | set(self.CRITICAL_PERPS))
+        )
+
+    def test_critical_perp_stale_fires_alert(self) -> None:
+        captured, hook = _hook_capture()
+        worker = self._tiered_worker(alert_hook=hook)
+        self._mark(worker, SPOT_SIGNAL_PRODUCT_IDS, age_s=5)
+        self._mark(worker, ("ETP-20DEC30-CDE",), age_s=5)
+        self._mark(worker, self.TELEMETRY_PERPS, age_s=5)
+        self._mark(worker, ("BIP-20DEC30-CDE",), age_s=400)
+        assert asyncio.run(worker.run_staleness_check_once(now_utc=NOW)) is True
+        assert len(captured) == 1
+        assert captured[0].category == "broker_disconnect"
+        assert set(captured[0].payload["stale_products"]) == {"BIP-20DEC30-CDE"}
+
+    def test_telemetry_only_stale_logs_but_never_alerts(self) -> None:
+        captured, hook = _hook_capture()
+        worker = self._tiered_worker(alert_hook=hook)
+        self._mark(worker, SPOT_SIGNAL_PRODUCT_IDS, age_s=5)
+        self._mark(worker, self.CRITICAL_PERPS, age_s=5)
+        self._mark(worker, self.TELEMETRY_PERPS, age_s=400)
+        with capture_logs() as logs:
+            result = asyncio.run(worker.run_staleness_check_once(now_utc=NOW))
+        assert result is False
+        assert captured == []
+        assert worker.status.stale_since_utc is None
+        telemetry_logs = [
+            entry for entry in logs if entry["event"] == "coinbase_marks_stale_telemetry_tier"
+        ]
+        assert len(telemetry_logs) == 1
+        assert set(telemetry_logs[0]["stale_products"]) == set(self.TELEMETRY_PERPS)
+        assert telemetry_logs[0]["log_level"] == "info"
+
+    def test_mixed_stale_alert_lists_only_critical_products(self) -> None:
+        # Decision (documented in run_staleness_check_once): the P2 body
+        # lists ONLY critical products — folding the expected-stale alt
+        # list back in would bury the load-bearing products and recreate
+        # the noise this tiering removes. Telemetry ages stay visible in
+        # the throttled info log.
+        captured, hook = _hook_capture()
+        worker = self._tiered_worker(alert_hook=hook)
+        self._mark(worker, SPOT_SIGNAL_PRODUCT_IDS, age_s=400)
+        self._mark(worker, self.CRITICAL_PERPS, age_s=400)
+        self._mark(worker, self.TELEMETRY_PERPS, age_s=999)
+        with capture_logs() as logs:
+            assert asyncio.run(worker.run_staleness_check_once(now_utc=NOW)) is True
+        assert len(captured) == 1
+        assert set(captured[0].payload["stale_products"]) == set(SPOT_SIGNAL_PRODUCT_IDS) | set(
+            self.CRITICAL_PERPS
+        )
+        for pid in self.TELEMETRY_PERPS:
+            assert pid not in captured[0].payload["stale_products"]
+            assert pid not in captured[0].body
+        # both tiers surfaced in logs, each on its own path
+        events = [entry["event"] for entry in logs]
+        assert "coinbase_marks_stale" in events
+        assert "coinbase_marks_stale_telemetry_tier" in events
+
+    def test_telemetry_log_throttled_per_cooldown_window(self) -> None:
+        worker = self._tiered_worker()
+        self._mark(worker, SPOT_SIGNAL_PRODUCT_IDS, age_s=5)
+        self._mark(worker, self.CRITICAL_PERPS, age_s=5)
+        self._mark(worker, self.TELEMETRY_PERPS, age_s=400)
+
+        def telemetry_log_count(at: datetime) -> int:
+            with capture_logs() as logs:
+                asyncio.run(worker.run_staleness_check_once(now_utc=at))
+            return sum(
+                1 for entry in logs if entry["event"] == "coinbase_marks_stale_telemetry_tier"
+            )
+
+        assert telemetry_log_count(NOW) == 1
+        assert telemetry_log_count(NOW + timedelta(seconds=30)) == 0  # inside window
+        assert telemetry_log_count(NOW + timedelta(seconds=1000)) == 1  # past cooldown
+
+    def test_cooldowns_are_independent_per_tier(self) -> None:
+        # A telemetry log inside its window must not suppress a fresh
+        # critical alert (and the critical cooldown timer is untouched
+        # by telemetry activity).
+        captured, hook = _hook_capture()
+        worker = self._tiered_worker(alert_hook=hook)
+        self._mark(worker, SPOT_SIGNAL_PRODUCT_IDS, age_s=5)
+        self._mark(worker, self.CRITICAL_PERPS, age_s=5)
+        self._mark(worker, self.TELEMETRY_PERPS, age_s=400)
+        asyncio.run(worker.run_staleness_check_once(now_utc=NOW))
+        assert captured == []  # telemetry only: logged, no alert
+        # 60 s later the critical tier goes stale (marks now 65 s + 245 s old)
+        later = NOW + timedelta(seconds=245)
+        assert asyncio.run(worker.run_staleness_check_once(now_utc=later)) is True
+        assert len(captured) == 1  # telemetry throttle didn't eat the alert
+
+    def test_critical_recovery_clears_state_while_telemetry_still_stale(self) -> None:
+        captured, hook = _hook_capture()
+        worker = self._tiered_worker(alert_hook=hook)
+        self._mark(worker, SPOT_SIGNAL_PRODUCT_IDS, age_s=400)
+        self._mark(worker, self.CRITICAL_PERPS, age_s=400)
+        self._mark(worker, self.TELEMETRY_PERPS, age_s=400)
+        asyncio.run(worker.run_staleness_check_once(now_utc=NOW))
+        assert len(captured) == 1
+        assert worker.status.stale_since_utc == NOW
+        # critical tier recovers; alt perps stay quiet (expected)
+        self._mark(worker, SPOT_SIGNAL_PRODUCT_IDS, age_s=0)
+        self._mark(worker, self.CRITICAL_PERPS, age_s=0)
+        result = asyncio.run(worker.run_staleness_check_once(now_utc=NOW + timedelta(seconds=1)))
+        assert result is False
+        assert worker.status.stale_since_utc is None
+        assert len(captured) == 1  # no further alert from telemetry tier
+
+    def test_never_ticked_telemetry_product_does_not_alert(self) -> None:
+        # Pre-fix, a discovered alt perp that never ticked after grace
+        # produced the P2. Now: telemetry log only.
+        captured, hook = _hook_capture()
+        worker = self._tiered_worker(alert_hook=hook)
+        self._mark(worker, SPOT_SIGNAL_PRODUCT_IDS, age_s=5)
+        self._mark(worker, self.CRITICAL_PERPS, age_s=5)
+        # telemetry perps never ticked
+        assert asyncio.run(worker.run_staleness_check_once(now_utc=NOW)) is False
+        assert captured == []
 
 
 # ---------------------------------------------------------------------------

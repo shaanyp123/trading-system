@@ -11,12 +11,17 @@ Two alert flavors:
 
 1. **Marks stale** (``build_marks_stale_alert``) — the 3-minute
    staleness watchdog (strategy §7 data-outage row) found at least one
-   subscribed product whose last WebSocket tick is older than the
-   threshold. Severity P2, category ``broker_disconnect`` — the delta
-   spec §3.8 remaps that existing category to "Coinbase WS/REST
-   outage" (free-text payload; no enum migration). The *policy
-   response* (protected-hold vs flatten) is the risk loop's job
-   (§3.3); this alert is the operator-visible detection signal.
+   CRITICAL-tier product (spot signal pairs + traded-asset perps; see
+   the worker's ``run_staleness_check_once``) whose last WebSocket
+   tick is older than the threshold. Telemetry-tier alt perps never
+   feed this builder — they are log-only (decisions-log 2026-07-09,
+   "C1 night one" alert-fatigue fix); the descriptor shape/category is
+   unchanged, only the product set feeding it narrowed. Severity P2,
+   category ``broker_disconnect`` — the delta spec §3.8 remaps that
+   existing category to "Coinbase WS/REST outage" (free-text payload;
+   no enum migration). The *policy response* (protected-hold vs
+   flatten) is the risk loop's job (§3.3); this alert is the
+   operator-visible detection signal.
 
 2. **Funding snapshot miss** (``build_funding_snapshot_miss_alert``) —
    the hourly funding logger (§3.2 "funding logger from day one",
