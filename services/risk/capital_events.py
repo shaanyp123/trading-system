@@ -42,18 +42,28 @@ Bootstrap edge case (first cutover deposit on $0 equity):
 * ``pct_of_pre_equity`` is recorded as ``Decimal("0")`` (sentinel; not
   used downstream).
 
-Session-counter semantics (Phase 0 placeholder):
+Session-counter semantics (Phase 0 placeholder, crypto-era resolution):
 
 The schema's ``capital_event_active_until_session_no`` +
 ``capital_event_vol_normalized_at_session_no`` fields (and the
 ``capital_events.capital_event_mode_session_start`` field) are INTEGERs
 that index into a global CME session counter. That counter mechanism
-does NOT yet exist as a queryable field in the system; this module
-accepts the current session number as an explicit argument
-(``current_session_no``) and computes ``+5`` and ``+30`` offsets per
-the spec. For the cutover-day bootstrap deposit on a fresh live DB,
-the operator passes ``current_session_no=0``. Subsequent uses can
-re-query whatever session-counter mechanism lands later.
+never existed as a queryable field; this module accepts the current
+session number as an explicit argument (``current_session_no``) and
+computes ``+5`` and ``+30`` offsets per the spec. For the cutover-day
+bootstrap deposit on a fresh live DB, the operator passes
+``current_session_no=0``.
+
+**Crypto-era resolution (decisions-log 2026-07-10):** post-CME a
+"session" is one UTC calendar day (same calendar the CONVALESCENT
+clean-day counter ticks on, per the 2026-07-09 amendment), and the
+live session count is DERIVED FROM DATES, not from the absolute
+counter fields: :func:`capital_event_session_count` computes the
+UTC-day delta between the decision date and the most recent
+threshold-met event's ``effective_at_utc`` date. The absolute
+``*_session_no`` fields remain as written-forensic placeholders (the
+``/capital-*`` flow still records them with the route's default
+``current_session_no=0``) but no consumer reads them for sizing.
 
 A01 BINDS — every audit row routes through :func:`append_audit_event`.
 A02 BINDS — ``services/risk/**`` requires ``risk-review-approved`` label.
@@ -67,7 +77,7 @@ A06 enforced — all timestamps tz-aware UTC.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Final, Literal
 from uuid import UUID
@@ -114,6 +124,40 @@ CAPITAL_EVENT_THRESHOLD_PCT: Final[Decimal] = Decimal("0.05")
 #: sessions 6-30 use 1.0 (mode-active flag); session 31+ ends mode.
 CAPITAL_EVENT_VOL_NORMALIZED_AFTER_SESSIONS: Final[int] = 5
 CAPITAL_EVENT_MODE_DURATION_SESSIONS: Final[int] = 30
+
+
+def capital_event_session_count(
+    *,
+    decision_date: date,
+    last_threshold_met_event_date_utc: date | None,
+) -> int:
+    """Sessions elapsed since the most recent threshold-met capital event.
+
+    Crypto-era session semantics (decisions-log 2026-07-10): one session
+    = one UTC calendar day, so the count is the plain UTC-day delta
+    between the decision date and the event's ``effective_at_utc`` date:
+
+    * no threshold-met event on record → ``0`` (no mode; multiplier
+      inactive per :func:`services.risk.multipliers.m_combined`),
+    * the event's own UTC day → ``0`` (that day's 00:05 UTC decision
+      predates an intraday event; under the CME design the event was
+      likewise observed at EOD recon, so the event session never ran
+      half-sized — sessions 1-5 are the five FOLLOWING days),
+    * days 1-5 after → ``1..5`` (m_capital_event = 0.5),
+    * days 6-30 after → mode-active window, multiplier normalized,
+    * day 31+ → mode over (callers compare against
+      :data:`CAPITAL_EVENT_MODE_DURATION_SESSIONS`).
+
+    A later threshold-met event restarts the clock (MAX event date wins
+    upstream), mirroring ``apply_capital_event``'s overwrite of the
+    ``risk_state`` window fields. A degenerate future-dated event clamps
+    to ``0`` — the mode has not started before its event day.
+
+    Pure + clock-free ([A22]); the caller supplies both dates.
+    """
+    if last_threshold_met_event_date_utc is None:
+        return 0
+    return max(0, (decision_date - last_threshold_met_event_date_utc).days)
 
 
 class CapitalEventError(Exception):
@@ -575,5 +619,6 @@ __all__ = [
     "CapitalEventError",
     "CapitalEventPlan",
     "apply_capital_event",
+    "capital_event_session_count",
     "plan_capital_event",
 ]

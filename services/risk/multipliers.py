@@ -12,11 +12,12 @@ Inputs (crypto-pivot mapping):
 
 * ``capital_event_session_count`` — sessions since a threshold-met
   capital event ("session" = UTC calendar day post-pivot, same calendar
-  the CONVALESCENT counter ticks on). The C1 strategy worker passes
-  ``0`` until the §3.5 recon PR wires the UTC-day session counter to
-  ``risk_state.capital_event_active_until_session_no`` — flagged, not
-  silent (the worker logs when the risk_state row carries an active
-  capital-event window it cannot yet evaluate).
+  the CONVALESCENT counter ticks on). The C1 strategy worker derives it
+  via :func:`services.risk.capital_events.capital_event_session_count`
+  from the latest threshold-met ``capital_events`` row's
+  ``effective_at_utc`` UTC date (the ``risk_state`` absolute
+  ``*_session_no`` fields are Phase-0 placeholders no consumer reads
+  for sizing).
 * ``is_convalescent`` — current kill-switch state is CONVALESCENT
   (backend-spec §2.5: trading permitted at half size during the 5-clean-
   UTC-day probation window).

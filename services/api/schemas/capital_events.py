@@ -21,9 +21,11 @@ class CapitalEventInvokeRequest(BaseModel):
     coerces to ``Decimal`` before passing to the planner.
 
     ``current_session_no`` is optional — when omitted the route defaults
-    to ``0`` (cutover-day bootstrap). When the global session-counter
-    mechanism lands, the route will compute the value automatically and
-    callers can stop sending it explicitly.
+    to ``0`` (cutover-day bootstrap). Crypto-era note (decisions-log
+    2026-07-10): the live m_capital_event session count is derived from
+    the event's ``effective_at_utc`` UTC date, not from this absolute
+    counter — the field persists as a forensic placeholder and the
+    default ``0`` is always fine.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -47,9 +49,9 @@ class CapitalEventInvokeRequest(BaseModel):
         default=0,
         ge=0,
         description=(
-            "Global CME session counter at event time. Cutover-day bootstrap "
-            "uses 0. Once the global counter mechanism lands, callers can "
-            "rely on the default and the route will populate it."
+            "Legacy absolute session counter at event time (Phase-0 "
+            "placeholder; forensic only). The live session count derives "
+            "from effective_at_utc UTC dates — rely on the default 0."
         ),
     )
 

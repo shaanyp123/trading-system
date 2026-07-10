@@ -110,6 +110,11 @@ from services.execution.types import (
     FuturesBalanceSummary,
     PerpProductRef,
 )
+from services.risk.capital_events import (
+    CAPITAL_EVENT_MODE_DURATION_SESSIONS,
+    CAPITAL_EVENT_VOL_NORMALIZED_AFTER_SESSIONS,
+    capital_event_session_count,
+)
 from services.risk.dispatch import apply_state_transition
 from services.risk.fill_processor import (
     FillIngestPayload,
@@ -670,6 +675,34 @@ class StrategyWorkerStore:
             convalescent_counter=int(row.convalescent_session_count or 0),
             capital_event_active=row.capital_event_active_until_session_no is not None,
         )
+
+    async def fetch_last_threshold_met_capital_event_date(self, account_id: UUID) -> date | None:
+        """UTC calendar date of the most recent threshold-met capital event.
+
+        Source of truth for the m_capital_event session count: the
+        UTC-day delta from this date (see
+        ``services.risk.capital_events.capital_event_session_count``).
+        The ``risk_state.capital_event_*_session_no`` fields are Phase-0
+        absolute-counter placeholders and are NOT read for sizing.
+        Below-threshold events never start the mode, hence the
+        ``threshold_met`` filter.
+        """
+        async with self._sf() as session:
+            row = (
+                await session.execute(
+                    text(
+                        "SELECT MAX((effective_at_utc AT TIME ZONE 'UTC')::date) "
+                        "       AS event_day "
+                        "FROM capital_events "
+                        "WHERE account_id = :acct AND threshold_met = TRUE"
+                    ),
+                    {"acct": account_id},
+                )
+            ).fetchone()
+        if row is None or row.event_day is None:
+            return None
+        event_day: date = row.event_day
+        return event_day
 
     async def fetch_parameter_head(self) -> tuple[str, dict[str, str]] | None:
         """The active ``parameter_sets`` row (bootstrap-minted Amendment B seed)."""
@@ -2317,17 +2350,35 @@ class StrategyWorker:
             return
 
         is_convalescent = risk_state == RiskState.CONVALESCENT.value
-        if risk_snapshot is not None and risk_snapshot.capital_event_active:
-            self._log.warning(
-                "strategy_worker_capital_event_window_unevaluated",
-                note=(
-                    "risk_state carries an active capital-event window; the UTC-day "
-                    "session counter wiring lands with the §3.5 recon PR — "
-                    "m_capital_event not applied this decision"
-                ),
+        last_capital_event_day = await self._store.fetch_last_threshold_met_capital_event_date(
+            self.account_id
+        )
+        capital_event_sessions = capital_event_session_count(
+            decision_date=decision_date,
+            last_threshold_met_event_date_utc=last_capital_event_day,
+        )
+        if 1 <= capital_event_sessions <= CAPITAL_EVENT_MODE_DURATION_SESSIONS:
+            self._log.info(
+                "strategy_worker_capital_event_window_active",
+                capital_event_session_count=capital_event_sessions,
+                capital_event_date=last_capital_event_day.isoformat()
+                if last_capital_event_day is not None
+                else None,
+                half_size=capital_event_sessions <= CAPITAL_EVENT_VOL_NORMALIZED_AFTER_SESSIONS,
+            )
+        elif risk_snapshot is not None and risk_snapshot.capital_event_active:
+            # risk_state still carries the Phase-0 absolute-counter window
+            # fields from a lapsed (or pre-crypto) event — nothing clears
+            # them. The date-derived count is authoritative for sizing.
+            self._log.info(
+                "strategy_worker_capital_event_window_lapsed",
+                capital_event_session_count=capital_event_sessions,
+                capital_event_date=last_capital_event_day.isoformat()
+                if last_capital_event_day is not None
+                else None,
             )
         monthly_dd = await self._monthly_dd(inputs.equity, decision_date)
-        m_comb = compute_m_combined(0, is_convalescent, monthly_dd)
+        m_comb = compute_m_combined(capital_event_sessions, is_convalescent, monthly_dd)
 
         weekly_halved = (
             self._weekly_halved_until is not None and decision_date <= self._weekly_halved_until
@@ -2462,6 +2513,7 @@ class StrategyWorker:
             "sizing_trace": sizing.sizing_trace,
             "weekly_halved": weekly_halved,
             "m_combined": str(m_comb),
+            "capital_event_session_count": capital_event_sessions,
         }
 
         await self._store.insert_decision(
