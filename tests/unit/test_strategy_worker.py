@@ -844,6 +844,22 @@ class TestSizingIntegration:
         assert row["m_combined"] == Decimal("1.0")
         assert row["outcome"]["capital_event_session_count"] == 31
 
+    async def test_capital_event_fetch_failure_fails_closed(self) -> None:
+        """A DB failure sourcing the count must never size on a guess:
+        the guarded decision fails loudly BEFORE any engine-state
+        mutation or dispatch, places no orders, and leaves the date
+        un-latched so the next 30 s tick retries."""
+        store = FakeStore()
+
+        async def _boom(account_id: UUID) -> date | None:
+            raise RuntimeError("db down")
+
+        store.fetch_last_threshold_met_capital_event_date = _boom  # type: ignore[method-assign]
+        worker, _, broker = await _started_worker(store=store)
+        await worker._run_decision_guarded(TODAY)
+        assert broker.create_calls == []
+        assert worker._last_decision_date != TODAY  # retried next tick
+
     async def test_phase_a_contract_clamp_applies(self) -> None:
         config = StrategyWorkerConfig(heartbeat_file=None, max_contracts={"BTC": 1, "ETH": 1})
         worker, store, _ = await _started_worker(config=config)

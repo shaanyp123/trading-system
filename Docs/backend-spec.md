@@ -709,6 +709,8 @@ def m_combined(now: datetime, equity: Decimal, peak_mtm: Decimal) -> Decimal:
     return min(multipliers)                    # MIN, not compounded
 ```
 
+- **SUPERSEDED (2026-07-10, decisions-log "C1 day two, evening" / PR #374):** the capital-event counter is UTC calendar days derived from the latest threshold-met `capital_events.effective_at_utc` date (no global session counter exists); the locked half-size window is `1 <= count <= 5` — the event's own UTC day is session 0, full size — per `services/risk/multipliers.py`, which is authoritative over the `<= 5` in the pseudocode above (retained as history). The §5.13 CME-era `capital_event_mode_ended` emission at session 31 has no crypto-era emitter: the mode lapses by date, and the `risk_state` absolute `capital_event_*_session_no` fields are unread forensic placeholders.
+
 ### 2.4.5 Margin Protocol (graduated de-leverage)
 
 ```mermaid

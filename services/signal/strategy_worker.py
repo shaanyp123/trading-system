@@ -2367,16 +2367,25 @@ class StrategyWorker:
                 half_size=capital_event_sessions <= CAPITAL_EVENT_VOL_NORMALIZED_AFTER_SESSIONS,
             )
         elif risk_snapshot is not None and risk_snapshot.capital_event_active:
-            # risk_state still carries the Phase-0 absolute-counter window
-            # fields from a lapsed (or pre-crypto) event — nothing clears
-            # them. The date-derived count is authoritative for sizing.
-            self._log.info(
-                "strategy_worker_capital_event_window_lapsed",
-                capital_event_session_count=capital_event_sessions,
-                capital_event_date=last_capital_event_day.isoformat()
-                if last_capital_event_day is not None
-                else None,
-            )
+            if capital_event_sessions == 0 and last_capital_event_day is not None:
+                # Event recorded earlier TODAY (a mid-day catch-up decision
+                # can land here): the event day is session 0 — the half-size
+                # window starts with tomorrow's decision.
+                self._log.info(
+                    "strategy_worker_capital_event_window_pending",
+                    capital_event_date=last_capital_event_day.isoformat(),
+                )
+            else:
+                # risk_state still carries the Phase-0 absolute-counter window
+                # fields from a lapsed (or pre-crypto) event — nothing clears
+                # them. The date-derived count is authoritative for sizing.
+                self._log.info(
+                    "strategy_worker_capital_event_window_lapsed",
+                    capital_event_session_count=capital_event_sessions,
+                    capital_event_date=last_capital_event_day.isoformat()
+                    if last_capital_event_day is not None
+                    else None,
+                )
         monthly_dd = await self._monthly_dd(inputs.equity, decision_date)
         m_comb = compute_m_combined(capital_event_sessions, is_convalescent, monthly_dd)
 
