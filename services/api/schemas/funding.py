@@ -38,10 +38,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from services.api.repos.funding import (
     BalanceSnapshotAuditRow,
+    CashBalanceSnapshotRow,
     CashSweepRow,
     FundingRateRow,
     HeldPositionRow,
     ProductMetadataRow,
+    RewardTransactionRow,
 )
 
 #: Hours in the annualization year (365 x 24). CDE funding settles hourly
@@ -143,6 +145,43 @@ class SystemFundingResponse(BaseModel):
     )
     liquidation_buffer_pct: Decimal | None
     liquidation_buffer_as_of_utc: datetime | None
+    # --- USDC-interest capture (decisions-log 2026-07-10) -------------
+    # Load-bearing rendering context (the venue-balance-semantics
+    # finding): spot USD IS trading equity (auto-swept in/out of
+    # derivatives margin); CBI USDC is INVISIBLE to equity (buying
+    # power only). The strip's tooltips must say so.
+    spot_usd_balance: Decimal | None = Field(
+        default=None,
+        description=(
+            "CBI spot USD available balance from the latest daily cash "
+            "snapshot — part of trading equity (venue auto-sweep). None "
+            "until the first capture."
+        ),
+    )
+    cbi_usdc_balance: Decimal | None = Field(
+        default=None,
+        description=(
+            "CBI USDC available balance (earns Coinbase One rewards; "
+            "invisible to trading equity). None until the first capture."
+        ),
+    )
+    cash_balances_as_of_utc: datetime | None = Field(
+        default=None,
+        description="Capture instant of the latest cash snapshot.",
+    )
+    last_usdc_reward_amount: Decimal | None = Field(
+        default=None,
+        description=(
+            "Most recent persisted positive USDC ledger credit (rewards "
+            "pay out weekly on Fridays). None until the first payout is "
+            "captured."
+        ),
+    )
+    last_usdc_reward_at_utc: datetime | None = None
+    lifetime_usdc_rewards: Decimal = Field(
+        default=Decimal("0"),
+        description="Sum of all persisted positive USDC ledger credits.",
+    )
     server_now: datetime
 
 
@@ -248,6 +287,9 @@ def build_system_funding_response(
     metadata: list[ProductMetadataRow],
     sweeps_today: list[CashSweepRow],
     balance_snapshot: BalanceSnapshotAuditRow | None,
+    cash_snapshot: CashBalanceSnapshotRow | None,
+    last_reward: RewardTransactionRow | None,
+    lifetime_rewards: Decimal,
     yield_apy: Decimal | None,
     now: datetime,
 ) -> SystemFundingResponse:
@@ -358,6 +400,12 @@ def build_system_funding_response(
         yield_apy=yield_apy,
         liquidation_buffer_pct=liq_buffer,
         liquidation_buffer_as_of_utc=liq_as_of,
+        spot_usd_balance=cash_snapshot.spot_usd if cash_snapshot else None,
+        cbi_usdc_balance=cash_snapshot.cbi_usdc if cash_snapshot else None,
+        cash_balances_as_of_utc=cash_snapshot.captured_at_utc if cash_snapshot else None,
+        last_usdc_reward_amount=last_reward.amount if last_reward else None,
+        last_usdc_reward_at_utc=last_reward.venue_created_at_utc if last_reward else None,
+        lifetime_usdc_rewards=lifetime_rewards,
         server_now=now,
     )
 

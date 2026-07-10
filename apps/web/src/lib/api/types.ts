@@ -238,6 +238,16 @@ export interface SystemFundingResponse {
   readonly yield_apy: string | null;
   readonly liquidation_buffer_pct: string | null;
   readonly liquidation_buffer_as_of_utc: string | null;
+  /** CBI spot USD (part of trading equity — venue auto-sweep); null until first capture. */
+  readonly spot_usd_balance: string | null;
+  /** CBI USDC (earns rewards; INVISIBLE to trading equity); null until first capture. */
+  readonly cbi_usdc_balance: string | null;
+  readonly cash_balances_as_of_utc: string | null;
+  /** Latest positive USDC ledger credit (rewards pay out Fridays). */
+  readonly last_usdc_reward_amount: string | null;
+  readonly last_usdc_reward_at_utc: string | null;
+  /** Sum of all persisted positive USDC ledger credits. */
+  readonly lifetime_usdc_rewards: string;
   readonly server_now: string;
 }
 

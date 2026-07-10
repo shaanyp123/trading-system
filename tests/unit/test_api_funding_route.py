@@ -33,10 +33,12 @@ from httpx import AsyncClient
 
 from services.api.repos.funding import (
     BalanceSnapshotAuditRow,
+    CashBalanceSnapshotRow,
     CashSweepRow,
     FundingRateRow,
     HeldPositionRow,
     ProductMetadataRow,
+    RewardTransactionRow,
 )
 from services.api.routes import system as system_route
 from services.api.schemas.funding import (
@@ -70,6 +72,9 @@ class _StubFundingRepo:
     metadata: list[ProductMetadataRow] = field(default_factory=list)
     sweeps: list[CashSweepRow] = field(default_factory=list)
     balance: BalanceSnapshotAuditRow | None = None
+    cash_snapshot: CashBalanceSnapshotRow | None = None
+    last_reward: RewardTransactionRow | None = None
+    lifetime_rewards: Decimal = Decimal("0")
     seen_today_product_ids: list[str] = field(default_factory=list)
     held_queried_for: list[UUID] = field(default_factory=list)
 
@@ -92,6 +97,15 @@ class _StubFundingRepo:
 
     async def fetch_latest_balance_snapshot_audit(self) -> BalanceSnapshotAuditRow | None:
         return self.balance
+
+    async def fetch_latest_cash_balance_snapshot(self) -> CashBalanceSnapshotRow | None:
+        return self.cash_snapshot
+
+    async def fetch_last_reward_credit(self) -> RewardTransactionRow | None:
+        return self.last_reward
+
+    async def fetch_lifetime_reward_credits_total(self) -> Decimal:
+        return self.lifetime_rewards
 
 
 def _wire(
@@ -148,9 +162,62 @@ class TestSystemFundingRoute:
         assert body["yield_apy"] is None
         assert body["liquidation_buffer_pct"] is None
         assert body["liquidation_buffer_as_of_utc"] is None
+        assert body["spot_usd_balance"] is None
+        assert body["cbi_usdc_balance"] is None
+        assert body["cash_balances_as_of_utc"] is None
+        assert body["last_usdc_reward_amount"] is None
+        assert body["last_usdc_reward_at_utc"] is None
+        assert body["lifetime_usdc_rewards"] == "0"
         assert body["server_now"] is not None
         # No active account → held positions never queried.
         assert repo.held_queried_for == []
+
+    async def test_cash_capture_fields_pass_through_as_decimal_strings(
+        self, api_client: AsyncClient, override_dep: Any
+    ) -> None:
+        """USDC-interest capture fields: exact Decimal-string passthrough ([A05])."""
+        repo = _StubFundingRepo(
+            cash_snapshot=CashBalanceSnapshotRow(
+                snapshot_date_utc=NOW.date(),
+                captured_at_utc=NOW,
+                spot_usd=Decimal("1397.01"),
+                cbi_usdc=Decimal("4300.55"),
+            ),
+            last_reward=RewardTransactionRow(
+                venue_created_at_utc=NOW,
+                amount=Decimal("0.48"),
+                currency="USDC",
+                transaction_type="interest",
+            ),
+            lifetime_rewards=Decimal("12.34"),
+        )
+        _wire(override_dep, account_id=None, funding_repo=repo)
+        resp = await api_client.get("/api/system/funding")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["spot_usd_balance"] == "1397.01"
+        assert body["cbi_usdc_balance"] == "4300.55"
+        assert body["cash_balances_as_of_utc"] is not None
+        assert body["last_usdc_reward_amount"] == "0.48"
+        assert body["last_usdc_reward_at_utc"] is not None
+        assert body["lifetime_usdc_rewards"] == "12.34"
+
+    async def test_cash_snapshot_without_usdc_account_renders_null_not_zero(
+        self, api_client: AsyncClient, override_dep: Any
+    ) -> None:
+        """None (no account seen) stays distinct from a genuine zero balance."""
+        repo = _StubFundingRepo(
+            cash_snapshot=CashBalanceSnapshotRow(
+                snapshot_date_utc=NOW.date(),
+                captured_at_utc=NOW,
+                spot_usd=Decimal("0"),
+                cbi_usdc=None,
+            ),
+        )
+        _wire(override_dep, account_id=None, funding_repo=repo)
+        body = (await api_client.get("/api/system/funding")).json()
+        assert body["spot_usd_balance"] == "0"
+        assert body["cbi_usdc_balance"] is None
 
     async def test_held_products_sort_first(
         self, api_client: AsyncClient, override_dep: Any
@@ -463,6 +530,9 @@ def test_build_response_rejects_naive_now(naive: datetime) -> None:
             metadata=[],
             sweeps_today=[],
             balance_snapshot=None,
+            cash_snapshot=None,
+            last_reward=None,
+            lifetime_rewards=Decimal("0"),
             yield_apy=None,
             now=naive,
         )

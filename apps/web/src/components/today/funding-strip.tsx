@@ -13,6 +13,10 @@
  *   - Yield rate — the USDC rewards APY; "—" until configured.
  *   - Liq buffer — venue liquidation buffer from the last 00:15 UTC
  *     recon; "—" when flat / no recon yet.
+ *   - Spot USD / CBI USDC / Last reward / Lifetime rewards — the daily
+ *     00:20 UTC USDC-interest capture (decisions-log 2026-07-10).
+ *     Tooltips carry the load-bearing venue semantics: spot USD IS
+ *     trading equity (auto-sweep), CBI USDC is invisible to it.
  *
  * Every number arrives as a server-computed Decimal-string
  * (frontend-spec §8.9 LOCKED — no arithmetic here); rendering goes
@@ -106,8 +110,54 @@ export function FundingStrip(): JSX.Element {
             : 'As of last recon; — when flat or no recon yet'
         }
       />
+      <StripItem
+        label="Spot USD"
+        value={
+          data?.spot_usd_balance != null ? `$${formatPrice(data.spot_usd_balance)}` : '—'
+        }
+        title={withAsOf(
+          'CBI spot USD — part of trading equity (venue auto-sweeps to/from derivatives margin)',
+          data?.cash_balances_as_of_utc,
+        )}
+      />
+      <StripItem
+        label="CBI USDC"
+        value={
+          data?.cbi_usdc_balance != null ? `$${formatPrice(data.cbi_usdc_balance)}` : '—'
+        }
+        title={withAsOf(
+          'USDC at CBI earning Coinbase One rewards — NOT part of trading equity (buying power only)',
+          data?.cash_balances_as_of_utc,
+        )}
+      />
+      <StripItem
+        label="Last reward"
+        value={
+          data?.last_usdc_reward_amount != null
+            ? `$${formatPrice(data.last_usdc_reward_amount)}`
+            : '—'
+        }
+        title={
+          data?.last_usdc_reward_at_utc != null
+            ? `Latest USDC reward credit — ${formatDateTimeET(data.last_usdc_reward_at_utc)}`
+            : 'USDC rewards pay out weekly on Fridays; — until the first payout is captured'
+        }
+      />
+      <StripItem
+        label="Lifetime rewards"
+        value={
+          data?.lifetime_usdc_rewards != null
+            ? `$${formatPrice(data.lifetime_usdc_rewards)}`
+            : '—'
+        }
+        title="Sum of all captured USDC reward credits"
+      />
     </div>
   );
+}
+
+function withAsOf(base: string, asOfUtc: string | null | undefined): string {
+  return asOfUtc != null ? `${base} — as of ${formatDateTimeET(asOfUtc)}` : base;
 }
 
 // ---------------------------------------------------------------------------

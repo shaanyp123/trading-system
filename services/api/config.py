@@ -410,6 +410,26 @@ class APISettings(BaseSettings):
         ),
     )
 
+    # --- USDC rewards + cash-balance capture (decisions-log 2026-07-10) ----
+    #
+    # Daily api-lifespan job (services/data/usdc_rewards.py, fired at
+    # 00:20 UTC by the generic once-per-UTC-day scheduler): polls the
+    # Coinbase v2 USDC ledger for candidate reward transactions and
+    # snapshots the CBI spot USD + USDC balances. Reuses the SAME CDP
+    # key pair as the execution/recon surfaces (coinbase_api_key_name +
+    # coinbase_api_private_key above) — when those are unset the job
+    # skips with a warning, same fail-closed contract as the recon
+    # scheduler. Operator kill switch for the capture alone:
+    # API_USDC_REWARDS_CAPTURE_ENABLED=false.
+    usdc_rewards_capture_enabled: bool = Field(
+        default=True,
+        description=(
+            "Start the daily USDC rewards + cash-balance capture job in "
+            "the api lifespan (00:20 UTC). Requires the coinbase.* CDP "
+            "credentials in the secrets file."
+        ),
+    )
+
     # --- Cash-yield display rate (crypto-pivot §3.6/§3.9) ------------------
     #
     # Interim MANUAL value surfaced by ``GET /api/system/funding`` as

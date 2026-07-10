@@ -1,8 +1,9 @@
 """services/api/repos/funding.py — read surface for ``GET /api/system/funding``.
 
 Crypto-pivot §3.7/§3.9 (``Docs/crypto-pivot-delta-spec.md``): the funding
-+ cash-yield telemetry projection. Six read-only queries over the C0-B1
++ cash-yield telemetry projection. Nine read-only queries over the C0-B1
 crypto-pivot tables (``alembic/versions/2026-07-08_crypto_pivot_tables.py``)
++ the USDC-interest capture tables (``2026-07-10_usdc_rewards_capture.py``)
 plus the venue-truth joins the funding math needs:
 
 * ``funding_rates`` — latest hourly snapshot per product (7-day window so
@@ -19,6 +20,10 @@ plus the venue-truth joins the funding math needs:
   payload carries the venue liquidation buffer (written by
   ``services/reconciliation/eod_cycle.py``). The chain is the source of
   truth here — no operational table duplicates the buffer.
+* ``cash_balance_snapshots`` + ``usdc_reward_transactions`` — the daily
+  00:20 UTC USDC-interest capture (``services/data/usdc_rewards.py``):
+  latest spot USD/CBI USDC balances, last reward credit, lifetime
+  reward credits total.
 
 READ-ONLY consumers — no writes, no schema changes. Same raw-SQL-over-
 ``AsyncSession`` + Protocol pattern as ``services/api/repos/cycle.py``;
@@ -33,7 +38,7 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
 from uuid import UUID
@@ -99,6 +104,37 @@ class ProductMetadataRow:
 
 
 @dataclass(frozen=True, slots=True)
+class CashBalanceSnapshotRow:
+    """Latest ``cash_balance_snapshots`` row (daily 00:20 UTC capture).
+
+    ``spot_usd``/``cbi_usdc`` are None when the capture saw no account
+    of that currency — distinct from a genuine zero balance.
+    """
+
+    snapshot_date_utc: date
+    captured_at_utc: datetime
+    spot_usd: Decimal | None
+    cbi_usdc: Decimal | None
+
+
+@dataclass(frozen=True, slots=True)
+class RewardTransactionRow:
+    """One persisted ``usdc_reward_transactions`` credit, projected.
+
+    Until the capture filter locks to the venue's real reward type
+    (observe-then-lock, decisions-log 2026-07-10), "reward" here means
+    any persisted POSITIVE-amount ledger credit — the repo queries
+    filter ``amount > 0`` so persisted forensic debits never surface
+    as payouts.
+    """
+
+    venue_created_at_utc: datetime
+    amount: Decimal
+    currency: str
+    transaction_type: str
+
+
+@dataclass(frozen=True, slots=True)
 class BalanceSnapshotAuditRow:
     """Latest ``balance_snapshot_recorded`` audit event, payload decoded.
 
@@ -138,6 +174,12 @@ class FundingQueryRepo(Protocol):
     async def fetch_latest_product_metadata(self) -> list[ProductMetadataRow]: ...
 
     async def fetch_latest_balance_snapshot_audit(self) -> BalanceSnapshotAuditRow | None: ...
+
+    async def fetch_latest_cash_balance_snapshot(self) -> CashBalanceSnapshotRow | None: ...
+
+    async def fetch_last_reward_credit(self) -> RewardTransactionRow | None: ...
+
+    async def fetch_lifetime_reward_credits_total(self) -> Decimal: ...
 
 
 # ---------------------------------------------------------------------------
@@ -343,13 +385,71 @@ class PostgresFundingQueryRepo:
             recorded_at_utc=row.source_clock_ts,
         )
 
+    async def fetch_latest_cash_balance_snapshot(self) -> CashBalanceSnapshotRow | None:
+        row = (
+            await self._session.execute(
+                text(
+                    "SELECT snapshot_date_utc, captured_at_utc, spot_usd, cbi_usdc "
+                    "FROM cash_balance_snapshots "
+                    "ORDER BY snapshot_date_utc DESC LIMIT 1"
+                )
+            )
+        ).fetchone()
+        if row is None:
+            return None
+        return CashBalanceSnapshotRow(
+            snapshot_date_utc=row.snapshot_date_utc,
+            captured_at_utc=row.captured_at_utc,
+            spot_usd=_to_decimal_or_none(row.spot_usd),
+            cbi_usdc=_to_decimal_or_none(row.cbi_usdc),
+        )
+
+    async def fetch_last_reward_credit(self) -> RewardTransactionRow | None:
+        # amount > 0: the capture persists forensic debits too (loose
+        # filter until the real reward type is observed); only credits
+        # render as payouts.
+        row = (
+            await self._session.execute(
+                text(
+                    "SELECT venue_created_at_utc, amount, currency, transaction_type "
+                    "FROM usdc_reward_transactions "
+                    "WHERE amount > 0 "
+                    "ORDER BY venue_created_at_utc DESC LIMIT 1"
+                )
+            )
+        ).fetchone()
+        if row is None:
+            return None
+        return RewardTransactionRow(
+            venue_created_at_utc=row.venue_created_at_utc,
+            amount=_to_decimal(row.amount),
+            currency=str(row.currency),
+            transaction_type=str(row.transaction_type),
+        )
+
+    async def fetch_lifetime_reward_credits_total(self) -> Decimal:
+        row = (
+            await self._session.execute(
+                text(
+                    "SELECT COALESCE(SUM(amount), 0) AS total "
+                    "FROM usdc_reward_transactions "
+                    "WHERE amount > 0"
+                )
+            )
+        ).fetchone()
+        if row is None:
+            return Decimal("0")
+        return _to_decimal(row.total)
+
 
 __all__ = [
     "BalanceSnapshotAuditRow",
+    "CashBalanceSnapshotRow",
     "CashSweepRow",
     "FundingQueryRepo",
     "FundingRateRow",
     "HeldPositionRow",
     "PostgresFundingQueryRepo",
     "ProductMetadataRow",
+    "RewardTransactionRow",
 ]

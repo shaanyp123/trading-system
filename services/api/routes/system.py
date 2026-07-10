@@ -1149,6 +1149,10 @@ async def system_funding(
       * **Liquidation buffer** — from the latest
         ``balance_snapshot_recorded`` audit payload (00:15 UTC recon);
         the venue's ``1000`` no-risk sentinel maps to None.
+      * **Cash balances + USDC rewards** — the daily 00:20 UTC capture
+        (``services/data/usdc_rewards.py``): latest spot USD / CBI USDC
+        balances, last positive USDC ledger credit (rewards pay out
+        Fridays), lifetime reward credits total.
 
     Fresh DB contract: empty lists + nulls, HTTP 200 — consumers render
     the no-telemetry-yet state, never an error.
@@ -1166,6 +1170,9 @@ async def system_funding(
     metadata = await funding_repo.fetch_latest_product_metadata()
     sweeps_today = await funding_repo.fetch_cash_sweeps_today()
     balance_snapshot = await funding_repo.fetch_latest_balance_snapshot_audit()
+    cash_snapshot = await funding_repo.fetch_latest_cash_balance_snapshot()
+    last_reward = await funding_repo.fetch_last_reward_credit()
+    lifetime_rewards = await funding_repo.fetch_lifetime_reward_credits_total()
     return build_system_funding_response(
         latest_rates=latest_rates,
         today_rates=today_rates,
@@ -1173,6 +1180,9 @@ async def system_funding(
         metadata=metadata,
         sweeps_today=sweeps_today,
         balance_snapshot=balance_snapshot,
+        cash_snapshot=cash_snapshot,
+        last_reward=last_reward,
+        lifetime_rewards=lifetime_rewards,
         yield_apy=settings.cash_yield_apy,
         now=now,
     )

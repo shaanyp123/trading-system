@@ -86,13 +86,15 @@ class TestCollectTrackedTasks:
         )
         # Crypto-pivot C0-B2b: the IBKR order_placement slot was retired
         # with the IBKR execution layer; coinbase_market_data (C0-B2a)
-        # is defaulted None so lifespan callers that fail its startup
-        # still produce the full tracked set.
-        assert len(result) == 3
+        # and usdc_rewards_capture (2026-07-10) are defaulted None so
+        # lifespan callers that fail their startup still produce the
+        # full tracked set.
+        assert len(result) == 4
         assert [t.name for t in result] == [
             "reconciliation_scheduler.run_forever",
             "heartbeat_probe.run_forever",
             "coinbase_market_data.run_forever",
+            "usdc_rewards_capture.run_forever",
         ]
         assert all(t.task is None for t in result)
         assert all(t.expected_alive is False for t in result)
