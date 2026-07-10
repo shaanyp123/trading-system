@@ -1012,6 +1012,93 @@ async def _stop_reconciliation_scheduler(state: tuple[object, object] | None) ->
         log.exception("reconciliation_scheduler_task_join_failed")
 
 
+async def _start_usdc_rewards_capture(
+    settings: APISettings,
+) -> tuple[object, object] | None:
+    """Construct + start the daily USDC rewards capture; (sched, task) or None.
+
+    Operator feature request (decisions-log 2026-07-10, measure-don't-
+    estimate): a daily 00:20 UTC job — after the 00:15 recon — that
+    polls the Coinbase v2 USDC ledger for candidate reward transactions
+    and snapshots the CBI spot USD/USDC balances
+    (``services/data/usdc_rewards.py``). Same fail-closed credential
+    contract as the recon scheduler (same CDP key pair); unlike recon it
+    needs NO active accounts row — its tables are venue-scoped (no
+    account FK), matching the funding_rates precedent.
+
+    Reuses :class:`services.reconciliation.scheduler.ReconciliationScheduler`
+    as the generic fire-once-per-UTC-day primitive (its
+    ``eod_recon_time_utc`` knob is just "the daily fire time"); errors
+    inside the callback are logged + swallowed so a venue outage never
+    kills the scheduler — and every insert is idempotent, so the
+    restart-refire semantics are safe.
+    """
+    if not settings.usdc_rewards_capture_enabled:
+        log.warning("usdc_rewards_capture_disabled_via_setting")
+        return None
+
+    if settings.coinbase_api_key_name is None or settings.coinbase_api_private_key is None:
+        log.warning(
+            "usdc_rewards_capture_coinbase_credentials_missing",
+            note=(
+                "Set coinbase.api_key_name + coinbase.api_private_key in the "
+                "secrets file to enable the daily USDC rewards capture."
+            ),
+        )
+        return None
+
+    from services.data.usdc_rewards import (
+        DEFAULT_CASH_CAPTURE_TIME_UTC,
+        SdkCoinbaseCashClient,
+        UsdcRewardsCaptureJob,
+        make_capture_callback,
+    )
+    from services.reconciliation.scheduler import ReconciliationScheduler
+
+    client = SdkCoinbaseCashClient(
+        api_key_name=settings.coinbase_api_key_name.get_secret_value(),
+        api_private_key=settings.coinbase_api_private_key.get_secret_value(),
+    )
+    job = UsdcRewardsCaptureJob(
+        client=client,
+        session_factory=api_db.get_session_factory(),
+    )
+    scheduler = ReconciliationScheduler(
+        callback=make_capture_callback(job),
+        eod_recon_time_utc=DEFAULT_CASH_CAPTURE_TIME_UTC,
+    )
+    task = asyncio.create_task(scheduler.run_forever(), name="usdc_rewards_capture.run_forever")
+    log.info(
+        "usdc_rewards_capture_spawned",
+        fire_time_utc=DEFAULT_CASH_CAPTURE_TIME_UTC.isoformat(),
+    )
+    return scheduler, task
+
+
+async def _stop_usdc_rewards_capture(state: tuple[object, object] | None) -> None:
+    """Request stop + await the capture scheduler task. Best-effort."""
+    if state is None:
+        return
+    scheduler, task = state
+    try:
+        scheduler.request_stop()  # type: ignore[attr-defined]
+    except Exception:
+        log.exception("usdc_rewards_capture_request_stop_failed")
+    try:
+        await asyncio.wait_for(task, timeout=15.0)  # type: ignore[arg-type]
+    except TimeoutError:
+        log.warning("usdc_rewards_capture_shutdown_timeout")
+        task.cancel()  # type: ignore[attr-defined]
+        try:
+            await task  # type: ignore[misc]
+        except asyncio.CancelledError:
+            log.info("usdc_rewards_capture_shutdown_cancelled")
+        except Exception:
+            log.exception("usdc_rewards_capture_shutdown_unclean")
+    except Exception:
+        log.exception("usdc_rewards_capture_task_join_failed")
+
+
 async def _start_heartbeat_probe(
     settings: APISettings,
 ) -> tuple[object, object] | None:
@@ -1325,6 +1412,7 @@ async def _start_async_task_monitor(
     reconciliation: tuple[object, object] | None,
     heartbeat_probe: tuple[object, object] | None,
     coinbase_market_data: tuple[object, object] | None = None,
+    usdc_rewards_capture: tuple[object, object] | None = None,
     monitor_alert_hook: object | None = None,
     task_death_alert_hook: object | None = None,
 ) -> tuple[object, object] | None:
@@ -1355,6 +1443,7 @@ async def _start_async_task_monitor(
         reconciliation=reconciliation,
         heartbeat_probe=heartbeat_probe,
         coinbase_market_data=coinbase_market_data,
+        usdc_rewards_capture=usdc_rewards_capture,
     )
 
     # Recovery-agent task-death hook (drill 5/6 follow-up, 2026-05-26).
@@ -1409,6 +1498,7 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     recon_state: tuple[object, object] | None = None
     heartbeat_probe_state: tuple[object, object] | None = None
     coinbase_market_data_state: tuple[object, object] | None = None
+    usdc_rewards_capture_state: tuple[object, object] | None = None
     async_task_monitor_state: tuple[object, object] | None = None
     try:
         try:
@@ -1445,6 +1535,13 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             # funding/metadata capture pauses until the next restart).
             log.exception("coinbase_market_data_worker_startup_failed")
         try:
+            usdc_rewards_capture_state = await _start_usdc_rewards_capture(settings)
+        except Exception:
+            # Capture startup is best-effort; the api serves requests
+            # without it (the funding strip's cash fields go stale and
+            # rewards capture pauses until the next restart).
+            log.exception("usdc_rewards_capture_startup_failed")
+        try:
             # The monitor MUST start AFTER the other workers so it can
             # capture their final `(worker, task)` tuples (or `None`
             # for ones that failed to spawn). The monitor itself is
@@ -1470,6 +1567,7 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 reconciliation=recon_state,
                 heartbeat_probe=heartbeat_probe_state,
                 coinbase_market_data=coinbase_market_data_state,
+                usdc_rewards_capture=usdc_rewards_capture_state,
                 monitor_alert_hook=monitor_alert_hook,
                 task_death_alert_hook=task_death_alert_hook,
             )
@@ -1482,6 +1580,7 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     finally:
         log.info("api_stopping")
         await _stop_async_task_monitor(async_task_monitor_state)
+        await _stop_usdc_rewards_capture(usdc_rewards_capture_state)
         await _stop_coinbase_market_data_worker(coinbase_market_data_state)
         await _stop_heartbeat_probe(heartbeat_probe_state)
         await _stop_reconciliation_scheduler(recon_state)

@@ -487,6 +487,7 @@ def collect_tracked_tasks(
     reconciliation: tuple[object, object] | None,
     heartbeat_probe: tuple[object, object] | None,
     coinbase_market_data: tuple[object, object] | None = None,
+    usdc_rewards_capture: tuple[object, object] | None = None,
 ) -> tuple[TrackedTask, ...]:
     """Build the canonical TrackedTask tuple from lifespan state.
 
@@ -497,9 +498,12 @@ def collect_tracked_tasks(
 
     The argument order matches the lifespan's ordering for log
     consistency: reconciliation → heartbeat_probe →
-    coinbase_market_data. (The IBKR order_placement slot was retired
-    with the IBKR execution layer, crypto-pivot C0-B2b; the §3.3
-    strategy worker claims a slot here in C0-B3.)
+    coinbase_market_data → usdc_rewards_capture. (The IBKR
+    order_placement slot was retired with the IBKR execution layer,
+    crypto-pivot C0-B2b; the §3.3 strategy worker claims a slot here
+    in C0-B3. The usdc_rewards_capture slot is telemetry-only — its
+    death is log-visible but deliberately NOT on the task-death
+    allow-list: no risk surface depends on it.)
     """
     return (
         TrackedTask(
@@ -516,6 +520,11 @@ def collect_tracked_tasks(
             name="coinbase_market_data.run_forever",
             task=_extract_task(coinbase_market_data),
             expected_alive=coinbase_market_data is not None,
+        ),
+        TrackedTask(
+            name="usdc_rewards_capture.run_forever",
+            task=_extract_task(usdc_rewards_capture),
+            expected_alive=usdc_rewards_capture is not None,
         ),
     )
 
