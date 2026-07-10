@@ -31,11 +31,32 @@ layer. Four responsibilities, one worker:
    :func:`fetch_daily_bars`.
 
 4. **3-minute staleness watchdog** (strategy §7 data-outage row) —
-   every tick, classifies each subscribed product's last-mark age; on
-   transition past the threshold, dispatches a P2 alert (descriptor
-   built in :mod:`services.data.coinbase_market_data_alerts`). The
-   protective *response* (protected-hold vs flatten) belongs to the
-   risk loop; this worker detects + alerts.
+   every tick, classifies each subscribed product's last-mark age
+   against the threshold, split into two tiers (decisions-log
+   2026-07-09, "C1 night one": one flat threshold across all ~28 CDE
+   subscriptions had illiquid alt perps re-firing the P2 every
+   cooldown window all night — alert fatigue on a real P2 channel):
+
+   * **Critical tier** — the spot signal products
+     (``config.spot_product_ids``) plus the discovered CDE perp
+     products whose base asset is in the traded set (derived from the
+     spot pairs, e.g. ``BTC-USD`` → ``BTC``; never an ID whitelist,
+     [A13]). Staleness here dispatches the P2 ``broker_disconnect``
+     alert (descriptor built in
+     :mod:`services.data.coinbase_market_data_alerts`), cooldown-
+     throttled as before.
+   * **Telemetry tier** — every other subscribed perp (funding-
+     telemetry-only alt products). Staleness here is LOGGED
+     (``coinbase_marks_stale_telemetry_tier``, throttled to once per
+     cooldown window) but NEVER alerts: a real venue/WS outage stales
+     the critical tier too (everything rides one WS connection), so
+     alerting on the critical tier alone loses no outage coverage,
+     while per-product illiquidity is not an incident.
+
+   The protective *response* (protected-hold vs flatten) belongs to
+   the risk loop; this worker detects + alerts. The strategy worker's
+   own held-positions ``marks_stale`` check (``services/signal``) is a
+   separate, unrelated surface and is unaffected by this tiering.
 
 **No authentication anywhere in this module** — every REST call uses
 the public ``/api/v3/brokerage/market`` endpoints and the WS ticker
@@ -65,7 +86,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
@@ -161,9 +182,19 @@ class PerpProductSnapshot:
     ``product_metadata.raw`` JSONB for forensic diffing beyond the
     first-class columns (REPORT rider: auto-demotion on fee/margin
     change detection).
+
+    ``base_asset`` is the normalized-upper base asset (e.g. ``BTC``),
+    preferring ``future_product_details.contract_root_unit`` — live
+    truth (probes 2026-07-09): the spot-style ``base_currency_id`` /
+    ``base_display_symbol`` fields are EMPTY strings on CDE products —
+    with those spot-style fields as fallback (same precedence as
+    ``services.api.schemas.funding.asset_label_from_metadata``). The
+    staleness watchdog uses it to classify the critical vs telemetry
+    alert tier (decisions-log 2026-07-09, "C1 night one").
     """
 
     product_id: str
+    base_asset: str | None
     tick_size: Decimal | None
     contract_size: Decimal | None
     initial_margin_requirement: Decimal | None
@@ -264,8 +295,19 @@ def parse_perp_product(raw: Mapping[str, Any]) -> PerpProductSnapshot | None:
     else:
         trading_disabled = None
 
+    base_asset: str | None = None
+    for candidate in (
+        details_map.get("contract_root_unit"),
+        raw.get("base_currency_id"),
+        raw.get("base_display_symbol"),
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            base_asset = candidate.strip().upper()
+            break
+
     return PerpProductSnapshot(
         product_id=product_id,
+        base_asset=base_asset,
         tick_size=_coerce_decimal(raw.get("price_increment") or raw.get("quote_increment")),
         contract_size=_coerce_decimal(details_map.get("contract_size")),
         initial_margin_requirement=_coerce_decimal(
@@ -293,6 +335,19 @@ def discover_perp_products(products: list[Mapping[str, Any]]) -> list[PerpProduc
         if snap is not None:
             out.append(snap)
     return out
+
+
+def spot_base_assets(spot_product_ids: Iterable[str]) -> frozenset[str]:
+    """Traded base-asset set derived from the spot signal pairs.
+
+    ``BTC-USD`` → ``BTC``; ``ETH-USD`` → ``ETH``. The staleness
+    watchdog's critical tier is the spot signal products plus every
+    discovered perp whose :attr:`PerpProductSnapshot.base_asset` is in
+    this set — derived, never a hardcoded product-ID whitelist ([A13]).
+    """
+    return frozenset(
+        pid.split("-", 1)[0].strip().upper() for pid in spot_product_ids if pid.strip()
+    )
 
 
 def parse_daily_candle(product_id: str, raw: Mapping[str, Any]) -> DailyBar | None:
@@ -582,6 +637,12 @@ class MarketDataStatus:
     ws_connected: bool = False
     ws_connect_count: int = 0
     subscribed_product_ids: tuple[str, ...] = ()
+    #: Staleness-alert critical tier: spot signal products + discovered
+    #: perps on the traded base assets (decisions-log 2026-07-09 "C1
+    #: night one" tiering). Everything else subscribed is telemetry-only
+    #: (logged when stale, never alerted). Additive field — existing
+    #: consumers of this status are unaffected.
+    critical_product_ids: tuple[str, ...] = ()
     last_funding_snapshot_utc: datetime | None = None
     last_funding_rows_written: int = 0
     consecutive_funding_misses: int = 0
@@ -630,12 +691,22 @@ class CoinbaseMarketDataWorker:
         self.mark_store = MarkStore()
         self.status = MarketDataStatus(
             subscribed_product_ids=tuple(config.spot_product_ids),
+            critical_product_ids=tuple(sorted(config.spot_product_ids)),
         )
+        #: Traded base assets derived from the spot signal pairs (e.g.
+        #: BTC-USD → BTC); classifies discovered perps into the
+        #: staleness-alert critical tier ([A13]: derived, not an ID list).
+        self._traded_base_assets: frozenset[str] = spot_base_assets(config.spot_product_ids)
         self._perp_product_ids: tuple[str, ...] = ()
+        #: Discovered perps on the traded base assets — refreshed by
+        #: ``_set_perp_products`` alongside the subscription list, so
+        #: critical-tier membership tracks the daily re-discovery.
+        self._critical_perp_product_ids: tuple[str, ...] = ()
         self._last_fired_funding_hour_utc: datetime | None = initial_fired_funding_hour_utc
         self._last_fired_metadata_date_utc: date | None = initial_fired_metadata_date_utc
         self._last_funding_success_utc: datetime | None = None
         self._last_stale_alert_utc: datetime | None = None
+        self._last_telemetry_stale_log_utc: datetime | None = None
         self._started_at_utc: datetime | None = None
 
     # -- lifecycle ---------------------------------------------------------
@@ -716,7 +787,7 @@ class CoinbaseMarketDataWorker:
         try:
             products = await self._rest.get_future_products()
             perps = discover_perp_products(products)
-            self._set_perp_products(tuple(sorted(p.product_id for p in perps)))
+            self._set_perp_products(perps)
         except Exception:
             self._log.exception("coinbase_funding_products_fetch_failed")
 
@@ -805,7 +876,7 @@ class CoinbaseMarketDataWorker:
         try:
             products = await self._rest.get_future_products()
             perps = discover_perp_products(products)
-            self._set_perp_products(tuple(sorted(p.product_id for p in perps)))
+            self._set_perp_products(perps)
         except Exception:
             self._log.exception("coinbase_metadata_products_fetch_failed")
 
@@ -894,10 +965,32 @@ class CoinbaseMarketDataWorker:
     # -- job: staleness watchdog ---------------------------------------------
 
     async def run_staleness_check_once(self, *, now_utc: datetime | None = None) -> bool:
-        """Classify mark freshness; alert on stale transition. True if stale.
+        """Classify mark freshness per tier; alert on CRITICAL staleness only.
+
+        Two tiers (decisions-log 2026-07-09, "C1 night one": illiquid alt
+        perps legitimately go >180 s without a WS tick, and a flat
+        threshold re-fired the P2 ``broker_disconnect`` every cooldown
+        window all night):
+
+        * **Critical** — spot signal products + discovered perps on the
+          traded base assets. Stale → the existing P2 alert (same
+          category/payload, cooldown-throttled). The alert lists ONLY
+          critical products: mixing the expected-stale alt-perp list back
+          into the P2 body would bury the load-bearing products and
+          recreate the noise this tiering removes; telemetry ages remain
+          visible in the throttled info log below.
+        * **Telemetry** — every other subscribed perp. Stale → info log
+          ``coinbase_marks_stale_telemetry_tier`` (throttled to once per
+          cooldown window, on its own timer), NEVER an alert. A real
+          venue/WS outage stales the critical tier too (one shared WS
+          connection), so no outage coverage is lost; per-product
+          illiquidity is not an incident.
 
         Products never ticked count as stale once the startup grace has
         elapsed (a WS that never connects must not look healthy).
+        Returns True when the CRITICAL tier is stale. Distinct surface
+        from the strategy worker's held-positions ``marks_stale`` check
+        in ``services/signal`` — that one is unaffected by this policy.
         """
         if now_utc is None:
             now_utc = self._clock()
@@ -907,18 +1000,47 @@ class CoinbaseMarketDataWorker:
             and (now_utc - self._started_at_utc).total_seconds() < self._config.startup_grace_s
         )
 
-        tracked = set(self._config.spot_product_ids) | set(self._perp_product_ids)
+        critical_tracked = set(self._config.spot_product_ids) | set(self._critical_perp_product_ids)
+        telemetry_tracked = set(self._perp_product_ids) - critical_tracked
         ages = self.mark_store.ages_seconds(now_utc=now_utc)
-        stale: dict[str, float] = {}
-        for product_id in sorted(tracked):
-            age = ages.get(product_id)
-            if age is None:
-                if not in_grace and self._started_at_utc is not None:
-                    stale[product_id] = (now_utc - self._started_at_utc).total_seconds()
-            elif age >= threshold:
-                stale[product_id] = age
 
-        if not stale:
+        def stale_ages(tracked: set[str]) -> dict[str, float]:
+            stale: dict[str, float] = {}
+            for product_id in sorted(tracked):
+                age = ages.get(product_id)
+                if age is None:
+                    if not in_grace and self._started_at_utc is not None:
+                        stale[product_id] = (now_utc - self._started_at_utc).total_seconds()
+                elif age >= threshold:
+                    stale[product_id] = age
+            return stale
+
+        stale_critical = stale_ages(critical_tracked)
+        stale_telemetry = stale_ages(telemetry_tracked)
+
+        # Telemetry tier: log-only, throttled on its own per-tier timer.
+        if stale_telemetry and not in_grace:
+            telemetry_log_due = (
+                self._last_telemetry_stale_log_utc is None
+                or (now_utc - self._last_telemetry_stale_log_utc).total_seconds()
+                >= self._config.stale_realert_cooldown_s
+            )
+            if telemetry_log_due:
+                self._log.info(
+                    "coinbase_marks_stale_telemetry_tier",
+                    stale_products={pid: int(age) for pid, age in stale_telemetry.items()},
+                    stale_threshold_s=int(threshold),
+                    telemetry_products_tracked=len(telemetry_tracked),
+                    note=(
+                        "funding-telemetry perp(s) without a recent WS tick; "
+                        "expected on illiquid products — never alerts "
+                        "(decisions-log 2026-07-09 C1 night-one tiering)"
+                    ),
+                )
+                self._last_telemetry_stale_log_utc = now_utc
+
+        # Critical tier: existing alert policy, product set narrowed.
+        if not stale_critical:
             if self.status.stale_since_utc is not None:
                 self._log.info(
                     "coinbase_marks_recovered",
@@ -939,13 +1061,14 @@ class CoinbaseMarketDataWorker:
         )
         self._log.warning(
             "coinbase_marks_stale",
-            stale_products={pid: int(age) for pid, age in stale.items()},
+            tier="critical",
+            stale_products={pid: int(age) for pid, age in stale_critical.items()},
             stale_threshold_s=int(threshold),
             alert_due=cooldown_ok,
         )
         if cooldown_ok:
             descriptor = build_marks_stale_alert(
-                stale_products=stale,
+                stale_products=stale_critical,
                 stale_threshold_s=threshold,
                 now_utc=now_utc,
             )
@@ -1026,7 +1149,7 @@ class CoinbaseMarketDataWorker:
         try:
             products = await self._rest.get_future_products()
             perps = discover_perp_products(products)
-            self._set_perp_products(tuple(sorted(p.product_id for p in perps)))
+            self._set_perp_products(perps)
         except Exception:
             self._log.warning(
                 "coinbase_ws_product_discovery_failed",
@@ -1037,14 +1160,36 @@ class CoinbaseMarketDataWorker:
                 known_perp_products=list(self._perp_product_ids),
             )
 
-    def _set_perp_products(self, product_ids: tuple[str, ...]) -> None:
-        if product_ids and product_ids != self._perp_product_ids:
-            self._log.info(
-                "coinbase_perp_products_discovered",
-                product_ids=list(product_ids),
-                previous=list(self._perp_product_ids),
-            )
-            self._perp_product_ids = product_ids
+    def _set_perp_products(self, perps: list[PerpProductSnapshot]) -> None:
+        """Record discovered perps + derive the staleness critical tier.
+
+        Called from every discovery path (WS resubscribe, hourly funding
+        pass, daily metadata pass) so critical-tier membership tracks
+        product refresh instead of being recomputed per staleness tick.
+        """
+        if not perps:
+            return
+        product_ids = tuple(sorted(p.product_id for p in perps))
+        critical_perp_ids = tuple(
+            sorted(p.product_id for p in perps if p.base_asset in self._traded_base_assets)
+        )
+        if (
+            product_ids == self._perp_product_ids
+            and critical_perp_ids == self._critical_perp_product_ids
+        ):
+            return
+        self._log.info(
+            "coinbase_perp_products_discovered",
+            product_ids=list(product_ids),
+            previous=list(self._perp_product_ids),
+            critical_perp_product_ids=list(critical_perp_ids),
+            traded_base_assets=sorted(self._traded_base_assets),
+        )
+        self._perp_product_ids = product_ids
+        self._critical_perp_product_ids = critical_perp_ids
+        self.status.critical_product_ids = tuple(
+            sorted(set(self._config.spot_product_ids) | set(critical_perp_ids))
+        )
 
     # -- alert seam --------------------------------------------------------------
 
@@ -1098,4 +1243,5 @@ __all__ = [
     "parse_perp_product",
     "should_fire_daily",
     "should_fire_hourly",
+    "spot_base_assets",
 ]

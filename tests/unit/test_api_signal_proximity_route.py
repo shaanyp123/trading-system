@@ -43,7 +43,11 @@ from services.api.schemas.signal_proximity import (
     hysteresis_days_from_parameters,
 )
 
-NOW = datetime(2026, 7, 9, 12, 0, tzinfo=UTC)
+# Midnight-UTC test bug (2026-07-10, C1 night one): a frozen NOW pinned
+# "today" to 2026-07-09 while the route derives lockout arithmetic from
+# the REAL clock — the test failed once the UTC calendar rolled. NOW
+# tracks the live clock; date-relative fixtures stay correct at any hour.
+NOW = datetime.now(tz=UTC)
 TODAY_ORD = NOW.date().toordinal()
 
 # ---------------------------------------------------------------------------

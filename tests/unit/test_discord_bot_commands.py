@@ -442,12 +442,19 @@ class TestStatusCommand:
 # ---------------------------------------------------------------------------
 
 
+# Midnight-UTC test bug (2026-07-10 00:00 UTC, C1 night one): these
+# fixtures originally hardcoded "2026-07-09" while the embed builder
+# compares decision_date against the REAL current UTC date — the tests
+# failed the moment the calendar rolled. Derive from the live clock.
+_FIXTURE_TODAY = datetime.now(tz=UTC).date().isoformat()
+
+
 def _cycle_payload_completed() -> dict[str, Any]:
     """Wire-shape mirror of ``GET /api/system/cycle`` (§3.7)."""
     return {
         "decision": {
-            "decision_date": "2026-07-09",
-            "decided_at_utc": "2026-07-09T00:05:12Z",
+            "decision_date": _FIXTURE_TODAY,
+            "decided_at_utc": f"{_FIXTURE_TODAY}T00:05:12Z",
             "status": "completed",
             "env": "paper",
             "equity_usd": "2000.00",
@@ -469,15 +476,15 @@ def _cycle_payload_completed() -> dict[str, Any]:
             ],
         },
         "worker": {
-            "risk_loop_heartbeat_utc": "2026-07-09T00:09:58Z",
+            "risk_loop_heartbeat_utc": f"{_FIXTURE_TODAY}T00:09:58Z",
             "seconds_since_heartbeat": 2,
             "heartbeat_fresh": True,
             "risk_loop_tick_count": 2880,
             "marks_stale": False,
-            "last_decision_date": "2026-07-09",
+            "last_decision_date": _FIXTURE_TODAY,
         },
         "next_friday_close_utc": "2026-07-10T21:00:00Z",
-        "server_now": "2026-07-09T00:10:00Z",
+        "server_now": f"{_FIXTURE_TODAY}T00:10:00Z",
     }
 
 
@@ -497,7 +504,7 @@ class TestCycleCommand:
         stub_client.get_system_cycle.assert_awaited_once()  # type: ignore[attr-defined]
         interaction.followup.send.assert_awaited_once()
         embed = interaction.followup.send.await_args.kwargs["embed"]
-        assert "Daily decision — 2026-07-09" in (embed.title or "")
+        assert f"Daily decision — {_FIXTURE_TODAY}" in (embed.title or "")
         field_names = [f.name for f in embed.fields]
         assert "BTC" in field_names
         assert "Risk loop" in field_names
@@ -523,7 +530,7 @@ class TestCycleCommand:
             "decision": None,
             "worker": None,
             "next_friday_close_utc": "2026-07-10T21:00:00Z",
-            "server_now": "2026-07-09T00:10:00Z",
+            "server_now": f"{_FIXTURE_TODAY}T00:10:00Z",
         }
         tree = _build_tree()
         register_cycle(tree, api_client=stub_client)
