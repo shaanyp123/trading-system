@@ -110,6 +110,7 @@ from services.api.schemas.system import (
     AuditLogPageResponse,
     HeartbeatItem,
     HeartbeatsResponse,
+    KillSwitchFalsePositiveRequest,
     KillSwitchInvokeRequest,
     KillSwitchResumeRequest,
     KillSwitchStatus,
@@ -133,6 +134,7 @@ from services.risk.state_machine import (
     IllegalTransitionError,
     RiskState,
     TransitionTrigger,
+    plan_false_positive_graduation,
     plan_invoke_kill_switch,
     plan_resume_from_halt,
 )
@@ -660,6 +662,114 @@ async def resume_from_halt(
         risk_state=applied.new_state,
         severity=applied.new_severity,
         halt_reason=None,  # CONVALESCENT carries no halt_reason
+        audit_event_uuid=str(applied.state_transition_audit_event_uuid),
+        sse_sequence_no=sequence_no,
+    )
+
+
+@router.post(
+    "/api/system/kill-switch/false-positive",
+    tags=["system"],
+    response_model=KillSwitchTransitionResponse,
+)
+async def adjudicate_false_positive(
+    body: KillSwitchFalsePositiveRequest,
+    session: SessionContext = Depends(get_session_context),
+    db: AsyncSession = Depends(get_session),
+    repo: Phase1QueryRepo = Depends(_get_repo),
+    settings: APISettings = Depends(get_settings),
+) -> KillSwitchTransitionResponse:
+    """Adjudicate the current CONVALESCENT probation as a false positive
+    and graduate to NORMAL immediately (2026-07-11 operator amendment).
+
+    Same auth bar as ``resume`` (risk-LOOSENING → recent WebAuthn UV per
+    dev-guide §1.5 LOCKED; Discord stays risk-tightening-only per
+    frontend-spec §6.1). Only lawful from CONVALESCENT — a false-positive
+    claim never shortcuts a live HALT_NEW; resume first, then adjudicate.
+
+    Conflicts:
+
+      * Re-auth missing → 401 ``RE_AUTH_REQUIRED``.
+      * No active account → 409 ``NO_ACTIVE_ACCOUNT``.
+      * ``risk_state != CONVALESCENT`` → 409 ``NOT_CONVALESCENT``.
+      * Blank reason / defect_reference → 422 (pydantic min_length).
+    """
+    sessions_mod.require_recent_uv(session)
+
+    now = datetime.now(tz=UTC)
+    account_id = await repo.fetch_active_account_id()
+    if account_id is None:
+        raise AppError(
+            error_code="NO_ACTIVE_ACCOUNT",
+            message="No active account is registered.",
+            status_code=409,
+        )
+
+    risk_row = await repo.fetch_risk_state_current(account_id)
+    if risk_row is None or risk_row.state != "CONVALESCENT":
+        current = risk_row.state if risk_row is not None else "NORMAL"
+        raise AppError(
+            error_code="NOT_CONVALESCENT",
+            message=(
+                f"Cannot adjudicate a false positive from state {current!r}; "
+                "adjudication is only valid from CONVALESCENT. Resume the "
+                "halt first if the system is in HALT_NEW."
+            ),
+            status_code=409,
+        )
+
+    # Whitespace-only reason/reference passes pydantic's min_length but is
+    # rejected by the policy layer — translate to 422 rather than 500.
+    try:
+        plan = plan_false_positive_graduation(
+            current_state=RiskState.CONVALESCENT,
+            convalescent_counter=risk_row.convalescent_session_count,
+            operator_reason=body.reason,
+            defect_reference=body.defect_reference,
+            operator_session_id=session.user_id,
+            timestamp_utc=now.isoformat(),
+        )
+    except IllegalTransitionError as exc:
+        raise AppError(
+            error_code="VALIDATION_ERROR",
+            message=str(exc),
+            status_code=422,
+        ) from exc
+
+    # DP-021 (Day 25 carryover): see invoke route comment. The repo SELECTs
+    # above auto-began a transaction on this session; the writer requires a
+    # clean session, so commit here before apply_state_transition.
+    await db.commit()
+
+    applied = await apply_state_transition(
+        plan=plan,
+        db=db,
+        account_id=account_id,
+        env=_env_for_audit(settings.environment),
+        phase_at_emit=_PHASE_AT_EMIT_PHASE_0,
+    )
+
+    sequence_no = await emit_sse(
+        plan.sse_event.event_type,
+        {
+            **plan.sse_event.data,
+            "audit_event_uuid": str(applied.state_transition_audit_event_uuid),
+        },
+    )
+
+    log.info(
+        "kill_switch_false_positive_applied",
+        operator_session_id=session.user_id,
+        defect_reference=body.defect_reference,
+        convalescent_sessions_served=risk_row.convalescent_session_count,
+        audit_event_uuid=str(applied.state_transition_audit_event_uuid),
+        sse_sequence_no=sequence_no,
+    )
+
+    return KillSwitchTransitionResponse(
+        risk_state=applied.new_state,
+        severity=applied.new_severity,
+        halt_reason=None,
         audit_event_uuid=str(applied.state_transition_audit_event_uuid),
         sse_sequence_no=sequence_no,
     )

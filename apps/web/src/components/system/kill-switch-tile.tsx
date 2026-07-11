@@ -39,6 +39,7 @@ import {
   useKillSwitchStatus,
 } from '@/lib/api/queries';
 import { useResumeKillSwitch } from '@/lib/api/mutations';
+import { FalsePositiveModal } from './false-positive-modal';
 import type { KillSwitchStatus } from '@/lib/api/types';
 import { formatDateTimeET } from '@/lib/format';
 import { Button } from '@/components/ui/button';
@@ -90,8 +91,11 @@ export function KillSwitchTile(): JSX.Element {
   const resume = useResumeKillSwitch();
 
   const [invokeOpen, setInvokeOpen] = useState(false);
+  const [falsePositiveOpen, setFalsePositiveOpen] = useState(false);
   const [reauthOpen, setReauthOpen] = useState(false);
-  const [reauthPurpose, setReauthPurpose] = useState<'resume' | null>(null);
+  const [reauthPurpose, setReauthPurpose] = useState<
+    'resume' | 'false-positive' | null
+  >(null);
 
   const handleResumeClick = (): void => {
     const lastUvAt = me.data?.last_uv_at ?? null;
@@ -103,9 +107,22 @@ export function KillSwitchTile(): JSX.Element {
     setReauthOpen(true);
   };
 
+  const handleFalsePositiveClick = (): void => {
+    const lastUvAt = me.data?.last_uv_at ?? null;
+    if (isUvFresh(lastUvAt)) {
+      setFalsePositiveOpen(true);
+      return;
+    }
+    setReauthPurpose('false-positive');
+    setReauthOpen(true);
+  };
+
   const handleReauthAuthorized = (): void => {
     if (reauthPurpose === 'resume') {
       resume.mutate({});
+    }
+    if (reauthPurpose === 'false-positive') {
+      setFalsePositiveOpen(true);
     }
     setReauthPurpose(null);
   };
@@ -143,6 +160,7 @@ export function KillSwitchTile(): JSX.Element {
               status={ks.data}
               onInvokeClick={() => setInvokeOpen(true)}
               onResumeClick={handleResumeClick}
+              onFalsePositiveClick={handleFalsePositiveClick}
               resumeBusy={resume.isPending}
             />
           )}
@@ -153,6 +171,10 @@ export function KillSwitchTile(): JSX.Element {
         open={invokeOpen}
         onClose={() => setInvokeOpen(false)}
       />
+      <FalsePositiveModal
+        open={falsePositiveOpen}
+        onClose={() => setFalsePositiveOpen(false)}
+      />
       <ReauthModal
         open={reauthOpen}
         onClose={() => {
@@ -161,7 +183,11 @@ export function KillSwitchTile(): JSX.Element {
         }}
         onAuthorized={handleReauthAuthorized}
         actionLabel={
-          reauthPurpose === 'resume' ? 'Resume kill switch' : 'Risk-loosening action'
+          reauthPurpose === 'resume'
+            ? 'Resume kill switch'
+            : reauthPurpose === 'false-positive'
+              ? 'Mark halt as false positive'
+              : 'Risk-loosening action'
         }
       />
     </>
@@ -172,11 +198,13 @@ function KillSwitchBody({
   status,
   onInvokeClick,
   onResumeClick,
+  onFalsePositiveClick,
   resumeBusy,
 }: {
   status: KillSwitchStatus;
   onInvokeClick: () => void;
   onResumeClick: () => void;
+  onFalsePositiveClick: () => void;
   resumeBusy: boolean;
 }): JSX.Element {
   if (status.risk_state === 'NORMAL') {
@@ -253,13 +281,23 @@ function KillSwitchBody({
       <div
         className={`rounded-md border ${SEVERITY_STYLES.CONVALESCENT?.banner ?? ''} px-3 py-2 text-sm`}
       >
-        CONVALESCENT mode — vol target halved for 5 sessions, then auto-returns
-        to NORMAL.
+        CONVALESCENT mode — position sizing halved until 3 clean UTC days
+        elapse (2026-07-09 amendment), then auto-returns to NORMAL.
       </div>
       <p className="text-sm text-text-muted">
-        Operator-initiated transitions are not required during CONVALESCENT;
-        the state advances automatically once the session counter elapses.
+        The state advances automatically at the 00:15 UTC tick after 3 clean
+        days. If this halt was caused by a system defect (not a real risk
+        trigger), you can adjudicate it as a false positive and return to
+        NORMAL immediately.
       </p>
+      <Button
+        variant="outline"
+        size="sm"
+        onClick={onFalsePositiveClick}
+        title="Re-verify with passkey, then graduate to NORMAL immediately."
+      >
+        Mark halt as false positive (re-auth required)
+      </Button>
     </div>
   );
 }

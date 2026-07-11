@@ -33,6 +33,11 @@ interface ResumeKillSwitchArgs {
   readonly incidentReviewId?: string;
 }
 
+interface FalsePositiveArgs {
+  readonly reason: string;
+  readonly defectReference: string;
+}
+
 function invalidateKillSwitchSurfaces(qc: ReturnType<typeof useQueryClient>): void {
   void qc.invalidateQueries({ queryKey: QUERY_KEYS.killSwitch });
   void qc.invalidateQueries({ queryKey: QUERY_KEYS.systemStatus });
@@ -55,6 +60,15 @@ function surfaceKillSwitchError(err: unknown, fallbackTitle: string): void {
         title: 'Not halted',
         description:
           'Resume is only valid from HALT_NEW. The system is already in NORMAL or CONVALESCENT.',
+        severity: 'p2',
+      });
+      return;
+    }
+    if (err.errorCode === 'NOT_CONVALESCENT') {
+      toast({
+        title: 'Not in CONVALESCENT',
+        description:
+          'False-positive adjudication is only valid from CONVALESCENT. Resume the halt first.',
         severity: 'p2',
       });
       return;
@@ -121,6 +135,32 @@ export function useResumeKillSwitch(): UseMutationResult<
       );
     },
     onError: (err) => surfaceKillSwitchError(err, 'Kill switch resume failed'),
+    onSettled: () => invalidateKillSwitchSurfaces(queryClient),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 2026-07-11 — False-positive adjudication (CONVALESCENT → NORMAL; re-auth
+// gated like resume — risk-loosening stays web-only per spec §6.1)
+// ---------------------------------------------------------------------------
+
+export function useFalsePositiveGraduation(): UseMutationResult<
+  KillSwitchTransitionResponse,
+  unknown,
+  FalsePositiveArgs
+> {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ reason, defectReference }) =>
+      apiCall<KillSwitchTransitionResponse>(
+        '/api/system/kill-switch/false-positive',
+        {
+          method: 'POST',
+          body: { reason, defect_reference: defectReference },
+        },
+      ),
+    onError: (err) =>
+      surfaceKillSwitchError(err, 'False-positive adjudication failed'),
     onSettled: () => invalidateKillSwitchSurfaces(queryClient),
   });
 }

@@ -23,7 +23,11 @@ Valid transitions (backend-spec §2.4.3 mermaid diagram):
     NORMAL       -> HALT_NEW       (any trigger; severity per trigger taxonomy)
     HALT_NEW     -> CONVALESCENT   (human resume; re-auth web-only)
     CONVALESCENT -> HALT_NEW       (any trigger; counter resets to 0)
-    CONVALESCENT -> NORMAL         (after EXACTLY 3 clean UTC calendar days)
+    CONVALESCENT -> NORMAL         (two lawful causes: (a) after EXACTLY 3
+                                    clean UTC calendar days; (b) operator
+                                    false-positive adjudication — 2026-07-11
+                                    amendment, :func:`plan_false_positive_graduation`,
+                                    re-auth web-only like resume)
 
 Invalid transitions (raise ``IllegalTransitionError``):
     NORMAL       -> CONVALESCENT       (must go through HALT_NEW)
@@ -398,6 +402,97 @@ def plan_resume_from_halt(
 
 
 # ---------------------------------------------------------------------------
+# Plan: operator false-positive adjudication (CONVALESCENT -> NORMAL)
+# ---------------------------------------------------------------------------
+
+
+def plan_false_positive_graduation(
+    *,
+    current_state: RiskState,
+    convalescent_counter: int,
+    operator_reason: str,
+    defect_reference: str,
+    operator_session_id: str,
+    timestamp_utc: str,
+) -> StateTransitionPlan:
+    """Plan CONVALESCENT -> NORMAL on operator false-positive adjudication.
+
+    2026-07-11 policy amendment (operator-directed after the phantom
+    recon-break auto-halt; decisions-log "C1 night two"): when a halt is
+    adjudicated to have been caused by a SYSTEM DEFECT rather than a
+    genuine risk trigger, the operator may graduate out of CONVALESCENT
+    immediately instead of serving the 3-clean-day probation. The
+    judgment is deliberately HUMAN — nothing auto-adjudicates:
+
+    * Only lawful from CONVALESCENT. The two-step shape is intentional:
+      the operator must first RESUME (HALT_NEW -> CONVALESCENT, the
+      existing re-auth gate) and then adjudicate — a false-positive
+      claim never shortcuts a live halt.
+    * ``defect_reference`` is REQUIRED (non-blank): the adjudication
+      must point at a concrete defect artifact (e.g. "PR #375" or a
+      decisions-log entry), so the audit chain always links the
+      probation waiver to the fix that justified it.
+    * ``operator_reason`` is REQUIRED (non-blank): the human rationale.
+    * Reuses the locked ``state_transition_convalescent_to_normal``
+      audit event type ([A04] — no enum migration); ``cause`` in the
+      payload distinguishes adjudication from clean-day graduation.
+
+    Same surface posture as resume: web-only behind the WebAuthn
+    re-auth gate. Discord stays risk-tightening-only per the locked
+    frontend-spec §6.1 posture — this is a risk-LOOSENING action.
+    """
+    if current_state != RiskState.CONVALESCENT:
+        raise IllegalTransitionError(
+            f"plan_false_positive_graduation from state={current_state} is "
+            "invalid; adjudication only valid from CONVALESCENT (resume the "
+            "halt first — a false-positive claim never shortcuts HALT_NEW)"
+        )
+    if not operator_reason.strip():
+        raise IllegalTransitionError("operator_reason is required for false-positive adjudication")
+    if not defect_reference.strip():
+        raise IllegalTransitionError(
+            "defect_reference is required for false-positive adjudication "
+            "(point at the defect fix, e.g. 'PR #375')"
+        )
+
+    audit_events = (
+        PendingAuditEvent(
+            event_type="state_transition_convalescent_to_normal",
+            payload={
+                "prior_state": RiskState.CONVALESCENT.value,
+                "new_state": RiskState.NORMAL.value,
+                "cause": "false_positive_adjudicated",
+                "convalescent_sessions_completed": convalescent_counter,
+                "operator_reason": operator_reason,
+                "defect_reference": defect_reference,
+                "operator_session_id": operator_session_id,
+                "ts": timestamp_utc,
+            },
+        ),
+    )
+    sse_event = PendingSSEEvent(
+        event_type="risk_state",
+        data={
+            "state": RiskState.NORMAL.value,
+            "severity": None,
+            "reason": "false_positive_adjudicated",
+            "audit_event_uuid": None,
+        },
+    )
+
+    return StateTransitionPlan(
+        prior_state=RiskState.CONVALESCENT,
+        new_state=RiskState.NORMAL,
+        prior_severity=None,
+        new_severity=None,
+        new_convalescent_counter=0,
+        reason="false_positive_adjudicated",
+        audit_events=audit_events,
+        sse_event=sse_event,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Plan: clean-UTC-day close — increment CONVALESCENT counter, maybe graduate
 # ---------------------------------------------------------------------------
 
@@ -569,6 +664,7 @@ __all__ = [
     "RiskState",
     "StateTransitionPlan",
     "TransitionTrigger",
+    "plan_false_positive_graduation",
     "plan_invoke_kill_switch",
     "plan_resume_from_halt",
     "plan_session_close",

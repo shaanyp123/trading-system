@@ -154,6 +154,32 @@ class KillSwitchResumeRequest(BaseModel):
     incident_review_id: str | None = None
 
 
+class KillSwitchFalsePositiveRequest(BaseModel):
+    """Body for ``POST /api/system/kill-switch/false-positive``
+    (CONVALESCENT → NORMAL; 2026-07-11 operator adjudication amendment).
+
+    Both fields are required and non-blank: the adjudication must carry
+    the human rationale AND point at the concrete defect artifact
+    (e.g. ``"PR #375"``) that justifies waiving the probation.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(
+        min_length=1,
+        max_length=500,
+        description="Operator rationale for adjudicating the halt false-positive.",
+    )
+    defect_reference: str = Field(
+        min_length=1,
+        max_length=200,
+        description=(
+            "Reference to the system-defect artifact that caused the halt "
+            "(e.g. 'PR #375' or a decisions-log entry)."
+        ),
+    )
+
+
 class KillSwitchTransitionResponse(BaseModel):
     """Body for the 200 OK response to both ``invoke`` and ``resume``.
 

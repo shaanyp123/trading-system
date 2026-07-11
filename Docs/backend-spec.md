@@ -690,6 +690,7 @@ stateDiagram-v2
 - State stored in `risk_state` table (single-row + history); all transitions write `state_transition_*` audit events
 - CONVALESCENT counter: `convalescent_session_count` integer in `risk_state`; incremented at each CME session close while in CONVALESCENT; reset on any trigger
 - **SUPERSEDED (2026-07-09, decisions-log "C1 night one, CONVALESCENT amendment"):** the criterion is now **3 clean UTC calendar days** (crypto has no CME sessions), the resume day counts, the breach day never counts, and the tick source is the 00:15 UTC recon cycle with a `convalescent_last_counted_day_utc` once-per-day marker. The mermaid "5 CME sessions" above is retained as history; the decisions-log entry wins.
+- **AMENDED (2026-07-11, decisions-log "C1 night two"):** CONVALESCENT → NORMAL gains a second lawful cause beside clean-day graduation: **operator false-positive adjudication** (`plan_false_positive_graduation` + `POST /api/system/kill-switch/false-positive`, re-auth gated web-only — Discord stays risk-tightening-only per frontend-spec §6.1). Only lawful from CONVALESCENT (never shortcuts HALT_NEW); requires a non-blank operator reason AND a defect-fix reference; reuses the locked `state_transition_convalescent_to_normal` audit event with `cause="false_positive_adjudicated"` in the payload.
 - Capital-event timer is independent of CONVALESCENT counter; both run in parallel, vol multipliers compose via `MIN`
 
 ### 2.4.4 Vol-Target Multiplier Composition
