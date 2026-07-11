@@ -338,6 +338,7 @@ class FakeStore(StrategyWorkerStore):
         self._log = structlog.get_logger()
         self.account = uuid4()
         self.risk = RiskStateSnapshot("NORMAL", None, 0, False)
+        self.capital_event_day: date | None = None
         self.param_head: tuple[str, dict[str, str]] | None = (
             "a" * 64,
             dict(AMENDMENT_B_CANONICAL_PARAMETERS),
@@ -364,6 +365,9 @@ class FakeStore(StrategyWorkerStore):
 
     async def fetch_risk_state(self, account_id: UUID) -> RiskStateSnapshot | None:
         return self.risk
+
+    async def fetch_last_threshold_met_capital_event_date(self, account_id: UUID) -> date | None:
+        return self.capital_event_day
 
     async def fetch_parameter_head(self) -> tuple[str, dict[str, str]] | None:
         return self.param_head
@@ -777,6 +781,84 @@ class TestSizingIntegration:
             assert sized == int(normal_targets[asset] * 0.5 // 1) or sized <= normal_targets[asset]
             engine = row["outcome"]["assets"][asset]["engine_target"]
             assert sized == (abs(engine) // 2) * (1 if engine > 0 else -1)
+
+    async def test_capital_event_sessions_1_to_5_halve_targets(self) -> None:
+        """Threshold-met event 3 UTC days back ⇒ m_capital_event=0.5."""
+        store = FakeStore()
+        store.capital_event_day = TODAY - timedelta(days=3)
+        worker, _, _ = await _started_worker(store=store)
+        await worker.run_daily_decision(TODAY)
+        row = store.decisions[TODAY]
+        assert row["status"] == "completed"
+        assert row["m_combined"] == Decimal("0.5")
+        assert row["outcome"]["capital_event_session_count"] == 3
+        for asset in ("BTC", "ETH"):
+            engine = row["outcome"]["assets"][asset]["engine_target"]
+            sized = row["outcome"]["assets"][asset]["sized_target"]
+            assert sized == (abs(engine) // 2) * (1 if engine > 0 else -1)
+
+    async def test_capital_event_session_6_normalizes_multiplier(self) -> None:
+        store = FakeStore()
+        store.capital_event_day = TODAY - timedelta(days=6)
+        worker, _, _ = await _started_worker(store=store)
+        await worker.run_daily_decision(TODAY)
+        row = store.decisions[TODAY]
+        assert row["status"] == "completed"
+        assert row["m_combined"] == Decimal("1.0")
+        assert row["outcome"]["capital_event_session_count"] == 6
+
+    async def test_capital_event_same_day_is_session_zero_full_size(self) -> None:
+        """The event's own UTC day counts as session 0 — sessions 1-5
+        are the five FOLLOWING days (the 00:05 decision predates an
+        intraday event; CME precedent: the event session never halved)."""
+        store = FakeStore()
+        store.capital_event_day = TODAY
+        worker, _, _ = await _started_worker(store=store)
+        await worker.run_daily_decision(TODAY)
+        row = store.decisions[TODAY]
+        assert row["m_combined"] == Decimal("1.0")
+        assert row["outcome"]["capital_event_session_count"] == 0
+
+    async def test_capital_event_plus_convalescent_is_min_not_product(self) -> None:
+        """§5.7 locked: MIN(0.5, 0.5) = 0.5, never 0.25."""
+        store = FakeStore()
+        store.risk = RiskStateSnapshot("CONVALESCENT", None, 2, False)
+        store.capital_event_day = TODAY - timedelta(days=2)
+        worker, _, _ = await _started_worker(store=store)
+        await worker.run_daily_decision(TODAY)
+        row = store.decisions[TODAY]
+        assert row["status"] == "completed"
+        assert row["m_combined"] == Decimal("0.5")
+
+    async def test_capital_event_lapsed_window_full_size(self) -> None:
+        """Event 31+ days back: mode over, even when risk_state still
+        carries the Phase-0 absolute-counter fields (nothing clears
+        them) — the date-derived count is authoritative."""
+        store = FakeStore()
+        store.risk = RiskStateSnapshot("NORMAL", None, 0, True)  # stale flag
+        store.capital_event_day = TODAY - timedelta(days=31)
+        worker, _, _ = await _started_worker(store=store)
+        await worker.run_daily_decision(TODAY)
+        row = store.decisions[TODAY]
+        assert row["status"] == "completed"
+        assert row["m_combined"] == Decimal("1.0")
+        assert row["outcome"]["capital_event_session_count"] == 31
+
+    async def test_capital_event_fetch_failure_fails_closed(self) -> None:
+        """A DB failure sourcing the count must never size on a guess:
+        the guarded decision fails loudly BEFORE any engine-state
+        mutation or dispatch, places no orders, and leaves the date
+        un-latched so the next 30 s tick retries."""
+        store = FakeStore()
+
+        async def _boom(account_id: UUID) -> date | None:
+            raise RuntimeError("db down")
+
+        store.fetch_last_threshold_met_capital_event_date = _boom  # type: ignore[method-assign]
+        worker, _, broker = await _started_worker(store=store)
+        await worker._run_decision_guarded(TODAY)
+        assert broker.create_calls == []
+        assert worker._last_decision_date != TODAY  # retried next tick
 
     async def test_phase_a_contract_clamp_applies(self) -> None:
         config = StrategyWorkerConfig(heartbeat_file=None, max_contracts={"BTC": 1, "ETH": 1})

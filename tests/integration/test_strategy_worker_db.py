@@ -302,6 +302,52 @@ class TestStoreRoundTrip:
             account_id, date(TODAY.year, TODAY.month, 1)
         ) == Decimal("6000")
 
+    async def test_fetch_last_threshold_met_capital_event_date(
+        self, session_factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Real-SQL contract for the m_capital_event count source:
+        threshold_met filter, MAX (latest event restarts the clock), and
+        the ``AT TIME ZONE 'UTC'`` date truncation."""
+        account_id, _ = await _seed_account_and_slippage(session_factory)
+        store = StrategyWorkerStore(session_factory=session_factory, env="paper")
+        assert await store.fetch_last_threshold_met_capital_event_date(account_id) is None
+
+        async def _insert(effective_at: str, threshold_met: bool) -> None:
+            async with session_factory() as session:
+                async with session.begin():
+                    await session.execute(
+                        text(
+                            "INSERT INTO capital_events ("
+                            "    account_id, event_type, amount_usd,"
+                            "    pre_event_equity, post_event_equity,"
+                            "    pct_of_pre_equity, threshold_met,"
+                            "    effective_at_utc, capital_event_mode_session_start,"
+                            "    audit_event_uuid"
+                            ") VALUES ("
+                            "    :acct, 'deposit', 500, 1500, 2000, 0.33333333,"
+                            "    :thr, :eff, :sess, :audit"
+                            ")"
+                        ),
+                        {
+                            "acct": account_id,
+                            "thr": threshold_met,
+                            "eff": datetime.fromisoformat(effective_at),
+                            "sess": 0 if threshold_met else None,
+                            "audit": uuid4(),
+                        },
+                    )
+
+        # Older threshold-met event, then a later one stored with a +02:00
+        # offset that is still 23:30 UTC the SAME UTC day — the fetch must
+        # normalize to the UTC calendar date, not the local one.
+        await _insert("2026-07-01T12:00:00+00:00", True)
+        await _insert("2026-07-06T01:30:00+02:00", True)  # = 2026-07-05T23:30Z
+        # Newest row is below threshold: never starts the mode, must not win.
+        await _insert("2026-07-08T00:00:00+00:00", False)
+
+        got = await store.fetch_last_threshold_met_capital_event_date(account_id)
+        assert got == date(2026, 7, 5)
+
     async def test_signal_order_fill_and_alert_round_trip(
         self, session_factory: async_sessionmaker[AsyncSession]
     ) -> None:

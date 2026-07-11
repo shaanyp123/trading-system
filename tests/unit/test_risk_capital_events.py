@@ -25,7 +25,7 @@ Coverage:
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
 
@@ -37,8 +37,10 @@ from services.risk.capital_events import (
     CAPITAL_EVENT_VOL_NORMALIZED_AFTER_SESSIONS,
     CapitalEventError,
     CapitalEventPlan,
+    capital_event_session_count,
     plan_capital_event,
 )
+from services.risk.multipliers import m_combined
 
 
 def _now() -> datetime:
@@ -318,3 +320,49 @@ class TestAuditPayloadShape:
         mode_payload = plan.audit_events[1].payload
         assert mode_payload["mode_active_until_session_no"] == 130
         assert mode_payload["mode_vol_normalized_at_session_no"] == 105
+
+
+class TestSessionCountUtcDays:
+    """Crypto-era session count: UTC-day delta since the latest
+    threshold-met event (decisions-log 2026-07-10). Event day = 0;
+    sessions 1-5 are the five following UTC days."""
+
+    DECISION = date(2026, 7, 15)
+
+    def _count(self, event_day: date | None) -> int:
+        return capital_event_session_count(
+            decision_date=self.DECISION,
+            last_threshold_met_event_date_utc=event_day,
+        )
+
+    def test_no_event_is_zero(self) -> None:
+        assert self._count(None) == 0
+
+    def test_event_day_itself_is_session_zero(self) -> None:
+        assert self._count(self.DECISION) == 0
+
+    def test_days_one_through_five_half_size_window(self) -> None:
+        for days in range(1, 6):
+            count = self._count(self.DECISION - timedelta(days=days))
+            assert count == days
+            assert m_combined(count, False, Decimal("0")) == Decimal("0.5")
+
+    def test_day_six_normalizes(self) -> None:
+        count = self._count(
+            self.DECISION - timedelta(days=CAPITAL_EVENT_VOL_NORMALIZED_AFTER_SESSIONS + 1)
+        )
+        assert count == 6
+        assert m_combined(count, False, Decimal("0")) == Decimal("1.0")
+
+    def test_day_thirty_still_inside_mode_window(self) -> None:
+        count = self._count(self.DECISION - timedelta(days=CAPITAL_EVENT_MODE_DURATION_SESSIONS))
+        assert count == CAPITAL_EVENT_MODE_DURATION_SESSIONS
+
+    def test_day_thirty_one_past_mode_window(self) -> None:
+        count = self._count(
+            self.DECISION - timedelta(days=CAPITAL_EVENT_MODE_DURATION_SESSIONS + 1)
+        )
+        assert count > CAPITAL_EVENT_MODE_DURATION_SESSIONS
+
+    def test_future_dated_event_clamps_to_zero(self) -> None:
+        assert self._count(self.DECISION + timedelta(days=2)) == 0
