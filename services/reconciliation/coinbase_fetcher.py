@@ -210,7 +210,9 @@ def recon_positions_from_broker(
             )
         market = asset if asset is not None else pos.product_id
         aggregated[market] = aggregated.get(market, Decimal(0)) + pos.contracts
-    return tuple(ReconPosition(market=m, quantity=q) for m, q in aggregated.items())
+    # A zero SUM (offsetting products on one asset) drops like any other
+    # zero-quantity row — the documented contract this function keeps.
+    return tuple(ReconPosition(market=m, quantity=q) for m, q in aggregated.items() if q != 0)
 
 
 class CoinbaseEodFetcher:

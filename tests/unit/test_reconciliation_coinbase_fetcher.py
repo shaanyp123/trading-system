@@ -250,6 +250,18 @@ class TestReconPositionsFromBroker:
         )
         assert out == (ReconPosition(market="BTC", quantity=Decimal("1")),)
 
+    def test_offsetting_products_zero_sum_dropped(self) -> None:
+        # Zero-quantity contract holds for AGGREGATED zeros too (review
+        # note N3): offsetting products on one asset emit no row.
+        out = recon_positions_from_broker(
+            [
+                _pos(product_id=_BTC, contracts="2"),
+                _pos(product_id="BTC-OTHER-CDE", contracts="-2"),
+            ],
+            product_to_asset={**_MAP, "BTC-OTHER-CDE": "BTC"},
+        )
+        assert out == ()
+
     def test_empty_book_maps_to_empty_tuple(self) -> None:
         assert recon_positions_from_broker([], product_to_asset=_MAP) == ()
 

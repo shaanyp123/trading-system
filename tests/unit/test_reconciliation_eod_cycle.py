@@ -209,6 +209,33 @@ class TestBuildBrokerView:
         )
         assert view.positions == {"BTC": Decimal("-2")}
 
+    def test_matching_position_produces_zero_breaks_end_to_end(self) -> None:
+        # Review note N5: the full 2026-07-11 incident shape in one
+        # assertion — backend {"BTC": -2} vs a venue snapshot reporting
+        # the SAME position under its product id must plan ZERO breaks
+        # (and therefore no kill-switch invocation).
+        from services.reconciliation.recon import BackendView, plan_reconciliation_check
+
+        backend = BackendView(
+            positions={"BTC": Decimal("-2")},
+            cash_usd=Decimal("1549.10"),
+            equity_baseline=Decimal("1549.10"),
+        )
+        broker = build_broker_view(
+            _build_snapshot(
+                positions=(_bpos(product_id=_BTC, contracts="-2"),),
+                cash="1549.10",
+                product_to_asset={_BTC: "BTC"},
+            )
+        )
+        plan = plan_reconciliation_check(
+            backend_view=backend,
+            broker_view=broker,
+            detected_at_utc=_PULLED_AT,
+        )
+        assert plan.breaks_detected == ()
+        assert plan.should_invoke_kill_switch is False
+
     def test_zero_quantity_dropped(self) -> None:
         view = build_broker_view(
             _build_snapshot(
