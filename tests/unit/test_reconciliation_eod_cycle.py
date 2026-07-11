@@ -126,21 +126,26 @@ def _build_snapshot(
     nlv: str | None = None,
     summary: FuturesBalanceSummary | None = None,
     pulled_at_utc: datetime = _PULLED_AT,
+    product_to_asset: dict[str, str] | None = None,
 ) -> CoinbaseReconSnapshot:
     """Assemble a venue snapshot the way the fetcher would.
 
     ``positions`` are venue rows; the planner-ready ``ReconPosition``
     tuple is derived via the fetcher's own mapping function so the two
-    can never drift in tests.
+    can never drift in tests. ``product_to_asset`` defaults to ``{}``
+    (verbatim passthrough) so key-shape-agnostic tests keep using the
+    raw product-id fixtures; normalization-specific tests pass a map.
     """
+    mapping = product_to_asset if product_to_asset is not None else {}
     return CoinbaseReconSnapshot(
-        positions=recon_positions_from_broker(positions),
+        positions=recon_positions_from_broker(positions, product_to_asset=mapping),
         position_details=positions,
         balance_summary=summary if summary is not None else _bal_summary(total=cash),
         cash_usd=Decimal(cash),
         net_liquidation_usd=Decimal(nlv) if nlv is not None else Decimal(cash),
         fills=(),
         pulled_at_utc=pulled_at_utc,
+        product_to_asset=mapping,
     )
 
 
@@ -185,11 +190,24 @@ class TestBuildBrokerView:
         assert view.cash_usd == Decimal("0")
         assert view.source == BrokerSource.COINBASE_EOD
 
-    def test_market_is_product_id_verbatim(self) -> None:
+    def test_market_is_product_id_verbatim_without_map(self) -> None:
+        # Unmapped ids pass through fail-visible (would break loudly).
         view = build_broker_view(
             _build_snapshot(positions=(_bpos(product_id=_BTC, contracts="2"),))
         )
         assert view.positions == {_BTC: Decimal("2")}
+
+    def test_market_normalized_to_asset_with_discovery_map(self) -> None:
+        # THE 2026-07-11 defect regression lock: with the runtime map the
+        # broker view keys by asset, matching positions_current (#355) —
+        # a real -2 position must NOT split into a phantom break pair.
+        view = build_broker_view(
+            _build_snapshot(
+                positions=(_bpos(product_id=_BTC, contracts="-2"),),
+                product_to_asset={_BTC: "BTC"},
+            )
+        )
+        assert view.positions == {"BTC": Decimal("-2")}
 
     def test_zero_quantity_dropped(self) -> None:
         view = build_broker_view(
@@ -1371,6 +1389,56 @@ class TestRefreshBackendFromBrokerSnapshot:
             if "UPDATE positions_current" in s
         )
         assert update_params["pid"] == position_id
+
+    async def test_position_mark_lookup_uses_normalized_asset_key(self) -> None:
+        # 2026-07-11 regression lock: the MTM lookup must query
+        # positions_current under the ASSET key ("BTC"), not the venue
+        # product id — else the uPnL refresh silently never matches.
+        from unittest.mock import patch
+
+        refresh_backend_from_broker_snapshot = _real_refresh  # captured before autouse monkeypatch
+
+        position_id = uuid4()
+        snapshot = _build_snapshot(
+            positions=(_bpos(product_id=_BTC, contracts="-2"),),
+            product_to_asset={_BTC: "BTC"},
+        )
+        factory, executed_sql, executed_params = _refresh_session_factory(
+            position_rows_by_market={
+                "BTC": {
+                    "id": position_id,
+                    "quantity": -2,
+                    "avg_cost": Decimal("109000"),
+                }
+            }
+        )
+        audit_payloads: list[Any] = []
+
+        async def _fake_audit(*args: Any, **kwargs: Any) -> MagicMock:
+            audit_payloads.append(args[2])  # payload
+            return _audit_record_mock()
+
+        with patch(
+            "services.reconciliation.eod_cycle.append_audit_event",
+            new=_fake_audit,
+        ):
+            result = await refresh_backend_from_broker_snapshot(
+                snapshot,
+                session_factory=factory,
+                account_id=uuid4(),
+                env="paper",
+            )
+        assert result.positions_marked_count == 1
+        lookup_params = next(
+            p
+            for s, p in zip(executed_sql, executed_params, strict=True)
+            if "SELECT id, quantity, avg_cost FROM positions_current" in s
+        )
+        assert lookup_params["market"] == "BTC"
+        # The mark audit carries BOTH keys for forensics.
+        mark_payload = audit_payloads[1]
+        assert mark_payload["market"] == "BTC"
+        assert mark_payload["venue_product_id"] == _BTC
 
     async def test_position_not_in_backend_is_skipped(self) -> None:
         from unittest.mock import patch

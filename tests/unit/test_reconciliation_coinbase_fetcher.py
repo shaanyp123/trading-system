@@ -25,6 +25,7 @@ from services.execution.types import (
     BrokerFill,
     BrokerPosition,
     FuturesBalanceSummary,
+    PerpProductRef,
 )
 from services.reconciliation.coinbase_fetcher import (
     DEFAULT_FILLS_LOOKBACK_HOURS,
@@ -41,6 +42,19 @@ _PULLED_AT = datetime(2026, 7, 10, 0, 15, tzinfo=UTC)
 # runtime per [A13]).
 _BTC = "BTC-PERP-CDE"
 _ETH = "ETH-PERP-CDE"
+
+#: product_id -> base_asset map mirroring what runtime discovery yields.
+_MAP = {_BTC: "BTC", _ETH: "ETH"}
+
+
+def _product(product_id: str, base_asset: str) -> PerpProductRef:
+    return PerpProductRef(
+        product_id=product_id,
+        base_asset=base_asset,
+        contract_size=Decimal("0.01"),
+        tick_size=Decimal("1"),
+        trading_disabled=False,
+    )
 
 
 def _pos(
@@ -110,17 +124,28 @@ class FakeBrokerClient:
         positions: list[BrokerPosition] | None = None,
         summary: FuturesBalanceSummary | None = None,
         fills: list[BrokerFill] | None = None,
+        products: list[PerpProductRef] | None = None,
         positions_error: BrokerError | None = None,
         summary_error: BrokerError | None = None,
         fills_error: BrokerError | None = None,
+        products_error: BrokerError | None = None,
     ) -> None:
         self._positions = positions if positions is not None else []
         self._summary = summary if summary is not None else _summary()
         self._fills = fills if fills is not None else []
+        self._products = (
+            products if products is not None else [_product(_BTC, "BTC"), _product(_ETH, "ETH")]
+        )
         self._positions_error = positions_error
         self._summary_error = summary_error
         self._fills_error = fills_error
+        self._products_error = products_error
         self.list_fills_calls: list[datetime | None] = []
+
+    async def list_perp_products(self) -> list[PerpProductRef]:
+        if self._products_error is not None:
+            raise self._products_error
+        return list(self._products)
 
     async def list_positions(self) -> list[BrokerPosition]:
         if self._positions_error is not None:
@@ -169,35 +194,68 @@ def _fetcher(client: FakeBrokerClient, **kwargs: object) -> CoinbaseEodFetcher:
 
 
 class TestReconPositionsFromBroker:
-    def test_maps_market_to_product_id_verbatim(self) -> None:
-        out = recon_positions_from_broker([_pos(product_id=_BTC, contracts="2")])
-        assert out == (ReconPosition(market=_BTC, quantity=Decimal("2")),)
+    def test_maps_product_id_to_base_asset(self) -> None:
+        # THE 2026-07-11 defect: positions_current is keyed by asset
+        # ("BTC"), the venue reports product ids — normalization is the
+        # planner-key contract.
+        out = recon_positions_from_broker(
+            [_pos(product_id=_BTC, contracts="2")], product_to_asset=_MAP
+        )
+        assert out == (ReconPosition(market="BTC", quantity=Decimal("2")),)
 
     def test_short_position_sign_preserved(self) -> None:
-        out = recon_positions_from_broker([_pos(product_id=_ETH, contracts="-4")])
-        assert out == (ReconPosition(market=_ETH, quantity=Decimal("-4")),)
+        out = recon_positions_from_broker(
+            [_pos(product_id=_ETH, contracts="-4")], product_to_asset=_MAP
+        )
+        assert out == (ReconPosition(market="ETH", quantity=Decimal("-4")),)
 
     def test_zero_quantity_dropped(self) -> None:
         out = recon_positions_from_broker(
-            [_pos(contracts="0"), _pos(product_id=_ETH, contracts="1")]
+            [_pos(contracts="0"), _pos(product_id=_ETH, contracts="1")],
+            product_to_asset=_MAP,
         )
-        assert out == (ReconPosition(market=_ETH, quantity=Decimal("1")),)
+        assert out == (ReconPosition(market="ETH", quantity=Decimal("1")),)
 
     def test_missing_product_id_skipped_with_warning(self) -> None:
         with structlog.testing.capture_logs() as captured:
             out = recon_positions_from_broker(
-                [_pos(product_id="", contracts="3"), _pos(product_id=_BTC, contracts="1")]
+                [_pos(product_id="", contracts="3"), _pos(product_id=_BTC, contracts="1")],
+                product_to_asset=_MAP,
             )
-        assert out == (ReconPosition(market=_BTC, quantity=Decimal("1")),)
+        assert out == (ReconPosition(market="BTC", quantity=Decimal("1")),)
         events = [c.get("event") for c in captured]
         assert "coinbase_recon_position_missing_product_id" in events
 
+    def test_unmapped_product_id_passes_through_with_warning(self) -> None:
+        # Fail-visible: an instrument discovery doesn't know must surface
+        # as a recon break under its raw id, never silently normalize.
+        with structlog.testing.capture_logs() as captured:
+            out = recon_positions_from_broker(
+                [_pos(product_id="SOL-MYSTERY-CDE", contracts="5")],
+                product_to_asset=_MAP,
+            )
+        assert out == (ReconPosition(market="SOL-MYSTERY-CDE", quantity=Decimal("5")),)
+        events = [c.get("event") for c in captured]
+        assert "coinbase_recon_position_unmapped_product" in events
+
+    def test_two_products_same_asset_aggregate(self) -> None:
+        # Defensive SUM per resulting key (one CDE product per asset
+        # today makes this a no-op in production).
+        out = recon_positions_from_broker(
+            [
+                _pos(product_id=_BTC, contracts="2"),
+                _pos(product_id="BTC-OTHER-CDE", contracts="-1"),
+            ],
+            product_to_asset={**_MAP, "BTC-OTHER-CDE": "BTC"},
+        )
+        assert out == (ReconPosition(market="BTC", quantity=Decimal("1")),)
+
     def test_empty_book_maps_to_empty_tuple(self) -> None:
-        assert recon_positions_from_broker([]) == ()
+        assert recon_positions_from_broker([], product_to_asset=_MAP) == ()
 
     def test_decimal_quantity_exact(self) -> None:
         # [A05]: quantities survive as exact Decimals (no float round-trip).
-        out = recon_positions_from_broker([_pos(contracts="7")])
+        out = recon_positions_from_broker([_pos(contracts="7")], product_to_asset=_MAP)
         assert out[0].quantity == Decimal(7)
         assert isinstance(out[0].quantity, Decimal)
 
@@ -218,9 +276,10 @@ class TestFetchSnapshotHappyPath:
         assert isinstance(snap, CoinbaseReconSnapshot)
         assert snap.pulled_at_utc == _PULLED_AT
         assert snap.positions == (
-            ReconPosition(market=_BTC, quantity=Decimal("2")),
-            ReconPosition(market=_ETH, quantity=Decimal("-4")),
+            ReconPosition(market="BTC", quantity=Decimal("2")),
+            ReconPosition(market="ETH", quantity=Decimal("-4")),
         )
+        assert snap.product_to_asset == _MAP
         assert len(snap.position_details) == 2
         assert snap.cash_usd == Decimal("100000")
         assert snap.net_liquidation_usd == Decimal("100150")
@@ -305,6 +364,35 @@ class TestFetchSnapshotErrorPaths:
             await _fetcher(client).fetch_snapshot()
         assert excinfo.value.operation == "get_futures_balance_summary"
         assert "total_usd_balance" in excinfo.value.detail
+
+    async def test_product_discovery_failure_raises(self) -> None:
+        # Discovery is load-bearing post-2026-07-11: without the map,
+        # every open position would fabricate a phantom break pair.
+        client = FakeBrokerClient(
+            positions=[_pos(contracts="1")],
+            products_error=_broker_error("list_perp_products"),
+        )
+        with pytest.raises(CoinbaseReconFetchError) as excinfo:
+            await _fetcher(client).fetch_snapshot()
+        assert excinfo.value.operation == "list_perp_products"
+
+    async def test_discovery_maps_no_open_position_fails_cycle(self) -> None:
+        # The #358 zero-products defect class: positions exist but the
+        # discovery map resolves none of them — soft-fail the cycle
+        # instead of reconciling phantom market keys (which auto-halts).
+        client = FakeBrokerClient(positions=[_pos(contracts="2")], products=[])
+        with pytest.raises(CoinbaseReconFetchError) as excinfo:
+            await _fetcher(client).fetch_snapshot()
+        assert excinfo.value.operation == "list_perp_products"
+        assert "phantom" in excinfo.value.detail
+
+    async def test_flat_book_with_empty_discovery_is_clean(self) -> None:
+        # No positions -> nothing to normalize; an empty discovery result
+        # must not fail the cash/NAV reconciliation.
+        client = FakeBrokerClient(positions=[], products=[])
+        snap = await _fetcher(client).fetch_snapshot()
+        assert snap.positions == ()
+        assert snap.product_to_asset == {}
 
     async def test_fills_failure_degrades_not_fatal(self) -> None:
         client = FakeBrokerClient(
