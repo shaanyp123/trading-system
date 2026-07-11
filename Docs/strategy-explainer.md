@@ -332,7 +332,13 @@ a risk loop that re-checks marks, margin, and limits **every 30 seconds**.
    requires **manual operator action**, and the first **3 clean UTC days** back run at
    **half size** (the "convalescent" state). The resume day itself counts toward the 3 —
    but the day of the breach never does, and a day only counts if no new trigger fired
-   (amended from 5 days, operator directive 2026-07-09 late session).
+   (amended from 5 days, operator directive 2026-07-09 late session). One exception
+   (added 2026-07-11): if a halt turns out to have been caused by a **system defect**
+   rather than a genuine risk event — e.g. the phantom reconciliation break on the first
+   overnight position — the operator can formally mark it a **false positive** from the
+   web dashboard (passkey re-verification required) and return to full size immediately.
+   The adjudication is always a human decision, must cite the fix for the defect, and is
+   permanently recorded in the audit chain.
 5. **Weekly loss limit −16%:** if rolling 7-day P&L is worse than −16% of equity, the
    volatility target is **halved for 7 days** — the system automatically de-risks after a
    bad week.
@@ -654,3 +660,4 @@ Plain-English definitions of every term of art used above.
 |---|---|---|
 | 2026-07-09 | Initial version. | Documents the Amendment B production profile as validated and built (spec + Amendments, REPORT.md, delta spec), status as of C1 small-live start. |
 | 2026-07-09 (later) | Convalescent probation shortened: 3 clean UTC days (was 5), resume day counts, breach day never counts. | Operator amendment at C1 night one; decisions-log "C1 night one, CONVALESCENT amendment". |
+| 2026-07-11 | False-positive halt adjudication added: from the convalescent state, the operator can graduate back to NORMAL immediately when the halt was caused by a system defect (web-only, re-auth gated, must cite the defect fix). | Operator directive after the 2026-07-11 phantom recon-break auto-halt; decisions-log "C1 night two". |

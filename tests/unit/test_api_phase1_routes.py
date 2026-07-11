@@ -1122,6 +1122,230 @@ class TestKillSwitchResume:
 # ---------------------------------------------------------------------------
 
 
+class TestKillSwitchFalsePositive:
+    """2026-07-11 amendment: CONVALESCENT -> NORMAL operator adjudication."""
+
+    @pytest.mark.asyncio
+    async def test_no_active_account_returns_409(
+        self,
+        api_client: AsyncClient,
+        api_app: Any,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(account_id=None)
+        _bind_repo(override_dep, system_route, repo)
+        _override_db_session(api_app)
+        response = await api_client.post(
+            "/api/system/kill-switch/false-positive",
+            json={"reason": "phantom break", "defect_reference": "PR #375"},
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 409
+        assert response.json()["error_code"] == "NO_ACTIVE_ACCOUNT"
+
+    @pytest.mark.asyncio
+    async def test_not_convalescent_from_normal_returns_409(
+        self,
+        api_client: AsyncClient,
+        api_app: Any,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(account_id=uuid4(), risk_row=None)  # -> NORMAL default
+        _bind_repo(override_dep, system_route, repo)
+        _override_db_session(api_app)
+        response = await api_client.post(
+            "/api/system/kill-switch/false-positive",
+            json={"reason": "phantom break", "defect_reference": "PR #375"},
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 409
+        body = response.json()
+        assert body["error_code"] == "NOT_CONVALESCENT"
+        assert "NORMAL" in body["message"]
+
+    @pytest.mark.asyncio
+    async def test_not_convalescent_from_halt_returns_409(
+        self,
+        api_client: AsyncClient,
+        api_app: Any,
+        override_dep: Any,
+    ) -> None:
+        # A false-positive claim never shortcuts a live halt: resume first.
+        repo = _StubRepo(
+            account_id=uuid4(),
+            risk_row=RiskStateRow(
+                state="HALT_NEW",
+                severity="routine",
+                reason="recon_mismatch",
+                entered_at_utc=datetime.now(tz=UTC),
+                convalescent_session_count=0,
+                vacation_active=False,
+                vacation_until_utc=None,
+                audit_event_uuid=uuid4(),
+            ),
+        )
+        _bind_repo(override_dep, system_route, repo)
+        _override_db_session(api_app)
+        response = await api_client.post(
+            "/api/system/kill-switch/false-positive",
+            json={"reason": "phantom break", "defect_reference": "PR #375"},
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 409
+        assert response.json()["error_code"] == "NOT_CONVALESCENT"
+
+    @pytest.mark.asyncio
+    async def test_convalescent_graduates_to_normal_returns_200(
+        self,
+        api_client: AsyncClient,
+        api_app: Any,
+        override_dep: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        account_id = uuid4()
+        repo = _StubRepo(
+            account_id=account_id,
+            risk_row=RiskStateRow(
+                state="CONVALESCENT",
+                severity=None,
+                reason="human_resume",
+                entered_at_utc=datetime.now(tz=UTC),
+                convalescent_session_count=0,
+                vacation_active=False,
+                vacation_until_utc=None,
+                audit_event_uuid=uuid4(),
+            ),
+        )
+        _bind_repo(override_dep, system_route, repo)
+        _override_db_session(api_app)
+
+        applied_audit_uuid = uuid4()
+        monkeypatch.setattr(
+            system_route,
+            "apply_state_transition",
+            _make_fake_apply(
+                applied_audit_uuid,
+                new_state="NORMAL",
+                new_severity=None,
+            ),
+        )
+        monkeypatch.setattr(
+            system_route,
+            "emit_sse",
+            _make_fake_emit_sse(captured_sequence_no=11),
+        )
+
+        response = await api_client.post(
+            "/api/system/kill-switch/false-positive",
+            json={
+                "reason": "recon phantom break; positions matched the venue",
+                "defect_reference": "PR #375",
+            },
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["risk_state"] == "NORMAL"
+        assert body["severity"] is None
+        assert body["halt_reason"] is None
+        assert body["audit_event_uuid"] == str(applied_audit_uuid)
+        assert body["sse_sequence_no"] == 11
+
+    @pytest.mark.asyncio
+    async def test_concurrent_transition_race_returns_409(
+        self,
+        api_client: AsyncClient,
+        api_app: Any,
+        override_dep: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Risk-review B1: an auto-halt landing inside the read->apply
+        # window wins; the (risk-loosening) adjudication 409s instead of
+        # silently overwriting HALT_NEW with NORMAL.
+        from services.risk.dispatch import StaleRiskStateError
+
+        repo = _StubRepo(
+            account_id=uuid4(),
+            risk_row=RiskStateRow(
+                state="CONVALESCENT",
+                severity=None,
+                reason="human_resume",
+                entered_at_utc=datetime.now(tz=UTC),
+                convalescent_session_count=0,
+                vacation_active=False,
+                vacation_until_utc=None,
+                audit_event_uuid=uuid4(),
+            ),
+        )
+        _bind_repo(override_dep, system_route, repo)
+        _override_db_session(api_app)
+
+        async def _stale_apply(**kwargs: Any) -> Any:
+            assert kwargs["expected_prior_state"] is not None  # guard engaged
+            raise StaleRiskStateError(expected="CONVALESCENT", account_id=kwargs["account_id"])
+
+        monkeypatch.setattr(system_route, "apply_state_transition", _stale_apply)
+
+        response = await api_client.post(
+            "/api/system/kill-switch/false-positive",
+            json={"reason": "phantom break", "defect_reference": "PR #375"},
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 409
+        body = response.json()
+        assert body["error_code"] == "NOT_CONVALESCENT"
+        assert "concurrent" in body["message"]
+
+    @pytest.mark.asyncio
+    async def test_whitespace_only_reference_returns_422(
+        self,
+        api_client: AsyncClient,
+        api_app: Any,
+        override_dep: Any,
+    ) -> None:
+        # Passes pydantic min_length; rejected by the policy layer ->
+        # translated to 422, never a 500.
+        repo = _StubRepo(
+            account_id=uuid4(),
+            risk_row=RiskStateRow(
+                state="CONVALESCENT",
+                severity=None,
+                reason="human_resume",
+                entered_at_utc=datetime.now(tz=UTC),
+                convalescent_session_count=1,
+                vacation_active=False,
+                vacation_until_utc=None,
+                audit_event_uuid=uuid4(),
+            ),
+        )
+        _bind_repo(override_dep, system_route, repo)
+        _override_db_session(api_app)
+        response = await api_client.post(
+            "/api/system/kill-switch/false-positive",
+            json={"reason": "phantom break", "defect_reference": "   "},
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 422
+        assert response.json()["error_code"] == "VALIDATION_ERROR"
+
+    @pytest.mark.asyncio
+    async def test_missing_fields_returns_422(
+        self,
+        api_client: AsyncClient,
+        api_app: Any,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(account_id=uuid4(), risk_row=None)
+        _bind_repo(override_dep, system_route, repo)
+        _override_db_session(api_app)
+        response = await api_client.post(
+            "/api/system/kill-switch/false-positive",
+            json={},
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 422
+
+
 class _NoopDbSession:
     """Placeholder session that errors loudly if anything tries to use it.
 

@@ -28,6 +28,7 @@ from services.risk.state_machine import (
     RiskState,
     TransitionTrigger,
     clean_day_skip_reason,
+    plan_false_positive_graduation,
     plan_invoke_kill_switch,
     plan_resume_from_halt,
     plan_session_close,
@@ -514,3 +515,79 @@ class TestCleanDayPredicate:
                 halt_day_utc=None,
                 counted_day_utc=self.COUNTED,
             )
+
+
+# ---------------------------------------------------------------------------
+# False-positive adjudication (2026-07-11 operator amendment)
+# ---------------------------------------------------------------------------
+
+
+class TestFalsePositiveGraduation:
+    """CONVALESCENT -> NORMAL on operator adjudication of a defect-caused
+    halt (decisions-log 2026-07-11; the phantom recon-break incident)."""
+
+    TS = "2026-07-11T02:00:00+00:00"
+
+    def _plan(self, **overrides: object) -> object:
+        kwargs: dict[str, object] = {
+            "current_state": RiskState.CONVALESCENT,
+            "convalescent_counter": 0,
+            "operator_reason": "recon compared asset keys vs product ids",
+            "defect_reference": "PR #375",
+            "operator_session_id": "op-session-1",
+            "adjudicated_stint_audit_event_uuid": "11111111-2222-3333-4444-555555555555",
+            "timestamp_utc": self.TS,
+        }
+        kwargs.update(overrides)
+        return plan_false_positive_graduation(**kwargs)  # type: ignore[arg-type]
+
+    def test_convalescent_graduates_to_normal_immediately(self) -> None:
+        plan = self._plan()
+        assert plan.prior_state == RiskState.CONVALESCENT
+        assert plan.new_state == RiskState.NORMAL
+        assert plan.new_severity is None
+        assert plan.new_convalescent_counter == 0
+        assert plan.reason == "false_positive_adjudicated"
+
+    def test_audit_event_reuses_locked_graduation_type_with_cause(self) -> None:
+        # [A04]: no new enum member — the locked convalescent_to_normal
+        # event carries a distinguishing `cause` in the payload.
+        plan = self._plan(convalescent_counter=1)
+        assert len(plan.audit_events) == 1
+        event = plan.audit_events[0]
+        assert event.event_type == "state_transition_convalescent_to_normal"
+        assert event.payload["cause"] == "false_positive_adjudicated"
+        assert event.payload["convalescent_sessions_completed"] == 1
+        assert event.payload["operator_reason"] == ("recon compared asset keys vs product ids")
+        assert event.payload["defect_reference"] == "PR #375"
+        assert event.payload["operator_session_id"] == "op-session-1"
+        assert event.payload["adjudicated_stint_audit_event_uuid"] == (
+            "11111111-2222-3333-4444-555555555555"
+        )
+        assert event.payload["ts"] == self.TS
+
+    def test_sse_envelope_shape(self) -> None:
+        plan = self._plan()
+        assert plan.sse_event.event_type == "risk_state"
+        assert plan.sse_event.data["state"] == RiskState.NORMAL.value
+        assert plan.sse_event.data["severity"] is None
+        assert plan.sse_event.data["reason"] == "false_positive_adjudicated"
+        assert plan.sse_event.data["audit_event_uuid"] is None
+
+    def test_from_normal_raises_illegal_transition(self) -> None:
+        with pytest.raises(IllegalTransitionError, match="only valid from CONVALESCENT"):
+            self._plan(current_state=RiskState.NORMAL)
+
+    def test_from_halt_new_raises_never_shortcuts_live_halt(self) -> None:
+        # The two-step shape is deliberate: resume first, adjudicate second.
+        with pytest.raises(IllegalTransitionError, match="never shortcuts HALT_NEW"):
+            self._plan(current_state=RiskState.HALT_NEW)
+
+    def test_blank_reason_rejected(self) -> None:
+        with pytest.raises(IllegalTransitionError, match="operator_reason is required"):
+            self._plan(operator_reason="   ")
+
+    def test_blank_defect_reference_rejected(self) -> None:
+        # The waiver must always link to the fix that justified it.
+        with pytest.raises(IllegalTransitionError, match="defect_reference is required"):
+            self._plan(defect_reference="")

@@ -63,11 +63,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from uuid import UUID
 
 import structlog
-from sqlalchemy import text
+from sqlalchemy import CursorResult, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from services.audit.writer import Environment, PhaseAtEmit, append_audit_event
@@ -79,6 +79,32 @@ from services.risk.state_machine import (
 )
 
 log = structlog.get_logger()
+
+
+class StaleRiskStateError(Exception):
+    """The risk_state row changed between the caller's read and the apply.
+
+    Raised only when the caller opted into the conditional flip via
+    ``apply_state_transition(expected_prior_state=...)`` and the current
+    row's ``state`` no longer matches — e.g. an auto-halt landed while a
+    risk-LOOSENING route (false-positive adjudication, PR #376) was
+    between its read and its write. The state transaction aborts BEFORE
+    the INSERT, so the concurrent transition's row stays current.
+
+    Residual by design: the plan's audit events were already committed
+    (audit-first per §2.10.1), leaving an "attempted" record with no
+    matching risk_state row — the same self-healing forensics shape the
+    convalescent clean-day tick documents for its FOR-UPDATE guard.
+    Callers translate this to 409 and the operator simply re-inspects.
+    """
+
+    def __init__(self, *, expected: str, account_id: UUID) -> None:
+        self.expected = expected
+        self.account_id = account_id
+        super().__init__(
+            f"risk_state for account {account_id} is no longer '{expected}' "
+            "(concurrent transition won); aborting before INSERT"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +143,7 @@ async def apply_state_transition(
     account_id: UUID,
     env: Environment,
     phase_at_emit: PhaseAtEmit,
+    expected_prior_state: RiskState | None = None,
 ) -> AppliedStateTransition:
     """Execute ``plan``'s I/O — write audit events, UPSERT risk_state.
 
@@ -145,6 +172,16 @@ async def apply_state_transition(
         With ``state_transition_audit_event_uuid`` set to the LAST audit
         write's UUID. The route layer reads this for the SSE envelope.
 
+    ``expected_prior_state`` (opt-in, PR #376 race guard): when set, the
+    flip statement additionally requires the current row's ``state`` to
+    still equal it — closing the read→apply TOCTOU window for
+    risk-LOOSENING callers. If a concurrent transition changed the state
+    first (e.g. an auto-halt landed mid-adjudication), the flip matches
+    0 rows and :class:`StaleRiskStateError` raises BEFORE the INSERT —
+    the concurrent (risk-tightening) transition wins, never the loosener.
+    ``None`` (the default) preserves the historical unconditional flip
+    for all existing callers.
+
     Raises
     ------
     ValueError
@@ -152,6 +189,11 @@ async def apply_state_transition(
         produce a plan with no audit events; this is a defensive check
         to surface the bug rather than silently UPSERTing the state
         without an audit trail).
+    StaleRiskStateError
+        If ``expected_prior_state`` is set and the current row's state
+        no longer matches (see above). The audit events are already
+        committed (audit-first) — an "attempted" forensic record with
+        no state change; the route translates to 409.
     services.audit.writer.AuditWriteFailure
         If :func:`append_audit_event` exhausts its 5-attempt SERIALIZABLE
         retry loop. Per backend-spec §2.10.1 the caller (the route
@@ -184,14 +226,36 @@ async def apply_state_transition(
     now = datetime.now(tz=UTC)
     async with db.begin():
         # Flip the prior is_current row to FALSE. NO-OP if no prior row
-        # exists (first-ever transition for this account).
-        await db.execute(
-            text(
-                "UPDATE risk_state SET is_current = FALSE "
-                "WHERE account_id = :acc AND is_current = TRUE"
-            ),
-            {"acc": account_id},
-        )
+        # exists (first-ever transition for this account). With
+        # expected_prior_state set, the flip is CONDITIONAL on the state
+        # still matching — rowcount 0 means a concurrent transition won
+        # the race; abort before the INSERT so its row stays current.
+        if expected_prior_state is not None:
+            # Runtime object for DML is a CursorResult (has rowcount);
+            # AsyncSession.execute is typed as the Result base.
+            flip = cast(
+                CursorResult[Any],
+                await db.execute(
+                    text(
+                        "UPDATE risk_state SET is_current = FALSE "
+                        "WHERE account_id = :acc AND is_current = TRUE "
+                        "  AND state = :expected"
+                    ),
+                    {"acc": account_id, "expected": expected_prior_state.value},
+                ),
+            )
+            if flip.rowcount != 1:
+                raise StaleRiskStateError(
+                    expected=expected_prior_state.value, account_id=account_id
+                )
+        else:
+            await db.execute(
+                text(
+                    "UPDATE risk_state SET is_current = FALSE "
+                    "WHERE account_id = :acc AND is_current = TRUE"
+                ),
+                {"acc": account_id},
+            )
         # INSERT the new current row. vacation_active stays FALSE by default;
         # vacation transitions are an orthogonal write surface (Phase 1+).
         await db.execute(
@@ -447,6 +511,7 @@ async def apply_convalescent_clean_day_tick(
 
 __all__ = [
     "AppliedStateTransition",
+    "StaleRiskStateError",
     "apply_convalescent_clean_day_tick",
     "apply_state_transition",
 ]
