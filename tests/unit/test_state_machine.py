@@ -535,6 +535,7 @@ class TestFalsePositiveGraduation:
             "operator_reason": "recon compared asset keys vs product ids",
             "defect_reference": "PR #375",
             "operator_session_id": "op-session-1",
+            "adjudicated_stint_audit_event_uuid": "11111111-2222-3333-4444-555555555555",
             "timestamp_utc": self.TS,
         }
         kwargs.update(overrides)
@@ -560,6 +561,9 @@ class TestFalsePositiveGraduation:
         assert event.payload["operator_reason"] == ("recon compared asset keys vs product ids")
         assert event.payload["defect_reference"] == "PR #375"
         assert event.payload["operator_session_id"] == "op-session-1"
+        assert event.payload["adjudicated_stint_audit_event_uuid"] == (
+            "11111111-2222-3333-4444-555555555555"
+        )
         assert event.payload["ts"] == self.TS
 
     def test_sse_envelope_shape(self) -> None:

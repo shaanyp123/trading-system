@@ -26,6 +26,7 @@ If Docker is unreachable, the module skips cleanly (same pattern as
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from collections.abc import AsyncIterator, Iterator
@@ -44,11 +45,12 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from services.audit.chain import GENESIS_HASH, verify_chain
-from services.risk.dispatch import apply_state_transition
+from services.risk.dispatch import StaleRiskStateError, apply_state_transition
 from services.risk.state_machine import (
     HaltSeverity,
     RiskState,
     TransitionTrigger,
+    plan_false_positive_graduation,
     plan_invoke_kill_switch,
     plan_resume_from_halt,
 )
@@ -699,3 +701,125 @@ async def test_apply_after_repo_reads_via_same_session_dp021(
         )
         assert applied.state_transition_audit_event_uuid is not None
         assert applied.new_state == "HALT_NEW"
+
+
+@pytest.mark.asyncio
+async def test_false_positive_adjudication_convalescent_to_normal(
+    async_session_factory: async_sessionmaker[AsyncSession],
+    sync_engine: Engine,
+    fresh_account_id: UUID,
+) -> None:
+    """PR #376: adjudication graduates CONVALESCENT -> NORMAL through the
+    REAL dispatcher — audit-first ordering, cause payload, FK linkage,
+    counter reset — with the conditional flip engaged."""
+    seed_audit_uuid = uuid.uuid4()
+    with sync_engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO risk_state ("
+                "    account_id, state, severity, reason, entered_at_utc, "
+                "    convalescent_session_count, vacation_active, "
+                "    audit_event_uuid, is_current"
+                ") VALUES ("
+                "    :acc, 'CONVALESCENT', NULL, 'human_resume', now(), "
+                "    1, FALSE, :seed, TRUE"
+                ")"
+            ),
+            {"acc": fresh_account_id, "seed": seed_audit_uuid},
+        )
+
+    plan = plan_false_positive_graduation(
+        current_state=RiskState.CONVALESCENT,
+        convalescent_counter=1,
+        operator_reason="recon phantom break; positions matched the venue",
+        defect_reference="PR #375",
+        operator_session_id="op-session-1",
+        adjudicated_stint_audit_event_uuid=str(seed_audit_uuid),
+        timestamp_utc="2026-07-11T02:00:00+00:00",
+    )
+
+    async with async_session_factory() as session:
+        applied = await apply_state_transition(
+            plan=plan,
+            db=session,
+            account_id=fresh_account_id,
+            env="paper",
+            phase_at_emit=0,
+            expected_prior_state=RiskState.CONVALESCENT,
+        )
+
+    row = _read_audit_row_by_uuid(sync_engine, applied.state_transition_audit_event_uuid)
+    assert row["event_type"] == "state_transition_convalescent_to_normal"
+    payload = json.loads(row["payload_jcs"].decode())
+    assert payload["cause"] == "false_positive_adjudicated"
+    assert payload["defect_reference"] == "PR #375"
+    assert payload["adjudicated_stint_audit_event_uuid"] == str(seed_audit_uuid)
+
+    state = _read_current_risk_state(sync_engine, fresh_account_id)
+    assert state is not None
+    assert state["state"] == "NORMAL"
+    assert state["severity"] is None
+    assert state["reason"] == "false_positive_adjudicated"
+    assert state["convalescent_session_count"] == 0
+    assert state["audit_event_uuid"] == applied.state_transition_audit_event_uuid
+    total, current = _count_risk_state_rows(sync_engine, fresh_account_id)
+    assert total == 2
+    assert current == 1
+
+
+@pytest.mark.asyncio
+async def test_false_positive_race_guard_concurrent_halt_wins(
+    async_session_factory: async_sessionmaker[AsyncSession],
+    sync_engine: Engine,
+    fresh_account_id: UUID,
+) -> None:
+    """Risk-review B1 pin: if an auto-halt won the race (current row is
+    HALT_NEW by apply time), the conditional flip matches 0 rows,
+    StaleRiskStateError raises BEFORE the INSERT, and the halt row stays
+    current — the loosener never overwrites a genuine halt."""
+    with sync_engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO risk_state ("
+                "    account_id, state, severity, reason, entered_at_utc, "
+                "    convalescent_session_count, vacation_active, "
+                "    audit_event_uuid, is_current"
+                ") VALUES ("
+                "    :acc, 'HALT_NEW', 'routine', 'recon_mismatch', now(), "
+                "    0, FALSE, :seed, TRUE"
+                ")"
+            ),
+            {"acc": fresh_account_id, "seed": uuid.uuid4()},
+        )
+
+    plan = plan_false_positive_graduation(
+        current_state=RiskState.CONVALESCENT,  # what the stale read saw
+        convalescent_counter=0,
+        operator_reason="phantom break",
+        defect_reference="PR #375",
+        operator_session_id="op-session-1",
+        adjudicated_stint_audit_event_uuid=None,
+        timestamp_utc="2026-07-11T02:00:00+00:00",
+    )
+
+    async with async_session_factory() as session:
+        with pytest.raises(StaleRiskStateError):
+            await apply_state_transition(
+                plan=plan,
+                db=session,
+                account_id=fresh_account_id,
+                env="paper",
+                phase_at_emit=0,
+                expected_prior_state=RiskState.CONVALESCENT,
+            )
+
+    # The genuine halt is untouched and still the ONLY state row — the
+    # aborted transaction inserted nothing (the audit row exists, as
+    # documented: an "attempted" forensic record).
+    state = _read_current_risk_state(sync_engine, fresh_account_id)
+    assert state is not None
+    assert state["state"] == "HALT_NEW"
+    assert state["reason"] == "recon_mismatch"
+    total, current = _count_risk_state_rows(sync_engine, fresh_account_id)
+    assert total == 1
+    assert current == 1

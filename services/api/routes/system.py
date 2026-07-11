@@ -128,7 +128,7 @@ from services.risk.capital_events import (
     apply_capital_event,
     plan_capital_event,
 )
-from services.risk.dispatch import apply_state_transition
+from services.risk.dispatch import StaleRiskStateError, apply_state_transition
 from services.risk.state_machine import (
     HaltSeverity,
     IllegalTransitionError,
@@ -727,6 +727,9 @@ async def adjudicate_false_positive(
             operator_reason=body.reason,
             defect_reference=body.defect_reference,
             operator_session_id=session.user_id,
+            adjudicated_stint_audit_event_uuid=str(risk_row.audit_event_uuid)
+            if risk_row.audit_event_uuid is not None
+            else None,
             timestamp_utc=now.isoformat(),
         )
     except IllegalTransitionError as exc:
@@ -741,13 +744,29 @@ async def adjudicate_false_positive(
     # clean session, so commit here before apply_state_transition.
     await db.commit()
 
-    applied = await apply_state_transition(
-        plan=plan,
-        db=db,
-        account_id=account_id,
-        env=_env_for_audit(settings.environment),
-        phase_at_emit=_PHASE_AT_EMIT_PHASE_0,
-    )
+    # Race guard (risk-review B1): the flip is CONDITIONAL on the row
+    # still being CONVALESCENT — a concurrent auto-halt landing inside
+    # the read→apply window wins, and this (risk-LOOSENING) request 409s
+    # instead of silently overwriting HALT_NEW with NORMAL.
+    try:
+        applied = await apply_state_transition(
+            plan=plan,
+            db=db,
+            account_id=account_id,
+            env=_env_for_audit(settings.environment),
+            phase_at_emit=_PHASE_AT_EMIT_PHASE_0,
+            expected_prior_state=RiskState.CONVALESCENT,
+        )
+    except StaleRiskStateError as exc:
+        raise AppError(
+            error_code="NOT_CONVALESCENT",
+            message=(
+                "The risk state changed while the adjudication was in "
+                "flight (a concurrent transition won). Re-inspect "
+                "/api/system/kill-switch and retry if still appropriate."
+            ),
+            status_code=409,
+        ) from exc
 
     sequence_no = await emit_sse(
         plan.sse_event.event_type,

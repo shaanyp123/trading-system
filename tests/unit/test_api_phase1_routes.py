@@ -1252,6 +1252,51 @@ class TestKillSwitchFalsePositive:
         assert body["sse_sequence_no"] == 11
 
     @pytest.mark.asyncio
+    async def test_concurrent_transition_race_returns_409(
+        self,
+        api_client: AsyncClient,
+        api_app: Any,
+        override_dep: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Risk-review B1: an auto-halt landing inside the read->apply
+        # window wins; the (risk-loosening) adjudication 409s instead of
+        # silently overwriting HALT_NEW with NORMAL.
+        from services.risk.dispatch import StaleRiskStateError
+
+        repo = _StubRepo(
+            account_id=uuid4(),
+            risk_row=RiskStateRow(
+                state="CONVALESCENT",
+                severity=None,
+                reason="human_resume",
+                entered_at_utc=datetime.now(tz=UTC),
+                convalescent_session_count=0,
+                vacation_active=False,
+                vacation_until_utc=None,
+                audit_event_uuid=uuid4(),
+            ),
+        )
+        _bind_repo(override_dep, system_route, repo)
+        _override_db_session(api_app)
+
+        async def _stale_apply(**kwargs: Any) -> Any:
+            assert kwargs["expected_prior_state"] is not None  # guard engaged
+            raise StaleRiskStateError(expected="CONVALESCENT", account_id=kwargs["account_id"])
+
+        monkeypatch.setattr(system_route, "apply_state_transition", _stale_apply)
+
+        response = await api_client.post(
+            "/api/system/kill-switch/false-positive",
+            json={"reason": "phantom break", "defect_reference": "PR #375"},
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 409
+        body = response.json()
+        assert body["error_code"] == "NOT_CONVALESCENT"
+        assert "concurrent" in body["message"]
+
+    @pytest.mark.asyncio
     async def test_whitespace_only_reference_returns_422(
         self,
         api_client: AsyncClient,

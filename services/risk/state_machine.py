@@ -413,6 +413,7 @@ def plan_false_positive_graduation(
     operator_reason: str,
     defect_reference: str,
     operator_session_id: str,
+    adjudicated_stint_audit_event_uuid: str | None,
     timestamp_utc: str,
 ) -> StateTransitionPlan:
     """Plan CONVALESCENT -> NORMAL on operator false-positive adjudication.
@@ -436,6 +437,11 @@ def plan_false_positive_graduation(
     * Reuses the locked ``state_transition_convalescent_to_normal``
       audit event type ([A04] — no enum migration); ``cause`` in the
       payload distinguishes adjudication from clean-day graduation.
+    * ``adjudicated_stint_audit_event_uuid`` — the current CONVALESCENT
+      row's ``audit_event_uuid`` (the resume-transition linkage), so the
+      waiver record is self-contained: a reviewer reaches the adjudicated
+      stint (and from it the originating halt) without walking the chain
+      by timestamp. ``None`` only for degenerate rows missing linkage.
 
     Same surface posture as resume: web-only behind the WebAuthn
     re-auth gate. Discord stays risk-tightening-only per the locked
@@ -466,6 +472,7 @@ def plan_false_positive_graduation(
                 "operator_reason": operator_reason,
                 "defect_reference": defect_reference,
                 "operator_session_id": operator_session_id,
+                "adjudicated_stint_audit_event_uuid": adjudicated_stint_audit_event_uuid,
                 "ts": timestamp_utc,
             },
         ),
