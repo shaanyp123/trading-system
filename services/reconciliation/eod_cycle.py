@@ -22,8 +22,10 @@ the scheduler can consume. The diff/apply engine itself (``recon.py``,
   2. Build :class:`BackendView` by reading ``positions_current`` +
      latest ``balances`` row for the account.
   3. Build :class:`BrokerView` from the snapshot's venue-neutral
-     :class:`ReconPosition` rows (``market`` = venue ``product_id``
-     verbatim) + the balance summary's aggregate USD cash.
+     :class:`ReconPosition` rows (``market`` = BASE-ASSET symbol — the
+     fetcher normalizes venue product ids via the runtime discovery
+     map, matching the worker's ``positions_current`` convention) + the
+     balance summary's aggregate USD cash.
   4. Call :func:`services.reconciliation.recon.plan_reconciliation_check`
      to produce a :class:`ReconciliationPlan`.
   5. Flush via :func:`services.reconciliation.apply.apply_reconciliation_plan`
@@ -305,10 +307,10 @@ def build_broker_view(
 
     Pure policy — no I/O. Positions are SUM-aggregated by market from
     the snapshot's venue-neutral :class:`ReconPosition` rows (``market``
-    is the venue ``product_id`` verbatim — the fetcher already applied
-    the canonical convention, so no symbol normalization runs here; the
-    FlexQuery-era ``/`` root-ticker prefixing died with the CME
-    universe). Zero-quantity rows are re-guarded for symmetry with
+    is the BASE-ASSET symbol — the fetcher already normalized venue
+    product ids via the runtime discovery map, so no symbol work runs
+    here; the FlexQuery-era ``/`` root-ticker prefixing died with the
+    CME universe). Zero-quantity rows are re-guarded for symmetry with
     ``build_backend_view`` even though the fetcher already drops them.
 
     **Position override seam.** When ``positions_override`` is ``None``
@@ -574,7 +576,9 @@ async def refresh_backend_from_broker_snapshot(
         if not pos.product_id:
             continue  # already warned by the fetcher's mapping pass
 
-        market = pos.product_id
+        # Same product_id → base-asset normalization the fetcher applied
+        # to the planner view; positions_current is keyed by asset (#355).
+        market = snapshot.product_to_asset.get(pos.product_id, pos.product_id)
 
         # Phase 1 contract_id=NULL match. If/when contract resolution
         # lands (Phase 2+), this query expands to take a contract_id.
@@ -625,6 +629,7 @@ async def refresh_backend_from_broker_snapshot(
             "account_id": str(account_id),
             "position_id": str(row.id),
             "market": market,
+            "venue_product_id": pos.product_id,
             "trigger": "eod_recon_refresh",
             "source": BALANCE_SOURCE_FROM_COINBASE,
             "quantity": prior_qty,

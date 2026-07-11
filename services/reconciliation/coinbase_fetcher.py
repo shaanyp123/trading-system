@@ -30,12 +30,22 @@ the operator's dead-code mandate).
   venue-side funding cash movements surface in the balance summary the
   snapshot already carries. Nothing additional to fetch here.
 
-**Market symbol convention (crypto):** ``ReconPosition.market`` is the
-venue ``product_id`` verbatim (runtime-discovered CDE ids — never
-hardcoded, [A13]). ``positions_current.market`` uses the same
-``product_id`` convention post-pivot, so the planner's key match is
-exact with no normalization layer (the FlexQuery root-ticker ``/MES``
-prefixing died with the CME universe).
+**Market symbol convention (crypto, corrected 2026-07-11):**
+``positions_current.market`` uses the BASE-ASSET symbol (``"BTC"`` /
+``"ETH"``) — the convention the C1 strategy worker's fill pipeline
+writes (#355). The venue reports positions under CDE ``product_id``s
+(``BIP-20DEC30-CDE``), so this fetcher NORMALIZES ``product_id`` →
+``base_asset`` at the boundary using the runtime-discovered product
+list (``list_perp_products`` — never hardcoded, [A13]). The original
+§3.5 assumption that ``positions_current`` carried product ids was
+wrong against the worker as built and produced a mirror-image phantom
+break pair (+auto-halt) on the first overnight position, 2026-07-11
+00:15 UTC — see decisions-log. A product id absent from the discovery
+map passes through VERBATIM with a WARNING: an instrument the system
+cannot identify must surface as a recon break, never be silently
+normalized away. Discovery returning an empty map while positions are
+open fails the cycle (``CoinbaseReconFetchError``) — that is the #358
+zero-products defect class, not a rogue position.
 
 **Error contract:** transport failures on the load-bearing calls
 (positions, balance summary) raise :class:`CoinbaseReconFetchError`;
@@ -59,8 +69,8 @@ A25 — structlog only.
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Final, Protocol
@@ -96,7 +106,9 @@ class ReconPosition:
     fetcher-owns-its-output-shape layout. ``eod_cycle`` re-exports it.
 
     * ``market`` — canonical symbol matching ``positions_current.market``
-      (post-pivot: the venue ``product_id`` verbatim).
+      (post-pivot: the BASE-ASSET symbol, e.g. ``"BTC"`` — the fetcher
+      normalizes venue product ids via the runtime discovery map; an
+      unmapped product id passes through verbatim, fail-visible).
     * ``quantity`` — signed (positive = long, negative = short).
     """
 
@@ -123,6 +135,12 @@ class CoinbaseReconSnapshot:
     net_liquidation_usd: Decimal
     fills: tuple[BrokerFill, ...]
     pulled_at_utc: datetime
+    product_to_asset: dict[str, str] = field(default_factory=dict)
+    """Runtime-discovered ``product_id`` → ``base_asset`` map used to
+    normalize ``positions`` — carried on the snapshot so the EOD
+    cycle's mark-to-market pass applies the SAME normalization when it
+    looks up ``positions_current`` rows for ``position_details`` (raw
+    venue rows, deliberately un-normalized for forensics)."""
 
 
 class CoinbaseReconFetchError(Exception):
@@ -149,6 +167,8 @@ class ReconSnapshotFetcher(Protocol):
 
 def recon_positions_from_broker(
     positions: tuple[BrokerPosition, ...] | list[BrokerPosition],
+    *,
+    product_to_asset: Mapping[str, str],
 ) -> tuple[ReconPosition, ...]:
     """Map venue positions → planner-ready :class:`ReconPosition` rows.
 
@@ -157,8 +177,16 @@ def recon_positions_from_broker(
     don't generate false-positive breaks). Rows missing a ``product_id``
     are skipped with a WARNING — an empty market key could never match
     a backend row and would fabricate a phantom break.
+
+    ``product_to_asset`` (runtime-discovered, [A13]) normalizes venue
+    product ids to the base-asset symbols ``positions_current.market``
+    actually carries (worker convention, #355). A product id absent
+    from the map passes through VERBATIM with a WARNING — fail-visible:
+    an instrument the system can't identify must surface as a break.
+    Quantities are SUM-aggregated per resulting market key (defensive;
+    one CDE product per asset today makes this a no-op).
     """
-    out: list[ReconPosition] = []
+    aggregated: dict[str, Decimal] = {}
     for pos in positions:
         if not pos.product_id:
             log.warning(
@@ -168,8 +196,23 @@ def recon_positions_from_broker(
             continue
         if pos.contracts == 0:
             continue
-        out.append(ReconPosition(market=pos.product_id, quantity=pos.contracts))
-    return tuple(out)
+        asset = product_to_asset.get(pos.product_id)
+        if asset is None:
+            log.warning(
+                "coinbase_recon_position_unmapped_product",
+                product_id=pos.product_id,
+                contracts=str(pos.contracts),
+                note=(
+                    "product id not in the runtime discovery map; market key "
+                    "passes through verbatim and will surface as a recon "
+                    "break if the backend holds no matching row"
+                ),
+            )
+        market = asset if asset is not None else pos.product_id
+        aggregated[market] = aggregated.get(market, Decimal(0)) + pos.contracts
+    # A zero SUM (offsetting products on one asset) drops like any other
+    # zero-quantity row — the documented contract this function keeps.
+    return tuple(ReconPosition(market=m, quantity=q) for m, q in aggregated.items() if q != 0)
 
 
 class CoinbaseEodFetcher:
@@ -210,8 +253,25 @@ class CoinbaseEodFetcher:
         try:
             broker_positions = await self._client.list_positions()
             summary = await self._client.get_futures_balance_summary()
+            perp_products = await self._client.list_perp_products()
         except BrokerError as exc:
             raise CoinbaseReconFetchError(operation=exc.operation, detail=exc.detail) from exc
+
+        product_to_asset = {p.product_id: p.base_asset for p in perp_products}
+        open_positions = [p for p in broker_positions if p.contracts != 0 and p.product_id]
+        if open_positions and not any(p.product_id in product_to_asset for p in open_positions):
+            # The #358 defect class: discovery returned nothing usable
+            # while the venue holds positions. Normalization would turn
+            # EVERY open position into a phantom break pair (+auto-halt);
+            # soft-fail the cycle instead — tomorrow retries.
+            raise CoinbaseReconFetchError(
+                operation="list_perp_products",
+                detail=(
+                    f"discovery mapped 0 of {len(open_positions)} open "
+                    "positions; refusing to reconcile against phantom "
+                    "market keys"
+                ),
+            )
 
         if summary.total_usd_balance is None:
             raise CoinbaseReconFetchError(
@@ -255,13 +315,14 @@ class CoinbaseEodFetcher:
             )
             fills = ()
 
-        positions = recon_positions_from_broker(broker_positions)
+        positions = recon_positions_from_broker(broker_positions, product_to_asset=product_to_asset)
         self._log.info(
             "coinbase_recon_snapshot_pulled",
             position_count=len(positions),
             fill_count=len(fills),
             cash_usd=str(cash_usd),
             net_liquidation_usd=str(net_liquidation_usd),
+            discovered_product_count=len(product_to_asset),
             pulled_at_utc=pulled_at.isoformat(),
         )
         return CoinbaseReconSnapshot(
@@ -272,6 +333,7 @@ class CoinbaseEodFetcher:
             net_liquidation_usd=net_liquidation_usd,
             fills=fills,
             pulled_at_utc=pulled_at,
+            product_to_asset=product_to_asset,
         )
 
 
