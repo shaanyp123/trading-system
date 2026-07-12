@@ -318,12 +318,13 @@ class BotAuthMiddleware(BaseHTTPMiddleware):
     Behavior:
 
       * No ``Authorization: Bearer ...`` header → pass through unchanged.
-        Downstream middleware (SessionStub) handles human-session paths.
+        Downstream middleware (Session) handles human-session paths.
       * ``Authorization: Bearer <valid-token>`` (constant-time matched
         against ``settings.discord_bot_bearer_token``) → set
         ``request.state.session = SessionContext(...)`` with service-
         account identity + ``request.state.is_bot_authenticated = True``.
-        Bypasses CSRF + SessionStub on later middleware. Pass through.
+        Bypasses CSRF + session-cookie validation on later middleware.
+        Pass through.
       * ``Authorization: Bearer <invalid-token>`` → 401 + canonical
         envelope. Don't pass through (defense-in-depth: a bad token is
         an explicit auth attempt that the api should reject loudly).
@@ -417,24 +418,27 @@ def register_middleware(app: FastAPI, settings: APISettings) -> None:
     layer OUTERMOST in the request path (verified empirically; see Day 17
     PR description). Resulting request path, outermost → innermost:
 
-        RequestContext → RateLimit → CSRF → (SessionStub*) → routes
+        RequestContext → RateLimit → CSRF → (Session*) → routes
 
-    (* SessionStub is added separately in main.py AFTER register_middleware,
-    so it ends up outermost of all four — request flow becomes
-    SessionStub → RequestContext → RateLimit → CSRF → routes. The SessionStub
-    only mutates `request.state` and never short-circuits, so it does not
-    affect the gate semantics below.)
+    (* SessionMiddleware is added separately in main.py BEFORE
+    register_middleware, so it ends up INNERMOST — moved there by the
+    2026-07-12 real-validation swap. Unlike the old Phase-0 stub (which
+    never short-circuited and sat outermost-of-four), real validation
+    rejects with 401/503 and performs a database lookup, so it must run
+    after RequestContext (trace_id on rejections), after RateLimit (an
+    anonymous cookie-probe flood consumes the per-IP budget instead of
+    free DB lookups), and after CSRF (a CSRF-failing POST never spends a
+    session lookup).)
 
-    Day 23 addition: ``BotAuthMiddleware`` is added LAST after the stub
-    in ``main.py`` so it ends up OUTERMOST of all middleware — the
-    request flow becomes:
+    Day 23 addition: ``BotAuthMiddleware`` is added LAST in ``main.py``
+    so it ends up OUTERMOST of all middleware — the request flow becomes:
 
-        BotAuth → SessionStub → RequestContext → RateLimit → CSRF → routes
+        BotAuth → RequestContext → RateLimit → CSRF → Session → routes
 
     BotAuth runs first because:
-      * It must execute BEFORE SessionStub's fail-close in production
-        envs (live-small / live-scale) — otherwise a bot request to
-        production gets 401'd before BotAuth can inject its session.
+      * It must execute BEFORE SessionMiddleware's cookie validation —
+        the bot holds no session cookie; BotAuth's injected session is
+        what SessionMiddleware honors on the bot path.
       * It must set ``request.state.is_bot_authenticated`` BEFORE CSRF
         checks it (CSRF reads the flag to decide whether to skip the
         cookie+header comparison for bot calls).

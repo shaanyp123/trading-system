@@ -155,9 +155,9 @@ class APISettings(BaseSettings):
     # auth_strength=``strong``, is_phase0_stub=False).
     #
     # When unset the middleware degrades to no-op (no bot path is
-    # served). Production must set this — the SessionStubMiddleware fail-
-    # close in live envs would otherwise reject the bot's calls before
-    # any handler runs.
+    # served). Deployed hosts must set this — the real SessionMiddleware
+    # cookie validation outside dev would otherwise reject the bot's
+    # calls (the bot holds no session cookie) before any handler runs.
     #
     # Sourced from secrets ``discord.api_bearer_token`` per
     # ``deploy/discord_bot/README.md``. Token format: 32-byte URL-safe
