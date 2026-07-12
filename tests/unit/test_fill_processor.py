@@ -607,6 +607,20 @@ def _audit_record_mock(event_uuid: UUID | None = None) -> MagicMock:
     return rec
 
 
+def _no_open_trade_guard() -> Any:
+    """Patch the refuse-at-open guard's market lookup to find nothing.
+
+    ``apply_fill_plan`` on an ``action='open'`` plan re-checks
+    ``fetch_prior_open_trade_for_market`` before its first write; the
+    mock session factory would otherwise hand the real helper a MagicMock
+    row that reads as an existing open trade.
+    """
+    return patch(
+        "services.risk.fill_processor.fetch_prior_open_trade_for_market",
+        new=AsyncMock(return_value=None),
+    )
+
+
 def _build_plan(*, action: str = "open") -> FillApplyPlan:
     """Build a minimal valid FillApplyPlan for apply-step tests."""
     audit_events = (
@@ -696,9 +710,12 @@ class TestApplyFillPlan:
             call_order.append("audit")
             return _audit_record_mock()
 
-        with patch(
-            "services.risk.fill_processor.append_audit_event",
-            side_effect=_fake_append,
+        with (
+            patch(
+                "services.risk.fill_processor.append_audit_event",
+                side_effect=_fake_append,
+            ),
+            _no_open_trade_guard(),
         ):
             original_side_effect = session_factory.side_effect
 
@@ -728,9 +745,12 @@ class TestApplyFillPlan:
     async def test_result_carries_signal_account_audit_uuids(self) -> None:
         plan = _build_plan(action="open")
         session_factory = _build_mock_session_factory()
-        with patch(
-            "services.risk.fill_processor.append_audit_event",
-            new=AsyncMock(side_effect=lambda *a, **k: _audit_record_mock()),
+        with (
+            patch(
+                "services.risk.fill_processor.append_audit_event",
+                new=AsyncMock(side_effect=lambda *a, **k: _audit_record_mock()),
+            ),
+            _no_open_trade_guard(),
         ):
             result = await apply_fill_plan(
                 plan,
@@ -747,9 +767,12 @@ class TestApplyFillPlan:
     async def test_apply_returns_valid_fillapplyresult(self) -> None:
         plan = _build_plan(action="open")
         session_factory = _build_mock_session_factory()
-        with patch(
-            "services.risk.fill_processor.append_audit_event",
-            new=AsyncMock(side_effect=lambda *a, **k: _audit_record_mock()),
+        with (
+            patch(
+                "services.risk.fill_processor.append_audit_event",
+                new=AsyncMock(side_effect=lambda *a, **k: _audit_record_mock()),
+            ),
+            _no_open_trade_guard(),
         ):
             result = await apply_fill_plan(
                 plan,
@@ -763,6 +786,129 @@ class TestApplyFillPlan:
         assert result.position_id is not None
         assert result.trade_id is not None
         assert result.balance_id is not None
+
+
+class TestApplyFillPlanRefuseAtOpenGuard:
+    """#377 accepted follow-up: one-open-trade-per-market is enforced at
+    the apply-step choke point because the partitioned ``trades`` table
+    cannot carry the partial unique index."""
+
+    @staticmethod
+    def _existing_open_trade() -> PriorTradeRow:
+        return PriorTradeRow(
+            trade_id=uuid4(),
+            trade_created_at=_ORDER_CREATED,
+            total_quantity=1,
+            avg_entry_price=Decimal("85.00000000"),
+            realized_commission_usd=Decimal("0.50"),
+            direction="long",
+        )
+
+    @pytest.mark.asyncio
+    async def test_open_action_with_existing_open_trade_refuses_before_any_write(self) -> None:
+        """The guard raises DUPLICATE_OPEN_TRADE_FOR_MARKET and NOTHING is
+        written — no audit event, no session opened for a table mutation."""
+        plan = _build_plan(action="open")
+        session_factory = _build_mock_session_factory()
+        existing = self._existing_open_trade()
+        append_mock = AsyncMock(side_effect=lambda *a, **k: _audit_record_mock())
+        guard_lookup = AsyncMock(return_value=existing)
+        with (
+            patch("services.risk.fill_processor.append_audit_event", new=append_mock),
+            patch(
+                "services.risk.fill_processor.fetch_prior_open_trade_for_market",
+                new=guard_lookup,
+            ),
+        ):
+            with pytest.raises(FillProcessingError) as excinfo:
+                await apply_fill_plan(
+                    plan,
+                    session_factory=session_factory,
+                    account_id=_ACCOUNT_ID,
+                    env="paper",
+                )
+        assert excinfo.value.error_code == "DUPLICATE_OPEN_TRADE_FOR_MARKET"
+        assert excinfo.value.details["market"] == plan.trade_mutation.market
+        assert excinfo.value.details["existing_trade_id"] == str(existing.trade_id)
+        # Pre-apply, before ANY write: no audit append, no mutation session.
+        append_mock.assert_not_awaited()
+        assert session_factory.call_count == 0
+        # The guard queried exactly the plan's (account, market).
+        guard_lookup.assert_awaited_once()
+        kwargs = guard_lookup.await_args.kwargs
+        assert kwargs["account_id"] == plan.trade_mutation.account_id
+        assert kwargs["market"] == plan.trade_mutation.market
+
+    @pytest.mark.asyncio
+    async def test_open_action_with_no_open_trade_proceeds(self) -> None:
+        plan = _build_plan(action="open")
+        session_factory = _build_mock_session_factory()
+        with (
+            patch(
+                "services.risk.fill_processor.append_audit_event",
+                new=AsyncMock(side_effect=lambda *a, **k: _audit_record_mock()),
+            ),
+            _no_open_trade_guard(),
+        ):
+            result = await apply_fill_plan(
+                plan,
+                session_factory=session_factory,
+                account_id=_ACCOUNT_ID,
+                env="paper",
+            )
+        assert isinstance(result, FillApplyResult)
+
+    @pytest.mark.asyncio
+    async def test_update_action_skips_guard(self) -> None:
+        """ADD-attach (#377 market fallback → action='update') must not
+        consult the guard — an open trade EXISTS by construction there."""
+        plan = _build_plan(action="update")
+        session_factory = _build_mock_session_factory()
+        guard_lookup = AsyncMock(return_value=self._existing_open_trade())
+        with (
+            patch(
+                "services.risk.fill_processor.append_audit_event",
+                new=AsyncMock(side_effect=lambda *a, **k: _audit_record_mock()),
+            ),
+            patch(
+                "services.risk.fill_processor.fetch_prior_open_trade_for_market",
+                new=guard_lookup,
+            ),
+        ):
+            result = await apply_fill_plan(
+                plan,
+                session_factory=session_factory,
+                account_id=_ACCOUNT_ID,
+                env="paper",
+            )
+        assert isinstance(result, FillApplyResult)
+        guard_lookup.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_close_action_skips_guard(self) -> None:
+        """Decision-driven closes (#377 market fallback → action='close')
+        must not consult the guard."""
+        plan = _build_close_plan()
+        session_factory = _build_mock_session_factory()
+        guard_lookup = AsyncMock(return_value=self._existing_open_trade())
+        with (
+            patch(
+                "services.risk.fill_processor.append_audit_event",
+                new=AsyncMock(side_effect=lambda *a, **k: _audit_record_mock()),
+            ),
+            patch(
+                "services.risk.fill_processor.fetch_prior_open_trade_for_market",
+                new=guard_lookup,
+            ),
+        ):
+            result = await apply_fill_plan(
+                plan,
+                session_factory=session_factory,
+                account_id=_ACCOUNT_ID,
+                env="paper",
+            )
+        assert isinstance(result, FillApplyResult)
+        guard_lookup.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -1081,6 +1227,63 @@ class TestProcessFillEventFacade:
                     env="paper",
                 )
         assert excinfo.value.error_code == "EXIT_NO_PRIOR_TRADE"
+
+    @pytest.mark.asyncio
+    async def test_entry_open_race_refused_by_apply_guard(self) -> None:
+        """Race-window pin for the refuse-at-open guard: the facade's
+        fallback lookup misses (no open trade at plan time), but by apply
+        time a concurrent writer opened one — the guard's re-check inside
+        apply_fill_plan refuses pre-write instead of minting a sibling."""
+        ctx = _ctx(signal_direction="long", order_direction="buy", target_contracts=1)
+        raced_in_trade = PriorTradeRow(
+            trade_id=uuid4(),
+            trade_created_at=_ORDER_CREATED,
+            total_quantity=1,
+            avg_entry_price=Decimal("85.00000000"),
+            realized_commission_usd=Decimal("0.50"),
+            direction="long",
+        )
+        append_mock = AsyncMock(side_effect=lambda *a, **k: _audit_record_mock())
+        # First call: the facade's market fallback (miss). Second call:
+        # the apply-step guard re-check (hit — the race lost).
+        market_lookup = AsyncMock(side_effect=[None, raced_in_trade])
+        with (
+            patch(
+                "services.risk.fill_processor.fetch_fill_context",
+                new=AsyncMock(return_value=ctx),
+            ),
+            patch(
+                "services.risk.fill_processor.fetch_prior_position",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "services.risk.fill_processor.fetch_prior_trade",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "services.risk.fill_processor.fetch_prior_open_trade_for_market",
+                new=market_lookup,
+            ),
+            patch(
+                "services.risk.fill_processor.fetch_prior_balance",
+                new=AsyncMock(
+                    return_value=PriorBalanceSnapshot(
+                        cash_usd=Decimal("1549"), net_liquidation=Decimal("1549")
+                    )
+                ),
+            ),
+            patch("services.risk.fill_processor.append_audit_event", new=append_mock),
+        ):
+            with pytest.raises(FillProcessingError) as excinfo:
+                await process_fill_event(
+                    session_factory=MagicMock(),
+                    client_order_id="entry-race-cid",
+                    payload=_payload(fill_quantity=1),
+                    env="paper",
+                )
+        assert excinfo.value.error_code == "DUPLICATE_OPEN_TRADE_FOR_MARKET"
+        assert market_lookup.await_count == 2
+        append_mock.assert_not_awaited()  # nothing written
 
 
 # ---------------------------------------------------------------------------
@@ -1873,9 +2076,12 @@ class TestApplyFillPlanCloseAction:
 
         session_factory.side_effect = lambda: _factory_cm()
 
-        with patch(
-            "services.risk.fill_processor.append_audit_event",
-            new=AsyncMock(side_effect=lambda *a, **k: _audit_record_mock()),
+        with (
+            patch(
+                "services.risk.fill_processor.append_audit_event",
+                new=AsyncMock(side_effect=lambda *a, **k: _audit_record_mock()),
+            ),
+            _no_open_trade_guard(),
         ):
             await apply_fill_plan(
                 plan,

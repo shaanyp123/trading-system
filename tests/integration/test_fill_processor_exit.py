@@ -51,7 +51,12 @@ from sqlalchemy.ext.asyncio import (
 
 from services.audit.chain import verify_chain
 from services.risk.fill_processor import (
+    FillContext,
     FillIngestPayload,
+    FillProcessingError,
+    PriorBalanceSnapshot,
+    apply_fill_plan,
+    plan_fill_application,
     process_fill_event,
 )
 
@@ -675,3 +680,118 @@ async def test_fresh_signal_add_attaches_to_open_trade(
     assert len(open_trades) == 1  # NO duplicate open trade
     assert int(open_trades[0].total_quantity) == 2
     assert Decimal(str(open_trades[0].avg_entry_price)) == Decimal("86.00")  # (85+87)/2
+
+
+@pytest.mark.asyncio
+async def test_refuse_at_open_guard_blocks_duplicate_open_trade(
+    async_session_factory: async_sessionmaker[AsyncSession],
+    sync_engine: Engine,
+    fresh_account_id: UUID,
+    slippage_head_version_id: UUID,
+) -> None:
+    """Refuse-at-open duplicate-trade guard (#377 accepted follow-up),
+    proven against the real schema: a plan that would INSERT a second
+    open trade for (account, market) is refused by apply_fill_plan with
+    DUPLICATE_OPEN_TRADE_FOR_MARKET and writes NOTHING — no audit rows,
+    no fills row, no second trades row.
+
+    The plan is built with ``prior_trade=None`` deliberately — the shape
+    a lookup→apply race (or a facade-bypassing caller) produces: the
+    lookups missed, so the planner chose ``trade action='open'`` while
+    the trades table already holds an open row for the market. The
+    partitioned ``trades`` table cannot carry the partial unique index
+    that would make Postgres enforce this, hence the code-level guard.
+    """
+    state = _seed_open_trade_state(
+        sync_engine,
+        account_id=fresh_account_id,
+        slip_id=slippage_head_version_id,
+        market="SOL",
+    )
+    dup_cid = "worker-decision-dup-entry-0"
+    dup_signal_id = _seed_fresh_signal_order(
+        sync_engine,
+        account_id=fresh_account_id,
+        slip_id=slippage_head_version_id,
+        market="SOL",
+        direction="buy",
+        quantity=1,
+        cid=dup_cid,
+    )
+    with sync_engine.connect() as conn:
+        dup_order = conn.execute(
+            text("SELECT id, created_at FROM orders WHERE client_order_id = :cid"),
+            {"cid": dup_cid},
+        ).one()
+        audit_count_before = conn.execute(
+            text("SELECT COUNT(*) FROM audit_log WHERE account_id = :acct"),
+            {"acct": fresh_account_id},
+        ).scalar_one()
+
+    context = FillContext(
+        order_id=UUID(str(dup_order.id)),
+        order_created_at=dup_order.created_at,
+        signal_id=dup_signal_id,
+        account_id=fresh_account_id,
+        env="paper",
+        market="SOL",
+        contract_id=None,
+        signal_direction="long",
+        order_direction="buy",
+        target_contracts=1,
+        strategy_hash="0" * 39 + "1",
+        parameter_set_hash="0" * 63 + "1",
+        slippage_calibration_version_id=slippage_head_version_id,
+        decision_price=Decimal("85.00"),
+        managed_by_version="0" * 39 + "1",
+    )
+    plan = plan_fill_application(
+        context=context,
+        payload=FillIngestPayload(
+            broker_fill_id=f"{dup_cid}:agg",
+            cumulative_filled_quantity=1,
+            fill_quantity=1,
+            fill_price=Decimal("85.00"),
+            commission_usd=Decimal("0.25"),
+            filled_at_utc=datetime(2026, 7, 13, 0, 5, tzinfo=UTC),
+        ),
+        prior_position=None,  # raced shape: lookups saw nothing
+        prior_trade=None,
+        prior_balance=PriorBalanceSnapshot(
+            cash_usd=Decimal("1549"), net_liquidation=Decimal("1549")
+        ),
+    )
+    assert plan.trade_mutation.action == "open"  # the sibling-minting shape
+
+    with pytest.raises(FillProcessingError) as excinfo:
+        await apply_fill_plan(
+            plan,
+            session_factory=async_session_factory,
+            account_id=fresh_account_id,
+            env="paper",
+        )
+    assert excinfo.value.error_code == "DUPLICATE_OPEN_TRADE_FOR_MARKET"
+    assert excinfo.value.details["existing_trade_id"] == str(state["trade_id"])
+
+    # NOTHING was written: audit count unchanged, no fills row, still
+    # exactly one open trade for the market.
+    with sync_engine.connect() as conn:
+        audit_count_after = conn.execute(
+            text("SELECT COUNT(*) FROM audit_log WHERE account_id = :acct"),
+            {"acct": fresh_account_id},
+        ).scalar_one()
+        fills = conn.execute(
+            text("SELECT 1 FROM fills WHERE account_id = :acct"),
+            {"acct": fresh_account_id},
+        ).fetchall()
+        open_trades = conn.execute(
+            text(
+                "SELECT id FROM trades WHERE account_id = :acct AND market = 'SOL' "
+                "  AND state = 'open_position'"
+            ),
+            {"acct": fresh_account_id},
+        ).fetchall()
+    assert audit_count_after == audit_count_before
+    assert fills == []
+    assert len(open_trades) == 1
+    assert UUID(str(open_trades[0].id)) == state["trade_id"]
