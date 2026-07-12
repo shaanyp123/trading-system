@@ -47,7 +47,10 @@ Two loops, one process:
 **Halt gate** — every decision dispatch path consults
 :data:`~services.risk.signal_dispatch.RISK_STATES_PERMITTING_DISPATCH`
 before sending orders; non-permitting states produce a logged skip and
-a ``skipped_risk_state`` decision row, never an order. Risk-loop
+a ``skipped_risk_state`` decision row, never an order. A MISSING
+``risk_state`` row fails CLOSED (no dispatch, retried next tick, P1
+``incident_review_required`` once per episode) — the gate never treats
+"cannot answer" as permission. Risk-loop
 *protective* exits (stops, loss-limit flattens, outage flattens)
 deliberately bypass the gate: HALT_NEW halts NEW exposure, not
 risk-reducing exits.
@@ -80,6 +83,7 @@ from contextlib import AbstractAsyncContextManager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
+from enum import Enum
 from pathlib import Path
 from typing import Any, Final, Literal
 from uuid import UUID
@@ -599,6 +603,23 @@ class RiskStateSnapshot:
     severity: str | None
     convalescent_counter: int
     capital_event_active: bool
+
+
+class KillSwitchInvokeResult(Enum):
+    """Tri-state outcome of :meth:`StrategyWorkerStore.invoke_kill_switch`.
+
+    ``ALREADY_HALTED`` is fail-SAFE: the goal state is already in force,
+    so callers may latch / stop retrying. ``NO_RISK_STATE_ROW`` is
+    fail-OPEN: nothing transitioned and the account is NOT halted —
+    callers must keep retrying and alert honestly, never latch. The
+    pre-tri-state boolean collapsed both into ``False``, which let the
+    tick-failure halt latch on a missing row while claiming resolution
+    (2026-07-12 #378 risk-review N-A).
+    """
+
+    APPLIED = "applied"
+    ALREADY_HALTED = "already_halted"
+    NO_RISK_STATE_ROW = "no_risk_state_row"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1453,19 +1474,21 @@ class StrategyWorkerStore:
         *,
         trigger: TransitionTrigger,
         now_utc: datetime,
-    ) -> bool:
+    ) -> KillSwitchInvokeResult:
         """Drive the EXISTING FSM transition to HALT_NEW (no new states).
 
-        Returns True when a transition was applied; False when already
-        halted (facade short-circuit per the policy-layer contract) or
-        when no risk_state row exists.
+        Returns ``APPLIED`` when a transition landed, ``ALREADY_HALTED``
+        on the facade short-circuit (goal state already in force — no
+        transition, no audit rows), and ``NO_RISK_STATE_ROW`` when the
+        FSM has nothing to transition (the halt did NOT land; callers
+        must treat this as failure, never as resolution).
         """
         snapshot = await self.fetch_risk_state(account_id)
         if snapshot is None:
             self._log.error("strategy_worker_kill_switch_no_risk_state_row")
-            return False
+            return KillSwitchInvokeResult.NO_RISK_STATE_ROW
         if snapshot.state == RiskState.HALT_NEW.value:
-            return False
+            return KillSwitchInvokeResult.ALREADY_HALTED
         plan = plan_invoke_kill_switch(
             current_state=RiskState(snapshot.state),
             current_severity=HaltSeverity(snapshot.severity) if snapshot.severity else None,
@@ -1489,7 +1512,7 @@ class StrategyWorkerStore:
             new_severity=applied.new_severity,
             audit_event_uuid=str(applied.state_transition_audit_event_uuid),
         )
-        return True
+        return KillSwitchInvokeResult.APPLIED
 
 
 # ---------------------------------------------------------------------------
@@ -1553,6 +1576,7 @@ class StrategyWorker:
         self._consecutive_tick_failures = 0
         self._tick_failure_halt_fired = False
         self._tick_failure_halt_invoke_alerted = False
+        self._dispatch_blocked_no_risk_state_alerted = False
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -1613,13 +1637,15 @@ class StrategyWorker:
     async def _maybe_halt_on_tick_failures(self) -> None:
         """Invoke HALT_NEW after RISK_TICK_FAILURE_HALT_THRESHOLD consecutive
         tick failures. The ``_tick_failure_halt_fired`` latch sets ONLY after
-        ``invoke_kill_switch`` returns — a raised invoke leaves the latch
-        unset so the next 30 s tick retries (fail-loud-with-retry, the
-        dispatch-layer lock contract; latching before the call was fail-open:
-        one transient invoke failure and the worker never halted). A raised
-        invoke also fires a ONE-SHOT P1 so a persistently failing halt is
-        visible on the alert surface, not just in logs. Both latches re-arm
-        on the next successful tick (per-episode semantics)."""
+        ``invoke_kill_switch`` returns a fail-SAFE result (``APPLIED`` or
+        ``ALREADY_HALTED``) — a raised invoke OR a ``NO_RISK_STATE_ROW``
+        result leaves the latch unset so the next 30 s tick retries
+        (fail-loud-with-retry, the dispatch-layer lock contract; latching
+        on the missing-row case was fail-open: the account was NOT halted
+        while the latch claimed resolution). Both failure shapes fire a
+        ONE-SHOT P1 so a persistently failing halt is visible on the alert
+        surface, not just in logs. Both latches re-arm on the next
+        successful tick (per-episode semantics)."""
         if (
             self._consecutive_tick_failures >= RISK_TICK_FAILURE_HALT_THRESHOLD
             and not self._tick_failure_halt_fired
@@ -1627,7 +1653,7 @@ class StrategyWorker:
         ):
             now = self._clock()
             try:
-                applied = await self._store.invoke_kill_switch(
+                result = await self._store.invoke_kill_switch(
                     self.account_id,
                     trigger=TransitionTrigger.UNHANDLED_EXCEPTION,
                     now_utc=now,
@@ -1638,26 +1664,25 @@ class StrategyWorker:
                     consecutive_failures=self._consecutive_tick_failures,
                     note="latch unset; next risk tick retries the kill switch",
                 )
-                if not self._tick_failure_halt_invoke_alerted:
-                    self._tick_failure_halt_invoke_alerted = True
-                    await self._store.insert_alert(
-                        self.account_id,
-                        severity="P1",
-                        category="kill_switch_invoked",
-                        message=(
-                            f"risk loop failed {self._consecutive_tick_failures} "
-                            "consecutive ticks AND the kill switch invoke FAILED — "
-                            "account NOT halted yet; retrying every tick; see worker logs"
-                        ),
-                        detail={
-                            "trigger": TransitionTrigger.UNHANDLED_EXCEPTION.value,
-                            "consecutive_failures": self._consecutive_tick_failures,
-                            "source": "strategy_worker_risk_loop",
-                            "transition_applied": False,
-                            "invoke_failed": True,
-                        },
-                        now_utc=now,
-                    )
+                await self._alert_tick_failure_halt_not_landed(
+                    now_utc=now,
+                    failure_shape="kill switch invoke FAILED",
+                    invoke_result=None,
+                )
+                return
+            if result is KillSwitchInvokeResult.NO_RISK_STATE_ROW:
+                # Fail-open shape: nothing transitioned, the account is NOT
+                # halted. Do not latch — retry every tick until a row exists.
+                self._log.error(
+                    "strategy_worker_tick_failure_halt_no_risk_state_row",
+                    consecutive_failures=self._consecutive_tick_failures,
+                    note="latch unset; next risk tick retries the kill switch",
+                )
+                await self._alert_tick_failure_halt_not_landed(
+                    now_utc=now,
+                    failure_shape="the kill switch found NO risk_state row",
+                    invoke_result=result,
+                )
                 return
             self._tick_failure_halt_fired = True
             await self._store.insert_alert(
@@ -1667,19 +1692,93 @@ class StrategyWorker:
                 message=(
                     f"risk loop failed {self._consecutive_tick_failures} consecutive "
                     "ticks — HALT_NEW (unhandled_exception); see worker logs"
-                    if applied
+                    if result is KillSwitchInvokeResult.APPLIED
                     else f"risk loop failed {self._consecutive_tick_failures} consecutive "
-                    "ticks — kill switch short-circuited (no transition applied: already "
-                    "halted, or missing risk_state row); see worker logs"
+                    "ticks — kill switch short-circuited (already HALT_NEW, no "
+                    "transition applied); see worker logs"
                 ),
                 detail={
                     "trigger": TransitionTrigger.UNHANDLED_EXCEPTION.value,
                     "consecutive_failures": self._consecutive_tick_failures,
                     "source": "strategy_worker_risk_loop",
-                    "transition_applied": applied,
+                    "transition_applied": result is KillSwitchInvokeResult.APPLIED,
+                    "invoke_result": result.value,
                 },
                 now_utc=now,
             )
+
+    async def _alert_tick_failure_halt_not_landed(
+        self,
+        *,
+        now_utc: datetime,
+        failure_shape: str,
+        invoke_result: KillSwitchInvokeResult | None,
+    ) -> None:
+        """ONE-SHOT honest P1 for a tick-failure halt that did NOT land
+        (raised invoke or missing risk_state row) — the operator sees
+        "NOT halted yet; retrying" instead of nothing (#378 review C2) or
+        a false resolution claim (#378 review N-A)."""
+        assert self.account_id is not None
+        if self._tick_failure_halt_invoke_alerted:
+            return
+        self._tick_failure_halt_invoke_alerted = True
+        await self._store.insert_alert(
+            self.account_id,
+            severity="P1",
+            category="kill_switch_invoked",
+            message=(
+                f"risk loop failed {self._consecutive_tick_failures} "
+                f"consecutive ticks AND {failure_shape} — "
+                "account NOT halted yet; retrying every tick; see worker logs"
+            ),
+            detail={
+                "trigger": TransitionTrigger.UNHANDLED_EXCEPTION.value,
+                "consecutive_failures": self._consecutive_tick_failures,
+                "source": "strategy_worker_risk_loop",
+                "transition_applied": False,
+                "invoke_failed": True,
+                "invoke_result": invoke_result.value if invoke_result is not None else None,
+            },
+            now_utc=now_utc,
+        )
+
+    async def _block_dispatch_no_risk_state(self, *, decision_date: date, source: str) -> None:
+        """Fail-closed refusal shared by the decision + resume halt gates.
+
+        Logs every occurrence (the blocked decision retries each 30 s tick)
+        but alerts ONCE per episode — the
+        ``_dispatch_blocked_no_risk_state_alerted`` latch re-arms when a
+        gate next observes a real snapshot. ``incident_review_required``
+        (existing category): a missing ``risk_state`` row is corruption
+        the operator must repair (re-run bootstrap), not a halt.
+        """
+        assert self.account_id is not None
+        self._log.error(
+            "strategy_worker_dispatch_blocked_no_risk_state",
+            decision_date=decision_date.isoformat(),
+            source=source,
+            note="fail closed: halt gate cannot answer without a risk_state row; "
+            "no decision row written — retried next tick",
+        )
+        if self._dispatch_blocked_no_risk_state_alerted:
+            return
+        self._dispatch_blocked_no_risk_state_alerted = True
+        await self._store.insert_alert(
+            self.account_id,
+            severity="P1",
+            category="incident_review_required",
+            message=(
+                f"decision dispatch for {decision_date.isoformat()} BLOCKED: no "
+                "risk_state row for the active account — halt gate fails closed; "
+                "no orders will dispatch until the row is restored (bootstrap)"
+            ),
+            detail={
+                "decision_date": decision_date.isoformat(),
+                "source": source,
+                "reason": "no_risk_state_row",
+            },
+            now_utc=self._clock(),
+        )
 
     async def startup_recovery(self) -> None:
         """§7 restart rule: reconcile venue state, re-arm missing stops,
@@ -1873,24 +1972,39 @@ class StrategyWorker:
                 )
                 await self._flatten_all(reason="halt_floor", now_utc=now_utc)
             if not already_halted:
-                await self._store.invoke_kill_switch(
+                result = await self._store.invoke_kill_switch(
                     self.account_id,
                     trigger=TransitionTrigger.DECOMMISSION_FLOOR,
                     now_utc=now_utc,
                 )
+                # Honest alert text: claim HALT_NEW only when the transition
+                # actually landed. On NO_RISK_STATE_ROW the account is NOT
+                # halted — the next 30 s tick re-invokes (already_halted stays
+                # False), so this deliberately keeps screaming until fixed.
+                if result is KillSwitchInvokeResult.APPLIED:
+                    halt_outcome = "flattened + HALT_NEW (decommission_floor)"
+                elif result is KillSwitchInvokeResult.ALREADY_HALTED:
+                    halt_outcome = "flattened; already HALT_NEW (no FSM retrip)"
+                else:
+                    halt_outcome = (
+                        "flattened; kill switch found NO risk_state row — "
+                        "HALT_NEW NOT applied; retrying next tick"
+                    )
                 await self._store.insert_alert(
                     self.account_id,
                     severity="P0",
                     category="kill_switch_invoked",
                     message=(
                         f"hard-halt equity floor breached: equity {equity} <= "
-                        f"{halt_floor} — flattened + HALT_NEW (decommission_floor)"
+                        f"{halt_floor} — {halt_outcome}"
                     ),
                     detail={
                         "trigger": TransitionTrigger.DECOMMISSION_FLOOR.value,
                         "equity_usd": str(equity),
                         "halt_floor_usd": str(halt_floor),
                         "source": "strategy_worker_risk_loop",
+                        "transition_applied": result is KillSwitchInvokeResult.APPLIED,
+                        "invoke_result": result.value,
                     },
                     now_utc=now_utc,
                 )
@@ -1927,18 +2041,30 @@ class StrategyWorker:
                     day_start_equity_usd=str(self._day_start_equity),
                 )
                 await self._flatten_all(reason="daily_loss", now_utc=now_utc)
-                await self._store.invoke_kill_switch(
+                result = await self._store.invoke_kill_switch(
                     self.account_id,
                     trigger=TransitionTrigger.DAILY_LOSS_BREACH,
                     now_utc=now_utc,
                 )
+                # Same honest-alert rule as the floor path: only APPLIED may
+                # claim HALT_NEW. NO_RISK_STATE_ROW retries next tick (the
+                # already_halted guard stays False without a row).
+                if result is KillSwitchInvokeResult.APPLIED:
+                    halt_outcome = "flattened + HALT_NEW (daily_loss_breach)"
+                elif result is KillSwitchInvokeResult.ALREADY_HALTED:
+                    halt_outcome = "flattened; already HALT_NEW (no FSM retrip)"
+                else:
+                    halt_outcome = (
+                        "flattened; kill switch found NO risk_state row — "
+                        "HALT_NEW NOT applied; retrying next tick"
+                    )
                 await self._store.insert_alert(
                     self.account_id,
                     severity="P1",
                     category="kill_switch_invoked",
                     message=(
                         f"daily loss limit breached ({daily_pnl_frac:.4f} < "
-                        f"{daily_limit}) — flattened + HALT_NEW (daily_loss_breach)"
+                        f"{daily_limit}) — {halt_outcome}"
                     ),
                     detail={
                         "trigger": TransitionTrigger.DAILY_LOSS_BREACH.value,
@@ -1947,6 +2073,8 @@ class StrategyWorker:
                         "equity_usd": str(equity),
                         "day_start_equity_usd": str(self._day_start_equity),
                         "source": "strategy_worker_risk_loop",
+                        "transition_applied": result is KillSwitchInvokeResult.APPLIED,
+                        "invoke_result": result.value,
                     },
                     now_utc=now_utc,
                 )
@@ -2436,9 +2564,20 @@ class StrategyWorker:
             return
 
         # Halt gate — EVERY dispatch path checks the risk state first.
+        # FAIL CLOSED on a missing snapshot: without a risk_state row the
+        # gate cannot answer, and dispatching anyway would trade through an
+        # unanswerable halt check. No decision row is written, so the next
+        # 30 s tick retries — the decision self-heals once the row is
+        # restored (bootstrap) instead of terminally skipping the date.
         risk_snapshot = await self._store.fetch_risk_state(self.account_id)
-        risk_state = risk_snapshot.state if risk_snapshot is not None else None
-        if risk_state is not None and risk_state not in RISK_STATES_PERMITTING_DISPATCH:
+        if risk_snapshot is None:
+            await self._block_dispatch_no_risk_state(
+                decision_date=decision_date, source="daily_decision"
+            )
+            return
+        self._dispatch_blocked_no_risk_state_alerted = False
+        risk_state = risk_snapshot.state
+        if risk_state not in RISK_STATES_PERMITTING_DISPATCH:
             self._log.warning(
                 "strategy_worker_decision_skipped_risk_state",
                 decision_date=decision_date.isoformat(),
@@ -2682,8 +2821,17 @@ class StrategyWorker:
         if existing.engine_state:
             self.state = deserialize_engine_state(existing.engine_state)
 
+        # Same fail-closed rule as the fresh-decision gate: a missing
+        # risk_state row blocks the resume (retried next tick) rather than
+        # letting the pending legs dispatch through an unanswerable gate.
         snapshot = await self._store.fetch_risk_state(self.account_id)
-        if snapshot is not None and snapshot.state not in RISK_STATES_PERMITTING_DISPATCH:
+        if snapshot is None:
+            await self._block_dispatch_no_risk_state(
+                decision_date=decision_date, source="resume_decision"
+            )
+            return
+        self._dispatch_blocked_no_risk_state_alerted = False
+        if snapshot.state not in RISK_STATES_PERMITTING_DISPATCH:
             self._log.warning(
                 "strategy_worker_resume_blocked_risk_state",
                 decision_date=decision_date.isoformat(),
@@ -2739,13 +2887,16 @@ class StrategyWorker:
             for leg in legs:
                 if leg.get("status") != "pending":
                     continue  # resume path: leg already executed / skipped pre-crash
-                # Halt gate re-check per dispatch (state can change mid-decision).
+                # Halt gate re-check per dispatch (state can change
+                # mid-decision). FAIL CLOSED: a missing snapshot skips the
+                # leg exactly like a halting state — never dispatch through
+                # an unanswerable gate.
                 snapshot = await self._store.fetch_risk_state(self.account_id)
-                if snapshot is not None and snapshot.state not in RISK_STATES_PERMITTING_DISPATCH:
+                if snapshot is None or snapshot.state not in RISK_STATES_PERMITTING_DISPATCH:
                     self._log.warning(
                         "strategy_worker_leg_skipped_risk_state",
                         asset=asset,
-                        risk_state=snapshot.state,
+                        risk_state=None if snapshot is None else snapshot.state,
                         leg=leg,
                     )
                     leg["status"] = "skipped_risk_state"
@@ -2917,18 +3068,28 @@ class StrategyWorker:
                 requested=str(result.requested_contracts),
                 filled=str(result.filled_contracts),
             )
-            await self._store.invoke_kill_switch(
+            invoke_result = await self._store.invoke_kill_switch(
                 self.account_id,
                 trigger=TransitionTrigger.UNHANDLED_EXCEPTION,
                 now_utc=now_utc,
             )
+            # Honest alert text (only APPLIED claims HALT_NEW). There is no
+            # per-site retry here, but on NO_RISK_STATE_ROW the per-leg halt
+            # gate now fails closed on the same missing row, so no further
+            # legs dispatch either.
+            if invoke_result is KillSwitchInvokeResult.APPLIED:
+                halt_outcome = "HALT_NEW (unhandled_exception)"
+            elif invoke_result is KillSwitchInvokeResult.ALREADY_HALTED:
+                halt_outcome = "already HALT_NEW (no FSM retrip)"
+            else:
+                halt_outcome = "kill switch found NO risk_state row — HALT_NEW NOT applied"
             await self._store.insert_alert(
                 self.account_id,
                 severity="P1",
                 category="kill_switch_invoked",
                 message=(
                     f"execution ladder incomplete on {asset} (venue failed the "
-                    "market stage) — HALT_NEW (unhandled_exception)"
+                    f"market stage) — {halt_outcome}"
                 ),
                 detail={
                     "trigger": TransitionTrigger.UNHANDLED_EXCEPTION.value,
@@ -2937,6 +3098,8 @@ class StrategyWorker:
                     "requested_contracts": str(result.requested_contracts),
                     "filled_contracts": str(result.filled_contracts),
                     "source": "strategy_worker_decision_dispatch",
+                    "transition_applied": invoke_result is KillSwitchInvokeResult.APPLIED,
+                    "invoke_result": invoke_result.value,
                 },
                 now_utc=now_utc,
             )
@@ -3496,6 +3659,7 @@ __all__ = [
     "RISK_TICK_FAILURE_HALT_THRESHOLD",
     "AssetRuntime",
     "DecisionRow",
+    "KillSwitchInvokeResult",
     "MarksFeed",
     "RiskStateSnapshot",
     "StrategyWorker",

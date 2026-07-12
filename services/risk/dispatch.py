@@ -349,7 +349,11 @@ async def apply_convalescent_clean_day_tick(
     the pair atomic. (Follow-up resolved 2026-07-12: the worker's
     ``_tick_failure_halt_fired`` latch now sets only after
     ``invoke_kill_switch`` returns, so a raised invoke retries on the
-    next 30 s tick instead of being swallowed.)
+    next 30 s tick instead of being swallowed. Same-day follow-up: the
+    invoke is tri-state — ``NO_RISK_STATE_ROW`` is distinguished from
+    the fail-safe already-halted short-circuit, so a missing row also
+    retries instead of latching, and the worker's decision halt gate
+    fails CLOSED on a missing snapshot.)
 
     Failure forensics: if the ``risk_state`` write fails AFTER the
     graduation audit event committed (the documented audit-canonical

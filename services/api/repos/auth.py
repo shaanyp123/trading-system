@@ -77,6 +77,7 @@ class BackupCodeRow:
 class AuthRepo(Protocol):
     # --- accounts (Phase 0 bootstrap helper)
     async def find_account_by_username(self, username: str) -> AccountRow | None: ...
+    async def find_account_by_id(self, account_id: UUID) -> AccountRow | None: ...
     async def find_or_create_bootstrap_account(
         self, username: str, role: Literal["owner", "reader"]
     ) -> AccountRow: ...
@@ -144,6 +145,29 @@ class PostgresAuthRepo:
                     "WHERE external_account_id = :u AND active_to IS NULL"
                 ),
                 {"u": username},
+            )
+        ).fetchone()
+        if row is None:
+            return None
+        return AccountRow(
+            id=row.id,
+            external_account_id=row.external_account_id,
+            role=row.role,
+        )
+
+    async def find_account_by_id(self, account_id: UUID) -> AccountRow | None:
+        # Primary-key resolution for real sessions (post-2026-07-12 #380:
+        # ``SessionContext.user_id`` carries the account UUID). Same
+        # ``active_to IS NULL`` liveness filter as the username lookup so a
+        # deactivated account's lingering session cannot mint credentials.
+        row = (
+            await self._session.execute(
+                text(
+                    "SELECT id, external_account_id, role "
+                    "FROM accounts "
+                    "WHERE id = :id AND active_to IS NULL"
+                ),
+                {"id": account_id},
             )
         ).fetchone()
         if row is None:
