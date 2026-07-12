@@ -308,6 +308,14 @@ class PriorTradeRow:
     this value to compute the trade's total commission against gross
     P&L. NUMERIC(20,4) per the trades schema."""
 
+    direction: str | None = None
+    """Populated ONLY by :func:`fetch_prior_open_trade_for_market` (the
+    market-level fallback) so the facade can cross-check the resolved
+    trade's direction against the live position sign — a mismatched
+    direction means the fallback found a corrupt/stale open trade and
+    must refuse rather than mis-attach (risk-review C1). ``None`` on the
+    same-signal-id path (the lookup there never needed it)."""
+
 
 @dataclass(frozen=True, slots=True)
 class PriorBalanceSnapshot:
@@ -1452,8 +1460,11 @@ def _plan_exit_close_fill_application(
         contract_id=context.contract_id,
         # entry_signal_id and entry_order_id are preserved on the trade;
         # the apply UPDATE only touches the close-side fields. We echo
-        # the entry_signal_id (== context.signal_id under the shared-
-        # signal contract) here for dataclass completeness; entry_order_id
+        # context.signal_id here for dataclass completeness — under the
+        # LEAN-era shared-signal contract it equalled the entry signal;
+        # on the market-level fallback path (C1 worker, fresh signal per
+        # leg) it is the CLOSE leg's signal id, which is fine because
+        # the apply UPDATE never references it; entry_order_id
         # is NOT available in FillContext for the close path (the context
         # holds the EXIT order id), so we use the same context.order_id
         # as a placeholder — the apply UPDATE doesn't reference it.
@@ -1673,7 +1684,7 @@ async def fetch_prior_open_trade_for_market(
             await session.execute(
                 text(
                     "SELECT id, created_at, total_quantity, avg_entry_price, "
-                    "       realized_commission_usd "
+                    "       realized_commission_usd, direction "
                     "FROM trades "
                     "WHERE account_id = :acct AND market = :market "
                     "  AND state = 'open_position' "
@@ -1690,6 +1701,7 @@ async def fetch_prior_open_trade_for_market(
         total_quantity=int(row.total_quantity),
         avg_entry_price=Decimal(str(row.avg_entry_price)),
         realized_commission_usd=Decimal(str(row.realized_commission_usd)),
+        direction=str(row.direction) if row.direction is not None else None,
     )
 
 
@@ -2136,6 +2148,30 @@ async def process_fill_event(
             session_factory, account_id=context.account_id, market=context.market
         )
         if prior_trade is not None:
+            # Direction cross-check (risk-review C1): the fallback trade
+            # must agree with the live position's sign — disagreement
+            # means a corrupt/stale open trade; refuse to attach (raise
+            # fires pre-apply; nothing is written).
+            expected_direction: str | None = None
+            if prior_position is not None and prior_position.quantity > 0:
+                expected_direction = "long"
+            elif prior_position is not None and prior_position.quantity < 0:
+                expected_direction = "short"
+            if (
+                expected_direction is not None
+                and prior_trade.direction is not None
+                and prior_trade.direction != expected_direction
+            ):
+                raise FillProcessingError(
+                    error_code="FALLBACK_TRADE_DIRECTION_MISMATCH",
+                    message=(
+                        "market-level fallback found an open trade whose "
+                        f"direction ({prior_trade.direction}) contradicts the "
+                        f"live position sign ({expected_direction}); refusing "
+                        "to attach — operator must reconcile the trades table"
+                    ),
+                    details={"market": context.market, "trade_id": str(prior_trade.trade_id)},
+                )
             log.info(
                 "fill_prior_trade_market_fallback",
                 client_order_id=client_order_id,

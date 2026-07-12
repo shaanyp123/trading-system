@@ -946,6 +946,7 @@ class TestProcessFillEventFacade:
             total_quantity=2,
             avg_entry_price=Decimal("64000"),
             realized_commission_usd=Decimal("1"),
+            direction="short",  # matches the live position sign
         )
         applied = MagicMock()
         market_lookup = AsyncMock(return_value=fallback_trade)
@@ -991,6 +992,55 @@ class TestProcessFillEventFacade:
         # The plan actually reached apply — i.e. no EXIT_NO_PRIOR_TRADE.
         plan = apply_mock.await_args.kwargs.get("plan") or apply_mock.await_args.args[0]
         assert plan is not None
+
+    @pytest.mark.asyncio
+    async def test_fallback_direction_mismatch_refuses(self) -> None:
+        """Risk-review C1: a fallback trade whose direction contradicts
+        the live position sign is corrupt/stale — refuse pre-apply."""
+        ctx = _ctx(signal_direction="short", order_direction="buy", target_contracts=2)
+        prior_pos = PriorPositionRow(position_id=uuid4(), quantity=-2, avg_cost=Decimal("64000"))
+        wrong_way_trade = PriorTradeRow(
+            trade_id=uuid4(),
+            trade_created_at=_ORDER_CREATED,
+            total_quantity=2,
+            avg_entry_price=Decimal("64000"),
+            realized_commission_usd=Decimal("1"),
+            direction="long",  # position is short
+        )
+        with (
+            patch(
+                "services.risk.fill_processor.fetch_fill_context",
+                new=AsyncMock(return_value=ctx),
+            ),
+            patch(
+                "services.risk.fill_processor.fetch_prior_position",
+                new=AsyncMock(return_value=prior_pos),
+            ),
+            patch(
+                "services.risk.fill_processor.fetch_prior_trade",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "services.risk.fill_processor.fetch_prior_open_trade_for_market",
+                new=AsyncMock(return_value=wrong_way_trade),
+            ),
+            patch(
+                "services.risk.fill_processor.fetch_prior_balance",
+                new=AsyncMock(
+                    return_value=PriorBalanceSnapshot(
+                        cash_usd=Decimal("1549"), net_liquidation=Decimal("1549")
+                    )
+                ),
+            ),
+        ):
+            with pytest.raises(FillProcessingError) as excinfo:
+                await process_fill_event(
+                    session_factory=MagicMock(),
+                    client_order_id="close-leg-cid",
+                    payload=_payload(fill_quantity=2),
+                    env="paper",
+                )
+        assert excinfo.value.error_code == "FALLBACK_TRADE_DIRECTION_MISMATCH"
 
     @pytest.mark.asyncio
     async def test_no_open_trade_anywhere_still_raises(self) -> None:

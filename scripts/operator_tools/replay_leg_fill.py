@@ -139,7 +139,11 @@ async def _run(args: argparse.Namespace) -> int:
         print("ERROR: quantity/price must be positive; commission >= 0", file=sys.stderr)
         return 2
     if args.filled_at_utc is not None:
-        filled_at = datetime.fromisoformat(args.filled_at_utc)
+        try:
+            filled_at = datetime.fromisoformat(args.filled_at_utc)
+        except ValueError:
+            print("ERROR: --filled-at-utc is not valid ISO-8601", file=sys.stderr)
+            return 2
         if filled_at.tzinfo is None:
             print("ERROR: --filled-at-utc must be tz-aware (A06)", file=sys.stderr)
             return 2
@@ -161,6 +165,20 @@ async def _run(args: argparse.Namespace) -> int:
         if str(order_row.status) == "filled" and not args.force:
             print("ERROR: order already status='filled' — pass --force to replay anyway")
             return 3
+        order_qty = int(order_row.quantity)
+        if args.fill_quantity > order_qty and not args.force:
+            print(
+                f"ERROR: --fill-quantity {args.fill_quantity} exceeds the orders "
+                f"row quantity {order_qty} — a typo here would mis-record the "
+                "position. Pass --force only if the venue record truly says so.",
+                file=sys.stderr,
+            )
+            return 2
+        if args.fill_quantity != order_qty:
+            print(
+                f"WARNING: --fill-quantity {args.fill_quantity} != order quantity "
+                f"{order_qty} (partial replay)"
+            )
 
         payload = FillIngestPayload(
             broker_fill_id=f"{args.client_order_id}:agg",

@@ -1630,3 +1630,31 @@ class TestExternalFlatOrphanedStop:
         # Unsynced on purpose: the diff re-fires next tick and retries.
         assert rt.contracts == -2
         assert rt.native_stop_order_id == stop.order_id
+
+    async def test_external_flat_cancel_rejected_in_http_200_retries(self) -> None:
+        """Risk-review B1: the venue can reject a cancel INSIDE an HTTP
+        200 (per-order success:false; adapter raises nothing). The
+        worker must verify the book is actually clean before clearing —
+        surviving orders leave state unsynced for the next-tick retry."""
+        worker, _, broker = await _started_worker()
+        rt = worker.state["BTC"]
+        rt.contracts = -2
+        stop = broker.seed_order(
+            client_order_id="stop-cid",
+            product_id=BTC_PID,
+            side="buy",
+            contracts=Decimal(2),
+            status="open",
+            kind="stop_limit",
+        )
+        rt.native_stop_order_id = stop.order_id
+
+        async def _cancel_rejected(order_ids: list[str]) -> dict[str, bool]:
+            return {oid: False for oid in order_ids}  # 200, but rejected
+
+        broker.cancel_orders = _cancel_rejected  # type: ignore[method-assign]
+        await worker._detect_external_position_changes({}, now_utc=NOW)
+
+        assert broker.orders[stop.order_id].status == "open"  # still resting
+        assert rt.contracts == -2  # unsynced => next tick retries
+        assert rt.native_stop_order_id == stop.order_id
