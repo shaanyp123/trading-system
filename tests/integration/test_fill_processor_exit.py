@@ -496,3 +496,182 @@ async def test_exit_full_close_end_to_end(
     # slippage-bootstrap audit is not emitted by the fixture path, so
     # rows_walked equals the count of audit_log rows in the testcontainer).
     assert verify_result[2] >= 4
+
+
+def _seed_fresh_signal_order(
+    sync_engine: Engine,
+    *,
+    account_id: UUID,
+    slip_id: UUID,
+    market: str,
+    direction: str,
+    quantity: int,
+    cid: str,
+) -> UUID:
+    """A worker-shaped leg: its OWN fresh signal row + order (the C1
+    worker mints one signal per leg — the 2026-07-12 incident shape)."""
+    with sync_engine.begin() as conn:
+        signal_id = conn.execute(
+            text(
+                "INSERT INTO signals ("
+                "    account_id, env, market, emitted_at_utc, session_date,"
+                "    direction, signal_type, strategy_hash, parameter_set_hash,"
+                "    slippage_calibration_version_id, decision_price, target_contracts,"
+                "    sizing_trace, status"
+                ") VALUES ("
+                "    :acct, 'paper', :market, now(), CURRENT_DATE,"
+                "    :sig_dir, 'donchian_breakout',"
+                "    '0000000000000000000000000000000000000001',"
+                "    '0000000000000000000000000000000000000000000000000000000000000001',"
+                "    :slip, 85.00, :qty,"
+                "    '{}'::jsonb, 'working'"
+                ") RETURNING id"
+            ),
+            {
+                "acct": account_id,
+                "market": market,
+                "sig_dir": "long" if direction == "buy" else "short",
+                "slip": slip_id,
+                "qty": quantity,
+            },
+        ).scalar_one()
+        conn.execute(
+            text(
+                "INSERT INTO orders ("
+                "    account_id, env, signal_id, client_order_id, broker_order_id,"
+                "    market, direction, order_type, quantity, limit_price, placed_at_utc,"
+                "    status, retry_n, strategy_hash, parameter_set_hash"
+                ") VALUES ("
+                "    :acct, 'paper', :sig, :cid, '9',"
+                "    :market, :dir, 'limit_marketable', :qty, 85.00, now(),"
+                "    'pending', 0,"
+                "    '0000000000000000000000000000000000000001',"
+                "    '0000000000000000000000000000000000000000000000000000000000000001'"
+                ") RETURNING id"
+            ),
+            {
+                "acct": account_id,
+                "sig": signal_id,
+                "cid": cid,
+                "market": market,
+                "dir": direction,
+                "qty": quantity,
+            },
+        )
+    return UUID(str(signal_id))
+
+
+@pytest.mark.asyncio
+async def test_fresh_signal_close_resolves_via_market_fallback(
+    async_session_factory: async_sessionmaker[AsyncSession],
+    sync_engine: Engine,
+    fresh_account_id: UUID,
+    slippage_head_version_id: UUID,
+) -> None:
+    """PR #377 end-to-end lock of the 2026-07-12 incident: a close leg
+    with its OWN signal id (never opened a trade) must resolve the open
+    trade via the market-level fallback and close it fully — real SQL,
+    real dispatcher, no mocked loaders."""
+    state = _seed_open_trade_state(
+        sync_engine,
+        account_id=fresh_account_id,
+        slip_id=slippage_head_version_id,
+        market="BTC",
+    )
+    close_cid = "worker-decision-close-0"
+    _seed_fresh_signal_order(
+        sync_engine,
+        account_id=fresh_account_id,
+        slip_id=slippage_head_version_id,
+        market="BTC",
+        direction="sell",  # closes the seeded long
+        quantity=state["quantity"],
+        cid=close_cid,
+    )
+
+    result = await process_fill_event(
+        session_factory=async_session_factory,
+        client_order_id=close_cid,
+        payload=FillIngestPayload(
+            broker_fill_id=f"{close_cid}:agg",
+            cumulative_filled_quantity=state["quantity"],
+            fill_quantity=state["quantity"],
+            fill_price=Decimal("86.00"),
+            commission_usd=Decimal("0.25"),
+            filled_at_utc=datetime(2026, 7, 12, 0, 5, tzinfo=UTC),
+        ),
+        env="paper",
+    )
+    assert result is not None
+    assert result.trade_id == state["trade_id"]  # the FALLBACK-resolved trade
+
+    with sync_engine.connect() as conn:
+        trade = conn.execute(
+            text("SELECT state, realized_pnl_usd FROM trades WHERE id = :tid"),
+            {"tid": state["trade_id"]},
+        ).one()
+        pos = conn.execute(
+            text("SELECT 1 FROM positions_current WHERE account_id = :acct AND market = 'BTC'"),
+            {"acct": fresh_account_id},
+        ).fetchone()
+    assert trade.state == "closed"
+    # (86 - 85) * 1 - (0.50 entry + 0.25 exit commission) = 0.25
+    assert Decimal(str(trade.realized_pnl_usd)) == Decimal("0.2500")
+    assert pos is None  # position row deleted
+
+
+@pytest.mark.asyncio
+async def test_fresh_signal_add_attaches_to_open_trade(
+    async_session_factory: async_sessionmaker[AsyncSession],
+    sync_engine: Engine,
+    fresh_account_id: UUID,
+    slippage_head_version_id: UUID,
+) -> None:
+    """The sibling defect, pre-fixed: a same-direction ADD with its own
+    signal id must attach to the existing open trade (averaged entry,
+    summed quantity) — never mint a second open trade for the market."""
+    state = _seed_open_trade_state(
+        sync_engine,
+        account_id=fresh_account_id,
+        slip_id=slippage_head_version_id,
+        market="ETH",
+    )
+    add_cid = "worker-decision-add-0"
+    _seed_fresh_signal_order(
+        sync_engine,
+        account_id=fresh_account_id,
+        slip_id=slippage_head_version_id,
+        market="ETH",
+        direction="buy",  # same direction as the seeded long
+        quantity=1,
+        cid=add_cid,
+    )
+
+    result = await process_fill_event(
+        session_factory=async_session_factory,
+        client_order_id=add_cid,
+        payload=FillIngestPayload(
+            broker_fill_id=f"{add_cid}:agg",
+            cumulative_filled_quantity=1,
+            fill_quantity=1,
+            fill_price=Decimal("87.00"),
+            commission_usd=Decimal("0.25"),
+            filled_at_utc=datetime(2026, 7, 12, 0, 6, tzinfo=UTC),
+        ),
+        env="paper",
+    )
+    assert result is not None
+    assert result.trade_id == state["trade_id"]
+
+    with sync_engine.connect() as conn:
+        open_trades = conn.execute(
+            text(
+                "SELECT id, total_quantity, avg_entry_price FROM trades "
+                "WHERE account_id = :acct AND market = 'ETH' "
+                "  AND state = 'open_position'"
+            ),
+            {"acct": fresh_account_id},
+        ).fetchall()
+    assert len(open_trades) == 1  # NO duplicate open trade
+    assert int(open_trades[0].total_quantity) == 2
+    assert Decimal(str(open_trades[0].avg_entry_price)) == Decimal("86.00")  # (85+87)/2

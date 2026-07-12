@@ -118,6 +118,7 @@ from services.risk.capital_events import (
 from services.risk.dispatch import apply_state_transition
 from services.risk.fill_processor import (
     FillIngestPayload,
+    FillProcessingError,
     UnsupportedFillScenarioError,
     process_fill_event,
 )
@@ -1249,6 +1250,29 @@ class StrategyWorkerStore:
                 detail=str(exc),
             )
             return False
+        except FillProcessingError as exc:
+            # 2026-07-12 incident: EXIT_NO_PRIOR_TRADE escaped this seam
+            # and killed the decision AFTER the venue fill — the worst
+            # possible ordering (venue traded, backend refused to record
+            # it, recon broke on the gap, auto-halt). No fill
+            # CLASSIFICATION/PLANNING error may ever again abort a
+            # decision post-execution — every FillProcessingError raise
+            # site fires BEFORE apply_fill_plan writes anything, so this
+            # catch can never mask a partial apply. Deliberately NOT
+            # `except Exception`: AuditWriteFailure and raw DB errors
+            # from the apply step MUST still abort (§2.10.1 fail-closed).
+            self._log.error(
+                "strategy_worker_fill_propagation_failed_fallback",
+                client_order_id=client_order_id,
+                error_code=exc.error_code,
+                detail=str(exc),
+                note=(
+                    "full position/trade propagation failed; falling back to "
+                    "minimal orders/fills recording — positions_current/trades "
+                    "may need the replay_leg_fill operator tool"
+                ),
+            )
+            return False
         if result is None:
             self._log.warning("strategy_worker_fill_unknown_order", client_order_id=client_order_id)
         return True
@@ -1915,7 +1939,19 @@ class StrategyWorker:
         self, venue_positions: Mapping[str, BrokerPosition], *, now_utc: datetime
     ) -> None:
         """Detect native-stop fills (and any other venue-side position
-        change) by diffing tracked state against ``list_positions``."""
+        change) by diffing tracked state against ``list_positions``.
+
+        Runs under ``_trade_lock`` (risk-review C2): a stale venue
+        snapshot interleaved with a decision leg executing could
+        otherwise cancel a freshly-armed stop / just-placed order and
+        zero tracking on a real position. Same lock discipline as the
+        flatten path."""
+        async with self._trade_lock:
+            await self._detect_external_position_changes_locked(venue_positions, now_utc=now_utc)
+
+    async def _detect_external_position_changes_locked(
+        self, venue_positions: Mapping[str, BrokerPosition], *, now_utc: datetime
+    ) -> None:
         for asset in ASSETS:
             rt = self.state[asset]
             product = self.products.get(asset)
@@ -1945,10 +1981,51 @@ class StrategyWorker:
                         "venue liquidation); syncing to venue truth"
                     ),
                 )
-                rt.contracts = venue_contracts
                 if venue_contracts == 0:
+                    # 2026-07-12 incident: _clear_position_state forgets the
+                    # native stop id WITHOUT cancelling it at the venue — a
+                    # resting stop on a flat book is a naked order that would
+                    # open an unintended position. Cancel venue-side FIRST,
+                    # then VERIFY the book is actually clean (risk-review B1:
+                    # the venue can reject a cancel inside an HTTP 200 and the
+                    # adapter's batch call surfaces no exception). On failure
+                    # OR surviving orders, tracked contracts stay UNSYNCED so
+                    # this branch re-fires on the next 30 s tick and retries.
+                    if rt.native_stop_order_id or rt.native_stop_client_order_id:
+                        try:
+                            await self._adapter.cancel_all_orders(product.product_id)
+                            remaining = await self._broker.list_open_orders(product.product_id)
+                        except Exception:
+                            self._log.exception(
+                                "strategy_worker_external_flat_cancel_failed",
+                                asset=asset,
+                                note=(
+                                    "tracked contracts left unsynced so the "
+                                    "next tick retries the cancel"
+                                ),
+                            )
+                            continue
+                        if remaining:
+                            self._log.error(
+                                "strategy_worker_external_flat_cancel_rejected",
+                                asset=asset,
+                                product_id=product.product_id,
+                                remaining_open_orders=len(remaining),
+                                note=(
+                                    "venue accepted the cancel request but "
+                                    "orders remain open; retrying next tick"
+                                ),
+                            )
+                            continue
+                        self._log.warning(
+                            "strategy_worker_external_flat_orders_cancelled",
+                            asset=asset,
+                            product_id=product.product_id,
+                        )
+                    rt.contracts = 0
                     self._clear_position_state(rt)
                 else:
+                    rt.contracts = venue_contracts
                     await self._arm_native_stop(asset, reason="external_change_rearm")
 
     async def _handle_native_stop_fill(

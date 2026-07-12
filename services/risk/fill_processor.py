@@ -40,14 +40,27 @@ The split mirrors the plan-then-apply convention used by
   * ``EXIT_REVERSAL`` (deferred Phase 2+) — opposite fill that crosses
     zero into a new opposite-direction position. Raises.
 
-For the EXIT_FULL_CLOSE path, the lookup convention is **same-signal-id**
-— the bracket-order stop placed by
-:mod:`services.risk.order_placement_worker.apply_order_placement` carries
-``signal_id = entry_signal.id`` (Option B per the 2026-05-17 session brief).
-The entry + stop orders both point at the same signal row; differentiation
-is via ``orders.direction`` + ``orders.order_type``. That means
-:func:`fetch_prior_trade(entry_signal_id=context.signal_id)` resolves the
-open trade for both entry-add and stop-fill paths without extra plumbing.
+For the EXIT_FULL_CLOSE path, the primary lookup convention is
+**same-signal-id** — the bracket-order stop placed in the LEAN/CME era
+carried ``signal_id = entry_signal.id`` (Option B per the 2026-05-17
+session brief), so :func:`fetch_prior_trade(entry_signal_id=
+context.signal_id)` resolved the open trade for entry-add and stop-fill
+paths without extra plumbing.
+
+**Market-level fallback (2026-07-12 incident):** the C1 strategy worker
+mints a FRESH signal row for every leg, including decision-driven close
+legs — so a close fill arrives under a signal_id that never opened any
+trade and the same-signal lookup misses. The first live decision-driven
+close (2026-07-12 00:05 UTC) hit exactly this: ``EXIT_NO_PRIOR_TRADE``
+raised AFTER the venue fill, the decision died, and the un-propagated
+fill surfaced as a recon break + auto-halt. The orchestrator now falls
+back to the open trade row for ``(account_id, market)`` when the
+same-signal lookup returns None (:func:`fetch_prior_open_trade_for_market`)
+— well-defined because the system holds at most one open trade per
+market. The same fallback makes same-direction ADD legs attach to the
+existing open trade instead of minting a duplicate. The raise now means
+the market genuinely has no open trade — real corruption, not a
+linkage-convention mismatch.
 
 **Audit event taxonomy** (`services/audit/event_types.py`):
 
@@ -294,6 +307,14 @@ class PriorTradeRow:
     the exit-close path the planner adds the exit fill's commission to
     this value to compute the trade's total commission against gross
     P&L. NUMERIC(20,4) per the trades schema."""
+
+    direction: str | None = None
+    """Populated ONLY by :func:`fetch_prior_open_trade_for_market` (the
+    market-level fallback) so the facade can cross-check the resolved
+    trade's direction against the live position sign — a mismatched
+    direction means the fallback found a corrupt/stale open trade and
+    must refuse rather than mis-attach (risk-review C1). ``None`` on the
+    same-signal-id path (the lookup there never needed it)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -827,11 +848,10 @@ def plan_fill_application(
         raise FillProcessingError(
             error_code="EXIT_NO_PRIOR_TRADE",
             message=(
-                "EXIT_FULL_CLOSE scenario reached but no open trade row was "
-                "found for the entry signal_id. Either the bracket-order stop "
-                "is not reusing the entry signal_id (Option B contract violated) "
-                "or the trade row was prematurely closed. Operator must "
-                "reconcile manually."
+                "EXIT_FULL_CLOSE scenario reached but no open trade row exists "
+                "for this market (same-signal-id lookup AND the market-level "
+                "fallback both missed). The trade row was prematurely closed "
+                "or never created. Operator must reconcile manually."
             ),
             details={
                 "signal_id": str(context.signal_id),
@@ -1440,8 +1460,11 @@ def _plan_exit_close_fill_application(
         contract_id=context.contract_id,
         # entry_signal_id and entry_order_id are preserved on the trade;
         # the apply UPDATE only touches the close-side fields. We echo
-        # the entry_signal_id (== context.signal_id under the shared-
-        # signal contract) here for dataclass completeness; entry_order_id
+        # context.signal_id here for dataclass completeness — under the
+        # LEAN-era shared-signal contract it equalled the entry signal;
+        # on the market-level fallback path (C1 worker, fresh signal per
+        # leg) it is the CLOSE leg's signal id, which is fine because
+        # the apply UPDATE never references it; entry_order_id
         # is NOT available in FillContext for the close path (the context
         # holds the EXIT order id), so we use the same context.order_id
         # as a placeholder — the apply UPDATE doesn't reference it.
@@ -1637,6 +1660,48 @@ async def fetch_prior_trade(
         total_quantity=int(row.total_quantity),
         avg_entry_price=Decimal(str(row.avg_entry_price)),
         realized_commission_usd=Decimal(str(row.realized_commission_usd)),
+    )
+
+
+async def fetch_prior_open_trade_for_market(
+    session_factory: async_sessionmaker[Any],
+    *,
+    account_id: UUID,
+    market: str,
+) -> PriorTradeRow | None:
+    """Read the open trade row for ``(account_id, market)`` if any.
+
+    The market-level fallback for the same-signal-id convention (module
+    docstring, 2026-07-12 incident): the C1 strategy worker mints a
+    fresh signal per leg, so decision-driven close/add fills carry a
+    signal_id that never opened a trade. At most one open trade per
+    market exists in this system (single position per market), so the
+    market-level lookup is well-defined. Newest-first ORDER BY is a
+    defensive tiebreak only.
+    """
+    async with session_factory() as session:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT id, created_at, total_quantity, avg_entry_price, "
+                    "       realized_commission_usd, direction "
+                    "FROM trades "
+                    "WHERE account_id = :acct AND market = :market "
+                    "  AND state = 'open_position' "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ),
+                {"acct": account_id, "market": market},
+            )
+        ).fetchone()
+    if row is None:
+        return None
+    return PriorTradeRow(
+        trade_id=row.id,
+        trade_created_at=row.created_at,
+        total_quantity=int(row.total_quantity),
+        avg_entry_price=Decimal(str(row.avg_entry_price)),
+        realized_commission_usd=Decimal(str(row.realized_commission_usd)),
+        direction=str(row.direction) if row.direction is not None else None,
     )
 
 
@@ -2075,6 +2140,44 @@ async def process_fill_event(
         contract_id=context.contract_id,
     )
     prior_trade = await fetch_prior_trade(session_factory, entry_signal_id=context.signal_id)
+    if prior_trade is None:
+        # Market-level fallback (2026-07-12): the strategy worker mints a
+        # fresh signal per leg, so close/add fills never match the
+        # same-signal-id convention. See module docstring.
+        prior_trade = await fetch_prior_open_trade_for_market(
+            session_factory, account_id=context.account_id, market=context.market
+        )
+        if prior_trade is not None:
+            # Direction cross-check (risk-review C1): the fallback trade
+            # must agree with the live position's sign — disagreement
+            # means a corrupt/stale open trade; refuse to attach (raise
+            # fires pre-apply; nothing is written).
+            expected_direction: str | None = None
+            if prior_position is not None and prior_position.quantity > 0:
+                expected_direction = "long"
+            elif prior_position is not None and prior_position.quantity < 0:
+                expected_direction = "short"
+            if (
+                expected_direction is not None
+                and prior_trade.direction is not None
+                and prior_trade.direction != expected_direction
+            ):
+                raise FillProcessingError(
+                    error_code="FALLBACK_TRADE_DIRECTION_MISMATCH",
+                    message=(
+                        "market-level fallback found an open trade whose "
+                        f"direction ({prior_trade.direction}) contradicts the "
+                        f"live position sign ({expected_direction}); refusing "
+                        "to attach — operator must reconcile the trades table"
+                    ),
+                    details={"market": context.market, "trade_id": str(prior_trade.trade_id)},
+                )
+            log.info(
+                "fill_prior_trade_market_fallback",
+                client_order_id=client_order_id,
+                market=context.market,
+                trade_id=str(prior_trade.trade_id),
+            )
     prior_balance = await fetch_prior_balance(session_factory, account_id=context.account_id)
 
     plan = plan_fill_application(
@@ -2120,6 +2223,7 @@ __all__ = [
     "apply_fill_plan",
     "fetch_fill_context",
     "fetch_prior_balance",
+    "fetch_prior_open_trade_for_market",
     "fetch_prior_position",
     "fetch_prior_trade",
     "plan_fill_application",
