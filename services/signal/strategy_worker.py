@@ -1552,6 +1552,7 @@ class StrategyWorker:
         self._last_decision_date: date | None = None
         self._consecutive_tick_failures = 0
         self._tick_failure_halt_fired = False
+        self._tick_failure_halt_invoke_alerted = False
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -1581,6 +1582,10 @@ class StrategyWorker:
                 try:
                     await self.run_tick()
                     self._consecutive_tick_failures = 0
+                    # A successful tick ends the failure episode: re-arm the
+                    # halt latch so a NEW streak can halt without a restart.
+                    self._tick_failure_halt_fired = False
+                    self._tick_failure_halt_invoke_alerted = False
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -1606,19 +1611,55 @@ class StrategyWorker:
             self._log.info("strategy_worker_stopped")
 
     async def _maybe_halt_on_tick_failures(self) -> None:
+        """Invoke HALT_NEW after RISK_TICK_FAILURE_HALT_THRESHOLD consecutive
+        tick failures. The ``_tick_failure_halt_fired`` latch sets ONLY after
+        ``invoke_kill_switch`` returns — a raised invoke leaves the latch
+        unset so the next 30 s tick retries (fail-loud-with-retry, the
+        dispatch-layer lock contract; latching before the call was fail-open:
+        one transient invoke failure and the worker never halted). A raised
+        invoke also fires a ONE-SHOT P1 so a persistently failing halt is
+        visible on the alert surface, not just in logs. Both latches re-arm
+        on the next successful tick (per-episode semantics)."""
         if (
             self._consecutive_tick_failures >= RISK_TICK_FAILURE_HALT_THRESHOLD
             and not self._tick_failure_halt_fired
             and self.account_id is not None
         ):
-            self._tick_failure_halt_fired = True
             now = self._clock()
-            with contextlib.suppress(Exception):
-                await self._store.invoke_kill_switch(
+            try:
+                applied = await self._store.invoke_kill_switch(
                     self.account_id,
                     trigger=TransitionTrigger.UNHANDLED_EXCEPTION,
                     now_utc=now,
                 )
+            except Exception:
+                self._log.exception(
+                    "strategy_worker_tick_failure_halt_invoke_failed",
+                    consecutive_failures=self._consecutive_tick_failures,
+                    note="latch unset; next risk tick retries the kill switch",
+                )
+                if not self._tick_failure_halt_invoke_alerted:
+                    self._tick_failure_halt_invoke_alerted = True
+                    await self._store.insert_alert(
+                        self.account_id,
+                        severity="P1",
+                        category="kill_switch_invoked",
+                        message=(
+                            f"risk loop failed {self._consecutive_tick_failures} "
+                            "consecutive ticks AND the kill switch invoke FAILED — "
+                            "account NOT halted yet; retrying every tick; see worker logs"
+                        ),
+                        detail={
+                            "trigger": TransitionTrigger.UNHANDLED_EXCEPTION.value,
+                            "consecutive_failures": self._consecutive_tick_failures,
+                            "source": "strategy_worker_risk_loop",
+                            "transition_applied": False,
+                            "invoke_failed": True,
+                        },
+                        now_utc=now,
+                    )
+                return
+            self._tick_failure_halt_fired = True
             await self._store.insert_alert(
                 self.account_id,
                 severity="P1",
@@ -1626,11 +1667,16 @@ class StrategyWorker:
                 message=(
                     f"risk loop failed {self._consecutive_tick_failures} consecutive "
                     "ticks — HALT_NEW (unhandled_exception); see worker logs"
+                    if applied
+                    else f"risk loop failed {self._consecutive_tick_failures} consecutive "
+                    "ticks — kill switch short-circuited (no transition applied: already "
+                    "halted, or missing risk_state row); see worker logs"
                 ),
                 detail={
                     "trigger": TransitionTrigger.UNHANDLED_EXCEPTION.value,
                     "consecutive_failures": self._consecutive_tick_failures,
                     "source": "strategy_worker_risk_loop",
+                    "transition_applied": applied,
                 },
                 now_utc=now,
             )

@@ -346,10 +346,10 @@ async def apply_convalescent_clean_day_tick(
     blocked behind it fails LOUDLY on the ``risk_state_current`` partial
     unique index and the worker's next 30 s risk tick re-fires it —
     fail-loud-with-retry rather than a silent stomp. It does NOT make
-    the pair atomic. Known follow-up (own [A02] PR): the worker's
-    ``_tick_failure_halt_fired`` latch is set before its suppressed
-    ``invoke_kill_switch`` call and would swallow that retry for the
-    tick-failure halt path specifically.
+    the pair atomic. (Follow-up resolved 2026-07-12: the worker's
+    ``_tick_failure_halt_fired`` latch now sets only after
+    ``invoke_kill_switch`` returns, so a raised invoke retries on the
+    next 30 s tick instead of being swallowed.)
 
     Failure forensics: if the ``risk_state`` write fails AFTER the
     graduation audit event committed (the documented audit-canonical

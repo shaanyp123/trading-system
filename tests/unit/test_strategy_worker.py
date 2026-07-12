@@ -54,6 +54,7 @@ from services.risk.fill_processor import FillIngestPayload
 from services.risk.state_machine import TransitionTrigger
 from services.signal.crypto_trend import AMENDMENT_B_PARAMS
 from services.signal.strategy_worker import (
+    RISK_TICK_FAILURE_HALT_THRESHOLD,
     AssetRuntime,
     DecisionRow,
     MarksFeed,
@@ -353,7 +354,8 @@ class FakeStore(StrategyWorkerStore):
         self.fill_fallbacks: list[str] = []
         self.terminals: list[tuple[str, str]] = []
         self.kill_switch_calls: list[TransitionTrigger] = []
-        self.alerts: list[tuple[str, str, str]] = []  # (severity, category, message)
+        # (severity, category, message, detail)
+        self.alerts: list[tuple[str, str, str, dict[str, Any]]] = []
         self.equity_history: dict[date, Decimal] = {}
         self._contract_ids: dict[str, UUID] = {}
         self.process_fill_supported = True
@@ -507,7 +509,7 @@ class FakeStore(StrategyWorkerStore):
         detail: dict[str, Any],
         now_utc: datetime,
     ) -> None:
-        self.alerts.append((severity, category, message))
+        self.alerts.append((severity, category, message, detail))
 
     async def invoke_kill_switch(
         self, account_id: UUID, *, trigger: TransitionTrigger, now_utc: datetime
@@ -1399,6 +1401,127 @@ class TestFillScenarioFallback:
 
         assert store.fill_fallbacks  # orders/fills stay truthful
         assert worker.state["BTC"].contracts == 2
+
+
+# ---------------------------------------------------------------------------
+# Tick-failure halt latch (fail-loud-with-retry)
+# ---------------------------------------------------------------------------
+
+
+class FlakyKillSwitchStore(FakeStore):
+    """invoke_kill_switch raises for the first ``fail_times`` attempts,
+    then delegates to the FakeStore happy path."""
+
+    def __init__(self, fail_times: int) -> None:
+        super().__init__()
+        self.fail_times = fail_times
+        self.invoke_attempts = 0
+
+    async def invoke_kill_switch(
+        self, account_id: UUID, *, trigger: TransitionTrigger, now_utc: datetime
+    ) -> bool:
+        self.invoke_attempts += 1
+        if self.invoke_attempts <= self.fail_times:
+            raise RuntimeError("transient db failure")
+        return await super().invoke_kill_switch(account_id, trigger=trigger, now_utc=now_utc)
+
+
+class TestTickFailureHaltLatch:
+    async def test_halt_fires_once_at_threshold_then_latches(self) -> None:
+        worker, store, _ = await _started_worker()
+        worker._consecutive_tick_failures = RISK_TICK_FAILURE_HALT_THRESHOLD
+
+        await worker._maybe_halt_on_tick_failures()
+        await worker._maybe_halt_on_tick_failures()  # next tick: latched, no re-fire
+
+        assert store.kill_switch_calls == [TransitionTrigger.UNHANDLED_EXCEPTION]
+        assert worker._tick_failure_halt_fired is True
+        assert [a[:2] for a in store.alerts] == [("P1", "kill_switch_invoked")]
+        assert store.alerts[0][3]["transition_applied"] is True
+
+    async def test_below_threshold_does_nothing(self) -> None:
+        worker, store, _ = await _started_worker()
+        worker._consecutive_tick_failures = RISK_TICK_FAILURE_HALT_THRESHOLD - 1
+
+        await worker._maybe_halt_on_tick_failures()
+
+        assert store.kill_switch_calls == []
+        assert store.alerts == []
+        assert worker._tick_failure_halt_fired is False
+
+    async def test_raised_invoke_leaves_latch_unset_and_next_tick_retries(self) -> None:
+        """The regression pin: a raised invoke_kill_switch must NOT latch —
+        the halt retries on the next 30 s tick until it lands."""
+        flaky = FlakyKillSwitchStore(fail_times=1)
+        worker, _, _ = await _started_worker(store=flaky)
+        worker._consecutive_tick_failures = RISK_TICK_FAILURE_HALT_THRESHOLD
+
+        await worker._maybe_halt_on_tick_failures()  # attempt 1 raises
+
+        assert worker._tick_failure_halt_fired is False
+        # one-shot invoke-failure P1: operator sees "NOT halted yet" on the
+        # alert surface instead of nothing (risk-review C2)
+        assert [a[:2] for a in flaky.alerts] == [("P1", "kill_switch_invoked")]
+        assert flaky.alerts[0][3]["invoke_failed"] is True
+        assert flaky.alerts[0][3]["transition_applied"] is False
+
+        await worker._maybe_halt_on_tick_failures()  # next tick: retry succeeds
+
+        assert flaky.invoke_attempts == 2
+        assert flaky.kill_switch_calls == [TransitionTrigger.UNHANDLED_EXCEPTION]
+        assert worker._tick_failure_halt_fired is True
+        assert [a[:2] for a in flaky.alerts] == [
+            ("P1", "kill_switch_invoked"),
+            ("P1", "kill_switch_invoked"),
+        ]
+        assert flaky.alerts[1][3]["transition_applied"] is True
+
+    async def test_persistently_failing_invoke_never_latches(self) -> None:
+        flaky = FlakyKillSwitchStore(fail_times=99)
+        worker, _, _ = await _started_worker(store=flaky)
+        worker._consecutive_tick_failures = RISK_TICK_FAILURE_HALT_THRESHOLD
+
+        for _ in range(5):
+            await worker._maybe_halt_on_tick_failures()
+
+        assert flaky.invoke_attempts == 5  # one retry per tick, forever
+        assert worker._tick_failure_halt_fired is False
+        assert len(flaky.alerts) == 1  # the invoke-failure P1 fires ONCE, not per tick
+
+    async def test_already_halted_short_circuit_latches_without_transition(self) -> None:
+        worker, store, _ = await _started_worker()
+        store.risk = RiskStateSnapshot("HALT_NEW", "routine", 0, False)
+        worker._consecutive_tick_failures = RISK_TICK_FAILURE_HALT_THRESHOLD
+
+        await worker._maybe_halt_on_tick_failures()
+
+        assert store.kill_switch_calls == []  # facade short-circuit (already halted)
+        assert worker._tick_failure_halt_fired is True  # goal state reached: stop retrying
+        assert [a[:2] for a in store.alerts] == [("P1", "kill_switch_invoked")]
+        assert store.alerts[0][3]["transition_applied"] is False  # honest alert record
+
+    async def test_successful_tick_rearms_halt_latch(self) -> None:
+        """Per-episode semantics (risk-review C3): a successful tick ends the
+        failure episode and re-arms both latches so a NEW streak can halt
+        without a worker restart."""
+        worker, _, _ = await _started_worker()
+        worker._tick_failure_halt_fired = True
+        worker._tick_failure_halt_invoke_alerted = True
+        worker._consecutive_tick_failures = 3
+
+        async def one_good_tick() -> None:
+            worker.request_stop()
+
+        async def no_marks() -> None:
+            return None
+
+        worker.run_tick = one_good_tick  # type: ignore[method-assign]
+        worker.marks.run_forever = no_marks  # type: ignore[method-assign]
+        await worker.run_forever()
+
+        assert worker._consecutive_tick_failures == 0
+        assert worker._tick_failure_halt_fired is False
+        assert worker._tick_failure_halt_invoke_alerted is False
 
 
 # ---------------------------------------------------------------------------
