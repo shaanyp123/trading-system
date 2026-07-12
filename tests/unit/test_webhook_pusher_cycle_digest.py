@@ -142,7 +142,8 @@ class TestBuildCycleDigestEmbed:
         embed = build_cycle_digest_embed(_payload_completed(), now_utc=NOW)
         account = _field(embed, "Account")
         assert "equity $2000.00" in account
-        assert "m_combined 1.0" in account
+        assert "m_combined 1" in account
+        assert "m_combined 1.0" not in account  # trailing zeros trimmed
         assert "weekly-halved no" in account
         assert "paper" in account
         risk = _field(embed, "Risk loop")
@@ -150,6 +151,38 @@ class TestBuildCycleDigestEmbed:
         assert "marks OK" in risk
         # Friday 2026-07-10 21:00Z = 17:00 EDT
         assert _field(embed, "Next CDE Friday close") == "2026-07-10 17:00 ET"
+
+    def test_account_display_normalizes_venue_scale_decimals(self) -> None:
+        """Live-observed shapes (2026-07-12): equity arrives at the venue's
+        8-dp scale and m_combined at 6-dp — the digest must render
+        '$1549.10' and '1', not '$1549.10000000' and '1.000000'.
+        Display-only rounding; the payload strings are untouched."""
+        payload = _payload_completed()
+        payload["decision"]["equity_usd"] = "1549.10000000"
+        payload["decision"]["m_combined"] = "1.000000"
+        embed = build_cycle_digest_embed(payload, now_utc=NOW)
+        account = _field(embed, "Account")
+        assert "equity $1549.10" in account
+        assert "1549.10000000" not in account
+        assert "m_combined 1 " in account or account.endswith("m_combined 1")
+        assert "1.000000" not in account
+
+        payload["decision"]["m_combined"] = "0.500000"
+        account = _field(build_cycle_digest_embed(payload, now_utc=NOW), "Account")
+        assert "m_combined 0.5" in account
+
+        # Unparseable strings fall back to exact passthrough, never raise.
+        payload["decision"]["equity_usd"] = "not-a-number"
+        payload["decision"]["m_combined"] = "also-not"
+        account = _field(build_cycle_digest_embed(payload, now_utc=NOW), "Account")
+        assert "equity $not-a-number" in account
+        assert "m_combined also-not" in account
+
+    def test_negative_equity_renders_sign_before_dollar(self) -> None:
+        payload = _payload_completed()
+        payload["decision"]["equity_usd"] = "-12.34500000"
+        account = _field(build_cycle_digest_embed(payload, now_utc=NOW), "Account")
+        assert "equity -$12.34" in account  # ROUND_HALF_EVEN at 2dp, display-only
 
     def test_announce_only_no_components(self) -> None:
         """Dev-guide §1.5 locked: no buttons / approval affordances."""

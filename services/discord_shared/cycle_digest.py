@@ -40,6 +40,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any, Final
 from zoneinfo import ZoneInfo
 
@@ -67,15 +68,36 @@ def _fmt_et(iso_ts: str | None) -> str:
     return ts.astimezone(_ET).strftime("%Y-%m-%d %H:%M ET")
 
 
-def _fmt_usd(raw: Any) -> str:
+def _fmt_usd(raw: Any, *, cents: bool = False) -> str:
     """Decimal-as-string passthrough with a $ prefix ('n/a' when absent).
 
     No float parsing — the api already serialized the exact Decimal
-    ([A05]); this only decorates the string.
+    ([A05]); ``decimal.Decimal`` (stdlib) is used ONLY to round for
+    display when ``cents=True`` (e.g. equity arrives with the venue's
+    full 8-dp scale — "1549.10000000" must render "$1549.10", not raw).
+    Display-only: nothing rounded here feeds computation.
+    An unparseable string falls back to the exact passthrough.
     """
     if raw is None or not isinstance(raw, str) or not raw:
         return "n/a"
-    return f"-${raw[1:]}" if raw.startswith("-") else f"${raw}"
+    display = raw
+    if cents:
+        try:
+            display = f"{Decimal(raw):.2f}"
+        except InvalidOperation:
+            display = raw
+    return f"-${display[1:]}" if display.startswith("-") else f"${display}"
+
+
+def _fmt_multiplier(raw: Any) -> str:
+    """Trim a Decimal-as-string multiplier for display ("1.000000" → "1",
+    "0.500000" → "0.5"). Exact passthrough when unparseable."""
+    if not isinstance(raw, str) or not raw:
+        return str(raw)
+    try:
+        return format(Decimal(raw).normalize(), "f")
+    except InvalidOperation:
+        return raw
 
 
 def _asset_line(entry: Mapping[str, Any]) -> str:
@@ -175,9 +197,9 @@ def build_cycle_digest_embed(
                 asset = str(entry.get("asset") or "?")
                 fields.append({"name": asset, "value": _asset_line(entry)[:1024], "inline": False})
 
-        account_bits = [f"equity {_fmt_usd(decision.get('equity_usd'))}"]
+        account_bits = [f"equity {_fmt_usd(decision.get('equity_usd'), cents=True)}"]
         if decision.get("m_combined") is not None:
-            account_bits.append(f"m_combined {decision.get('m_combined')}")
+            account_bits.append(f"m_combined {_fmt_multiplier(decision.get('m_combined'))}")
         account_bits.append(
             "weekly-halved YES" if decision.get("weekly_halved") else "weekly-halved no"
         )
