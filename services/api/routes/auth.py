@@ -62,7 +62,7 @@ from services.api.auth.ceremony import (
 from services.api.config import APISettings, get_settings
 from services.api.db import get_session
 from services.api.errors import AppError
-from services.api.repos.auth import AuthRepo, PostgresAuthRepo
+from services.api.repos.auth import AccountRow, AuthRepo, PostgresAuthRepo
 from services.api.schemas.auth import (
     AuthMeResponse,
     BackupCodesGenerateRequest,
@@ -700,15 +700,19 @@ async def backup_codes_regenerate(
     # Real sessions (post-#380) carry the account UUID in
     # ``session.user_id`` — resolve by primary key so the codes are minted
     # for exactly the session's account, never a same-named other row
-    # (#380 review N-a). The dev-only Phase-0 stub (``phase0-stub-owner``,
-    # not a UUID) falls back to the username lookup it always used.
+    # (#380 review N-a). ONLY the dev-only Phase-0 stub (non-UUID
+    # ``user_id``, ``is_phase0_stub=True``) falls back to the username
+    # lookup it always used; any other non-UUID session (e.g. the BotAuth
+    # synthetic service account) hard-404s instead of resolving a
+    # username-keyed credential mint (#381 review should-fix).
+    account: AccountRow | None = None
     try:
         account_uuid: UUID | None = UUID(session.user_id)
     except ValueError:
         account_uuid = None
     if account_uuid is not None:
         account = await repo.find_account_by_id(account_uuid)
-    else:
+    elif session.is_phase0_stub:
         account = await repo.find_account_by_username(session.username)
     if account is None:
         raise AppError(

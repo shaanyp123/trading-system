@@ -1040,7 +1040,7 @@ class TestRecover:
 # ---------------------------------------------------------------------------
 # Backup-code regenerate (re-auth-gated; account resolution via session)
 # ---------------------------------------------------------------------------
-def _strong_session_context(user_id: str, username: str) -> Any:
+def _strong_session_context(user_id: str, username: str, *, is_phase0_stub: bool = False) -> Any:
     """A strong-auth SessionContext with a fresh UV (passes the 5-min gate)."""
     from services.api.session import SessionContext
 
@@ -1054,7 +1054,7 @@ def _strong_session_context(user_id: str, username: str) -> Any:
         session_expires_at=now,
         webauthn_enrolled=True,
         totp_enrolled=True,
-        is_phase0_stub=False,
+        is_phase0_stub=is_phase0_stub,
     )
 
 
@@ -1137,7 +1137,7 @@ class TestBackupCodesRegenerate:
                 )
             )
         api_app.dependency_overrides[get_session_context] = lambda: _strong_session_context(
-            user_id="phase0-stub-owner", username="operator"
+            user_id="phase0-stub-owner", username="operator", is_phase0_stub=True
         )
 
         response = await api_client.post(
@@ -1150,6 +1150,36 @@ class TestBackupCodesRegenerate:
         unused = [c for c in stub_repo.backup_codes if c.used_at_utc is None]
         assert len(unused) == 8
         assert len(stub_repo.backup_codes) == 16
+
+    @pytest.mark.asyncio
+    async def test_non_uuid_non_stub_session_hard_404s(
+        self,
+        api_app: FastAPI,
+        api_client: AsyncClient,
+        wire_auth_overrides: None,
+        stub_repo: _StubAuthRepo,
+    ) -> None:
+        """#381 review should-fix pin: the username fallback is gated on
+        ``is_phase0_stub`` — a non-UUID, non-stub session (the BotAuth
+        synthetic service account shape) must hard-404 even when an
+        account row happens to share its username surface."""
+        from services.api.session import get_session_context
+
+        # Adversarial decoy: an account whose external_account_id equals
+        # the bot service-account username must NOT be resolvable.
+        decoy = AccountRow(id=uuid4(), external_account_id="discord-bot", role="owner")
+        stub_repo.accounts_by_username["discord-bot"] = decoy
+        api_app.dependency_overrides[get_session_context] = lambda: _strong_session_context(
+            user_id="discord-bot", username="discord-bot", is_phase0_stub=False
+        )
+
+        response = await api_client.post(
+            "/api/auth/backup-codes/regenerate", json={}, **_csrf_kwargs()
+        )
+
+        assert response.status_code == 404
+        assert response.json()["error_code"] == "ACCOUNT_NOT_FOUND"
+        assert not any(i["type"] == "backup_codes" for i in stub_repo.inserts)
 
 
 # ---------------------------------------------------------------------------
