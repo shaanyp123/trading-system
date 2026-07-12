@@ -346,19 +346,31 @@ class TestNoBotConfigured:
 
 
 class TestProductionFailClose:
-    """In live envs, SessionStub fail-closes UNLESS BotAuth injected a session."""
+    """In live envs, SessionMiddleware fail-closes UNLESS BotAuth injected
+    a session."""
 
-    async def test_no_auth_header_in_production_returns_401(
+    async def test_no_auth_header_in_production_refused(
         self,
         client_in_production: AsyncClient,
     ) -> None:
-        # POST without any auth → SessionStub fail-closes with 401.
-        # (Note: SessionStub runs INNER of CSRF in middleware order, so
-        # in production its 401 short-circuits before CSRF would 403.)
+        # 2026-07-12 real-validation ordering: CSRF runs OUTER of the
+        # session middleware (a CSRF-failing POST must never spend a DB
+        # session lookup), so a bare POST is rejected by the double-submit
+        # gate first ...
         resp = await client_in_production.post(_INVOKE_PATH, json=_VALID_BODY)
+        assert resp.status_code == 403
+        assert resp.json()["error_code"] == "CSRF_REJECTED"
+        # ... and once the double-submit is satisfied, the session
+        # middleware fail-closes with 401 (no session cookie → no DB touch).
+        csrf = "double-submit-token"
+        resp = await client_in_production.post(
+            _INVOKE_PATH,
+            json=_VALID_BODY,
+            cookies={"__Host-csrf_token": csrf},
+            headers={"X-CSRF-Token": csrf},
+        )
         assert resp.status_code == 401
-        body = resp.json()
-        assert body["error_code"] == "AUTH_REQUIRED"
+        assert resp.json()["error_code"] == "AUTH_REQUIRED"
 
     async def test_valid_bot_bearer_in_production_succeeds(
         self,

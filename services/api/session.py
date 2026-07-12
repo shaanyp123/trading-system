@@ -1,64 +1,94 @@
-"""services/api/session.py — Phase-0 session-stub middleware.
+"""services/api/session.py — session middleware (real validation + dev stub).
 
-The real session ceremony (WebAuthn registration → session-cookie issuance →
-``last_uv_at`` tracking → re-auth gating) lands Week 6 alongside the frontend
-auth flow. Day 15 ships a deliberate stub so the Phase-1 REST endpoints can:
+**Real session validation (2026-07-12, security priority from the 2026-07-09
+"C1 night one, later" decisions-log entry):** in every environment except
+``dev``, requests to non-exempt paths must present a valid
+``__Host-trading_session`` cookie. The middleware decodes the cookie,
+loads the row via ``services.api.auth.sessions.load_active_session``
+(which enforces eviction + absolute-expiry + idle-timeout per backend-spec
+§8.5.3), refreshes ``last_activity_utc``, and builds the real
+:class:`SessionContext` (auth_strength from ``totp_bootstrap_only``,
+``last_uv_at`` from the row — the 5-minute re-auth window now gates on the
+REAL WebAuthn UV timestamp). Anything else — missing cookie, malformed
+cookie, unknown/evicted/expired session — is refused with 401
+``AUTH_REQUIRED``. A database failure during validation refuses with 503
+``AUTH_UNAVAILABLE`` (fail closed: an unverifiable session is not a
+session).
 
-  * accept any (or no) ``__Host-trading_session`` cookie value as a proxy for
-    "logged in as the bootstrap operator" — sufficient for ``curl`` smoke
-    tests + the operator browser bringup before WebAuthn lands.
-  * inject ``request.state.session`` with mock owner-role + ``auth_strength
-    = "weak"`` so endpoints that branch on auth_strength have a concrete
-    value to read from rather than a None-check.
+**Phase-0 stub (dev only):** the Day-15 stub survives exclusively under
+``API_ENVIRONMENT=dev`` for local development + the unit-test suite: any
+request gets a strong-auth operator session injected. The stub previously
+also covered ``paper`` — that was the C1 exposure of 2026-07-09 (the VPS
+runs ``paper``, so the entire API on the public apex was stub-authenticated
+behind only the Caddy basic-auth edge gate). ``paper`` now takes the real
+path.
 
-When real session middleware lands Week 6 the entire body of this file
-deletes; only the ``SessionContext`` dataclass survives (downstream
-endpoints depend on its shape). The middleware class is replaced by one
-that hits the real ``sessions`` table.
+**Auth ceremony paths are session-exempt** (you cannot hold a session
+before logging in): the WebAuthn/TOTP login + recover endpoints, and the
+setup-wizard endpoints, which carry their own gate (a ``ceremony_session_id``
+minted only by the setup-token flow — see ``routes/setup.py``). CSRF
+double-submit still applies to all of them (separate middleware).
 
-The stub is INACTIVE outside the ``API_ENVIRONMENT in {"dev", "paper"}``
-horizon. ``live-small`` and ``live-scale`` environments fail closed: the
-middleware raises ``AppError("AUTH_REQUIRED")`` if a ``sessions`` table
-lookup hasn't been wired and the env says we're in production. This
-defends against a forgotten removal of the stub when the WebAuthn ceremony
-ships — production SHOULD NEVER accept anonymous requests under the stub
-contract, even by accident.
+**CSRF cookie bootstrap:** any response to a request that arrived without a
+``__Host-csrf_token`` cookie gets one minted (bot-authenticated requests
+excluded). In real mode this is what lets a fresh anonymous browser POST to
+the login endpoints at all — the double-submit token proves same-origin,
+not identity, so handing it to anonymous visitors is sound. Idempotent: a
+request that already carries the cookie never gets it churned (2026-05-28
+regression class).
 """
 
 from __future__ import annotations
 
 import secrets
 from collections.abc import Awaitable, Callable
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Final, Literal
+from typing import Final, Literal, cast
 
 import structlog
 from fastapi import FastAPI, Request, Response
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
 from services.api.config import APISettings
+from services.api.db import session_scope as _default_session_scope
 from services.api.errors import ErrorEnvelope
 
 log = structlog.get_logger()
 
 
-#: Routes that don't need a session — mirror of the CSRF allowlist plus
-#: the health probe (public). Keep in sync with
-#: ``services/api/middleware._CSRF_EXEMPT_PATHS`` plus the read-only public
-#: probes.
+#: Routes that don't need a session. Three groups:
+#:   * the public health probe;
+#:   * the setup-token gate itself (mirror of the CSRF allowlist in
+#:     ``services/api/middleware._CSRF_EXEMPT_PATHS``);
+#:   * the auth ceremony: login endpoints (no session exists yet by
+#:     definition), the setup-wizard endpoints (gated by the
+#:     ``ceremony_session_id`` that only ``POST /api/setup/verify-token``
+#:     mints), and logout (reads + revokes the presented cookie itself; must
+#:     work for an already-expired session so the browser can always clear
+#:     state).
 #:
-#: ``/api/sse/events`` is NOT exempt as of Day 16 — the SSE multiplexer
-#: needs ``session.user_id`` to enforce the per-user N=4 tab limit
-#: (frontend-spec §4.6). Before Day 16 the path was exempt because the
-#: Day-5 heartbeat scaffold had no per-user state; the Day 16 multiplexer
-#: introduces it.
+#: ``/api/sse/events`` is NOT exempt — the SSE multiplexer needs
+#: ``session.user_id`` to enforce the per-user N=4 tab limit
+#: (frontend-spec §4.6).
 _SESSION_EXEMPT_PATHS: Final[frozenset[str]] = frozenset(
     {
         "/api/health",
         "/api/setup/verify-token",
-        "/api/internal/watchdog",
+        "/api/auth/webauthn/register/challenge",
+        "/api/auth/webauthn/register/verify",
+        "/api/auth/webauthn/challenge",
+        "/api/auth/webauthn/verify",
+        "/api/auth/totp/enroll-challenge",
+        "/api/auth/totp/setup-verify",
+        "/api/auth/totp/verify",
+        "/api/auth/backup-codes/generate",
+        "/api/auth/recover",
+        "/api/auth/logout",
     }
 )
 
@@ -68,9 +98,9 @@ class SessionContext:
     """The shape downstream route handlers read from ``request.state.session``.
 
     Fields mirror the ``AuthMeResponse`` schema (services/api/schemas/auth.py)
-    plus a ``is_phase0_stub`` flag so future code paths can branch on whether
-    the data is real (Week 6+) or scaffolded (now). When real auth lands the
-    flag is removed; downstream code should treat its absence as "real".
+    plus a ``is_phase0_stub`` flag so code paths can branch on whether the
+    data is real (cookie-validated against ``sessions``) or scaffolded
+    (dev-only stub).
     """
 
     user_id: str
@@ -85,32 +115,16 @@ class SessionContext:
 
 
 def _build_phase0_stub_session(idle_seconds: int) -> SessionContext:
-    """Compose the canonical Phase-0 stub session.
+    """Compose the canonical Phase-0 stub session (dev environments only).
 
     ``last_uv_at`` is set to NOW - 1 minute so risk-loosening endpoints
-    that gate on the 5-minute re-auth window see a recent UV (the 5-min
-    window per dev-guide §1.5 covers requests up to 5 minutes after the
-    last WebAuthn assertion). The 1-minute offset is symbolic — Phase 0
-    has no real WebAuthn so the value is mock; downstream code should
-    NOT depend on the exact timestamp until Week 6 wiring lands.
-
+    that gate on the 5-minute re-auth window see a recent UV.
     ``auth_strength`` is ``"strong"``: the stub explicitly models a
-    "WebAuthn-just-verified" session so risk-loosening endpoints
-    (``POST /api/system/kill-switch/resume``,
-    ``POST /api/auth/backup-codes/regenerate``) are reachable in
-    Phase-0 paper/dev environments. The Day-15 author left this field as
-    ``"weak"`` while writing ``last_uv_at`` to a recent timestamp; Day 25
-    realigned the field to match the docstring intent. The semantic of
-    the change: the stub IS the operator in paper/dev — the operator's
-    real WebAuthn session has been verified, just by a different
-    middleware that hasn't landed yet (Week 6+). The fail-closed
-    behavior in ``live-small``/``live-scale`` means production never
-    sees this strong-stub session, so this carries no security weight
-    in those envs.
-
-    ``session_expires_at`` is NOW + idle_seconds (default 30 min from
-    APISettings). The stub does NOT track absolute expiry — that lands
-    when the real ``sessions`` table is wired.
+    "WebAuthn-just-verified" session so risk-loosening endpoints are
+    reachable in local development. Since 2026-07-12 the stub is
+    dev-exclusive — ``paper`` and ``live-*`` validate real session cookies —
+    so this synthetic strength never authenticates anything on a deployed
+    host.
     """
     now = datetime.now(tz=UTC)
     return SessionContext(
@@ -126,37 +140,42 @@ def _build_phase0_stub_session(idle_seconds: int) -> SessionContext:
     )
 
 
-class SessionStubMiddleware(BaseHTTPMiddleware):
-    """Inject a stub ``SessionContext`` into ``request.state.session``.
+class SessionMiddleware(BaseHTTPMiddleware):
+    """Populate ``request.state.session`` or refuse the request.
 
-    Production-mode (``live-*``) requests fail closed with HTTP 401 because
-    the stub is explicitly Phase-0 only — see module docstring.
+    Runs INNERMOST of the middleware stack (outer → inner: BotAuth →
+    RequestContext → RateLimit → CSRF → **this** → routes; see
+    ``services/api/middleware.register_middleware`` for the ordering
+    rationale). Dispatch:
 
-    CSRF cookie bootstrap (2026-05-28 fix):
-      Real auth flows (``services/api/routes/auth.py::_set_session_cookies``)
-      mint the ``__Host-csrf_token`` cookie alongside the session cookie on
-      every WebAuthn/TOTP login. The Phase-0 stub has no equivalent ceremony
-      — pre-fix, an operator who visited a non-auth page (e.g. ``/system``)
-      in a fresh browser session never received a CSRF cookie. The first
-      state-changing POST (Resume kill switch, regenerate backup codes,
-      etc.) was then rejected by :class:`CSRFMiddleware` with
-      ``CSRF_REJECTED``. This middleware now piggybacks a server-minted
-      CSRF token onto the response of every stub-injected request that
-      arrived without one. The cookie attributes mirror
-      ``_set_session_cookies`` exactly (Secure outside dev, SameSite=Strict,
-      Path=/, Max-Age=session_absolute_seconds, no Domain) so the
-      ``__Host-`` prefix browser invariants hold. See
-      ``Docs/decisions-log.md`` 2026-05-28 entry for the late-evening
-      manual-override incident that surfaced this gap.
+      1. Exempt paths pass through untouched (plus CSRF bootstrap).
+      2. A session already injected by ``BotAuthMiddleware`` (service
+         account, bearer-authenticated) wins — pass through.
+      3. ``dev`` env: inject the Phase-0 stub session (local development +
+         unit tests).
+      4. Everything else (``paper``/``live-small``/``live-scale``): validate
+         the session cookie against the ``sessions`` table — 401 on any
+         miss, 503 if the database can't answer (fail closed).
+
+    The DB read lives in :meth:`_load_session_context_from_db`; unit tests
+    monkeypatch that seam ([A22] — no SQL in unit tests), and the
+    Docker-gated integration suite drives the real SQL against Postgres.
     """
 
-    def __init__(self, app: FastAPI, *, settings: APISettings) -> None:
+    def __init__(
+        self,
+        app: FastAPI,
+        *,
+        settings: APISettings,
+        session_scope: Callable[[], AbstractAsyncContextManager[AsyncSession]] | None = None,
+    ) -> None:
         super().__init__(app)
         self._cookie_name = settings.session_cookie_name
         self._csrf_cookie_name = settings.csrf_cookie_name
         self._idle_seconds = settings.session_idle_seconds
         self._csrf_max_age = settings.session_absolute_seconds
-        self._is_production = settings.environment in ("live-small", "live-scale")
+        self._stub_active = settings.environment == "dev"
+        self._session_scope = session_scope or _default_session_scope
         # Match ``_set_session_cookies`` semantics: Secure flag everywhere
         # except ``dev`` env. Required for the ``__Host-`` cookie-name prefix
         # to survive browser-side validation on https origins.
@@ -167,55 +186,163 @@ class SessionStubMiddleware(BaseHTTPMiddleware):
         request: Request,
         call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
-        if request.url.path in _SESSION_EXEMPT_PATHS:
-            return await call_next(request)
+        csrf_cookie_present = self._csrf_cookie_name in request.cookies
 
-        # Day 23: if BotAuthMiddleware (running OUTER of this middleware)
-        # already injected a service-account session, don't overwrite it
-        # — the bot's strong-auth context wins over the Phase-0 stub.
-        # Without this guard the bot's calls would land in production envs
-        # with the stub session, defeating BotAuth's purpose.
+        if request.url.path in _SESSION_EXEMPT_PATHS:
+            return self._with_csrf_bootstrap(request, await call_next(request), csrf_cookie_present)
+
+        # BotAuthMiddleware (running OUTER of this middleware) may have
+        # already injected a service-account session — the bot's bearer-
+        # authenticated context wins; don't overwrite and don't demand a
+        # cookie the bot doesn't hold.
         if getattr(request.state, "session", None) is not None:
             return await call_next(request)
 
-        if self._is_production:
-            # Fail closed in production. The stub MUST NOT be the auth path
-            # in live environments. When the real session middleware ships,
-            # this branch becomes the only branch.
-            log.error(
-                "session_stub_invoked_in_production_environment",
-                path=request.url.path,
+        if self._stub_active:
+            session = _build_phase0_stub_session(self._idle_seconds)
+            request.state.session = session
+            log.debug(
+                "session_stub_injected",
+                user_id=session.user_id,
+                auth_strength=session.auth_strength,
+                cookie_present=self._cookie_name in request.cookies,
+                csrf_cookie_present=csrf_cookie_present,
             )
-            return JSONResponse(
-                status_code=401,
-                content=ErrorEnvelope(
-                    error_code="AUTH_REQUIRED",
-                    message="Session middleware not yet wired for production.",
-                ).model_dump(),
+            return self._with_csrf_bootstrap(request, await call_next(request), csrf_cookie_present)
+
+        # --- real validation (paper / live-small / live-scale) -----------
+        # Lazy import: services.api.auth.sessions imports SessionContext
+        # from this module at load time (same cycle-dodge as BotAuth's
+        # SessionContext import; safe at request time).
+        from services.api.auth import sessions as sessions_mod
+
+        cookie_val = request.cookies.get(self._cookie_name)
+        session_id = sessions_mod.decode_cookie_value(cookie_val) if cookie_val else None
+        context: SessionContext | None = None
+        if session_id is not None:
+            try:
+                context = await self._load_session_context_from_db(session_id)
+            except Exception:
+                log.exception("session_validation_unavailable", path=request.url.path)
+                return JSONResponse(
+                    status_code=503,
+                    content=ErrorEnvelope(
+                        error_code="AUTH_UNAVAILABLE",
+                        message="Session validation is temporarily unavailable.",
+                    ).model_dump(),
+                )
+        if context is None:
+            log.info(
+                "session_rejected",
+                path=request.url.path,
+                cookie_present=cookie_val is not None,
+                cookie_decodable=session_id is not None,
+            )
+            return self._with_csrf_bootstrap(
+                request,
+                JSONResponse(
+                    status_code=401,
+                    content=ErrorEnvelope(
+                        error_code="AUTH_REQUIRED",
+                        message="A valid session is required. Log in and retry.",
+                    ).model_dump(),
+                ),
+                csrf_cookie_present,
             )
 
-        session = _build_phase0_stub_session(self._idle_seconds)
-        request.state.session = session
-        csrf_cookie_present = self._csrf_cookie_name in request.cookies
-        log.debug(
-            "session_stub_injected",
-            user_id=session.user_id,
-            auth_strength=session.auth_strength,
-            cookie_present=self._cookie_name in request.cookies,
-            csrf_cookie_present=csrf_cookie_present,
+        request.state.session = context
+        return self._with_csrf_bootstrap(request, await call_next(request), csrf_cookie_present)
+
+    async def _load_session_context_from_db(self, session_id: bytes) -> SessionContext | None:
+        """Validate ``session_id`` against ``sessions`` and build the context.
+
+        Returns ``None`` for any invalid session (unknown, evicted, absolute-
+        expired, idle-expired, or referencing a missing/malformed accounts
+        row). Raises on infrastructure failure — the caller translates to
+        503. On success, bumps ``last_activity_utc`` (the idle window per
+        backend-spec §8.5.3 is measured request-to-request).
+        """
+        from services.api.auth import sessions as sessions_mod
+
+        async with self._session_scope() as db:
+            row = await sessions_mod.load_active_session(
+                db, session_id=session_id, idle_seconds=self._idle_seconds
+            )
+            if row is None:
+                return None
+            acct = (
+                await db.execute(
+                    text(
+                        """
+                        SELECT a.role,
+                               a.external_account_id,
+                               EXISTS(
+                                   SELECT 1 FROM webauthn_credentials w
+                                   WHERE w.account_id = a.id AND w.active = TRUE
+                               ) AS webauthn_enrolled,
+                               EXISTS(
+                                   SELECT 1 FROM totp_secrets t
+                                   WHERE t.account_id = a.id
+                               ) AS totp_enrolled
+                        FROM accounts a
+                        WHERE a.id = :acct
+                        """
+                    ),
+                    {"acct": row.account_id},
+                )
+            ).fetchone()
+            if acct is None or acct.role not in ("owner", "reader"):
+                # A session pointing at a missing or malformed account row is
+                # corruption, not authentication — refuse it.
+                log.error(
+                    "session_account_row_invalid",
+                    account_id=str(row.account_id),
+                    role=None if acct is None else acct.role,
+                )
+                return None
+            await sessions_mod.refresh_activity(db, session_id=session_id)
+            now = datetime.now(tz=UTC)
+            return SessionContext(
+                user_id=str(row.account_id),
+                # The bootstrap flow writes the username INTO
+                # external_account_id (repos/auth.py
+                # find_or_create_bootstrap_account) — read the session
+                # account's own identity back out rather than assuming the
+                # configured operator (a future reader account must never
+                # inherit the owner's name).
+                username=str(acct.external_account_id),
+                role=cast(Literal["owner", "reader"], acct.role),
+                auth_strength="weak" if row.totp_bootstrap_only else "strong",
+                last_uv_at=row.last_uv_at_utc,
+                # Effective expiry = whichever of the absolute deadline or
+                # the freshly-reset idle window comes first.
+                session_expires_at=min(
+                    row.expires_at_utc, now + timedelta(seconds=self._idle_seconds)
+                ),
+                webauthn_enrolled=bool(acct.webauthn_enrolled),
+                totp_enrolled=bool(acct.totp_enrolled),
+                is_phase0_stub=False,
+            )
+
+    def _with_csrf_bootstrap(
+        self,
+        request: Request,
+        response: Response,
+        csrf_cookie_present: bool,
+    ) -> Response:
+        """Mint the CSRF cookie onto ``response`` iff the request lacked one.
+
+        Skipped for bot-authenticated requests (no cookies in that flow).
+        """
+        if csrf_cookie_present or getattr(request.state, "is_bot_authenticated", False):
+            return response
+        _mint_csrf_cookie_on_response(
+            response,
+            csrf_cookie_name=self._csrf_cookie_name,
+            max_age_seconds=self._csrf_max_age,
+            secure=self._cookie_secure,
         )
-        response = await call_next(request)
-        if not csrf_cookie_present:
-            _mint_csrf_cookie_on_response(
-                response,
-                csrf_cookie_name=self._csrf_cookie_name,
-                max_age_seconds=self._csrf_max_age,
-                secure=self._cookie_secure,
-            )
-            log.debug(
-                "session_stub_csrf_cookie_bootstrapped",
-                path=request.url.path,
-            )
+        log.debug("session_csrf_cookie_bootstrapped", path=request.url.path)
         return response
 
 
@@ -228,19 +355,13 @@ def _mint_csrf_cookie_on_response(
 ) -> None:
     """Attach a fresh ``__Host-csrf_token`` cookie to the response.
 
-    Helper extracted from :class:`SessionStubMiddleware` so the same
-    cookie-attribute set lives in one place (this module) rather than
-    being duplicated between session.py and routes/auth.py. The real
-    auth flow's ``_set_session_cookies`` in routes/auth.py mints the
-    same cookie shape — when real session middleware lands Week 6+,
-    that callsite can move to this helper too.
+    The real auth flow's ``_set_session_cookies`` in routes/auth.py mints the
+    same cookie shape; this helper keeps the attribute set in one place.
 
     The value is 256 bits of cryptographic randomness via
-    :func:`secrets.token_urlsafe` — matches the format used by
-    ``_set_session_cookies``. The CSRF middleware only does a
+    :func:`secrets.token_urlsafe`. The CSRF middleware only does a
     constant-time compare against the ``X-CSRF-Token`` header so the
-    value is opaque to the server, but consistency keeps audit-log
-    payloads uniform.
+    value is opaque to the server.
 
     Attribute rationale (must keep these aligned with the ``__Host-``
     cookie-name prefix browser invariants):
@@ -267,7 +388,7 @@ def get_session_context(request: Request) -> SessionContext:
     """FastAPI dependency: pull the ``SessionContext`` for a route handler.
 
     The middleware always populates ``request.state.session`` for non-exempt
-    paths (or returns 401 first), so this raises in the rare case of a
+    paths (or refuses first), so this raises in the rare case of a
     misconfigured middleware order — surfaces the bug loudly during route
     development rather than producing a silent ``AttributeError`` at call
     time.
@@ -276,7 +397,7 @@ def get_session_context(request: Request) -> SessionContext:
     if session is None:
         raise RuntimeError(
             "SessionContext not set on request.state — "
-            "SessionStubMiddleware must be registered before this route runs"
+            "SessionMiddleware must be registered before this route runs"
         )
     if not isinstance(session, SessionContext):
         raise RuntimeError(
@@ -287,6 +408,6 @@ def get_session_context(request: Request) -> SessionContext:
 
 __all__ = [
     "SessionContext",
-    "SessionStubMiddleware",
+    "SessionMiddleware",
     "get_session_context",
 ]

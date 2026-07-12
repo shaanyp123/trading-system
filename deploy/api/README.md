@@ -340,10 +340,13 @@ restart on Ashburn after the PR merges:
   Matches the existing `idle 24h` philosophy.
 - **API-side rate limiting** — `services/api/middleware.py` adds
   `RateLimitMiddleware`: 100 req / 10s per IP on `/api/**` (general bucket);
-  5 req / 10s per IP on `/api/auth/**` (auth bucket); `/api/health`,
-  `/api/internal/watchdog`, `/api/sse/events` exempt. Done in the api rather
-  than Caddy because `caddy:2-alpine` doesn't include `mholt/caddy-ratelimit`
-  and a custom xcaddy build was deferred per Day 17 PR rationale.
+  5 req / 10s per IP on `/api/auth/**` (auth bucket); 30 req / 10s per IP on
+  `/api/sse/events` (sse bucket, 2026-07-12 — each connect costs a
+  session-table lookup under real validation); only `/api/health` is exempt
+  (`/api/internal/watchdog` lost its exemption 2026-07-12: the route was
+  never built). Done in the api rather than Caddy because `caddy:2-alpine`
+  doesn't include `mholt/caddy-ratelimit` and a custom xcaddy build was
+  deferred per Day 17 PR rationale.
 
 ### Step 1 — Pull + rebuild
 

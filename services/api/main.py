@@ -59,7 +59,7 @@ from services.api.routes.sse import router as sse_router
 from services.api.routes.system import router as system_router
 from services.api.routes.today import router as today_router
 from services.api.routes.trades import router as trades_router
-from services.api.session import SessionStubMiddleware
+from services.api.session import SessionMiddleware
 
 log = structlog.get_logger()
 
@@ -114,8 +114,11 @@ async def _bootstrap_owner_token() -> None:
             raw_token=raw_token,
             instructions=(
                 "Submit this token at POST /api/setup/verify-token within 24h. "
-                "It will not be re-emitted; if lost, run "
-                "`python -m services.api.bootstrap_owner_token` to mint another."
+                "It will not be re-emitted for this row. If lost: delete the "
+                "unconsumed setup_tokens row (or wait out its 24h expiry), "
+                "then restart the api container — the lifespan mints a fresh "
+                "owner token whenever no unconsumed unexpired one exists "
+                "(grep the api logs for SETUP_TOKEN_EMITTED)."
             ),
         )
 
@@ -1600,13 +1603,22 @@ def create_app() -> FastAPI:
         lifespan=_lifespan,
     )
     register_error_handlers(app)
+    # Session middleware (real cookie validation outside dev; Phase-0 stub
+    # in dev). Added BEFORE register_middleware so it ends up INNERMOST
+    # (Starlette: last-added = outermost, empirically verified Day 17 +
+    # Day 23) — request flow:
+    #
+    #     BotAuth → RequestContext → RateLimit → CSRF → Session → routes
+    #
+    # The 2026-07-12 real-validation swap moved it here from the old
+    # outermost-of-four stub position: unlike the stub, this middleware
+    # SHORT-CIRCUITS (401/503) and hits the database, so it must run after
+    # RequestContext (rejections carry trace_id), after RateLimit (an
+    # anonymous cookie-probe flood consumes its per-IP budget instead of
+    # free DB lookups), and after CSRF (a CSRF-failing POST is rejected
+    # before it can spend a session lookup).
+    app.add_middleware(SessionMiddleware, settings=settings)  # type: ignore[arg-type]
     register_middleware(app, settings)
-    # Session stub middleware sits BETWEEN the request-context binding and
-    # the CSRF gate so route handlers see ``request.state.session`` after
-    # CSRF has cleared. Added after register_middleware so it ends up
-    # innermost (FastAPI/Starlette: last-added = innermost in the request
-    # path; runs after CSRF + RequestContext).
-    app.add_middleware(SessionStubMiddleware, settings=settings)  # type: ignore[arg-type]
     # Day 23: BotAuthMiddleware sits OUTERMOST so the Discord bot's
     # bearer-authenticated requests bypass CSRF (no cookies) and
     # short-circuit SessionStub's fail-close in production envs. The

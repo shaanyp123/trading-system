@@ -550,4 +550,6 @@ class TestSessionExemptPathsUpdated:
         # But the other Day-15 exemptions remain.
         assert "/api/health" in _SESSION_EXEMPT_PATHS
         assert "/api/setup/verify-token" in _SESSION_EXEMPT_PATHS
-        assert "/api/internal/watchdog" in _SESSION_EXEMPT_PATHS
+        # /api/internal/watchdog dropped 2026-07-12 — the route was never
+        # built; a standing exemption for an unmounted path is a foot-gun.
+        assert "/api/internal/watchdog" not in _SESSION_EXEMPT_PATHS

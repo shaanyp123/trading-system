@@ -4,7 +4,9 @@ Covers IG §3 Week 5 Wed rate-limiting contract:
 
   * `/api/**`         — 100 req / 10s per IP (general bucket).
   * `/api/auth/**`    —   5 req / 10s per IP (auth bucket; brute-force-tightened).
-  * `/api/health`, `/api/internal/watchdog`, `/api/sse/events` — exempt.
+  * `/api/health`     — exempt.
+  * `/api/sse/events` —  30 req / 10s per IP (sse bucket; added 2026-07-12 —
+    each connect costs a session-table lookup under real validation).
 
 Plus middleware-mechanic invariants:
 
@@ -28,8 +30,7 @@ Path choices:
   * Auth bucket:    probes use ``/api/auth/__rl_test`` (same idea; under
     ``/api/auth/`` prefix so it routes to the AUTH bucket).
   * Exempt:         /api/health hits a real handler, so `api_db.ping` is
-    monkeypatched to a no-op. /api/internal/watchdog has no handler yet
-    (Week 5+); we only assert the middleware does not 429 it.
+    monkeypatched to a no-op.
 """
 
 from __future__ import annotations
@@ -135,35 +136,20 @@ class TestExemptPaths:
             # short-circuited on the non-api prefix.
             assert response.status_code == 404
 
-    @pytest.mark.asyncio
-    async def test_internal_watchdog_exempt(
-        self,
-        rl_client: AsyncClient,
-    ) -> None:
-        """``/api/internal/watchdog`` is the single-trusted-IP push endpoint
-        (Caddy IP-allowlisted per spec §4.4). The middleware MUST NOT
-        rate-limit it; the watchdog VPS may legitimately burst on recovery.
-        The route handler doesn't exist yet (lands Week 5+) — the test
-        asserts only that no response is 429.
-        """
-        for _ in range(105):
-            response = await rl_client.get("/api/internal/watchdog")
-            assert response.status_code != 429
-
-    def test_sse_endpoint_exemption_decision(
+    def test_bucket_selection_decision(
         self,
     ) -> None:
-        """``/api/sse/events`` is a long-lived single-connection stream; the
-        N=4 tab cap inside the SSE multiplexer (frontend-spec §4.6) already
-        bounds per-user concurrency. Rate-limiting reconnect bursts here
-        would defeat client retry behavior.
+        """``/api/sse/events`` gets its own SMALL bucket (2026-07-12): with
+        real session validation each SSE connect costs a sessions-table
+        lookup, so the old blanket exemption was an unmetered DB-probe seam.
+        30/window still clears the N=4-tab reconnect-storm worst case.
 
         We can't issue a 100-request HTTP loop against SSE because each
-        stream is infinite — pytest would hang. Instead we test the
-        exemption decision DIRECTLY against the middleware's
-        ``_select_bucket()`` method. The decision is the unit under test;
-        the ASGI machinery around it is covered by the other exempt-path
-        tests in this class.
+        stream is infinite — pytest would hang. Instead we test the bucket
+        decision DIRECTLY against the middleware's ``_select_bucket()``
+        method. ``/api/internal/watchdog`` lost its exemption the same day:
+        the route was never built, and a standing exemption for an unmounted
+        path would silently unthrottle whatever mounts there next.
         """
         from services.api.config import APISettings
 
@@ -172,9 +158,9 @@ class TestExemptPaths:
         )
         # Inert app reference — the middleware only reads it on dispatch.
         mw = api_middleware.RateLimitMiddleware(app=None, settings=settings)  # type: ignore[arg-type]
-        assert mw._select_bucket("/api/sse/events") is None
+        assert mw._select_bucket("/api/sse/events") == ("sse", 30)
         assert mw._select_bucket("/api/health") is None
-        assert mw._select_bucket("/api/internal/watchdog") is None
+        assert mw._select_bucket("/api/internal/watchdog") == ("general", 100)
         # Sanity: non-exempt paths still resolve to a bucket.
         assert mw._select_bucket("/api/orders") == ("general", 100)
         assert mw._select_bucket("/api/auth/me") == ("auth", 5)

@@ -65,30 +65,31 @@ from services.api.errors import ErrorEnvelope
 log = structlog.get_logger()
 
 
-# Routes that are exempt from CSRF enforcement. Bootstrap + machine-to-machine
-# endpoints — they authenticate via cryptographic material in the request body
-# (raw setup token; bearer auth) rather than via session cookie + CSRF.
+# Routes that are exempt from CSRF enforcement. Bootstrap endpoint — it
+# authenticates via cryptographic material in the request body (raw setup
+# token) rather than via session cookie + CSRF. (`/api/internal/watchdog`
+# was removed 2026-07-12: the route was never built, and a standing
+# session+CSRF+rate-limit triple exemption for an unmounted path is a
+# silent-unauth foot-gun for whatever mounts there next.)
 _CSRF_EXEMPT_PATHS: frozenset[str] = frozenset(
     {
         "/api/setup/verify-token",
-        "/api/internal/watchdog",
     }
 )
 
 
 # Paths exempt from rate limiting. /api/health is the watchdog's poll target
-# (a 5-min cron would chew through the bucket immediately); /api/internal/watchdog
-# is the inbound push (single trusted Hetzner Nuremberg IP; no rate-limit
-# defence needed). /api/sse/events is a long-lived single-connection stream
-# (a tab would burn its 100-req bucket on reconnect bursts otherwise). The N=4
-# tab limit in the SSE multiplexer already bounds per-user concurrency.
+# (a 5-min cron would chew through the bucket immediately). /api/sse/events
+# moved OFF this list 2026-07-12: with real session validation each SSE
+# request costs a DB lookup, so an anonymous cookie-probe flood on an
+# unmetered path was a DB-load DoS seam — it now gets its own small bucket
+# (below) sized for legitimate N=4-tab reconnect storms.
 _RATE_LIMIT_EXEMPT_PATHS: frozenset[str] = frozenset(
     {
         "/api/health",
-        "/api/internal/watchdog",
-        "/api/sse/events",
     }
 )
+_RATE_LIMIT_SSE_PATH = "/api/sse/events"
 _RATE_LIMIT_AUTH_PREFIX = "/api/auth/"
 _RATE_LIMIT_API_PREFIX = "/api/"
 
@@ -197,11 +198,13 @@ class _Bucket:
 class RateLimitMiddleware(BaseHTTPMiddleware):
     """Per-IP fixed-window rate limiter.
 
-    Two buckets per IG §3 Week 5 Wed:
-      * `general` — 100 req / 10s on `/api/**` (excludes auth, SSE, health,
-        internal/watchdog).
+    Three buckets (IG §3 Week 5 Wed; `sse` added 2026-07-12):
+      * `general` — 100 req / 10s on `/api/**` (excludes auth, SSE, health).
       * `auth`    —   5 req / 10s on `/api/auth/**`. Tighter because the
         threat model is credential-stuffing / brute-force.
+      * `sse`     —  30 req / 10s on `/api/sse/events`: each connect costs a
+        session-table lookup under real validation, so the old blanket
+        exemption was a DB-load DoS seam.
 
     Implementation notes:
       * Fixed-window counter, NOT sliding-window or token-bucket. The
@@ -229,6 +232,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self._window_seconds = float(settings.rate_limit_window_seconds)
         self._limit_general = int(settings.rate_limit_general_per_window)
         self._limit_auth = int(settings.rate_limit_auth_per_window)
+        self._limit_sse = int(settings.rate_limit_sse_per_window)
         self._buckets: dict[tuple[str, str], _Bucket] = {}
         self._lock = asyncio.Lock()
 
@@ -237,13 +241,17 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
         Exempt paths short-circuit BEFORE we touch the dict so the counter
         isn't even allocated for /api/health (which the watchdog hits every
-        5 min from a single IP) or /api/sse/events (which a single tab holds
-        open for hours).
+        5 min from a single IP).
         """
         if path in _RATE_LIMIT_EXEMPT_PATHS:
             return None
         if not path.startswith(_RATE_LIMIT_API_PREFIX):
             return None
+        if path == _RATE_LIMIT_SSE_PATH:
+            # A connection holds one slot for hours, but each CONNECT costs a
+            # session-table lookup since 2026-07-12 — bounded, generously
+            # above the N=4-tab reconnect-storm worst case.
+            return ("sse", self._limit_sse)
         if path.startswith(_RATE_LIMIT_AUTH_PREFIX):
             return ("auth", self._limit_auth)
         return ("general", self._limit_general)
@@ -318,12 +326,13 @@ class BotAuthMiddleware(BaseHTTPMiddleware):
     Behavior:
 
       * No ``Authorization: Bearer ...`` header → pass through unchanged.
-        Downstream middleware (SessionStub) handles human-session paths.
+        Downstream middleware (Session) handles human-session paths.
       * ``Authorization: Bearer <valid-token>`` (constant-time matched
         against ``settings.discord_bot_bearer_token``) → set
         ``request.state.session = SessionContext(...)`` with service-
         account identity + ``request.state.is_bot_authenticated = True``.
-        Bypasses CSRF + SessionStub on later middleware. Pass through.
+        Bypasses CSRF + session-cookie validation on later middleware.
+        Pass through.
       * ``Authorization: Bearer <invalid-token>`` → 401 + canonical
         envelope. Don't pass through (defense-in-depth: a bad token is
         an explicit auth attempt that the api should reject loudly).
@@ -417,24 +426,27 @@ def register_middleware(app: FastAPI, settings: APISettings) -> None:
     layer OUTERMOST in the request path (verified empirically; see Day 17
     PR description). Resulting request path, outermost → innermost:
 
-        RequestContext → RateLimit → CSRF → (SessionStub*) → routes
+        RequestContext → RateLimit → CSRF → (Session*) → routes
 
-    (* SessionStub is added separately in main.py AFTER register_middleware,
-    so it ends up outermost of all four — request flow becomes
-    SessionStub → RequestContext → RateLimit → CSRF → routes. The SessionStub
-    only mutates `request.state` and never short-circuits, so it does not
-    affect the gate semantics below.)
+    (* SessionMiddleware is added separately in main.py BEFORE
+    register_middleware, so it ends up INNERMOST — moved there by the
+    2026-07-12 real-validation swap. Unlike the old Phase-0 stub (which
+    never short-circuited and sat outermost-of-four), real validation
+    rejects with 401/503 and performs a database lookup, so it must run
+    after RequestContext (trace_id on rejections), after RateLimit (an
+    anonymous cookie-probe flood consumes the per-IP budget instead of
+    free DB lookups), and after CSRF (a CSRF-failing POST never spends a
+    session lookup).)
 
-    Day 23 addition: ``BotAuthMiddleware`` is added LAST after the stub
-    in ``main.py`` so it ends up OUTERMOST of all middleware — the
-    request flow becomes:
+    Day 23 addition: ``BotAuthMiddleware`` is added LAST in ``main.py``
+    so it ends up OUTERMOST of all middleware — the request flow becomes:
 
-        BotAuth → SessionStub → RequestContext → RateLimit → CSRF → routes
+        BotAuth → RequestContext → RateLimit → CSRF → Session → routes
 
     BotAuth runs first because:
-      * It must execute BEFORE SessionStub's fail-close in production
-        envs (live-small / live-scale) — otherwise a bot request to
-        production gets 401'd before BotAuth can inject its session.
+      * It must execute BEFORE SessionMiddleware's cookie validation —
+        the bot holds no session cookie; BotAuth's injected session is
+        what SessionMiddleware honors on the bot path.
       * It must set ``request.state.is_bot_authenticated`` BEFORE CSRF
         checks it (CSRF reads the flag to decide whether to skip the
         cookie+header comparison for bot calls).
