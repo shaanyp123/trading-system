@@ -580,15 +580,21 @@ async def refresh_backend_from_broker_snapshot(
         # to the planner view; positions_current is keyed by asset (#355).
         market = snapshot.product_to_asset.get(pos.product_id, pos.product_id)
 
-        # Phase 1 contract_id=NULL match. If/when contract resolution
-        # lands (Phase 2+), this query expands to take a contract_id.
+        # Match by (account, market) regardless of contract_id: the C1
+        # strategy worker's fill pipeline writes positions_current rows
+        # WITH a real contract_id (ensure_contract_row), so the original
+        # Phase-1 "contract_id IS NULL" filter matched nothing and the
+        # uPnL refresh silently skipped every worker-held position
+        # (observed live 2026-07-11 17:40: positions_marked=0 with a
+        # matching BTC row present). One row per market in practice;
+        # LIMIT 1 newest is a defensive tiebreak.
         async with session_factory() as lookup_session:
             row = (
                 await lookup_session.execute(
                     text(
                         "SELECT id, quantity, avg_cost FROM positions_current "
                         "WHERE account_id = :acct AND market = :market "
-                        "  AND contract_id IS NULL"
+                        "ORDER BY id DESC LIMIT 1"
                     ),
                     {"acct": account_id, "market": market},
                 )

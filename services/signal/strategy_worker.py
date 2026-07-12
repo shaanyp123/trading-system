@@ -118,6 +118,7 @@ from services.risk.capital_events import (
 from services.risk.dispatch import apply_state_transition
 from services.risk.fill_processor import (
     FillIngestPayload,
+    FillProcessingError,
     UnsupportedFillScenarioError,
     process_fill_event,
 )
@@ -1249,6 +1250,25 @@ class StrategyWorkerStore:
                 detail=str(exc),
             )
             return False
+        except FillProcessingError as exc:
+            # 2026-07-12 incident: EXIT_NO_PRIOR_TRADE escaped this seam
+            # and killed the decision AFTER the venue fill — the worst
+            # possible ordering (venue traded, backend refused to record
+            # it, recon broke on the gap, auto-halt). No fill-processor
+            # error may ever again abort a decision post-execution:
+            # degrade to the minimal orders/fills propagation, loudly.
+            self._log.error(
+                "strategy_worker_fill_propagation_failed_fallback",
+                client_order_id=client_order_id,
+                error_code=exc.error_code,
+                detail=str(exc),
+                note=(
+                    "full position/trade propagation failed; falling back to "
+                    "minimal orders/fills recording — positions_current/trades "
+                    "may need the replay_leg_fill operator tool"
+                ),
+            )
+            return False
         if result is None:
             self._log.warning("strategy_worker_fill_unknown_order", client_order_id=client_order_id)
         return True
@@ -1945,10 +1965,35 @@ class StrategyWorker:
                         "venue liquidation); syncing to venue truth"
                     ),
                 )
-                rt.contracts = venue_contracts
                 if venue_contracts == 0:
+                    # 2026-07-12 incident: _clear_position_state forgets the
+                    # native stop id WITHOUT cancelling it at the venue — a
+                    # resting stop on a flat book is a naked order that would
+                    # open an unintended position. Cancel venue-side FIRST.
+                    # On transport failure, tracked contracts stay UNSYNCED so
+                    # this branch re-fires on the next 30 s tick and retries.
+                    if rt.native_stop_order_id or rt.native_stop_client_order_id:
+                        try:
+                            await self._adapter.cancel_all_orders(product.product_id)
+                            self._log.warning(
+                                "strategy_worker_external_flat_orders_cancelled",
+                                asset=asset,
+                                product_id=product.product_id,
+                            )
+                        except Exception:
+                            self._log.exception(
+                                "strategy_worker_external_flat_cancel_failed",
+                                asset=asset,
+                                note=(
+                                    "tracked contracts left unsynced so the "
+                                    "next tick retries the cancel"
+                                ),
+                            )
+                            continue
+                    rt.contracts = 0
                     self._clear_position_state(rt)
                 else:
+                    rt.contracts = venue_contracts
                     await self._arm_native_stop(asset, reason="external_change_rearm")
 
     async def _handle_native_stop_fill(

@@ -1519,3 +1519,114 @@ class TestProtectiveExitPreemption:
         await worker.run_daily_decision(TODAY)
         assert store.decisions[TODAY]["status"] == "completed"
         assert worker.state["BTC"].contracts == 1
+
+
+# ---------------------------------------------------------------------------
+# 2026-07-12 incident regression locks
+# ---------------------------------------------------------------------------
+
+
+class TestFillPropagationSeam:
+    """The real store's process_fill must NEVER let a fill-processor
+    error escape and kill a decision post-execution (2026-07-12: the
+    EXIT_NO_PRIOR_TRADE raise did exactly that)."""
+
+    async def test_fill_processing_error_falls_back_not_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from services.risk.fill_processor import FillProcessingError
+        from services.signal import strategy_worker as sw_module
+
+        store = StrategyWorkerStore(session_factory=MagicMock(), env="paper")
+
+        async def _boom(**kwargs: Any) -> Any:
+            raise FillProcessingError(error_code="EXIT_NO_PRIOR_TRADE", message="no open trade row")
+
+        monkeypatch.setattr(sw_module, "process_fill_event", _boom)
+        payload = FillIngestPayload(
+            broker_fill_id="cid-1:agg",
+            cumulative_filled_quantity=2,
+            fill_quantity=2,
+            fill_price=Decimal("64000"),
+            commission_usd=Decimal("1"),
+            filled_at_utc=NOW,
+        )
+        result = await store.process_fill(client_order_id="cid-1", payload=payload)
+        assert result is False  # caller degrades to minimal_fill_fallback
+
+    async def test_unsupported_scenario_still_falls_back(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from services.risk.fill_processor import UnsupportedFillScenarioError
+        from services.signal import strategy_worker as sw_module
+
+        store = StrategyWorkerStore(session_factory=MagicMock(), env="paper")
+
+        async def _boom(**kwargs: Any) -> Any:
+            raise UnsupportedFillScenarioError("phase 2 deferral")
+
+        monkeypatch.setattr(sw_module, "process_fill_event", _boom)
+        payload = FillIngestPayload(
+            broker_fill_id="cid-2:agg",
+            cumulative_filled_quantity=1,
+            fill_quantity=1,
+            fill_price=Decimal("64000"),
+            commission_usd=Decimal("1"),
+            filled_at_utc=NOW,
+        )
+        assert await store.process_fill(client_order_id="cid-2", payload=payload) is False
+
+
+class TestExternalFlatOrphanedStop:
+    """2026-07-12: syncing to venue-flat used to FORGET the native stop
+    without cancelling it at the venue — a naked resting order."""
+
+    async def test_external_flat_cancels_resting_stop_then_clears(self) -> None:
+        worker, _, broker = await _started_worker()
+        rt = worker.state["BTC"]
+        rt.contracts = -2
+        stop = broker.seed_order(
+            client_order_id="stop-cid",
+            product_id=BTC_PID,
+            side="buy",
+            contracts=Decimal(2),
+            status="open",
+            kind="stop_limit",
+        )
+        rt.native_stop_order_id = stop.order_id
+        rt.native_stop_client_order_id = "stop-cid"
+
+        # Venue reports FLAT (empty mapping) while the worker tracks -2.
+        await worker._detect_external_position_changes({}, now_utc=NOW)
+
+        assert broker.orders[stop.order_id].status == "cancelled"
+        assert rt.contracts == 0
+        assert rt.native_stop_order_id is None
+
+    async def test_external_flat_cancel_failure_retries_next_tick(self) -> None:
+        worker, _, broker = await _started_worker()
+        rt = worker.state["BTC"]
+        rt.contracts = -2
+        stop = broker.seed_order(
+            client_order_id="stop-cid",
+            product_id=BTC_PID,
+            side="buy",
+            contracts=Decimal(2),
+            status="open",
+            kind="stop_limit",
+        )
+        rt.native_stop_order_id = stop.order_id
+
+        async def _cancel_boom(order_ids: list[str]) -> dict[str, bool]:
+            raise RuntimeError("venue 5xx")
+
+        broker.cancel_orders = _cancel_boom  # type: ignore[method-assign]
+        await worker._detect_external_position_changes({}, now_utc=NOW)
+
+        # Unsynced on purpose: the diff re-fires next tick and retries.
+        assert rt.contracts == -2
+        assert rt.native_stop_order_id == stop.order_id
