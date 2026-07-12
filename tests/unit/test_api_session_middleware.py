@@ -327,10 +327,10 @@ class TestExemptPaths:
             "/api/auth/logout",
             "/api/health",
             "/api/setup/verify-token",
-            "/api/internal/watchdog",
         ):
             assert path in _SESSION_EXEMPT_PATHS
         # And the ones that must NOT be exempt:
+        assert "/api/internal/watchdog" not in _SESSION_EXEMPT_PATHS  # unmounted
         assert "/api/auth/me" not in _SESSION_EXEMPT_PATHS
         assert "/api/auth/backup-codes/regenerate" not in _SESSION_EXEMPT_PATHS
         assert "/api/sse/events" not in _SESSION_EXEMPT_PATHS

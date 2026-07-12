@@ -62,9 +62,9 @@ log = structlog.get_logger()
 
 
 #: Routes that don't need a session. Three groups:
-#:   * public probes / machine ingress (health, watchdog push) — mirror of
-#:     the CSRF allowlist in ``services/api/middleware._CSRF_EXEMPT_PATHS``;
-#:   * the setup-token gate itself;
+#:   * the public health probe;
+#:   * the setup-token gate itself (mirror of the CSRF allowlist in
+#:     ``services/api/middleware._CSRF_EXEMPT_PATHS``);
 #:   * the auth ceremony: login endpoints (no session exists yet by
 #:     definition), the setup-wizard endpoints (gated by the
 #:     ``ceremony_session_id`` that only ``POST /api/setup/verify-token``
@@ -79,7 +79,6 @@ _SESSION_EXEMPT_PATHS: Final[frozenset[str]] = frozenset(
     {
         "/api/health",
         "/api/setup/verify-token",
-        "/api/internal/watchdog",
         "/api/auth/webauthn/register/challenge",
         "/api/auth/webauthn/register/verify",
         "/api/auth/webauthn/challenge",
@@ -175,7 +174,6 @@ class SessionMiddleware(BaseHTTPMiddleware):
         self._csrf_cookie_name = settings.csrf_cookie_name
         self._idle_seconds = settings.session_idle_seconds
         self._csrf_max_age = settings.session_absolute_seconds
-        self._operator_username = settings.operator_username
         self._stub_active = settings.environment == "dev"
         self._session_scope = session_scope or _default_session_scope
         # Match ``_set_session_cookies`` semantics: Secure flag everywhere
@@ -277,6 +275,7 @@ class SessionMiddleware(BaseHTTPMiddleware):
                     text(
                         """
                         SELECT a.role,
+                               a.external_account_id,
                                EXISTS(
                                    SELECT 1 FROM webauthn_credentials w
                                    WHERE w.account_id = a.id AND w.active = TRUE
@@ -305,7 +304,13 @@ class SessionMiddleware(BaseHTTPMiddleware):
             now = datetime.now(tz=UTC)
             return SessionContext(
                 user_id=str(row.account_id),
-                username=self._operator_username,
+                # The bootstrap flow writes the username INTO
+                # external_account_id (repos/auth.py
+                # find_or_create_bootstrap_account) — read the session
+                # account's own identity back out rather than assuming the
+                # configured operator (a future reader account must never
+                # inherit the owner's name).
+                username=str(acct.external_account_id),
                 role=cast(Literal["owner", "reader"], acct.role),
                 auth_strength="weak" if row.totp_bootstrap_only else "strong",
                 last_uv_at=row.last_uv_at_utc,

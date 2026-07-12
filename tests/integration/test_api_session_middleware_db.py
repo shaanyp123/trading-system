@@ -164,6 +164,15 @@ class TestLoaderHappyPath:
 
         assert ctx is not None
         assert ctx.user_id == str(seeded_account)
+        # username reads the account's own identity (external_account_id —
+        # the bootstrap flow writes the username there), never a config value.
+        ext_id = (
+            await db_session.execute(
+                text("SELECT external_account_id FROM accounts WHERE id = :a"),
+                {"a": seeded_account},
+            )
+        ).scalar_one()
+        assert ctx.username == ext_id
         assert ctx.role == "owner"
         assert ctx.auth_strength == "strong"
         assert ctx.last_uv_at is not None

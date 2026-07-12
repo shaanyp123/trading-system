@@ -86,13 +86,17 @@ class APISettings(BaseSettings):
     # filtering is justified by real load. See Docs/decisions-log.md
     # "2026-05-10 — Day 17 09:00" entry for the rationale.
     #
-    # Two buckets per IG §3 Week 5 Wed:
+    # Three buckets (IG §3 Week 5 Wed, + sse added 2026-07-12):
     #   - general: 100 req / 10s on /api/** (excl. /api/auth/**, /api/health,
-    #     /api/internal/watchdog, /api/sse/events)
+    #     /api/sse/events)
     #   - auth:      5 req / 10s on /api/auth/** (brute-force-conscious)
+    #   - sse:      30 req / 10s on /api/sse/events (each connect costs a
+    #     session-table lookup under real validation; sized well above the
+    #     N=4-tab reconnect-storm worst case)
     rate_limit_window_seconds: float = Field(default=10.0)
     rate_limit_general_per_window: int = Field(default=100)
     rate_limit_auth_per_window: int = Field(default=5)
+    rate_limit_sse_per_window: int = Field(default=30)
 
     # --- WebAuthn (Day 21 — IG §3 Week 6 Tue) -----------------------------
     # Relying-party identifier per spec §5.1 — apex registrable domain.

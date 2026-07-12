@@ -114,8 +114,11 @@ async def _bootstrap_owner_token() -> None:
             raw_token=raw_token,
             instructions=(
                 "Submit this token at POST /api/setup/verify-token within 24h. "
-                "It will not be re-emitted; if lost, run "
-                "`python -m services.api.bootstrap_owner_token` to mint another."
+                "It will not be re-emitted for this row. If lost: delete the "
+                "unconsumed setup_tokens row (or wait out its 24h expiry), "
+                "then restart the api container — the lifespan mints a fresh "
+                "owner token whenever no unconsumed unexpired one exists "
+                "(grep the api logs for SETUP_TOKEN_EMITTED)."
             ),
         )
 
