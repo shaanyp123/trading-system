@@ -54,6 +54,7 @@ from services.risk.fill_processor import FillIngestPayload
 from services.risk.state_machine import TransitionTrigger
 from services.signal.crypto_trend import AMENDMENT_B_PARAMS
 from services.signal.strategy_worker import (
+    RISK_TICK_FAILURE_HALT_THRESHOLD,
     AssetRuntime,
     DecisionRow,
     MarksFeed,
@@ -1399,6 +1400,94 @@ class TestFillScenarioFallback:
 
         assert store.fill_fallbacks  # orders/fills stay truthful
         assert worker.state["BTC"].contracts == 2
+
+
+# ---------------------------------------------------------------------------
+# Tick-failure halt latch (fail-loud-with-retry)
+# ---------------------------------------------------------------------------
+
+
+class FlakyKillSwitchStore(FakeStore):
+    """invoke_kill_switch raises for the first ``fail_times`` attempts,
+    then delegates to the FakeStore happy path."""
+
+    def __init__(self, fail_times: int) -> None:
+        super().__init__()
+        self.fail_times = fail_times
+        self.invoke_attempts = 0
+
+    async def invoke_kill_switch(
+        self, account_id: UUID, *, trigger: TransitionTrigger, now_utc: datetime
+    ) -> bool:
+        self.invoke_attempts += 1
+        if self.invoke_attempts <= self.fail_times:
+            raise RuntimeError("transient db failure")
+        return await super().invoke_kill_switch(account_id, trigger=trigger, now_utc=now_utc)
+
+
+class TestTickFailureHaltLatch:
+    async def test_halt_fires_once_at_threshold_then_latches(self) -> None:
+        worker, store, _ = await _started_worker()
+        worker._consecutive_tick_failures = RISK_TICK_FAILURE_HALT_THRESHOLD
+
+        await worker._maybe_halt_on_tick_failures()
+        await worker._maybe_halt_on_tick_failures()  # next tick: latched, no re-fire
+
+        assert store.kill_switch_calls == [TransitionTrigger.UNHANDLED_EXCEPTION]
+        assert worker._tick_failure_halt_fired is True
+        assert [a[:2] for a in store.alerts] == [("P1", "kill_switch_invoked")]
+
+    async def test_below_threshold_does_nothing(self) -> None:
+        worker, store, _ = await _started_worker()
+        worker._consecutive_tick_failures = RISK_TICK_FAILURE_HALT_THRESHOLD - 1
+
+        await worker._maybe_halt_on_tick_failures()
+
+        assert store.kill_switch_calls == []
+        assert store.alerts == []
+        assert worker._tick_failure_halt_fired is False
+
+    async def test_raised_invoke_leaves_latch_unset_and_next_tick_retries(self) -> None:
+        """The regression pin: a raised invoke_kill_switch must NOT latch —
+        the halt retries on the next 30 s tick until it lands."""
+        flaky = FlakyKillSwitchStore(fail_times=1)
+        worker, _, _ = await _started_worker(store=flaky)
+        worker._consecutive_tick_failures = RISK_TICK_FAILURE_HALT_THRESHOLD
+
+        await worker._maybe_halt_on_tick_failures()  # attempt 1 raises
+
+        assert worker._tick_failure_halt_fired is False
+        assert flaky.alerts == []  # no alert until the halt actually lands
+
+        await worker._maybe_halt_on_tick_failures()  # next tick: retry succeeds
+
+        assert flaky.invoke_attempts == 2
+        assert flaky.kill_switch_calls == [TransitionTrigger.UNHANDLED_EXCEPTION]
+        assert worker._tick_failure_halt_fired is True
+        assert [a[:2] for a in flaky.alerts] == [("P1", "kill_switch_invoked")]
+
+    async def test_persistently_failing_invoke_never_latches(self) -> None:
+        flaky = FlakyKillSwitchStore(fail_times=99)
+        worker, _, _ = await _started_worker(store=flaky)
+        worker._consecutive_tick_failures = RISK_TICK_FAILURE_HALT_THRESHOLD
+
+        for _ in range(5):
+            await worker._maybe_halt_on_tick_failures()
+
+        assert flaky.invoke_attempts == 5  # one retry per tick, forever
+        assert worker._tick_failure_halt_fired is False
+        assert flaky.alerts == []
+
+    async def test_already_halted_short_circuit_latches_without_transition(self) -> None:
+        worker, store, _ = await _started_worker()
+        store.risk = RiskStateSnapshot("HALT_NEW", "routine", 0, False)
+        worker._consecutive_tick_failures = RISK_TICK_FAILURE_HALT_THRESHOLD
+
+        await worker._maybe_halt_on_tick_failures()
+
+        assert store.kill_switch_calls == []  # facade short-circuit (already halted)
+        assert worker._tick_failure_halt_fired is True  # goal state reached: stop retrying
+        assert [a[:2] for a in store.alerts] == [("P1", "kill_switch_invoked")]
 
 
 # ---------------------------------------------------------------------------

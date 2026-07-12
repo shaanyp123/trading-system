@@ -1606,19 +1606,32 @@ class StrategyWorker:
             self._log.info("strategy_worker_stopped")
 
     async def _maybe_halt_on_tick_failures(self) -> None:
+        """Invoke HALT_NEW after RISK_TICK_FAILURE_HALT_THRESHOLD consecutive
+        tick failures. The ``_tick_failure_halt_fired`` latch sets ONLY after
+        ``invoke_kill_switch`` returns — a raised invoke leaves the latch
+        unset so the next 30 s tick retries (fail-loud-with-retry, the
+        dispatch-layer lock contract). Latching before the call was fail-open:
+        one transient invoke failure and the worker never halted."""
         if (
             self._consecutive_tick_failures >= RISK_TICK_FAILURE_HALT_THRESHOLD
             and not self._tick_failure_halt_fired
             and self.account_id is not None
         ):
-            self._tick_failure_halt_fired = True
             now = self._clock()
-            with contextlib.suppress(Exception):
-                await self._store.invoke_kill_switch(
+            try:
+                applied = await self._store.invoke_kill_switch(
                     self.account_id,
                     trigger=TransitionTrigger.UNHANDLED_EXCEPTION,
                     now_utc=now,
                 )
+            except Exception:
+                self._log.exception(
+                    "strategy_worker_tick_failure_halt_invoke_failed",
+                    consecutive_failures=self._consecutive_tick_failures,
+                    note="latch unset; next risk tick retries the kill switch",
+                )
+                return
+            self._tick_failure_halt_fired = True
             await self._store.insert_alert(
                 self.account_id,
                 severity="P1",
@@ -1631,6 +1644,7 @@ class StrategyWorker:
                     "trigger": TransitionTrigger.UNHANDLED_EXCEPTION.value,
                     "consecutive_failures": self._consecutive_tick_failures,
                     "source": "strategy_worker_risk_loop",
+                    "transition_applied": applied,
                 },
                 now_utc=now,
             )
