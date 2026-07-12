@@ -1805,8 +1805,11 @@ async def apply_fill_plan(
                 error_code="DUPLICATE_OPEN_TRADE_FOR_MARKET",
                 message=(
                     "refuse-at-open: an open trade already exists for "
-                    f"(account, market={plan.trade_mutation.market!r}) but this "
-                    "plan would INSERT a second one — one-open-trade-per-market "
+                    f"(account, market={plan.trade_mutation.market!r}) — existing "
+                    f"trade_id={existing_open_trade.trade_id}; refused "
+                    f"entry_signal_id={plan.trade_mutation.entry_signal_id}, "
+                    f"order_id={plan.trade_mutation.entry_order_id}. This plan "
+                    "would INSERT a second open trade — one-open-trade-per-market "
                     "is a convention the partitioned trades table cannot enforce, "
                     "so it is enforced here. Nothing was written; the caller "
                     "should have attached to the existing trade (market-level "
