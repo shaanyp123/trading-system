@@ -57,6 +57,7 @@ from services.signal.strategy_worker import (
     RISK_TICK_FAILURE_HALT_THRESHOLD,
     AssetRuntime,
     DecisionRow,
+    KillSwitchInvokeResult,
     MarksFeed,
     RiskStateSnapshot,
     StrategyWorker,
@@ -338,7 +339,7 @@ class FakeStore(StrategyWorkerStore):
         self._phase = 1
         self._log = structlog.get_logger()
         self.account = uuid4()
-        self.risk = RiskStateSnapshot("NORMAL", None, 0, False)
+        self.risk: RiskStateSnapshot | None = RiskStateSnapshot("NORMAL", None, 0, False)
         self.capital_event_day: date | None = None
         self.param_head: tuple[str, dict[str, str]] | None = (
             "a" * 64,
@@ -513,12 +514,14 @@ class FakeStore(StrategyWorkerStore):
 
     async def invoke_kill_switch(
         self, account_id: UUID, *, trigger: TransitionTrigger, now_utc: datetime
-    ) -> bool:
+    ) -> KillSwitchInvokeResult:
+        if self.risk is None:
+            return KillSwitchInvokeResult.NO_RISK_STATE_ROW
         if self.risk.state == "HALT_NEW":
-            return False
+            return KillSwitchInvokeResult.ALREADY_HALTED
         self.kill_switch_calls.append(trigger)
         self.risk = RiskStateSnapshot("HALT_NEW", "routine", 0, False)
-        return True
+        return KillSwitchInvokeResult.APPLIED
 
 
 def _build_worker(
@@ -1062,6 +1065,82 @@ class TestHaltGate:
         await worker.run_daily_decision(TODAY)
         assert store.decisions[TODAY]["status"] == "completed"
 
+    async def test_missing_risk_state_row_fails_closed_no_dispatch(self) -> None:
+        """The gate must never treat "cannot answer" as permission: no
+        orders, no decision row (the next tick retries), a ONE-SHOT P1,
+        and the decision self-heals once the row is restored."""
+        store = FakeStore()
+        store.risk = None
+        worker, _, broker = await _started_worker(store=store)
+
+        await worker.run_daily_decision(TODAY)
+
+        assert broker.create_calls == []
+        assert TODAY not in store.decisions  # not terminally skipped
+        assert [a[:2] for a in store.alerts] == [("P1", "incident_review_required")]
+        assert store.alerts[0][3]["reason"] == "no_risk_state_row"
+
+        await worker.run_daily_decision(TODAY)  # next tick: still blocked
+        assert broker.create_calls == []
+        assert len(store.alerts) == 1  # alert stays one-shot per episode
+
+        store.risk = RiskStateSnapshot("NORMAL", None, 0, False)  # row restored
+        await worker.run_daily_decision(TODAY)
+        assert store.decisions[TODAY]["status"] == "completed"
+
+    async def test_missing_risk_state_row_blocks_resume(self) -> None:
+        """The crash-recovery resume path shares the fail-closed rule: a
+        'dispatching' row with pending legs must not dispatch through an
+        unanswerable gate — and must NOT be terminally skipped either."""
+        store = FakeStore()
+        store.risk = None
+        store.decisions[TODAY] = {
+            "status": "dispatching",
+            "equity_usd": Decimal("6000"),
+            "outcome": {
+                "schema_version": "strategy_decision_v1",
+                "assets": {
+                    "BTC": {
+                        "final_target": 1,
+                        "action": "buy",
+                        "legs": [{"seq": 0, "kind": "open", "delta": 1, "status": "pending"}],
+                    },
+                    "ETH": {"final_target": 0, "action": "hold", "legs": []},
+                },
+            },
+            "engine_state": serialize_engine_state(
+                {"BTC": AssetRuntime(applied_dir=1), "ETH": AssetRuntime()}
+            ),
+        }
+        worker, _, broker = await _started_worker(store=store)
+
+        await worker.run_daily_decision(TODAY)
+
+        assert broker.create_calls == []
+        assert store.decisions[TODAY]["status"] == "dispatching"  # retried next tick
+        assert [a[:2] for a in store.alerts] == [("P1", "incident_review_required")]
+
+    async def test_leg_gate_fails_closed_when_row_vanishes_mid_decision(self) -> None:
+        """A risk_state row vanishing between legs is treated exactly like
+        a halt landing between legs: the remaining legs skip."""
+        store = FakeStore()
+        worker, _, _broker = await _started_worker(store=store)
+
+        original_execute = worker._adapter.execute_target_delta
+
+        async def _drop_row_after_first(**kwargs: Any) -> Any:
+            result = await original_execute(**kwargs)
+            store.risk = None
+            return result
+
+        worker._adapter.execute_target_delta = _drop_row_after_first  # type: ignore[method-assign]
+        await worker.run_daily_decision(TODAY)
+        row = store.decisions[TODAY]
+        statuses = [
+            leg["status"] for a in ("BTC", "ETH") for leg in row["outcome"]["assets"][a]["legs"]
+        ]
+        assert "skipped_risk_state" in statuses  # the post-vanish leg never dispatched
+
 
 # ---------------------------------------------------------------------------
 # Risk loop: client stops, loss limits, halt floor, outage
@@ -1165,6 +1244,30 @@ class TestLossLimits:
         assert store.kill_switch_calls == [TransitionTrigger.DECOMMISSION_FLOOR]
         assert worker.state["BTC"].contracts == 0
         assert ("P0", "kill_switch_invoked") in {(a[0], a[1]) for a in store.alerts}
+        floor_alert = next(a for a in store.alerts if a[1] == "kill_switch_invoked")
+        assert "HALT_NEW (decommission_floor)" in floor_alert[2]
+        assert floor_alert[3]["transition_applied"] is True
+
+    async def test_hard_halt_floor_missing_risk_row_alert_is_honest(self) -> None:
+        """Tri-state honesty at the floor site: with no risk_state row the
+        flatten still runs, but the P0 must say the halt did NOT land
+        (and the next tick re-invokes since already_halted stays False)."""
+        store = FakeStore()
+        store.risk = None
+        worker, _, broker = await _started_worker(store=store)
+        _open_long(worker, broker, "BTC", contracts=2)
+        broker.equity = Decimal("1400")
+
+        await worker.run_risk_checks(now_utc=NOW)
+
+        assert store.kill_switch_calls == []  # nothing transitioned
+        assert worker.state["BTC"].contracts == 0  # protective flatten still ran
+        floor_alert = next(a for a in store.alerts if a[1] == "kill_switch_invoked")
+        assert floor_alert[0] == "P0"
+        assert "NOT applied" in floor_alert[2]
+        assert "HALT_NEW (decommission_floor)" not in floor_alert[2]
+        assert floor_alert[3]["transition_applied"] is False
+        assert floor_alert[3]["invoke_result"] == "no_risk_state_row"
 
     async def test_already_halted_does_not_retrip(self) -> None:
         store = FakeStore()
@@ -1419,7 +1522,7 @@ class FlakyKillSwitchStore(FakeStore):
 
     async def invoke_kill_switch(
         self, account_id: UUID, *, trigger: TransitionTrigger, now_utc: datetime
-    ) -> bool:
+    ) -> KillSwitchInvokeResult:
         self.invoke_attempts += 1
         if self.invoke_attempts <= self.fail_times:
             raise RuntimeError("transient db failure")
@@ -1499,6 +1602,36 @@ class TestTickFailureHaltLatch:
         assert worker._tick_failure_halt_fired is True  # goal state reached: stop retrying
         assert [a[:2] for a in store.alerts] == [("P1", "kill_switch_invoked")]
         assert store.alerts[0][3]["transition_applied"] is False  # honest alert record
+        assert store.alerts[0][3]["invoke_result"] == "already_halted"
+
+    async def test_no_risk_state_row_does_not_latch_and_retries(self) -> None:
+        """#378 review N-A regression pin: the missing-row result is
+        fail-OPEN — nothing transitioned, the account is NOT halted. The
+        latch must stay unset (retry every tick) and the one-shot P1 must
+        say "NOT halted", never claim resolution like the fail-safe
+        already-halted short-circuit does."""
+        worker, store, _ = await _started_worker()
+        store.risk = None
+        worker._consecutive_tick_failures = RISK_TICK_FAILURE_HALT_THRESHOLD
+
+        await worker._maybe_halt_on_tick_failures()
+
+        assert worker._tick_failure_halt_fired is False  # NOT latched
+        assert store.kill_switch_calls == []
+        assert [a[:2] for a in store.alerts] == [("P1", "kill_switch_invoked")]
+        assert "NOT halted" in store.alerts[0][2]
+        assert store.alerts[0][3]["transition_applied"] is False
+        assert store.alerts[0][3]["invoke_result"] == "no_risk_state_row"
+
+        await worker._maybe_halt_on_tick_failures()  # still no row
+        assert worker._tick_failure_halt_fired is False
+        assert len(store.alerts) == 1  # invoke-failure P1 stays one-shot
+
+        store.risk = RiskStateSnapshot("NORMAL", None, 0, False)  # row restored
+        await worker._maybe_halt_on_tick_failures()
+        assert store.kill_switch_calls == [TransitionTrigger.UNHANDLED_EXCEPTION]
+        assert worker._tick_failure_halt_fired is True
+        assert store.alerts[1][3]["transition_applied"] is True
 
     async def test_successful_tick_rearms_halt_latch(self) -> None:
         """Per-episode semantics (risk-review C3): a successful tick ends the

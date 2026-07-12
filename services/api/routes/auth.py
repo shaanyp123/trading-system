@@ -697,12 +697,19 @@ async def backup_codes_regenerate(
 ) -> BackupCodesRegenerateResponse:
     # Re-auth gate: WebAuthn UV within last 5 min (dev-guide §1.5).
     _require_recent_uv(session)
-    # Phase 0 stub session uses ``user_id = "phase0-stub-owner"`` -- not a
-    # UUID, so we look up the actual operator account by username for now.
-    # When real sessions land, ``session.user_id`` is the account UUID
-    # directly; the lookup is still safe since find_account_by_username is
-    # idempotent.
-    account = await repo.find_account_by_username(session.username)
+    # Real sessions (post-#380) carry the account UUID in
+    # ``session.user_id`` — resolve by primary key so the codes are minted
+    # for exactly the session's account, never a same-named other row
+    # (#380 review N-a). The dev-only Phase-0 stub (``phase0-stub-owner``,
+    # not a UUID) falls back to the username lookup it always used.
+    try:
+        account_uuid: UUID | None = UUID(session.user_id)
+    except ValueError:
+        account_uuid = None
+    if account_uuid is not None:
+        account = await repo.find_account_by_id(account_uuid)
+    else:
+        account = await repo.find_account_by_username(session.username)
     if account is None:
         raise AppError(
             error_code="ACCOUNT_NOT_FOUND",

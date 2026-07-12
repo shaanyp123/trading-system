@@ -54,6 +54,12 @@ class _StubAuthRepo:
     async def find_account_by_username(self, username: str) -> AccountRow | None:
         return self.accounts_by_username.get(username)
 
+    async def find_account_by_id(self, account_id: UUID) -> AccountRow | None:
+        for row in self.accounts_by_username.values():
+            if row.id == account_id:
+                return row
+        return None
+
     async def find_or_create_bootstrap_account(
         self, username: str, role: Literal["owner", "reader"]
     ) -> AccountRow:
@@ -1029,6 +1035,121 @@ class TestRecover:
         # Session was weak.
         assert len(stub_create_session) == 1
         assert stub_create_session[0]["totp_bootstrap_only"] is True
+
+
+# ---------------------------------------------------------------------------
+# Backup-code regenerate (re-auth-gated; account resolution via session)
+# ---------------------------------------------------------------------------
+def _strong_session_context(user_id: str, username: str) -> Any:
+    """A strong-auth SessionContext with a fresh UV (passes the 5-min gate)."""
+    from services.api.session import SessionContext
+
+    now = datetime.now(tz=UTC)
+    return SessionContext(
+        user_id=user_id,
+        username=username,
+        role="owner",
+        auth_strength="strong",
+        last_uv_at=now,
+        session_expires_at=now,
+        webauthn_enrolled=True,
+        totp_enrolled=True,
+        is_phase0_stub=False,
+    )
+
+
+class TestBackupCodesRegenerate:
+    @pytest.mark.asyncio
+    async def test_real_session_resolves_by_account_uuid_not_username(
+        self,
+        api_app: FastAPI,
+        api_client: AsyncClient,
+        wire_auth_overrides: None,
+        stub_repo: _StubAuthRepo,
+    ) -> None:
+        """#380 review N-a: a real session carries the account UUID in
+        ``user_id`` — the codes must be minted for exactly that account,
+        even when another account shares the session's username surface."""
+        from services.api.session import get_session_context
+
+        real_account = AccountRow(id=uuid4(), external_account_id="real-owner", role="owner")
+        decoy_account = AccountRow(id=uuid4(), external_account_id="operator", role="owner")
+        stub_repo.accounts_by_username["real-owner"] = real_account
+        # Decoy: same username the session presents, DIFFERENT account id.
+        stub_repo.accounts_by_username["operator"] = decoy_account
+        api_app.dependency_overrides[get_session_context] = lambda: _strong_session_context(
+            user_id=str(real_account.id), username="operator"
+        )
+
+        response = await api_client.post(
+            "/api/auth/backup-codes/regenerate", json={}, **_csrf_kwargs()
+        )
+
+        assert response.status_code == 200, response.text
+        assert len(response.json()["codes"]) == 8
+        insert = next(i for i in stub_repo.inserts if i["type"] == "backup_codes")
+        assert insert["account_id"] == real_account.id  # by-id, not by-username
+
+    @pytest.mark.asyncio
+    async def test_real_session_unknown_account_uuid_404s(
+        self,
+        api_app: FastAPI,
+        api_client: AsyncClient,
+        wire_auth_overrides: None,
+        stub_repo: _StubAuthRepo,
+    ) -> None:
+        from services.api.session import get_session_context
+
+        api_app.dependency_overrides[get_session_context] = lambda: _strong_session_context(
+            user_id=str(uuid4()), username="operator"
+        )
+        response = await api_client.post(
+            "/api/auth/backup-codes/regenerate", json={}, **_csrf_kwargs()
+        )
+        assert response.status_code == 404
+        assert response.json()["error_code"] == "ACCOUNT_NOT_FOUND"
+        assert not any(i["type"] == "backup_codes" for i in stub_repo.inserts)
+
+    @pytest.mark.asyncio
+    async def test_stub_session_falls_back_to_username_and_invalidates_old(
+        self,
+        api_app: FastAPI,
+        api_client: AsyncClient,
+        wire_auth_overrides: None,
+        stub_repo: _StubAuthRepo,
+    ) -> None:
+        """Dev-only Phase-0 stub (``user_id`` is not a UUID): resolution
+        falls back to the username lookup; the old batch is invalidated."""
+        from services.api.auth import backup_codes as bc_mod
+        from services.api.session import get_session_context
+
+        account = AccountRow(id=uuid4(), external_account_id="operator", role="owner")
+        stub_repo.accounts_by_username["operator"] = account
+        old_codes = bc_mod.generate_codes()
+        for c in old_codes:
+            stub_repo.backup_codes.append(
+                BackupCodeRow(
+                    id=uuid4(),
+                    account_id=account.id,
+                    code_hash=c.hash,
+                    used_at_utc=None,
+                    generation_id=uuid4(),
+                )
+            )
+        api_app.dependency_overrides[get_session_context] = lambda: _strong_session_context(
+            user_id="phase0-stub-owner", username="operator"
+        )
+
+        response = await api_client.post(
+            "/api/auth/backup-codes/regenerate", json={}, **_csrf_kwargs()
+        )
+
+        assert response.status_code == 200, response.text
+        assert len(response.json()["codes"]) == 8
+        # The 8 pre-existing codes are used-up; 8 fresh unused rows exist.
+        unused = [c for c in stub_repo.backup_codes if c.used_at_utc is None]
+        assert len(unused) == 8
+        assert len(stub_repo.backup_codes) == 16
 
 
 # ---------------------------------------------------------------------------
