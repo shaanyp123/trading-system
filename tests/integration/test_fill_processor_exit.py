@@ -55,6 +55,8 @@ from services.risk.fill_processor import (
     FillIngestPayload,
     FillProcessingError,
     PriorBalanceSnapshot,
+    TradeMutation,
+    _apply_trade_mutation,
     apply_fill_plan,
     plan_fill_application,
     process_fill_event,
@@ -795,3 +797,169 @@ async def test_refuse_at_open_guard_blocks_duplicate_open_trade(
     assert fills == []
     assert len(open_trades) == 1
     assert UUID(str(open_trades[0].id)) == state["trade_id"]
+
+
+@pytest.mark.asyncio
+async def test_open_race_lost_at_db_backstop_returns_survivor_and_alerts(
+    async_session_factory: async_sessionmaker[AsyncSession],
+    sync_engine: Engine,
+    fresh_account_id: UUID,
+    slippage_head_version_id: UUID,
+) -> None:
+    """#383 accepted hardening, proven against the real schema: when an
+    open trade already exists for (account, market), the conditional
+    trades INSERT (INSERT … WHERE NOT EXISTS) is SUPPRESSED — no second
+    open row — and the race-lost arm returns the surviving trade's id
+    and INSERTs one P1 incident_review_required alert, never raising.
+
+    ``_apply_trade_mutation`` is driven directly (not via
+    apply_fill_plan) deliberately: the step-0 guard would refuse first,
+    and the DB backstop exists precisely for the window AFTER that guard
+    passed — calling the internal seam IS the race simulation.
+    """
+    state = _seed_open_trade_state(
+        sync_engine,
+        account_id=fresh_account_id,
+        slip_id=slippage_head_version_id,
+        market="ADA",
+    )
+    racing_cid = "worker-decision-race-entry-0"
+    racing_signal_id = _seed_fresh_signal_order(
+        sync_engine,
+        account_id=fresh_account_id,
+        slip_id=slippage_head_version_id,
+        market="ADA",
+        direction="buy",
+        quantity=1,
+        cid=racing_cid,
+    )
+    with sync_engine.connect() as conn:
+        racing_order = conn.execute(
+            text("SELECT id FROM orders WHERE client_order_id = :cid"),
+            {"cid": racing_cid},
+        ).one()
+
+    mutation = TradeMutation(
+        action="open",
+        trade_id=None,
+        trade_created_at=None,
+        account_id=fresh_account_id,
+        env="paper",
+        market="ADA",
+        contract_id=None,
+        entry_signal_id=racing_signal_id,
+        entry_order_id=UUID(str(racing_order.id)),
+        direction="long",
+        opened_at_utc=datetime(2026, 7, 13, 0, 5, tzinfo=UTC),
+        new_total_quantity=1,
+        new_avg_entry_price=Decimal("85.00"),
+        realized_commission_usd=Decimal("0.25"),
+        managed_by_version="0" * 39 + "1",
+        strategy_hash="0" * 39 + "1",
+        parameter_set_hash="0" * 63 + "1",
+        slippage_calibration_version_id=slippage_head_version_id,
+    )
+
+    returned_trade_id = await _apply_trade_mutation(mutation, session_factory=async_session_factory)
+    assert returned_trade_id == state["trade_id"]  # the SURVIVOR, not a new row
+
+    with sync_engine.connect() as conn:
+        open_trades = conn.execute(
+            text(
+                "SELECT id FROM trades WHERE account_id = :acct AND market = 'ADA' "
+                "  AND state = 'open_position'"
+            ),
+            {"acct": fresh_account_id},
+        ).fetchall()
+        alerts = conn.execute(
+            text(
+                "SELECT severity, category::text AS category, message, detail "
+                "FROM alerts WHERE account_id = :acct"
+            ),
+            {"acct": fresh_account_id},
+        ).fetchall()
+    assert len(open_trades) == 1  # the conditional INSERT was suppressed
+    assert UUID(str(open_trades[0].id)) == state["trade_id"]
+    assert len(alerts) == 1
+    assert alerts[0].severity == "P1"
+    assert alerts[0].category == "incident_review_required"
+    assert str(state["trade_id"]) in alerts[0].message
+    detail = alerts[0].detail
+    assert detail["surviving_trade_id"] == str(state["trade_id"])
+    assert detail["refused_entry_signal_id"] == str(racing_signal_id)
+    assert detail["refused_order_id"] == str(racing_order.id)
+
+
+@pytest.mark.asyncio
+async def test_open_happy_path_conditional_insert_lands_row(
+    async_session_factory: async_sessionmaker[AsyncSession],
+    sync_engine: Engine,
+    fresh_account_id: UUID,
+    slippage_head_version_id: UUID,
+) -> None:
+    """Review should-fix C1: the REWRITTEN happy-path open INSERT — the
+    statement every C1 live entry executes — must land a row against the
+    real partitioned table (INSERT … SELECT … WHERE NOT EXISTS with
+    repeated params + RETURNING id + created_at DEFAULT now() routing),
+    not just string-match in a unit mock."""
+    entry_cid = "worker-decision-fresh-entry-0"
+    entry_signal_id = _seed_fresh_signal_order(
+        sync_engine,
+        account_id=fresh_account_id,
+        slip_id=slippage_head_version_id,
+        market="DOT",
+        direction="buy",
+        quantity=2,
+        cid=entry_cid,
+    )
+    with sync_engine.connect() as conn:
+        entry_order = conn.execute(
+            text("SELECT id FROM orders WHERE client_order_id = :cid"),
+            {"cid": entry_cid},
+        ).one()
+
+    mutation = TradeMutation(
+        action="open",
+        trade_id=None,
+        trade_created_at=None,
+        account_id=fresh_account_id,
+        env="paper",
+        market="DOT",
+        contract_id=None,
+        entry_signal_id=entry_signal_id,
+        entry_order_id=UUID(str(entry_order.id)),
+        direction="long",
+        opened_at_utc=datetime(2026, 7, 13, 0, 5, tzinfo=UTC),
+        new_total_quantity=2,
+        new_avg_entry_price=Decimal("6.50"),
+        realized_commission_usd=Decimal("0.10"),
+        managed_by_version="0" * 39 + "1",
+        strategy_hash="0" * 39 + "1",
+        parameter_set_hash="0" * 63 + "1",
+        slippage_calibration_version_id=slippage_head_version_id,
+    )
+
+    trade_id = await _apply_trade_mutation(mutation, session_factory=async_session_factory)
+
+    with sync_engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT id, state, direction, total_quantity, avg_entry_price, "
+                "       entry_signal_id, created_at "
+                "FROM trades WHERE account_id = :acct AND market = 'DOT'"
+            ),
+            {"acct": fresh_account_id},
+        ).fetchall()
+        alerts = conn.execute(
+            text("SELECT 1 FROM alerts WHERE account_id = :acct"),
+            {"acct": fresh_account_id},
+        ).fetchall()
+    assert len(rows) == 1
+    assert UUID(str(rows[0].id)) == trade_id
+    assert rows[0].state == "open_position"
+    assert rows[0].direction == "long"
+    assert int(rows[0].total_quantity) == 2
+    assert Decimal(str(rows[0].avg_entry_price)) == Decimal("6.50")
+    assert UUID(str(rows[0].entry_signal_id)) == entry_signal_id
+    assert rows[0].created_at is not None  # DEFAULT now() routed the partition
+    assert alerts == []  # happy path: no incident alert

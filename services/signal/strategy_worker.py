@@ -641,6 +641,34 @@ class WorkerStatusRow:
     last_decision_date: date | None
 
 
+@dataclass(frozen=True, slots=True)
+class FillPropagationOutcome:
+    """Result of one :meth:`StrategyWorkerStore.process_fill` call.
+
+    Replaces the former bare bool (#383 review accepted residual): the
+    fallback's ORDER_FILLED audit narrative must describe the ACTUAL
+    failure shape, and a bool collapsed two OPPOSITE shapes — a Phase-2
+    scenario deferral (``deferred=True``, e.g. EXIT_PARTIAL: expected,
+    benign, EOD recon reconciles) and a pre-apply propagation REFUSAL
+    (``deferred=False``, e.g. DUPLICATE_OPEN_TRADE_FOR_MARKET or
+    FALLBACK_TRADE_DIRECTION_MISMATCH: the book may need the
+    ``replay_leg_fill`` operator tool).
+
+    ``__bool__`` mirrors ``propagated`` so ``if not outcome:`` keeps the
+    pre-#383-follow-up call-site semantics — a third caller written
+    against the old bool contract degrades gracefully instead of
+    treating every outcome object as truthy.
+    """
+
+    propagated: bool
+    deferred: bool = False
+    error_code: str | None = None
+    detail: str | None = None
+
+    def __bool__(self) -> bool:
+        return self.propagated
+
+
 class StrategyWorkerStore:
     """All DB reads/writes + downstream-processor feeds for the worker.
 
@@ -1245,15 +1273,19 @@ class StrategyWorkerStore:
         *,
         client_order_id: str,
         payload: FillIngestPayload,
-    ) -> bool:
+    ) -> FillPropagationOutcome:
         """Feed one aggregated leg fill into the kept fill pipeline.
 
-        Returns True when fully propagated; False when the scenario is
-        outside the processor's supported set (EXIT_PARTIAL /
-        EXIT_REVERSAL are pre-existing Phase-2 deferrals) — the caller
-        falls back to :meth:`minimal_fill_fallback` so ``orders`` +
-        ``fills`` stay truthful even when position/trade propagation
-        defers.
+        Returns a :class:`FillPropagationOutcome`: ``propagated=True``
+        when fully propagated; otherwise the outcome carries the failure
+        SHAPE (``deferred`` = scenario outside the processor's supported
+        set, e.g. EXIT_PARTIAL — a pre-existing Phase-2 deferral — vs. a
+        pre-apply propagation refusal) plus the error code/detail — the
+        caller falls back to :meth:`minimal_fill_fallback` passing the
+        outcome as ``cause`` so ``orders`` + ``fills`` stay truthful AND
+        the fallback's audit narrative describes what actually happened
+        (#383 review residual: the note hardcoded "EXIT_PARTIAL
+        deferral" for every shape).
         """
         try:
             result = await process_fill_event(
@@ -1270,7 +1302,12 @@ class StrategyWorkerStore:
                 error_code=exc.error_code,
                 detail=str(exc),
             )
-            return False
+            return FillPropagationOutcome(
+                propagated=False,
+                deferred=True,
+                error_code=exc.error_code,
+                detail=str(exc),
+            )
         except FillProcessingError as exc:
             # 2026-07-12 incident: EXIT_NO_PRIOR_TRADE escaped this seam
             # and killed the decision AFTER the venue fill — the worst
@@ -1293,10 +1330,15 @@ class StrategyWorkerStore:
                     "may need the replay_leg_fill operator tool"
                 ),
             )
-            return False
+            return FillPropagationOutcome(
+                propagated=False,
+                deferred=False,
+                error_code=exc.error_code,
+                detail=str(exc),
+            )
         if result is None:
             self._log.warning("strategy_worker_fill_unknown_order", client_order_id=client_order_id)
-        return True
+        return FillPropagationOutcome(propagated=True)
 
     async def minimal_fill_fallback(
         self,
@@ -1306,12 +1348,23 @@ class StrategyWorkerStore:
         payload: FillIngestPayload,
         market: str,
         fully_filled: bool,
+        cause: FillPropagationOutcome | None = None,
     ) -> None:
-        """ORDER_FILLED audit + fills INSERT + orders UPDATE for scenarios
-        the fill processor defers (partial reduces). Position/trade rows
-        are NOT mutated here — the divergence is logged loudly and the
-        00:15 UTC recon cycle (§3.5) reconciles the read models; the
-        worker's own position truth is the venue."""
+        """ORDER_FILLED audit + fills INSERT + orders UPDATE when full
+        propagation did not run. Position/trade rows are NOT mutated
+        here — the divergence is logged loudly and the 00:15 UTC recon
+        cycle (§3.5) reconciles the read models; the worker's own
+        position truth is the venue.
+
+        ``cause`` (the :class:`FillPropagationOutcome` from the failed
+        :meth:`process_fill`) drives the audit narrative (#383 review
+        residual — the note used to hardcode "EXIT_PARTIAL deferral" for
+        every shape): a ``deferred`` scenario reads as the benign
+        Phase-2 deferral it is, a propagation REFUSAL names its error
+        code and points at the ``replay_leg_fill`` repair tool. ``None``
+        (a legacy caller) records the shape as unspecified rather than
+        guessing.
+        """
         order_status = await self.order_row_exists(client_order_id)
         if order_status in ("filled", "cancelled", "rejected"):
             return
@@ -1332,6 +1385,28 @@ class StrategyWorkerStore:
             )
             return
         order_id = UUID(str(row.id))
+        if cause is not None and not cause.deferred:
+            fallback_cause = "propagation_refused"
+            note = (
+                "minimal propagation: full position/trade propagation was "
+                f"REFUSED pre-apply ({cause.error_code}); orders/fills are "
+                "recorded here only — positions_current/trades were NOT "
+                "mutated. Run the replay_leg_fill operator tool if the book "
+                "needs repair; the 00:15 UTC recon flags any residual gap"
+            )
+        elif cause is not None:
+            fallback_cause = "deferred_scenario"
+            note = (
+                "minimal propagation: fill scenario outside fill_processor's "
+                f"supported set ({cause.error_code}, Phase-2 deferral); "
+                "positions/trades reconcile via the EOD cycle"
+            )
+        else:
+            fallback_cause = "unspecified"
+            note = (
+                "minimal propagation: caller did not supply the failure "
+                "shape; positions/trades reconcile via the EOD cycle"
+            )
         async with self._sf() as audit_session:
             await append_audit_event(
                 audit_session,
@@ -1343,10 +1418,13 @@ class StrategyWorkerStore:
                     "fill_quantity": payload.fill_quantity,
                     "fill_price": str(payload.fill_price),
                     "commission_usd": str(payload.commission_usd),
-                    "note": (
-                        "minimal propagation: fill scenario outside fill_processor's "
-                        "supported set (EXIT_PARTIAL deferral); positions/trades "
-                        "reconcile via the EOD cycle"
+                    "note": note,
+                    "fallback_cause": fallback_cause,
+                    "error_code": cause.error_code if cause is not None else None,
+                    # Bounded: FillProcessingError messages carry the full
+                    # refusal narrative (ids ride the string since #383).
+                    "error_detail": (
+                        cause.detail[:1000] if cause is not None and cause.detail else None
                     ),
                     "ts": payload.filled_at_utc.isoformat(),
                 },
@@ -2223,16 +2301,17 @@ class StrategyWorker:
             commission_usd=stop_state.total_fees_usd,
             filled_at_utc=now_utc,
         )
-        propagated = await self._store.process_fill(
+        outcome = await self._store.process_fill(
             client_order_id=stop_state.client_order_id, payload=payload
         )
-        if not propagated and self.account_id is not None:
+        if not outcome.propagated and self.account_id is not None:
             await self._store.minimal_fill_fallback(
                 self.account_id,
                 client_order_id=stop_state.client_order_id,
                 payload=payload,
                 market=asset,
                 fully_filled=True,
+                cause=outcome,
             )
         self._apply_stop_lockout(rt, now_utc=now_utc)
 
@@ -3223,14 +3302,15 @@ class StrategyWorker:
                 commission_usd=total_fees,
                 filled_at_utc=now_utc,
             )
-            propagated = await self._store.process_fill(client_order_id=cid, payload=payload)
-            if not propagated:
+            outcome = await self._store.process_fill(client_order_id=cid, payload=payload)
+            if not outcome.propagated:
                 await self._store.minimal_fill_fallback(
                     self.account_id,
                     client_order_id=cid,
                     payload=payload,
                     market=asset,
                     fully_filled=int(total_filled) >= abs(leg_delta),
+                    cause=outcome,
                 )
             new_signal_status = (
                 "filled" if int(total_filled) >= abs(leg_delta) else "partially_filled"
@@ -3659,6 +3739,7 @@ __all__ = [
     "RISK_TICK_FAILURE_HALT_THRESHOLD",
     "AssetRuntime",
     "DecisionRow",
+    "FillPropagationOutcome",
     "KillSwitchInvokeResult",
     "MarksFeed",
     "RiskStateSnapshot",

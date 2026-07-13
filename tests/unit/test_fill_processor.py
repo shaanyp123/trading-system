@@ -54,6 +54,7 @@ from services.risk.fill_processor import (
     PriorTradeRow,
     TradeMutation,
     UnsupportedFillScenarioError,
+    _apply_trade_mutation,
     _classify_fill_scenario,
     _quantize_avg_cost,
     _recompute_avg_cost,
@@ -909,6 +910,161 @@ class TestApplyFillPlanRefuseAtOpenGuard:
             )
         assert isinstance(result, FillApplyResult)
         guard_lookup.assert_not_awaited()
+
+
+class TestInsertOpenTradeDbBackstop:
+    """#383 accepted hardening: the trades INSERT for action='open' is
+    conditional (INSERT … WHERE NOT EXISTS) — the DB-level backstop of
+    the step-0 guard. The race-lost arm alerts + returns the survivor,
+    deliberately never raising a post-write FillProcessingError."""
+
+    @staticmethod
+    def _survivor() -> PriorTradeRow:
+        return PriorTradeRow(
+            trade_id=uuid4(),
+            trade_created_at=_ORDER_CREATED,
+            total_quantity=1,
+            avg_entry_price=Decimal("85.00000000"),
+            realized_commission_usd=Decimal("0.50"),
+            direction="long",
+        )
+
+    @staticmethod
+    def _factory_insert_suppressed(*, alert_raises: bool = False) -> tuple[MagicMock, list[Any]]:
+        """Session factory whose trades-INSERT returns no row (the NOT
+        EXISTS suppressed it); other statements succeed unless
+        ``alert_raises``. Captures (sql, params) per execute."""
+        executed: list[tuple[str, dict[str, Any]]] = []
+
+        def _make_session() -> MagicMock:
+            sess = MagicMock()
+
+            @asynccontextmanager
+            async def _begin_cm() -> Any:
+                yield None
+
+            sess.begin = MagicMock(side_effect=lambda: _begin_cm())
+
+            async def _execute(stmt: Any, params: Any = None) -> MagicMock:
+                sql = str(stmt)
+                executed.append((sql, params or {}))
+                result = MagicMock()
+                if "INSERT INTO trades" in sql:
+                    result.fetchone = MagicMock(return_value=None)
+                    return result
+                if "INSERT INTO alerts" in sql and alert_raises:
+                    raise RuntimeError("alerts write failed")
+                result.fetchone = MagicMock(return_value=MagicMock(id=uuid4()))
+                return result
+
+            sess.execute = _execute
+            return sess
+
+        @asynccontextmanager
+        async def _factory_cm() -> Any:
+            yield _make_session()
+
+        factory = MagicMock()
+        factory.side_effect = lambda: _factory_cm()
+        return factory, executed  # type: ignore[return-value]
+
+    @pytest.mark.asyncio
+    async def test_open_insert_carries_not_exists_backstop(self) -> None:
+        """The INSERT statement itself must carry the NOT EXISTS guard on
+        (account, market, state='open_position') — one statement, no
+        check-then-insert window."""
+        plan = _build_plan(action="open")
+        executed: list[tuple[str, dict[str, Any]]] = []
+        session_factory = _build_mock_session_factory()
+        original_side_effect = session_factory.side_effect
+
+        @asynccontextmanager
+        async def _wrap() -> Any:
+            async with original_side_effect() as sess:  # type: ignore[misc]
+                real_execute = sess.execute
+
+                async def _spy(stmt: Any, params: Any = None) -> Any:
+                    executed.append((str(stmt), params or {}))
+                    return await real_execute(stmt, params)
+
+                sess.execute = _spy
+                yield sess
+
+        session_factory.side_effect = lambda: _wrap()
+        trade_id = await _apply_trade_mutation(plan.trade_mutation, session_factory=session_factory)
+        assert isinstance(trade_id, UUID)
+        insert_sql = next(sql for sql, _ in executed if "INSERT INTO trades" in sql)
+        assert "WHERE NOT EXISTS" in insert_sql
+        assert "state = 'open_position'" in insert_sql
+
+    @pytest.mark.asyncio
+    async def test_race_lost_returns_survivor_and_alerts_without_raising(self) -> None:
+        plan = _build_plan(action="open")
+        survivor = self._survivor()
+        factory, executed = self._factory_insert_suppressed()
+        with patch(
+            "services.risk.fill_processor.fetch_prior_open_trade_for_market",
+            new=AsyncMock(return_value=survivor),
+        ):
+            trade_id = await _apply_trade_mutation(plan.trade_mutation, session_factory=factory)
+        # The SURVIVING trade's id comes back — never a post-write refusal.
+        assert trade_id == survivor.trade_id
+        # A P1 incident_review_required alert was INSERTed with the
+        # surviving + refused ids in the detail.
+        alert_calls = [(sql, p) for sql, p in executed if "INSERT INTO alerts" in sql]
+        assert len(alert_calls) == 1
+        alert_sql, alert_params = alert_calls[0]
+        assert "'P1'" in alert_sql
+        assert "incident_review_required" in alert_sql
+        assert str(survivor.trade_id) in alert_params["detail"]
+        assert str(plan.trade_mutation.entry_signal_id) in alert_params["detail"]
+        assert str(plan.trade_mutation.entry_order_id) in alert_params["detail"]
+
+    @pytest.mark.asyncio
+    async def test_race_lost_with_no_survivor_raises_runtime_error(self) -> None:
+        """INSERT suppressed but no open trade visible afterwards: a
+        provably inconsistent book — the fail-closed infrastructure
+        shape (RuntimeError), deliberately NOT a FillProcessingError
+        (the worker seam would double-record via the fallback)."""
+        plan = _build_plan(action="open")
+        factory, executed = self._factory_insert_suppressed()
+        with patch(
+            "services.risk.fill_processor.fetch_prior_open_trade_for_market",
+            new=AsyncMock(return_value=None),
+        ):
+            with pytest.raises(RuntimeError) as excinfo:
+                await _apply_trade_mutation(plan.trade_mutation, session_factory=factory)
+        assert not isinstance(excinfo.value, FillProcessingError)
+        # The alert still fired before the raise.
+        assert any("INSERT INTO alerts" in sql for sql, _ in executed)
+
+    @pytest.mark.asyncio
+    async def test_race_lost_alert_write_failure_still_returns_survivor(self) -> None:
+        """Alert-after-action: a failed alerts INSERT must not unwind or
+        mask the race-lost handling (CRITICAL log is the fallback)."""
+        plan = _build_plan(action="open")
+        survivor = self._survivor()
+        factory, _ = self._factory_insert_suppressed(alert_raises=True)
+        with patch(
+            "services.risk.fill_processor.fetch_prior_open_trade_for_market",
+            new=AsyncMock(return_value=survivor),
+        ):
+            trade_id = await _apply_trade_mutation(plan.trade_mutation, session_factory=factory)
+        assert trade_id == survivor.trade_id
+
+    @pytest.mark.asyncio
+    async def test_survivor_lookup_failure_alerts_then_raises(self) -> None:
+        """A DB error in the survivor lookup must not silence the alert;
+        with no survivor id available the arm then fails closed."""
+        plan = _build_plan(action="open")
+        factory, executed = self._factory_insert_suppressed()
+        with patch(
+            "services.risk.fill_processor.fetch_prior_open_trade_for_market",
+            new=AsyncMock(side_effect=RuntimeError("db blip")),
+        ):
+            with pytest.raises(RuntimeError):
+                await _apply_trade_mutation(plan.trade_mutation, session_factory=factory)
+        assert any("INSERT INTO alerts" in sql for sql, _ in executed)
 
 
 # ---------------------------------------------------------------------------
