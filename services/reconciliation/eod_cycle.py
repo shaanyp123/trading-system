@@ -157,8 +157,10 @@ DEFAULT_PRIOR_BREAKS_WINDOW_HOURS: Final[int] = 36
 #: self-healing, which is exactly when the operator must be paged.
 #:
 #: Deliberately NOT a one-shot: the alert re-fires on every subsequent
-#: nightly soft-fail (max one per day — naturally throttled by the
-#: cycle cadence) until a snapshot succeeds, and the age is derived
+#: soft-failing cycle until a snapshot succeeds — nominally once per
+#: day (the cycle cadence), though a restart-driven catch-up cycle that
+#: also soft-fails can add a same-day repeat; every alert maps to a
+#: real failed cycle, so there is no storm surface. The age is derived
 #: from the DB so the signal survives api-container restarts. Severity
 #: P1 → Discord ``#alerts`` only (locked routing).
 RECON_COVERAGE_DEGRADED_AFTER_HOURS: Final[int] = DEFAULT_PRIOR_BREAKS_WINDOW_HOURS
@@ -535,7 +537,11 @@ async def alert_recon_coverage_gap(
     estimated_failed_cycles: int | None = None
     if last_success is not None:
         hours_since = int((now - last_success).total_seconds() // 3600)
-        estimated_failed_cycles = max(1, hours_since // 24)
+        # Round age to the nearest whole cycle (24h), counting tonight's
+        # failure: ~48h ± jitter reads "2", and the exact 36h boundary
+        # also reads "2" — consistent with the threshold's N=2 semantics
+        # (a plain floor read "1" under a title implying the 2nd failure).
+        estimated_failed_cycles = max(1, (hours_since + 12) // 24)
         if hours_since < RECON_COVERAGE_DEGRADED_AFTER_HOURS:
             log.info(
                 "reconciliation_coverage_soft_fail_within_tolerance",

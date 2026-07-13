@@ -361,7 +361,12 @@ def _stub_session_factory(
 
 
 class TestRunEodCycleOrchestrator:
-    async def test_fetch_failure_returns_none_no_db_writes(self) -> None:
+    async def test_fetch_failure_returns_none(self) -> None:
+        # (Renamed from ..._no_db_writes: since the #375-C2 coverage-gap
+        # check, the production soft-fail branch DOES read the DB — and
+        # past the 36h threshold writes an audit row + alert. The autouse
+        # _patch_coverage_alert no-ops that here; the contract this test
+        # pins is the return-None soft-fail shape.)
         fetcher = _fake_fetcher(
             error=CoinbaseReconFetchError(operation="list_positions", detail="venue 503")
         )
