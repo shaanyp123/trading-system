@@ -99,6 +99,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from services.audit.event_types import AuditEventType
 from services.audit.writer import Environment, PhaseAtEmit, append_audit_event
 from services.reconciliation.apply import (
+    AlertDispatchContext,
     AlertDispatchHook,
     ReconciliationApplyResult,
     StateTransitionHook,
@@ -111,6 +112,9 @@ from services.reconciliation.coinbase_fetcher import (
     ReconSnapshotFetcher,
 )
 from services.reconciliation.recon import (
+    AlertCategoryLiteral,
+    AlertDescriptor,
+    AlertSeverityLiteral,
     BackendView,
     BrokerSource,
     BrokerView,
@@ -131,6 +135,42 @@ log = structlog.get_logger()
 #: Friday→Monday limitation no longer applies — the cycle fires every
 #: UTC calendar day).
 DEFAULT_PRIOR_BREAKS_WINDOW_HOURS: Final[int] = 36
+
+
+#: Coverage-gap threshold for the consecutive-soft-fail alert (#375
+#: review follow-up C2): when a fetch soft-fail lands and the newest
+#: successful snapshot (latest ``balances`` row with
+#: ``source='coinbase_eod'``) is older than this many hours, the cycle
+#: emits a P1 ``reconciliation_data_source_degraded`` alert instead of
+#: only the WARNING log line.
+#:
+#: **Why N = 2 consecutive soft-fails, expressed as a 36 h age:** cycles
+#: fire once per UTC day, so at the k-th consecutive soft-fail the last
+#: success is ~k*24 h old — a 36 h cutoff tolerates exactly one failed
+#: cycle (age ~24 h, the designed venue-outage contract: "tomorrow
+#: retries") and alerts on the second (age ~48 h), with 12 h of jitter
+#: margin on both sides. The value is deliberately tied to
+#: :data:`DEFAULT_PRIOR_BREAKS_WINDOW_HOURS`: once the venue has been
+#: dark longer than the prior-breaks grace window, open break rows age
+#: out of grace classification (they then need manual resolution — the
+#: #375 accepted-risk note) — i.e. the recon machinery has degraded past
+#: self-healing, which is exactly when the operator must be paged.
+#:
+#: Deliberately NOT a one-shot: the alert re-fires on every subsequent
+#: nightly soft-fail (max one per day — naturally throttled by the
+#: cycle cadence) until a snapshot succeeds, and the age is derived
+#: from the DB so the signal survives api-container restarts. Severity
+#: P1 → Discord ``#alerts`` only (locked routing).
+RECON_COVERAGE_DEGRADED_AFTER_HOURS: Final[int] = DEFAULT_PRIOR_BREAKS_WINDOW_HOURS
+
+#: Severity + category for the coverage-gap alert. Category reuses the
+#: existing ``reconciliation_data_source_degraded`` member of the
+#: alembic ``alert_category`` enum (added 2026-05-29 for the retired
+#: FlexQuery fallback; dormant since C0 §3.5 — no new category, per the
+#: locked taxonomy). P1 matches the backend-spec §3.27 routing recorded
+#: for this category.
+RECON_COVERAGE_ALERT_SEVERITY: Final[AlertSeverityLiteral] = "P1"
+RECON_COVERAGE_ALERT_CATEGORY: Final[AlertCategoryLiteral] = "reconciliation_data_source_degraded"
 
 
 #: Source string for the per-recon ``balances`` row INSERTed by
@@ -411,6 +451,215 @@ async def fetch_prior_breaks_within_grace_window(
             )
         )
     return tuple(prior)
+
+
+# ---------------------------------------------------------------------------
+# Coverage-gap alert on consecutive fetch soft-fails (#375 follow-up C2)
+# ---------------------------------------------------------------------------
+
+
+async def fetch_last_successful_snapshot_ts(
+    session_factory: async_sessionmaker[Any], *, account_id: UUID
+) -> datetime | None:
+    """Newest ``balances.snapshot_ts`` written by a successful recon cycle.
+
+    Every successful cycle INSERTs exactly one ``balances`` row stamped
+    ``source = 'coinbase_eod'`` (:func:`refresh_backend_from_broker_snapshot`,
+    unconditional), so the newest such row IS the last time the recon
+    safety net actually saw the venue. ``None`` means no cycle has ever
+    completed against this account (fresh bootstrap). SELECT-only.
+    """
+    async with session_factory() as session:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT MAX(snapshot_ts) AS last_success_ts FROM balances "
+                    "WHERE account_id = :acct AND source = :source"
+                ),
+                {"acct": account_id, "source": BALANCE_SOURCE_FROM_COINBASE},
+            )
+        ).fetchone()
+    if row is None or row.last_success_ts is None:
+        return None
+    ts: datetime = row.last_success_ts
+    return ts
+
+
+async def alert_recon_coverage_gap(
+    *,
+    session_factory: async_sessionmaker[Any],
+    config: EodCycleConfig,
+    failed_operation: str,
+    failed_detail: str,
+    alert_dispatch_hook: AlertDispatchHook | None,
+    now_utc: datetime | None = None,
+) -> bool:
+    """Escalate consecutive recon fetch soft-fails to a P1 alert.
+
+    Called from :func:`run_eod_cycle`'s soft-fail branch AFTER the
+    WARNING log line. A single soft-fail is the designed venue-outage
+    contract (tomorrow retries) and stays log-only; once the newest
+    successful snapshot is older than
+    :data:`RECON_COVERAGE_DEGRADED_AFTER_HOURS` (~= the 2nd consecutive
+    failed cycle; see the constant's docstring for the N=2
+    justification) — or NO successful snapshot exists at all
+    (fail-visible: a bootstrap whose venue credentials never worked is
+    exactly the unmonitored gap this closes) — the cycle:
+
+      1. Appends a ``RECONCILIATION_DATA_SOURCE_DEGRADED`` audit event
+         (existing enum member — its recorded "natural future producer"
+         is exactly this recon-coverage surface) — audit-first per
+         §2.10.1.
+      2. Dispatches a P1 ``reconciliation_data_source_degraded`` alert
+         through the same ``alert_dispatch_hook`` seam the break alerts
+         use (heartbeat-probe precedent: ``triggering_break_index=-1``
+         marks "not a reconciliation break"). Dispatch is best-effort:
+         a hook failure logs at WARNING and keeps the audit row (the
+         durable record). Hook unset → the apply module's
+         dropped-no-hook warning shape.
+
+    Returns True when the degradation threshold was crossed (audit row
+    appended), False when the soft-fail was within tolerance. Raises
+    only on audit-write failure or a DB error in the last-success
+    lookup — the caller wraps this helper so a broken check can never
+    mask the soft-fail contract (``run_eod_cycle`` still returns None).
+    """
+    now = now_utc if now_utc is not None else datetime.now(tz=UTC)
+    if now.tzinfo is None:
+        raise ValueError("now_utc must be tz-aware UTC per [A06]")
+
+    last_success = await fetch_last_successful_snapshot_ts(
+        session_factory, account_id=config.account_id
+    )
+    hours_since: int | None = None
+    estimated_failed_cycles: int | None = None
+    if last_success is not None:
+        hours_since = int((now - last_success).total_seconds() // 3600)
+        estimated_failed_cycles = max(1, hours_since // 24)
+        if hours_since < RECON_COVERAGE_DEGRADED_AFTER_HOURS:
+            log.info(
+                "reconciliation_coverage_soft_fail_within_tolerance",
+                account_id=str(config.account_id),
+                env=config.env,
+                last_successful_snapshot_utc=last_success.isoformat(),
+                hours_since_last_success=hours_since,
+                threshold_hours=RECON_COVERAGE_DEGRADED_AFTER_HOURS,
+            )
+            return False
+
+    if last_success is not None:
+        title = f"Reconciliation coverage degraded: no successful venue snapshot for {hours_since}h"
+        last_success_line = (
+            f"Last successful venue snapshot: {last_success.isoformat()} "
+            f"({hours_since}h ago; ~{estimated_failed_cycles} consecutive "
+            f"failed cycles)."
+        )
+    else:
+        title = "Reconciliation coverage degraded: no successful venue snapshot on record"
+        last_success_line = (
+            "No successful venue snapshot has EVER been recorded for this "
+            "account — if this is not a fresh bootstrap, the recon safety "
+            "net has been dark since day one (check CDP key permissions)."
+        )
+    body = (
+        f"Tonight's EOD recon fetch soft-failed again "
+        f"({failed_operation}: {failed_detail}).\n"
+        f"{last_success_line}\n"
+        "While this persists the nightly safety net is dark: backend-vs-"
+        "venue divergence (position/cash breaks, including un-propagated "
+        "fills) goes undetected, and open break rows age past the "
+        f"{DEFAULT_PRIOR_BREAKS_WINDOW_HOURS}h grace window (manual "
+        "resolution needed).\n"
+        "Check Coinbase CFM status + the CDP key's View permission; "
+        "inspect api logs for reconciliation_eod_cycle_coinbase_fetch_"
+        "failed. Recon retries at the next 00:15 UTC cycle; this alert "
+        "re-fires nightly until a snapshot succeeds."
+    )
+    payload: dict[str, Any] = {
+        "trigger": "consecutive_recon_fetch_soft_fails",
+        "failed_operation": failed_operation,
+        "failed_detail": failed_detail,
+        "last_successful_snapshot_utc": (
+            last_success.isoformat() if last_success is not None else None
+        ),
+        "hours_since_last_success": hours_since,
+        "estimated_consecutive_failed_cycles": estimated_failed_cycles,
+        "threshold_hours": RECON_COVERAGE_DEGRADED_AFTER_HOURS,
+        "balance_source": BALANCE_SOURCE_FROM_COINBASE,
+        "observed_at_utc": now.isoformat(),
+        "alert_severity": RECON_COVERAGE_ALERT_SEVERITY,
+        "alert_category": RECON_COVERAGE_ALERT_CATEGORY,
+    }
+
+    # Audit-first (§2.10.1): the durable breadcrumb lands before the
+    # operator-visible side effect. Raises propagate to the caller's
+    # guard — no alert without the audit row.
+    async with session_factory() as audit_session:
+        record = await append_audit_event(
+            audit_session,
+            AuditEventType.RECONCILIATION_DATA_SOURCE_DEGRADED,
+            payload,
+            account_id=config.account_id,
+            env=config.env,
+            phase_at_emit=config.phase_at_emit,
+            source_clock_ts=now,
+        )
+    log.error(
+        "reconciliation_coverage_degraded",
+        account_id=str(config.account_id),
+        env=config.env,
+        audit_event_uuid=str(record.event_uuid),
+        last_successful_snapshot_utc=(
+            last_success.isoformat() if last_success is not None else None
+        ),
+        hours_since_last_success=hours_since,
+        estimated_consecutive_failed_cycles=estimated_failed_cycles,
+        threshold_hours=RECON_COVERAGE_DEGRADED_AFTER_HOURS,
+        failed_operation=failed_operation,
+    )
+
+    if alert_dispatch_hook is None:
+        log.warning(
+            "reconciliation_coverage_alert_dropped_no_hook",
+            account_id=str(config.account_id),
+            env=config.env,
+            audit_event_uuid=str(record.event_uuid),
+            note=(
+                "alert_dispatch_hook is None; the coverage-gap alert will "
+                "not be delivered. The audit breadcrumb landed. Wire the "
+                "hook in the api lifespan (see services/api/main.py)."
+            ),
+        )
+        return True
+
+    try:
+        await alert_dispatch_hook(
+            AlertDispatchContext(
+                descriptor=AlertDescriptor(
+                    triggering_break_index=_NO_TRIGGERING_BREAK_INDEX,
+                    severity=RECON_COVERAGE_ALERT_SEVERITY,
+                    category=RECON_COVERAGE_ALERT_CATEGORY,
+                    title=title,
+                    body=body,
+                    payload=payload,
+                ),
+                triggering_audit_event_uuid=record.event_uuid,
+                account_id=config.account_id,
+                env=config.env,
+            )
+        )
+    except Exception:
+        # Best-effort dispatch (heartbeat-probe precedent): the audit
+        # row is the durable record; a Discord/DB hiccup here must not
+        # abort the caller's soft-fail contract.
+        log.warning(
+            "reconciliation_coverage_alert_dispatch_failed",
+            account_id=str(config.account_id),
+            env=config.env,
+            audit_event_uuid=str(record.event_uuid),
+            exc_info=True,
+        )
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -732,6 +981,24 @@ async def run_eod_cycle(
             operation=exc.operation,
             detail=exc.detail,
         )
+        # #375 follow-up C2: consecutive soft-fails must not stay an
+        # unmonitored coverage gap. Guarded so a broken check can never
+        # change the soft-fail contract (the scheduler survives, and
+        # tomorrow's cycle still fires either way).
+        try:
+            await alert_recon_coverage_gap(
+                session_factory=session_factory,
+                config=config,
+                failed_operation=exc.operation,
+                failed_detail=exc.detail,
+                alert_dispatch_hook=alert_dispatch_hook,
+            )
+        except Exception:
+            log.exception(
+                "reconciliation_eod_cycle_coverage_check_failed",
+                account_id=str(config.account_id),
+                env=config.env,
+            )
         return None
 
     # PR-I: write broker-side state (cash + NLV + position marks) to
@@ -813,6 +1080,11 @@ async def run_eod_cycle(
         phase_at_emit=config.phase_at_emit,
         alert_dispatch_hook=alert_dispatch_hook,
         state_transition_hook=state_transition_hook,
+        # The planner's breaks_resolved are machine re-resolutions (this
+        # cycle observed the divergence gone) — stamp the honest path
+        # (2026-07-13 migration; the #375 "manual" cosmetic), not the
+        # operator-action default.
+        resolution_path="auto_rereconciled",
     )
 
     # CONVALESCENT clean-day tick (2026-07-09 amendment; module docstring).
@@ -1089,13 +1361,18 @@ __all__ = [
     "BALANCE_SOURCE_FROM_COINBASE",
     "DEFAULT_PRIOR_BREAKS_WINDOW_HOURS",
     "PNL_QUANTIZER",
+    "RECON_COVERAGE_ALERT_CATEGORY",
+    "RECON_COVERAGE_ALERT_SEVERITY",
+    "RECON_COVERAGE_DEGRADED_AFTER_HOURS",
     "BackendRefreshResult",
     "ConvalescentTickHook",
     "CycleCallback",
     "EodCycleConfig",
     "ReconPosition",
+    "alert_recon_coverage_gap",
     "build_backend_view",
     "build_broker_view",
+    "fetch_last_successful_snapshot_ts",
     "fetch_prior_breaks_within_grace_window",
     "make_cycle_callback",
     "refresh_backend_from_broker_snapshot",

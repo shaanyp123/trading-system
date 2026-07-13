@@ -70,7 +70,7 @@ A25 — structlog only.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Final, Protocol
@@ -135,12 +135,20 @@ class CoinbaseReconSnapshot:
     net_liquidation_usd: Decimal
     fills: tuple[BrokerFill, ...]
     pulled_at_utc: datetime
-    product_to_asset: dict[str, str] = field(default_factory=dict)
+    product_to_asset: dict[str, str]
     """Runtime-discovered ``product_id`` → ``base_asset`` map used to
     normalize ``positions`` — carried on the snapshot so the EOD
     cycle's mark-to-market pass applies the SAME normalization when it
     looks up ``positions_current`` rows for ``position_details`` (raw
-    venue rows, deliberately un-normalized for forensics)."""
+    venue rows, deliberately un-normalized for forensics).
+
+    REQUIRED, deliberately (#375 review note N4): the field originally
+    defaulted to ``{}``, which meant a future snapshot producer (the
+    Phase C1 intraday probe reusing this dataclass) could forget the
+    discovery map and every MTM lookup would silently fall back to raw
+    venue product-id keys — the exact market-key mismatch class behind
+    the 2026-07-11 phantom-break auto-halt. A producer with a genuinely
+    flat book and empty discovery passes ``{}`` explicitly."""
 
 
 class CoinbaseReconFetchError(Exception):

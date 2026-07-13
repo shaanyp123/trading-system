@@ -400,6 +400,32 @@ class TestApplyResolvedBreaks:
             resolution_path="manual",
         )
 
+    @pytest.mark.asyncio
+    async def test_auto_rereconciled_resolution_path_accepted(
+        self, fake_writer: list[tuple[Any, Any]]
+    ) -> None:
+        """'auto_rereconciled' (2026-07-13 migration) is in the Literal.
+
+        The EOD cycle passes it for the planner's natural re-resolutions;
+        the real CHECK-constraint acceptance is pinned at integration
+        time (`tests/integration/test_reconciliation_apply.py`).
+        """
+        plan = ReconciliationPlan(
+            breaks_detected=(),
+            breaks_resolved=(_make_resolved(),),
+            audit_events=(_make_pending("reconciliation_break_resolved"),),
+            actionable_break_count=0,
+            should_invoke_kill_switch=False,
+        )
+        result = await apply_reconciliation_plan(
+            plan,
+            session_factory=_FakeSessionFactory(),
+            account_id=uuid4(),
+            env="paper",
+            resolution_path="auto_rereconciled",
+        )
+        assert result.resolved_break_count == 1
+
 
 class TestApplyOrdering:
     @pytest.mark.asyncio

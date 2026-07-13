@@ -227,17 +227,21 @@ class AlertDispatchContext:
 # ---------------------------------------------------------------------------
 
 
-#: Resolution-path values accepted by alembic 0004's CHECK constraint on
-#: `reconciliation_breaks.resolution_path`. The pure planner emits a
-#: ``ResolvedPriorBreak`` for prior breaks that don't match today's
-#: snapshot; the apply step's caller picks which path-string to stamp
-#: (typically ``manual`` for now — natural re-resolution doesn't have its
-#: own CHECK value yet, and adding one requires an alembic migration).
+#: Resolution-path values accepted by the CHECK constraint on
+#: `reconciliation_breaks.resolution_path` (alembic 0004, extended by the
+#: 2026-07-13 ``recon_resolution_auto`` migration). The pure planner
+#: emits a ``ResolvedPriorBreak`` for prior breaks that don't match
+#: today's snapshot; the apply step's caller picks which path-string to
+#: stamp. The EOD cycle passes ``auto_rereconciled`` (a subsequent recon
+#: cycle observed the divergence gone — no human touched it); the
+#: parameter default stays ``manual`` as the conservative value for any
+#: operator-tooling caller that doesn't say otherwise.
 ResolutionPathLiteral = Literal[
     "grace_period",
     "manual",
     "kill_switch",
     "tolerance_widened_dividend",
+    "auto_rereconciled",
 ]
 
 

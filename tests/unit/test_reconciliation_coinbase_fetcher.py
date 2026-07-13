@@ -436,6 +436,25 @@ class TestFetchSnapshotErrorPaths:
             )
 
 
+class TestSnapshotDataclassContract:
+    def test_product_to_asset_is_required(self) -> None:
+        # #375 review note N4: the `{}` default died 2026-07-13 — a
+        # future snapshot producer (the C1 intraday probe) that forgets
+        # the discovery map must fail at CONSTRUCTION, not silently
+        # regress into the 2026-07-11 product-id/asset market-key
+        # mismatch class at MTM-lookup time.
+        with pytest.raises(TypeError, match="product_to_asset"):
+            CoinbaseReconSnapshot(  # type: ignore[call-arg]
+                positions=(),
+                position_details=(),
+                balance_summary=_summary(),
+                cash_usd=Decimal("0"),
+                net_liquidation_usd=Decimal("0"),
+                fills=(),
+                pulled_at_utc=_PULLED_AT,
+            )
+
+
 class TestModuleContract:
     def test_all_exports_present(self) -> None:
         from services.reconciliation import coinbase_fetcher as mod
