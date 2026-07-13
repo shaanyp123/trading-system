@@ -186,13 +186,20 @@ ReconciliationAuditEventType = Literal[
 AlertSeverityLiteral = Literal["P0", "P1", "P2"]
 
 
-# Subset of the alembic 0004 ``alert_category`` Postgres enum that this
-# module emits — Phase 1 only emits ``"reconciliation_break"``. Adding a
-# new category value here REQUIRES the same value in the alembic enum
-# (forbidden-whitelist alembic/** PR) AND in
+# Subset of the alembic 0004 ``alert_category`` Postgres enum that the
+# reconciliation package emits — this planner emits only
+# ``"reconciliation_break"``; the EOD cycle's coverage-gap alert
+# (``eod_cycle.alert_recon_coverage_gap``, 2026-07-13) emits
+# ``"reconciliation_data_source_degraded"`` (added to the Postgres enum
+# by the 2026-05-29 ``recon_src_degraded`` migration — no new category).
+# Adding a NEW category value here REQUIRES the same value in the
+# alembic enum (forbidden-whitelist alembic/** PR) AND in
 # ``services.webhook_pusher.payloads.AlertCategory``. The Postgres enum
 # is the source of truth.
-AlertCategoryLiteral = Literal["reconciliation_break"]
+AlertCategoryLiteral = Literal[
+    "reconciliation_break",
+    "reconciliation_data_source_degraded",
+]
 
 
 #: Default severity floor for reconciliation-break alerts in Phase 1.

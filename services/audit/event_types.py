@@ -133,10 +133,12 @@ class AuditEventType(StrEnum):
     # FlexQuery position list (durable breadcrumb + paired ``alerts``
     # row of category ``reconciliation_data_source_degraded``, P1 →
     # Discord #alerts). That producer died with the IBKR stack
-    # (crypto-pivot C0-B2b) and the FlexQuery path was deleted in C0
-    # §3.5 — the value is DORMANT but stays per the locked audit
-    # taxonomy ([A04]); the Phase C1 intraday-probe fallback is its
-    # natural future producer.
+    # (crypto-pivot C0-B2b; FlexQuery deleted in C0 §3.5). Dormant until
+    # 2026-07-13: re-adopted by the C1 recon-coverage-gap alert
+    # (``services/reconciliation/eod_cycle.py::alert_recon_coverage_gap``
+    # — consecutive fetch soft-fails, #375 follow-up C2; same paired
+    # P1 alert category). The Phase C1 intraday-probe fallback remains a
+    # future producer.
     RECONCILIATION_DATA_SOURCE_DEGRADED = "reconciliation_data_source_degraded"
     DATA_QUALITY_REJECT = "data_quality_reject"
     DATA_QUALITY_QUARANTINE = "data_quality_quarantine"

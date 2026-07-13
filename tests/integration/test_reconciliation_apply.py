@@ -298,6 +298,58 @@ async def test_apply_resolved_break_updates_prior_row(
 
 
 @pytest.mark.asyncio
+async def test_apply_resolved_break_stamps_auto_rereconciled(
+    async_session_factory: async_sessionmaker[AsyncSession],
+    sync_engine: Engine,
+    fresh_account_id: UUID,
+) -> None:
+    """The 2026-07-13 CHECK extension: 'auto_rereconciled' lands against
+    the REAL constraint (migration ``20260713_recon_resolution_auto``) —
+    the path ``run_eod_cycle`` stamps for machine re-resolutions."""
+    seed_plan = ReconciliationPlan(
+        breaks_detected=(_make_break(market="/MES", delta=Decimal("1")),),
+        breaks_resolved=(),
+        audit_events=(_pending("reconciliation_break_detected", market="/MES"),),
+        actionable_break_count=1,
+        should_invoke_kill_switch=False,
+    )
+    await apply_reconciliation_plan(
+        seed_plan,
+        session_factory=async_session_factory,
+        account_id=fresh_account_id,
+        env="paper",
+        phase_at_emit=1,
+    )
+    resolve_plan = ReconciliationPlan(
+        breaks_detected=(),
+        breaks_resolved=(
+            ResolvedPriorBreak(
+                metric=ReconciliationMetric.POSITION_QTY,
+                market="/MES",
+                delta=Decimal("1"),
+            ),
+        ),
+        audit_events=(_pending("reconciliation_break_resolved", market="/MES"),),
+        actionable_break_count=0,
+        should_invoke_kill_switch=False,
+    )
+    result = await apply_reconciliation_plan(
+        resolve_plan,
+        session_factory=async_session_factory,
+        account_id=fresh_account_id,
+        env="paper",
+        phase_at_emit=1,
+        resolution_path="auto_rereconciled",
+    )
+    assert result.resolved_break_count == 1
+
+    rows = _read_breaks(sync_engine, fresh_account_id)
+    assert len(rows) == 1
+    assert rows[0]["resolved_at_utc"] is not None
+    assert rows[0]["resolution_path"] == "auto_rereconciled"
+
+
+@pytest.mark.asyncio
 async def test_apply_kill_switch_hook_receives_primary_audit_uuid(
     async_session_factory: async_sessionmaker[AsyncSession],
     sync_engine: Engine,

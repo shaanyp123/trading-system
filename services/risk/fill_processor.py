@@ -144,6 +144,15 @@ log = structlog.get_logger()
 #: C1 fill wiring) revisits it. The end-of-day reconciliation refresh
 #: writes ``coinbase_eod`` instead
 #: (``services/reconciliation/eod_cycle.py::BALANCE_SOURCE_FROM_COINBASE``).
+#:
+#: **MUST NOT become ``coinbase_eod``** (2026-07-13): the recon
+#: coverage-gap alert (``eod_cycle.alert_recon_coverage_gap``, #375 C2)
+#: derives "last successful recon cycle" from the newest balances row
+#: with ``source='coinbase_eod'``. If per-fill rows ever share that
+#: source string, intraday fills silently reset the coverage clock and
+#: defeat the consecutive-soft-fail alert. When the C1 re-feed renames
+#: this, pick a NEW source value (CHECK-constraint migration), never
+#: the recon one.
 BALANCE_SOURCE_FROM_FILL: Final[str] = "tws_api"
 
 

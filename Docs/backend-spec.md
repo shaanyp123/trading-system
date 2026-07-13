@@ -1492,7 +1492,11 @@ CREATE TABLE reconciliation_breaks (
   source TEXT NOT NULL,
   resolved_at_utc TIMESTAMPTZ,
   resolution_path TEXT
-    CHECK (resolution_path IN ('grace_period','manual','kill_switch','tolerance_widened_dividend')),
+    -- 'auto_rereconciled' added 2026-07-13 (migration 20260713_recon_resolution_auto):
+    -- a subsequent recon cycle observed the divergence gone (machine
+    -- re-resolution; the EOD cycle stamps it). 'manual' = operator action.
+    CHECK (resolution_path IN ('grace_period','manual','kill_switch',
+                               'tolerance_widened_dividend','auto_rereconciled')),
   audit_event_uuid UUID NOT NULL
 );
 ```

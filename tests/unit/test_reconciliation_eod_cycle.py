@@ -12,7 +12,7 @@ file locks the orchestrator contract + the pure-policy view builders.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -32,12 +32,18 @@ from services.reconciliation.coinbase_fetcher import (
 from services.reconciliation.eod_cycle import (
     BALANCE_SOURCE_FROM_COINBASE,
     DEFAULT_PRIOR_BREAKS_WINDOW_HOURS,
+    RECON_COVERAGE_ALERT_CATEGORY,
+    RECON_COVERAGE_ALERT_SEVERITY,
+    RECON_COVERAGE_DEGRADED_AFTER_HOURS,
     BackendRefreshResult,
     EodCycleConfig,
     build_broker_view,
     fetch_prior_breaks_within_grace_window,
     make_cycle_callback,
     run_eod_cycle,
+)
+from services.reconciliation.eod_cycle import (
+    alert_recon_coverage_gap as _real_coverage_alert,
 )
 from services.reconciliation.eod_cycle import (
     refresh_backend_from_broker_snapshot as _real_refresh,
@@ -73,6 +79,28 @@ def _patch_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(
         "services.reconciliation.eod_cycle.refresh_backend_from_broker_snapshot",
+        _noop,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _patch_coverage_alert(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No-op the #375-C2 coverage-gap check inside ``run_eod_cycle``.
+
+    The orchestrator tests' stub session factory doesn't model the
+    last-success ``balances`` MAX lookup (its generic ``balances`` row
+    would leak MagicMock attributes into datetime arithmetic).
+    Coverage-gap-specific tests in TestReconCoverageGapAlert bypass via
+    the top-level-imported ``_real_coverage_alert`` symbol (captured
+    BEFORE the monkeypatch fires), mirroring the ``_real_refresh``
+    pattern above.
+    """
+
+    async def _noop(*args: Any, **kwargs: Any) -> bool:
+        return False
+
+    monkeypatch.setattr(
+        "services.reconciliation.eod_cycle.alert_recon_coverage_gap",
         _noop,
     )
 
@@ -333,7 +361,12 @@ def _stub_session_factory(
 
 
 class TestRunEodCycleOrchestrator:
-    async def test_fetch_failure_returns_none_no_db_writes(self) -> None:
+    async def test_fetch_failure_returns_none(self) -> None:
+        # (Renamed from ..._no_db_writes: since the #375-C2 coverage-gap
+        # check, the production soft-fail branch DOES read the DB — and
+        # past the 36h threshold writes an audit row + alert. The autouse
+        # _patch_coverage_alert no-ops that here; the contract this test
+        # pins is the return-None soft-fail shape.)
         fetcher = _fake_fetcher(
             error=CoinbaseReconFetchError(operation="list_positions", detail="venue 503")
         )
@@ -343,6 +376,83 @@ class TestRunEodCycleOrchestrator:
             fetcher=fetcher,
         )
         assert result is None
+
+    async def test_fetch_failure_invokes_coverage_check(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #375-C2 wiring: the soft-fail branch hands the failure to the
+        # coverage-gap check with the fetch error's fields + the hook.
+        captured: dict[str, Any] = {}
+
+        async def fake_check(**kwargs: Any) -> bool:
+            captured.update(kwargs)
+            return True
+
+        monkeypatch.setattr(
+            "services.reconciliation.eod_cycle.alert_recon_coverage_gap", fake_check
+        )
+
+        async def hook(ctx: Any) -> None:  # pragma: no cover - identity only
+            pass
+
+        config = _config()
+        result = await run_eod_cycle(
+            config=config,
+            session_factory=_stub_session_factory(positions=[], balance=None),
+            fetcher=_fake_fetcher(
+                error=CoinbaseReconFetchError(operation="list_positions", detail="venue 503")
+            ),
+            alert_dispatch_hook=hook,
+        )
+        assert result is None
+        assert captured["config"] is config
+        assert captured["failed_operation"] == "list_positions"
+        assert captured["failed_detail"] == "venue 503"
+        assert captured["alert_dispatch_hook"] is hook
+
+    async def test_coverage_check_raise_never_breaks_soft_fail_contract(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A broken coverage check must not change the documented
+        # fetch-soft-fail contract (return None; scheduler survives).
+        async def broken_check(**kwargs: Any) -> bool:
+            raise RuntimeError("db down too")
+
+        monkeypatch.setattr(
+            "services.reconciliation.eod_cycle.alert_recon_coverage_gap", broken_check
+        )
+        result = await run_eod_cycle(
+            config=_config(),
+            session_factory=_stub_session_factory(positions=[], balance=None),
+            fetcher=_fake_fetcher(
+                error=CoinbaseReconFetchError(operation="list_positions", detail="venue 503")
+            ),
+        )
+        assert result is None
+
+    async def test_apply_receives_auto_rereconciled_resolution_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The 2026-07-13 cosmetic fix: the cycle's natural re-resolutions
+        # stamp the honest machine path, not the 'manual' default.
+        snap = _build_snapshot(cash="100000")
+        factory = _stub_session_factory(
+            positions=[],
+            balance={"cash_usd": Decimal("100000"), "net_liquidation": Decimal("100000")},
+        )
+        captured: dict[str, Any] = {}
+
+        async def fake_apply(plan: Any, **kwargs: Any) -> MagicMock:
+            captured["kwargs"] = kwargs
+            mock_result = MagicMock()
+            mock_result.kill_switch_invoked = False
+            return mock_result
+
+        monkeypatch.setattr(
+            "services.reconciliation.eod_cycle.apply_reconciliation_plan", fake_apply
+        )
+        await run_eod_cycle(config=_config(), session_factory=factory, fetcher=_fake_fetcher(snap))
+        assert captured["kwargs"]["resolution_path"] == "auto_rereconciled"
 
     async def test_happy_path_with_no_breaks(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Venue + backend agree exactly on positions + cash.
@@ -436,6 +546,182 @@ class TestRunEodCycleOrchestrator:
         # (delta > tolerance since equity_baseline=0 means bps tolerance=0).
         plan = captured["plan"]
         assert any(b.metric.value == "cash_usd" for b in plan.breaks_detected)
+
+
+_NOW = datetime(2026, 7, 13, 0, 16, tzinfo=UTC)
+
+
+class TestReconCoverageGapAlert:
+    """#375 follow-up C2: the consecutive-soft-fail coverage-gap alert.
+
+    Exercises the REAL ``alert_recon_coverage_gap`` (the autouse
+    ``_patch_coverage_alert`` fixture only patches the module attribute
+    ``run_eod_cycle`` resolves; ``_real_coverage_alert`` was imported
+    before the patch). ``append_audit_event`` is patched at the
+    eod_cycle seam per the house pattern.
+    """
+
+    def _factory_with_last_success(self, ts: Any) -> Any:
+        # The MAX(snapshot_ts) lookup matches the stub's "balances" arm.
+        return _stub_session_factory(
+            positions=[],
+            balance={"last_success_ts": ts} if ts is not None else None,
+        )
+
+    def _audit_patch(self, monkeypatch: pytest.MonkeyPatch, record: MagicMock) -> AsyncMock:
+        mock = AsyncMock(return_value=record)
+        monkeypatch.setattr("services.reconciliation.eod_cycle.append_audit_event", mock)
+        return mock
+
+    @staticmethod
+    def _record() -> MagicMock:
+        rec = MagicMock()
+        rec.event_uuid = uuid4()
+        return rec
+
+    async def test_single_soft_fail_within_tolerance_stays_silent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 1st consecutive failure: last success ~24h old — the designed
+        # venue-outage contract. No audit row, no alert.
+        audit_mock = self._audit_patch(monkeypatch, self._record())
+        hook = AsyncMock()
+        fired = await _real_coverage_alert(
+            session_factory=self._factory_with_last_success(_NOW - timedelta(hours=24)),
+            config=_config(),
+            failed_operation="list_positions",
+            failed_detail="venue 503",
+            alert_dispatch_hook=hook,
+            now_utc=_NOW,
+        )
+        assert fired is False
+        audit_mock.assert_not_awaited()
+        hook.assert_not_awaited()
+
+    async def test_second_soft_fail_fires_p1_alert(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # 2nd consecutive failure: last success ~48h old (> 36h
+        # threshold) — audit-first breadcrumb + P1 alert through the
+        # recon dispatch seam.
+        record = self._record()
+        audit_mock = self._audit_patch(monkeypatch, record)
+        contexts: list[AlertDispatchContext] = []
+
+        async def hook(ctx: AlertDispatchContext) -> None:
+            contexts.append(ctx)
+
+        config = _config()
+        fired = await _real_coverage_alert(
+            session_factory=self._factory_with_last_success(_NOW - timedelta(hours=48)),
+            config=config,
+            failed_operation="list_positions",
+            failed_detail="venue 503",
+            alert_dispatch_hook=hook,
+            now_utc=_NOW,
+        )
+        assert fired is True
+        # Audit-first: the breadcrumb is the locked enum member.
+        assert audit_mock.await_count == 1
+        assert audit_mock.await_args.args[1] is AuditEventType.RECONCILIATION_DATA_SOURCE_DEGRADED
+        # Alert shape.
+        assert len(contexts) == 1
+        ctx = contexts[0]
+        assert ctx.triggering_audit_event_uuid == record.event_uuid
+        assert ctx.account_id == config.account_id
+        desc = ctx.descriptor
+        assert desc.severity == RECON_COVERAGE_ALERT_SEVERITY == "P1"
+        assert desc.category == RECON_COVERAGE_ALERT_CATEGORY
+        assert desc.triggering_break_index == -1  # not a reconciliation break
+        assert desc.payload["hours_since_last_success"] == 48
+        assert desc.payload["estimated_consecutive_failed_cycles"] == 2
+        assert desc.payload["threshold_hours"] == RECON_COVERAGE_DEGRADED_AFTER_HOURS
+        assert desc.payload["failed_operation"] == "list_positions"
+
+    async def test_exact_threshold_age_fires(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Boundary pin: age == threshold is DEGRADED (strictly-younger
+        # stays silent) so the 36h cutoff can never be argued both ways.
+        self._audit_patch(monkeypatch, self._record())
+        hook = AsyncMock()
+        fired = await _real_coverage_alert(
+            session_factory=self._factory_with_last_success(
+                _NOW - timedelta(hours=RECON_COVERAGE_DEGRADED_AFTER_HOURS)
+            ),
+            config=_config(),
+            failed_operation="list_positions",
+            failed_detail="venue 503",
+            alert_dispatch_hook=hook,
+            now_utc=_NOW,
+        )
+        assert fired is True
+        hook.assert_awaited_once()
+
+    async def test_no_successful_snapshot_ever_fires(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Fail-visible: a bootstrap whose recon NEVER succeeded is
+        # exactly the unmonitored gap — alert with the never-succeeded
+        # shape rather than staying silent forever.
+        self._audit_patch(monkeypatch, self._record())
+        contexts: list[AlertDispatchContext] = []
+
+        async def hook(ctx: AlertDispatchContext) -> None:
+            contexts.append(ctx)
+
+        fired = await _real_coverage_alert(
+            session_factory=self._factory_with_last_success(None),
+            config=_config(),
+            failed_operation="get_futures_balance_summary",
+            failed_detail="401 unauthorized",
+            alert_dispatch_hook=hook,
+            now_utc=_NOW,
+        )
+        assert fired is True
+        payload = contexts[0].descriptor.payload
+        assert payload["last_successful_snapshot_utc"] is None
+        assert payload["hours_since_last_success"] is None
+        assert payload["estimated_consecutive_failed_cycles"] is None
+        assert "never" in contexts[0].descriptor.title.lower() or (
+            "no successful" in contexts[0].descriptor.title.lower()
+        )
+
+    async def test_hook_none_keeps_audit_row_no_raise(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        audit_mock = self._audit_patch(monkeypatch, self._record())
+        fired = await _real_coverage_alert(
+            session_factory=self._factory_with_last_success(_NOW - timedelta(hours=48)),
+            config=_config(),
+            failed_operation="list_positions",
+            failed_detail="venue 503",
+            alert_dispatch_hook=None,
+            now_utc=_NOW,
+        )
+        assert fired is True
+        audit_mock.assert_awaited_once()
+
+    async def test_hook_failure_is_best_effort(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Discord/DB hiccup in dispatch: audit row already landed (the
+        # durable record); the helper must not raise.
+        audit_mock = self._audit_patch(monkeypatch, self._record())
+        hook = AsyncMock(side_effect=RuntimeError("discord 500"))
+        fired = await _real_coverage_alert(
+            session_factory=self._factory_with_last_success(_NOW - timedelta(hours=48)),
+            config=_config(),
+            failed_operation="list_positions",
+            failed_detail="venue 503",
+            alert_dispatch_hook=hook,
+            now_utc=_NOW,
+        )
+        assert fired is True
+        audit_mock.assert_awaited_once()
+
+    async def test_naive_now_rejected(self) -> None:
+        with pytest.raises(ValueError, match="tz-aware"):
+            await _real_coverage_alert(
+                session_factory=self._factory_with_last_success(None),
+                config=_config(),
+                failed_operation="list_positions",
+                failed_detail="venue 503",
+                alert_dispatch_hook=None,
+                now_utc=datetime(2026, 7, 13, 0, 16),  # naive
+            )
 
 
 class TestConvalescentTickWiring:
@@ -1205,6 +1491,7 @@ class TestRefreshBackendFromBrokerSnapshot:
             net_liquidation_usd=Decimal("100000"),
             fills=(),
             pulled_at_utc=datetime(2026, 7, 10, 0, 15),  # naive
+            product_to_asset={},
         )
         factory, _, _ = _refresh_session_factory(position_rows_by_market={})
 
@@ -1269,6 +1556,7 @@ class TestRefreshBackendFromBrokerSnapshot:
             net_liquidation_usd=Decimal("100150"),
             fills=(),
             pulled_at_utc=_PULLED_AT,
+            product_to_asset={},
         )
         factory, executed_sql, executed_params = _refresh_session_factory(
             position_rows_by_market={}
@@ -1344,6 +1632,7 @@ class TestRefreshBackendFromBrokerSnapshot:
             net_liquidation_usd=Decimal("100150"),
             fills=(),
             pulled_at_utc=_PULLED_AT,
+            product_to_asset={},
         )
         factory, _, _ = _refresh_session_factory(position_rows_by_market={})
         append = AsyncMock(side_effect=lambda *a, **k: _audit_record_mock())
