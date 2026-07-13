@@ -62,6 +62,28 @@ existing open trade instead of minting a duplicate. The raise now means
 the market genuinely has no open trade — real corruption, not a
 linkage-convention mismatch.
 
+**Refuse-at-open duplicate-trade guard (#377 accepted follow-up):**
+one-open-trade-per-market is a code-level convention, NOT a DB
+constraint — ``trades`` is partitioned by ``created_at``, so Postgres
+cannot carry the partial unique index ``(account_id, market) WHERE
+state='open_position'`` (unique indexes on partitioned tables must
+include the partition key). :func:`apply_fill_plan` therefore enforces
+the convention at the single pre-write choke point: a plan whose
+``trade_mutation.action == 'open'`` re-checks
+:func:`fetch_prior_open_trade_for_market` BEFORE the first audit write
+and raises ``DUPLICATE_OPEN_TRADE_FOR_MARKET`` when an open trade
+already exists for ``(account_id, market)`` — a loud pre-apply refusal
+(nothing written) instead of a silently-minted sibling row. The guard
+cannot fire on the legitimate first-entry path (the facade's fallback
+lookup already returned None moments earlier); it exists for the
+lookup→apply race window (e.g. the operator replay tool running
+concurrently with the worker) and for any future caller that builds
+plans without the facade's lookups. Residual: the check-then-insert
+window inside ``apply_fill_plan`` itself is not transactional with the
+trades INSERT — closing it fully needs the DB constraint the partition
+scheme forbids; accepted because the worker serializes its own fill
+processing and operator tooling is run against a quiesced book.
+
 **Audit event taxonomy** (`services/audit/event_types.py`):
 
   * ``ORDER_FILLED`` — the broker-side confirmation. Carries
@@ -1748,6 +1770,15 @@ async def apply_fill_plan(
 ) -> FillApplyResult:
     """Flush a :class:`FillApplyPlan` to the database.
 
+    **Step 0 — refuse-at-open duplicate-trade guard** (module docstring,
+    #377 accepted follow-up): a plan about to INSERT a new open trade
+    (``trade_mutation.action == 'open'``) first re-checks that no open
+    trade exists for ``(account_id, market)``. A hit raises
+    :class:`FillProcessingError` (``DUPLICATE_OPEN_TRADE_FOR_MARKET``)
+    BEFORE the first audit write — nothing is written, preserving the
+    strategy-worker seam invariant that every ``FillProcessingError``
+    raise site fires before ``apply_fill_plan`` writes anything.
+
     Audit-first per backend-spec §2.10.1:
 
       1. For each :class:`PendingAuditEvent`: append via
@@ -1763,6 +1794,35 @@ async def apply_fill_plan(
     so callers can correlate. Errors propagate; the worker catches +
     logs at ERROR.
     """
+    if plan.trade_mutation.action == "open":
+        existing_open_trade = await fetch_prior_open_trade_for_market(
+            session_factory,
+            account_id=plan.trade_mutation.account_id,
+            market=plan.trade_mutation.market,
+        )
+        if existing_open_trade is not None:
+            raise FillProcessingError(
+                error_code="DUPLICATE_OPEN_TRADE_FOR_MARKET",
+                message=(
+                    "refuse-at-open: an open trade already exists for "
+                    f"(account, market={plan.trade_mutation.market!r}) — existing "
+                    f"trade_id={existing_open_trade.trade_id}; refused "
+                    f"entry_signal_id={plan.trade_mutation.entry_signal_id}, "
+                    f"order_id={plan.trade_mutation.entry_order_id}. This plan "
+                    "would INSERT a second open trade — one-open-trade-per-market "
+                    "is a convention the partitioned trades table cannot enforce, "
+                    "so it is enforced here. Nothing was written; the caller "
+                    "should have attached to the existing trade (market-level "
+                    "fallback) or the book needs operator reconciliation."
+                ),
+                details={
+                    "market": plan.trade_mutation.market,
+                    "account_id": str(plan.trade_mutation.account_id),
+                    "existing_trade_id": str(existing_open_trade.trade_id),
+                    "refused_entry_signal_id": str(plan.trade_mutation.entry_signal_id),
+                    "refused_order_id": str(plan.trade_mutation.entry_order_id),
+                },
+            )
     audit_uuids: list[UUID] = []
     for pending in plan.audit_events:
         async with session_factory() as audit_session:
