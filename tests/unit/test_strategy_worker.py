@@ -57,6 +57,7 @@ from services.signal.strategy_worker import (
     RISK_TICK_FAILURE_HALT_THRESHOLD,
     AssetRuntime,
     DecisionRow,
+    FillPropagationOutcome,
     KillSwitchInvokeResult,
     MarksFeed,
     RiskStateSnapshot,
@@ -353,6 +354,7 @@ class FakeStore(StrategyWorkerStore):
         self.order_rows: dict[str, dict[str, Any]] = {}
         self.fills: list[tuple[str, FillIngestPayload]] = []
         self.fill_fallbacks: list[str] = []
+        self.fill_fallback_causes: list[FillPropagationOutcome | None] = []
         self.terminals: list[tuple[str, str]] = []
         self.kill_switch_calls: list[TransitionTrigger] = []
         # (severity, category, message, detail)
@@ -464,13 +466,20 @@ class FakeStore(StrategyWorkerStore):
         }
         return order_id
 
-    async def process_fill(self, *, client_order_id: str, payload: FillIngestPayload) -> bool:
+    async def process_fill(
+        self, *, client_order_id: str, payload: FillIngestPayload
+    ) -> FillPropagationOutcome:
         if not self.process_fill_supported:
-            return False
+            return FillPropagationOutcome(
+                propagated=False,
+                deferred=True,
+                error_code="EXIT_PARTIAL_UNSUPPORTED",
+                detail="phase 2 deferral (fake)",
+            )
         self.fills.append((client_order_id, payload))
         if client_order_id in self.order_rows:
             self.order_rows[client_order_id]["status"] = "filled"
-        return True
+        return FillPropagationOutcome(propagated=True)
 
     async def minimal_fill_fallback(
         self,
@@ -480,8 +489,10 @@ class FakeStore(StrategyWorkerStore):
         payload: FillIngestPayload,
         market: str,
         fully_filled: bool,
+        cause: FillPropagationOutcome | None = None,
     ) -> None:
         self.fill_fallbacks.append(client_order_id)
+        self.fill_fallback_causes.append(cause)
         if client_order_id in self.order_rows:
             self.order_rows[client_order_id]["status"] = (
                 "filled" if fully_filled else "partially_filled"
@@ -1504,6 +1515,140 @@ class TestFillScenarioFallback:
 
         assert store.fill_fallbacks  # orders/fills stay truthful
         assert worker.state["BTC"].contracts == 2
+        # The failure SHAPE travels with the fallback so the audit note
+        # can describe what actually happened (#383 review residual).
+        cause = store.fill_fallback_causes[-1]
+        assert cause is not None
+        assert cause.propagated is False
+        assert cause.deferred is True
+
+
+class TestMinimalFallbackNarrative:
+    """#383 review residual: the fallback's ORDER_FILLED audit note used
+    to hardcode "EXIT_PARTIAL deferral" for EVERY shape — including
+    pre-apply propagation refusals like DUPLICATE_OPEN_TRADE_FOR_MARKET.
+    The narrative now keys on the FillPropagationOutcome cause."""
+
+    @staticmethod
+    def _store_with_order_row() -> tuple[StrategyWorkerStore, Any]:
+        """Real store over a mock session factory whose SELECT returns an
+        orders row and whose writes no-op."""
+        from contextlib import asynccontextmanager
+        from unittest.mock import MagicMock
+
+        def _make_session() -> MagicMock:
+            sess = MagicMock()
+
+            @asynccontextmanager
+            async def _begin_cm() -> Any:
+                yield None
+
+            sess.begin = MagicMock(side_effect=lambda: _begin_cm())
+
+            async def _execute(stmt: Any, params: Any = None) -> MagicMock:
+                result = MagicMock()
+                row = MagicMock()
+                row.id = uuid4()
+                row.created_at = NOW
+                result.fetchone = MagicMock(return_value=row)
+                return result
+
+            sess.execute = _execute
+            return sess
+
+        @asynccontextmanager
+        async def _factory_cm() -> Any:
+            yield _make_session()
+
+        factory = MagicMock()
+        factory.side_effect = lambda: _factory_cm()
+        store = StrategyWorkerStore(session_factory=factory, env="paper")
+        return store, factory
+
+    @staticmethod
+    def _payload() -> FillIngestPayload:
+        return FillIngestPayload(
+            broker_fill_id="cid-x:agg",
+            cumulative_filled_quantity=1,
+            fill_quantity=1,
+            fill_price=Decimal("64000"),
+            commission_usd=Decimal("1"),
+            filled_at_utc=NOW,
+        )
+
+    async def _run_fallback(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        cause: FillPropagationOutcome | None,
+    ) -> dict[str, Any]:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from services.signal import strategy_worker as sw_module
+
+        store, _ = self._store_with_order_row()
+        monkeypatch.setattr(store, "order_row_exists", AsyncMock(return_value="pending"))
+        captured: dict[str, Any] = {}
+
+        async def _fake_append(session: Any, event_type: Any, payload: Any, **kwargs: Any) -> Any:
+            captured["event_type"] = event_type
+            captured["payload"] = payload
+            rec = MagicMock()
+            rec.event_uuid = uuid4()
+            return rec
+
+        monkeypatch.setattr(sw_module, "append_audit_event", _fake_append)
+        await store.minimal_fill_fallback(
+            uuid4(),
+            client_order_id="cid-x",
+            payload=self._payload(),
+            market="BTC",
+            fully_filled=True,
+            cause=cause,
+        )
+        return captured
+
+    async def test_refusal_cause_names_the_refusal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured = await self._run_fallback(
+            monkeypatch,
+            FillPropagationOutcome(
+                propagated=False,
+                deferred=False,
+                error_code="DUPLICATE_OPEN_TRADE_FOR_MARKET",
+                detail="refuse-at-open: an open trade already exists …",
+            ),
+        )
+        payload = captured["payload"]
+        assert payload["fallback_cause"] == "propagation_refused"
+        assert payload["error_code"] == "DUPLICATE_OPEN_TRADE_FOR_MARKET"
+        assert "REFUSED" in payload["note"]
+        assert "replay_leg_fill" in payload["note"]
+        assert "EXIT_PARTIAL" not in payload["note"]  # the old hardcoded lie
+        assert payload["error_detail"].startswith("refuse-at-open")
+
+    async def test_deferred_cause_reads_as_phase2_deferral(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured = await self._run_fallback(
+            monkeypatch,
+            FillPropagationOutcome(
+                propagated=False,
+                deferred=True,
+                error_code="EXIT_PARTIAL_UNSUPPORTED",
+                detail="phase 2 deferral",
+            ),
+        )
+        payload = captured["payload"]
+        assert payload["fallback_cause"] == "deferred_scenario"
+        assert payload["error_code"] == "EXIT_PARTIAL_UNSUPPORTED"
+        assert "Phase-2 deferral" in payload["note"]
+        assert "REFUSED" not in payload["note"]
+
+    async def test_no_cause_recorded_as_unspecified(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured = await self._run_fallback(monkeypatch, None)
+        payload = captured["payload"]
+        assert payload["fallback_cause"] == "unspecified"
+        assert payload["error_code"] is None
+        assert payload["error_detail"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -1810,7 +1955,12 @@ class TestFillPropagationSeam:
             filled_at_utc=NOW,
         )
         result = await store.process_fill(client_order_id="cid-1", payload=payload)
-        assert result is False  # caller degrades to minimal_fill_fallback
+        # Caller degrades to minimal_fill_fallback, and the outcome names
+        # the REFUSAL shape (not a Phase-2 deferral) for the audit note.
+        assert result.propagated is False
+        assert result.deferred is False
+        assert result.error_code == "EXIT_NO_PRIOR_TRADE"
+        assert not result  # __bool__ mirrors .propagated (legacy contract)
 
     async def test_unsupported_scenario_still_falls_back(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1834,7 +1984,9 @@ class TestFillPropagationSeam:
             commission_usd=Decimal("1"),
             filled_at_utc=NOW,
         )
-        assert await store.process_fill(client_order_id="cid-2", payload=payload) is False
+        outcome = await store.process_fill(client_order_id="cid-2", payload=payload)
+        assert outcome.propagated is False
+        assert outcome.deferred is True  # Phase-2 deferral shape
 
 
 class TestExternalFlatOrphanedStop:

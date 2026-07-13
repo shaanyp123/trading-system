@@ -78,11 +78,18 @@ cannot fire on the legitimate first-entry path (the facade's fallback
 lookup already returned None moments earlier); it exists for the
 lookup→apply race window (e.g. the operator replay tool running
 concurrently with the worker) and for any future caller that builds
-plans without the facade's lookups. Residual: the check-then-insert
-window inside ``apply_fill_plan`` itself is not transactional with the
-trades INSERT — closing it fully needs the DB constraint the partition
-scheme forbids; accepted because the worker serializes its own fill
-processing and operator tooling is run against a quiesced book.
+plans without the facade's lookups. The check-then-insert window inside
+``apply_fill_plan`` itself is closed at the DB level (2026-07-13, the
+#383 accepted hardening): the trades INSERT for ``action='open'`` is
+conditional (``INSERT … SELECT … WHERE NOT EXISTS`` — see
+:func:`_insert_open_trade`), so a sibling open committed between the
+step-0 guard and the INSERT suppresses the row instead of minting a
+duplicate; the race-lost arm logs CRITICAL + fires a P1
+``incident_review_required`` alert and returns the surviving trade's
+id — deliberately never a post-write ``FillProcessingError`` refusal
+(the fill's other rows are already applied; double-recording via the
+worker's fallback would be worse than the un-merged trade row the
+alert demands the operator reconcile).
 
 **Audit event taxonomy** (`services/audit/event_types.py`):
 
@@ -121,8 +128,9 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import ROUND_HALF_EVEN, Decimal
+from json import dumps as _json_dumps
 from typing import Any, Final, Literal
 from uuid import UUID
 
@@ -2038,6 +2046,208 @@ async def _insert_balance(
             return UUID(str(row.id))
 
 
+async def _insert_open_trade(
+    mutation: TradeMutation,
+    *,
+    session_factory: async_sessionmaker[Any],
+) -> UUID:
+    """Conditionally INSERT the open trade row (the #383 accepted
+    hardening: DB-level backstop of the step-0 refuse-at-open guard).
+
+    ``INSERT … SELECT … WHERE NOT EXISTS (open trade for (account,
+    market))`` closes the check-then-insert window that the step-0 guard
+    alone leaves open (the partitioned ``trades`` table cannot carry the
+    partial unique index): the existence check and the INSERT now
+    evaluate inside ONE statement, so a sibling open committed between
+    the pre-write guard and this INSERT suppresses the row instead of
+    minting a silent duplicate.
+
+    **The race-lost arm deliberately must NOT raise a refusal** — by the
+    time this runs, the audit events, fills row, orders UPDATE, position
+    mutation and balance snapshot have already been applied. Raising
+    ``FillProcessingError`` here would (a) violate the worker-seam
+    invariant that every such raise fires pre-apply and (b) route the
+    worker into ``minimal_fill_fallback`` ON TOP of a nearly-complete
+    apply — double-recording the fill. Instead the arm:
+
+      1. Logs at CRITICAL (``fill_processor_trade_open_race_lost``).
+      2. INSERTs a P1 ``incident_review_required`` alert (existing
+         category; never raises — alert-after-action per the worker
+         precedent) naming the surviving trade + the refused ids.
+      3. Returns the SURVIVING open trade's id so the caller's
+         ``FillApplyResult.trade_id`` names the trade that actually
+         holds the market. The fill's quantities were NOT merged into
+         it — that is exactly what the alert demands the operator
+         reconcile (``replay_leg_fill`` / manual review); the 00:15 UTC
+         recon flags any residual position gap.
+
+    Only a provably inconsistent book (the NOT EXISTS suppressed the
+    INSERT yet no open trade is visible afterwards) raises — a
+    ``RuntimeError`` infrastructure-corruption shape (same fail-closed
+    class as a raw DB error mid-apply), never a ``FillProcessingError``
+    refusal.
+    """
+    async with session_factory() as session:
+        async with session.begin():
+            row = (
+                await session.execute(
+                    text(
+                        "INSERT INTO trades ("
+                        "    account_id, env, market, contract_id, "
+                        "    entry_signal_id, entry_order_id, "
+                        "    direction, opened_at_utc, "
+                        "    total_quantity, avg_entry_price, "
+                        "    realized_commission_usd, state, "
+                        "    managed_by_version, strategy_hash, "
+                        "    parameter_set_hash, slippage_calibration_version_id"
+                        ") SELECT "
+                        "    :acct, :env, :market, :cid, "
+                        "    :sig, :ord, "
+                        "    :dir, :opened, "
+                        "    :qty, :avg, "
+                        "    :comm, 'open_position', "
+                        "    :ver, :strat, "
+                        "    :param, :slip "
+                        "WHERE NOT EXISTS ("
+                        "    SELECT 1 FROM trades "
+                        "    WHERE account_id = :acct AND market = :market "
+                        "      AND state = 'open_position'"
+                        ") RETURNING id"
+                    ),
+                    {
+                        "acct": mutation.account_id,
+                        "env": mutation.env,
+                        "market": mutation.market,
+                        "cid": mutation.contract_id,
+                        "sig": mutation.entry_signal_id,
+                        "ord": mutation.entry_order_id,
+                        "dir": mutation.direction,
+                        "opened": mutation.opened_at_utc,
+                        "qty": mutation.new_total_quantity,
+                        "avg": mutation.new_avg_entry_price,
+                        "comm": mutation.realized_commission_usd,
+                        "ver": mutation.managed_by_version,
+                        "strat": mutation.strategy_hash,
+                        "param": mutation.parameter_set_hash,
+                        "slip": mutation.slippage_calibration_version_id,
+                    },
+                )
+            ).fetchone()
+    if row is not None:
+        return UUID(str(row.id))
+
+    # Race-lost arm (docstring): a concurrent open won between the
+    # step-0 guard and this INSERT.
+    survivor_id: UUID | None = None
+    try:
+        survivor = await fetch_prior_open_trade_for_market(
+            session_factory,
+            account_id=mutation.account_id,
+            market=mutation.market,
+        )
+        survivor_id = survivor.trade_id if survivor is not None else None
+    except Exception:
+        log.exception(
+            "fill_processor_trade_open_race_survivor_lookup_failed",
+            account_id=str(mutation.account_id),
+            market=mutation.market,
+        )
+    log.critical(
+        "fill_processor_trade_open_race_lost",
+        account_id=str(mutation.account_id),
+        env=mutation.env,
+        market=mutation.market,
+        surviving_trade_id=str(survivor_id) if survivor_id else None,
+        refused_entry_signal_id=str(mutation.entry_signal_id),
+        refused_order_id=str(mutation.entry_order_id),
+        note=(
+            "conditional trades INSERT suppressed: a concurrent open won the "
+            "race after the step-0 guard passed. Orders/fills/position/balance "
+            "for THIS fill are already applied but its quantities were NOT "
+            "merged into the surviving trade — operator reconciliation "
+            "required (replay_leg_fill / manual review)"
+        ),
+    )
+    await _insert_incident_alert(
+        session_factory,
+        account_id=mutation.account_id,
+        message=(
+            f"Trade-open race lost for market {mutation.market}: a concurrent "
+            "open trade won after the duplicate guard passed. The fill was "
+            "recorded (orders/fills/position/balance) but NOT merged into the "
+            f"surviving trade {survivor_id}. Reconcile the trade row manually "
+            "(replay_leg_fill or manual review); the 00:15 UTC recon flags any "
+            "residual position gap."
+        ),
+        detail={
+            "market": mutation.market,
+            "surviving_trade_id": str(survivor_id) if survivor_id else None,
+            "refused_entry_signal_id": str(mutation.entry_signal_id),
+            "refused_order_id": str(mutation.entry_order_id),
+            "env": mutation.env,
+        },
+    )
+    if survivor_id is None:
+        raise RuntimeError(
+            "trade-open conditional INSERT was suppressed for market "
+            f"{mutation.market!r} but no surviving open trade is visible — "
+            "book state inconsistent; operator review required "
+            f"(refused entry_signal_id={mutation.entry_signal_id}, "
+            f"order_id={mutation.entry_order_id})"
+        )
+    return survivor_id
+
+
+async def _insert_incident_alert(
+    session_factory: async_sessionmaker[Any],
+    *,
+    account_id: UUID,
+    message: str,
+    detail: dict[str, Any],
+) -> None:
+    """INSERT one P1 ``incident_review_required`` alerts row; NEVER raises.
+
+    Mirrors the strategy worker's ``insert_alert`` contract
+    (alert-after-action): a failed alert write must not unwind or mask
+    the state it reports — the CRITICAL log line is the fallback record.
+    ``incident_review_required`` is an EXISTING ``alert_category`` enum
+    member (alembic 0004; the #381 missing-risk-state precedent) — no
+    taxonomy change.
+    """
+    try:
+        async with session_factory() as session:
+            async with session.begin():
+                await session.execute(
+                    text(
+                        "INSERT INTO alerts ("
+                        "    account_id, fired_at_utc, severity, category,"
+                        "    message, detail"
+                        ") VALUES ("
+                        "    :acct, :ts, 'P1', CAST('incident_review_required' AS alert_category),"
+                        "    :msg, CAST(:detail AS JSONB)"
+                        ")"
+                    ),
+                    {
+                        "acct": account_id,
+                        "ts": datetime.now(tz=UTC),
+                        "msg": message,
+                        "detail": _json_dumps(detail, default=str),
+                    },
+                )
+        log.info(
+            "fill_processor_incident_alert_inserted",
+            account_id=str(account_id),
+            message=message,
+        )
+    except Exception:
+        log.exception(
+            "fill_processor_incident_alert_insert_failed",
+            account_id=str(account_id),
+            message=message,
+            detail=detail,
+        )
+
+
 async def _apply_trade_mutation(
     mutation: TradeMutation,
     *,
@@ -2045,58 +2255,20 @@ async def _apply_trade_mutation(
 ) -> UUID:
     """Apply a ``trades`` mutation.
 
-    * ``action='open'`` → INSERT new trade row + RETURNING id.
+    * ``action='open'`` → conditional INSERT of a new trade row (see
+      :func:`_insert_open_trade` — the DB-level backstop of the step-0
+      refuse-at-open guard). Returns the new trade_id, or the SURVIVING
+      open trade's id when a concurrent open won the race.
     * ``action='update'`` → UPDATE total_quantity / avg_entry_price +
       accumulate commission. Returns the trade_id.
     * ``action='close'`` → UPDATE state='closed' + stamp closed_at_utc +
       exit_order_id + avg_exit_price + realized_pnl_usd + accumulate
       commission. Returns the trade_id.
     """
+    if mutation.action == "open":
+        return await _insert_open_trade(mutation, session_factory=session_factory)
     async with session_factory() as session:
         async with session.begin():
-            if mutation.action == "open":
-                row = (
-                    await session.execute(
-                        text(
-                            "INSERT INTO trades ("
-                            "    account_id, env, market, contract_id, "
-                            "    entry_signal_id, entry_order_id, "
-                            "    direction, opened_at_utc, "
-                            "    total_quantity, avg_entry_price, "
-                            "    realized_commission_usd, state, "
-                            "    managed_by_version, strategy_hash, "
-                            "    parameter_set_hash, slippage_calibration_version_id"
-                            ") VALUES ("
-                            "    :acct, :env, :market, :cid, "
-                            "    :sig, :ord, "
-                            "    :dir, :opened, "
-                            "    :qty, :avg, "
-                            "    :comm, 'open_position', "
-                            "    :ver, :strat, "
-                            "    :param, :slip"
-                            ") RETURNING id"
-                        ),
-                        {
-                            "acct": mutation.account_id,
-                            "env": mutation.env,
-                            "market": mutation.market,
-                            "cid": mutation.contract_id,
-                            "sig": mutation.entry_signal_id,
-                            "ord": mutation.entry_order_id,
-                            "dir": mutation.direction,
-                            "opened": mutation.opened_at_utc,
-                            "qty": mutation.new_total_quantity,
-                            "avg": mutation.new_avg_entry_price,
-                            "comm": mutation.realized_commission_usd,
-                            "ver": mutation.managed_by_version,
-                            "strat": mutation.strategy_hash,
-                            "param": mutation.parameter_set_hash,
-                            "slip": mutation.slippage_calibration_version_id,
-                        },
-                    )
-                ).fetchone()
-                assert row is not None
-                return UUID(str(row.id))
             if mutation.action == "update":
                 assert mutation.trade_id is not None
                 assert mutation.trade_created_at is not None
