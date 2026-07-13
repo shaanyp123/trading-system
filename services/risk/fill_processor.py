@@ -79,12 +79,16 @@ lookup already returned None moments earlier); it exists for the
 lookup→apply race window (e.g. the operator replay tool running
 concurrently with the worker) and for any future caller that builds
 plans without the facade's lookups. The check-then-insert window inside
-``apply_fill_plan`` itself is closed at the DB level (2026-07-13, the
-#383 accepted hardening): the trades INSERT for ``action='open'`` is
-conditional (``INSERT … SELECT … WHERE NOT EXISTS`` — see
-:func:`_insert_open_trade`), so a sibling open committed between the
-step-0 guard and the INSERT suppresses the row instead of minting a
-duplicate; the race-lost arm logs CRITICAL + fires a P1
+``apply_fill_plan`` itself is closed at the DB level against COMMITTED
+siblings (2026-07-13, the #383 accepted hardening): the trades INSERT
+for ``action='open'`` is conditional (``INSERT … SELECT … WHERE NOT
+EXISTS`` — see :func:`_insert_open_trade`), so a sibling open committed
+between the step-0 guard and the INSERT suppresses the row instead of
+minting a duplicate. (Two simultaneously in-flight UNCOMMITTED opens
+remain the theoretical residue only the partition-forbidden unique
+index could close — READ COMMITTED's NOT EXISTS cannot see an
+uncommitted row; accepted because the worker serializes its own fill
+processing and the realistic racers commit in milliseconds.) the race-lost arm logs CRITICAL + fires a P1
 ``incident_review_required`` alert and returns the surviving trade's
 id — deliberately never a post-write ``FillProcessingError`` refusal
 (the fill's other rows are already applied; double-recording via the
