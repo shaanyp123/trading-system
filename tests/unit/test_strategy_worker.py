@@ -362,6 +362,7 @@ class FakeStore(StrategyWorkerStore):
         self.equity_history: dict[date, Decimal] = {}
         self._contract_ids: dict[str, UUID] = {}
         self.process_fill_supported = True
+        self.insert_alert_delivers = True
 
     # -- reads ------------------------------------------------------------
 
@@ -520,8 +521,14 @@ class FakeStore(StrategyWorkerStore):
         message: str,
         detail: dict[str, Any],
         now_utc: datetime,
-    ) -> None:
+    ) -> bool:
+        # ``insert_alert_delivers`` models a DB-write outcome so the
+        # one-shot helpers' flag-on-confirmed-delivery (#381) is testable;
+        # defaults to True (the healthy path).
+        if not self.insert_alert_delivers:
+            return False
         self.alerts.append((severity, category, message, detail))
+        return True
 
     async def invoke_kill_switch(
         self, account_id: UUID, *, trigger: TransitionTrigger, now_utc: datetime
@@ -1098,6 +1105,25 @@ class TestHaltGate:
         store.risk = RiskStateSnapshot("NORMAL", None, 0, False)  # row restored
         await worker.run_daily_decision(TODAY)
         assert store.decisions[TODAY]["status"] == "completed"
+
+    async def test_dispatch_blocked_one_shot_not_spent_on_failed_insert(self) -> None:
+        """#381 review residual (flag-before-insert): a dropped BLOCKED P1
+        INSERT must NOT spend the one-shot — the next blocked tick retries
+        the alert until one lands."""
+        store = FakeStore()
+        store.risk = None
+        worker, _, broker = await _started_worker(store=store)
+
+        store.insert_alert_delivers = False
+        await worker.run_daily_decision(TODAY)
+        assert broker.create_calls == []
+        assert store.alerts == []  # INSERT dropped
+        assert worker._dispatch_blocked_no_risk_state_alerted is False  # one-shot NOT spent
+
+        store.insert_alert_delivers = True
+        await worker.run_daily_decision(TODAY)  # next tick: retry lands
+        assert [a[:2] for a in store.alerts] == [("P1", "incident_review_required")]
+        assert worker._dispatch_blocked_no_risk_state_alerted is True
 
     async def test_missing_risk_state_row_blocks_resume(self) -> None:
         """The crash-recovery resume path shares the fail-closed rule: a
@@ -1800,6 +1826,78 @@ class TestTickFailureHaltLatch:
         assert worker._consecutive_tick_failures == 0
         assert worker._tick_failure_halt_fired is False
         assert worker._tick_failure_halt_invoke_alerted is False
+
+    async def test_resume_while_ticks_still_failing_rearms_and_rehalts(self) -> None:
+        """#378 review C3: if the operator RESUMES the account while ticks
+        are still failing (no clean tick to re-arm on), the latched
+        tick-failure halt must re-arm on the observed resume so the
+        continuing streak drives HALT_NEW again — never run un-halted on
+        a dead risk loop."""
+        worker, store, _ = await _started_worker()
+        store.risk = RiskStateSnapshot("NORMAL", None, 0, False)
+        worker._consecutive_tick_failures = RISK_TICK_FAILURE_HALT_THRESHOLD
+
+        # First streak halts the account.
+        await worker._maybe_halt_on_tick_failures()
+        assert store.kill_switch_calls == [TransitionTrigger.UNHANDLED_EXCEPTION]
+        assert worker._tick_failure_halt_fired is True
+        assert store.risk.state == "HALT_NEW"
+
+        # Still latched while genuinely HALT_NEW: no re-halt (negative arm).
+        await worker._maybe_halt_on_tick_failures()
+        assert len(store.kill_switch_calls) == 1
+        assert worker._tick_failure_halt_fired is True
+
+        # Operator resumes to CONVALESCENT while ticks keep failing.
+        store.risk = RiskStateSnapshot("CONVALESCENT", None, 1, False)
+        await worker._maybe_halt_on_tick_failures()
+
+        # Re-armed on the observed resume → re-halted the continuing streak.
+        assert store.kill_switch_calls == [
+            TransitionTrigger.UNHANDLED_EXCEPTION,
+            TransitionTrigger.UNHANDLED_EXCEPTION,
+        ]
+        assert worker._tick_failure_halt_fired is True
+        assert store.risk.state == "HALT_NEW"
+        # A fresh per-episode P1 fired on the re-halt.
+        assert len(store.alerts) == 2
+
+    async def test_resume_check_db_error_keeps_latch(self) -> None:
+        """The resume check must fail SAFE: an unreadable risk_state
+        snapshot keeps the latch (cannot confirm a resume — re-arming on
+        a guess could hammer the kill switch)."""
+        worker, store, _ = await _started_worker()
+        store.risk = RiskStateSnapshot("NORMAL", None, 0, False)
+        worker._consecutive_tick_failures = RISK_TICK_FAILURE_HALT_THRESHOLD
+        await worker._maybe_halt_on_tick_failures()  # halts + latches
+        assert worker._tick_failure_halt_fired is True
+
+        async def _boom(account_id: UUID) -> RiskStateSnapshot | None:
+            raise RuntimeError("db down")
+
+        store.fetch_risk_state = _boom  # type: ignore[method-assign]
+        await worker._maybe_halt_on_tick_failures()  # latched; resume check raises
+
+        assert len(store.kill_switch_calls) == 1  # no re-halt on an unconfirmable resume
+        assert worker._tick_failure_halt_fired is True  # latch kept
+
+    async def test_invoke_alert_one_shot_not_spent_on_failed_insert(self) -> None:
+        """#381 review residual (flag-before-insert): a transient DB blip
+        that drops the not-landed P1 INSERT must NOT spend the one-shot —
+        the next failing tick retries the alert until one lands."""
+        worker, store, _ = await _started_worker()
+        store.risk = None  # NO_RISK_STATE_ROW → not-landed one-shot path
+        worker._consecutive_tick_failures = RISK_TICK_FAILURE_HALT_THRESHOLD
+
+        store.insert_alert_delivers = False
+        await worker._maybe_halt_on_tick_failures()
+        assert store.alerts == []  # INSERT dropped
+        assert worker._tick_failure_halt_invoke_alerted is False  # one-shot NOT spent
+
+        store.insert_alert_delivers = True
+        await worker._maybe_halt_on_tick_failures()  # retry lands
+        assert [a[:2] for a in store.alerts] == [("P1", "kill_switch_invoked")]
+        assert worker._tick_failure_halt_invoke_alerted is True  # now latched
 
 
 # ---------------------------------------------------------------------------
