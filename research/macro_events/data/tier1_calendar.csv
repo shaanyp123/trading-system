@@ -1,0 +1,523 @@
+event_type,scheduled_at_utc,importance,source,source_series_names
+NFP,2016-06-03 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (May); Nonfarm Payrolls Private (May)
+FOMC_DECISION,2016-06-15 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+CPI,2016-06-16 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (May); Core Inflation Rate YoY (May); Inflation Rate MoM (May); Inflation Rate YoY (May)
+PCE,2016-06-29 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (May); Core PCE Price Index YoY (May); PCE Price Index MoM (May); PCE Price Index YoY (May)
+FOMC_MINUTES,2016-07-06 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+NFP,2016-07-08 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Jun); Nonfarm Payrolls Private (Jun)
+CPI,2016-07-15 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Jun); Core Inflation Rate YoY (Jun); Inflation Rate MoM (Jun); Inflation Rate YoY (Jun)
+FOMC_DECISION,2016-07-27 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2016-08-02 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Jun); Core PCE Price Index YoY (Jun); PCE Price Index MoM (Jun); PCE Price Index YoY (Jun)
+NFP,2016-08-05 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Jul); Nonfarm Payrolls Private (Jul)
+CPI,2016-08-16 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Jul); Core Inflation Rate YoY (Jul); Inflation Rate MoM (Jul); Inflation Rate YoY (Jul)
+FOMC_MINUTES,2016-08-17 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2016-08-29 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Jul); Core PCE Price Index YoY (Jul); PCE Price Index MoM (Jul); PCE Price Index YoY (Jul)
+NFP,2016-09-02 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Aug); Nonfarm Payrolls Private (Aug)
+CPI,2016-09-16 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Aug); Core Inflation Rate YoY (Aug); Inflation Rate MoM (Aug); Inflation Rate YoY (Aug)
+FOMC_DECISION,2016-09-21 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2016-09-30 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Aug); Core PCE Price Index YoY (Aug); PCE Price Index MoM (Aug); PCE Price Index YoY (Aug)
+NFP,2016-10-07 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Sep); Nonfarm Payrolls Private (Sep)
+FOMC_MINUTES,2016-10-12 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+CPI,2016-10-18 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Sep); Core Inflation Rate YoY (Sep); Inflation Rate MoM (Sep); Inflation Rate YoY (Sep)
+PCE,2016-10-31 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Sep); Core PCE Price Index YoY (Sep); PCE Price Index MoM (Sep); PCE Price Index YoY (Sep)
+FOMC_DECISION,2016-11-02 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+NFP,2016-11-04 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Oct); Nonfarm Payrolls Private (Oct)
+CPI,2016-11-17 13:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Oct); Core Inflation Rate YoY (Oct); Inflation Rate MoM (Oct); Inflation Rate YoY (Oct)
+FOMC_MINUTES,2016-11-23 19:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2016-11-30 13:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Oct); Core PCE Price Index YoY (Oct); PCE Price Index MoM (Oct); PCE Price Index YoY (Oct)
+NFP,2016-12-02 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Nov); Nonfarm Payrolls Private (Nov)
+FOMC_DECISION,2016-12-14 19:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+CPI,2016-12-15 13:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Nov); Core Inflation Rate YoY (Nov); Inflation Rate MoM (Nov); Inflation Rate YoY (Nov)
+PCE,2016-12-22 15:00:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Nov); Core PCE Price Index YoY (Nov); PCE Price Index MoM (Nov); PCE Price Index YoY (Nov)
+FOMC_MINUTES,2017-01-04 19:00:00,medium,fmp_economics_calendar,FOMC Minutes
+NFP,2017-01-06 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Dec); Nonfarm Payrolls Private (Dec)
+CPI,2017-01-18 13:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Dec); Core Inflation Rate YoY (Dec); Inflation Rate MoM (Dec); Inflation Rate YoY (Dec)
+PCE,2017-01-30 13:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Dec); Core PCE Price Index YoY (Dec); PCE Price Index MoM (Dec); PCE Price Index YoY (Dec)
+FOMC_DECISION,2017-02-01 19:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+NFP,2017-02-03 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Jan); Nonfarm Payrolls Private (Jan)
+CPI,2017-02-15 13:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Jan); Core Inflation Rate YoY (Jan); Inflation Rate MoM (Jan); Inflation Rate YoY (Jan)
+FOMC_MINUTES,2017-02-22 19:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2017-03-01 13:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Jan); Core PCE Price Index YoY (Jan); PCE Price Index MoM (Jan); PCE Price Index YoY (Jan)
+NFP,2017-03-10 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Feb); Nonfarm Payrolls Private (Feb)
+CPI,2017-03-15 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Feb); Core Inflation Rate YoY (Feb); Inflation Rate MoM (Feb); Inflation Rate YoY (Feb)
+FOMC_DECISION,2017-03-15 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2017-03-31 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Feb); Core PCE Price Index YoY (Feb); PCE Price Index MoM (Feb); PCE Price Index YoY (Feb)
+FOMC_MINUTES,2017-04-05 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+NFP,2017-04-07 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Mar); Nonfarm Payrolls Private (Mar)
+CPI,2017-04-14 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Mar); Core Inflation Rate YoY (Mar); Inflation Rate MoM (Mar); Inflation Rate YoY (Mar)
+PCE,2017-05-01 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Mar); Core PCE Price Index YoY (Mar); PCE Price Index MoM (Mar); PCE Price Index YoY (Mar)
+FOMC_DECISION,2017-05-03 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+NFP,2017-05-05 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Apr); Nonfarm Payrolls Private (Apr)
+CPI,2017-05-12 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Apr); Core Inflation Rate YoY (Apr); Inflation Rate MoM (Apr); Inflation Rate YoY (Apr)
+FOMC_MINUTES,2017-05-24 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2017-05-30 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Apr); Core PCE Price Index YoY (Apr); PCE Price Index MoM (Apr); PCE Price Index YoY (Apr)
+NFP,2017-06-02 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (May); Nonfarm Payrolls Private (May)
+CPI,2017-06-14 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (May); Core Inflation Rate YoY (May); Inflation Rate MoM (May); Inflation Rate YoY (May)
+FOMC_DECISION,2017-06-14 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2017-06-30 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (May); Core PCE Price Index YoY (May); PCE Price Index MoM (May); PCE Price Index YoY (May)
+FOMC_MINUTES,2017-07-05 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+NFP,2017-07-07 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Jun); Nonfarm Payrolls Private (Jun)
+CPI,2017-07-14 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Jun); Core Inflation Rate YoY (Jun); Inflation Rate MoM (Jun); Inflation Rate YoY (Jun)
+FOMC_DECISION,2017-07-26 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2017-08-01 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Jun); Core PCE Price Index YoY (Jun); PCE Price Index MoM (Jun); PCE Price Index YoY (Jun)
+NFP,2017-08-04 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Jul); Nonfarm Payrolls Private (Jul)
+CPI,2017-08-11 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Jul); Core Inflation Rate YoY (Jul); Inflation Rate MoM (Jul); Inflation Rate YoY (Jul)
+FOMC_MINUTES,2017-08-16 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2017-08-31 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Jul); Core PCE Price Index YoY (Jul); PCE Price Index MoM (Jul); PCE Price Index YoY (Jul)
+NFP,2017-09-01 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Aug); Nonfarm Payrolls Private (Aug)
+CPI,2017-09-14 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Aug); Core Inflation Rate YoY (Aug); Inflation Rate MoM (Aug); Inflation Rate YoY (Aug)
+FOMC_DECISION,2017-09-20 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2017-09-29 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Aug); Core PCE Price Index YoY (Aug); PCE Price Index MoM (Aug); PCE Price Index YoY (Aug)
+NFP,2017-10-06 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Sep); Nonfarm Payrolls Private (Sep)
+FOMC_MINUTES,2017-10-11 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+CPI,2017-10-13 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Sep); Core Inflation Rate YoY (Sep); Inflation Rate MoM (Sep); Inflation Rate YoY (Sep)
+PCE,2017-10-30 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Sep); Core PCE Price Index YoY (Sep); PCE Price Index MoM (Sep); PCE Price Index YoY (Sep)
+FOMC_DECISION,2017-11-01 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+NFP,2017-11-03 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Oct); Nonfarm Payrolls Private (Oct)
+CPI,2017-11-15 13:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Oct); Core Inflation Rate YoY (Oct); Inflation Rate MoM (Oct); Inflation Rate YoY (Oct)
+FOMC_MINUTES,2017-11-22 19:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2017-11-30 13:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Oct); Core PCE Price Index YoY (Oct); PCE Price Index MoM (Oct); PCE Price Index YoY (Oct)
+NFP,2017-12-08 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Nov); Nonfarm Payrolls Private (Nov)
+CPI,2017-12-13 13:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Nov); Core Inflation Rate YoY (Nov); Inflation Rate MoM (Nov); Inflation Rate YoY (Nov)
+FOMC_DECISION,2017-12-13 19:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2017-12-22 13:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Nov); Core PCE Price Index YoY (Nov); PCE Price Index MoM (Nov); PCE Price Index YoY (Nov)
+FOMC_MINUTES,2018-01-03 19:00:00,medium,fmp_economics_calendar,FOMC Minutes
+NFP,2018-01-05 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Dec); Nonfarm Payrolls Private (Dec)
+CPI,2018-01-12 13:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Dec); Core Inflation Rate YoY (Dec); Inflation Rate MoM (Dec); Inflation Rate YoY (Dec)
+PCE,2018-01-29 13:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Dec); Core PCE Price Index YoY (Dec); PCE Price Index MoM (Dec); PCE Price Index YoY (Dec)
+FOMC_DECISION,2018-01-31 19:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+NFP,2018-02-02 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Jan); Nonfarm Payrolls Private (Jan)
+CPI,2018-02-14 13:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Jan); Core Inflation Rate YoY (Jan); Inflation Rate MoM (Jan); Inflation Rate YoY (Jan)
+FOMC_MINUTES,2018-02-21 19:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2018-03-01 13:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Jan); Core PCE Price Index YoY (Jan); PCE Price Index MoM (Jan); PCE Price Index YoY (Jan)
+NFP,2018-03-09 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Feb); Nonfarm Payrolls Private (Feb)
+CPI,2018-03-13 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Feb); Core Inflation Rate YoY (Feb); Inflation Rate MoM (Feb); Inflation Rate YoY (Feb)
+FOMC_DECISION,2018-03-21 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2018-03-29 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Feb); Core PCE Price Index YoY (Feb); PCE Price Index MoM (Feb); PCE Price Index YoY (Feb)
+NFP,2018-04-06 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Mar); Nonfarm Payrolls Private (Mar)
+CPI,2018-04-11 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Mar); Core Inflation Rate YoY (Mar); Inflation Rate MoM (Mar); Inflation Rate YoY (Mar)
+FOMC_MINUTES,2018-04-11 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2018-04-30 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Mar); Core PCE Price Index YoY (Mar); PCE Price Index MoM (Mar); PCE Price Index YoY (Mar)
+FOMC_DECISION,2018-05-02 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+NFP,2018-05-04 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Apr); Nonfarm Payrolls Private (Apr)
+CPI,2018-05-10 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Apr); Core Inflation Rate YoY (Apr); Inflation Rate MoM (Apr); Inflation Rate YoY (Apr)
+FOMC_MINUTES,2018-05-23 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2018-05-31 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Apr); Core PCE Price Index YoY (Apr); PCE Price Index MoM (Apr); PCE Price Index YoY (Apr)
+NFP,2018-06-01 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (May); Nonfarm Payrolls Private (May)
+CPI,2018-06-12 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (May); Core Inflation Rate YoY (May); Inflation Rate MoM (May); Inflation Rate YoY (May)
+FOMC_DECISION,2018-06-13 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2018-06-29 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (May); Core PCE Price Index YoY (May); PCE Price Index MoM (May); PCE Price Index YoY (May)
+FOMC_MINUTES,2018-07-05 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+NFP,2018-07-06 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Jun); Nonfarm Payrolls Private (Jun)
+CPI,2018-07-12 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Jun); Core Inflation Rate YoY (Jun); Inflation Rate MoM (Jun); Inflation Rate YoY (Jun)
+PCE,2018-07-31 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Jun); Core PCE Price Index YoY (Jun); PCE Price Index MoM (Jun); PCE Price Index YoY (Jun)
+FOMC_DECISION,2018-08-01 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+NFP,2018-08-03 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Jul); Nonfarm Payrolls Private (Jul)
+CPI,2018-08-10 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Jul); Core Inflation Rate YoY (Jul); Inflation Rate MoM (Jul); Inflation Rate YoY (Jul)
+FOMC_MINUTES,2018-08-22 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2018-08-30 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Jul); Core PCE Price Index YoY (Jul); PCE Price Index MoM (Jul); PCE Price Index YoY (Jul)
+NFP,2018-09-07 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Aug); Nonfarm Payrolls Private (Aug)
+CPI,2018-09-13 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Aug); Core Inflation Rate YoY (Aug); Inflation Rate MoM (Aug); Inflation Rate YoY (Aug)
+FOMC_DECISION,2018-09-26 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2018-09-28 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Aug); Core PCE Price Index YoY (Aug); PCE Price Index MoM (Aug); PCE Price Index YoY (Aug)
+NFP,2018-10-05 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Sep); Nonfarm Payrolls Private (Sep)
+CPI,2018-10-11 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Sep); Core Inflation Rate YoY (Sep); Inflation Rate MoM (Sep); Inflation Rate YoY (Sep)
+FOMC_MINUTES,2018-10-17 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2018-10-29 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Sep); Core PCE Price Index YoY (Sep); PCE Price Index MoM (Sep); PCE Price Index YoY (Sep)
+NFP,2018-11-02 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Oct); Nonfarm Payrolls Private (Oct)
+FOMC_DECISION,2018-11-08 19:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+CPI,2018-11-14 13:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Oct); Core Inflation Rate YoY (Oct); Inflation Rate MoM (Oct); Inflation Rate YoY (Oct)
+PCE,2018-11-29 13:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Oct); Core PCE Price Index YoY (Oct); PCE Price Index MoM (Oct); PCE Price Index YoY (Oct)
+FOMC_MINUTES,2018-11-29 19:00:00,medium,fmp_economics_calendar,FOMC Minutes
+NFP,2018-12-07 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Nov); Nonfarm Payrolls Private (Nov)
+CPI,2018-12-12 13:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Nov); Core Inflation Rate YoY (Nov); Inflation Rate MoM (Nov); Inflation Rate YoY (Nov)
+FOMC_DECISION,2018-12-19 19:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2018-12-21 15:00:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Nov); Core PCE Price Index YoY (Nov); PCE Price Index MoM (Nov); PCE Price Index YoY (Nov)
+NFP,2019-01-04 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Dec); Nonfarm Payrolls Private (Dec)
+FOMC_MINUTES,2019-01-09 19:00:00,medium,fmp_economics_calendar,FOMC Minutes
+CPI,2019-01-11 13:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Dec); Core Inflation Rate YoY (Dec); Inflation Rate MoM (Dec); Inflation Rate YoY (Dec)
+FOMC_DECISION,2019-01-30 19:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+NFP,2019-02-01 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Jan); Nonfarm Payrolls Private (Jan)
+CPI,2019-02-13 13:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Jan); Core Inflation Rate YoY (Jan); Inflation Rate MoM (Jan); Inflation Rate YoY (Jan)
+FOMC_MINUTES,2019-02-20 19:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2019-03-01 13:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Dec); Core PCE Price Index YoY (Dec); PCE Price Index MoM (Dec); PCE Price Index YoY (Dec)
+NFP,2019-03-08 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Feb); Nonfarm Payrolls Private (Feb)
+CPI,2019-03-12 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Feb); Core Inflation Rate YoY (Feb); Inflation Rate MoM (Feb); Inflation Rate YoY (Feb)
+FOMC_DECISION,2019-03-20 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2019-03-29 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Jan); Core PCE Price Index YoY (Jan); PCE Price Index MoM (Jan); PCE Price Index YoY (Jan)
+NFP,2019-04-05 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Mar); Nonfarm Payrolls Private (Mar)
+CPI,2019-04-10 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Mar); Core Inflation Rate YoY (Mar); Inflation Rate MoM (Mar); Inflation Rate YoY (Mar)
+FOMC_MINUTES,2019-04-10 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2019-04-29 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Feb); Core PCE Price Index MoM (Mar); Core PCE Price Index YoY (Feb); Core PCE Price Index YoY (Mar); PCE Price Index MoM (Feb); PCE Price Index MoM (Mar); PCE Price Index YoY (Feb); PCE Price Index YoY (Mar)
+FOMC_DECISION,2019-05-01 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+NFP,2019-05-03 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Apr); Nonfarm Payrolls Private (Apr)
+CPI,2019-05-10 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Apr); Core Inflation Rate YoY (Apr); Inflation Rate MoM (Apr); Inflation Rate YoY (Apr)
+FOMC_MINUTES,2019-05-22 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2019-05-31 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Apr); Core PCE Price Index YoY (Apr); PCE Price Index MoM (Apr); PCE Price Index YoY (Apr)
+NFP,2019-06-07 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (May); Nonfarm Payrolls Private (May)
+CPI,2019-06-12 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (May); Core Inflation Rate YoY (May); Inflation Rate MoM (May); Inflation Rate YoY (May)
+FOMC_DECISION,2019-06-19 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2019-06-28 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (May); Core PCE Price Index YoY (May); PCE Price Index MoM (May); PCE Price Index YoY (May)
+NFP,2019-07-05 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Jun); Nonfarm Payrolls Private (Jun)
+FOMC_MINUTES,2019-07-10 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+CPI,2019-07-11 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Jun); Core Inflation Rate YoY (Jun); Inflation Rate MoM (Jun); Inflation Rate YoY (Jun)
+PCE,2019-07-30 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Jun); Core PCE Price Index YoY (Jun); PCE Price Index MoM (Jun); PCE Price Index YoY (Jun)
+FOMC_DECISION,2019-07-31 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+NFP,2019-08-02 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Jul); Nonfarm Payrolls Private (Jul)
+CPI,2019-08-13 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Jul); Core Inflation Rate YoY (Jul); Inflation Rate MoM (Jul); Inflation Rate YoY (Jul)
+FOMC_MINUTES,2019-08-21 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2019-08-30 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Jul); Core PCE Price Index YoY (Jul); PCE Price Index MoM (Jul); PCE Price Index YoY (Jul)
+NFP,2019-09-06 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Aug); Nonfarm Payrolls Private (Aug)
+CPI,2019-09-12 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Aug); Core Inflation Rate YoY (Aug); Inflation Rate MoM (Aug); Inflation Rate YoY (Aug)
+FOMC_DECISION,2019-09-18 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2019-09-27 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Aug); Core PCE Price Index YoY (Aug); PCE Price Index MoM (Aug); PCE Price Index YoY (Aug)
+NFP,2019-10-04 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Sep); Nonfarm Payrolls Private (Sep)
+FOMC_MINUTES,2019-10-09 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+CPI,2019-10-10 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Sep); Core Inflation Rate YoY (Sep); Inflation Rate MoM (Sep); Inflation Rate YoY (Sep)
+FOMC_DECISION,2019-10-30 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2019-10-31 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Sep); Core PCE Price Index YoY (Sep); PCE Price Index MoM (Sep); PCE Price Index YoY (Sep)
+NFP,2019-11-01 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Oct); Nonfarm Payrolls Private (Oct)
+CPI,2019-11-13 13:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Oct); Core Inflation Rate YoY (Oct); Inflation Rate MoM (Oct); Inflation Rate YoY (Oct)
+FOMC_MINUTES,2019-11-20 19:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2019-11-27 15:00:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Oct); Core PCE Price Index YoY (Oct); PCE Price Index MoM (Oct); PCE Price Index YoY (Oct)
+NFP,2019-12-06 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Nov); Nonfarm Payrolls Private (Nov)
+CPI,2019-12-11 13:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Nov); Core Inflation Rate YoY (Nov); Inflation Rate MoM (Nov); Inflation Rate YoY (Nov)
+FOMC_DECISION,2019-12-11 19:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2019-12-20 15:00:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Nov); Core PCE Price Index YoY (Nov); PCE Price Index MoM (Nov); PCE Price Index YoY (Nov)
+FOMC_MINUTES,2020-01-03 19:00:00,medium,fmp_economics_calendar,FOMC Minutes
+NFP,2020-01-10 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Dec); Nonfarm Payrolls Private (Dec)
+CPI,2020-01-14 13:30:00,high,fmp_economics_calendar,CPI (Dec); CPI MoM (Dec); CPI YoY (Dec); Core CPI (Dec); Core CPI MoM (Dec); Core CPI YoY (Dec); Core Inflation Rate MoM (Dec); Core Inflation Rate YoY (Dec); Inflation Rate MoM (Dec); Inflation Rate YoY (Dec)
+FOMC_DECISION,2020-01-29 19:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2020-01-31 13:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Dec); Core PCE Price Index YoY (Dec); PCE Price Index MoM (Dec); PCE Price Index YoY (Dec)
+NFP,2020-02-07 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Jan); Nonfarm Payrolls Private (Jan)
+CPI,2020-02-13 13:30:00,high,fmp_economics_calendar,CPI (Jan); CPI MoM (Jan); CPI YoY (Jan); Core CPI (Jan); Core CPI MoM (Jan); Core CPI YoY (Jan); Core Inflation Rate MoM (Jan); Core Inflation Rate YoY (Jan); Inflation Rate MoM (Jan); Inflation Rate YoY (Jan)
+FOMC_MINUTES,2020-02-19 19:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2020-02-28 13:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Jan); Core PCE Price Index YoY (Jan); PCE Price Index MoM (Jan); PCE Price Index YoY (Jan)
+NFP,2020-03-06 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Feb); Nonfarm Payrolls Private (Feb)
+CPI,2020-03-11 12:30:00,high,fmp_economics_calendar,CPI (Feb); CPI MoM (Feb); CPI YoY (Feb); Core CPI (Feb); Core CPI MoM (Feb); Core CPI YoY (Feb); Core Inflation Rate MoM (Feb); Core Inflation Rate YoY (Feb); Inflation Rate MoM (Feb); Inflation Rate YoY (Feb)
+PCE,2020-03-27 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Feb); Core PCE Price Index YoY (Feb); PCE Price Index MoM (Feb); PCE Price Index YoY (Feb)
+NFP,2020-04-03 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Mar); Nonfarm Payrolls Private (Mar)
+FOMC_MINUTES,2020-04-08 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+CPI,2020-04-10 12:30:00,high,fmp_economics_calendar,CPI (Mar); CPI MoM (Mar); CPI YoY (Mar); Core CPI (Mar); Core CPI MoM (Mar); Core CPI YoY (Mar); Core Inflation Rate MoM (Mar); Core Inflation Rate YoY (Mar); Inflation Rate MoM (Mar); Inflation Rate YoY (Mar)
+FOMC_DECISION,2020-04-29 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2020-04-30 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Mar); Core PCE Price Index YoY (Mar); PCE Price Index MoM (Mar); PCE Price Index YoY (Mar)
+NFP,2020-05-08 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Apr); Nonfarm Payrolls Private (Apr)
+CPI,2020-05-12 12:30:00,high,fmp_economics_calendar,CPI (Apr); CPI MoM (Apr); CPI YoY (Apr); Core CPI (Apr); Core CPI MoM (Apr); Core CPI YoY (Apr); Core Inflation Rate MoM (Apr); Core Inflation Rate YoY (Apr); Inflation Rate MoM (Apr); Inflation Rate YoY (Apr)
+FOMC_MINUTES,2020-05-20 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2020-05-29 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Apr); Core PCE Price Index YoY (Apr); PCE Price Index MoM (Apr); PCE Price Index YoY (Apr)
+NFP,2020-06-05 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (May); Nonfarm Payrolls Private (May)
+CPI,2020-06-10 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (May); Core Inflation Rate YoY (May); Inflation Rate MoM (May); Inflation Rate YoY (May)
+FOMC_DECISION,2020-06-10 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2020-06-26 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (May); Core PCE Price Index YoY (May); PCE Price Index MoM (May); PCE Price Index YoY (May)
+FOMC_MINUTES,2020-07-01 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+NFP,2020-07-02 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Jun); Nonfarm Payrolls Private (Jun)
+CPI,2020-07-14 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Jun); Core Inflation Rate YoY (Jun); Inflation Rate MoM (Jun); Inflation Rate YoY (Jun)
+FOMC_DECISION,2020-07-29 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2020-07-31 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Jun); Core PCE Price Index YoY (Jun); PCE Price Index MoM (Jun); PCE Price Index YoY (Jun)
+NFP,2020-08-07 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Jul); Nonfarm Payrolls Private (Jul)
+CPI,2020-08-12 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Jul); Core Inflation Rate YoY (Jul); Inflation Rate MoM (Jul); Inflation Rate YoY (Jul)
+FOMC_MINUTES,2020-08-19 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2020-08-28 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Jul); Core PCE Price Index YoY (Jul); PCE Price Index MoM (Jul); PCE Price Index YoY (Jul)
+NFP,2020-09-04 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Aug); Nonfarm Payrolls Private (Aug)
+CPI,2020-09-11 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Aug); Core Inflation Rate YoY (Aug); Inflation Rate MoM (Aug); Inflation Rate YoY (Aug)
+FOMC_DECISION,2020-09-16 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2020-10-01 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Aug); Core PCE Price Index YoY (Aug); PCE Price Index MoM (Aug); PCE Price Index YoY (Aug)
+NFP,2020-10-02 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Sep); Nonfarm Payrolls Private (Sep)
+FOMC_MINUTES,2020-10-07 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+CPI,2020-10-13 12:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Sep); Core Inflation Rate YoY (Sep); Inflation Rate MoM (Sep); Inflation Rate YoY (Sep)
+PCE,2020-10-30 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Sep); Core PCE Price Index YoY (Sep); PCE Price Index MoM (Sep); PCE Price Index YoY (Sep)
+FOMC_DECISION,2020-11-05 19:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+NFP,2020-11-06 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Oct); Nonfarm Payrolls Private (Oct)
+CPI,2020-11-12 13:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Oct); Core Inflation Rate YoY (Oct); Inflation Rate MoM (Oct); Inflation Rate YoY (Oct)
+PCE,2020-11-25 15:00:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Oct); Core PCE Price Index YoY (Oct); PCE Price Index MoM (Oct); PCE Price Index YoY (Oct)
+FOMC_MINUTES,2020-11-25 19:00:00,medium,fmp_economics_calendar,FOMC Minutes
+NFP,2020-12-04 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Nov); Nonfarm Payrolls Private (Nov)
+CPI,2020-12-10 13:30:00,high,fmp_economics_calendar,Core Inflation Rate MoM (Nov); Core Inflation Rate YoY (Nov); Inflation Rate MoM (Nov); Inflation Rate YoY (Nov)
+FOMC_DECISION,2020-12-16 19:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2020-12-23 13:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Nov); Core PCE Price Index YoY (Nov); PCE Price Index MoM (Nov); PCE Price Index YoY (Nov)
+FOMC_MINUTES,2021-01-06 19:00:00,medium,fmp_economics_calendar,FOMC Minutes
+NFP,2021-01-08 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Dec); Nonfarm Payrolls Private (Dec)
+CPI,2021-01-13 13:30:00,high,fmp_economics_calendar,CPI (Dec); Core Inflation Rate MoM (Dec); Core Inflation Rate YoY (Dec); Inflation Rate MoM (Dec); Inflation Rate YoY (Dec)
+FOMC_DECISION,2021-01-27 19:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2021-01-29 13:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Dec); Core PCE Price Index YoY (Dec); PCE Price Index MoM (Dec); PCE Price Index YoY (Dec)
+NFP,2021-02-05 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Jan); Nonfarm Payrolls Private (Jan)
+CPI,2021-02-10 13:30:00,high,fmp_economics_calendar,CPI (Jan); Core Inflation Rate MoM (Jan); Core Inflation Rate YoY (Jan); Inflation Rate MoM (Jan); Inflation Rate YoY (Jan)
+FOMC_MINUTES,2021-02-17 19:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2021-02-26 13:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Jan); Core PCE Price Index YoY (Jan); PCE Price Index MoM (Jan); PCE Price Index YoY (Jan)
+NFP,2021-03-05 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Feb); Nonfarm Payrolls Private (Feb)
+CPI,2021-03-10 13:30:00,high,fmp_economics_calendar,CPI (Feb); Core Inflation Rate MoM (Feb); Core Inflation Rate YoY (Feb); Inflation Rate MoM (Feb); Inflation Rate YoY (Feb)
+FOMC_DECISION,2021-03-17 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2021-03-26 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Feb); Core PCE Price Index YoY (Feb); PCE Price Index MoM (Feb); PCE Price Index YoY (Feb)
+NFP,2021-04-02 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Mar); Nonfarm Payrolls Private (Mar)
+FOMC_MINUTES,2021-04-07 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+CPI,2021-04-13 12:30:00,high,fmp_economics_calendar,CPI (Mar); Core Inflation Rate MoM (Mar); Core Inflation Rate YoY (Mar); Inflation Rate MoM (Mar); Inflation Rate YoY (Mar)
+FOMC_DECISION,2021-04-28 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2021-04-30 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Mar); Core PCE Price Index YoY (Mar); PCE Price Index MoM (Mar); PCE Price Index YoY (Mar)
+NFP,2021-05-07 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Apr); Nonfarm Payrolls Private (Apr)
+CPI,2021-05-12 12:30:00,high,fmp_economics_calendar,CPI (Apr); Core Inflation Rate MoM (Apr); Core Inflation Rate YoY (Apr); Inflation Rate MoM (Apr); Inflation Rate YoY (Apr)
+FOMC_MINUTES,2021-05-19 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2021-05-28 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Apr); Core PCE Price Index YoY (Apr); PCE Price Index MoM (Apr); PCE Price Index YoY (Apr)
+NFP,2021-06-04 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (May); Nonfarm Payrolls Private (May)
+CPI,2021-06-10 12:30:00,high,fmp_economics_calendar,CPI (May); Core Inflation Rate MoM (May); Core Inflation Rate YoY (May); Inflation Rate MoM (May); Inflation Rate YoY (May)
+FOMC_DECISION,2021-06-16 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2021-06-25 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (May); Core PCE Price Index YoY (May); PCE Price Index MoM (May); PCE Price Index YoY (May)
+NFP,2021-07-02 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Jun); Nonfarm Payrolls Private (Jun)
+FOMC_MINUTES,2021-07-07 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+CPI,2021-07-13 12:30:00,high,fmp_economics_calendar,CPI (Jun); Core Inflation Rate MoM (Jun); Core Inflation Rate YoY (Jun); Inflation Rate MoM (Jun); Inflation Rate YoY (Jun)
+FOMC_DECISION,2021-07-28 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2021-07-30 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Jun); Core PCE Price Index YoY (Jun); PCE Price Index MoM (Jun); PCE Price Index YoY (Jun)
+NFP,2021-08-06 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Jul); Nonfarm Payrolls Private (Jul)
+CPI,2021-08-11 12:30:00,high,fmp_economics_calendar,CPI (Jul); Core Inflation Rate MoM (Jul); Core Inflation Rate YoY (Jul); Inflation Rate MoM (Jul); Inflation Rate YoY (Jul)
+FOMC_MINUTES,2021-08-18 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2021-08-27 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Jul); Core PCE Price Index YoY (Jul); PCE Price Index MoM (Jul); PCE Price Index YoY (Jul)
+NFP,2021-09-03 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Aug); Nonfarm Payrolls Private (Aug)
+CPI,2021-09-14 12:30:00,high,fmp_economics_calendar,CPI (Aug); Core Inflation Rate MoM (Aug); Core Inflation Rate YoY (Aug); Inflation Rate MoM (Aug); Inflation Rate YoY (Aug)
+FOMC_DECISION,2021-09-22 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2021-10-01 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Aug); Core PCE Price Index YoY (Aug); PCE Price Index MoM (Aug); PCE Price Index YoY (Aug)
+NFP,2021-10-08 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Sep); Nonfarm Payrolls Private (Sep)
+CPI,2021-10-13 12:30:00,high,fmp_economics_calendar,CPI (Sep); Core Inflation Rate MoM (Sep); Core Inflation Rate YoY (Sep); Inflation Rate MoM (Sep); Inflation Rate YoY (Sep)
+FOMC_MINUTES,2021-10-13 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2021-10-29 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Sep); Core PCE Price Index YoY (Sep); PCE Price Index MoM (Sep); PCE Price Index YoY (Sep)
+FOMC_DECISION,2021-11-03 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+NFP,2021-11-05 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Oct); Nonfarm Payrolls Private (Oct)
+CPI,2021-11-10 13:30:00,high,fmp_economics_calendar,CPI (Oct); Core Inflation Rate MoM (Oct); Core Inflation Rate YoY (Oct); Inflation Rate MoM (Oct); Inflation Rate YoY (Oct)
+PCE,2021-11-24 15:00:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Oct); Core PCE Price Index YoY (Oct); PCE Price Index MoM (Oct); PCE Price Index YoY (Oct)
+FOMC_MINUTES,2021-11-24 19:00:00,medium,fmp_economics_calendar,FOMC Minutes
+NFP,2021-12-03 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Nov); Nonfarm Payrolls Private (Nov)
+CPI,2021-12-10 13:30:00,high,fmp_economics_calendar,CPI (Nov); Core Inflation Rate MoM (Nov); Core Inflation Rate YoY (Nov); Inflation Rate MoM (Nov); Inflation Rate YoY (Nov)
+FOMC_DECISION,2021-12-15 19:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2021-12-23 13:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Nov); Core PCE Price Index YoY (Nov); PCE Price Index MoM (Nov); PCE Price Index YoY (Nov)
+FOMC_MINUTES,2022-01-05 19:00:00,medium,fmp_economics_calendar,FOMC Minutes
+NFP,2022-01-07 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Dec); Nonfarm Payrolls Private (Dec)
+CPI,2022-01-12 13:30:00,high,fmp_economics_calendar,CPI (Dec); Core Inflation Rate MoM (Dec); Core Inflation Rate YoY (Dec); Inflation Rate MoM (Dec); Inflation Rate YoY (Dec)
+FOMC_DECISION,2022-01-26 19:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2022-01-28 13:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Dec); Core PCE Price Index YoY (Dec); PCE Price Index MoM (Dec); PCE Price Index YoY (Dec)
+NFP,2022-02-04 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Jan); Nonfarm Payrolls Private (Jan)
+CPI,2022-02-10 13:30:00,high,fmp_economics_calendar,CPI (Jan); Core Inflation Rate MoM (Jan); Core Inflation Rate YoY (Jan); Inflation Rate MoM (Jan); Inflation Rate YoY (Jan)
+FOMC_MINUTES,2022-02-16 19:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2022-02-25 13:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Jan); Core PCE Price Index YoY (Jan); PCE Price Index MoM (Jan); PCE Price Index YoY (Jan)
+NFP,2022-03-04 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Feb); Nonfarm Payrolls Private (Feb)
+CPI,2022-03-10 13:30:00,high,fmp_economics_calendar,CPI (Feb); Core Inflation Rate MoM (Feb); Core Inflation Rate YoY (Feb); Inflation Rate MoM (Feb); Inflation Rate YoY (Feb)
+FOMC_DECISION,2022-03-16 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2022-03-31 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Feb); Core PCE Price Index YoY (Feb); PCE Price Index MoM (Feb); PCE Price Index YoY (Feb)
+NFP,2022-04-01 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Mar); Nonfarm Payrolls Private (Mar)
+FOMC_MINUTES,2022-04-06 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+CPI,2022-04-12 12:30:00,high,fmp_economics_calendar,CPI (Mar); Core Inflation Rate MoM (Mar); Core Inflation Rate YoY (Mar); Inflation Rate MoM (Mar); Inflation Rate YoY (Mar)
+PCE,2022-04-29 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Mar); Core PCE Price Index YoY (Mar); PCE Price Index MoM (Mar); PCE Price Index YoY (Mar)
+FOMC_DECISION,2022-05-04 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+NFP,2022-05-06 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Apr); Nonfarm Payrolls Private (Apr)
+CPI,2022-05-11 12:30:00,high,fmp_economics_calendar,CPI (Apr); Core Inflation Rate MoM (Apr); Core Inflation Rate YoY (Apr); Inflation Rate MoM (Apr); Inflation Rate YoY (Apr)
+FOMC_MINUTES,2022-05-25 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2022-05-27 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Apr); Core PCE Price Index YoY (Apr); PCE Price Index MoM (Apr); PCE Price Index YoY (Apr)
+NFP,2022-06-03 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (May); Nonfarm Payrolls Private (May)
+CPI,2022-06-10 12:30:00,high,fmp_economics_calendar,CPI (May); Core Inflation Rate MoM (May); Core Inflation Rate YoY (May); Inflation Rate MoM (May); Inflation Rate YoY (May)
+FOMC_DECISION,2022-06-15 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2022-06-30 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (May); Core PCE Price Index YoY (May); PCE Price Index MoM (May); PCE Price Index YoY (May)
+FOMC_MINUTES,2022-07-06 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+NFP,2022-07-08 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Jun); Nonfarm Payrolls Private (Jun)
+CPI,2022-07-13 12:30:00,high,fmp_economics_calendar,CPI (Jun); Core Inflation Rate MoM (Jun); Core Inflation Rate YoY (Jun); Inflation Rate MoM (Jun); Inflation Rate YoY (Jun)
+FOMC_DECISION,2022-07-27 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2022-07-29 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Jun); Core PCE Price Index YoY (Jun); PCE Price Index MoM (Jun); PCE Price Index YoY (Jun)
+NFP,2022-08-05 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Jul); Nonfarm Payrolls Private (Jul)
+CPI,2022-08-10 12:30:00,high,fmp_economics_calendar,CPI (Jul); Core Inflation Rate MoM (Jul); Core Inflation Rate YoY (Jul); Inflation Rate MoM (Jul); Inflation Rate YoY (Jul)
+FOMC_MINUTES,2022-08-17 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2022-08-26 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Jul); Core PCE Price Index YoY (Jul); PCE Price Index MoM (Jul); PCE Price Index YoY (Jul)
+NFP,2022-09-02 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Aug); Nonfarm Payrolls Private (Aug)
+CPI,2022-09-13 12:30:00,high,fmp_economics_calendar,CPI (Aug); Core Inflation Rate MoM (Aug); Core Inflation Rate YoY (Aug); Inflation Rate MoM (Aug); Inflation Rate YoY (Aug)
+FOMC_DECISION,2022-09-21 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2022-09-30 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Aug); Core PCE Price Index YoY (Aug); PCE Price Index MoM (Aug); PCE Price Index YoY (Aug)
+NFP,2022-10-07 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Sep); Nonfarm Payrolls Private (Sep)
+FOMC_MINUTES,2022-10-12 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+CPI,2022-10-13 12:30:00,high,fmp_economics_calendar,CPI (Sep); Core Inflation Rate MoM (Sep); Core Inflation Rate YoY (Sep); Inflation Rate MoM (Sep); Inflation Rate YoY (Sep)
+PCE,2022-10-28 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Sep); Core PCE Price Index YoY (Sep); PCE Price Index MoM (Sep); PCE Price Index YoY (Sep)
+FOMC_DECISION,2022-11-02 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+NFP,2022-11-04 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Oct); Nonfarm Payrolls Private (Oct)
+CPI,2022-11-10 13:30:00,high,fmp_economics_calendar,CPI (Oct); Core Inflation Rate MoM (Oct); Core Inflation Rate YoY (Oct); Inflation Rate MoM (Oct); Inflation Rate YoY (Oct)
+FOMC_MINUTES,2022-11-23 19:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2022-12-01 13:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Oct); Core PCE Price Index YoY (Oct); PCE Price Index MoM (Oct); PCE Price Index YoY (Oct)
+NFP,2022-12-02 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Nov); Nonfarm Payrolls Private (Nov)
+CPI,2022-12-13 13:30:00,high,fmp_economics_calendar,CPI (Nov); Core Inflation Rate MoM (Nov); Core Inflation Rate YoY (Nov); Inflation Rate MoM (Nov); Inflation Rate YoY (Nov)
+FOMC_DECISION,2022-12-14 19:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2022-12-23 13:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Nov); Core PCE Price Index YoY (Nov); PCE Price Index MoM (Nov); PCE Price Index YoY (Nov)
+FOMC_MINUTES,2023-01-04 19:00:00,medium,fmp_economics_calendar,FOMC Minutes
+NFP,2023-01-06 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Dec); Nonfarm Payrolls Private (Dec)
+CPI,2023-01-12 13:30:00,high,fmp_economics_calendar,CPI (Dec); Core Inflation Rate MoM (Dec); Core Inflation Rate YoY (Dec); Inflation Rate MoM (Dec); Inflation Rate YoY (Dec)
+PCE,2023-01-27 13:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Dec); Core PCE Price Index YoY (Dec); PCE Price Index MoM (Dec); PCE Price Index YoY (Dec)
+FOMC_DECISION,2023-02-01 19:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+NFP,2023-02-03 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Jan); Nonfarm Payrolls Private (Jan)
+CPI,2023-02-14 13:30:00,high,fmp_economics_calendar,CPI (Jan); Core Inflation Rate MoM (Jan); Core Inflation Rate YoY (Jan); Inflation Rate MoM (Jan); Inflation Rate YoY (Jan)
+FOMC_MINUTES,2023-02-22 19:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2023-02-24 13:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Jan); Core PCE Price Index YoY (Jan); PCE Price Index MoM (Jan); PCE Price Index YoY (Jan)
+NFP,2023-03-10 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Feb); Nonfarm Payrolls Private (Feb)
+CPI,2023-03-14 12:30:00,high,fmp_economics_calendar,CPI (Feb); CPI s.a (Feb); Core Inflation Rate MoM (Feb); Core Inflation Rate YoY (Feb); Inflation Rate MoM (Feb); Inflation Rate YoY (Feb)
+FOMC_DECISION,2023-03-22 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2023-03-31 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Feb); Core PCE Price Index YoY (Feb); PCE Price Index MoM (Feb); PCE Price Index YoY (Feb)
+NFP,2023-04-07 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Mar); Nonfarm Payrolls Private (Mar)
+CPI,2023-04-12 12:30:00,high,fmp_economics_calendar,CPI (Mar); CPI s.a (Mar); Core Inflation Rate MoM (Mar); Core Inflation Rate YoY (Mar); Inflation Rate MoM (Mar); Inflation Rate YoY (Mar)
+FOMC_MINUTES,2023-04-12 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2023-04-28 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Mar); Core PCE Price Index YoY (Mar); PCE Price Index MoM (Mar); PCE Price Index YoY (Mar)
+FOMC_DECISION,2023-05-03 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+NFP,2023-05-05 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Apr); Nonfarm Payrolls Private (Apr)
+CPI,2023-05-10 12:30:00,high,fmp_economics_calendar,CPI (Apr); CPI s.a (Apr); Core Inflation Rate MoM (Apr); Core Inflation Rate YoY (Apr); Inflation Rate MoM (Apr); Inflation Rate YoY (Apr)
+FOMC_MINUTES,2023-05-24 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2023-05-26 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Apr); Core PCE Price Index YoY (Apr); PCE Price Index MoM (Apr); PCE Price Index YoY (Apr)
+NFP,2023-06-02 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (May); Nonfarm Payrolls Private (May)
+CPI,2023-06-13 12:30:00,high,fmp_economics_calendar,CPI (May); CPI s.a (May); Core Inflation Rate MoM (May); Core Inflation Rate YoY (May); Inflation Rate MoM (May); Inflation Rate YoY (May)
+FOMC_DECISION,2023-06-14 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2023-06-30 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (May); Core PCE Price Index YoY (May); PCE Price Index MoM (May); PCE Price Index YoY (May)
+FOMC_MINUTES,2023-07-05 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+NFP,2023-07-07 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Jun); Nonfarm Payrolls Private (Jun)
+CPI,2023-07-12 12:30:00,high,fmp_economics_calendar,CPI (Jun); CPI s.a (Jun); Core Inflation Rate MoM (Jun); Core Inflation Rate YoY (Jun); Inflation Rate MoM (Jun); Inflation Rate YoY (Jun)
+FOMC_DECISION,2023-07-26 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2023-07-28 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Jun); Core PCE Price Index YoY (Jun); PCE Price Index MoM (Jun); PCE Price Index YoY (Jun)
+NFP,2023-08-04 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Jul); Nonfarm Payrolls Private (Jul)
+CPI,2023-08-10 12:30:00,high,fmp_economics_calendar,CPI (Jul); CPI s.a (Jul); Core Inflation Rate MoM (Jul); Core Inflation Rate YoY (Jul); Inflation Rate MoM (Jul); Inflation Rate YoY (Jul)
+FOMC_MINUTES,2023-08-16 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2023-08-31 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Jul); Core PCE Price Index YoY (Jul); PCE Price Index MoM (Jul); PCE Price Index YoY (Jul)
+NFP,2023-09-01 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Aug); Nonfarm Payrolls Private (Aug)
+CPI,2023-09-13 12:30:00,high,fmp_economics_calendar,CPI (Aug); CPI s.a (Aug); Core Inflation Rate MoM (Aug); Core Inflation Rate YoY (Aug); Inflation Rate MoM (Aug); Inflation Rate YoY (Aug)
+FOMC_DECISION,2023-09-20 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2023-09-29 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Aug); Core PCE Price Index YoY (Aug); PCE Price Index MoM (Aug); PCE Price Index YoY (Aug)
+NFP,2023-10-06 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Sep); Nonfarm Payrolls Private (Sep)
+FOMC_MINUTES,2023-10-11 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+CPI,2023-10-12 12:30:00,high,fmp_economics_calendar,CPI (Sep); CPI s.a (Sep); Core Inflation Rate MoM (Sep); Core Inflation Rate YoY (Sep); Inflation Rate MoM (Sep); Inflation Rate YoY (Sep)
+PCE,2023-10-27 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Sep); Core PCE Price Index YoY (Sep); PCE Price Index MoM (Sep); PCE Price Index YoY (Sep)
+FOMC_DECISION,2023-11-01 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+NFP,2023-11-03 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Oct); Nonfarm Payrolls Private (Oct)
+CPI,2023-11-14 13:30:00,high,fmp_economics_calendar,CPI (Oct); CPI s.a (Oct); Core Inflation Rate MoM (Oct); Core Inflation Rate YoY (Oct); Inflation Rate MoM (Oct); Inflation Rate YoY (Oct)
+FOMC_MINUTES,2023-11-21 19:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2023-11-30 13:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Oct); Core PCE Price Index YoY (Oct); PCE Price Index MoM (Oct); PCE Price Index YoY (Oct)
+NFP,2023-12-08 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Nov); Nonfarm Payrolls Private (Nov)
+CPI,2023-12-12 13:30:00,high,fmp_economics_calendar,CPI (Nov); CPI s.a (Nov); Core Inflation Rate MoM (Nov); Core Inflation Rate YoY (Nov); Inflation Rate MoM (Nov); Inflation Rate YoY (Nov)
+FOMC_DECISION,2023-12-13 19:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2023-12-22 13:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Nov); Core PCE Price Index YoY (Nov); PCE Price Index MoM (Nov); PCE Price Index YoY (Nov)
+FOMC_MINUTES,2024-01-03 19:00:00,medium,fmp_economics_calendar,FOMC Minutes
+NFP,2024-01-05 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Dec); Nonfarm Payrolls Private (Dec)
+CPI,2024-01-11 13:30:00,high,fmp_economics_calendar,CPI (Dec); CPI MoM (Dec); CPI YoY (Dec); CPI s.a (Dec); Core CPI (Dec); Core CPI MoM (Dec); Core CPI YoY (Dec); Core Inflation Rate MoM (Dec); Core Inflation Rate YoY (Dec); Inflation Rate MoM (Dec); Inflation Rate YoY (Dec)
+PCE,2024-01-26 13:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Dec); Core PCE Price Index YoY (Dec); PCE Price Index MoM (Dec); PCE Price Index YoY (Dec)
+FOMC_DECISION,2024-01-31 19:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+NFP,2024-02-02 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Jan); Nonfarm Payrolls Private (Jan)
+CPI,2024-02-13 13:30:00,high,fmp_economics_calendar,CPI (Jan); CPI MoM (Jan); CPI YoY (Jan); CPI s.a (Jan); Core CPI (Jan); Core CPI MoM (Jan); Core CPI YoY (Jan); Core Inflation Rate MoM (Jan); Core Inflation Rate YoY (Jan); Inflation Rate MoM (Jan); Inflation Rate YoY (Jan)
+FOMC_MINUTES,2024-02-21 19:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2024-02-29 13:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Jan); Core PCE Price Index YoY (Jan); PCE Price Index MoM (Jan); PCE Price Index YoY (Jan)
+NFP,2024-03-08 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Feb); Nonfarm Payrolls Private (Feb)
+CPI,2024-03-12 12:30:00,high,fmp_economics_calendar,CPI (Feb); CPI MoM (Feb); CPI YoY (Feb); CPI s.a (Feb); Core CPI (Feb); Core CPI MoM (Feb); Core CPI YoY (Feb); Core Inflation Rate MoM (Feb); Core Inflation Rate YoY (Feb); Inflation Rate MoM (Feb); Inflation Rate YoY (Feb)
+FOMC_DECISION,2024-03-20 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2024-03-29 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Feb); Core PCE Price Index YoY (Feb); PCE Price Index MoM (Feb); PCE Price Index YoY (Feb)
+NFP,2024-04-05 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Mar); Nonfarm Payrolls Private (Mar)
+CPI,2024-04-10 12:30:00,high,fmp_economics_calendar,CPI (Mar); CPI MoM (Mar); CPI YoY (Mar); CPI s.a (Mar); Core CPI (Mar); Core CPI MoM (Mar); Core CPI YoY (Mar); Core Inflation Rate MoM (Mar); Core Inflation Rate YoY (Mar); Inflation Rate MoM (Mar); Inflation Rate YoY (Mar)
+FOMC_MINUTES,2024-04-10 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2024-04-26 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Mar); Core PCE Price Index YoY (Mar); PCE Price Index MoM (Mar); PCE Price Index YoY (Mar)
+FOMC_DECISION,2024-05-01 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+NFP,2024-05-03 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Apr); Nonfarm Payrolls Private (Apr)
+CPI,2024-05-15 12:30:00,high,fmp_economics_calendar,CPI (Apr); CPI s.a (Apr); Core Inflation Rate MoM (Apr); Core Inflation Rate YoY (Apr); Inflation Rate MoM (Apr); Inflation Rate YoY (Apr)
+FOMC_MINUTES,2024-05-22 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2024-05-31 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Apr); Core PCE Price Index YoY (Apr); PCE Price Index MoM (Apr); PCE Price Index YoY (Apr)
+NFP,2024-06-07 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (May); Nonfarm Payrolls Private (May)
+CPI,2024-06-12 12:30:00,high,fmp_economics_calendar,CPI (May); CPI s.a (May); Core Inflation Rate MoM (May); Core Inflation Rate YoY (May); Inflation Rate MoM (May); Inflation Rate YoY (May)
+FOMC_DECISION,2024-06-12 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2024-06-28 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (May); Core PCE Price Index YoY (May); PCE Price Index MoM (May); PCE Price Index YoY (May)
+FOMC_MINUTES,2024-07-03 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+NFP,2024-07-05 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Jun); Nonfarm Payrolls Private (Jun)
+CPI,2024-07-11 12:30:00,high,fmp_economics_calendar,CPI (Jun); CPI s.a (Jun); Core Inflation Rate MoM (Jun); Core Inflation Rate YoY (Jun); Inflation Rate MoM (Jun); Inflation Rate YoY (Jun)
+PCE,2024-07-26 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Jun); Core PCE Price Index YoY (Jun); PCE Price Index MoM (Jun); PCE Price Index YoY (Jun)
+FOMC_DECISION,2024-07-31 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+NFP,2024-08-02 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Jul); Nonfarm Payrolls Private (Jul)
+CPI,2024-08-14 12:30:00,high,fmp_economics_calendar,CPI (Jul); CPI s.a (Jul); Core Inflation Rate MoM (Jul); Core Inflation Rate YoY (Jul); Inflation Rate MoM (Jul); Inflation Rate YoY (Jul)
+FOMC_MINUTES,2024-08-21 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2024-08-30 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Jul); Core PCE Price Index YoY (Jul); PCE Price Index MoM (Jul); PCE Price Index YoY (Jul)
+NFP,2024-09-06 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Aug); Nonfarm Payrolls Private (Aug)
+CPI,2024-09-11 12:30:00,high,fmp_economics_calendar,CPI (Aug); CPI s.a (Aug); Core Inflation Rate MoM (Aug); Core Inflation Rate YoY (Aug); Inflation Rate MoM (Aug); Inflation Rate YoY (Aug)
+FOMC_DECISION,2024-09-18 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2024-09-27 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Aug); Core PCE Price Index YoY (Aug); PCE Price Index MoM (Aug); PCE Price Index YoY (Aug)
+NFP,2024-10-04 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Sep); Nonfarm Payrolls Private (Sep)
+FOMC_MINUTES,2024-10-09 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+CPI,2024-10-10 12:30:00,high,fmp_economics_calendar,CPI (Sep); CPI s.a (Sep); Core Inflation Rate MoM (Sep); Core Inflation Rate YoY (Sep); Inflation Rate MoM (Sep); Inflation Rate YoY (Sep)
+PCE,2024-10-31 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Sep); Core PCE Price Index YoY (Sep); PCE Price Index MoM (Sep); PCE Price Index YoY (Sep)
+NFP,2024-11-01 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Oct); Nonfarm Payrolls Private (Oct)
+FOMC_DECISION,2024-11-07 19:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+CPI,2024-11-13 13:30:00,high,fmp_economics_calendar,CPI (Oct); CPI s.a (Oct); Core Inflation Rate MoM (Oct); Core Inflation Rate YoY (Oct); Inflation Rate MoM (Oct); Inflation Rate YoY (Oct)
+FOMC_MINUTES,2024-11-26 19:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2024-11-27 15:00:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Oct); Core PCE Price Index YoY (Oct); PCE Price Index MoM (Oct); PCE Price Index YoY (Oct)
+NFP,2024-12-06 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Nov); Nonfarm Payrolls Private (Nov)
+CPI,2024-12-11 13:30:00,high,fmp_economics_calendar,CPI (Nov); CPI s.a (Nov); Core Inflation Rate MoM (Nov); Core Inflation Rate YoY (Nov); Inflation Rate MoM (Nov); Inflation Rate YoY (Nov)
+FOMC_DECISION,2024-12-18 19:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2024-12-20 13:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Nov); Core PCE Price Index YoY (Nov); PCE Price Index MoM (Nov); PCE Price Index YoY (Nov)
+FOMC_MINUTES,2025-01-08 19:00:00,medium,fmp_economics_calendar,FOMC Minutes
+NFP,2025-01-10 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Dec); Nonfarm Payrolls Private (Dec)
+CPI,2025-01-15 13:30:00,high,fmp_economics_calendar,CPI (Dec); CPI MoM (Dec); CPI YoY (Dec); CPI s.a (Dec); Core CPI (Dec); Core CPI MoM (Dec); Core CPI YoY (Dec); Core Inflation Rate MoM (Dec); Core Inflation Rate YoY (Dec); Inflation Rate MoM (Dec); Inflation Rate YoY (Dec)
+FOMC_DECISION,2025-01-29 19:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2025-01-31 13:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Dec); Core PCE Price Index YoY (Dec); PCE Price Index MoM (Dec); PCE Price Index YoY (Dec)
+NFP,2025-02-07 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Jan); Nonfarm Payrolls Private (Jan)
+CPI,2025-02-12 13:30:00,high,fmp_economics_calendar,CPI (Jan); CPI MoM (Jan); CPI YoY (Jan); CPI s.a (Jan); Core CPI (Jan); Core CPI MoM (Jan); Core CPI YoY (Jan); Core Inflation Rate MoM (Jan); Core Inflation Rate YoY (Jan); Inflation Rate MoM (Jan); Inflation Rate YoY (Jan)
+FOMC_MINUTES,2025-02-19 19:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2025-02-28 13:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Jan); Core PCE Price Index YoY (Jan); PCE Price Index MoM (Jan); PCE Price Index YoY (Jan)
+NFP,2025-03-07 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Feb); Nonfarm Payrolls Private (Feb)
+CPI,2025-03-12 12:30:00,high,fmp_economics_calendar,CPI (Feb); CPI MoM (Feb); CPI YoY (Feb); CPI s.a (Feb); Core CPI (Feb); Core CPI MoM (Feb); Core CPI YoY (Feb); Core Inflation Rate MoM (Feb); Core Inflation Rate YoY (Feb); Inflation Rate MoM (Feb); Inflation Rate YoY (Feb)
+FOMC_DECISION,2025-03-19 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2025-03-28 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Feb); Core PCE Price Index YoY (Feb); PCE Price Index MoM (Feb); PCE Price Index YoY (Feb)
+NFP,2025-04-04 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Mar); Nonfarm Payrolls Private (Mar)
+FOMC_MINUTES,2025-04-09 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+CPI,2025-04-10 12:30:00,high,fmp_economics_calendar,CPI (Mar); CPI MoM (Mar); CPI YoY (Mar); CPI s.a (Mar); Core CPI (Mar); Core CPI MoM (Mar); Core CPI YoY (Mar); Core Inflation Rate MoM (Mar); Core Inflation Rate YoY (Mar); Inflation Rate MoM (Mar); Inflation Rate YoY (Mar)
+PCE,2025-04-30 14:00:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Mar); Core PCE Price Index YoY (Mar); PCE Price Index MoM (Mar); PCE Price Index YoY (Mar)
+NFP,2025-05-02 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Apr); Nonfarm Payrolls Private (Apr)
+FOMC_DECISION,2025-05-07 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+CPI,2025-05-13 12:30:00,high,fmp_economics_calendar,CPI (Apr); CPI MoM (Apr); CPI YoY (Apr); CPI s.a (Apr); Core CPI (Apr); Core CPI MoM (Apr); Core CPI YoY (Apr); Core Inflation Rate MoM (Apr); Core Inflation Rate YoY (Apr); Inflation Rate MoM (Apr); Inflation Rate YoY (Apr)
+FOMC_MINUTES,2025-05-28 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2025-05-30 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Apr); Core PCE Price Index YoY (Apr); PCE Price Index MoM (Apr); PCE Price Index YoY (Apr)
+NFP,2025-06-06 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (May); Nonfarm Payrolls Private (May)
+CPI,2025-06-11 12:30:00,high,fmp_economics_calendar,CPI (May); CPI MoM (May); CPI YoY (May); CPI s.a (May); Core CPI (May); Core CPI MoM (May); Core CPI YoY (May); Core Inflation Rate MoM (May); Core Inflation Rate YoY (May); Inflation Rate MoM (May); Inflation Rate YoY (May)
+FOMC_DECISION,2025-06-18 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2025-06-27 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (May); Core PCE Price Index YoY (May); PCE Price Index MoM (May); PCE Price Index YoY (May)
+NFP,2025-07-03 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Jun); Nonfarm Payrolls Private (Jun)
+FOMC_MINUTES,2025-07-09 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+CPI,2025-07-15 12:30:00,high,fmp_economics_calendar,CPI (Jun); CPI MoM (Jun); CPI YoY (Jun); CPI s.a (Jun); Core CPI (Jun); Core CPI MoM (Jun); Core CPI YoY (Jun); Core Inflation Rate MoM (Jun); Core Inflation Rate YoY (Jun); Inflation Rate MoM (Jun); Inflation Rate YoY (Jun)
+FOMC_DECISION,2025-07-30 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2025-07-31 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Jun); Core PCE Price Index YoY (Jun); PCE Price Index MoM (Jun); PCE Price Index YoY (Jun)
+NFP,2025-08-01 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Jul); Nonfarm Payrolls Private (Jul)
+CPI,2025-08-12 12:30:00,high,fmp_economics_calendar,CPI (Jul); CPI s.a (Jul); Core Inflation Rate MoM (Jul); Core Inflation Rate YoY (Jul); Inflation Rate MoM (Jul); Inflation Rate YoY (Jul)
+FOMC_MINUTES,2025-08-20 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2025-08-29 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Jul); Core PCE Price Index YoY (Jul); PCE Price Index MoM (Jul); PCE Price Index YoY (Jul)
+NFP,2025-09-05 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Aug); Nonfarm Payrolls Private (Aug)
+CPI,2025-09-11 12:30:00,high,fmp_economics_calendar,CPI (Aug); CPI s.a (Aug); Core Inflation Rate MoM (Aug); Core Inflation Rate YoY (Aug); Inflation Rate MoM (Aug); Inflation Rate YoY (Aug)
+FOMC_DECISION,2025-09-17 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2025-09-26 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Aug); Core PCE Price Index YoY (Aug); PCE Price Index MoM (Aug); PCE Price Index YoY (Aug)
+FOMC_MINUTES,2025-10-08 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+CPI,2025-10-24 12:30:00,high,fmp_economics_calendar,CPI (Sep); CPI s.a (Sep); Core Inflation Rate MoM (Sep); Core Inflation Rate YoY (Sep); Inflation Rate MoM (Sep); Inflation Rate YoY (Sep)
+FOMC_DECISION,2025-10-29 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+CPI,2025-11-13 13:30:00,high,fmp_economics_calendar,CPI (Oct); CPI YoY (Oct); CPI s.a (Oct); Core CPI (Oct); Core CPI YoY (Oct); Core Inflation Rate MoM (Oct); Core Inflation Rate YoY (Oct); Inflation Rate MoM (Oct); Inflation Rate YoY (Oct)
+FOMC_MINUTES,2025-11-19 19:00:00,medium,fmp_economics_calendar,FOMC Minutes
+NFP,2025-11-20 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Sep); Nonfarm Payrolls Private (Sep)
+PCE,2025-12-05 15:00:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Sep); Core PCE Price Index YoY (Sep); PCE Price Index MoM (Sep); PCE Price Index YoY (Sep)
+FOMC_DECISION,2025-12-10 19:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+NFP,2025-12-16 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Nov); Non Farm Payrolls (Oct); Nonfarm Payrolls Private (Nov); Nonfarm Payrolls Private (Oct)
+CPI,2025-12-18 13:30:00,high,fmp_economics_calendar,CPI (Nov); CPI s.a (Nov); Core CPI MoM (Nov); Core Inflation Rate MoM (Nov); Core Inflation Rate YoY (Nov); Inflation Rate MoM (Nov); Inflation Rate YoY (Nov)
+PCE,2025-12-23 13:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Oct)
+FOMC_MINUTES,2025-12-30 19:00:00,medium,fmp_economics_calendar,FOMC Minutes
+NFP,2026-01-09 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Dec); Nonfarm Payrolls Private (Dec)
+CPI,2026-01-13 13:30:00,high,fmp_economics_calendar,CPI (Dec); CPI MoM (Dec); CPI MoM (Oct); CPI YoY (Dec); CPI s.a (Dec); Core CPI (Dec); Core CPI MoM (Dec); Core CPI MoM (Oct); Core CPI YoY (Dec); Core Inflation Rate MoM (Dec); Core Inflation Rate YoY (Dec); Inflation Rate MoM (Dec); Inflation Rate YoY (Dec)
+PCE,2026-01-22 15:00:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Nov); Core PCE Price Index YoY (Nov); Core PCE Price Index YoY (Oct); PCE Price Index MoM (Nov); PCE Price Index MoM (Oct); PCE Price Index YoY (Nov); PCE Price Index YoY (Oct)
+FOMC_DECISION,2026-01-28 19:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+NFP,2026-02-11 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Jan); Nonfarm Payrolls Private (Jan)
+CPI,2026-02-13 13:30:00,high,fmp_economics_calendar,CPI (Jan); CPI MoM (Jan); CPI YoY (Jan); CPI s.a (Jan); Core CPI (Jan); Core Inflation Rate MoM (Jan); Core Inflation Rate YoY (Jan); Inflation Rate MoM (Jan); Inflation Rate YoY (Jan)
+FOMC_MINUTES,2026-02-18 19:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2026-02-20 13:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Dec); Core PCE Price Index YoY (Dec); PCE Price Index MoM (Dec); PCE Price Index YoY (Dec)
+NFP,2026-03-06 13:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Feb); Nonfarm Payrolls Private (Feb)
+CPI,2026-03-11 12:30:00,high,fmp_economics_calendar,CPI (Feb); CPI MoM (Feb); CPI YoY (Feb); CPI s.a (Feb); Core CPI (Feb); Core CPI MoM (Feb); Core CPI YoY (Feb); Core Inflation Rate MoM (Feb); Core Inflation Rate YoY (Feb); Inflation Rate MoM (Feb); Inflation Rate YoY (Feb)
+PCE,2026-03-13 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Jan); Core PCE Price Index YoY (Jan); PCE Price Index MoM (Jan); PCE Price Index YoY (Jan)
+FOMC_DECISION,2026-03-18 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+NFP,2026-04-03 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Mar); Nonfarm Payrolls Private (Mar)
+FOMC_MINUTES,2026-04-08 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2026-04-09 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Feb); Core PCE Price Index YoY (Feb); PCE Price Index MoM (Feb); PCE Price Index YoY (Feb)
+CPI,2026-04-10 12:30:00,high,fmp_economics_calendar,CPI (Mar); CPI MoM (Mar); CPI YoY (Mar); CPI s.a (Mar); Core CPI (Mar); Core CPI MoM (Mar); Core CPI YoY (Mar); Core Inflation Rate MoM (Mar); Core Inflation Rate YoY (Mar); Inflation Rate MoM (Mar); Inflation Rate YoY (Mar)
+FOMC_DECISION,2026-04-29 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2026-04-30 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Mar); Core PCE Price Index YoY (Mar); PCE Price Index MoM (Mar); PCE Price Index YoY (Mar)
+NFP,2026-05-08 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Apr); Nonfarm Payrolls Private (Apr)
+CPI,2026-05-12 12:30:00,high,fmp_economics_calendar,CPI (Apr); CPI MoM (Apr); CPI YoY (Apr); CPI s.a (Apr); Core CPI (Apr); Core CPI MoM (Apr); Core CPI YoY (Apr); Core Inflation Rate MoM (Apr); Core Inflation Rate YoY (Apr); Inflation Rate MoM (Apr); Inflation Rate YoY (Apr)
+FOMC_MINUTES,2026-05-20 18:00:00,medium,fmp_economics_calendar,FOMC Minutes
+PCE,2026-05-28 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (Apr); Core PCE Price Index YoY (Apr); PCE Price Index MoM (Apr); PCE Price Index YoY (Apr)
+NFP,2026-06-05 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (May); Nonfarm Payrolls Private (May)
+CPI,2026-06-10 12:30:00,high,fmp_economics_calendar,CPI (May); CPI MoM (May); CPI YoY (May); CPI s.a (May); Core CPI (May); Core CPI MoM (May); Core CPI YoY (May); Core Inflation Rate MoM (May); Core Inflation Rate YoY (May); Inflation Rate MoM (May); Inflation Rate YoY (May)
+FOMC_DECISION,2026-06-17 18:00:00,high,fmp_economics_calendar,Fed Interest Rate Decision
+PCE,2026-06-25 12:30:00,medium,fmp_economics_calendar,Core PCE Price Index MoM (May); Core PCE Price Index YoY (May); PCE Price Index MoM (May); PCE Price Index YoY (May)
+NFP,2026-07-02 12:30:00,high,fmp_economics_calendar,Non Farm Payrolls (Jun); Nonfarm Payrolls Private (Jun)
