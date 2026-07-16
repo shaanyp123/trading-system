@@ -402,8 +402,15 @@ class SdkCoinbaseBrokerClient:
             # status so callers can distinguish retryable venue shapes
             # (the order-poll 404 read-after-write gap, 2026-07-16
             # incident) from generic transport failure. getattr-chained:
-            # non-HTTP exceptions simply carry http_status=None.
-            status = getattr(getattr(exc, "response", None), "status_code", None)
+            # non-HTTP exceptions simply carry http_status=None. The
+            # try/except makes the extraction airtight against exotic
+            # exception shapes whose `response`/`status_code` are
+            # raising properties (risk-review note #3) — extraction
+            # failure must never mask the original venue error.
+            try:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+            except Exception:
+                status = None
             raise BrokerError(
                 operation=operation,
                 detail=repr(exc),

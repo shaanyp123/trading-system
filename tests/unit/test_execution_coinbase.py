@@ -1075,3 +1075,69 @@ class TestBrokerErrorHttpStatus:
         with pytest.raises(BrokerError) as excinfo:
             asyncio.run(client._call("list_positions", _raiser))
         assert excinfo.value.http_status is None
+
+    def test_stop_verify_persistent_404_still_times_out_within_gate_a2_bound(self) -> None:
+        """Risk-review should-fix #1: a stop that 404s forever AND never
+        appears in list_open_orders must still end in
+        StopVerificationError within the unchanged 10 s verify bound —
+        the 404 tolerance may only skip the terminal check, never the
+        timeout."""
+
+        class _NeverVisible(_FakeBroker):
+            async def list_open_orders(
+                self, product_id: str | None = None
+            ) -> list[BrokerOrderState]:
+                return []
+
+            async def get_order(self, order_id: str) -> BrokerOrderState:
+                raise _not_found_error()
+
+        tm = _TimeMachine()
+        broker = _NeverVisible(stop="stay_open")
+        adapter = _adapter(broker, tm)
+        with pytest.raises(StopVerificationError, match="not confirmed resting"):
+            asyncio.run(
+                adapter.ensure_native_stop(
+                    product=BTC_PERP,
+                    position_contracts=Decimal(-2),
+                    entry_ref=Decimal("62265"),
+                    atrp=Decimal("0.0322"),
+                    decision_date=D,
+                    decision_seq=0,
+                )
+            )
+        # verify loop sleeps 1 s per pass; the 10 s bound caps the wait
+        assert sum(tm.slept) <= 11.0
+
+    def test_404_grace_floor_outlives_a_short_stage_deadline(self) -> None:
+        """Risk-review should-fix #2: with a 10 s stage deadline (IOC/
+        market shape) the 404 arm keeps retrying to the 30 s grace
+        floor — a fill that becomes visible at 15 s is recovered
+        instead of stranding the leg."""
+        tm = _TimeMachine()
+        broker = _NotFoundThenFillBroker(not_found_polls=3, post_only="fill")
+        seed = BrokerOrderRequest(
+            client_order_id="cid-x",
+            product_id=BTC_PERP.product_id,
+            side="buy",
+            contracts=Decimal(2),
+            kind="limit_post_only",
+            limit_price=Decimal("100000"),
+        )
+        broker.orders["venue-x"] = _FakeOrder(seed, "fill")
+        adapter = _adapter(broker, tm)
+        # poll_interval 5 s: 404s at t=0/5/10 (10 >= the old deadline —
+        # pre-floor this raised), visible + filled at t=15 < 30 floor.
+        state = asyncio.run(adapter._await_order_terminal_or_deadline("venue-x", deadline_s=10.0))
+        assert state.status == "filled"
+        assert broker.get_order_calls == 4
+
+    def test_404_grace_floor_still_raises_when_persistent(self) -> None:
+        """The floor widens the window; it does not remove the raise."""
+        tm = _TimeMachine()
+        broker = _NotFoundThenFillBroker(not_found_polls=10_000, post_only="fill")
+        adapter = _adapter(broker, tm)
+        with pytest.raises(BrokerError) as excinfo:
+            asyncio.run(adapter._await_order_terminal_or_deadline("venue-x", deadline_s=10.0))
+        assert excinfo.value.http_status == 404
+        assert 30.0 <= sum(tm.slept) <= 40.0  # bounded by the grace floor, not 10 s
