@@ -1663,6 +1663,18 @@ class StrategyWorker:
         self._tick_failure_halt_fired = False
         self._tick_failure_halt_invoke_alerted = False
         self._dispatch_blocked_no_risk_state_alerted = False
+        # Two-tick confirmation latch for venue-vs-tracked position
+        # divergences (2026-07-14 incident): asset -> the (tracked, venue)
+        # observation from the previous successful-fetch tick. A divergence
+        # acts only when the SAME pair repeats on the next such tick —
+        # pair-keyed so a leg/flatten mutating tracked contracts between
+        # ticks invalidates the pending observation (risk-review 2026-07-16
+        # finding 2). Native-stop fills bypass the latch entirely.
+        self._external_divergence_pending: dict[str, tuple[int, int]] = {}
+        # One-shot-per-(decision_date, asset) delivery latch for the
+        # engine-state divergence tripwire (confirmed-delivery latching per
+        # the #387 pattern).
+        self._engine_divergence_alerted: set[tuple[date, str]] = set()
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -2045,31 +2057,34 @@ class StrategyWorker:
         if self.account_id is None:
             return
 
-        # 1) Venue snapshots (bounded by the client's per-call timeout).
+        # 1) Venue balance snapshot (bounded by the client's per-call timeout).
         summary: FuturesBalanceSummary | None
         try:
             summary = await self._broker.get_futures_balance_summary()
         except Exception:
             self._log.warning("strategy_worker_balance_fetch_failed")
             summary = None
-        venue_positions: dict[str, BrokerPosition] | None
-        try:
-            venue_positions = {p.product_id: p for p in await self._broker.list_positions()}
-        except Exception:
-            self._log.warning("strategy_worker_positions_fetch_failed")
-            venue_positions = None
 
-        # 2) Native-stop fill / external-change detection.
-        if venue_positions is not None:
-            await self._detect_external_position_changes(venue_positions, now_utc=now_utc)
+        # 2) Native-stop fill / external-change detection. The positions
+        # snapshot is fetched INSIDE the trade lock (2026-07-14 incident):
+        # a snapshot captured before the lock is stale by construction when
+        # a decision leg fills while the detector awaits the lock.
+        await self._detect_external_position_changes(now_utc=now_utc)
 
         # 2b) Re-arm any missing native stop (gate A2 posture: a position
         # must never sit without its venue-resting backstop; a failed arm
-        # retries every tick and logs each attempt).
+        # retries every tick and logs each attempt). Under the trade lock
+        # with a re-check (2026-07-14 incident class): the arm mutates rt
+        # AND the venue, so it must serialize with dispatch legs and the
+        # external-change detector like every other stop/tracking mutation.
         for asset in ASSETS:
-            rt = self.state[asset]
-            if rt.contracts != 0 and rt.native_stop_order_id is None:
-                await self._arm_native_stop(asset, reason="risk_loop_rearm")
+            if self.state[asset].contracts != 0 and self.state[asset].native_stop_order_id is None:
+                async with self._trade_lock:
+                    # Re-fetch under the lock: a crash-resume can swap
+                    # self.state wholesale, orphaning a pre-lock reference.
+                    rt = self.state[asset]
+                    if rt.contracts != 0 and rt.native_stop_order_id is None:
+                        await self._arm_native_stop(asset, reason="risk_loop_rearm")
 
         # 3) Data-outage policy (§7): stale marks ⇒ protected-hold / flatten.
         if self._marks_stale(now_utc=now_utc):
@@ -2175,56 +2190,29 @@ class StrategyWorker:
                 )
             return
 
-        # 5b) Daily loss limit (from 00:00 UTC baseline).
-        if not already_halted and self._day_start_equity is not None and self._day_start_equity > 0:
+        # 5b) Daily loss limit (from 00:00 UTC baseline). Same F4 rule as
+        # the floor path above (risk-review 2026-07-16 re-review B1): the
+        # flatten re-fires while the breach persists and positions exist
+        # even when already HALT_NEW — a venue-recheck skip on the first
+        # attempt (false-flat read) must self-heal on a later tick instead
+        # of stranding an open position under halt with a cancelled
+        # backstop; only the FSM transition is retrip-guarded.
+        if self._day_start_equity is not None and self._day_start_equity > 0:
             daily_pnl_frac = equity / self._day_start_equity - 1
             if daily_pnl_frac < daily_limit:
-                self._log.error(
-                    "strategy_worker_daily_loss_limit_breached",
-                    daily_pnl_frac=str(daily_pnl_frac),
-                    limit=str(daily_limit),
-                    equity_usd=str(equity),
-                    day_start_equity_usd=str(self._day_start_equity),
-                )
-                await self._flatten_all(reason="daily_loss", now_utc=now_utc)
-                result = await self._store.invoke_kill_switch(
-                    self.account_id,
-                    trigger=TransitionTrigger.DAILY_LOSS_BREACH,
-                    now_utc=now_utc,
-                )
-                # Same honest-alert rule as the floor path: only APPLIED may
-                # claim HALT_NEW. NO_RISK_STATE_ROW retries next tick (the
-                # already_halted guard stays False without a row).
-                if result is KillSwitchInvokeResult.APPLIED:
-                    halt_outcome = "flattened + HALT_NEW (daily_loss_breach)"
-                elif result is KillSwitchInvokeResult.ALREADY_HALTED:
-                    halt_outcome = "flattened; already HALT_NEW (no FSM retrip)"
-                else:
-                    halt_outcome = (
-                        "flattened; kill switch found NO risk_state row — "
-                        "HALT_NEW NOT applied; retrying next tick"
+                has_positions = any(self.state[a].contracts != 0 for a in ASSETS)
+                # Halted AND flat: nothing to protect this tick — fall
+                # through to 5c/5d as before.
+                if not already_halted or has_positions:
+                    await self._apply_daily_loss_breach(
+                        daily_pnl_frac=daily_pnl_frac,
+                        daily_limit=daily_limit,
+                        equity=equity,
+                        has_positions=has_positions,
+                        already_halted=already_halted,
+                        now_utc=now_utc,
                     )
-                await self._store.insert_alert(
-                    self.account_id,
-                    severity="P1",
-                    category="kill_switch_invoked",
-                    message=(
-                        f"daily loss limit breached ({daily_pnl_frac:.4f} < "
-                        f"{daily_limit}) — {halt_outcome}"
-                    ),
-                    detail={
-                        "trigger": TransitionTrigger.DAILY_LOSS_BREACH.value,
-                        "daily_pnl_frac": str(daily_pnl_frac),
-                        "limit": str(daily_limit),
-                        "equity_usd": str(equity),
-                        "day_start_equity_usd": str(self._day_start_equity),
-                        "source": "strategy_worker_risk_loop",
-                        "transition_applied": result is KillSwitchInvokeResult.APPLIED,
-                        "invoke_result": result.value,
-                    },
-                    now_utc=now_utc,
-                )
-                return
+                    return
 
         # 5c) Weekly loss limit — engine semantics: halve V_target for 7
         # days (strategy §7); NOT an FSM halt.
@@ -2255,18 +2243,118 @@ class StrategyWorker:
                 )
                 await self._force_reduce_half(now_utc=now_utc)
 
-    async def _detect_external_position_changes(
-        self, venue_positions: Mapping[str, BrokerPosition], *, now_utc: datetime
+    async def _apply_daily_loss_breach(
+        self,
+        *,
+        daily_pnl_frac: Decimal,
+        daily_limit: Decimal,
+        equity: Decimal,
+        has_positions: bool,
+        already_halted: bool,
+        now_utc: datetime,
     ) -> None:
+        """Daily-loss breach handling: flatten (re-firing under HALT_NEW
+        while positions exist — F4 pattern), FSM invoke retrip-guarded,
+        honest alerts on both shapes."""
+        assert self.account_id is not None
+        self._log.error(
+            "strategy_worker_daily_loss_limit_breached",
+            daily_pnl_frac=str(daily_pnl_frac),
+            limit=str(daily_limit),
+            equity_usd=str(equity),
+            day_start_equity_usd=str(self._day_start_equity),
+            already_halted=already_halted,
+        )
+        if already_halted:
+            # Persistent-halt re-fire: flatten only while positions exist
+            # (no every-tick global cancels/preempts under a lasting halt).
+            if has_positions:
+                await self._flatten_all(reason="daily_loss", now_utc=now_utc)
+        else:
+            # Fresh breach: UNCONDITIONAL, matching the pre-change path —
+            # `_flatten_all` also preempts an in-flight decision dispatch
+            # and cancels resting orders globally, which matters even on a
+            # tracked-flat book (an entry ladder can be resting at the
+            # venue when the halt lands; re-review N1).
+            await self._flatten_all(reason="daily_loss", now_utc=now_utc)
+        if already_halted:
+            # Already halted, but positions existed under a persisting
+            # breach — the re-fired flatten must be visible (F1a + F4).
+            await self._store.insert_alert(
+                self.account_id,
+                severity="P1",
+                category="kill_switch_invoked",
+                message=(
+                    f"daily loss limit breached ({daily_pnl_frac:.4f} < "
+                    f"{daily_limit}) while already HALT_NEW — open positions "
+                    "flattened (no FSM retrip)"
+                ),
+                detail={
+                    "daily_pnl_frac": str(daily_pnl_frac),
+                    "limit": str(daily_limit),
+                    "equity_usd": str(equity),
+                    "already_halted": True,
+                    "source": "strategy_worker_risk_loop",
+                },
+                now_utc=now_utc,
+            )
+            return
+        result = await self._store.invoke_kill_switch(
+            self.account_id,
+            trigger=TransitionTrigger.DAILY_LOSS_BREACH,
+            now_utc=now_utc,
+        )
+        # Same honest-alert rule as the floor path: only APPLIED may
+        # claim HALT_NEW. NO_RISK_STATE_ROW retries next tick (the
+        # already_halted guard stays False without a row).
+        if result is KillSwitchInvokeResult.APPLIED:
+            halt_outcome = "flattened + HALT_NEW (daily_loss_breach)"
+        elif result is KillSwitchInvokeResult.ALREADY_HALTED:
+            halt_outcome = "flattened; already HALT_NEW (no FSM retrip)"
+        else:
+            halt_outcome = (
+                "flattened; kill switch found NO risk_state row — "
+                "HALT_NEW NOT applied; retrying next tick"
+            )
+        await self._store.insert_alert(
+            self.account_id,
+            severity="P1",
+            category="kill_switch_invoked",
+            message=(
+                f"daily loss limit breached ({daily_pnl_frac:.4f} < {daily_limit}) — {halt_outcome}"
+            ),
+            detail={
+                "trigger": TransitionTrigger.DAILY_LOSS_BREACH.value,
+                "daily_pnl_frac": str(daily_pnl_frac),
+                "limit": str(daily_limit),
+                "equity_usd": str(equity),
+                "day_start_equity_usd": str(self._day_start_equity),
+                "source": "strategy_worker_risk_loop",
+                "transition_applied": result is KillSwitchInvokeResult.APPLIED,
+                "invoke_result": result.value,
+            },
+            now_utc=now_utc,
+        )
+
+    async def _detect_external_position_changes(self, *, now_utc: datetime) -> None:
         """Detect native-stop fills (and any other venue-side position
         change) by diffing tracked state against ``list_positions``.
 
-        Runs under ``_trade_lock`` (risk-review C2): a stale venue
-        snapshot interleaved with a decision leg executing could
-        otherwise cancel a freshly-armed stop / just-placed order and
-        zero tracking on a real position. Same lock discipline as the
-        flatten path."""
+        Runs under ``_trade_lock`` (risk-review C2) AND fetches the venue
+        snapshot inside the lock (2026-07-14 incident): a snapshot captured
+        before the lock is stale by construction whenever a decision leg
+        fills while the detector awaits the lock — acting on it zeroed
+        tracked contracts + hysteresis memory on a real position and
+        poisoned the persisted engine state for two decision nights. Same
+        lock discipline as the flatten path."""
         async with self._trade_lock:
+            try:
+                venue_positions: Mapping[str, BrokerPosition] = {
+                    p.product_id: p for p in await self._broker.list_positions()
+                }
+            except Exception:
+                self._log.warning("strategy_worker_positions_fetch_failed")
+                return
             await self._detect_external_position_changes_locked(venue_positions, now_utc=now_utc)
 
     async def _detect_external_position_changes_locked(
@@ -2280,73 +2368,109 @@ class StrategyWorker:
             pos = venue_positions.get(product.product_id)
             venue_contracts = int(pos.contracts) if pos is not None else 0
             if venue_contracts == rt.contracts:
+                self._external_divergence_pending.pop(asset, None)
                 continue
+            # Native-stop fill check FIRST, on EVERY divergent tick
+            # (risk-review blocker, 2026-07-16): an order-id read returning
+            # "filled" is positive confirmation — not the stale-snapshot
+            # ambiguity the latch below defends against — and deferring it
+            # one tick would leave the client-stop/outage flatten paths a
+            # window of stale tracked contracts to market-flatten a book
+            # the venue already closed (the flatten is NOT reduce-only).
             stop_filled = False
             if rt.native_stop_order_id:
                 with contextlib.suppress(Exception):
                     stop_state = await self._broker.get_order(rt.native_stop_order_id)
                     if stop_state.status == "filled":
                         stop_filled = True
+                        self._external_divergence_pending.pop(asset, None)
                         await self._handle_native_stop_fill(
                             asset, stop_state=stop_state, now_utc=now_utc
                         )
-            if not stop_filled:
-                self._log.error(
-                    "strategy_worker_external_position_change",
+            if stop_filled:
+                continue
+            # Two-tick confirmation for position-only divergences
+            # (2026-07-14 + 2026-07-16 incidents): the venue's read surface
+            # lags its write surface (404s on just-placed orders; stale
+            # just-changed positions), so ONE divergent reading is a
+            # suspect, not a fact — act only when the SAME (tracked, venue)
+            # observation repeats on the next successful-fetch tick. A
+            # matching tick clears the latch; a tracked-side change between
+            # ticks (a leg/flatten ran under the lock) re-latches. The
+            # entry survives a confirmed divergence whose handling defers
+            # (cancel failed/rejected), keeping those retries at every-tick
+            # cadence.
+            observation = (rt.contracts, venue_contracts)
+            pending = self._external_divergence_pending.get(asset)
+            if pending != observation:
+                self._external_divergence_pending[asset] = observation
+                self._log.warning(
+                    "strategy_worker_external_divergence_suspect",
                     asset=asset,
                     tracked_contracts=rt.contracts,
                     venue_contracts=venue_contracts,
                     note=(
-                        "position changed outside the worker (manual action or "
-                        "venue liquidation); syncing to venue truth"
+                        "single divergent reading; re-checking next tick "
+                        "before acting (venue read-after-write guard)"
                     ),
                 )
-                if venue_contracts == 0:
-                    # 2026-07-12 incident: _clear_position_state forgets the
-                    # native stop id WITHOUT cancelling it at the venue — a
-                    # resting stop on a flat book is a naked order that would
-                    # open an unintended position. Cancel venue-side FIRST,
-                    # then VERIFY the book is actually clean (risk-review B1:
-                    # the venue can reject a cancel inside an HTTP 200 and the
-                    # adapter's batch call surfaces no exception). On failure
-                    # OR surviving orders, tracked contracts stay UNSYNCED so
-                    # this branch re-fires on the next 30 s tick and retries.
-                    if rt.native_stop_order_id or rt.native_stop_client_order_id:
-                        try:
-                            await self._adapter.cancel_all_orders(product.product_id)
-                            remaining = await self._broker.list_open_orders(product.product_id)
-                        except Exception:
-                            self._log.exception(
-                                "strategy_worker_external_flat_cancel_failed",
-                                asset=asset,
-                                note=(
-                                    "tracked contracts left unsynced so the "
-                                    "next tick retries the cancel"
-                                ),
-                            )
-                            continue
-                        if remaining:
-                            self._log.error(
-                                "strategy_worker_external_flat_cancel_rejected",
-                                asset=asset,
-                                product_id=product.product_id,
-                                remaining_open_orders=len(remaining),
-                                note=(
-                                    "venue accepted the cancel request but "
-                                    "orders remain open; retrying next tick"
-                                ),
-                            )
-                            continue
-                        self._log.warning(
-                            "strategy_worker_external_flat_orders_cancelled",
+                continue
+            self._log.error(
+                "strategy_worker_external_position_change",
+                asset=asset,
+                tracked_contracts=rt.contracts,
+                venue_contracts=venue_contracts,
+                note=(
+                    "position changed outside the worker (manual action or "
+                    "venue liquidation); syncing to venue truth"
+                ),
+            )
+            if venue_contracts == 0:
+                # 2026-07-12 incident: _clear_position_state forgets the
+                # native stop id WITHOUT cancelling it at the venue — a
+                # resting stop on a flat book is a naked order that would
+                # open an unintended position. Cancel venue-side FIRST,
+                # then VERIFY the book is actually clean (risk-review B1:
+                # the venue can reject a cancel inside an HTTP 200 and the
+                # adapter's batch call surfaces no exception). On failure
+                # OR surviving orders, tracked contracts stay UNSYNCED so
+                # this branch re-fires on the next 30 s tick and retries.
+                if rt.native_stop_order_id or rt.native_stop_client_order_id:
+                    try:
+                        await self._adapter.cancel_all_orders(product.product_id)
+                        remaining = await self._broker.list_open_orders(product.product_id)
+                    except Exception:
+                        self._log.exception(
+                            "strategy_worker_external_flat_cancel_failed",
+                            asset=asset,
+                            note=(
+                                "tracked contracts left unsynced so the "
+                                "next tick retries the cancel"
+                            ),
+                        )
+                        continue
+                    if remaining:
+                        self._log.error(
+                            "strategy_worker_external_flat_cancel_rejected",
                             asset=asset,
                             product_id=product.product_id,
+                            remaining_open_orders=len(remaining),
+                            note=(
+                                "venue accepted the cancel request but "
+                                "orders remain open; retrying next tick"
+                            ),
                         )
-                    rt.contracts = 0
-                    self._clear_position_state(rt)
-                else:
-                    rt.contracts = venue_contracts
-                    await self._arm_native_stop(asset, reason="external_change_rearm")
+                        continue
+                    self._log.warning(
+                        "strategy_worker_external_flat_orders_cancelled",
+                        asset=asset,
+                        product_id=product.product_id,
+                    )
+                rt.contracts = 0
+                self._clear_position_state(rt)
+            else:
+                rt.contracts = venue_contracts
+                await self._arm_native_stop(asset, reason="external_change_rearm")
 
     async def _handle_native_stop_fill(
         self, asset: str, *, stop_state: BrokerOrderState, now_utc: datetime
@@ -2550,6 +2674,53 @@ class StrategyWorker:
         full_close = flatten_contracts == abs(rt.contracts)
 
         async with self._trade_lock:
+            # Venue-truth re-check under the lock (risk-review blocker,
+            # 2026-07-16): the market flatten is NOT reduce-only at the
+            # venue — fired against a book the venue already flattened (a
+            # just-filled native stop or manual close the detector has not
+            # yet absorbed) it would OPEN a reversed position of full
+            # former size. Skip on venue-flat or opposite sign; clamp to a
+            # smaller venue size. A FAILED read proceeds on tracked state:
+            # a protective exit must not be blocked by a read failure.
+            venue_now: dict[str, BrokerPosition] | None
+            try:
+                venue_now = {p.product_id: p for p in await self._broker.list_positions()}
+            except Exception:
+                self._log.warning(
+                    "strategy_worker_flatten_venue_recheck_failed",
+                    asset=asset,
+                    reason=reason,
+                    note="proceeding on tracked state (protective exit not blocked)",
+                )
+                venue_now = None
+            if venue_now is not None:
+                pos_now = venue_now.get(product.product_id)
+                venue_signed = int(pos_now.contracts) if pos_now is not None else 0
+                if venue_signed == 0 or (venue_signed > 0) != (rt.contracts > 0):
+                    self._log.error(
+                        "strategy_worker_flatten_skipped_venue_divergence",
+                        asset=asset,
+                        reason=reason,
+                        tracked_contracts=rt.contracts,
+                        venue_contracts=venue_signed,
+                        note=(
+                            "venue book does not carry the tracked position; "
+                            "flattening would open a reversed position — the "
+                            "external-change detector reconciles tracking"
+                        ),
+                    )
+                    return
+                if abs(venue_signed) < flatten_contracts:
+                    self._log.warning(
+                        "strategy_worker_flatten_clamped_to_venue",
+                        asset=asset,
+                        reason=reason,
+                        requested_contracts=flatten_contracts,
+                        venue_contracts=venue_signed,
+                    )
+                    flatten_contracts = abs(venue_signed)
+                    signed = flatten_contracts * (1 if rt.contracts > 0 else -1)
+                    full_close = flatten_contracts == abs(rt.contracts)
             if cancel_stop:
                 with contextlib.suppress(Exception):
                     await self._adapter.cancel_all_orders(product.product_id)
@@ -2758,6 +2929,10 @@ class StrategyWorker:
             # decision row, which short-circuits the retry above.
             return
 
+        await self._alert_engine_state_divergence(
+            decision_date=decision_date, now_utc=now, source="strategy_worker_daily_decision"
+        )
+
         is_convalescent = risk_state == RiskState.CONVALESCENT.value
         last_capital_event_day = await self._store.fetch_last_threshold_met_capital_event_date(
             self.account_id
@@ -2957,6 +3132,64 @@ class StrategyWorker:
         self._last_decision_date = decision_date
         await self._persist_status(now_utc=self._clock(), tick_increment=False)
 
+    async def _alert_engine_state_divergence(
+        self, *, decision_date: date, now_utc: datetime, source: str
+    ) -> None:
+        """Engine-memory tripwire (2026-07-15 anomaly): a live position whose
+        hysteresis memory carries no applied direction (or the opposite
+        sign) means persisted engine state diverged from position truth.
+        The decision still runs on the engine's authority — auto-repairing
+        memory from position truth is a queued operator decision — but the
+        divergence must be operator-visible SAME DAY, not two nights later.
+        One alert per (decision_date, asset), latched only on confirmed
+        delivery (#387 pattern); the ERROR log fires every evaluation."""
+        assert self.account_id is not None
+        for asset in ASSETS:
+            rt = self.state[asset]
+            if rt.contracts == 0 or (
+                rt.applied_dir != 0 and (rt.applied_dir > 0) == (rt.contracts > 0)
+            ):
+                continue
+            self._log.error(
+                "strategy_worker_engine_state_divergence",
+                asset=asset,
+                contracts=rt.contracts,
+                applied_dir=rt.applied_dir,
+                pending_dir=rt.pending_dir,
+                pending_count=rt.pending_count,
+                decision_date=decision_date.isoformat(),
+                source=source,
+            )
+            key = (decision_date, asset)
+            if key in self._engine_divergence_alerted:
+                continue
+            delivered = await self._store.insert_alert(
+                self.account_id,
+                severity="P2",
+                category="incident_review_required",
+                message=(
+                    f"engine hysteresis memory diverged from position truth on "
+                    f"{asset}: contracts={rt.contracts} with "
+                    f"applied_dir={rt.applied_dir} — decision proceeds on engine "
+                    "authority; review engine_state history before next cycle"
+                ),
+                detail={
+                    "asset": asset,
+                    "contracts": rt.contracts,
+                    "applied_dir": rt.applied_dir,
+                    "pending_dir": rt.pending_dir,
+                    "pending_count": rt.pending_count,
+                    "decision_date": decision_date.isoformat(),
+                    "source": source,
+                },
+                now_utc=now_utc,
+            )
+            if delivered:
+                self._engine_divergence_alerted = {
+                    k for k in self._engine_divergence_alerted if k[0] == decision_date
+                }
+                self._engine_divergence_alerted.add(key)
+
     async def _resume_decision(self, existing: DecisionRow, decision_date: date) -> None:
         """Resume a decision that crashed mid-dispatch (status='dispatching')."""
         assert self.account_id is not None
@@ -2967,6 +3200,12 @@ class StrategyWorker:
         )
         if existing.engine_state:
             self.state = deserialize_engine_state(existing.engine_state)
+            # The row's engine_state is the 2026-07-14 corruption vector —
+            # a poisoned snapshot restored here would otherwise stay
+            # operator-invisible (risk-review 2026-07-16 finding 4).
+            await self._alert_engine_state_divergence(
+                decision_date=decision_date, now_utc=now, source="strategy_worker_resume_decision"
+            )
 
         # Same fail-closed rule as the fresh-decision gate: a missing
         # risk_state row blocks the resume (retried next tick) rather than
@@ -3060,23 +3299,29 @@ class StrategyWorker:
                 fees = leg.get("fees_usd")
                 if fees:
                     total_fees += Decimal(str(fees))
-            entry["est_cost_usd"] = str(total_fees)
-            entry["final_contracts"] = rt.contracts
+            # Post-leg tracking read + stop management under the trade
+            # lock (2026-07-14 incident): the arm mutates rt AND the venue
+            # while the external-change detector diffs rt against venue —
+            # unserialized, the detector zeroed tracking + hysteresis
+            # memory mid-arm. Same discipline as _flatten_position.
+            async with self._trade_lock:
+                entry["est_cost_usd"] = str(total_fees)
+                entry["final_contracts"] = rt.contracts
 
-            # Stop management after the asset's legs complete.
-            if rt.contracts != 0:
-                await self._arm_native_stop(
-                    asset,
-                    reason="decision",
-                    atrp_today=inputs.rows[asset].atrp,
-                )
-                entry["stop"] = {
-                    "client_stop_level": rt.client_stop_level,
-                    "native_stop_order_id": rt.native_stop_order_id,
-                }
-            elif product is not None:
-                with contextlib.suppress(Exception):
-                    await self._adapter.cancel_all_orders(product.product_id)
+                # Stop management after the asset's legs complete.
+                if rt.contracts != 0:
+                    await self._arm_native_stop(
+                        asset,
+                        reason="decision",
+                        atrp_today=inputs.rows[asset].atrp,
+                    )
+                    entry["stop"] = {
+                        "client_stop_level": rt.client_stop_level,
+                        "native_stop_order_id": rt.native_stop_order_id,
+                    }
+                elif product is not None:
+                    with contextlib.suppress(Exception):
+                        await self._adapter.cancel_all_orders(product.product_id)
 
             await self._store.update_decision(
                 self.account_id,

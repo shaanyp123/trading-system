@@ -1244,6 +1244,52 @@ class TestLossLimits:
         # F1a: the halt reached the operator alert surface.
         assert ("P1", "kill_switch_invoked") in {(a[0], a[1]) for a in store.alerts}
 
+    async def test_daily_loss_reflattens_when_already_halted(self) -> None:
+        """Risk-review 2026-07-16 re-review B1: a venue-recheck skip on
+        the first daily-loss flatten must self-heal — the flatten
+        re-fires while the breach persists and positions exist even
+        under HALT_NEW (F4 pattern, mirroring the floor path); the FSM
+        stays retrip-guarded."""
+        store = FakeStore()
+        store.risk = RiskStateSnapshot("HALT_NEW", "routine", 0, False)
+        worker, _, broker = await _started_worker(store=store)
+        _open_long(worker, broker, "BTC", contracts=2)
+        worker._day_start_date = TODAY
+        worker._day_start_equity = Decimal("2000")
+        broker.equity = Decimal("1700")  # -15% < -8%, above the $1,500 floor
+
+        await worker.run_risk_checks(now_utc=NOW)
+
+        assert worker.state["BTC"].contracts == 0  # flattened under halt
+        assert store.kill_switch_calls == []  # no FSM retrip
+        assert any(
+            a[0] == "P1" and a[1] == "kill_switch_invoked" and "already HALT_NEW" in a[2]
+            for a in store.alerts
+        )
+
+    async def test_daily_loss_false_flat_read_self_heals_next_tick(self) -> None:
+        """B1 end-to-end: tick 1's flatten venue-recheck gets a false-flat
+        read (skip; halt lands); tick 2's recovered read re-flattens the
+        stranded position under HALT_NEW."""
+        worker, store, broker = await _started_worker()
+        rt = _open_long(worker, broker, "BTC", contracts=2)
+        worker._day_start_date = TODAY
+        worker._day_start_equity = Decimal("2000")
+        broker.equity = Decimal("1700")
+
+        real_positions = dict(broker.positions)
+        broker.positions = {}  # false-flat venue view
+        await worker.run_risk_checks(now_utc=NOW)
+        assert rt.contracts == 2  # flatten skipped on the false read
+        assert store.kill_switch_calls == [TransitionTrigger.DAILY_LOSS_BREACH]
+
+        broker.positions = dict(real_positions)  # venue reads recover
+        store.risk = RiskStateSnapshot("HALT_NEW", "routine", 0, False)
+        await worker.run_risk_checks(now_utc=NOW)
+
+        assert rt.contracts == 0  # re-flattened under halt
+        assert store.kill_switch_calls == [TransitionTrigger.DAILY_LOSS_BREACH]  # once
+
     async def test_daily_loss_within_limit_no_action(self) -> None:
         worker, store, broker = await _started_worker()
         _open_long(worker, broker, "BTC", contracts=2)
@@ -1381,6 +1427,9 @@ class TestOutagePolicy:
         rt.native_stop_client_order_id = "stop-cid-2"
         broker.positions[BTC_PID] = Decimal(0)  # the venue stop closed it
 
+        # A CONFIRMED stop-fill read bypasses the two-tick divergence
+        # latch and acts on the FIRST tick (risk-review blocker: deferring
+        # it would leave the flatten paths one tick of stale tracking).
         await worker.run_risk_checks(now_utc=NOW)
 
         assert rt.contracts == 0
@@ -2106,8 +2155,11 @@ class TestExternalFlatOrphanedStop:
         rt.native_stop_order_id = stop.order_id
         rt.native_stop_client_order_id = "stop-cid"
 
-        # Venue reports FLAT (empty mapping) while the worker tracks -2.
-        await worker._detect_external_position_changes({}, now_utc=NOW)
+        # Venue reports FLAT (no broker.positions entry) while the worker
+        # tracks -2; two consecutive ticks confirm before acting.
+        await worker._detect_external_position_changes(now_utc=NOW)
+        assert rt.contracts == -2  # first reading latches only
+        await worker._detect_external_position_changes(now_utc=NOW)
 
         assert broker.orders[stop.order_id].status == "cancelled"
         assert rt.contracts == 0
@@ -2131,7 +2183,8 @@ class TestExternalFlatOrphanedStop:
             raise RuntimeError("venue 5xx")
 
         broker.cancel_orders = _cancel_boom  # type: ignore[method-assign]
-        await worker._detect_external_position_changes({}, now_utc=NOW)
+        await worker._detect_external_position_changes(now_utc=NOW)  # latch
+        await worker._detect_external_position_changes(now_utc=NOW)  # act
 
         # Unsynced on purpose: the diff re-fires next tick and retries.
         assert rt.contracts == -2
@@ -2159,8 +2212,382 @@ class TestExternalFlatOrphanedStop:
             return {oid: False for oid in order_ids}  # 200, but rejected
 
         broker.cancel_orders = _cancel_rejected  # type: ignore[method-assign]
-        await worker._detect_external_position_changes({}, now_utc=NOW)
+        await worker._detect_external_position_changes(now_utc=NOW)  # latch
+        await worker._detect_external_position_changes(now_utc=NOW)  # act
 
         assert broker.orders[stop.order_id].status == "open"  # still resting
         assert rt.contracts == -2  # unsynced => next tick retries
-        assert rt.native_stop_order_id == stop.order_id
+        assert rt.native_stop_order_id == stop.order_id  # tracking kept
+
+
+# ---------------------------------------------------------------------------
+# 2026-07-14 incident regression locks (engine-state wipe by stale snapshot)
+# ---------------------------------------------------------------------------
+
+
+class TestExternalDivergenceConfirmLatch:
+    """2026-07-14: a positions snapshot captured before the trade lock —
+    or a venue read lagging its write surface — reported FLAT while a
+    freshly-filled short existed. Acting on that single stale reading
+    zeroed tracked contracts AND hysteresis memory (applied_dir) on a
+    live position, poisoning the persisted engine state for two nights.
+    A divergence must repeat on two consecutive ticks before acting."""
+
+    def _short_with_resting_stop(self, worker: StrategyWorker, broker: FakeBroker) -> AssetRuntime:
+        rt = worker.state["BTC"]
+        rt.contracts = -2
+        rt.applied_dir = -1
+        rt.entry_vwap = str(broker.marks[BTC_PID])
+        stop = broker.seed_order(
+            client_order_id="stop-cid",
+            product_id=BTC_PID,
+            side="buy",
+            contracts=Decimal(2),
+            status="open",
+            kind="stop_limit",
+        )
+        rt.native_stop_order_id = stop.order_id
+        rt.native_stop_client_order_id = "stop-cid"
+        return rt
+
+    async def test_transient_flat_reading_does_not_wipe_state(self) -> None:
+        worker, _, broker = await _started_worker(confirmed_long=False)
+        rt = self._short_with_resting_stop(worker, broker)
+
+        # Tick 1: venue transiently reads flat (read-after-write gap).
+        await worker._detect_external_position_changes(now_utc=NOW)
+        assert rt.contracts == -2
+        assert rt.applied_dir == -1  # hysteresis memory intact
+
+        # Tick 2: the venue read surface catches up — latch clears.
+        broker.positions[BTC_PID] = Decimal(-2)
+        await worker._detect_external_position_changes(now_utc=NOW)
+        assert rt.contracts == -2
+        assert rt.applied_dir == -1
+        assert worker._external_divergence_pending == {}
+
+        # Tick 3: another transient flat is a FRESH suspect (no action).
+        broker.positions[BTC_PID] = Decimal(0)
+        await worker._detect_external_position_changes(now_utc=NOW)
+        assert rt.contracts == -2
+        assert rt.applied_dir == -1
+        assert rt.native_stop_order_id is not None
+
+    async def test_changing_divergent_readings_never_confirm(self) -> None:
+        worker, _, broker = await _started_worker(confirmed_long=False)
+        rt = self._short_with_resting_stop(worker, broker)
+        for reading in (Decimal(0), Decimal(-1), Decimal(1)):
+            if reading == 0:
+                broker.positions.pop(BTC_PID, None)
+            else:
+                broker.positions[BTC_PID] = reading
+            await worker._detect_external_position_changes(now_utc=NOW)
+        assert rt.contracts == -2  # no reading repeated: never acted
+        assert rt.applied_dir == -1
+
+    async def test_confirmed_flat_still_acts_on_second_tick(self) -> None:
+        """The real external-flat case (2026-07-16 shape) still works —
+        one tick later, cancel-first + clear semantics unchanged."""
+        worker, _, broker = await _started_worker(confirmed_long=False)
+        rt = self._short_with_resting_stop(worker, broker)
+        stop_order_id = rt.native_stop_order_id
+        assert stop_order_id is not None
+
+        await worker._detect_external_position_changes(now_utc=NOW)
+        await worker._detect_external_position_changes(now_utc=NOW)
+
+        assert rt.contracts == 0
+        assert rt.applied_dir == 0
+        assert broker.orders[stop_order_id].status == "cancelled"
+
+    async def test_tracked_mutation_invalidates_pending_observation(self) -> None:
+        """Risk-review finding 2: the latch is keyed on the (tracked,
+        venue) pair — a leg/flatten changing tracked contracts between
+        ticks must invalidate the pending observation, not confirm it
+        against a still-stale venue read."""
+        worker, _, broker = await _started_worker(confirmed_long=False)
+        rt = self._short_with_resting_stop(worker, broker)
+        stop_order_id = rt.native_stop_order_id
+        assert stop_order_id is not None
+
+        await worker._detect_external_position_changes(now_utc=NOW)  # (-2, 0) latched
+        rt.contracts = 2  # a leg flipped the book between ticks
+        rt.applied_dir = 1
+        await worker._detect_external_position_changes(now_utc=NOW)  # (2, 0) != pending
+
+        assert rt.contracts == 2  # not zeroed
+        assert rt.applied_dir == 1  # hysteresis intact
+        assert broker.orders[stop_order_id].status == "open"  # stop NOT cancelled
+
+    async def test_confirmed_stop_fill_bypasses_latch_same_tick(self) -> None:
+        """Risk-review blocker: a get_order read returning 'filled' is
+        positive confirmation — it must act on the FIRST divergent tick,
+        before the client-stop/outage flatten paths can run on stale
+        tracked contracts."""
+        worker, store, broker = await _started_worker(confirmed_long=False)
+        rt = worker.state["BTC"]
+        rt.contracts = -2
+        rt.applied_dir = -1
+        stop = broker.seed_order(
+            client_order_id="stop-cid",
+            product_id=BTC_PID,
+            side="buy",
+            contracts=Decimal(2),
+            status="filled",  # the venue backstop fired
+            kind="stop_limit",
+        )
+        rt.native_stop_order_id = stop.order_id
+        rt.native_stop_client_order_id = "stop-cid"
+
+        await worker._detect_external_position_changes(now_utc=NOW)
+
+        assert rt.contracts == 0  # absorbed on tick 1, no latch deferral
+        assert rt.stopped_on_date == TODAY.isoformat()
+        assert any(cid == "stop-cid" for cid, _ in store.fills)
+
+    async def test_positions_snapshot_fetched_under_trade_lock(self) -> None:
+        """The snapshot must be captured INSIDE the trade lock — a
+        pre-lock snapshot is stale by construction whenever a decision
+        leg fills while the detector awaits the lock."""
+        worker, _, broker = await _started_worker()
+        lock_states: list[bool] = []
+        orig = broker.list_positions
+
+        async def _instrumented() -> list[BrokerPosition]:
+            lock_states.append(worker._trade_lock.locked())
+            return await orig()
+
+        broker.list_positions = _instrumented  # type: ignore[method-assign]
+        await worker._detect_external_position_changes(now_utc=NOW)
+        assert lock_states == [True]
+
+    async def test_positions_fetch_failure_is_a_no_op(self) -> None:
+        worker, _, broker = await _started_worker(confirmed_long=False)
+        rt = self._short_with_resting_stop(worker, broker)
+
+        async def _boom() -> list[BrokerPosition]:
+            raise RuntimeError("venue 5xx")
+
+        broker.list_positions = _boom  # type: ignore[method-assign]
+        await worker._detect_external_position_changes(now_utc=NOW)
+        assert rt.contracts == -2
+        assert rt.applied_dir == -1
+
+
+class TestNativeStopFillSameTick:
+    """Risk-review blocker regression: when the native 3xATR stop
+    genuinely filled, the mark is beyond the 2xATR client level by
+    construction — the fill must be absorbed in the SAME risk tick,
+    BEFORE the client-stop path can market-flatten stale tracked
+    contracts against a flat book (the flatten is not reduce-only: it
+    would open a full-size reversed position)."""
+
+    async def test_stop_fill_with_mark_through_client_level_no_reversal(self) -> None:
+        worker, _store, broker = await _started_worker()
+        rt = _open_long(worker, broker, "BTC", contracts=2)
+        stop = broker.seed_order(
+            client_order_id="stop-cid-3",
+            product_id=BTC_PID,
+            side="sell",
+            contracts=Decimal(2),
+            status="filled",
+            kind="stop_limit",
+        )
+        rt.native_stop_order_id = stop.order_id
+        rt.native_stop_client_order_id = "stop-cid-3"
+        broker.positions[BTC_PID] = Decimal(0)  # venue flat post-fill
+        # Mark moved through the client stop level (a realistic 3xATR fill).
+        worker.marks.store.record(
+            BTC_PID, Decimal(rt.client_stop_level or "0") - Decimal(1), observed_at_utc=NOW
+        )
+
+        await worker.run_risk_checks(now_utc=NOW)
+
+        assert rt.contracts == 0  # fill absorbed same tick
+        assert rt.stopped_on_date == TODAY.isoformat()
+        # NO market order fired on the flat book.
+        assert not [c for c in broker.create_calls if c.kind == "market"]
+
+
+class TestFlattenVenueRecheck:
+    """Risk-review blocker: the protective market flatten is not
+    reduce-only at the venue — `_flatten_position` re-reads positions
+    under the trade lock and refuses to fire against a book that does
+    not carry the tracked position."""
+
+    async def test_client_stop_flatten_skipped_when_venue_flat(self) -> None:
+        worker, _store, broker = await _started_worker()
+        rt = _open_long(worker, broker, "BTC", contracts=2)
+        broker.positions[BTC_PID] = Decimal(0)  # venue already flat, unabsorbed
+        worker.marks.store.record(
+            BTC_PID, Decimal(rt.client_stop_level or "0") - Decimal(1), observed_at_utc=NOW
+        )
+
+        await worker.run_risk_checks(now_utc=NOW)
+
+        # No market order on the flat book; tracking left for the
+        # detector's two-tick reconcile.
+        assert not [c for c in broker.create_calls if c.kind == "market"]
+        assert rt.contracts == 2
+
+    async def test_flatten_clamps_to_smaller_venue_size(self) -> None:
+        worker, _store, broker = await _started_worker()
+        rt = _open_long(worker, broker, "BTC", contracts=4)
+        broker.positions[BTC_PID] = Decimal(2)  # venue partially closed already
+        worker.marks.store.record(
+            BTC_PID, Decimal(rt.client_stop_level or "0") - Decimal(1), observed_at_utc=NOW
+        )
+
+        await worker.run_risk_checks(now_utc=NOW)
+
+        flattens = [c for c in broker.create_calls if c.kind == "market" and c.side == "sell"]
+        assert len(flattens) == 1
+        assert flattens[0].contracts == Decimal(2)  # clamped to venue truth
+
+    async def test_flatten_proceeds_when_recheck_read_fails(self) -> None:
+        """A protective exit must not be blocked by a venue read failure."""
+        worker, _store, broker = await _started_worker()
+        rt = _open_long(worker, broker, "BTC", contracts=2)
+        worker.marks.store.record(
+            BTC_PID, Decimal(rt.client_stop_level or "0") - Decimal(1), observed_at_utc=NOW
+        )
+
+        async def _boom() -> list[BrokerPosition]:
+            raise RuntimeError("venue 5xx")
+
+        broker.list_positions = _boom  # type: ignore[method-assign]
+        await worker.run_risk_checks(now_utc=NOW)
+
+        assert rt.contracts == 0  # flatten proceeded on tracked state
+        assert [c for c in broker.create_calls if c.kind == "market"]
+
+
+class TestStopArmLockDiscipline:
+    """2026-07-14: the decision dispatch armed the native stop OUTSIDE
+    the trade lock, so the external-change detector interleaved with the
+    arm and mutated the same AssetRuntime mid-flight. Every stop-arm
+    call site must hold the trade lock."""
+
+    async def test_decision_stop_arm_runs_under_trade_lock(self) -> None:
+        worker, store, _broker = await _started_worker()
+        lock_states: list[tuple[str, bool]] = []
+        orig_arm = worker._arm_native_stop
+
+        async def _instrumented(asset: str, **kwargs: Any) -> None:
+            lock_states.append((str(kwargs.get("reason", "")), worker._trade_lock.locked()))
+            await orig_arm(asset, **kwargs)
+
+        worker._arm_native_stop = _instrumented  # type: ignore[method-assign]
+        await worker.run_daily_decision(TODAY)
+
+        assert store.decisions[TODAY]["status"] == "completed"
+        decision_arms = [(r, locked) for r, locked in lock_states if r == "decision"]
+        assert decision_arms  # the confirmed-long decision opened + armed
+        assert all(locked for _, locked in decision_arms)
+
+    async def test_risk_loop_rearm_runs_under_trade_lock(self) -> None:
+        worker, _store, broker = await _started_worker()
+        rt = _open_long(worker, broker, "BTC", contracts=2)
+        rt.native_stop_order_id = None  # missing backstop → 2b re-arm
+        lock_states: list[tuple[str, bool]] = []
+        orig_arm = worker._arm_native_stop
+
+        async def _instrumented(asset: str, **kwargs: Any) -> None:
+            lock_states.append((str(kwargs.get("reason", "")), worker._trade_lock.locked()))
+            await orig_arm(asset, **kwargs)
+
+        worker._arm_native_stop = _instrumented  # type: ignore[method-assign]
+        await worker.run_risk_checks(now_utc=NOW)
+
+        rearms = [(r, locked) for r, locked in lock_states if r == "risk_loop_rearm"]
+        assert rearms
+        assert all(locked for _, locked in rearms)
+        assert rt.native_stop_order_id is not None
+
+
+class TestEngineStateDivergenceTripwire:
+    """2026-07-15 anomaly: the decision silently ran hysteresis-hold on a
+    live short whose applied_dir had been wiped to 0. A live position
+    with no (or opposite-sign) applied direction must alert same-day."""
+
+    async def test_position_with_zero_applied_dir_alerts(self) -> None:
+        worker, store, broker = await _started_worker(confirmed_long=False)
+        rt = _open_long(worker, broker, "BTC", contracts=2)
+        rt.applied_dir = 0  # the 2026-07-14 corruption shape
+
+        await worker.run_daily_decision(TODAY)
+
+        alerts = [a for a in store.alerts if a[1] == "incident_review_required"]
+        assert len(alerts) == 1
+        severity, _category, message, detail = alerts[0]
+        assert severity == "P2"
+        assert "diverged from position truth" in message
+        assert detail["asset"] == "BTC"
+        assert detail["applied_dir"] == 0
+        assert detail["contracts"] == 2
+        # The decision itself still ran on the engine's authority.
+        assert store.decisions[TODAY]["status"] == "completed"
+
+    async def test_sign_mismatch_alerts(self) -> None:
+        worker, store, broker = await _started_worker(confirmed_long=False)
+        rt = _open_long(worker, broker, "BTC", contracts=2)
+        rt.applied_dir = -1  # opposite sign vs the long position
+
+        await worker.run_daily_decision(TODAY)
+
+        assert [a for a in store.alerts if a[1] == "incident_review_required"]
+
+    async def test_healthy_state_no_alert(self) -> None:
+        worker, store, broker = await _started_worker()
+        _open_long(worker, broker, "BTC", contracts=2)  # applied_dir=1 set
+
+        await worker.run_daily_decision(TODAY)
+
+        assert not [a for a in store.alerts if a[1] == "incident_review_required"]
+
+    async def test_resume_path_alerts_on_poisoned_row_state(self) -> None:
+        """Risk-review finding 4: a crash-resume restores engine_state
+        from the decision row — the exact 2026-07-14 corruption vector —
+        and must run the same tripwire."""
+        worker, store, broker = await _started_worker(confirmed_long=False)
+        broker.positions[BTC_PID] = Decimal(-2)
+        store.decisions[TODAY] = {
+            "status": "dispatching",
+            "equity_usd": Decimal("6000"),
+            "outcome": {
+                "schema_version": "strategy_decision_v1",
+                "assets": {
+                    "BTC": {
+                        "final_target": -2,
+                        "action": "sell",
+                        "legs": [{"seq": 0, "kind": "open", "delta": -2, "status": "filled"}],
+                    },
+                    "ETH": {"final_target": 0, "action": "hold", "legs": []},
+                },
+            },
+            "engine_state": serialize_engine_state(
+                {
+                    "BTC": AssetRuntime(contracts=-2, applied_dir=0),  # poisoned
+                    "ETH": AssetRuntime(),
+                }
+            ),
+        }
+
+        await worker.run_daily_decision(TODAY)
+
+        alerts = [a for a in store.alerts if a[1] == "incident_review_required"]
+        assert len(alerts) == 1
+        assert alerts[0][3]["source"] == "strategy_worker_resume_decision"
+
+    async def test_alert_is_one_shot_per_decision_date_and_asset(self) -> None:
+        """Note 5: a crash between the tripwire and the decision row leaves
+        the fresh path re-entered every 30 s — the alert must not re-fire
+        for the same (decision_date, asset) once delivered."""
+        worker, store, broker = await _started_worker(confirmed_long=False)
+        rt = _open_long(worker, broker, "BTC", contracts=2)
+        rt.applied_dir = 0
+
+        await worker._alert_engine_state_divergence(decision_date=TODAY, now_utc=NOW, source="test")
+        await worker._alert_engine_state_divergence(decision_date=TODAY, now_utc=NOW, source="test")
+
+        assert len([a for a in store.alerts if a[1] == "incident_review_required"]) == 1
