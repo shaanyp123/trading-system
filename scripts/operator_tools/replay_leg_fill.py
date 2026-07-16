@@ -36,8 +36,24 @@ or the Coinbase web UI fills screen for the order:
 ``--force`` is passed. Dry-run by default: prints the located order row +
 the payload it WOULD feed; ``--no-dry-run --confirm`` executes.
 
+**Missing-orders-row repair mode (2026-07-16 incident).** The night-three
+variant crashed AFTER ``insert_order_row``; the 2026-07-16 variant crashed
+BEFORE it (venue filled the close, but the leg died between
+``execute_target_delta`` and the orders INSERT), so the ``orders`` row the
+replay needs does not exist — only the leg's ``signals`` row landed (it is
+written before the venue is touched, so a venue fill proves it exists).
+``--create-order-row --signal-id <uuid> --order-direction buy|sell`` first
+records the missing orders row through the SAME production path the worker
+uses (``StrategyWorkerStore.insert_order_row``: audit-first ORDER_PLACED
+with an explicit ``repair`` marker, then the INSERT), then replays the fill
+through the pipeline as usual. Validations (each overridable ONLY with
+``--force``): the signal must exist, be ``signal_type='exit'``, and match
+an open ``positions_current`` row whose sign the order direction actually
+closes (short → buy, long → sell) with ``|quantity| == --fill-quantity``.
+
 **Exit codes:** 0 success/dry-run; 2 validation; 3 order row not found /
-already filled; 5 DB init failure.
+already filled; 4 signal row not found / repair validation failed;
+5 DB init failure.
 
 On the VPS, run inside the api container with the in-container DATABASE_URL
 (same wrapper ceremony as ``bootstrap_live_account`` — see
@@ -104,6 +120,26 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Required together with --no-dry-run.",
     )
+    parser.add_argument(
+        "--create-order-row",
+        action="store_true",
+        help=(
+            "When no orders row exists for --client-order-id, create it from "
+            "the leg's signals row (via StrategyWorkerStore.insert_order_row) "
+            "before replaying. Requires --signal-id and --order-direction."
+        ),
+    )
+    parser.add_argument(
+        "--signal-id",
+        default=None,
+        help="signals.id (UUID) of the leg whose orders row is missing.",
+    )
+    parser.add_argument(
+        "--order-direction",
+        default=None,
+        choices=["buy", "sell"],
+        help="Order side for the created row (closing a short = buy).",
+    )
     return parser
 
 
@@ -121,6 +157,130 @@ async def _fetch_order_row(
                 {"cid": client_order_id},
             )
         ).fetchone()
+
+
+async def _fetch_signal_row(session_factory: async_sessionmaker[Any], signal_id: str) -> Any | None:
+    async with session_factory() as session:
+        return (
+            await session.execute(
+                text(
+                    "SELECT id, account_id, market, contract_id, direction, "
+                    "       signal_type, target_contracts, strategy_hash, "
+                    "       parameter_set_hash, status, emitted_at_utc "
+                    "FROM signals WHERE id = :sid"
+                ),
+                {"sid": signal_id},
+            )
+        ).fetchone()
+
+
+async def _fetch_position_row(
+    session_factory: async_sessionmaker[Any], *, account_id: Any, market: str
+) -> Any | None:
+    async with session_factory() as session:
+        return (
+            await session.execute(
+                text(
+                    "SELECT quantity FROM positions_current "
+                    "WHERE account_id = :acct AND market = :market "
+                    "ORDER BY id DESC LIMIT 1"
+                ),
+                {"acct": account_id, "market": market},
+            )
+        ).fetchone()
+
+
+async def _create_missing_order_row(
+    *,
+    session_factory: async_sessionmaker[Any],
+    args: argparse.Namespace,
+    execute: bool,
+) -> int:
+    """Validate (always) + create (only when ``execute``) the missing
+    orders row from the leg's signal.
+
+    Returns 0 on success (validations passed; row created when
+    ``execute=True`` — caller proceeds to replay), or the exit code to
+    bail with. Validations are identical in dry-run and execute so the
+    dry-run output is a faithful preview.
+    """
+    signal = await _fetch_signal_row(session_factory, args.signal_id)
+    if signal is None:
+        print(f"ERROR: no signals row for --signal-id={args.signal_id!r}", file=sys.stderr)
+        return 4
+    if str(signal.signal_type) != "exit" and not args.force:
+        print(
+            f"ERROR: signal {args.signal_id} has signal_type="
+            f"{signal.signal_type!r}, expected 'exit' (the stranded-close "
+            "repair). Pass --force only if you are certain.",
+            file=sys.stderr,
+        )
+        return 4
+
+    position = await _fetch_position_row(
+        session_factory, account_id=signal.account_id, market=str(signal.market)
+    )
+    pos_qty = int(position.quantity) if position is not None else 0
+    closes_short = args.order_direction == "buy" and pos_qty < 0
+    closes_long = args.order_direction == "sell" and pos_qty > 0
+    if not (closes_short or closes_long) and not args.force:
+        print(
+            f"ERROR: positions_current for {signal.market} is {pos_qty}; an "
+            f"--order-direction {args.order_direction} order does not close "
+            "it. Pass --force only if the book state is already known-wrong.",
+            file=sys.stderr,
+        )
+        return 4
+    if abs(pos_qty) != args.fill_quantity and not args.force:
+        print(
+            f"ERROR: --fill-quantity {args.fill_quantity} != |positions_current| "
+            f"{abs(pos_qty)} — a full-close replay must take the position to "
+            "exactly zero. Pass --force only if the venue record truly says so.",
+            file=sys.stderr,
+        )
+        return 4
+
+    print(
+        f"missing orders row would be created from signal {signal.id}: "
+        f"market={signal.market} direction={args.order_direction} "
+        f"quantity={args.fill_quantity} order_type=limit_marketable "
+        f"(positions_current={pos_qty})"
+    )
+    if not execute:
+        return 0
+
+    # Local import: the store pulls the worker module (pandas etc.); only
+    # this repair mode needs it, and the api image ships the full tree.
+    from services.signal.strategy_worker import StrategyWorkerStore
+
+    store = StrategyWorkerStore(session_factory=session_factory, env=args.env)
+    order_id = await store.insert_order_row(
+        signal.account_id,
+        signal_id=signal.id,
+        client_order_id=args.client_order_id,
+        broker_order_id=None,
+        market=str(signal.market),
+        contract_id=signal.contract_id,
+        direction=args.order_direction,
+        order_type="limit_marketable",
+        quantity=args.fill_quantity,
+        limit_price=None,
+        stop_price=None,
+        now_utc=datetime.now(tz=UTC),
+        strategy_hash=str(signal.strategy_hash),
+        parameter_set_hash=str(signal.parameter_set_hash),
+        audit_payload={
+            "repair": "replay_leg_fill --create-order-row",
+            "note": (
+                "orders row recorded post-hoc: the leg crashed after the "
+                "venue fill but before insert_order_row (2026-07-16 "
+                "stranded-close variant); fill economics follow in the "
+                "replayed ORDER_FILLED event"
+            ),
+        },
+    )
+    print(f"orders row created: id={order_id} (audit-first ORDER_PLACED with repair marker)")
+    return 0
 
 
 async def _run(args: argparse.Namespace) -> int:
@@ -149,23 +309,55 @@ async def _run(args: argparse.Namespace) -> int:
             return 2
     else:
         filled_at = datetime.now(tz=UTC)
+    if args.no_dry_run and not args.confirm:
+        print("ERROR: --no-dry-run requires --confirm", file=sys.stderr)
+        return 2
 
     engine = create_async_engine(database_url, pool_pre_ping=True)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         order_row = await _fetch_order_row(session_factory, args.client_order_id)
-        if order_row is None:
-            print(f"ERROR: no orders row for client_order_id={args.client_order_id!r}")
+        if order_row is None and args.create_order_row:
+            if not args.signal_id or not args.order_direction:
+                print(
+                    "ERROR: --create-order-row requires --signal-id and --order-direction",
+                    file=sys.stderr,
+                )
+                return 2
+            rc = await _create_missing_order_row(
+                session_factory=session_factory, args=args, execute=args.no_dry_run
+            )
+            if rc != 0:
+                return rc
+            if args.no_dry_run:
+                order_row = await _fetch_order_row(session_factory, args.client_order_id)
+                if order_row is None:
+                    print(
+                        "ERROR: orders row still missing after create — investigate",
+                        file=sys.stderr,
+                    )
+                    return 4
+        if order_row is None and not args.no_dry_run and args.create_order_row:
+            # Dry-run preview of the create path: no row to print yet; the
+            # payload block below still previews the replay economics.
+            pass
+        elif order_row is None:
+            print(
+                f"ERROR: no orders row for client_order_id={args.client_order_id!r} "
+                "(if the leg crashed before insert_order_row, re-run with "
+                "--create-order-row --signal-id <uuid> --order-direction buy|sell)"
+            )
             return 3
-        print(
-            f"orders row: id={order_row.id} market={order_row.market} "
-            f"direction={order_row.direction} quantity={order_row.quantity} "
-            f"status={order_row.status}"
-        )
-        if str(order_row.status) == "filled" and not args.force:
-            print("ERROR: order already status='filled' — pass --force to replay anyway")
-            return 3
-        order_qty = int(order_row.quantity)
+        else:
+            print(
+                f"orders row: id={order_row.id} market={order_row.market} "
+                f"direction={order_row.direction} quantity={order_row.quantity} "
+                f"status={order_row.status}"
+            )
+            if str(order_row.status) == "filled" and not args.force:
+                print("ERROR: order already status='filled' — pass --force to replay anyway")
+                return 3
+        order_qty = int(order_row.quantity) if order_row is not None else args.fill_quantity
         if args.fill_quantity > order_qty and not args.force:
             print(
                 f"ERROR: --fill-quantity {args.fill_quantity} exceeds the orders "

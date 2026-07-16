@@ -44,6 +44,7 @@ from services.execution.coinbase_client import (
 )
 from services.execution.types import (
     BestBidAsk,
+    BrokerError,
     BrokerOrderAck,
     BrokerOrderRequest,
     BrokerOrderState,
@@ -907,3 +908,236 @@ class TestStartupAndEmergency:
         assert not hasattr(CoinbaseBrokerClient, "set_intraday_margin_setting")
         assert not hasattr(SdkCoinbaseBrokerClient, "set_intraday_margin_setting")
         assert not hasattr(CoinbaseExecutionAdapter, "set_intraday_margin_setting")
+
+
+# ---------------------------------------------------------------------------
+# order-poll NOT_FOUND tolerance (2026-07-16 incident)
+# ---------------------------------------------------------------------------
+
+
+def _not_found_error() -> BrokerError:
+    return BrokerError(
+        operation="get_order",
+        detail=(
+            "HTTPError('404 Client Error: Not Found "
+            '{"error":"NOT_FOUND","error_details":"order with this orderID '
+            "was not found\"}')"
+        ),
+        underlying_exception_class="HTTPError",
+        occurred_at_utc=NOW,
+        http_status=404,
+    )
+
+
+class _NotFoundThenFillBroker(_FakeBroker):
+    """get_order 404s for the first N polls, then behaves normally —
+    the venue read-after-write gap that killed the 2026-07-16 close."""
+
+    def __init__(self, *, not_found_polls: int, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.not_found_polls = not_found_polls
+        self.get_order_calls = 0
+
+    async def get_order(self, order_id: str) -> BrokerOrderState:
+        self.get_order_calls += 1
+        if self.get_order_calls <= self.not_found_polls:
+            raise _not_found_error()
+        return await super().get_order(order_id)
+
+
+class TestOrderPollNotFoundTolerance:
+    def test_transient_404_then_fill_completes_the_ladder(self) -> None:
+        """Incident pin: a 404 one poll after placement must NOT kill the
+        leg — the poll retries and sees the fill."""
+        tm = _TimeMachine()
+        broker = _NotFoundThenFillBroker(not_found_polls=2, post_only="fill")
+        adapter = _adapter(broker, tm)
+        result = asyncio.run(
+            adapter.execute_target_delta(
+                product=BTC_PERP, delta_contracts=Decimal(2), decision_date=D, decision_seq=0
+            )
+        )
+        assert result.fully_filled
+        assert broker.get_order_calls == 3  # two 404s + the fill read
+
+    def test_persistent_404_raises_at_the_stage_deadline(self) -> None:
+        """A 404 that never clears re-raises once the stage deadline is
+        spent — venue state unknown, the pre-existing BrokerError
+        contract (never silently returns a fabricated state)."""
+        tm = _TimeMachine()
+        broker = _NotFoundThenFillBroker(not_found_polls=10_000, post_only="fill")
+        adapter = _adapter(broker, tm)
+        with pytest.raises(BrokerError) as excinfo:
+            asyncio.run(
+                adapter.execute_target_delta(
+                    product=BTC_PERP, delta_contracts=Decimal(2), decision_date=D, decision_seq=0
+                )
+            )
+        assert excinfo.value.http_status == 404
+        # the poll kept retrying through the 10-min stage-1 window
+        assert sum(tm.slept) >= 600.0
+
+    def test_non_404_broker_error_raises_immediately(self) -> None:
+        class _Boom(_FakeBroker):
+            async def get_order(self, order_id: str) -> BrokerOrderState:
+                raise BrokerError(
+                    operation="get_order",
+                    detail="HTTPError('503 Server Error')",
+                    underlying_exception_class="HTTPError",
+                    occurred_at_utc=NOW,
+                    http_status=503,
+                )
+
+        tm = _TimeMachine()
+        broker = _Boom(post_only="fill")
+        adapter = _adapter(broker, tm)
+        with pytest.raises(BrokerError) as excinfo:
+            asyncio.run(
+                adapter.execute_target_delta(
+                    product=BTC_PERP, delta_contracts=Decimal(2), decision_date=D, decision_seq=0
+                )
+            )
+        assert excinfo.value.http_status == 503
+        assert tm.slept == []  # no retry loop was entered
+
+    def test_stop_verify_tolerates_404_until_open_orders_confirm(self) -> None:
+        """ensure_native_stop's verify loop: a 404 on the just-placed
+        stop is 'not visible yet', not terminal — the loop keeps
+        waiting and confirms via list_open_orders."""
+
+        class _StopHiddenBriefly(_FakeBroker):
+            def __init__(self, **kwargs: Any) -> None:
+                super().__init__(**kwargs)
+                self.get_order_calls = 0
+                self.list_calls = 0
+
+            async def list_open_orders(
+                self, product_id: str | None = None
+            ) -> list[BrokerOrderState]:
+                # Call 1 is ensure_native_stop's pre-placement scan;
+                # call 2 is the verify loop's first pass — keep the
+                # stop invisible there so the loop consults get_order
+                # (which 404s); visible from call 3.
+                self.list_calls += 1
+                if self.list_calls <= 2:
+                    return []
+                return await super().list_open_orders(product_id)
+
+            async def get_order(self, order_id: str) -> BrokerOrderState:
+                self.get_order_calls += 1
+                raise _not_found_error()
+
+        tm = _TimeMachine()
+        broker = _StopHiddenBriefly(stop="stay_open")
+        adapter = _adapter(broker, tm)
+        result = asyncio.run(
+            adapter.ensure_native_stop(
+                product=BTC_PERP,
+                position_contracts=Decimal(-2),
+                entry_ref=Decimal("62265"),
+                atrp=Decimal("0.0322"),
+                decision_date=D,
+                decision_seq=0,
+            )
+        )
+        assert result.verified_resting
+        assert broker.get_order_calls == 1  # 404 was tolerated, not raised
+
+
+class TestBrokerErrorHttpStatus:
+    def test_call_extracts_status_from_response_carrying_exceptions(self) -> None:
+        class _Resp:
+            status_code = 404
+
+        class _HttpErrorish(Exception):
+            def __init__(self) -> None:
+                super().__init__("404 Client Error")
+                self.response = _Resp()
+
+        def _raiser() -> None:
+            raise _HttpErrorish()
+
+        client = SdkCoinbaseBrokerClient(
+            api_key_name="k", api_private_key="p", api_host="example.invalid"
+        )
+        with pytest.raises(BrokerError) as excinfo:
+            asyncio.run(client._call("get_order", _raiser))
+        assert excinfo.value.http_status == 404
+        assert excinfo.value.underlying_exception_class == "_HttpErrorish"
+
+    def test_call_leaves_status_none_for_plain_exceptions(self) -> None:
+        def _raiser() -> None:
+            raise RuntimeError("boom")
+
+        client = SdkCoinbaseBrokerClient(
+            api_key_name="k", api_private_key="p", api_host="example.invalid"
+        )
+        with pytest.raises(BrokerError) as excinfo:
+            asyncio.run(client._call("list_positions", _raiser))
+        assert excinfo.value.http_status is None
+
+    def test_stop_verify_persistent_404_still_times_out_within_gate_a2_bound(self) -> None:
+        """Risk-review should-fix #1: a stop that 404s forever AND never
+        appears in list_open_orders must still end in
+        StopVerificationError within the unchanged 10 s verify bound —
+        the 404 tolerance may only skip the terminal check, never the
+        timeout."""
+
+        class _NeverVisible(_FakeBroker):
+            async def list_open_orders(
+                self, product_id: str | None = None
+            ) -> list[BrokerOrderState]:
+                return []
+
+            async def get_order(self, order_id: str) -> BrokerOrderState:
+                raise _not_found_error()
+
+        tm = _TimeMachine()
+        broker = _NeverVisible(stop="stay_open")
+        adapter = _adapter(broker, tm)
+        with pytest.raises(StopVerificationError, match="not confirmed resting"):
+            asyncio.run(
+                adapter.ensure_native_stop(
+                    product=BTC_PERP,
+                    position_contracts=Decimal(-2),
+                    entry_ref=Decimal("62265"),
+                    atrp=Decimal("0.0322"),
+                    decision_date=D,
+                    decision_seq=0,
+                )
+            )
+        # verify loop sleeps 1 s per pass; the 10 s bound caps the wait
+        assert sum(tm.slept) <= 11.0
+
+    def test_404_grace_floor_outlives_a_short_stage_deadline(self) -> None:
+        """Risk-review should-fix #2: with a 10 s stage deadline (IOC/
+        market shape) the 404 arm keeps retrying to the 30 s grace
+        floor — a fill that becomes visible at 15 s is recovered
+        instead of stranding the leg."""
+        tm = _TimeMachine()
+        broker = _NotFoundThenFillBroker(not_found_polls=3, post_only="fill")
+        seed = BrokerOrderRequest(
+            client_order_id="cid-x",
+            product_id=BTC_PERP.product_id,
+            side="buy",
+            contracts=Decimal(2),
+            kind="limit_post_only",
+            limit_price=Decimal("100000"),
+        )
+        broker.orders["venue-x"] = _FakeOrder(seed, "fill")
+        adapter = _adapter(broker, tm)
+        # poll_interval 5 s: 404s at t=0/5/10 (10 >= the old deadline —
+        # pre-floor this raised), visible + filled at t=15 < 30 floor.
+        state = asyncio.run(adapter._await_order_terminal_or_deadline("venue-x", deadline_s=10.0))
+        assert state.status == "filled"
+        assert broker.get_order_calls == 4
+
+    def test_404_grace_floor_still_raises_when_persistent(self) -> None:
+        """The floor widens the window; it does not remove the raise."""
+        tm = _TimeMachine()
+        broker = _NotFoundThenFillBroker(not_found_polls=10_000, post_only="fill")
+        adapter = _adapter(broker, tm)
+        with pytest.raises(BrokerError) as excinfo:
+            asyncio.run(adapter._await_order_terminal_or_deadline("venue-x", deadline_s=10.0))
+        assert excinfo.value.http_status == 404
+        assert 30.0 <= sum(tm.slept) <= 40.0  # bounded by the grace floor, not 10 s

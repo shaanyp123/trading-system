@@ -398,11 +398,25 @@ class SdkCoinbaseBrokerClient:
                 occurred_at_utc=datetime.now(tz=UTC),
             ) from exc
         except Exception as exc:
+            # requests.HTTPError carries the venue response; surface its
+            # status so callers can distinguish retryable venue shapes
+            # (the order-poll 404 read-after-write gap, 2026-07-16
+            # incident) from generic transport failure. getattr-chained:
+            # non-HTTP exceptions simply carry http_status=None. The
+            # try/except makes the extraction airtight against exotic
+            # exception shapes whose `response`/`status_code` are
+            # raising properties (risk-review note #3) — extraction
+            # failure must never mask the original venue error.
+            try:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+            except Exception:
+                status = None
             raise BrokerError(
                 operation=operation,
                 detail=repr(exc),
                 underlying_exception_class=type(exc).__name__,
                 occurred_at_utc=datetime.now(tz=UTC),
+                http_status=status if isinstance(status, int) else None,
             ) from exc
 
     @staticmethod

@@ -230,6 +230,13 @@ class BrokerError(Exception):
     detail: str
     underlying_exception_class: str
     occurred_at_utc: datetime
+    #: HTTP status of the venue response when the underlying exception
+    #: carried one (requests.HTTPError shape), else None. Added for the
+    #: 2026-07-16 incident: the order-terminal poll must distinguish a
+    #: venue read-after-write 404 (just-placed order not yet visible to
+    #: GET — retryable within the poll deadline) from every other
+    #: transport failure (fail fast, venue state unknown).
+    http_status: int | None = None
 
 
 __all__ = [

@@ -48,6 +48,7 @@ import structlog
 
 from services.execution.coinbase_client import CoinbaseBrokerClient
 from services.execution.types import (
+    BrokerError,
     BrokerOrderRequest,
     BrokerOrderState,
     BrokerPosition,
@@ -66,6 +67,18 @@ IOC_CROSS_BPS: Final[Decimal] = Decimal("5")  # mid ± 5 bps stage-2 limit
 NATIVE_STOP_ATR_MULT: Final[Decimal] = Decimal("3.0")  # §5 Layer-1 backstop
 STOP_LIMIT_THROUGH_FRAC: Final[Decimal] = Decimal("0.01")  # limit 1% past trigger
 STOP_VERIFY_TIMEOUT_SECONDS: Final[float] = 10.0  # gate A2 resting deadline
+
+#: Minimum window the order-terminal poll tolerates venue NOT_FOUND
+#: before treating the 404 as terminal (2026-07-16 risk-review should-fix
+#: #2). The stage deadlines bound how long we wait for a FILL; this
+#: floor bounds how long we wait for the order to become VISIBLE at all
+#: — the IOC/market stages' 10-20 s deadlines are only 10-20x the
+#: observed 1 s read-after-write gap, and a stranded filled order costs
+#: an EOD recon break + auto-halt (the exact 2026-07-16 incident).
+#: Implementation-layer poll timing, NOT a §5 locked execution constant:
+#: it never shortens a stage, never affects fill economics, and only
+#: widens the retry window on the NOT_FOUND shape.
+ORDER_POLL_NOT_FOUND_GRACE_SECONDS: Final[float] = 30.0
 
 #: Ladder poll cadence while waiting on the stage-1 post-only order.
 DEFAULT_POLL_INTERVAL_SECONDS: Final[float] = 5.0
@@ -315,16 +328,59 @@ class CoinbaseExecutionAdapter:
     async def _await_order_terminal_or_deadline(
         self, order_id: str, *, deadline_s: float
     ) -> BrokerOrderState:
-        """Poll one order until terminal or the deadline; return last state."""
+        """Poll one order until terminal or the deadline; return last state.
+
+        **NOT_FOUND tolerance (2026-07-16 incident):** the venue can 404
+        a ``get_order`` for a JUST-PLACED order (read-after-write
+        visibility gap — observed live one second after a close order
+        that in fact FILLED). A 404 inside the poll window is therefore
+        treated as "not visible yet": log + keep polling. A 404 that
+        PERSISTS through the deadline re-raises — at that point the id
+        is either genuinely unknown or the venue is degraded, and the
+        caller must treat venue state as unknown (the pre-existing
+        BrokerError contract). Every non-404 BrokerError still raises
+        immediately.
+
+        The 404 window is ``max(deadline_s,
+        ORDER_POLL_NOT_FOUND_GRACE_SECONDS)`` (risk-review should-fix
+        #2): the short IOC/market stage deadlines bound the wait for a
+        FILL, not the wait for venue VISIBILITY — under a degraded
+        venue the read-after-write gap is unbounded, and giving up at
+        10-20 s would re-create the stranded-fill incident this fix
+        exists to close. The non-terminal return path keeps the plain
+        ``deadline_s`` (stage economics unchanged); only the 404-retry
+        arm uses the floored window.
+        """
         started = self._clock()
-        state = await self._client.get_order(order_id)
-        while not state.is_terminal:
+        not_found_deadline_s = max(deadline_s, ORDER_POLL_NOT_FOUND_GRACE_SECONDS)
+        state: BrokerOrderState | None = None
+        while True:
+            try:
+                state = await self._client.get_order(order_id)
+            except BrokerError as exc:
+                if exc.http_status != 404:
+                    raise
+                elapsed = (self._clock() - started).total_seconds()
+                if elapsed >= not_found_deadline_s:
+                    raise
+                self._log.warning(
+                    "coinbase_order_poll_not_found_retrying",
+                    order_id=order_id,
+                    elapsed_s=round(elapsed, 1),
+                    deadline_s=not_found_deadline_s,
+                    note=(
+                        "venue 404 on a just-placed order (read-after-write "
+                        "gap); polling until the NOT_FOUND grace deadline"
+                    ),
+                )
+                await self._sleep(self._poll_interval_s)
+                continue
+            if state.is_terminal:
+                return state
             elapsed = (self._clock() - started).total_seconds()
             if elapsed >= deadline_s:
-                break
+                return state
             await self._sleep(self._poll_interval_s)
-            state = await self._client.get_order(order_id)
-        return state
 
     # -- execution ladder ------------------------------------------------------
 
@@ -636,8 +692,19 @@ class CoinbaseExecutionAdapter:
             open_now = await self._client.list_open_orders(product.product_id)
             if any(o.order_id == order_id and o.status in ("open", "queued") for o in open_now):
                 break
-            state = await self._client.get_order(order_id)
-            if state.is_terminal:
+            try:
+                state = await self._client.get_order(order_id)
+            except BrokerError as exc:
+                if exc.http_status != 404:
+                    raise
+                # Same read-after-write gap as the ladder poll
+                # (2026-07-16): a just-placed stop can 404 on lookup.
+                # Not visible yet ≠ terminal — keep waiting; the
+                # timeout below still bounds the wait (and a timeout
+                # raises StopVerificationError → gate A2 fail-safe:
+                # re-arm retries every risk tick).
+                state = None
+            if state is not None and state.is_terminal:
                 raise StopVerificationError(
                     f"stop order {order_id} went terminal ({state.status}) before resting"
                 )
