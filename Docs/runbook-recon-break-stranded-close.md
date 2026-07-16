@@ -28,18 +28,29 @@ are the safety net working as designed; the repair re-records reality.
 
 ## Step 0 — Confirm the shape (paste-ready, read-only)
 
+Postgres requires a password even for in-container `psql`
+(`--auth-local=scram-sha-256` per the compose file); the superuser password
+lives in `deploy/.env` on the VPS — you never type it by hand. Paste this
+preamble ONCE per SSH session (same pattern `deploy/day5-bringup.sh` uses),
+then use the `psq` helper for every query in this runbook:
+
 ```
 cd /opt/trading
-docker compose --env-file deploy/.env exec -T postgres psql -U postgres -d trading -c \
-  "SELECT state, severity, reason, entered_at_utc FROM risk_state WHERE is_current;"
-docker compose --env-file deploy/.env exec -T postgres psql -U postgres -d trading -c \
-  "SELECT market, quantity, avg_cost, last_mark_ts FROM positions_current;"
-docker compose --env-file deploy/.env exec -T postgres psql -U postgres -d trading -c \
-  "SELECT metric, market, expected, actual, delta, detected_at_utc, resolved_at_utc, resolution_path \
-   FROM reconciliation_breaks ORDER BY detected_at_utc DESC LIMIT 5;"
-docker compose --env-file deploy/.env exec -T postgres psql -U postgres -d trading -c \
-  "SELECT id, market, direction, state, total_quantity, opened_at_utc, closed_at_utc \
-   FROM trades ORDER BY created_at DESC LIMIT 5;"
+set -a; source deploy/.env; set +a
+psq() { docker compose --env-file deploy/.env exec -T \
+  -e PGPASSWORD="${POSTGRES_SUPERUSER_PASSWORD}" \
+  postgres psql -U postgres -d trading -c "$1"; }
+```
+
+Then:
+
+```
+psq "SELECT state, severity, reason, entered_at_utc FROM risk_state WHERE is_current;"
+psq "SELECT market, quantity, avg_cost, last_mark_ts FROM positions_current;"
+psq "SELECT metric, market, expected, actual, delta, detected_at_utc, resolved_at_utc, resolution_path \
+     FROM reconciliation_breaks ORDER BY detected_at_utc DESC LIMIT 5;"
+psq "SELECT id, market, direction, state, total_quantity, opened_at_utc, closed_at_utc \
+     FROM trades ORDER BY created_at DESC LIMIT 5;"
 ```
 
 **Shape match:** `risk_state` = `HALT_NEW`; `positions_current` shows a non-zero
@@ -56,11 +67,9 @@ Find the close leg's `client_order_id` and status (the decision outcome JSON
 carries the ladder stages; the first stage's cid is the leg cid):
 
 ```
-docker compose --env-file deploy/.env exec -T postgres psql -U postgres -d trading -c \
-  "SELECT decision_date, status, outcome FROM strategy_decisions ORDER BY decision_date DESC LIMIT 3;"
-docker compose --env-file deploy/.env exec -T postgres psql -U postgres -d trading -c \
-  "SELECT client_order_id, market, direction, quantity, status, created_at \
-   FROM orders ORDER BY created_at DESC LIMIT 8;"
+psq "SELECT decision_date, status, outcome FROM strategy_decisions ORDER BY decision_date DESC LIMIT 3;"
+psq "SELECT client_order_id, market, direction, quantity, status, created_at \
+     FROM orders ORDER BY created_at DESC LIMIT 8;"
 ```
 
 Then pull the worker's own account of the failure (pick the close night's date):
@@ -111,10 +120,8 @@ from the venue (documented `from_fill` convention, PR #377).
 ## Step 3 — Verify
 
 ```
-docker compose --env-file deploy/.env exec -T postgres psql -U postgres -d trading -c \
-  "SELECT market, quantity FROM positions_current;"
-docker compose --env-file deploy/.env exec -T postgres psql -U postgres -d trading -c \
-  "SELECT id, state, realized_pnl_usd, closed_at_utc FROM trades ORDER BY created_at DESC LIMIT 3;"
+psq "SELECT market, quantity FROM positions_current;"
+psq "SELECT id, state, realized_pnl_usd, closed_at_utc FROM trades ORDER BY created_at DESC LIMIT 3;"
 ```
 
 Expect: no stale row (flat book), trade `closed` with a real
