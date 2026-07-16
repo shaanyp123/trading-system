@@ -114,19 +114,39 @@ price, total fees, fill timestamp.
 > (no migration; standard timing window applies).
 
 The tool re-feeds the aggregated close fill through the SAME pipeline the
-worker uses (`process_fill_event`) — full audit record, no hand SQL. Dry-run
-prints what it would do:
+worker uses (`process_fill_event`) — full audit record, no hand SQL.
+
+> **`DATABASE_URL` wrapper is REQUIRED** (bit the 2026-07-16 repair):
+> `docker compose exec` bypasses the api entrypoint, so a bare
+> `python -m scripts.operator_tools.replay_leg_fill` fails with
+> "DATABASE_URL not set". Build it in-process from the mounted secrets
+> file — the same pattern as `deploy/crypto-vps-bringup.md` Step 7.
+
+Dry-run (writes nothing; fill in the venue values):
 
 ```
 cd /opt/trading
-docker compose --env-file deploy/.env exec -T api python -m scripts.operator_tools.replay_leg_fill \
-  --client-order-id <CLOSE_LEG_CID> \
-  --fill-quantity <CONTRACTS> \
-  --fill-price "<AVG_PRICE>" \
-  --commission-usd "<TOTAL_FEES>" \
-  --filled-at-utc "<REAL_FILL_TS_ISO>" \
-  --env paper
+docker compose --env-file deploy/.env exec -T api python -c "
+import os, sys, runpy, yaml
+pw = yaml.safe_load(open('/run/secrets/secrets.yaml'))['postgres']['app_service_password']
+os.environ['DATABASE_URL'] = f'postgresql+asyncpg://app_service:{pw}@postgres:5432/trading'
+sys.argv = ['replay_leg_fill',
+            '--client-order-id', '<CLOSE_LEG_CID>',
+            '--fill-quantity', '<CONTRACTS>',
+            '--fill-price', '<AVG_PRICE>',
+            '--commission-usd', '<TOTAL_FEES>',
+            '--filled-at-utc', '<REAL_FILL_TS_ISO>',
+            '--env', 'paper']
+runpy.run_module('scripts.operator_tools.replay_leg_fill', run_name='__main__')
+"
 ```
+
+`<CLOSE_LEG_CID>` note: the leg's client_order_id is DETERMINISTIC — when
+the Coinbase UI doesn't show it, recompute it (from any checkout of this
+repo): `deterministic_client_order_id(decision_date=<UTC decision date>,
+asset='BTC', decision_seq=<leg seq, usually 0>, purpose='entry',
+stage=<0 post-only / 1 ioc / 2 market — match the UI's order Type>)`
+in `services/execution/coinbase_adapter.py`.
 
 For the **no-orders-row variant** (2026-07-16), add the create mode — the
 tool first records the missing orders row through the same production path
@@ -134,18 +154,20 @@ the worker uses (audit-first ORDER_PLACED carrying an explicit `repair`
 marker), then replays:
 
 ```
-  ... same flags as above ... \
-  --create-order-row \
-  --signal-id <EXIT_SIGNAL_UUID> \
-  --order-direction buy
+            ... same sys.argv entries as above ...,
+            '--create-order-row',
+            '--signal-id', '<EXIT_SIGNAL_UUID>',
+            '--order-direction', 'buy']
 ```
 
 (`--order-direction buy` closes a short; `sell` closes a long. The tool
 refuses unless the direction and `--fill-quantity` exactly close the live
 `positions_current` row.)
 
-Review the printed order row + payload, then execute by appending
-`--no-dry-run --confirm` (add `--force` ONLY for the fallback shape above).
+Review the printed order row + payload, then execute by re-running the
+SAME wrapper with `'--no-dry-run', '--confirm'` appended to the `sys.argv`
+list (add `'--force'` ONLY for the fallback shape above). Paste the whole
+wrapper as one block — a bare trailing-flags line is a shell error.
 Expected on success: `ORDER_FILLED → POSITION_CLOSED → BALANCE_SNAPSHOT_RECORDED
 → TRADE_CLOSED` audit events; the `positions_current` row deleted; the trade
 `closed` with realized PnL. Known accepted artifact: the replay's balance
