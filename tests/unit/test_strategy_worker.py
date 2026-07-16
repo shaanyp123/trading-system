@@ -1412,6 +1412,27 @@ class TestOutagePolicy:
         assert [c for c in broker.create_calls if c.kind == "market"]
         assert ("P1", "position_unprotected") in {(a[0], a[1]) for a in _store.alerts}
 
+    async def test_outage_snapshot_fetched_under_trade_lock(self) -> None:
+        """Risk-review 2026-07-16 note-9 follow-up: the open-orders
+        snapshot + covered/unprotected classification must serialize with
+        stop arms/cancels — the last stale-snapshot-outside-lock instance.
+        The flatten still runs OUTSIDE the lock (it re-acquires; a nested
+        acquire would deadlock — this test completing at all pins that)."""
+        worker, _store, broker = await _started_worker()
+        _open_long(worker, broker, "BTC", contracts=2)  # no resting stop
+        lock_states: list[bool] = []
+        orig = broker.list_open_orders
+
+        async def _instrumented(product_id: str | None = None) -> list[BrokerOrderState]:
+            lock_states.append(worker._trade_lock.locked())
+            return await orig(product_id)
+
+        broker.list_open_orders = _instrumented  # type: ignore[method-assign]
+        await worker._apply_outage_policy(now_utc=NOW)
+
+        assert lock_states and lock_states[0] is True  # snapshot under lock
+        assert worker.state["BTC"].contracts == 0  # unprotected flatten ran
+
     async def test_native_stop_fill_detected_and_locked_out(self) -> None:
         worker, store, broker = await _started_worker()
         rt = _open_long(worker, broker, "BTC", contracts=2)
