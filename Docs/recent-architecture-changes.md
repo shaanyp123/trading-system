@@ -80,3 +80,19 @@ The delta spec §1 decommission executed (repo-side; VPS ceremony at `deploy/cme
 - **Retired research surface note:** the reproduce-V1 / LEAN parity tests that read production `lean/` inputs now assert the loud-failure contract instead; the vbt↔LEAN parity + reproduce-V1 integration tests were removed with the signals ingress.
 
 **2026-07-09 addendum (secrets + hosting):** the Ashburn VPS was cancelled (fresh start, no DB backup — operator-directed) and the **sops/age secrets pipeline was retired** (operator-approved amendment). Secrets are now ONE plain-YAML host file (`/opt/trading-secrets/secrets.yaml`, schema `deploy/secrets.template.yaml`); recovery is re-issue-from-dashboard, not restore. New host: small Hetzner Cloud box (Ashburn) per `deploy/crypto-vps-bringup.md`. Full rationale + deletions: `Docs/decisions-log.md` 2026-07-09 (post-C0-merge). Do NOT recommend sops/age ceremonies for new work.
+
+---
+
+## 2026-07-09 — Phase C1 SMALL-LIVE START (C0 exit gates closed)
+
+The strategy worker went LIVE at 18:05 UTC 2026-07-09 (decisions-log "2026-07-09 (C1 START)"): 00:05 UTC daily decision + 30 s risk loop under the Phase-A clamps (`E_effective = min(equity, $1500)`, max 2 BTC / 4 ETH), Coinbase recon at 00:15 UTC, nightly `/cycle` digest. **There was no shadow phase** (operator directive 2026-07-08): C0's offline gates substituted full-history signal parity + canary execution drills. The VPS deliberately runs the `paper` env tag through C1 (`Docs/live-money-cutover-plan.md` stays inactive).
+
+**C1 operational chain so far (details + verdicts in decisions-log, 2026-07-09 → 2026-07-16):**
+
+- **2026-07-09 (night one):** real session-auth gap found and closed (#380 real session middleware; Caddy edge gate same night); CONVALESCENT probation amended to 3 clean UTC days.
+- **2026-07-10:** first autonomous entry (BTC short). **2026-07-11 (night two):** phantom recon break (base-asset vs product_id key mismatch, fixed #375) → false-positive adjudication path added (#376/#381).
+- **2026-07-12 (night three):** decision-driven close filled at the venue but crashed in propagation → recon auto-halt; repair + the fill-pipeline/worker-latch hardening wave (#377, #378, #381, #383, #385, #386, #387).
+- **2026-07-14:** first decision-driven entry to propagate fully clean through the hardened pipeline (operator-verified).
+- **2026-07-16:** close leg crashed on a Coinbase 404 read-after-write gap before `insert_order_row` (stranded-close variant) → `Docs/runbook-recon-break-stranded-close.md` + `replay_leg_fill --create-order-row` + 404-tolerant order poll (#392). Root-causing the companion Jul-15 hysteresis-hold anomaly exposed a **TOCTOU class in the worker**: venue snapshots read outside the trade lock + stop/tracking mutations outside it let a stale flat snapshot wipe engine memory on a live position. Fixed by #393 (snapshot-under-lock, two-tick `(tracked, venue)` divergence confirmation with same-tick stop-fill bypass, venue-checked non-reduce-only flatten, daily-loss F4 re-fire, engine-memory divergence tripwire) + #394 (outage-policy snapshot under the lock — the last instance of the pattern).
+
+**Current invariant (post-#394):** every venue-snapshot read and every stop/tracking mutation in `services/signal/strategy_worker.py` serializes under the worker's `_trade_lock`; single divergent venue readings never mutate state (two-tick confirmation; confirmed stop fills act same-tick); protective market flattens venue-verify before placing.
