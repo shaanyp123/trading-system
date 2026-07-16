@@ -2536,42 +2536,56 @@ class StrategyWorker:
     async def _apply_outage_policy(self, *, now_utc: datetime) -> None:
         """§7 data-outage row: protected-hold when the native stop is
         confirmed resting; otherwise flatten as soon as an order path
-        works."""
-        try:
-            open_orders = await self._broker.list_open_orders()
-        except Exception:
-            self._log.error(
-                "strategy_worker_outage_order_path_down",
-                note="marks stale AND order endpoints failing; will retry next tick",
-            )
-            return
-        for asset in ASSETS:
-            rt = self.state[asset]
-            product = self.products.get(asset)
-            if rt.contracts == 0 or product is None:
-                continue
-            closing_side = "sell" if rt.contracts > 0 else "buy"
-            covered = any(
-                o.kind == "stop_limit"
-                and o.product_id == product.product_id
-                and o.side == closing_side
-                and o.status in ("open", "queued")
-                and o.contracts >= abs(Decimal(rt.contracts))
-                for o in open_orders
-            )
-            if covered:
-                self._log.warning(
-                    "strategy_worker_outage_protected_hold",
-                    asset=asset,
-                    contracts=rt.contracts,
-                )
-            else:
+        works.
+
+        The open-orders snapshot AND the per-asset covered/unprotected
+        classification run under ``_trade_lock`` (2026-07-16 risk-review
+        note-9 follow-up — the last stale-snapshot-outside-lock instance):
+        un-serialized, a mid-flight stop arm/cancel on another path could
+        interleave with the read and misclassify a protected position as
+        naked (or a naked one as covered). The flattens themselves run
+        AFTER release — ``_flatten_position`` re-acquires the lock (not
+        reentrant) and re-verifies venue truth before placing (#393
+        recheck), which bounds the unlock gap."""
+        async with self._trade_lock:
+            try:
+                open_orders = await self._broker.list_open_orders()
+            except Exception:
                 self._log.error(
-                    "strategy_worker_outage_flattening_unprotected",
-                    asset=asset,
-                    contracts=rt.contracts,
+                    "strategy_worker_outage_order_path_down",
+                    note="marks stale AND order endpoints failing; will retry next tick",
                 )
-                await self._flatten_position(asset, reason="outage_unprotected", now_utc=now_utc)
+                return
+            unprotected: list[str] = []
+            for asset in ASSETS:
+                rt = self.state[asset]
+                product = self.products.get(asset)
+                if rt.contracts == 0 or product is None:
+                    continue
+                closing_side = "sell" if rt.contracts > 0 else "buy"
+                covered = any(
+                    o.kind == "stop_limit"
+                    and o.product_id == product.product_id
+                    and o.side == closing_side
+                    and o.status in ("open", "queued")
+                    and o.contracts >= abs(Decimal(rt.contracts))
+                    for o in open_orders
+                )
+                if covered:
+                    self._log.warning(
+                        "strategy_worker_outage_protected_hold",
+                        asset=asset,
+                        contracts=rt.contracts,
+                    )
+                else:
+                    self._log.error(
+                        "strategy_worker_outage_flattening_unprotected",
+                        asset=asset,
+                        contracts=rt.contracts,
+                    )
+                    unprotected.append(asset)
+        for asset in unprotected:
+            await self._flatten_position(asset, reason="outage_unprotected", now_utc=now_utc)
 
     async def _check_client_stops(self, *, now_utc: datetime) -> None:
         for asset in ASSETS:
