@@ -84,15 +84,34 @@ Interpretation:
 | Evidence | Meaning | Repair path |
 |---|---|---|
 | `orders` row **`pending`**, no `fills` row, decision `failed` | Propagation crashed mid-apply (night-three shape) | Step 2, no `--force` |
+| **NO `orders` row at all** for the close leg + decision `failed` ("unhandled exception") | The leg crashed AFTER the venue fill but BEFORE `insert_order_row` (2026-07-16 variant) — only the leg's `signals` row exists | Step 2 with `--create-order-row --signal-id <uuid> --order-direction buy\|sell` (find the signal id via the query below) |
 | `orders` row **`filled`** + `fills` row present + `strategy_worker_fill_propagation_failed_fallback` or `..._fill_scenario_deferred` in logs | The #386 minimal fallback recorded orders/fills honestly but deliberately did NOT touch positions/trades | Step 2 with `--force` (expect one duplicate `fills` row — accepted per PR #377 notes) |
 | `strategy_worker_ladder_incomplete_halting` | Venue only partially filled the close — venue is NOT flat | **Do not replay.** Report back; the remainder must be flattened first |
 | None of the above | Unknown variant | **Do not replay.** Export the journal window (`--output=json`) and report back |
+
+For the no-orders-row variant, the exit signal the worker minted before the
+crash (it is written before the venue is touched, so a venue fill proves it
+exists):
+
+```
+psq "SELECT id, emitted_at_utc, market, direction, signal_type, status, target_contracts \
+     FROM signals ORDER BY emitted_at_utc DESC LIMIT 3;"
+```
+
+Expect a `direction='flat' / signal_type='exit'` row stamped at the crash
+night's 00:05 UTC — its `id` is the `--signal-id` for Step 2.
 
 Also record the real fill economics off the Coinbase web UI fills screen (or
 the `order_placed` audit payload's `stages` array): total contracts, average
 price, total fees, fill timestamp.
 
 ## Step 2 — Repair the book via replay (dry-run first)
+
+> **Deploy prerequisite for the `--create-order-row` mode:** the mode landed
+> 2026-07-16 — the running api image must include it (`scripts/` ships inside
+> the image). If the merge is newer than the last deploy:
+> `cd /opt/trading && git pull --ff-only origin main && bash deploy/day5-bringup.sh --rebuild`
+> (no migration; standard timing window applies).
 
 The tool re-feeds the aggregated close fill through the SAME pipeline the
 worker uses (`process_fill_event`) — full audit record, no hand SQL. Dry-run
@@ -108,6 +127,22 @@ docker compose --env-file deploy/.env exec -T api python -m scripts.operator_too
   --filled-at-utc "<REAL_FILL_TS_ISO>" \
   --env paper
 ```
+
+For the **no-orders-row variant** (2026-07-16), add the create mode — the
+tool first records the missing orders row through the same production path
+the worker uses (audit-first ORDER_PLACED carrying an explicit `repair`
+marker), then replays:
+
+```
+  ... same flags as above ... \
+  --create-order-row \
+  --signal-id <EXIT_SIGNAL_UUID> \
+  --order-direction buy
+```
+
+(`--order-direction buy` closes a short; `sell` closes a long. The tool
+refuses unless the direction and `--fill-quantity` exactly close the live
+`positions_current` row.)
 
 Review the printed order row + payload, then execute by appending
 `--no-dry-run --confirm` (add `--force` ONLY for the fallback shape above).
