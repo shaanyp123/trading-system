@@ -168,7 +168,10 @@ class CycleDigestScheduler:
         if payload is None:
             return "fetch_failed"
 
-        plan = plan_cycle_digest_push(payload, now_utc=now)
+        # §10 gates section is best-effort: a gates fetch failure never
+        # blocks the nightly digest (the field is simply absent).
+        gates_payload = await self._fetch_json("/api/system/gates", http_client)
+        plan = plan_cycle_digest_push(payload, now_utc=now, gates_payload=gates_payload)
         if plan is None:
             self._last_handled_date = fire_date
             log.info("cycle_digest_skipped_no_decision", fire_date=fire_date.isoformat())
@@ -202,7 +205,13 @@ class CycleDigestScheduler:
         self, http_client: httpx.AsyncClient | None
     ) -> dict[str, Any] | None:
         """GET /api/system/cycle with the shared bearer; None on any failure."""
-        url = f"{self._config.api_base_url.rstrip('/')}/api/system/cycle"
+        return await self._fetch_json("/api/system/cycle", http_client)
+
+    async def _fetch_json(
+        self, path: str, http_client: httpx.AsyncClient | None
+    ) -> dict[str, Any] | None:
+        """GET an api JSON object with the shared bearer; None on any failure."""
+        url = f"{self._config.api_base_url.rstrip('/')}{path}"
         headers = {
             "Authorization": f"Bearer {self._config.api_bearer_token}",
             "User-Agent": "trading-webhook-pusher/0.1",

@@ -328,6 +328,27 @@ class ApiClient:
             )
         return body
 
+    async def get_system_gates(self) -> dict[str, Any]:
+        """``GET /api/system/gates`` — §10 acceptance-gate status.
+
+        Returns the parsed JSON dict for the shared renderer
+        ``services.discord_shared.gates_digest.build_gates_embed`` (same
+        no-bot-side-mirror rationale as :meth:`get_system_cycle`).
+        Raises :class:`ApiClientHTTPError` on non-200.
+        """
+        response = await self._client.get("/api/system/gates")
+        if response.status_code != 200:
+            self._raise_for_response(response)
+        body = response.json()
+        if not isinstance(body, dict):
+            raise ApiClientHTTPError(
+                status_code=response.status_code,
+                error_code="UNEXPECTED_SHAPE",
+                message="GET /api/system/gates returned a non-object JSON body.",
+                raw_body=str(body)[:4096],
+            )
+        return body
+
     async def invoke_kill_switch(
         self,
         *,

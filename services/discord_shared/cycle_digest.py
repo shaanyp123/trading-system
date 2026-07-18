@@ -140,6 +140,7 @@ def build_cycle_digest_embed(
     payload: Mapping[str, Any],
     *,
     now_utc: datetime,
+    gates_summary: str | None = None,
 ) -> dict[str, Any]:
     """Build the §3.8 digest embed dict from the §3.7 cycle payload.
 
@@ -210,6 +211,11 @@ def build_cycle_digest_embed(
         )
 
     fields.append({"name": "Risk loop", "value": _worker_line(worker)[:1024], "inline": False})
+    if gates_summary:
+        # §10 gate tracker one-liner (pre-rendered by the caller via
+        # services.discord_shared.gates_digest.format_gates_summary_line
+        # — passed as a string to keep this module's import DAG flat).
+        fields.append({"name": "§10 gates", "value": gates_summary[:1024], "inline": False})
     next_close = payload.get("next_friday_close_utc")
     fields.append(
         {
