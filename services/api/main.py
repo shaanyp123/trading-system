@@ -1078,6 +1078,67 @@ async def _start_usdc_rewards_capture(
     return scheduler, task
 
 
+async def _start_cash_manager(settings: APISettings) -> tuple[object, object] | None:
+    """Construct + start the daily cash-yield sweep worker; DORMANT default.
+
+    Delta spec §3.6, shipped behind ``cash_manager_enabled = False``: the
+    first branch below early-returns, so in the default configuration NO
+    scheduler task, NO venue client, and NO sweep path is ever
+    constructed. Activation (C2 decision, delta-spec open question #1 —
+    same-day reclaim verified live) = flipping API_CASH_MANAGER_ENABLED
+    per the operator runbook ``deploy/cash_manager/README.md``.
+    """
+    if not settings.cash_manager_enabled:
+        log.info("cash_manager_dormant_via_setting")
+        return None
+
+    if settings.coinbase_api_key_name is None or settings.coinbase_api_private_key is None:
+        log.warning(
+            "cash_manager_coinbase_credentials_missing",
+            note=(
+                "Set coinbase.api_key_name + coinbase.api_private_key in the "
+                "secrets file before enabling the cash manager."
+            ),
+        )
+        return None
+
+    from services.execution.coinbase_client import SdkCoinbaseBrokerClient
+    from services.reconciliation.scheduler import ReconciliationScheduler
+    from services.risk.cash_manager import (
+        DEFAULT_SWEEP_TIME_UTC,
+        CashManagerJob,
+        SdkCashSweepVenueClient,
+        make_sweep_callback,
+    )
+
+    key_name = settings.coinbase_api_key_name.get_secret_value()
+    private_key = settings.coinbase_api_private_key.get_secret_value()
+    job = CashManagerJob(
+        broker=SdkCoinbaseBrokerClient(
+            api_key_name=key_name,
+            api_private_key=private_key,
+        ),
+        sweep_client=SdkCashSweepVenueClient(
+            api_key_name=key_name,
+            api_private_key=private_key,
+        ),
+        session_factory=api_db.get_session_factory(),
+        env=_audit_env_from_settings(settings),
+        phase_at_emit=1,
+    )
+    scheduler = ReconciliationScheduler(
+        callback=make_sweep_callback(job),
+        eod_recon_time_utc=DEFAULT_SWEEP_TIME_UTC,
+    )
+    task = asyncio.create_task(scheduler.run_forever(), name="cash_manager.run_forever")
+    log.warning(
+        "cash_manager_ENABLED_spawned",
+        fire_time_utc=DEFAULT_SWEEP_TIME_UTC.isoformat(),
+        note="C2 activation path — verify deploy/cash_manager/README.md checklist",
+    )
+    return scheduler, task
+
+
 async def _stop_usdc_rewards_capture(state: tuple[object, object] | None) -> None:
     """Request stop + await the capture scheduler task. Best-effort."""
     if state is None:
@@ -1100,6 +1161,31 @@ async def _stop_usdc_rewards_capture(state: tuple[object, object] | None) -> Non
             log.exception("usdc_rewards_capture_shutdown_unclean")
     except Exception:
         log.exception("usdc_rewards_capture_task_join_failed")
+
+
+async def _stop_cash_manager(state: tuple[object, object] | None) -> None:
+    """Request stop + await the sweep scheduler task. Best-effort; a
+    dormant worker (state None — the default) is a no-op."""
+    if state is None:
+        return
+    scheduler, task = state
+    try:
+        scheduler.request_stop()  # type: ignore[attr-defined]
+    except Exception:
+        log.exception("cash_manager_request_stop_failed")
+    try:
+        await asyncio.wait_for(task, timeout=15.0)  # type: ignore[arg-type]
+    except TimeoutError:
+        log.warning("cash_manager_shutdown_timeout")
+        task.cancel()  # type: ignore[attr-defined]
+        try:
+            await task  # type: ignore[misc]
+        except asyncio.CancelledError:
+            log.info("cash_manager_shutdown_cancelled")
+        except Exception:
+            log.exception("cash_manager_shutdown_unclean")
+    except Exception:
+        log.exception("cash_manager_task_join_failed")
 
 
 async def _start_heartbeat_probe(
@@ -1502,6 +1588,7 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     heartbeat_probe_state: tuple[object, object] | None = None
     coinbase_market_data_state: tuple[object, object] | None = None
     usdc_rewards_capture_state: tuple[object, object] | None = None
+    cash_manager_state: tuple[object, object] | None = None
     async_task_monitor_state: tuple[object, object] | None = None
     try:
         try:
@@ -1545,6 +1632,13 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             # rewards capture pauses until the next restart).
             log.exception("usdc_rewards_capture_startup_failed")
         try:
+            cash_manager_state = await _start_cash_manager(settings)
+        except Exception:
+            # Own handler (risk-review finding 6): a capture-startup
+            # failure must not suppress (or misattribute) the cash
+            # manager's startup, and vice versa. Best-effort either way.
+            log.exception("cash_manager_startup_failed")
+        try:
             # The monitor MUST start AFTER the other workers so it can
             # capture their final `(worker, task)` tuples (or `None`
             # for ones that failed to spawn). The monitor itself is
@@ -1584,6 +1678,7 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         log.info("api_stopping")
         await _stop_async_task_monitor(async_task_monitor_state)
         await _stop_usdc_rewards_capture(usdc_rewards_capture_state)
+        await _stop_cash_manager(cash_manager_state)
         await _stop_coinbase_market_data_worker(coinbase_market_data_state)
         await _stop_heartbeat_probe(heartbeat_probe_state)
         await _stop_reconciliation_scheduler(recon_state)
