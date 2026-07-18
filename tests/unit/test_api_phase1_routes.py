@@ -2823,3 +2823,286 @@ class TestAuditLogTable:
         _bind_repo(override_dep, system_route, repo)
         response = await api_client.get("/api/system/audit?limit=999")
         assert response.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Incident reviews (§3.25 write-up gate — 2026-07-18)
+# ---------------------------------------------------------------------------
+
+
+class _RecordingDbSession:
+    """Fake session recording ``execute()`` calls with canned fetchone rows.
+
+    Unlike :class:`_NoopDbSession` (which errors on any execute), the
+    incident-review endpoints issue real INSERT/SELECT/UPDATE statements
+    through the route's ``db`` dependency — this fake records each
+    ``(sql, params)`` pair and pops canned rows for ``fetchone()``.
+    """
+
+    def __init__(self, fetchone_rows: list[Any] | None = None) -> None:
+        self.executed: list[tuple[str, dict[str, Any]]] = []
+        self.commits = 0
+        self._fetchone_rows = list(fetchone_rows or [])
+
+    async def execute(self, stmt: Any, params: Any = None) -> Any:
+        self.executed.append((str(stmt), dict(params or {})))
+        row = self._fetchone_rows.pop(0) if self._fetchone_rows else None
+
+        class _Result:
+            def __init__(self, r: Any) -> None:
+                self._r = r
+
+            def fetchone(self) -> Any:
+                return self._r
+
+        return _Result(row)
+
+    async def commit(self) -> None:
+        self.commits += 1
+
+
+def _override_db_session_with(api_app: Any, session_obj: Any) -> None:
+    """Wire a specific fake session object over ``get_session``."""
+    from services.api.db import get_session
+
+    async def _dep() -> Any:
+        yield session_obj
+
+    api_app.dependency_overrides[get_session] = _dep
+
+
+def _incident_review_halt_row() -> RiskStateRow:
+    return RiskStateRow(
+        state="HALT_NEW",
+        severity="incident_review",
+        reason="decommission_floor",
+        entered_at_utc=datetime.now(tz=UTC),
+        convalescent_session_count=0,
+        vacation_active=False,
+        vacation_until_utc=None,
+        audit_event_uuid=uuid4(),
+    )
+
+
+_VALID_WRITE_UP = (
+    "Decommission-floor halt 2026-07-17: venue USD ledger posted the Jul-16 "
+    "close loss with settlement lag against a zero-headroom floor. Capital "
+    "topped up; resume is safe."
+)
+
+
+class TestCreateIncidentReview:
+    """POST /api/system/incident-reviews (§2.4.3 write-up gate)."""
+
+    @pytest.mark.asyncio
+    async def test_no_active_account_returns_409(
+        self,
+        api_client: AsyncClient,
+        api_app: Any,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(account_id=None)
+        _bind_repo(override_dep, system_route, repo)
+        _override_db_session(api_app)
+        response = await api_client.post(
+            "/api/system/incident-reviews",
+            json={"write_up_text": _VALID_WRITE_UP},
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 409
+        assert response.json()["error_code"] == "NO_ACTIVE_ACCOUNT"
+
+    @pytest.mark.asyncio
+    async def test_routine_halt_returns_409(
+        self,
+        api_client: AsyncClient,
+        api_app: Any,
+        override_dep: Any,
+    ) -> None:
+        row = _incident_review_halt_row()
+        routine = RiskStateRow(
+            state=row.state,
+            severity="routine",
+            reason="trailing_dd_breach",
+            entered_at_utc=row.entered_at_utc,
+            convalescent_session_count=0,
+            vacation_active=False,
+            vacation_until_utc=None,
+            audit_event_uuid=uuid4(),
+        )
+        repo = _StubRepo(account_id=uuid4(), risk_row=routine)
+        _bind_repo(override_dep, system_route, repo)
+        _override_db_session(api_app)
+        response = await api_client.post(
+            "/api/system/incident-reviews",
+            json={"write_up_text": _VALID_WRITE_UP},
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 409
+        assert response.json()["error_code"] == "NOT_INCIDENT_REVIEW_HALT"
+
+    @pytest.mark.asyncio
+    async def test_normal_state_returns_409(
+        self,
+        api_client: AsyncClient,
+        api_app: Any,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(account_id=uuid4(), risk_row=None)  # → NORMAL default
+        _bind_repo(override_dep, system_route, repo)
+        _override_db_session(api_app)
+        response = await api_client.post(
+            "/api/system/incident-reviews",
+            json={"write_up_text": _VALID_WRITE_UP},
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 409
+        assert response.json()["error_code"] == "NOT_INCIDENT_REVIEW_HALT"
+
+    @pytest.mark.asyncio
+    async def test_short_write_up_returns_422(
+        self,
+        api_client: AsyncClient,
+        api_app: Any,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(account_id=uuid4(), risk_row=_incident_review_halt_row())
+        _bind_repo(override_dep, system_route, repo)
+        _override_db_session(api_app)
+        response = await api_client.post(
+            "/api/system/incident-reviews",
+            json={"write_up_text": "too short"},
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_happy_path_inserts_row_and_returns_201(
+        self,
+        api_client: AsyncClient,
+        api_app: Any,
+        override_dep: Any,
+    ) -> None:
+        from types import SimpleNamespace
+
+        halt_row = _incident_review_halt_row()
+        repo = _StubRepo(account_id=uuid4(), risk_row=halt_row)
+        _bind_repo(override_dep, system_route, repo)
+        review_id = uuid4()
+        authored_at = datetime.now(tz=UTC)
+        db = _RecordingDbSession(
+            fetchone_rows=[SimpleNamespace(id=review_id, authored_at_utc=authored_at)]
+        )
+        _override_db_session_with(api_app, db)
+
+        response = await api_client.post(
+            "/api/system/incident-reviews",
+            json={"write_up_text": _VALID_WRITE_UP},
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 201, response.text
+        body = response.json()
+        assert body["id"] == str(review_id)
+
+        assert len(db.executed) == 1
+        sql, params = db.executed[0]
+        assert "INSERT INTO incident_reviews" in sql
+        assert params["write_up_text"] == _VALID_WRITE_UP
+        assert params["triggering_audit_event_uuid"] == halt_row.audit_event_uuid
+        assert "authored_by" in params
+        assert db.commits == 1
+
+
+class TestResumeIncidentReviewValidation:
+    """Resume-route incident_review_id existence validation + resolve stamp."""
+
+    @pytest.mark.asyncio
+    async def test_malformed_id_returns_422(
+        self,
+        api_client: AsyncClient,
+        api_app: Any,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(account_id=uuid4(), risk_row=_incident_review_halt_row())
+        _bind_repo(override_dep, system_route, repo)
+        _override_db_session_with(api_app, _RecordingDbSession())
+        response = await api_client.post(
+            "/api/system/kill-switch/resume",
+            json={"incident_review_id": "not-a-uuid"},
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 422
+        assert response.json()["error_code"] == "INCIDENT_REVIEW_NOT_FOUND"
+
+    @pytest.mark.asyncio
+    async def test_unknown_id_returns_422(
+        self,
+        api_client: AsyncClient,
+        api_app: Any,
+        override_dep: Any,
+    ) -> None:
+        repo = _StubRepo(account_id=uuid4(), risk_row=_incident_review_halt_row())
+        _bind_repo(override_dep, system_route, repo)
+        db = _RecordingDbSession(fetchone_rows=[None])  # SELECT misses
+        _override_db_session_with(api_app, db)
+        response = await api_client.post(
+            "/api/system/kill-switch/resume",
+            json={"incident_review_id": str(uuid4())},
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 422
+        assert response.json()["error_code"] == "INCIDENT_REVIEW_NOT_FOUND"
+        assert any("SELECT id FROM incident_reviews" in sql for sql, _ in db.executed)
+
+    @pytest.mark.asyncio
+    async def test_happy_path_resumes_and_stamps_resolved(
+        self,
+        api_client: AsyncClient,
+        api_app: Any,
+        override_dep: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from types import SimpleNamespace
+
+        repo = _StubRepo(account_id=uuid4(), risk_row=_incident_review_halt_row())
+        _bind_repo(override_dep, system_route, repo)
+        review_id = uuid4()
+        db = _RecordingDbSession(
+            fetchone_rows=[SimpleNamespace(id=review_id)]  # SELECT hit
+        )
+        _override_db_session_with(api_app, db)
+
+        applied_audit_uuid = uuid4()
+        monkeypatch.setattr(
+            system_route,
+            "apply_state_transition",
+            _make_fake_apply(
+                applied_audit_uuid,
+                new_state="CONVALESCENT",
+                new_severity=None,
+            ),
+        )
+        monkeypatch.setattr(
+            system_route,
+            "emit_sse",
+            _make_fake_emit_sse(captured_sequence_no=11),
+        )
+
+        response = await api_client.post(
+            "/api/system/kill-switch/resume",
+            json={"incident_review_id": str(review_id)},
+            **_csrf_kwargs(),
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["risk_state"] == "CONVALESCENT"
+        assert body["audit_event_uuid"] == str(applied_audit_uuid)
+
+        update_calls = [
+            (sql, params) for sql, params in db.executed if "UPDATE incident_reviews" in sql
+        ]
+        assert len(update_calls) == 1
+        _, params = update_calls[0]
+        assert params["id"] == review_id
+        assert params["resume_audit_event_uuid"] == applied_audit_uuid
+        assert "resolved_at_utc" in params

@@ -8,10 +8,14 @@
  *   - NORMAL          → green pill + "Invoke kill switch" button
  *   - HALT_NEW routine        → amber banner + RESUME (re-auth)
  *   - HALT_NEW defensive      → amber banner + RESUME (re-auth)
- *   - HALT_NEW incident_review → RED banner + RESUME disabled until
- *                                 incident_reviews row exists for the
- *                                 current halt (Phase 1+ surfaces the
- *                                 incident-review form)
+ *   - HALT_NEW incident_review → RED banner + RESUME opens the
+ *                                 incident-review write-up modal first
+ *                                 (§3.25 row created via
+ *                                 POST /api/system/incident-reviews;
+ *                                 its id rides the resume mutation —
+ *                                 built 2026-07-18 when the first live
+ *                                 incident_review halt hit the deferred
+ *                                 form)
  *   - CONVALESCENT    → amber banner + countdown (SSE-driven)
  *
  * RESUME re-auth flow (dev-guide §1.5 LOCKED 5-min UV window):
@@ -40,6 +44,7 @@ import {
 } from '@/lib/api/queries';
 import { useResumeKillSwitch } from '@/lib/api/mutations';
 import { FalsePositiveModal } from './false-positive-modal';
+import { IncidentReviewModal } from './incident-review-modal';
 import type { KillSwitchStatus } from '@/lib/api/types';
 import { formatDateTimeET } from '@/lib/format';
 import { Button } from '@/components/ui/button';
@@ -96,15 +101,41 @@ export function KillSwitchTile(): JSX.Element {
   const [reauthPurpose, setReauthPurpose] = useState<
     'resume' | 'false-positive' | null
   >(null);
+  // incident_review resume path (2026-07-18): the §3.25 write-up row must
+  // exist before resume; its id rides the resume mutation.
+  const [incidentReviewOpen, setIncidentReviewOpen] = useState(false);
+  const [pendingIncidentReviewId, setPendingIncidentReviewId] = useState<
+    string | null
+  >(null);
 
-  const handleResumeClick = (): void => {
+  const startResume = (incidentReviewId: string | null): void => {
     const lastUvAt = me.data?.last_uv_at ?? null;
     if (isUvFresh(lastUvAt)) {
-      resume.mutate({});
+      resume.mutate(
+        incidentReviewId !== null ? { incidentReviewId } : {},
+      );
       return;
     }
     setReauthPurpose('resume');
     setReauthOpen(true);
+  };
+
+  const handleResumeClick = (): void => {
+    const needsWriteUp =
+      ks.data?.risk_state === 'HALT_NEW' &&
+      ks.data?.severity === 'incident_review' &&
+      pendingIncidentReviewId === null;
+    if (needsWriteUp) {
+      setIncidentReviewOpen(true);
+      return;
+    }
+    startResume(pendingIncidentReviewId);
+  };
+
+  const handleIncidentReviewCreated = (id: string): void => {
+    setPendingIncidentReviewId(id);
+    setIncidentReviewOpen(false);
+    startResume(id);
   };
 
   const handleFalsePositiveClick = (): void => {
@@ -119,7 +150,11 @@ export function KillSwitchTile(): JSX.Element {
 
   const handleReauthAuthorized = (): void => {
     if (reauthPurpose === 'resume') {
-      resume.mutate({});
+      resume.mutate(
+        pendingIncidentReviewId !== null
+          ? { incidentReviewId: pendingIncidentReviewId }
+          : {},
+      );
     }
     if (reauthPurpose === 'false-positive') {
       setFalsePositiveOpen(true);
@@ -162,6 +197,7 @@ export function KillSwitchTile(): JSX.Element {
               onResumeClick={handleResumeClick}
               onFalsePositiveClick={handleFalsePositiveClick}
               resumeBusy={resume.isPending}
+              incidentReviewAuthored={pendingIncidentReviewId !== null}
             />
           )}
         </CardContent>
@@ -170,6 +206,12 @@ export function KillSwitchTile(): JSX.Element {
       <InvokeKillSwitchModal
         open={invokeOpen}
         onClose={() => setInvokeOpen(false)}
+      />
+      <IncidentReviewModal
+        open={incidentReviewOpen}
+        haltReason={ks.data?.halt_reason ?? null}
+        onClose={() => setIncidentReviewOpen(false)}
+        onCreated={handleIncidentReviewCreated}
       />
       <FalsePositiveModal
         open={falsePositiveOpen}
@@ -200,12 +242,14 @@ function KillSwitchBody({
   onResumeClick,
   onFalsePositiveClick,
   resumeBusy,
+  incidentReviewAuthored,
 }: {
   status: KillSwitchStatus;
   onInvokeClick: () => void;
   onResumeClick: () => void;
   onFalsePositiveClick: () => void;
   resumeBusy: boolean;
+  incidentReviewAuthored: boolean;
 }): JSX.Element {
   if (status.risk_state === 'NORMAL') {
     return (
@@ -229,7 +273,9 @@ function KillSwitchBody({
       ? INCIDENT_REVIEW_BANNER
       : SEVERITY_STYLES.HALT_NEW?.banner ?? '';
     const bannerCopy = isIncidentReview
-      ? 'Incident review required before resume. Write up the incident_reviews row first.'
+      ? incidentReviewAuthored
+        ? 'Incident review saved. Resume proceeds with it attached.'
+        : 'Incident review required before resume — Resume opens the write-up form first.'
       : `HALT_NEW (${status.severity ?? 'routine'}) — auto-resume after recovery conditions.`;
     return (
       <div className="space-y-3">
@@ -261,15 +307,19 @@ function KillSwitchBody({
         <Button
           variant="default"
           size="sm"
-          disabled={isIncidentReview || resumeBusy}
+          disabled={resumeBusy}
           onClick={onResumeClick}
           title={
-            isIncidentReview
-              ? 'Incident review write-up required before resume.'
+            isIncidentReview && !incidentReviewAuthored
+              ? 'Opens the incident-review write-up, then re-verify with passkey to resume.'
               : 'Re-verify with passkey, then transition to CONVALESCENT.'
           }
         >
-          {resumeBusy ? 'Resuming…' : 'Resume (re-auth required)'}
+          {resumeBusy
+            ? 'Resuming…'
+            : isIncidentReview && !incidentReviewAuthored
+              ? 'Write incident review & resume'
+              : 'Resume (re-auth required)'}
         </Button>
       </div>
     );
