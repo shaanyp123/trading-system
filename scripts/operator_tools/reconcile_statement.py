@@ -379,7 +379,10 @@ async def _load_trades(
     async with session_factory() as session:
         account_row = (
             await session.execute(
-                text("SELECT id FROM accounts WHERE active IS TRUE ORDER BY created_at LIMIT 1")
+                text(
+                    "SELECT id FROM accounts WHERE active_to IS NULL "
+                    "ORDER BY active_from DESC LIMIT 1"
+                )
             )
         ).fetchone()
         if account_row is None:
