@@ -529,6 +529,12 @@ export interface KillSwitchTransitionResponse {
   readonly sse_sequence_no: number;
 }
 
+/** POST /api/system/incident-reviews — §3.25 write-up gate (2026-07-18). */
+export interface IncidentReviewCreateResponse {
+  readonly id: string;
+  readonly authored_at_utc: string;
+}
+
 // ---------------------------------------------------------------------------
 // Risk envelope (services/api/schemas/system.py — Day 27)
 // ---------------------------------------------------------------------------

@@ -15,6 +15,7 @@ import { apiCall, ApiError } from '../api';
 import { toast } from '../toast';
 import type {
   BackupCodesRegenerateResponse,
+  IncidentReviewCreateResponse,
   KillSwitchTransitionResponse,
   KillSwitchTrigger,
 } from './types';
@@ -31,6 +32,10 @@ interface InvokeKillSwitchArgs {
 
 interface ResumeKillSwitchArgs {
   readonly incidentReviewId?: string;
+}
+
+interface CreateIncidentReviewArgs {
+  readonly writeUpText: string;
 }
 
 interface FalsePositiveArgs {
@@ -114,6 +119,27 @@ export function useInvokeKillSwitch(): UseMutationResult<
       }),
     onError: (err) => surfaceKillSwitchError(err, 'Kill switch invoke failed'),
     onSettled: () => invalidateKillSwitchSurfaces(queryClient),
+  });
+}
+
+/**
+ * Author the §3.25 incident-review write-up for the current
+ * incident_review-severity halt (2026-07-18 gap: the tile's resume was
+ * unreachable without it). The returned `id` feeds
+ * `useResumeKillSwitch({ incidentReviewId })`.
+ */
+export function useCreateIncidentReview(): UseMutationResult<
+  IncidentReviewCreateResponse,
+  unknown,
+  CreateIncidentReviewArgs
+> {
+  return useMutation({
+    mutationFn: ({ writeUpText }) =>
+      apiCall<IncidentReviewCreateResponse>('/api/system/incident-reviews', {
+        method: 'POST',
+        body: { write_up_text: writeUpText },
+      }),
+    onError: (err) => surfaceKillSwitchError(err, 'Incident review write-up failed'),
   });
 }
 

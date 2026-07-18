@@ -69,6 +69,7 @@ from zoneinfo import ZoneInfo
 
 import structlog
 from fastapi import APIRouter, Depends, Query
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from services.api.auth import sessions as sessions_mod
@@ -110,6 +111,8 @@ from services.api.schemas.system import (
     AuditLogPageResponse,
     HeartbeatItem,
     HeartbeatsResponse,
+    IncidentReviewCreateRequest,
+    IncidentReviewCreateResponse,
     KillSwitchFalsePositiveRequest,
     KillSwitchInvokeRequest,
     KillSwitchResumeRequest,
@@ -552,6 +555,102 @@ async def invoke_capital_event(
 
 
 @router.post(
+    "/api/system/incident-reviews",
+    tags=["system"],
+    response_model=IncidentReviewCreateResponse,
+    status_code=201,
+)
+async def create_incident_review(
+    body: IncidentReviewCreateRequest,
+    session: SessionContext = Depends(get_session_context),
+    db: AsyncSession = Depends(get_session),
+    repo: Phase1QueryRepo = Depends(_get_repo),
+) -> IncidentReviewCreateResponse:
+    """Author the §3.25 ``incident_reviews`` write-up for the CURRENT
+    ``incident_review``-severity halt (backend-spec §2.4.3 write-up gate).
+
+    First live need 2026-07-18 (``decommission_floor`` halt): §2.6.2
+    deferred the incident-review form to "Phase 1+", so the first
+    incident_review-severity halt had no authoring surface and resume was
+    unreachable from the web tile. This endpoint + the tile modal close
+    that gap.
+
+    No recent-UV gate: authoring a write-up is not risk-loosening — the
+    resume that consumes the row still gates on the WebAuthn re-auth
+    window (dev-guide §1.5 LOCKED). Session auth + CSRF apply as on every
+    POST.
+
+    Conflicts:
+
+      * No active account → 409 ``NO_ACTIVE_ACCOUNT``.
+      * Current state is not an incident_review-severity ``HALT_NEW`` →
+        409 ``NOT_INCIDENT_REVIEW_HALT`` (the write-up anchors to the
+        halt's audit event; there is nothing to anchor to otherwise).
+    """
+    account_id = await repo.fetch_active_account_id()
+    if account_id is None:
+        raise AppError(
+            error_code="NO_ACTIVE_ACCOUNT",
+            message="No active account is registered.",
+            status_code=409,
+        )
+
+    risk_row = await repo.fetch_risk_state_current(account_id)
+    if (
+        risk_row is None
+        or risk_row.state != "HALT_NEW"
+        or risk_row.severity != "incident_review"
+        or risk_row.audit_event_uuid is None
+    ):
+        current = risk_row.state if risk_row is not None else "NORMAL"
+        severity = risk_row.severity if risk_row is not None else None
+        raise AppError(
+            error_code="NOT_INCIDENT_REVIEW_HALT",
+            message=(
+                f"Incident reviews are authored against an active "
+                f"incident_review-severity HALT_NEW; current state is "
+                f"{current!r} (severity={severity!r})."
+            ),
+            status_code=409,
+        )
+
+    row = (
+        await db.execute(
+            text(
+                "INSERT INTO incident_reviews ("
+                "    triggering_audit_event_uuid, state_transition_to,"
+                "    authored_by, write_up_text"
+                ") VALUES ("
+                "    :triggering_audit_event_uuid, 'HALT_NEW',"
+                "    :authored_by, :write_up_text"
+                ") RETURNING id, authored_at_utc"
+            ),
+            {
+                "triggering_audit_event_uuid": risk_row.audit_event_uuid,
+                "authored_by": session.user_id,
+                "write_up_text": body.write_up_text,
+            },
+        )
+    ).fetchone()
+    await db.commit()
+    if row is None:  # pragma: no cover - INSERT..RETURNING always yields a row
+        raise AppError(
+            error_code="INTERNAL_ERROR",
+            message="incident_reviews INSERT returned no row.",
+            status_code=500,
+        )
+
+    log.info(
+        "incident_review_authored",
+        incident_review_id=str(row.id),
+        triggering_audit_event_uuid=str(risk_row.audit_event_uuid),
+        halt_reason=risk_row.reason,
+        operator_session_id=session.user_id,
+    )
+    return IncidentReviewCreateResponse(id=str(row.id), authored_at_utc=row.authored_at_utc)
+
+
+@router.post(
     "/api/system/kill-switch/resume",
     tags=["system"],
     response_model=KillSwitchTransitionResponse,
@@ -605,6 +704,37 @@ async def resume_from_halt(
 
     current_severity = HaltSeverity(risk_row.severity) if risk_row.severity is not None else None
 
+    # §2.4.3 write-up gate: a provided incident_review_id must reference a
+    # real incident_reviews row — the id is not a free-text token. (The
+    # policy layer below still enforces PRESENCE for incident_review
+    # severity; this enforces existence.)
+    review_uuid: UUID | None = None
+    if body.incident_review_id is not None:
+        try:
+            review_uuid = UUID(body.incident_review_id)
+        except ValueError:
+            review_uuid = None
+        review_row = (
+            (
+                await db.execute(
+                    text("SELECT id FROM incident_reviews WHERE id = :id"),
+                    {"id": review_uuid},
+                )
+            ).fetchone()
+            if review_uuid is not None
+            else None
+        )
+        if review_row is None:
+            raise AppError(
+                error_code="INCIDENT_REVIEW_NOT_FOUND",
+                message=(
+                    f"incident_review_id {body.incident_review_id!r} does not "
+                    "reference an incident_reviews row. Author the write-up "
+                    "first (POST /api/system/incident-reviews)."
+                ),
+                status_code=422,
+            )
+
     # The policy layer's IllegalTransitionError on missing incident_review_id
     # is a 422-equivalent for the caller. Translate it to AppError(422) here
     # rather than letting the policy exception propagate as a 500.
@@ -640,6 +770,33 @@ async def resume_from_halt(
         env=_env_for_audit(settings.environment),
         phase_at_emit=_PHASE_AT_EMIT_PHASE_0,
     )
+
+    # Close the write-up's loop (§3.25): stamp the consumed review resolved
+    # with the resume's audit anchor. Best-effort AFTER the transition —
+    # the resume itself must never fail on the stamp.
+    if review_uuid is not None:
+        try:
+            await db.execute(
+                text(
+                    "UPDATE incident_reviews SET"
+                    "    resolved = TRUE,"
+                    "    resolved_at_utc = :resolved_at_utc,"
+                    "    resume_audit_event_uuid = :resume_audit_event_uuid "
+                    "WHERE id = :id"
+                ),
+                {
+                    "resolved_at_utc": now,
+                    "resume_audit_event_uuid": applied.state_transition_audit_event_uuid,
+                    "id": review_uuid,
+                },
+            )
+            await db.commit()
+        except Exception:
+            log.error(
+                "incident_review_resolve_stamp_failed",
+                incident_review_id=str(review_uuid),
+                audit_event_uuid=str(applied.state_transition_audit_event_uuid),
+            )
 
     sequence_no = await emit_sse(
         plan.sse_event.event_type,

@@ -154,6 +154,31 @@ class KillSwitchResumeRequest(BaseModel):
     incident_review_id: str | None = None
 
 
+class IncidentReviewCreateRequest(BaseModel):
+    """Body for ``POST /api/system/incident-reviews`` (§3.25 write-up gate).
+
+    ``write_up_text`` minimum mirrors the DDL CHECK
+    (``length(write_up_text) >= 100``): the write-up is the substantive
+    gate on resuming an ``incident_review``-severity halt (backend-spec
+    §2.4.3), so a token string must not satisfy it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    write_up_text: str = Field(min_length=100, max_length=10_000)
+
+
+class IncidentReviewCreateResponse(BaseModel):
+    """201-shape response for ``POST /api/system/incident-reviews``.
+
+    ``id`` feeds ``KillSwitchResumeRequest.incident_review_id`` — the tile
+    passes it straight into the resume mutation.
+    """
+
+    id: str
+    authored_at_utc: datetime
+
+
 class KillSwitchFalsePositiveRequest(BaseModel):
     """Body for ``POST /api/system/kill-switch/false-positive``
     (CONVALESCENT → NORMAL; 2026-07-11 operator adjudication amendment).
