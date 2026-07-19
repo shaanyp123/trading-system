@@ -434,6 +434,22 @@ class APISettings(BaseSettings):
         ),
     )
 
+    # --- Cash-yield worker (delta spec §3.6) — DORMANT by default ----------
+    #
+    # C2 activation gate (delta-spec open question #1: same-day reclaim
+    # verified live). While false, the api lifespan starter early-returns
+    # and NO scheduler task is created — the worker code ships fully
+    # dormant. Flip API_CASH_MANAGER_ENABLED=true ONLY per the C2
+    # decision recorded in the decisions-log.
+    cash_manager_enabled: bool = Field(
+        default=False,
+        description=(
+            "Start the daily 00:25 UTC cash-yield sweep worker "
+            "(services/risk/cash_manager.py). DORMANT by default; "
+            "activation is a C2 operator decision."
+        ),
+    )
+
     # --- Cash-yield display rate (crypto-pivot §3.6/§3.9) ------------------
     #
     # Interim MANUAL value surfaced by ``GET /api/system/funding`` as
