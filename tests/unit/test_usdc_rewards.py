@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -264,8 +265,12 @@ class _FakeCashClient:
 
 
 class _FakeResult:
-    def __init__(self, rowcount: int) -> None:
+    def __init__(self, rowcount: int, row: Any = None) -> None:
         self.rowcount = rowcount
+        self._row = row
+
+    def fetchone(self) -> Any:
+        return self._row
 
 
 class _FakeBegin:
@@ -298,8 +303,12 @@ class _FakeSession:
         key = None
         if isinstance(params, dict):
             key = params.get("venue_transaction_id", params.get("snapshot_date_utc"))
-        rowcount = 0 if key in self._factory.existing else 1
-        return _FakeResult(rowcount)
+        conflicted = key in self._factory.existing
+        # Recapture UPSERT: RETURNING (xmax <> 0) — an UPDATE-resolved
+        # conflict reports replaced=True; a fresh INSERT reports False.
+        if "RETURNING" in str(stmt):
+            return _FakeResult(1, row=SimpleNamespace(replaced=conflicted))
+        return _FakeResult(0 if conflicted else 1)
 
 
 class _FakeSessionFactory:
@@ -444,6 +453,66 @@ class TestRunCaptureOnce:
         job, _factory = _job(client)
         callback = make_capture_callback(job)
         await callback(TODAY)  # returns None; must not raise
+
+
+class TestRecapture:
+    """Operator-triggered re-capture (Amendment C double-count closer).
+
+    Design pin: ONLY this explicit path UPSERTs; the scheduled 00:20
+    job's first-capture-wins DO NOTHING is asserted unchanged.
+    """
+
+    async def test_recapture_upserts_and_reports_replaced(self) -> None:
+        client = _FakeCashClient(
+            balances=[_usd_balance("2251.38"), _usdc_balance("3500.00")],
+        )
+        job, factory = _job(client)
+        factory.existing.add(TODAY)  # today's 00:20 row already exists
+        result = await job.run_recapture_once(TODAY)
+        assert result.replaced is True
+        assert result.spot_usd == Decimal("2251.38")
+        assert result.cbi_usdc == Decimal("3500.00")
+        assert result.captured_at_utc == NOW
+        stmt, params = next((s, p) for (s, p) in factory.executed if "cash_balance_snapshots" in s)
+        assert "ON CONFLICT (snapshot_date_utc) DO UPDATE SET" in stmt
+        assert "DO NOTHING" not in stmt
+        assert params["snapshot_date_utc"] == TODAY
+
+    async def test_recapture_first_write_of_day_reports_not_replaced(self) -> None:
+        client = _FakeCashClient(balances=[_usd_balance("100.00")])
+        job, _factory = _job(client)
+        result = await job.run_recapture_once(TODAY)
+        assert result.replaced is False
+        assert result.cbi_usdc is None  # no USDC account seen → None, not 0
+
+    async def test_recapture_raises_on_balance_read_failure(self) -> None:
+        # Unlike the scheduled job, the interactive path must report
+        # failure honestly — the route turns this into a 502.
+        client = _FakeCashClient(balances_raises=True)
+        job, _factory = _job(client)
+        with pytest.raises(CashCaptureError):
+            await job.run_recapture_once(TODAY)
+
+    async def test_recapture_ledger_failure_is_best_effort(self) -> None:
+        client = _FakeCashClient(
+            balances=[_usd_balance("100.00")],
+            ledger_raises=True,
+        )
+        job, _factory = _job(client)
+        result = await job.run_recapture_once(TODAY)  # ledger half swallowed
+        assert result.spot_usd == Decimal("100.00")
+
+    async def test_scheduled_job_snapshot_sql_still_do_nothing(self) -> None:
+        # The first-capture-wins rule is load-bearing (a mid-day redeploy
+        # re-fire must not overwrite the 00:20 observation) — pin that
+        # the SCHEDULED path's SQL kept DO NOTHING after the recapture
+        # refactor.
+        client = _FakeCashClient(balances=[_usd_balance("100.00")])
+        job, factory = _job(client)
+        await job.run_capture_once(TODAY)
+        stmt = next(s for (s, _p) in factory.executed if "cash_balance_snapshots" in s)
+        assert "ON CONFLICT (snapshot_date_utc) DO NOTHING" in stmt
+        assert "DO UPDATE" not in stmt
 
 
 # ---------------------------------------------------------------------------

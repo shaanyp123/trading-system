@@ -186,6 +186,57 @@ class TestSystemGatesRoute:
         assert body["days_live"] == 9
         assert body["scale_up_eligible"] is False
 
+    async def test_b3_arms_green_with_proxy_rows(
+        self, api_client: AsyncClient, override_dep: Any
+    ) -> None:
+        """The binance_proxy logger's rows flip B3 out of insufficient_data
+        with NO gate-code change (any non-coinbase source with a positive
+        mean counts) — the PR-1 wiring proof, at route level."""
+        repo = _StubGatesRepo(
+            funding=[
+                FundingSourceStat(
+                    source="coinbase_advanced",
+                    observation_count=500,
+                    mean_abs_annualized_rate=Decimal("0.10"),
+                ),
+                FundingSourceStat(
+                    source="binance_proxy",
+                    observation_count=105,
+                    mean_abs_annualized_rate=Decimal("0.08"),
+                ),
+            ]
+        )
+        _wire(override_dep, account_id=uuid4(), repo=repo)
+        resp = await api_client.get("/api/system/gates")
+        assert resp.status_code == 200
+        b3 = _gate(resp.json(), "B3")
+        assert b3["status"] == "green"
+        assert "binance_proxy" in b3["value"]
+
+    async def test_b3_goes_red_when_proxy_diverges_past_2x(
+        self, api_client: AsyncClient, override_dep: Any
+    ) -> None:
+        repo = _StubGatesRepo(
+            funding=[
+                FundingSourceStat(
+                    source="coinbase_advanced",
+                    observation_count=500,
+                    mean_abs_annualized_rate=Decimal("0.30"),
+                ),
+                FundingSourceStat(
+                    source="binance_proxy",
+                    observation_count=105,
+                    mean_abs_annualized_rate=Decimal("0.10"),
+                ),
+            ]
+        )
+        _wire(override_dep, account_id=uuid4(), repo=repo)
+        resp = await api_client.get("/api/system/gates")
+        assert resp.status_code == 200
+        b3 = _gate(resp.json(), "B3")
+        assert b3["status"] == "red"
+        assert "ratio 3.00" in b3["value"]
+
 
 class TestGateClassification:
     """Pure builder coverage — no ASGI app."""

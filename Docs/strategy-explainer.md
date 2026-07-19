@@ -384,8 +384,11 @@ a risk loop that re-checks marks, margin, and limits **every 30 seconds**.
     calculation deliberately still ignores USDC.
     *Operator note:* after converting USDC → USD, the daily USDC reading is stale-high
     until the next 00:20 UTC capture — for that window the breaker double-counts the
-    converted amount (it is less sensitive, never more). Prefer converting shortly
-    before 00:20 UTC, or treat the breaker as USD-only until the next capture.
+    converted amount (it is less sensitive, never more). **Close the window immediately
+    after any conversion by re-capturing the reading: `/cash-recapture` in Discord (or
+    `POST /api/system/cash-capture` from the web session).** The re-capture re-reads
+    the venue balances and replaces today's reading; the scheduled 00:20 capture still
+    never overwrites an existing one.
 
 **Operational fail-safes:**
 
@@ -674,3 +677,4 @@ Plain-English definitions of every term of art used above.
 | 2026-07-09 (later) | Convalescent probation shortened: 3 clean UTC days (was 5), resume day counts, breach day never counts. | Operator amendment at C1 night one; decisions-log "C1 night one, CONVALESCENT amendment". |
 | 2026-07-11 | False-positive halt adjudication added: from the convalescent state, the operator can graduate back to NORMAL immediately when the halt was caused by a system defect (web-only, re-auth gated, must cite the defect fix). | Operator directive after the 2026-07-11 phantom recon-break auto-halt; decisions-log "C1 night two". |
 | 2026-07-18 | Hard-halt floor now measures **total capital** (futures USD equity + latest CBI-USDC capture ≤48h old), fail-safe fallback to USD-only when the USDC reading is missing/stale. Floor value unchanged at $1,500; sizing still reads USD only. | Amendment C after the 2026-07-17 decommission-floor halt (annual subscription charge against a zero-headroom USD-visible floor); decisions-log 2026-07-18 queued decision, option (b). |
+| 2026-07-19 | Amendment C stale-reading window closed by an operator re-capture: `/cash-recapture` (Discord) or `POST /api/system/cash-capture` refreshes today's USDC reading immediately after a conversion. Gate B3's Binance-proxy funding comparison series now logs daily. | C1→C2 follow-up build (proxy funding logger + re-capture hook); decisions-log 2026-07-19 PR 1. |

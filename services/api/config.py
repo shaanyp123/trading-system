@@ -434,6 +434,31 @@ class APISettings(BaseSettings):
         ),
     )
 
+    # --- Binance funding-rate proxy logger (gate B3; C1→C2 build) ----------
+    #
+    # Daily api-lifespan job (services/data/binance_funding_proxy.py,
+    # 00:40 UTC via the generic once-per-UTC-day scheduler): persists
+    # settled Binance USDT-perp funding rates into ``funding_rates`` with
+    # source='binance_proxy' so strategy §10 gate B3 (CDE vs proxy
+    # funding within 2x) has its comparison series. Public endpoint —
+    # no credentials. Read-only telemetry: nothing in the decision/risk
+    # path consumes proxy rows, hence default ON.
+    binance_funding_proxy_enabled: bool = Field(
+        default=True,
+        description=(
+            "Start the daily Binance USDT-perp funding proxy logger in "
+            "the api lifespan (00:40 UTC). Public endpoint, no key; "
+            "feeds gate B3 only."
+        ),
+    )
+    binance_fapi_base_url: str = Field(
+        default="https://fapi.binance.com",
+        description=(
+            "Base URL for the public Binance USDT-margined futures REST "
+            "endpoints (/fapi/v1/fundingRate). Override for tests."
+        ),
+    )
+
     # --- Cash-yield worker (delta spec §3.6) — DORMANT by default ----------
     #
     # C2 activation gate (delta-spec open question #1: same-day reclaim

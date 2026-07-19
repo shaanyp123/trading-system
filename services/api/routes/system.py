@@ -111,6 +111,8 @@ from services.api.schemas.gates import SystemGatesResponse, build_system_gates_r
 from services.api.schemas.system import (
     AuditLogEntry,
     AuditLogPageResponse,
+    CashCaptureRequest,
+    CashCaptureResponse,
     HeartbeatItem,
     HeartbeatsResponse,
     IncidentReviewCreateRequest,
@@ -128,6 +130,11 @@ from services.api.schemas.system import (
 from services.api.session import SessionContext, get_session_context
 from services.api.sse import emit_sse
 from services.audit.writer import Environment
+from services.data.usdc_rewards import (
+    CashCaptureError,
+    SdkCoinbaseCashClient,
+    UsdcRewardsCaptureJob,
+)
 from services.risk.capital_events import (
     CapitalEventError,
     apply_capital_event,
@@ -650,6 +657,95 @@ async def create_incident_review(
         operator_session_id=session.user_id,
     )
     return IncidentReviewCreateResponse(id=str(row.id), authored_at_utc=row.authored_at_utc)
+
+
+def _get_cash_capture_job(
+    settings: APISettings = Depends(get_settings),
+) -> UsdcRewardsCaptureJob | None:
+    """Build a per-request capture job for the re-capture endpoint.
+
+    None when the Coinbase CDP credentials are unset (same fail-closed
+    contract as the 00:20 scheduled job — the route 503s honestly).
+    Per-request construction is deliberate: the client is cheap (lazy
+    SDK), and reusing the lifespan job would couple an interactive
+    route to background-worker state for no benefit. Overridable in
+    tests via dependency_overrides.
+    """
+    if settings.coinbase_api_key_name is None or settings.coinbase_api_private_key is None:
+        return None
+    from services.api.db import get_session_factory
+
+    client = SdkCoinbaseCashClient(
+        api_key_name=settings.coinbase_api_key_name.get_secret_value(),
+        api_private_key=settings.coinbase_api_private_key.get_secret_value(),
+    )
+    return UsdcRewardsCaptureJob(client=client, session_factory=get_session_factory())
+
+
+@router.post(
+    "/api/system/cash-capture",
+    tags=["system"],
+    response_model=CashCaptureResponse,
+)
+async def recapture_cash_balances(
+    body: CashCaptureRequest,
+    session: SessionContext = Depends(get_session_context),
+    job: UsdcRewardsCaptureJob | None = Depends(_get_cash_capture_job),
+) -> CashCaptureResponse:
+    """Operator-triggered re-capture of today's CBI cash-balance snapshot.
+
+    Closes the Amendment C double-count window (decisions-log 2026-07-18
+    PR 1, risk-review residual): after a USDC↔USD conversion the daily
+    00:20 capture is stale until the next day, so the halt-floor basis
+    double-counts (or misses) the converted amount for up to ~24 h. This
+    endpoint re-reads the venue balances and UPSERTs today's
+    ``cash_balance_snapshots`` row — the ONLY path allowed to overwrite;
+    the scheduled 00:20 job keeps its first-capture-wins DO NOTHING.
+
+    Session auth + CSRF as on every POST; no recent-UV gate — the
+    re-capture records venue truth (an observation), it does not move a
+    risk knob. The Discord ``/cash-recapture`` command reaches this same
+    endpoint through the bot bearer path.
+
+    Errors:
+
+      * Coinbase CDP credentials unset → 503 ``CASH_CAPTURE_CREDENTIALS_MISSING``.
+      * Venue balance read failed → 502 ``CASH_CAPTURE_VENUE_FAILURE``.
+    """
+    if job is None:
+        raise AppError(
+            error_code="CASH_CAPTURE_CREDENTIALS_MISSING",
+            message=(
+                "Coinbase CDP credentials are not configured; the cash "
+                "capture cannot read venue balances."
+            ),
+            status_code=503,
+        )
+    now = datetime.now(tz=UTC)
+    try:
+        result = await job.run_recapture_once(now.date())
+    except CashCaptureError as exc:
+        raise AppError(
+            error_code="CASH_CAPTURE_VENUE_FAILURE",
+            message=f"Venue balance read failed: {exc.operation}: {exc.detail}",
+            status_code=502,
+        ) from exc
+    log.info(
+        "cash_recapture_invoked",
+        operator_session_id=session.user_id,
+        reason=body.reason,
+        snapshot_date_utc=result.snapshot_date_utc.isoformat(),
+        spot_usd=str(result.spot_usd) if result.spot_usd is not None else None,
+        cbi_usdc=str(result.cbi_usdc) if result.cbi_usdc is not None else None,
+        replaced=result.replaced,
+    )
+    return CashCaptureResponse(
+        snapshot_date_utc=result.snapshot_date_utc,
+        captured_at_utc=result.captured_at_utc,
+        spot_usd=str(result.spot_usd) if result.spot_usd is not None else None,
+        cbi_usdc=str(result.cbi_usdc) if result.cbi_usdc is not None else None,
+        replaced=result.replaced,
+    )
 
 
 @router.post(

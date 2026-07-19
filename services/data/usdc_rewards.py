@@ -158,6 +158,22 @@ class CaptureResult:
     snapshot_written: bool
 
 
+@dataclass(frozen=True, slots=True)
+class RecaptureResult:
+    """One operator-triggered re-capture: the fresh balances + row fate.
+
+    ``replaced`` is True when today's existing snapshot row was
+    overwritten (the normal re-capture case), False when this was the
+    day's FIRST capture (no 00:20 row existed yet).
+    """
+
+    snapshot_date_utc: date
+    captured_at_utc: datetime
+    spot_usd: Decimal | None
+    cbi_usdc: Decimal | None
+    replaced: bool
+
+
 class CashCaptureError(Exception):
     """A venue call inside the capture job failed terminally.
 
@@ -564,6 +580,97 @@ class UsdcRewardsCaptureJob:
                             new_rows += 1
         return len(transactions), len(to_persist), new_rows
 
+    async def run_recapture_once(self, session_date_utc: date) -> RecaptureResult:
+        """Operator-triggered re-capture of today's cash-balance snapshot.
+
+        Closes the Amendment C double-count window (risk-review residual,
+        decisions-log 2026-07-18 PR 1): after an operator USDC↔USD
+        conversion the daily 00:20 capture is stale until the next day —
+        the floor basis reads a ``cbi_usdc`` that no longer exists (or
+        misses one that now does). This path re-reads the venue balances
+        and **UPSERTs** today's ``cash_balance_snapshots`` row.
+
+        Design decision (deliberate, documented in the PR): the UNIQUE
+        ``(snapshot_date_utc)`` + DO NOTHING "first capture of the day
+        wins" rule stays the law for the SCHEDULED 00:20 job
+        (:meth:`run_capture_once` is unchanged) — only this explicit
+        operator-triggered path overwrites, so a mid-day redeploy
+        re-fire still cannot clobber the morning observation. Basis
+        direction is symmetric venue truth, not a policy loosening: a
+        post-USDC→USD re-capture LOWERS ``cbi_usdc`` (tightens the floor
+        basis back to reality); a post-USD→USDC re-capture raises it
+        (the USD it measures left ``equity_from_summary`` at the same
+        instant).
+
+        Unlike :meth:`run_capture_once` this RAISES
+        :class:`CashCaptureError` on a venue read failure — the caller
+        is an interactive surface (API route / Discord command) that
+        must report failure honestly, not swallow it. The ledger
+        re-poll rides along best-effort (idempotent DO NOTHING).
+        """
+        try:
+            await self._capture_ledger()
+        except Exception:
+            self._log.exception("usdc_rewards_recapture_ledger_poll_failed")
+
+        try:
+            balances = await self._client.list_account_balances()
+        except CashCaptureError:
+            raise
+        except Exception as exc:
+            # Normalize non-transport failures to the interactive path's
+            # typed error so the route's 502 mapping stays total.
+            raise CashCaptureError(operation="list_account_balances", detail=repr(exc)) from exc
+        spot_usd = _sum_available(balances, currency="USD")
+        cbi_usdc = _sum_available(balances, currency="USDC")
+        raw_accounts = [
+            b.raw for b in balances if b.currency in ("USD", "USDC") or b.available != 0
+        ]
+        captured_at = self._clock()
+        async with self._session_factory() as session:
+            async with session.begin():
+                row = (
+                    await session.execute(
+                        text(
+                            "INSERT INTO cash_balance_snapshots ("
+                            "    snapshot_date_utc, captured_at_utc, spot_usd,"
+                            "    cbi_usdc, raw"
+                            ") VALUES ("
+                            "    :snapshot_date_utc, :captured_at_utc, :spot_usd,"
+                            "    :cbi_usdc, CAST(:raw AS JSONB)"
+                            ") ON CONFLICT (snapshot_date_utc) DO UPDATE SET"
+                            "    captured_at_utc = EXCLUDED.captured_at_utc,"
+                            "    spot_usd = EXCLUDED.spot_usd,"
+                            "    cbi_usdc = EXCLUDED.cbi_usdc,"
+                            "    raw = EXCLUDED.raw "
+                            "RETURNING (xmax <> 0) AS replaced"
+                        ),
+                        {
+                            "snapshot_date_utc": session_date_utc,
+                            "captured_at_utc": captured_at,
+                            "spot_usd": spot_usd,
+                            "cbi_usdc": cbi_usdc,
+                            "raw": json.dumps({"accounts": raw_accounts}, default=str),
+                        },
+                    )
+                ).fetchone()
+        replaced = bool(row.replaced) if row is not None else False
+        result = RecaptureResult(
+            snapshot_date_utc=session_date_utc,
+            captured_at_utc=captured_at,
+            spot_usd=spot_usd,
+            cbi_usdc=cbi_usdc,
+            replaced=replaced,
+        )
+        self._log.info(
+            "usdc_rewards_recapture_completed",
+            snapshot_date_utc=session_date_utc.isoformat(),
+            spot_usd=str(spot_usd) if spot_usd is not None else None,
+            cbi_usdc=str(cbi_usdc) if cbi_usdc is not None else None,
+            replaced=replaced,
+        )
+        return result
+
     async def _capture_balance_snapshot(self, session_date_utc: date) -> bool:
         """Snapshot spot USD + CBI USDC availables; first write of the day wins."""
         balances = await self._client.list_account_balances()
@@ -645,6 +752,7 @@ __all__ = [
     "CashAccountBalance",
     "CashCaptureError",
     "CoinbaseCashClient",
+    "RecaptureResult",
     "SdkCoinbaseCashClient",
     "UsdcRewardsCaptureJob",
     "V2LedgerTransaction",

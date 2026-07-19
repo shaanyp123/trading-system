@@ -25,7 +25,7 @@ from §4.1.3 remain deferred (Phase 2 surfaces).
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
 
@@ -177,6 +177,37 @@ class IncidentReviewCreateResponse(BaseModel):
 
     id: str
     authored_at_utc: datetime
+
+
+class CashCaptureRequest(BaseModel):
+    """Body for ``POST /api/system/cash-capture`` (Amendment C re-capture).
+
+    ``reason`` is log-only context (why the operator re-captured — e.g.
+    "converted 802.10 USDC->USD"); it gates nothing.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class CashCaptureResponse(BaseModel):
+    """200-shape response for ``POST /api/system/cash-capture``.
+
+    Money as Decimal-serialized strings ([A05]); None when the venue
+    listed no account of that currency (rendered "—" upstream).
+    """
+
+    snapshot_date_utc: date
+    captured_at_utc: datetime
+    spot_usd: str | None
+    cbi_usdc: str | None
+    replaced: bool = Field(
+        description=(
+            "True when today's existing snapshot row was overwritten; "
+            "False when this was the day's first capture."
+        )
+    )
 
 
 class KillSwitchFalsePositiveRequest(BaseModel):
@@ -393,6 +424,8 @@ class HeartbeatsResponse(BaseModel):
 __all__ = [
     "AuditLogEntry",
     "AuditLogPageResponse",
+    "CashCaptureRequest",
+    "CashCaptureResponse",
     "HeartbeatItem",
     "HeartbeatsResponse",
     "KillSwitchInvokeRequest",

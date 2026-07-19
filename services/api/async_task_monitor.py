@@ -488,6 +488,7 @@ def collect_tracked_tasks(
     heartbeat_probe: tuple[object, object] | None,
     coinbase_market_data: tuple[object, object] | None = None,
     usdc_rewards_capture: tuple[object, object] | None = None,
+    binance_funding_proxy: tuple[object, object] | None = None,
 ) -> tuple[TrackedTask, ...]:
     """Build the canonical TrackedTask tuple from lifespan state.
 
@@ -525,6 +526,11 @@ def collect_tracked_tasks(
             name="usdc_rewards_capture.run_forever",
             task=_extract_task(usdc_rewards_capture),
             expected_alive=usdc_rewards_capture is not None,
+        ),
+        TrackedTask(
+            name="binance_funding_proxy.run_forever",
+            task=_extract_task(binance_funding_proxy),
+            expected_alive=binance_funding_proxy is not None,
         ),
     )
 

@@ -1078,6 +1078,76 @@ async def _start_usdc_rewards_capture(
     return scheduler, task
 
 
+async def _start_binance_funding_proxy(
+    settings: APISettings,
+) -> tuple[object, object] | None:
+    """Construct + start the daily Binance funding-proxy logger; or None.
+
+    Gate B3 comparison series (C1→C2 build): settled Binance USDT-perp
+    funding rates persisted into ``funding_rates`` with
+    ``source='binance_proxy'`` (``services/data/binance_funding_proxy.py``).
+    Public endpoint — no credential gate; the only switch is
+    ``API_BINANCE_FUNDING_PROXY_ENABLED`` (default on — read-only
+    telemetry). Reuses the generic once-per-UTC-day scheduler primitive,
+    same shape as the USDC rewards capture.
+    """
+    if not settings.binance_funding_proxy_enabled:
+        log.warning("binance_funding_proxy_disabled_via_setting")
+        return None
+
+    from services.data.binance_funding_proxy import (
+        DEFAULT_FUNDING_PROXY_POLL_TIME_UTC,
+        BinanceFundingProxyJob,
+        HttpxBinanceFundingClient,
+        make_funding_proxy_callback,
+        proxy_symbols_for_spot_products,
+    )
+    from services.data.coinbase_market_data import SPOT_SIGNAL_PRODUCT_IDS
+    from services.reconciliation.scheduler import ReconciliationScheduler
+
+    symbols = proxy_symbols_for_spot_products(SPOT_SIGNAL_PRODUCT_IDS)
+    job = BinanceFundingProxyJob(
+        client=HttpxBinanceFundingClient(base_url=settings.binance_fapi_base_url),
+        session_factory=api_db.get_session_factory(),
+        symbols=symbols,
+    )
+    scheduler = ReconciliationScheduler(
+        callback=make_funding_proxy_callback(job),
+        eod_recon_time_utc=DEFAULT_FUNDING_PROXY_POLL_TIME_UTC,
+    )
+    task = asyncio.create_task(scheduler.run_forever(), name="binance_funding_proxy.run_forever")
+    log.info(
+        "binance_funding_proxy_spawned",
+        fire_time_utc=DEFAULT_FUNDING_PROXY_POLL_TIME_UTC.isoformat(),
+        symbols=list(symbols),
+    )
+    return scheduler, task
+
+
+async def _stop_binance_funding_proxy(state: tuple[object, object] | None) -> None:
+    """Request stop + await the proxy scheduler task. Best-effort."""
+    if state is None:
+        return
+    scheduler, task = state
+    try:
+        scheduler.request_stop()  # type: ignore[attr-defined]
+    except Exception:
+        log.exception("binance_funding_proxy_request_stop_failed")
+    try:
+        await asyncio.wait_for(task, timeout=15.0)  # type: ignore[arg-type]
+    except TimeoutError:
+        log.warning("binance_funding_proxy_shutdown_timeout")
+        task.cancel()  # type: ignore[attr-defined]
+        try:
+            await task  # type: ignore[misc]
+        except asyncio.CancelledError:
+            log.info("binance_funding_proxy_shutdown_cancelled")
+        except Exception:
+            log.exception("binance_funding_proxy_shutdown_unclean")
+    except Exception:
+        log.exception("binance_funding_proxy_task_join_failed")
+
+
 async def _start_cash_manager(settings: APISettings) -> tuple[object, object] | None:
     """Construct + start the daily cash-yield sweep worker; DORMANT default.
 
@@ -1502,6 +1572,7 @@ async def _start_async_task_monitor(
     heartbeat_probe: tuple[object, object] | None,
     coinbase_market_data: tuple[object, object] | None = None,
     usdc_rewards_capture: tuple[object, object] | None = None,
+    binance_funding_proxy: tuple[object, object] | None = None,
     monitor_alert_hook: object | None = None,
     task_death_alert_hook: object | None = None,
 ) -> tuple[object, object] | None:
@@ -1533,6 +1604,7 @@ async def _start_async_task_monitor(
         heartbeat_probe=heartbeat_probe,
         coinbase_market_data=coinbase_market_data,
         usdc_rewards_capture=usdc_rewards_capture,
+        binance_funding_proxy=binance_funding_proxy,
     )
 
     # Recovery-agent task-death hook (drill 5/6 follow-up, 2026-05-26).
@@ -1588,6 +1660,7 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     heartbeat_probe_state: tuple[object, object] | None = None
     coinbase_market_data_state: tuple[object, object] | None = None
     usdc_rewards_capture_state: tuple[object, object] | None = None
+    binance_funding_proxy_state: tuple[object, object] | None = None
     cash_manager_state: tuple[object, object] | None = None
     async_task_monitor_state: tuple[object, object] | None = None
     try:
@@ -1632,6 +1705,12 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             # rewards capture pauses until the next restart).
             log.exception("usdc_rewards_capture_startup_failed")
         try:
+            binance_funding_proxy_state = await _start_binance_funding_proxy(settings)
+        except Exception:
+            # Proxy-logger startup is best-effort; gate B3 simply keeps
+            # reporting insufficient_data until the next restart.
+            log.exception("binance_funding_proxy_startup_failed")
+        try:
             cash_manager_state = await _start_cash_manager(settings)
         except Exception:
             # Own handler (risk-review finding 6): a capture-startup
@@ -1665,6 +1744,7 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 heartbeat_probe=heartbeat_probe_state,
                 coinbase_market_data=coinbase_market_data_state,
                 usdc_rewards_capture=usdc_rewards_capture_state,
+                binance_funding_proxy=binance_funding_proxy_state,
                 monitor_alert_hook=monitor_alert_hook,
                 task_death_alert_hook=task_death_alert_hook,
             )
@@ -1678,6 +1758,7 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         log.info("api_stopping")
         await _stop_async_task_monitor(async_task_monitor_state)
         await _stop_usdc_rewards_capture(usdc_rewards_capture_state)
+        await _stop_binance_funding_proxy(binance_funding_proxy_state)
         await _stop_cash_manager(cash_manager_state)
         await _stop_coinbase_market_data_worker(coinbase_market_data_state)
         await _stop_heartbeat_probe(heartbeat_probe_state)
