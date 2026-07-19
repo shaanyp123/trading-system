@@ -66,6 +66,11 @@ class EventChannel(StrEnum):
     #: existing #daily-brief channel (webhook already in the locked 7-webhook
     #: secrets schema; #reports is a C2 governance-report surface, not this).
     DAILY_BRIEF = "daily_brief"
+    #: §3.8 monthly + quarterly governance reports (C1→C2 follow-up PR 3).
+    #: A wire-payload/routing string only — NOT a DB/SSE/audit enum; the
+    #: secrets schema gains the OPTIONAL ``discord.webhook_urls.reports``
+    #: key (missing → the scheduler is skipped with a log, never a crash).
+    REPORTS = "reports"
 
 
 @dataclass(frozen=True, slots=True)

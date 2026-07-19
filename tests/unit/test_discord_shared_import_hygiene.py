@@ -69,7 +69,11 @@ def _modules_under(full: list[str], prefix: str) -> list[str]:
 
 class TestDiscordSharedIsDependencyNeutral:
     def test_shared_builder_imports_stdlib_only(self) -> None:
-        roots, full = _probe("import services.discord_shared.cycle_digest")
+        roots, full = _probe(
+            "import services.discord_shared.cycle_digest\n"
+            "import services.discord_shared.gates_digest\n"
+            "import services.discord_shared.governance_digest"
+        )
         forbidden_roots = {"sqlalchemy", "httpx", "discord", "pydantic", "asyncpg"}
         assert roots & forbidden_roots == set(), (
             f"services.discord_shared must stay dependency-neutral; "
@@ -134,6 +138,7 @@ class TestWebhookPusherImageImportSurface:
         "import services.webhook_pusher.sse_subscriber\n"
         "import services.webhook_pusher.cycle_digest\n"
         "import services.webhook_pusher.cycle_digest_scheduler\n"
+        "import services.webhook_pusher.governance_reports\n"
         "import services.webhook_pusher.__main__\n"
     )
 

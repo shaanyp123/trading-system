@@ -412,3 +412,33 @@ For test coverage see `tests/unit/test_webhook_pusher.py` (58 tests:
 severity routing, Discord embed shape, Resend payload shape, planner
 errors, sender HTTP statuses, sender 429 retry, sender transport
 failures, dispatcher idempotency, dispatcher fan-out wiring).
+
+## Governance reports (#reports) — C1→C2 follow-up PR 3
+
+A third long-lived loop in this container:
+`services/webhook_pusher/governance_reports.py` fires on the **1st of
+each month at 00:30 UTC** with the prior month's governance report
+(trades/P&L, fees, funding telemetry, sweeps, capital events, §10 gate
+snapshot, refinement-loop reminder), and on quarter-start months
+(Jan/Apr/Jul/Oct) a second, quarterly report (adds the §4 revalidation
+reminder + governance checklist). Data via
+`GET /api/system/governance-report`; embeds built by the stdlib-only
+`services/discord_shared/governance_digest.py`.
+
+**Arming it (operator step):** create a webhook for the `#reports`
+channel (server settings → integrations) and add it to the host secrets
+file:
+
+```yaml
+discord:
+  webhook_urls:
+    reports: https://discord.com/api/webhooks/...   # the #reports webhook
+```
+
+then restart the container. The key is **OPTIONAL**: while missing, the
+runner logs `governance_reports_skipped_no_webhook` at boot and skips
+the scheduler — a logged skip, never a crash. Verification after the
+first armed boot: `governance_report_scheduler_started` in the logs;
+after the next 1st-of-month 00:30 UTC (catch-up window 48 h):
+`governance_monthly_report_pushed period=YYYY-MM` (+
+`governance_quarterly_report_pushed` on quarter months).
