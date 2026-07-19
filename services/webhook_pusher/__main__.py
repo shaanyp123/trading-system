@@ -45,6 +45,11 @@ is acceptable.
   * ``WEBHOOK_PUSHER_API_BASE_URL`` — defaults to ``http://api:8000``
     (the api container's Docker DNS name on the ``internal`` network).
   * ``WEBHOOK_PUSHER_LOG_LEVEL`` — INFO / DEBUG / WARN / ERROR.
+  * ``WEBHOOK_PUSHER_REPORTS_WEBHOOK_URL`` — secrets
+    ``discord.webhook_urls.reports``. OPTIONAL (C1→C2 PR 3): when unset
+    the monthly/quarterly governance-report scheduler is SKIPPED with a
+    ``governance_reports_skipped_no_webhook`` warning — a logged skip,
+    never a crash. Populate the key + restart to arm #reports.
 """
 
 from __future__ import annotations
@@ -60,6 +65,10 @@ import structlog
 from services.webhook_pusher.cycle_digest_scheduler import (
     CycleDigestConfig,
     CycleDigestScheduler,
+)
+from services.webhook_pusher.governance_reports import (
+    GovernanceReportConfig,
+    GovernanceReportScheduler,
 )
 from services.webhook_pusher.sse_subscriber import (
     SSESubscriber,
@@ -116,6 +125,26 @@ def _build_config() -> SSESubscriberConfig:
     )
 
 
+def _build_governance_report_config() -> GovernanceReportConfig | None:
+    """§3.8 monthly/quarterly governance reports → #reports (PR 3).
+
+    UNLIKE the fail-closed signals/fills/daily_brief URLs, the #reports
+    webhook is OPTIONAL: the channel webhook may not exist on the VPS
+    yet, and a missing secret must degrade to a logged skip, never a
+    crash (task-locked). Returns None when
+    ``WEBHOOK_PUSHER_REPORTS_WEBHOOK_URL`` is unset/empty — the runner
+    then skips the scheduler with a WARNING naming the secrets key.
+    """
+    url = os.environ.get("WEBHOOK_PUSHER_REPORTS_WEBHOOK_URL", "").strip()
+    if not url:
+        return None
+    return GovernanceReportConfig(
+        api_base_url=os.environ.get("WEBHOOK_PUSHER_API_BASE_URL", "http://api:8000"),
+        api_bearer_token=_require("WEBHOOK_PUSHER_API_BEARER_TOKEN"),
+        reports_webhook_url=url,
+    )
+
+
 def _build_cycle_digest_config() -> CycleDigestConfig:
     """Crypto-pivot §3.8 — the 00:10 UTC daily-decision digest scheduler.
 
@@ -136,11 +165,27 @@ async def _run() -> None:
     config = _build_config()
     subscriber = SSESubscriber(config)
     digest_scheduler = CycleDigestScheduler(_build_cycle_digest_config())
+    governance_config = _build_governance_report_config()
+    governance_scheduler: GovernanceReportScheduler | None = None
+    if governance_config is None:
+        # Task-locked degradation: missing #reports webhook = logged
+        # skip, never a crash. Populate discord.webhook_urls.reports in
+        # the secrets file + restart to arm the governance reports.
+        log.warning(
+            "governance_reports_skipped_no_webhook",
+            note=(
+                "secrets discord.webhook_urls.reports unset — monthly/"
+                "quarterly governance reports will not fire"
+            ),
+        )
+    else:
+        governance_scheduler = GovernanceReportScheduler(governance_config)
     log.info(
         "webhook_pusher_sse_runner_starting",
         api_base_url=config.api_base_url,
         reconnect_initial_seconds=config.reconnect_initial_seconds,
         reconnect_max_seconds=config.reconnect_max_seconds,
+        governance_reports_armed=governance_scheduler is not None,
     )
 
     # SIGTERM / SIGINT → request_stop() on both loops. Docker sends
@@ -149,6 +194,8 @@ async def _run() -> None:
     def _request_stop() -> None:
         subscriber.request_stop()
         digest_scheduler.request_stop()
+        if governance_scheduler is not None:
+            governance_scheduler.request_stop()
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -161,14 +208,16 @@ async def _run() -> None:
             pass
 
     try:
-        # Two long-lived loops in one container: the SSE subscriber
-        # (#signals/#fills event pushes) + the 00:10 UTC cycle-digest
-        # scheduler (#daily-brief). Both are stop-responsive and never
-        # raise out; gather propagates only genuine bugs.
-        await asyncio.gather(
-            subscriber.run_forever(),
-            digest_scheduler.run_forever(),
-        )
+        # Up to three long-lived loops in one container: the SSE
+        # subscriber (#signals/#fills event pushes), the 00:10 UTC
+        # cycle-digest scheduler (#daily-brief), and — when the
+        # #reports webhook is configured — the 1st-of-month 00:30 UTC
+        # governance-report scheduler (#reports). All stop-responsive
+        # and never raise out; gather propagates only genuine bugs.
+        loops = [subscriber.run_forever(), digest_scheduler.run_forever()]
+        if governance_scheduler is not None:
+            loops.append(governance_scheduler.run_forever())
+        await asyncio.gather(*loops)
     finally:
         log.info("webhook_pusher_sse_runner_stopped")
 

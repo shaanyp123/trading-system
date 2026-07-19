@@ -62,6 +62,7 @@ The ``server_now`` field is computed at response build time per spec
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from datetime import date as date_type
 from decimal import Decimal
 from typing import Final, Literal
 from uuid import UUID
@@ -86,6 +87,13 @@ from services.api.heartbeats import (
 from services.api.repos.cycle import CycleQueryRepo, PostgresCycleQueryRepo
 from services.api.repos.funding import FundingQueryRepo, PostgresFundingQueryRepo
 from services.api.repos.gates import GatesQueryRepo, PostgresGatesQueryRepo
+from services.api.repos.governance import (
+    CapitalEventRow,
+    FeesPeriodStats,
+    GovernanceQueryRepo,
+    PostgresGovernanceQueryRepo,
+    TradesPeriodStats,
+)
 from services.api.repos.phase1 import (
     AuditLogRow,
     ParameterSetRow,
@@ -108,6 +116,10 @@ from services.api.schemas.funding import (
     build_system_funding_response,
 )
 from services.api.schemas.gates import SystemGatesResponse, build_system_gates_response
+from services.api.schemas.governance import (
+    GovernanceReportResponse,
+    build_governance_report_response,
+)
 from services.api.schemas.system import (
     AuditLogEntry,
     AuditLogPageResponse,
@@ -1615,6 +1627,88 @@ async def system_gates(
         latest_heartbeat=await gates_repo.fetch_latest_heartbeat(account_id),
         decisions=await gates_repo.fetch_decision_days(account_id),
         funding_stats=await gates_repo.fetch_funding_source_stats(),
+        now=now,
+    )
+
+
+def _get_governance_repo(
+    session: AsyncSession = Depends(get_session),
+) -> GovernanceQueryRepo:
+    return PostgresGovernanceQueryRepo(session)
+
+
+#: Widest window the governance-report endpoint will aggregate; keeps a
+#: fat-fingered curl from scanning years of partitions in one query.
+GOVERNANCE_REPORT_MAX_WINDOW_DAYS: Final[int] = 400
+
+
+@router.get(
+    "/api/system/governance-report",
+    tags=["system"],
+    response_model=GovernanceReportResponse,
+)
+async def system_governance_report(
+    period_start: date_type = Query(description="Period start (UTC calendar date, inclusive)."),
+    period_end: date_type = Query(description="Period end (UTC calendar date, EXCLUSIVE)."),
+    session: SessionContext = Depends(get_session_context),
+    repo: Phase1QueryRepo = Depends(_get_repo),
+    governance_repo: GovernanceQueryRepo = Depends(_get_governance_repo),
+) -> GovernanceReportResponse:
+    """Period aggregates for the §3.8 monthly/quarterly governance
+    reports — trades/P&L, fees, funding telemetry, sweeps, capital
+    events over an explicit [period_start, period_end) window. Read-only
+    projections over existing tables; the report CADENCE (which month/
+    quarter, fire windows) lives in the webhook_pusher scheduler; the
+    operator can curl any window. Funding is rate TELEMETRY, not
+    realized funding payments — the payload's ``funding_note`` says so.
+
+    422 ``INVALID_PERIOD`` on an empty/inverted or oversized window.
+    """
+    if period_end <= period_start:
+        raise AppError(
+            error_code="INVALID_PERIOD",
+            message="period_end must be after period_start (end is exclusive).",
+            status_code=422,
+        )
+    if (period_end - period_start).days > GOVERNANCE_REPORT_MAX_WINDOW_DAYS:
+        raise AppError(
+            error_code="INVALID_PERIOD",
+            message=(
+                f"window exceeds {GOVERNANCE_REPORT_MAX_WINDOW_DAYS} days; "
+                "aggregate smaller periods."
+            ),
+            status_code=422,
+        )
+    now = datetime.now(tz=UTC)
+    start_utc = datetime(period_start.year, period_start.month, period_start.day, tzinfo=UTC)
+    end_utc = datetime(period_end.year, period_end.month, period_end.day, tzinfo=UTC)
+    account_id = await repo.fetch_active_account_id()
+
+    capital_events: list[CapitalEventRow]
+    if account_id is None:
+        # Fresh DB: venue-scoped surfaces still aggregate; account-scoped
+        # ones render empty (HTTP 200 — consumers show the empty period).
+        trades = TradesPeriodStats(0, 0, 0, Decimal(0), Decimal(0))
+        fees = FeesPeriodStats(0, Decimal(0), Decimal(0))
+        capital_events = []
+    else:
+        trades = await governance_repo.fetch_trades_stats(
+            account_id, start_utc=start_utc, end_utc=end_utc
+        )
+        fees = await governance_repo.fetch_fees_stats(
+            account_id, start_utc=start_utc, end_utc=end_utc
+        )
+        capital_events = await governance_repo.fetch_capital_events(
+            account_id, start_utc=start_utc, end_utc=end_utc
+        )
+    return build_governance_report_response(
+        period_start=period_start,
+        period_end=period_end,
+        trades=trades,
+        fees=fees,
+        funding=await governance_repo.fetch_funding_stats(start_utc=start_utc, end_utc=end_utc),
+        sweeps=await governance_repo.fetch_sweeps_stats(start_utc=start_utc, end_utc=end_utc),
+        capital_events=capital_events,
         now=now,
     )
 

@@ -80,11 +80,32 @@ if ! /opt/venv/bin/python -c "import yaml" >/dev/null 2>&1; then
     exit 3
 fi
 
+# Optional fields: exported when present, silently absent otherwise
+# (the python runner degrades to a logged skip — never fail-closed).
+_optional() {
+    name="$1"
+    key_path="$2"
+    current=$(eval "echo \${$name:-}")
+    if [ -n "$current" ] && ! _looks_placeholder "$current"; then
+        return 0
+    fi
+    value="$(read_secret "$key_path")"
+    if _looks_placeholder "$value"; then
+        return 0
+    fi
+    eval "export $name=\"$value\""
+}
+
 # Required fields. Each one fails-closed if missing.
 _require WEBHOOK_PUSHER_API_BEARER_TOKEN         "discord.api_bearer_token"
 _require WEBHOOK_PUSHER_SIGNALS_WEBHOOK_URL      "discord.webhook_urls.signals"
 _require WEBHOOK_PUSHER_FILLS_WEBHOOK_URL        "discord.webhook_urls.fills"
 _require WEBHOOK_PUSHER_DAILY_BRIEF_WEBHOOK_URL  "discord.webhook_urls.daily_brief"
+
+# Optional: #reports governance-report webhook (C1->C2 follow-up PR 3).
+# Missing => the governance-report scheduler is skipped with a WARNING
+# in the runner logs; populate discord.webhook_urls.reports + restart.
+_optional WEBHOOK_PUSHER_REPORTS_WEBHOOK_URL     "discord.webhook_urls.reports"
 
 # Optional defaults.
 : "${WEBHOOK_PUSHER_API_BASE_URL:=http://api:8000}"
