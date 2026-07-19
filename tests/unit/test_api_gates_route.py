@@ -155,9 +155,12 @@ class TestSystemGatesRoute:
                 )
             ],
             heartbeat=NOW,
+            # Anchor to the REAL clock: the route computes days_live from
+            # datetime.now(), so a fixed date here goes stale overnight.
             decisions=[
                 DecisionDayRow(
-                    decision_date=NOW.date() - timedelta(days=offset), status="completed"
+                    decision_date=datetime.now(tz=UTC).date() - timedelta(days=offset),
+                    status="completed",
                 )
                 for offset in range(1, 10)
             ],
