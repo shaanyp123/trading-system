@@ -85,6 +85,7 @@ from services.api.heartbeats import (
 )
 from services.api.repos.cycle import CycleQueryRepo, PostgresCycleQueryRepo
 from services.api.repos.funding import FundingQueryRepo, PostgresFundingQueryRepo
+from services.api.repos.gates import GatesQueryRepo, PostgresGatesQueryRepo
 from services.api.repos.phase1 import (
     AuditLogRow,
     ParameterSetRow,
@@ -106,6 +107,7 @@ from services.api.schemas.funding import (
     SystemFundingResponse,
     build_system_funding_response,
 )
+from services.api.schemas.gates import SystemGatesResponse, build_system_gates_response
 from services.api.schemas.system import (
     AuditLogEntry,
     AuditLogPageResponse,
@@ -1470,6 +1472,53 @@ async def system_funding(
         last_reward=last_reward,
         lifetime_rewards=lifetime_rewards,
         yield_apy=settings.cash_yield_apy,
+        now=now,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Strategy §10 — C1→C2 acceptance-gate tracker (read-only)
+# ---------------------------------------------------------------------------
+
+
+def _get_gates_repo(session: AsyncSession = Depends(get_session)) -> GatesQueryRepo:
+    return PostgresGatesQueryRepo(session)
+
+
+@router.get(
+    "/api/system/gates",
+    tags=["system"],
+    response_model=SystemGatesResponse,
+)
+async def system_gates(
+    session: SessionContext = Depends(get_session_context),
+    repo: Phase1QueryRepo = Depends(_get_repo),
+    gates_repo: GatesQueryRepo = Depends(_get_gates_repo),
+) -> SystemGatesResponse:
+    """Strategy §10 gate status (A1-A4, B1-B3) computed from existing
+    tables — read-only; classification thresholds live in
+    ``services/api/schemas/gates.py`` verbatim from the strategy doc."""
+    now = datetime.now(tz=UTC)
+    account_id = await repo.fetch_active_account_id()
+    if account_id is None:
+        return build_system_gates_response(
+            fills=[],
+            opens=[],
+            stops=[],
+            failure_times=[],
+            latest_heartbeat=None,
+            decisions=[],
+            funding_stats=await gates_repo.fetch_funding_source_stats(),
+            now=now,
+        )
+    return build_system_gates_response(
+        fills=await gates_repo.fetch_recent_fills(account_id),
+        opens=await gates_repo.fetch_trade_opens(account_id),
+        stops=await gates_repo.fetch_stop_orders(account_id),
+        failure_times=await gates_repo.fetch_worker_failure_alert_times(account_id),
+        latest_heartbeat=await gates_repo.fetch_latest_heartbeat(account_id),
+        decisions=await gates_repo.fetch_decision_days(account_id),
+        funding_stats=await gates_repo.fetch_funding_source_stats(),
         now=now,
     )
 

@@ -20,6 +20,8 @@ Post-pivot commands:
     signal from any channel without opening the web app)
   * :mod:`services.discord_bot.commands.cycle` — ``/cycle`` (crypto-pivot
     §3.8: latest daily-decision digest; announce-only)
+  * :mod:`services.discord_bot.commands.gates` — ``/gates`` (strategy §10
+    acceptance-gate tracker; announce-only)
 
 Phase 1+ command modules land in subsequent PRs (one slash command per
 module per spec §6.7 layout).
@@ -27,6 +29,7 @@ module per spec §6.7 layout).
 
 from services.discord_bot.commands.capital import register_capital_event_commands
 from services.discord_bot.commands.cycle import register_cycle
+from services.discord_bot.commands.gates import register_gates
 from services.discord_bot.commands.halt import register_halt
 from services.discord_bot.commands.positions import register_positions
 from services.discord_bot.commands.status import register_status
@@ -34,6 +37,7 @@ from services.discord_bot.commands.status import register_status
 __all__ = [
     "register_capital_event_commands",
     "register_cycle",
+    "register_gates",
     "register_halt",
     "register_positions",
     "register_status",

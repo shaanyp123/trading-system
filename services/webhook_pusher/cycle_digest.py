@@ -28,6 +28,7 @@ from datetime import UTC, datetime
 from typing import Any, Final
 
 from services.discord_shared.cycle_digest import build_cycle_digest_embed
+from services.discord_shared.gates_digest import format_gates_summary_line
 from services.webhook_pusher.event_pushes import EventChannel, EventPushPlan
 
 #: §3.8 — the digest fires at 00:10 UTC, five minutes after the 00:05
@@ -40,6 +41,7 @@ def plan_cycle_digest_push(
     payload: Mapping[str, Any],
     *,
     now_utc: datetime,
+    gates_payload: Mapping[str, Any] | None = None,
 ) -> EventPushPlan | None:
     """Payload → #daily-brief push plan; None = skip (no decision ever).
 
@@ -53,7 +55,10 @@ def plan_cycle_digest_push(
     decision = payload.get("decision")
     if not isinstance(decision, dict):
         return None
-    embed = build_cycle_digest_embed(payload, now_utc=now_utc)
+    # §10 gate tracker section (C1→C2 build): best-effort — a missing or
+    # unusable gates payload renders no field, never blocks the digest.
+    gates_summary = format_gates_summary_line(gates_payload) if gates_payload is not None else None
+    embed = build_cycle_digest_embed(payload, now_utc=now_utc, gates_summary=gates_summary)
     decision_date = str(decision.get("decision_date") or "unknown")
     fire_date = now_utc.astimezone(UTC).date().isoformat()
     return EventPushPlan(

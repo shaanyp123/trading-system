@@ -328,10 +328,15 @@ class TestFireOnce:
         scheduler = CycleDigestScheduler(_config())
         outcome = await scheduler.fire_once(now_utc=NOW, http_client=client)
         assert outcome == "pushed"
-        client.get.assert_awaited_once()
-        get_args = client.get.await_args
-        assert get_args.args[0] == "http://api:8000/api/system/cycle"
-        assert get_args.kwargs["headers"]["Authorization"] == "Bearer test-bearer"
+        # Two GETs: the cycle payload + the best-effort §10 gates fetch.
+        assert client.get.await_count == 2
+        get_urls = [call.args[0] for call in client.get.await_args_list]
+        assert get_urls == [
+            "http://api:8000/api/system/cycle",
+            "http://api:8000/api/system/gates",
+        ]
+        first_get = client.get.await_args_list[0]
+        assert first_get.kwargs["headers"]["Authorization"] == "Bearer test-bearer"
         client.post.assert_awaited_once()
         post_args = client.post.await_args
         assert post_args.args[0] == WEBHOOK_URL

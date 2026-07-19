@@ -54,6 +54,7 @@ from services.discord_bot.commands.capital import (
     register_capital_event_commands,
 )
 from services.discord_bot.commands.cycle import register_cycle
+from services.discord_bot.commands.gates import register_gates
 from services.discord_bot.commands.halt import HaltConfirmView, register_halt
 from services.discord_bot.commands.positions import register_positions
 from services.discord_bot.commands.status import register_status
@@ -81,6 +82,7 @@ def _stub_api_client() -> ApiClient:
     client.invoke_kill_switch = AsyncMock()  # type: ignore[method-assign]
     client.invoke_capital_event = AsyncMock()  # type: ignore[method-assign]
     client.get_system_cycle = AsyncMock()  # type: ignore[method-assign]
+    client.get_system_gates = AsyncMock()  # type: ignore[method-assign]
     return client
 
 
@@ -561,6 +563,80 @@ class TestCycleCommand:
         assert "db down" in (embed.description or "")
 
 
+def _gates_payload() -> dict:
+    return {
+        "gates": [
+            {
+                "key": "A1",
+                "title": "Consecutive complete recorded fills",
+                "status": "green",
+                "value": "18 consecutive (25 recent fills examined)",
+                "target": ">= 15 consecutive, matched to statement within ±$1/±2%",
+                "evidence_note": "statement match is operator-run",
+            },
+            {
+                "key": "B3",
+                "title": "CDE vs proxy funding",
+                "status": "insufficient_data",
+                "value": "no proxy-source rows recorded",
+                "target": "within 2x",
+                "evidence_note": None,
+            },
+        ],
+        "days_live": 9,
+        "phase_a_min_days": 45,
+        "all_mechanical_green": False,
+        "scale_up_eligible": False,
+        "server_now": f"{_FIXTURE_TODAY}T00:10:00Z",
+    }
+
+
+class TestGatesCommand:
+    async def test_happy_path_defers_then_followup_with_embed(self, stub_client: ApiClient) -> None:
+        stub_client.get_system_gates.return_value = _gates_payload()  # type: ignore[attr-defined]
+        tree = _build_tree()
+        register_gates(tree, api_client=stub_client)
+        callback = _command_callback(tree, "gates")
+        interaction = _build_mock_interaction()
+
+        await callback(interaction)
+
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+        stub_client.get_system_gates.assert_awaited_once()  # type: ignore[attr-defined]
+        embed = interaction.followup.send.await_args.kwargs["embed"]
+        assert "§10 acceptance gates" in (embed.title or "")
+        field_names = [f.name for f in embed.fields]
+        assert any("A1" in name for name in field_names)
+        assert any("B3" in name for name in field_names)
+
+    async def test_announce_only_no_view_attached(self, stub_client: ApiClient) -> None:
+        stub_client.get_system_gates.return_value = _gates_payload()  # type: ignore[attr-defined]
+        tree = _build_tree()
+        register_gates(tree, api_client=stub_client)
+        callback = _command_callback(tree, "gates")
+        interaction = _build_mock_interaction()
+
+        await callback(interaction)
+
+        assert "view" not in interaction.followup.send.await_args.kwargs
+
+    async def test_api_error_renders_error_embed(self, stub_client: ApiClient) -> None:
+        stub_client.get_system_gates.side_effect = ApiClientHTTPError(  # type: ignore[attr-defined]
+            status_code=503,
+            error_code="SERVICE_UNAVAILABLE",
+            message="db down",
+        )
+        tree = _build_tree()
+        register_gates(tree, api_client=stub_client)
+        callback = _command_callback(tree, "gates")
+        interaction = _build_mock_interaction()
+
+        await callback(interaction)
+
+        embed = interaction.followup.send.await_args.kwargs["embed"]
+        assert "SERVICE_UNAVAILABLE" in (embed.title or "")
+
+
 # ---------------------------------------------------------------------------
 # Registration sanity (crypto-pivot C0-B4: /approve RETIRED — announce-only)
 # ---------------------------------------------------------------------------
@@ -573,8 +649,9 @@ class TestRegistrationSanity:
         register_halt(tree, api_client=stub_client, environment="paper")
         register_status(tree, api_client=stub_client)
         register_cycle(tree, api_client=stub_client)
+        register_gates(tree, api_client=stub_client)
         names = {cmd.name for cmd in tree.get_commands()}
-        assert {"positions", "halt", "status", "cycle"}.issubset(names)
+        assert {"positions", "halt", "status", "cycle", "gates"}.issubset(names)
         assert "approve" not in names  # C0-B4: announce-only, /approve retired
 
     def test_all_commands_register_with_guild(self, stub_client: ApiClient) -> None:
@@ -584,9 +661,10 @@ class TestRegistrationSanity:
         register_halt(tree, api_client=stub_client, environment="paper", guild=guild)
         register_status(tree, api_client=stub_client, guild=guild)
         register_cycle(tree, api_client=stub_client, guild=guild)
+        register_gates(tree, api_client=stub_client, guild=guild)
         # Guild-scoped commands aren't returned by get_commands() with no guild arg
         names = {cmd.name for cmd in tree.get_commands(guild=guild)}
-        assert {"positions", "halt", "status", "cycle"}.issubset(names)
+        assert {"positions", "halt", "status", "cycle", "gates"}.issubset(names)
 
 
 # ---------------------------------------------------------------------------
