@@ -347,6 +347,43 @@ def equity_from_summary(summary: FuturesBalanceSummary) -> Decimal | None:
     return summary.cfm_usd_balance
 
 
+#: Maximum age of the CBI-USDC capture accepted into the floor basis.
+#: Older (or missing / malformed) snapshots fall back to USD-only — a
+#: tightening, never a loosening (Amendment C fail-safe bias).
+FLOOR_USDC_SNAPSHOT_MAX_AGE = timedelta(hours=48)
+
+
+def compute_floor_equity(
+    *,
+    equity: Decimal,
+    snapshot: CashBalanceSnapshot | None,
+    now_utc: datetime,
+) -> tuple[Decimal, str]:
+    """Floor-check basis per the 2026-07-18 halt-floor amendment (Amendment C).
+
+    The $1,500 malfunction floor is measured against TOTAL capital: venue
+    USD equity (``equity_from_summary``) plus the latest CBI-USDC capture.
+    Fail-safe bias: a missing, stale (> 48 h), or malformed snapshot falls
+    back to USD-only — since USDC >= 0 can only RAISE the basis, every
+    fallback is a tightening, never a loosening. Sizing equity is out of
+    scope by design (LOCKED: the sizer keeps reading venue USD only).
+    """
+    if snapshot is None:
+        return equity, "usd_only_no_snapshot"
+    if snapshot.cbi_usdc is None:
+        return equity, "usd_only_null_usdc"
+    if not snapshot.cbi_usdc.is_finite() or snapshot.cbi_usdc < 0:
+        # Postgres NUMERIC admits NaN/Infinity, and a negative CBI spot
+        # balance is venue-impossible; treat all of them as malformed
+        # rather than tripping (negative) or permanently clearing
+        # (Infinity) the floor on garbage input. is_finite() runs FIRST:
+        # NaN < 0 raises InvalidOperation (risk-review finding 1).
+        return equity, "usd_only_malformed_usdc"
+    if now_utc.astimezone(UTC) - snapshot.captured_at_utc > FLOOR_USDC_SNAPSHOT_MAX_AGE:
+        return equity, "usd_only_stale_snapshot"
+    return equity + snapshot.cbi_usdc, "total_capital"
+
+
 def normalize_liq_buffer(value: Decimal) -> Decimal:
     """Normalize the venue liquidation-buffer field to a fraction.
 
@@ -603,6 +640,15 @@ class RiskStateSnapshot:
     severity: str | None
     convalescent_counter: int
     capital_event_active: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CashBalanceSnapshot:
+    """Latest ``cash_balance_snapshots`` capture — the CBI-USDC input to
+    the total-capital floor basis (Amendment C, 2026-07-18)."""
+
+    captured_at_utc: datetime
+    cbi_usdc: Decimal | None
 
 
 class KillSwitchInvokeResult(Enum):
@@ -885,6 +931,26 @@ class StrategyWorkerStore:
             flatten_seq=int(row.flatten_seq or 0),
             engine_state=engine_state,
             last_decision_date=row.last_decision_date,
+        )
+
+    async def fetch_latest_cash_balance_snapshot(self) -> CashBalanceSnapshot | None:
+        """Latest daily CBI cash capture (00:20 UTC ``usdc_rewards`` job) —
+        the Amendment C floor-basis input. Newest calendar day wins; the
+        48 h freshness gate lives in :func:`compute_floor_equity`."""
+        async with self._sf() as session:
+            row = (
+                await session.execute(
+                    text(
+                        "SELECT captured_at_utc, cbi_usdc FROM cash_balance_snapshots "
+                        "ORDER BY snapshot_date_utc DESC LIMIT 1"
+                    )
+                )
+            ).fetchone()
+        if row is None:
+            return None
+        return CashBalanceSnapshot(
+            captured_at_utc=row.captured_at_utc,
+            cbi_usdc=_dec(row.cbi_usdc),
         )
 
     # -- writes --------------------------------------------------------------
@@ -2117,17 +2183,62 @@ class StrategyWorker:
         weekly_limit = _dec(canonical.get("WEEKLY_LOSS_LIMIT")) or Decimal("-0.16")
 
         # 5a) Hard halt — the $1,500 malfunction circuit-breaker (§7 /
-        # Amendment A). DECOMMISSION_FLOOR is the existing incident-review
-        # trigger for the equity floor; restart is manual-flag-removal.
-        # Risk-review F4: the flatten runs even when ALREADY halted (a
-        # halted book sliding through the floor must still be flattened);
-        # only the FSM transition itself is retrip-guarded.
+        # Amendment A; measurement basis amended 2026-07-18 → Amendment C:
+        # TOTAL capital = venue USD equity + the latest CBI-USDC capture,
+        # with fail-safe USD-only fallback). DECOMMISSION_FLOOR is the
+        # existing incident-review trigger for the equity floor; restart is
+        # manual-flag-removal. Risk-review F4: the flatten runs even when
+        # ALREADY halted (a halted book sliding through the floor must
+        # still be flattened); only the FSM transition is retrip-guarded.
+        floor_equity = equity
+        floor_basis = "usd_only"
+        usdc_snapshot: CashBalanceSnapshot | None = None
         if equity <= halt_floor:
+            # The USD-visible basis alone would trip. Fetch the USDC
+            # capture only on this path: USDC >= 0 can only RAISE the
+            # basis, so a USD-side pass can never become a total-capital
+            # trip — the guarded fetch is exactly equivalent to computing
+            # the total basis every tick, without the per-tick query.
+            fetch_failed = False
+            try:
+                usdc_snapshot = await self._store.fetch_latest_cash_balance_snapshot()
+            except Exception:
+                # Fail-safe: a broken snapshot read tightens to USD-only.
+                # Distinct basis string (risk-review finding 4): "fetch
+                # failed" is actionably different from "no snapshot" —
+                # the operator chases the DB, not the capture job.
+                self._log.warning("strategy_worker_floor_usdc_snapshot_fetch_failed")
+                usdc_snapshot = None
+                fetch_failed = True
+            floor_equity, floor_basis = compute_floor_equity(
+                equity=equity, snapshot=usdc_snapshot, now_utc=now_utc
+            )
+            if fetch_failed:
+                floor_basis = "usd_only_fetch_failed"
+            if floor_equity > halt_floor:
+                # Jul-17-shaped state: visible USD at/below the floor but
+                # total capital clears it. No halt under Amendment C —
+                # scream in the logs so headroom erosion stays visible
+                # (the operator's cue to convert USDC → USD).
+                self._log.warning(
+                    "strategy_worker_floor_headroom_from_usdc",
+                    equity_usd=str(equity),
+                    cbi_usdc=(
+                        str(usdc_snapshot.cbi_usdc)
+                        if usdc_snapshot is not None and usdc_snapshot.cbi_usdc is not None
+                        else None
+                    ),
+                    floor_equity_usd=str(floor_equity),
+                    halt_floor_usd=str(halt_floor),
+                )
+        if floor_equity <= halt_floor:
             has_positions = any(self.state[a].contracts != 0 for a in ASSETS)
             if has_positions:
                 self._log.error(
                     "strategy_worker_hard_halt_floor_breached",
                     equity_usd=str(equity),
+                    floor_equity_usd=str(floor_equity),
+                    floor_basis=floor_basis,
                     halt_floor_usd=str(halt_floor),
                     already_halted=already_halted,
                 )
@@ -2156,12 +2267,25 @@ class StrategyWorker:
                     severity="P0",
                     category="kill_switch_invoked",
                     message=(
-                        f"hard-halt equity floor breached: equity {equity} <= "
-                        f"{halt_floor} — {halt_outcome}"
+                        f"hard-halt equity floor breached: floor equity "
+                        f"{floor_equity} <= {halt_floor} (basis {floor_basis}; "
+                        f"venue USD {equity}) — {halt_outcome}"
                     ),
                     detail={
                         "trigger": TransitionTrigger.DECOMMISSION_FLOOR.value,
                         "equity_usd": str(equity),
+                        "floor_equity_usd": str(floor_equity),
+                        "floor_basis": floor_basis,
+                        "cbi_usdc_usd": (
+                            str(usdc_snapshot.cbi_usdc)
+                            if usdc_snapshot is not None and usdc_snapshot.cbi_usdc is not None
+                            else None
+                        ),
+                        "usdc_captured_at_utc": (
+                            usdc_snapshot.captured_at_utc.isoformat()
+                            if usdc_snapshot is not None
+                            else None
+                        ),
                         "halt_floor_usd": str(halt_floor),
                         "source": "strategy_worker_risk_loop",
                         "transition_applied": result is KillSwitchInvokeResult.APPLIED,
@@ -2177,11 +2301,14 @@ class StrategyWorker:
                     severity="P0",
                     category="kill_switch_invoked",
                     message=(
-                        f"equity {equity} <= floor {halt_floor} while already "
+                        f"floor equity {floor_equity} <= floor {halt_floor} "
+                        f"(basis {floor_basis}; venue USD {equity}) while already "
                         "HALT_NEW — open positions flattened (no FSM retrip)"
                     ),
                     detail={
                         "equity_usd": str(equity),
+                        "floor_equity_usd": str(floor_equity),
+                        "floor_basis": floor_basis,
                         "halt_floor_usd": str(halt_floor),
                         "already_halted": True,
                         "source": "strategy_worker_risk_loop",
@@ -4063,8 +4190,10 @@ __all__ = [
     "DECISION_TIME_UTC",
     "DEFAULT_BARS_HISTORY_DAYS",
     "DEFAULT_STALE_THRESHOLD_S",
+    "FLOOR_USDC_SNAPSHOT_MAX_AGE",
     "RISK_TICK_FAILURE_HALT_THRESHOLD",
     "AssetRuntime",
+    "CashBalanceSnapshot",
     "DecisionRow",
     "FillPropagationOutcome",
     "KillSwitchInvokeResult",
@@ -4074,6 +4203,7 @@ __all__ = [
     "StrategyWorkerConfig",
     "StrategyWorkerStore",
     "WorkerStatusRow",
+    "compute_floor_equity",
     "decision_due",
     "deserialize_engine_state",
     "equity_from_summary",

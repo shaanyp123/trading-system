@@ -56,6 +56,7 @@ from services.signal.crypto_trend import AMENDMENT_B_PARAMS
 from services.signal.strategy_worker import (
     RISK_TICK_FAILURE_HALT_THRESHOLD,
     AssetRuntime,
+    CashBalanceSnapshot,
     DecisionRow,
     FillPropagationOutcome,
     KillSwitchInvokeResult,
@@ -65,6 +66,7 @@ from services.signal.strategy_worker import (
     StrategyWorkerConfig,
     StrategyWorkerStore,
     WorkerStatusRow,
+    compute_floor_equity,
     decision_due,
     deserialize_engine_state,
     equity_from_summary,
@@ -360,6 +362,8 @@ class FakeStore(StrategyWorkerStore):
         # (severity, category, message, detail)
         self.alerts: list[tuple[str, str, str, dict[str, Any]]] = []
         self.equity_history: dict[date, Decimal] = {}
+        self.cash_snapshot: CashBalanceSnapshot | None = None
+        self.cash_snapshot_raises = False
         self._contract_ids: dict[str, UUID] = {}
         self.process_fill_supported = True
         self.insert_alert_delivers = True
@@ -408,6 +412,11 @@ class FakeStore(StrategyWorkerStore):
 
     async def fetch_worker_status(self, account_id: UUID) -> WorkerStatusRow | None:
         return self.status_row
+
+    async def fetch_latest_cash_balance_snapshot(self) -> CashBalanceSnapshot | None:
+        if self.cash_snapshot_raises:
+            raise RuntimeError("cash snapshot surface down")
+        return self.cash_snapshot
 
     # -- writes ------------------------------------------------------------
 
@@ -1373,6 +1382,183 @@ class TestLossLimits:
         assert worker.state["BTC"].contracts == 2
         assert store.kill_switch_calls == []
         assert ("P1", "margin_warn") in {(a[0], a[1]) for a in store.alerts}
+
+
+class TestFloorTotalCapitalBasis:
+    """Amendment C (2026-07-18): the $1,500 floor measures TOTAL capital —
+    venue USD + the latest fresh CBI-USDC capture — with fail-safe
+    USD-only fallback (missing / stale / malformed snapshot ⇒ tighten)."""
+
+    async def test_fresh_usdc_headroom_clears_the_floor(self) -> None:
+        """Jul-17 shape: visible USD at/below the floor, USDC covers it."""
+        worker, store, broker = await _started_worker()
+        _open_long(worker, broker, "BTC", contracts=2)
+        broker.equity = Decimal("1449.28")
+        store.cash_snapshot = CashBalanceSnapshot(
+            captured_at_utc=NOW - timedelta(hours=1), cbi_usdc=Decimal("3500")
+        )
+
+        await worker.run_risk_checks(now_utc=NOW)
+
+        assert store.kill_switch_calls == []
+        assert worker.state["BTC"].contracts == 2  # no flatten
+        assert not any(a[1] == "kill_switch_invoked" for a in store.alerts)
+
+    async def test_total_capital_still_below_floor_halts(self) -> None:
+        worker, store, broker = await _started_worker()
+        _open_long(worker, broker, "BTC", contracts=2)
+        broker.equity = Decimal("1000")
+        store.cash_snapshot = CashBalanceSnapshot(
+            captured_at_utc=NOW - timedelta(hours=1), cbi_usdc=Decimal("300")
+        )
+
+        await worker.run_risk_checks(now_utc=NOW)
+
+        assert store.kill_switch_calls == [TransitionTrigger.DECOMMISSION_FLOOR]
+        assert worker.state["BTC"].contracts == 0
+        floor_alert = next(a for a in store.alerts if a[1] == "kill_switch_invoked")
+        assert floor_alert[3]["floor_basis"] == "total_capital"
+        assert floor_alert[3]["floor_equity_usd"] == "1300"
+        assert floor_alert[3]["equity_usd"] == "1000"
+        assert floor_alert[3]["cbi_usdc_usd"] == "300"
+
+    async def test_missing_snapshot_falls_back_usd_only(self) -> None:
+        worker, store, broker = await _started_worker()
+        _open_long(worker, broker, "BTC", contracts=2)
+        broker.equity = Decimal("1400")
+        store.cash_snapshot = None
+
+        await worker.run_risk_checks(now_utc=NOW)
+
+        assert store.kill_switch_calls == [TransitionTrigger.DECOMMISSION_FLOOR]
+        floor_alert = next(a for a in store.alerts if a[1] == "kill_switch_invoked")
+        assert floor_alert[3]["floor_basis"] == "usd_only_no_snapshot"
+
+    async def test_stale_snapshot_falls_back_usd_only(self) -> None:
+        worker, store, broker = await _started_worker()
+        _open_long(worker, broker, "BTC", contracts=2)
+        broker.equity = Decimal("1400")
+        store.cash_snapshot = CashBalanceSnapshot(
+            captured_at_utc=NOW - timedelta(hours=49), cbi_usdc=Decimal("3500")
+        )
+
+        await worker.run_risk_checks(now_utc=NOW)
+
+        assert store.kill_switch_calls == [TransitionTrigger.DECOMMISSION_FLOOR]
+        floor_alert = next(a for a in store.alerts if a[1] == "kill_switch_invoked")
+        assert floor_alert[3]["floor_basis"] == "usd_only_stale_snapshot"
+
+    async def test_snapshot_fetch_failure_falls_back_usd_only(self) -> None:
+        worker, store, broker = await _started_worker()
+        _open_long(worker, broker, "BTC", contracts=2)
+        broker.equity = Decimal("1400")
+        store.cash_snapshot_raises = True
+
+        await worker.run_risk_checks(now_utc=NOW)
+
+        assert store.kill_switch_calls == [TransitionTrigger.DECOMMISSION_FLOOR]
+        floor_alert = next(a for a in store.alerts if a[1] == "kill_switch_invoked")
+        assert floor_alert[3]["floor_basis"] == "usd_only_fetch_failed"
+
+    async def test_already_halted_covered_by_usdc_no_flatten(self) -> None:
+        """F4 semantic under Amendment C (risk-review finding 3): an
+        already-HALT_NEW book with USD through the floor but total
+        capital clearing it is NOT flattened — coverage suppresses the
+        floor block entirely, alerts included."""
+        store = FakeStore()
+        store.risk = RiskStateSnapshot("HALT_NEW", "routine", 0, False)
+        store.cash_snapshot = CashBalanceSnapshot(
+            captured_at_utc=NOW - timedelta(hours=1), cbi_usdc=Decimal("3500")
+        )
+        worker, _, broker = await _started_worker(store=store)
+        _open_long(worker, broker, "BTC", contracts=2)
+        broker.equity = Decimal("1400")
+
+        await worker.run_risk_checks(now_utc=NOW)
+
+        assert store.kill_switch_calls == []
+        assert worker.state["BTC"].contracts == 2
+        assert not any(a[1] == "kill_switch_invoked" for a in store.alerts)
+
+    async def test_equity_exactly_at_floor_covered_no_halt(self) -> None:
+        """Boundary: equity == floor triggers the snapshot fetch (<=),
+        and fresh coverage clears it — a behavior change vs the
+        pre-amendment USD-only floor, pinned deliberately."""
+        worker, store, broker = await _started_worker()
+        _open_long(worker, broker, "BTC", contracts=2)
+        broker.equity = Decimal("1500")
+        store.cash_snapshot = CashBalanceSnapshot(
+            captured_at_utc=NOW - timedelta(hours=1), cbi_usdc=Decimal("100")
+        )
+
+        await worker.run_risk_checks(now_utc=NOW)
+
+        assert store.kill_switch_calls == []
+        assert worker.state["BTC"].contracts == 2
+
+    async def test_usd_above_floor_never_fetches_snapshot(self) -> None:
+        """A USD-side pass short-circuits: no per-tick snapshot query, and
+        a broken snapshot surface cannot affect a healthy account."""
+        worker, store, broker = await _started_worker()
+        _open_long(worker, broker, "BTC", contracts=2)
+        broker.equity = Decimal("2251.38")
+        store.cash_snapshot_raises = True  # would raise if fetched
+
+        await worker.run_risk_checks(now_utc=NOW)
+
+        assert store.kill_switch_calls == []
+        assert worker.state["BTC"].contracts == 2
+
+    async def test_sizing_ignores_usdc_snapshot(self) -> None:
+        """LOCKED out-of-scope: the sizer reads venue USD only — a huge
+        USDC balance must not change decision-time equity_for_sizing."""
+        worker, store, broker = await _started_worker()
+        # Structural pin (risk-review finding 7): ANY snapshot read in
+        # the decision path would raise and fail the decision.
+        store.cash_snapshot_raises = True
+        await worker.run_daily_decision(TODAY)
+        row = store.decisions[TODAY]
+        assert row["status"] == "completed"
+        # equity_for_sizing stays min(venue USD, $1,500 Phase-A cap).
+        assert row["equity_usd"] == broker.equity
+
+    def test_compute_floor_equity_pure_cases(self) -> None:
+        eq = Decimal("1400")
+        fresh = CashBalanceSnapshot(
+            captured_at_utc=NOW - timedelta(hours=48), cbi_usdc=Decimal("200")
+        )
+        # Exactly 48h old is still fresh (strictly-older-than gate).
+        assert compute_floor_equity(equity=eq, snapshot=fresh, now_utc=NOW) == (
+            Decimal("1600"),
+            "total_capital",
+        )
+        null_usdc = CashBalanceSnapshot(captured_at_utc=NOW, cbi_usdc=None)
+        assert compute_floor_equity(equity=eq, snapshot=null_usdc, now_utc=NOW) == (
+            eq,
+            "usd_only_null_usdc",
+        )
+        negative = CashBalanceSnapshot(captured_at_utc=NOW, cbi_usdc=Decimal("-1"))
+        assert compute_floor_equity(equity=eq, snapshot=negative, now_utc=NOW) == (
+            eq,
+            "usd_only_malformed_usdc",
+        )
+        # Postgres NUMERIC admits NaN/Infinity; both are malformed —
+        # Infinity would otherwise clear the floor forever, NaN raises
+        # on the < 0 guard (risk-review finding 1).
+        for garbage in (Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity")):
+            snap = CashBalanceSnapshot(captured_at_utc=NOW, cbi_usdc=garbage)
+            assert compute_floor_equity(equity=eq, snapshot=snap, now_utc=NOW) == (
+                eq,
+                "usd_only_malformed_usdc",
+            )
+        # Boundary: total exactly == floor trips (<=): 1400 + 100 = 1500.
+        boundary = CashBalanceSnapshot(captured_at_utc=NOW, cbi_usdc=Decimal("100"))
+        total, basis = compute_floor_equity(equity=eq, snapshot=boundary, now_utc=NOW)
+        assert (total, basis) == (Decimal("1500"), "total_capital")
+        assert compute_floor_equity(equity=eq, snapshot=None, now_utc=NOW) == (
+            eq,
+            "usd_only_no_snapshot",
+        )
 
 
 class TestOutagePolicy:

@@ -365,15 +365,27 @@ a risk loop that re-checks marks, margin, and limits **every 30 seconds**.
 
 **Break-glass:**
 
-10. **Hard halt at $1,500 equity (−75% from the $6,000 start):** checked on every
-    30-second tick. Flatten everything at market, cancel all orders, set a persistent
-    HALTED flag, exit the process. **Restart requires a human to manually remove the
-    flag.** Important honesty note: this is a *malfunction circuit-breaker*, not a
-    risk-tolerance bound — in 9.5 years of backtest at this profile it never fired
+10. **Hard halt at $1,500 of total capital (−75% from the $6,000 start):** checked on
+    every 30-second tick. Flatten everything at market, cancel all orders, set a
+    persistent HALTED flag, exit the process. **Restart requires a human to manually
+    remove the flag.** Important honesty note: this is a *malfunction circuit-breaker*,
+    not a risk-tolerance bound — in 9.5 years of backtest at this profile it never fired
     (including a 48.5% intra-year drawdown), and a system down 75% is far more likely
     broken than unlucky. The operator's actual risk tolerance is full loss of the
     $6,000; the halt exists to catch a broken feed, a venue change, or a code fault
     before it can dig into a negative balance.
+    *Measurement basis (Amendment C, 2026-07-18):* the floor compares against **total
+    capital** — the futures-side USD equity *plus* the cash-yield USDC parked at
+    Coinbase (latest daily capture, no older than 48 hours). This fixed the 2026-07-17
+    false alarm where a routine ~$52 subscription charge tripped the breaker: the USD
+    side sat near $1,500 by design while ~$4k of USDC was invisible to the check. If
+    the USDC reading is missing or stale, the check falls back to USD-only — which can
+    only make the breaker *more* likely to fire, never less. The trading size
+    calculation deliberately still ignores USDC.
+    *Operator note:* after converting USDC → USD, the daily USDC reading is stale-high
+    until the next 00:20 UTC capture — for that window the breaker double-counts the
+    converted amount (it is less sensitive, never more). Prefer converting shortly
+    before 00:20 UTC, or treat the breaker as USD-only until the next capture.
 
 **Operational fail-safes:**
 
@@ -661,3 +673,4 @@ Plain-English definitions of every term of art used above.
 | 2026-07-09 | Initial version. | Documents the Amendment B production profile as validated and built (spec + Amendments, REPORT.md, delta spec), status as of C1 small-live start. |
 | 2026-07-09 (later) | Convalescent probation shortened: 3 clean UTC days (was 5), resume day counts, breach day never counts. | Operator amendment at C1 night one; decisions-log "C1 night one, CONVALESCENT amendment". |
 | 2026-07-11 | False-positive halt adjudication added: from the convalescent state, the operator can graduate back to NORMAL immediately when the halt was caused by a system defect (web-only, re-auth gated, must cite the defect fix). | Operator directive after the 2026-07-11 phantom recon-break auto-halt; decisions-log "C1 night two". |
+| 2026-07-18 | Hard-halt floor now measures **total capital** (futures USD equity + latest CBI-USDC capture ≤48h old), fail-safe fallback to USD-only when the USDC reading is missing/stale. Floor value unchanged at $1,500; sizing still reads USD only. | Amendment C after the 2026-07-17 decommission-floor halt (annual subscription charge against a zero-headroom USD-visible floor); decisions-log 2026-07-18 queued decision, option (b). |
