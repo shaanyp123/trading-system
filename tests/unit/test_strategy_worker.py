@@ -58,6 +58,7 @@ from services.signal.strategy_worker import (
     AssetRuntime,
     CashBalanceSnapshot,
     DecisionRow,
+    EquityObservation,
     FillPropagationOutcome,
     KillSwitchInvokeResult,
     MarksFeed,
@@ -364,6 +365,9 @@ class FakeStore(StrategyWorkerStore):
         self.equity_history: dict[date, Decimal] = {}
         self.cash_snapshot: CashBalanceSnapshot | None = None
         self.cash_snapshot_raises = False
+        # (completed_at_utc, direction, amount_usd) — completed sweeps only.
+        self.sweeps: list[tuple[datetime, str, Decimal]] = []
+        self.sweeps_raise = False
         self._contract_ids: dict[str, UUID] = {}
         self.process_fill_supported = True
         self.insert_alert_delivers = True
@@ -399,12 +403,30 @@ class FakeStore(StrategyWorkerStore):
 
     async def fetch_equity_on_or_before(
         self, account_id: UUID, on_date: date, *, lookback_days: int = 3
-    ) -> Decimal | None:
+    ) -> EquityObservation | None:
         for offset in range(lookback_days + 1):
-            v = self.equity_history.get(on_date - timedelta(days=offset))
+            day = on_date - timedelta(days=offset)
+            v = self.equity_history.get(day)
             if v is not None:
-                return v
+                # Real rows are written by the 00:05 UTC decision; mirror
+                # that instant as the sweep-netting window anchor.
+                observed = datetime(day.year, day.month, day.day, 0, 5, tzinfo=UTC)
+                return EquityObservation(equity_usd=v, observed_at_utc=observed)
         return None
+
+    async def fetch_completed_sweep_net_outflow(
+        self, *, since_utc: datetime | None, until_utc: datetime
+    ) -> Decimal:
+        if self.sweeps_raise:
+            raise RuntimeError("cash_sweeps surface down")
+        net = Decimal(0)
+        for completed_at, direction, amount in self.sweeps:
+            if since_utc is not None and completed_at <= since_utc:
+                continue
+            if completed_at > until_utc:
+                continue
+            net += amount if direction == "to_yield" else -amount
+        return net
 
     async def fetch_month_max_equity(self, account_id: UUID, month_start: date) -> Decimal | None:
         vals = [v for d, v in self.equity_history.items() if d >= month_start]
@@ -425,6 +447,7 @@ class FakeStore(StrategyWorkerStore):
         self.status_row = WorkerStatusRow(
             day_start_date=kwargs["day_start_date"],
             day_start_equity_usd=kwargs["day_start_equity_usd"],
+            day_start_captured_at_utc=kwargs["day_start_captured_at_utc"],
             weekly_halved_until=kwargs["weekly_halved_until"],
             flatten_seq=kwargs["flatten_seq"],
             engine_state=json.loads(json.dumps(kwargs["engine_state"], default=str)),
@@ -1237,6 +1260,179 @@ class TestClientStop:
         assert assets["BTC"]["final_target"] == 0
 
 
+class TestSweepNettedLossLimits:
+    """C1→C2 PR 2 (the cash_manager HARD GATE): completed cash sweeps are
+    internal transfers, netted out of the daily/weekly loss measures.
+    Sign convention pinned in BOTH directions for both consumers, window
+    boundaries pinned, zero-rows bit-identity pinned, fail-safe pinned.
+    """
+
+    async def test_daily_to_yield_sweep_does_not_read_as_loss(self) -> None:
+        worker, store, broker = await _started_worker()
+        _open_long(worker, broker, "BTC", contracts=2)
+        worker._day_start_date = TODAY
+        worker._day_start_equity = Decimal("2000")
+        worker._day_start_captured_at = NOW - timedelta(minutes=5)
+        # 00:25-style sweep: $400 USD -> USDC after the baseline capture.
+        store.sweeps = [(NOW - timedelta(minutes=1), "to_yield", Decimal("400"))]
+        broker.equity = Decimal("1600")  # unadjusted -20% would breach
+
+        await worker.run_risk_checks(now_utc=NOW)
+
+        # Adjusted: (1600 + 400) / 2000 - 1 = 0% — no loss occurred.
+        assert store.kill_switch_calls == []
+        assert worker.state["BTC"].contracts == 2
+
+    async def test_daily_to_margin_reclaim_does_not_mask_breach(self) -> None:
+        worker, store, broker = await _started_worker()
+        _open_long(worker, broker, "BTC", contracts=2)
+        worker._day_start_date = TODAY
+        worker._day_start_equity = Decimal("2000")
+        worker._day_start_captured_at = NOW - timedelta(minutes=5)
+        # $400 USDC -> USD reclaim inflated visible equity mid-day.
+        store.sweeps = [(NOW - timedelta(minutes=1), "to_margin", Decimal("400"))]
+        broker.equity = Decimal("1900")  # unadjusted -5% would pass
+
+        await worker.run_risk_checks(now_utc=NOW)
+
+        # Adjusted: (1900 - 400) / 2000 - 1 = -25% — genuine breach.
+        assert store.kill_switch_calls == [TransitionTrigger.DAILY_LOSS_BREACH]
+        assert worker.state["BTC"].contracts == 0
+
+    async def test_daily_sweep_before_baseline_capture_not_netted(self) -> None:
+        # Window boundary: a sweep completed AT-OR-BEFORE the baseline
+        # instant is already inside the baseline reading — netting it
+        # again would double-count.
+        worker, store, broker = await _started_worker()
+        _open_long(worker, broker, "BTC", contracts=2)
+        worker._day_start_date = TODAY
+        worker._day_start_equity = Decimal("2000")
+        worker._day_start_captured_at = NOW - timedelta(minutes=5)
+        store.sweeps = [(NOW - timedelta(minutes=5), "to_yield", Decimal("400"))]
+        broker.equity = Decimal("1600")  # -20% is a REAL breach here
+
+        await worker.run_risk_checks(now_utc=NOW)
+
+        assert store.kill_switch_calls == [TransitionTrigger.DAILY_LOSS_BREACH]
+
+    async def test_daily_zero_sweep_rows_bit_identical(self) -> None:
+        # CRITICAL invariant: with zero cash_sweeps rows (today's dormant
+        # reality) the computation is bit-identical to pre-PR behavior —
+        # -5% passes, -15% breaches, exactly as before.
+        worker, store, broker = await _started_worker()
+        _open_long(worker, broker, "BTC", contracts=2)
+        worker._day_start_date = TODAY
+        worker._day_start_equity = Decimal("2000")
+        worker._day_start_captured_at = NOW - timedelta(minutes=5)
+        assert store.sweeps == []
+        broker.equity = Decimal("1900")
+        await worker.run_risk_checks(now_utc=NOW)
+        assert store.kill_switch_calls == []
+
+        broker.equity = Decimal("1700")
+        await worker.run_risk_checks(now_utc=NOW)
+        assert store.kill_switch_calls == [TransitionTrigger.DAILY_LOSS_BREACH]
+
+    async def test_daily_sweeps_read_failure_falls_back_unadjusted(self) -> None:
+        # Fail-safe: broken sweeps read => UNADJUSTED (pre-PR) behavior
+        # — the to_yield sweep reads as a loss and the limit over-fires
+        # (tightening), with the fallback logged.
+        worker, store, broker = await _started_worker()
+        _open_long(worker, broker, "BTC", contracts=2)
+        worker._day_start_date = TODAY
+        worker._day_start_equity = Decimal("2000")
+        worker._day_start_captured_at = NOW - timedelta(minutes=5)
+        store.sweeps = [(NOW - timedelta(minutes=1), "to_yield", Decimal("400"))]
+        store.sweeps_raise = True
+        broker.equity = Decimal("1600")
+
+        await worker.run_risk_checks(now_utc=NOW)
+
+        assert store.kill_switch_calls == [TransitionTrigger.DAILY_LOSS_BREACH]
+
+    async def test_daily_no_anchor_falls_back_unadjusted(self) -> None:
+        # Legacy restore (pre-migration status row): no baseline-capture
+        # instant => no netting window => unadjusted computation.
+        worker, store, broker = await _started_worker()
+        _open_long(worker, broker, "BTC", contracts=2)
+        worker._day_start_date = TODAY
+        worker._day_start_equity = Decimal("2000")
+        worker._day_start_captured_at = None
+        store.sweeps = [(NOW - timedelta(minutes=1), "to_yield", Decimal("400"))]
+        broker.equity = Decimal("1600")
+
+        await worker.run_risk_checks(now_utc=NOW)
+
+        assert store.kill_switch_calls == [TransitionTrigger.DAILY_LOSS_BREACH]
+
+    async def test_weekly_to_yield_sweep_does_not_trip_halving(self) -> None:
+        worker, store, broker = await _started_worker()
+        store.equity_history[TODAY - timedelta(days=7)] = Decimal("2000")
+        # Sweep completed after the week-ago observation (00:05 that day).
+        store.sweeps = [(NOW - timedelta(days=3), "to_yield", Decimal("400"))]
+        broker.equity = Decimal("1600")  # unadjusted -20% would halve
+
+        await worker.run_risk_checks(now_utc=NOW)
+
+        # Adjusted: (1600 + 400) / 2000 - 1 = 0% — no halving.
+        assert worker._weekly_halved_until is None
+
+    async def test_weekly_to_margin_reclaim_does_not_mask_halving(self) -> None:
+        worker, store, broker = await _started_worker()
+        store.equity_history[TODAY - timedelta(days=7)] = Decimal("2000")
+        store.sweeps = [(NOW - timedelta(days=3), "to_margin", Decimal("400"))]
+        broker.equity = Decimal("1900")  # unadjusted -5% would pass
+
+        await worker.run_risk_checks(now_utc=NOW)
+
+        # Adjusted: (1900 - 400) / 2000 - 1 = -25% < -16% — halving fires.
+        assert worker._weekly_halved_until == TODAY + timedelta(days=7)
+
+    async def test_weekly_sweep_before_observation_not_netted(self) -> None:
+        worker, store, broker = await _started_worker()
+        week_ago_day = TODAY - timedelta(days=7)
+        store.equity_history[week_ago_day] = Decimal("2000")
+        # Completed BEFORE that day's 00:05 observation instant.
+        before_obs = datetime(
+            week_ago_day.year, week_ago_day.month, week_ago_day.day, 0, 1, tzinfo=UTC
+        )
+        store.sweeps = [(before_obs, "to_yield", Decimal("400"))]
+        broker.equity = Decimal("1600")  # -20% is a REAL weekly breach here
+
+        await worker.run_risk_checks(now_utc=NOW)
+
+        assert worker._weekly_halved_until == TODAY + timedelta(days=7)
+
+    async def test_weekly_sweeps_read_failure_falls_back_unadjusted(self) -> None:
+        worker, store, broker = await _started_worker()
+        store.equity_history[TODAY - timedelta(days=7)] = Decimal("2000")
+        store.sweeps = [(NOW - timedelta(days=3), "to_yield", Decimal("400"))]
+        store.sweeps_raise = True
+        broker.equity = Decimal("1600")
+
+        await worker.run_risk_checks(now_utc=NOW)
+
+        # Unadjusted -20% < -16% => halving (tightening fallback).
+        assert worker._weekly_halved_until == TODAY + timedelta(days=7)
+
+    async def test_baseline_capture_instant_persists_and_restores(self) -> None:
+        # Day rollover anchors the netting window; the anchor round-trips
+        # through strategy_worker_status so a restart keeps the window
+        # exact instead of re-anchoring mid-day.
+        worker, store, broker = await _started_worker()
+        broker.equity = Decimal("2000")
+        assert worker._day_start_captured_at is None
+
+        await worker.run_risk_checks(now_utc=NOW)
+        assert worker._day_start_captured_at == NOW
+        await worker._persist_status(now_utc=NOW, tick_increment=False)
+        assert store.status_row is not None
+        assert store.status_row.day_start_captured_at_utc == NOW
+
+        worker2, _, _ = await _started_worker(store=store, broker=broker)
+        assert worker2._day_start_captured_at == NOW
+
+
 class TestLossLimits:
     async def test_daily_loss_flattens_and_trips_fsm(self) -> None:
         worker, store, broker = await _started_worker()
@@ -1803,6 +1999,66 @@ class TestFillScenarioFallback:
         assert cause is not None
         assert cause.propagated is False
         assert cause.deferred is True
+
+
+class TestSweepNettingStoreSql:
+    """Pin the real store's sweep-netting read: SQL shape, window params,
+    Decimal coercion, and the EquityObservation created_at ride-along."""
+
+    @staticmethod
+    def _store_with_scripted_row(row_fields: dict[str, Any]) -> tuple[StrategyWorkerStore, list]:
+        from contextlib import asynccontextmanager
+        from unittest.mock import MagicMock
+
+        captured: list[tuple[str, Any]] = []
+
+        def _make_session() -> MagicMock:
+            sess = MagicMock()
+
+            async def _execute(stmt: Any, params: Any = None) -> MagicMock:
+                captured.append((str(stmt), params))
+                result = MagicMock()
+                row = MagicMock(spec=list(row_fields.keys()))
+                for k, v in row_fields.items():
+                    setattr(row, k, v)
+                result.fetchone = MagicMock(return_value=row)
+                return result
+
+            sess.execute = _execute
+            return sess
+
+        @asynccontextmanager
+        async def _factory_cm() -> Any:
+            yield _make_session()
+
+        factory = MagicMock()
+        factory.side_effect = lambda: _factory_cm()
+        return StrategyWorkerStore(session_factory=factory, env="paper"), captured
+
+    async def test_net_outflow_sql_and_coercion(self) -> None:
+        store, captured = self._store_with_scripted_row({"net": "400.00"})
+        since = NOW - timedelta(hours=1)
+        net = await store.fetch_completed_sweep_net_outflow(since_utc=since, until_utc=NOW)
+        assert net == Decimal("400.00")
+        sql, params = captured[0]
+        assert "FROM cash_sweeps" in sql
+        assert "status = 'completed'" in sql
+        assert "WHEN direction = 'to_yield'" in sql
+        assert "THEN amount_usd ELSE -amount_usd" in sql
+        assert "completed_at_utc > :since" in sql
+        assert "completed_at_utc <= :until" in sql
+        assert params == {"since": since, "until": NOW}
+
+    async def test_equity_observation_carries_created_at(self) -> None:
+        created = NOW - timedelta(days=7)
+        store, captured = self._store_with_scripted_row(
+            {"equity_usd": "2000.00", "created_at": created}
+        )
+        obs = await store.fetch_equity_on_or_before(uuid4(), TODAY - timedelta(days=7))
+        assert obs is not None
+        assert obs.equity_usd == Decimal("2000.00")
+        assert obs.observed_at_utc == created
+        assert "created_at" in captured[0][0]
 
 
 class TestMinimalFallbackNarrative:

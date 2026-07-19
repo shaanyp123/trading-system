@@ -295,6 +295,27 @@ async def build_backend_view(
     cash + NAV both default to ``Decimal(0)`` so the planner can still
     compare against the broker view (it'll flag a `cash_usd` break,
     which is the truth: backend has no cash record yet).
+
+    **Cash-sweep netting (C1→C2 PR 2, the cash_manager HARD GATE).**
+    Backend cash rolls forward from the last VENUE-sourced balances row
+    (``source='coinbase_eod'``, written by this cycle daily) via
+    fills-derived ``from_fill`` rows — a chain that is structurally
+    blind to cash sweeps, while live venue cash moves by every completed
+    sweep. Left alone, the two diverge CUMULATIVELY by the swept amount
+    (the min $50 sweep already exceeds the max($5, 1 bps) tolerance).
+    The netting: subtract ``Σ to_yield - Σ to_margin`` over completed
+    sweeps whose ``completed_at_utc`` is strictly AFTER the latest
+    venue-sourced row's ``snapshot_ts`` (that row re-based backend cash
+    to venue truth, so earlier sweeps are already inside it; when no
+    venue row exists yet, ALL completed sweeps are netted). Sign: a
+    ``to_yield`` sweep lowered venue USD, so the backend expectation is
+    lowered by the same amount; ``to_margin`` the reverse. Zero sweep
+    rows ⇒ net 0 ⇒ bit-identical to pre-PR behavior. Fail-safe: if the
+    sweeps read fails, compare UNADJUSTED (today's live behavior) and
+    log — a spurious break alerts loudly rather than silently passing.
+    ``equity_baseline`` (NAV) is deliberately left unadjusted: it only
+    scales the 1 bps tolerance band, where a sweep-sized error is
+    fractions of a cent.
     """
     async with session_factory() as session:
         pos_rows = (
@@ -325,12 +346,49 @@ async def build_backend_view(
             )
         ).fetchone()
 
+        sweep_net_outflow = Decimal(0)
+        try:
+            sweep_row = (
+                await session.execute(
+                    text(
+                        "SELECT COALESCE(SUM(CASE WHEN direction = 'to_yield' "
+                        "           THEN amount_usd ELSE -amount_usd END), 0) AS net "
+                        "FROM cash_sweeps "
+                        "WHERE status = 'completed' "
+                        "  AND completed_at_utc IS NOT NULL "
+                        "  AND completed_at_utc > COALESCE("
+                        "      (SELECT MAX(snapshot_ts) FROM balances "
+                        "       WHERE account_id = :acct AND source = :venue_src),"
+                        "      'epoch'::timestamptz)"
+                    ),
+                    {"acct": account_id, "venue_src": BALANCE_SOURCE_FROM_COINBASE},
+                )
+            ).fetchone()
+            if sweep_row is not None and sweep_row.net is not None:
+                sweep_net_outflow = Decimal(str(sweep_row.net))
+        except Exception:
+            log.warning(
+                "recon_backend_view_sweep_netting_read_failed_unadjusted",
+                account_id=str(account_id),
+            )
+            sweep_net_outflow = Decimal(0)
+
     if bal_row is None:
         cash = Decimal(0)
         nav = Decimal(0)
     else:
         cash = Decimal(str(bal_row.cash_usd))
         nav = Decimal(str(bal_row.net_liquidation))
+
+    if sweep_net_outflow != 0:
+        log.info(
+            "recon_backend_view_sweep_netting_applied",
+            account_id=str(account_id),
+            net_outflow_usd=str(sweep_net_outflow),
+            cash_before=str(cash),
+            cash_after=str(cash - sweep_net_outflow),
+        )
+        cash = cash - sweep_net_outflow
 
     return BackendView(
         positions=positions,

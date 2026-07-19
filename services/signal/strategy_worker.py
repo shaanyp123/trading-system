@@ -681,10 +681,29 @@ class DecisionRow:
 class WorkerStatusRow:
     day_start_date: date | None
     day_start_equity_usd: Decimal | None
+    #: Instant the daily-loss baseline was captured — the cash-sweep
+    #: netting window's anchor (C1→C2 PR 2). None on legacy rows
+    #: (pre-migration): the daily check falls back to UNADJUSTED.
+    day_start_captured_at_utc: datetime | None
     weekly_halved_until: date | None
     flatten_seq: int
     engine_state: dict[str, Any]
     last_decision_date: date | None
+
+
+@dataclass(frozen=True, slots=True)
+class EquityObservation:
+    """One historical equity reading + the instant it was observed.
+
+    The weekly-loss window input (5c): ``observed_at_utc`` anchors the
+    cash-sweep netting window — a sweep completed AFTER the observation
+    moved cash the observation could not have reflected, so it is
+    netted; a sweep completed before it is already inside the reading
+    and is not.
+    """
+
+    equity_usd: Decimal
+    observed_at_utc: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -871,14 +890,17 @@ class StrategyWorkerStore:
 
     async def fetch_equity_on_or_before(
         self, account_id: UUID, on_date: date, *, lookback_days: int = 3
-    ) -> Decimal | None:
+    ) -> EquityObservation | None:
         """Decision-time equity at ``on_date`` (or the nearest earlier
-        decision within ``lookback_days``) — the weekly-loss window input."""
+        decision within ``lookback_days``) — the weekly-loss window input.
+
+        ``created_at`` (the decision row's write instant, ~00:05 UTC)
+        rides along as the sweep-netting window anchor (C1→C2 PR 2)."""
         async with self._sf() as session:
             row = (
                 await session.execute(
                     text(
-                        "SELECT equity_usd FROM strategy_decisions "
+                        "SELECT equity_usd, created_at FROM strategy_decisions "
                         "WHERE account_id = :acct AND decision_date <= :d "
                         "  AND decision_date >= :floor AND equity_usd IS NOT NULL "
                         "ORDER BY decision_date DESC LIMIT 1"
@@ -890,7 +912,51 @@ class StrategyWorkerStore:
                     },
                 )
             ).fetchone()
-        return _dec(row.equity_usd) if row is not None else None
+        if row is None:
+            return None
+        equity = _dec(row.equity_usd)
+        if equity is None:
+            return None
+        return EquityObservation(equity_usd=equity, observed_at_utc=row.created_at)
+
+    async def fetch_completed_sweep_net_outflow(
+        self, *, since_utc: datetime, until_utc: datetime
+    ) -> Decimal:
+        """Net visible-USD outflow from completed cash sweeps in a window.
+
+        Sign convention (test-pinned at the consumers): ``to_yield``
+        moves USD OUT of the visible equity complex (+amount here);
+        ``to_margin`` moves USD back IN (-amount). The returned value is
+        ADDED to current equity to recover what equity would read had no
+        sweeps happened — so trading P&L, not cash routing, is what the
+        loss limits measure.
+
+        Window: ``completed_at_utc`` strictly after ``since_utc`` (the
+        baseline observation already reflects anything completed at or
+        before its own capture instant) and at-or-before ``until_utc``.
+        ``since_utc`` is REQUIRED — an anchorless caller must fall back
+        to unadjusted at its own layer (``_sweep_net_outflow``), never
+        ask for an unbounded window (risk-review 2026-07-19 note 4).
+        Zero rows → ``Decimal(0)`` → every consumer is bit-identical to
+        pre-PR behavior.
+        """
+        async with self._sf() as session:
+            row = (
+                await session.execute(
+                    text(
+                        "SELECT COALESCE(SUM(CASE WHEN direction = 'to_yield' "
+                        "           THEN amount_usd ELSE -amount_usd END), 0) AS net "
+                        "FROM cash_sweeps "
+                        "WHERE status = 'completed' "
+                        "  AND completed_at_utc IS NOT NULL "
+                        "  AND completed_at_utc > :since "
+                        "  AND completed_at_utc <= :until"
+                    ),
+                    {"since": since_utc, "until": until_utc},
+                )
+            ).fetchone()
+        net = _dec(row.net) if row is not None else None
+        return net if net is not None else Decimal(0)
 
     async def fetch_month_max_equity(self, account_id: UUID, month_start: date) -> Decimal | None:
         async with self._sf() as session:
@@ -910,7 +976,8 @@ class StrategyWorkerStore:
             row = (
                 await session.execute(
                     text(
-                        "SELECT day_start_date, day_start_equity_usd, weekly_halved_until, "
+                        "SELECT day_start_date, day_start_equity_usd, "
+                        "       day_start_captured_at_utc, weekly_halved_until, "
                         "       flatten_seq, engine_state, last_decision_date "
                         "FROM strategy_worker_status WHERE account_id = :acct"
                     ),
@@ -927,6 +994,7 @@ class StrategyWorkerStore:
         return WorkerStatusRow(
             day_start_date=row.day_start_date,
             day_start_equity_usd=_dec(row.day_start_equity_usd),
+            day_start_captured_at_utc=row.day_start_captured_at_utc,
             weekly_halved_until=row.weekly_halved_until,
             flatten_seq=int(row.flatten_seq or 0),
             engine_state=engine_state,
@@ -964,6 +1032,7 @@ class StrategyWorkerStore:
         marks_stale: bool,
         day_start_date: date | None,
         day_start_equity_usd: Decimal | None,
+        day_start_captured_at_utc: datetime | None,
         weekly_halved_until: date | None,
         flatten_seq: int,
         engine_state: dict[str, Any],
@@ -977,10 +1046,11 @@ class StrategyWorkerStore:
                         "INSERT INTO strategy_worker_status ("
                         "    account_id, env, risk_loop_heartbeat_utc, risk_loop_tick_count,"
                         "    marks_stale, day_start_date, day_start_equity_usd,"
+                        "    day_start_captured_at_utc,"
                         "    weekly_halved_until, flatten_seq, engine_state,"
                         "    last_decision_date, updated_at_utc"
                         ") VALUES ("
-                        "    :acct, :env, :hb, 1, :stale, :dsd, :dse,"
+                        "    :acct, :env, :hb, 1, :stale, :dsd, :dse, :dsc,"
                         "    :whu, :fseq, CAST(:state AS JSONB), :ldd, :now"
                         ") ON CONFLICT (account_id) DO UPDATE SET"
                         "    risk_loop_heartbeat_utc = :hb,"
@@ -989,6 +1059,7 @@ class StrategyWorkerStore:
                         "    marks_stale = :stale,"
                         "    day_start_date = :dsd,"
                         "    day_start_equity_usd = :dse,"
+                        "    day_start_captured_at_utc = :dsc,"
                         "    weekly_halved_until = :whu,"
                         "    flatten_seq = :fseq,"
                         "    engine_state = CAST(:state AS JSONB),"
@@ -1003,6 +1074,7 @@ class StrategyWorkerStore:
                         "stale": marks_stale,
                         "dsd": day_start_date,
                         "dse": day_start_equity_usd,
+                        "dsc": day_start_captured_at_utc,
                         "whu": weekly_halved_until,
                         "fseq": flatten_seq,
                         "state": json.dumps(engine_state, default=str),
@@ -1722,6 +1794,13 @@ class StrategyWorker:
         self.products: dict[str, PerpProductRef] = {}
         self._day_start_date: date | None = None
         self._day_start_equity: Decimal | None = None
+        #: Instant the daily baseline was captured — the cash-sweep
+        #: netting window's anchor (C1→C2 PR 2). None = anchor unknown
+        #: (legacy restore): the daily check runs UNADJUSTED until the
+        #: next day rollover sets a fresh anchored baseline.
+        self._day_start_captured_at: datetime | None = None
+        #: Once-per-(consumer, UTC day) latch for the no-anchor WARNING.
+        self._sweep_no_anchor_warned: set[tuple[str, date]] = set()
         self._weekly_halved_until: date | None = None
         self._flatten_seq: int = 0
         self._last_decision_date: date | None = None
@@ -2017,6 +2096,7 @@ class StrategyWorker:
             self.state = deserialize_engine_state(status.engine_state)
             self._day_start_date = status.day_start_date
             self._day_start_equity = status.day_start_equity_usd
+            self._day_start_captured_at = status.day_start_captured_at_utc
             self._weekly_halved_until = status.weekly_halved_until
             self._flatten_seq = status.flatten_seq
             self._last_decision_date = status.last_decision_date
@@ -2098,6 +2178,7 @@ class StrategyWorker:
             marks_stale=marks_stale,
             day_start_date=self._day_start_date,
             day_start_equity_usd=self._day_start_equity,
+            day_start_captured_at_utc=self._day_start_captured_at,
             weekly_halved_until=self._weekly_halved_until,
             flatten_seq=self._flatten_seq,
             engine_state=serialize_engine_state(self.state),
@@ -2171,6 +2252,10 @@ class StrategyWorker:
         if self._day_start_date != today:
             self._day_start_date = today
             self._day_start_equity = equity
+            # Anchor the cash-sweep netting window (C1→C2 PR 2): sweeps
+            # completed at-or-before this instant are inside the baseline
+            # reading; only later ones are netted.
+            self._day_start_captured_at = now_utc
 
         risk_snapshot = await self._store.fetch_risk_state(self.account_id)
         already_halted = (
@@ -2324,8 +2409,22 @@ class StrategyWorker:
         # attempt (false-flat read) must self-heal on a later tick instead
         # of stranding an open position under halt with a cancelled
         # backstop; only the FSM transition is retrip-guarded.
+        #
+        # Cash-sweep netting (C1→C2 PR 2, the cash_manager HARD GATE):
+        # completed cash_sweeps are internal transfers, not P&L — a
+        # to_yield sweep must not read as a loss, and a to_margin reclaim
+        # must not mask a genuine breach. The measured quantity becomes
+        #   (equity + net_swept_out_since_baseline) / day_start_equity - 1
+        # where net_swept_out = Σ to_yield - Σ to_margin over sweeps
+        # completed inside (baseline instant, now]. Zero sweep rows ⇒
+        # net 0 ⇒ bit-identical to the pre-PR computation.
         if self._day_start_equity is not None and self._day_start_equity > 0:
-            daily_pnl_frac = equity / self._day_start_equity - 1
+            daily_net_outflow = await self._sweep_net_outflow(
+                since_utc=self._day_start_captured_at,
+                until_utc=now_utc,
+                consumer="daily_loss",
+            )
+            daily_pnl_frac = (equity + daily_net_outflow) / self._day_start_equity - 1
             if daily_pnl_frac < daily_limit:
                 has_positions = any(self.state[a].contracts != 0 for a in ASSETS)
                 # Halted AND flat: nothing to protect this tick — fall
@@ -2335,6 +2434,7 @@ class StrategyWorker:
                         daily_pnl_frac=daily_pnl_frac,
                         daily_limit=daily_limit,
                         equity=equity,
+                        sweep_net_outflow=daily_net_outflow,
                         has_positions=has_positions,
                         already_halted=already_halted,
                         now_utc=now_utc,
@@ -2342,12 +2442,18 @@ class StrategyWorker:
                     return
 
         # 5c) Weekly loss limit — engine semantics: halve V_target for 7
-        # days (strategy §7); NOT an FSM halt.
-        week_ago_equity = await self._store.fetch_equity_on_or_before(
+        # days (strategy §7); NOT an FSM halt. Same sweep netting as 5b,
+        # anchored to the week-ago decision row's write instant.
+        week_ago = await self._store.fetch_equity_on_or_before(
             self.account_id, today - timedelta(days=7)
         )
-        if week_ago_equity is not None and week_ago_equity > 0:
-            weekly_pnl_frac = equity / week_ago_equity - 1
+        if week_ago is not None and week_ago.equity_usd > 0:
+            weekly_net_outflow = await self._sweep_net_outflow(
+                since_utc=week_ago.observed_at_utc,
+                until_utc=now_utc,
+                consumer="weekly_loss",
+            )
+            weekly_pnl_frac = (equity + weekly_net_outflow) / week_ago.equity_usd - 1
             if weekly_pnl_frac < weekly_limit:
                 new_until = today + timedelta(days=7)
                 if self._weekly_halved_until is None or self._weekly_halved_until < new_until:
@@ -2356,6 +2462,8 @@ class StrategyWorker:
                         "strategy_worker_weekly_loss_limit_tripped",
                         weekly_pnl_frac=str(weekly_pnl_frac),
                         limit=str(weekly_limit),
+                        week_ago_equity_usd=str(week_ago.equity_usd),
+                        sweep_net_outflow_usd=str(weekly_net_outflow),
                         v_target_halved_until=new_until.isoformat(),
                     )
 
@@ -2370,19 +2478,84 @@ class StrategyWorker:
                 )
                 await self._force_reduce_half(now_utc=now_utc)
 
+    async def _sweep_net_outflow(
+        self,
+        *,
+        since_utc: datetime | None,
+        until_utc: datetime,
+        consumer: str,
+    ) -> Decimal:
+        """Windowed completed-sweep netting with the operator-directed
+        fail-safe: ANY doubt ⇒ ``Decimal(0)`` ⇒ the consumer computes
+        exactly the pre-PR (unadjusted) value, and the log says so.
+
+        Doubt cases: (a) no window anchor (``since_utc`` None — a legacy
+        ``strategy_worker_status`` row restored before this code's first
+        UTC-day rollover, or a decision row missing ``created_at``);
+        (b) the cash_sweeps read raises. Falling back to unadjusted is a
+        tightening for the ``to_yield`` direction (a sweep-out reads as
+        a loss → the limit over-triggers) and is today's live behavior
+        in all cases; the honest residual — an unadjusted ``to_margin``
+        reclaim can mask a breach exactly as it can today — is why the
+        fallback logs at WARNING, not DEBUG. The no-anchor WARNING is
+        rate-limited to once per (consumer, UTC day) — on the deploy day
+        the legacy row has no anchor until the next 00:00 rollover, and
+        a 30 s-tick repeat would be ~2,880 lines of alert fatigue
+        (risk-review 2026-07-19 finding 1).
+
+        Accepted sub-second races (risk-review note 6, direction-
+        analyzed): the daily anchor is the tick's ``now_utc`` while
+        equity was fetched moments earlier in the same tick, and the
+        weekly ``created_at`` postdates its equity observation by insert
+        latency — both windows are sub-second and structurally disjoint
+        from the 00:25 UTC sweep schedule.
+        """
+        if since_utc is None:
+            today = until_utc.astimezone(UTC).date()
+            if (consumer, today) not in self._sweep_no_anchor_warned:
+                self._sweep_no_anchor_warned.add((consumer, today))
+                self._log.warning(
+                    "strategy_worker_sweep_netting_no_anchor_unadjusted",
+                    consumer=consumer,
+                    note="unadjusted until the next UTC-day rollover anchors a fresh baseline",
+                )
+            return Decimal(0)
+        try:
+            net = await self._store.fetch_completed_sweep_net_outflow(
+                since_utc=since_utc, until_utc=until_utc
+            )
+        except Exception:
+            self._log.warning(
+                "strategy_worker_sweep_netting_read_failed_unadjusted",
+                consumer=consumer,
+            )
+            return Decimal(0)
+        if net != 0:
+            self._log.info(
+                "strategy_worker_sweep_netting_applied",
+                consumer=consumer,
+                net_outflow_usd=str(net),
+                since_utc=since_utc.isoformat(),
+            )
+        return net
+
     async def _apply_daily_loss_breach(
         self,
         *,
         daily_pnl_frac: Decimal,
         daily_limit: Decimal,
         equity: Decimal,
+        sweep_net_outflow: Decimal,
         has_positions: bool,
         already_halted: bool,
         now_utc: datetime,
     ) -> None:
         """Daily-loss breach handling: flatten (re-firing under HALT_NEW
         while positions exist — F4 pattern), FSM invoke retrip-guarded,
-        honest alerts on both shapes."""
+        honest alerts on both shapes. ``sweep_net_outflow`` rides into
+        the durable alert detail so the recorded frac stays post-hoc
+        reconstructible — with nonzero netting, ``equity / day_start - 1``
+        alone no longer reproduces it (risk-review 2026-07-19 finding 3)."""
         assert self.account_id is not None
         self._log.error(
             "strategy_worker_daily_loss_limit_breached",
@@ -2390,6 +2563,7 @@ class StrategyWorker:
             limit=str(daily_limit),
             equity_usd=str(equity),
             day_start_equity_usd=str(self._day_start_equity),
+            sweep_net_outflow_usd=str(sweep_net_outflow),
             already_halted=already_halted,
         )
         if already_halted:
@@ -2420,6 +2594,7 @@ class StrategyWorker:
                     "daily_pnl_frac": str(daily_pnl_frac),
                     "limit": str(daily_limit),
                     "equity_usd": str(equity),
+                    "sweep_net_outflow_usd": str(sweep_net_outflow),
                     "already_halted": True,
                     "source": "strategy_worker_risk_loop",
                 },
@@ -2456,6 +2631,7 @@ class StrategyWorker:
                 "limit": str(daily_limit),
                 "equity_usd": str(equity),
                 "day_start_equity_usd": str(self._day_start_equity),
+                "sweep_net_outflow_usd": str(sweep_net_outflow),
                 "source": "strategy_worker_risk_loop",
                 "transition_applied": result is KillSwitchInvokeResult.APPLIED,
                 "invoke_result": result.value,
@@ -4195,6 +4371,7 @@ __all__ = [
     "AssetRuntime",
     "CashBalanceSnapshot",
     "DecisionRow",
+    "EquityObservation",
     "FillPropagationOutcome",
     "KillSwitchInvokeResult",
     "MarksFeed",

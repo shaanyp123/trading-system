@@ -14,7 +14,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
 
@@ -358,6 +358,124 @@ def _stub_session_factory(
         yield session
 
     return factory
+
+
+def _backend_view_session_factory(
+    *,
+    balance: dict[str, Any] | None,
+    sweep_net: Decimal | None,
+    sweep_query_raises: bool = False,
+    positions: list[dict[str, Any]] | None = None,
+    captured_params: list[dict[str, Any]] | None = None,
+) -> Any:
+    """Scripted session factory for ``build_backend_view``.
+
+    Dispatch order matters: the sweep-netting SQL contains BOTH
+    ``cash_sweeps`` and a ``balances`` subselect, so ``cash_sweeps`` is
+    matched first.
+    """
+
+    def _make_row(d: dict[str, Any]) -> MagicMock:
+        row = MagicMock(spec=list(d.keys()))
+        for k, v in d.items():
+            setattr(row, k, v)
+        return row
+
+    session = MagicMock()
+
+    async def execute(stmt: Any, params: Any) -> MagicMock:
+        sql = str(stmt)
+        result = MagicMock()
+        if "cash_sweeps" in sql:
+            if captured_params is not None:
+                captured_params.append(dict(params))
+            if sweep_query_raises:
+                raise RuntimeError("cash_sweeps surface down")
+            result.fetchone = MagicMock(return_value=_make_row({"net": sweep_net}))
+        elif "positions_current" in sql:
+            result.fetchall = MagicMock(return_value=[_make_row(p) for p in (positions or [])])
+        elif "balances" in sql:
+            result.fetchone = MagicMock(
+                return_value=_make_row(balance) if balance is not None else None
+            )
+        return result
+
+    session.execute = execute  # type: ignore[method-assign]
+
+    @asynccontextmanager
+    async def factory() -> Any:
+        yield session
+
+    return factory
+
+
+class TestBuildBackendViewSweepNetting:
+    """C1→C2 PR 2 (cash_manager HARD GATE consumer 3): the fills-derived
+    backend cash figure nets completed sweeps so the daily cash compare
+    doesn't diverge cumulatively. Sign pinned both directions; zero-rows
+    bit-identity pinned; fail-safe pinned.
+    """
+
+    _BALANCE: ClassVar[dict[str, Any]] = {
+        "cash_usd": Decimal("2000.00"),
+        "net_liquidation": Decimal("2010.00"),
+    }
+
+    async def test_to_yield_sweep_lowers_backend_expectation(self) -> None:
+        from services.reconciliation.eod_cycle import build_backend_view
+
+        factory = _backend_view_session_factory(
+            balance=dict(self._BALANCE), sweep_net=Decimal("400")
+        )
+        view = await build_backend_view(factory, account_id=uuid4())
+        # Venue USD dropped by the $400 swept to USDC; the backend
+        # expectation must drop identically or every recon breaks.
+        assert view.cash_usd == Decimal("1600.00")
+        # NAV (tolerance scale only) deliberately unadjusted.
+        assert view.equity_baseline == Decimal("2010.00")
+
+    async def test_to_margin_reclaim_raises_backend_expectation(self) -> None:
+        from services.reconciliation.eod_cycle import build_backend_view
+
+        factory = _backend_view_session_factory(
+            balance=dict(self._BALANCE), sweep_net=Decimal("-400")
+        )
+        view = await build_backend_view(factory, account_id=uuid4())
+        assert view.cash_usd == Decimal("2400.00")
+
+    async def test_zero_sweep_rows_bit_identical(self) -> None:
+        from services.reconciliation.eod_cycle import build_backend_view
+
+        factory = _backend_view_session_factory(balance=dict(self._BALANCE), sweep_net=Decimal("0"))
+        view = await build_backend_view(factory, account_id=uuid4())
+        assert view.cash_usd == Decimal("2000.00")
+        assert view.equity_baseline == Decimal("2010.00")
+
+    async def test_sweep_read_failure_falls_back_unadjusted(self) -> None:
+        from services.reconciliation.eod_cycle import build_backend_view
+
+        factory = _backend_view_session_factory(
+            balance=dict(self._BALANCE), sweep_net=None, sweep_query_raises=True
+        )
+        view = await build_backend_view(factory, account_id=uuid4())
+        # Fail-safe: unadjusted (pre-PR) figure — a genuine sweep then
+        # surfaces as a loud break instead of a silent wrong pass.
+        assert view.cash_usd == Decimal("2000.00")
+
+    async def test_netting_window_anchored_to_venue_source(self) -> None:
+        from services.reconciliation.eod_cycle import build_backend_view
+
+        captured: list[dict[str, Any]] = []
+        factory = _backend_view_session_factory(
+            balance=dict(self._BALANCE),
+            sweep_net=Decimal("0"),
+            captured_params=captured,
+        )
+        await build_backend_view(factory, account_id=uuid4())
+        # The window base is the latest VENUE-sourced balances row —
+        # that row re-based backend cash to venue truth, so sweeps at or
+        # before it are already inside the figure.
+        assert captured and captured[0]["venue_src"] == BALANCE_SOURCE_FROM_COINBASE
 
 
 class TestRunEodCycleOrchestrator:

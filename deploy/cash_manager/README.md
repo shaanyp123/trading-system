@@ -36,37 +36,44 @@ Any missing/malformed input (equity, margin, marks, contract sizes,
 USDC balance for a reclaim) produces a named no-op — the worker never
 sweeps on partial data.
 
-## HARD GATES — sweep-blind consumers (MUST be resolved before first enable)
+## HARD GATES — sweep-blind consumers (RESOLVED 2026-07-19; activation still gated)
 
-The sweep is guarded against the *absolute* floor, but three existing
-consumers measure *relative* baselines that do NOT read `cash_sweeps`
-(risk-review 2026-07-18, blocker 2). Activating without resolving these
-produces a spurious P0 halt and permanent recon breakage on day one:
+**The consumer-adjustment PR has LANDED** (C1→C2 follow-up PR 2,
+decisions-log 2026-07-19 — the [A02] prerequisite this section used to
+demand). All three formerly sweep-blind consumers now net completed
+`cash_sweeps` (`status='completed'`, `Σ to_yield − Σ to_margin`,
+windowed by `completed_at_utc`):
 
-1. **Daily loss limit (`strategy_worker` 5b):** `equity /
-   day_start_equity − 1` with the baseline captured at ~00:00 UTC — 25
-   minutes BEFORE the 00:25 sweep. A `to_yield` sweep > 8% of day-start
-   equity reads as a same-day loss → spurious flatten + HALT_NEW within
-   one risk tick (the first-activation sweep at current balances is
-   ~40%+). Worse, a `to_margin` reclaim inflates equity vs the stale
-   baseline and can MASK a genuine −8% breach (a loosening).
-2. **Weekly loss limit (5c):** same distortion via `strategy_decisions`
-   equity history → spurious 7-day V_target halving after a large sweep.
-3. **EOD recon cash compare:** backend cash is fills-derived; venue cash
-   is live. Every completed sweep diverges the two by its amount,
-   CUMULATIVELY — the min $50 sweep already exceeds the max($5, 1 bps)
-   tolerance, and ≥$1,000 net drift escalates P0.
+1. **Daily loss limit (`strategy_worker` 5b):** measures
+   `(equity + net_swept_out_since_baseline) / day_start_equity − 1`,
+   windowed from the persisted baseline-capture instant
+   (`strategy_worker_status.day_start_captured_at_utc`). A `to_yield`
+   sweep no longer reads as a loss; a `to_margin` reclaim no longer
+   masks a genuine −8% breach. Test-pinned in both directions.
+2. **Weekly loss limit (5c):** same netting, windowed from the week-ago
+   decision row's write instant.
+3. **EOD recon cash compare:** the backend cash figure subtracts net
+   sweeps completed after the latest venue-sourced (`coinbase_eod`)
+   balances row — the venue row re-bases to truth daily, so the netting
+   window never double-counts. Test-pinned in both directions.
 
-**Required before the flag is flipped:** a consumer-adjustment PR
-([A02]) that nets completed `cash_sweeps` out of the daily/weekly
-baselines and the recon backend-cash figure (or explicitly re-bases
-them at sweep time), reviewed and merged. Do NOT enable on the strength
-of this runbook alone.
+Fail-safe on every consumer: if the sweeps read fails (or a netting
+window has no anchor), the consumer computes the UNADJUSTED pre-PR
+value and logs `*_sweep_netting_*_unadjusted` at WARNING. With zero
+`cash_sweeps` rows — today's dormant reality — all three consumers are
+bit-identical to pre-PR behavior (test-pinned).
+
+**Activation remains gated** on the [A27] venue drill below (the
+conversion/sweep SDK wrappers are still unverified live, incl.
+delta-spec open question #1: same-day reclaim) **and the C2 operator
+decision recorded in the decisions-log.** Do NOT flip the flag on the
+strength of the consumer PR alone.
 
 Also before C2: make `scripts/operator_tools/reconcile_statement.py`
 sweep-aware (its "conversion"/"transfer" keywords currently classify
 sweep lines as `capital_event` — cross-reference `cash_sweeps` so daily
-conversions don't pollute the A1 statement-match categories).
+conversions don't pollute the A1 statement-match categories). Still
+OUTSTANDING — not part of the consumer-adjustment PR.
 
 ## A27 fact-check checklist (MUST complete before first enable)
 
