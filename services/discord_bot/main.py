@@ -54,6 +54,7 @@ from discord import app_commands
 from services.discord_bot.api_client import ApiClient
 from services.discord_bot.commands import (
     register_capital_event_commands,
+    register_cash_recapture,
     register_cycle,
     register_gates,
     register_halt,
@@ -162,6 +163,13 @@ class TradingBotClient(discord.Client):
             self._tree,
             api_client=self._api_client,
             environment=self._settings.environment,
+            guild=self._guild,
+        )
+        # Amendment C re-capture hook (C1→C2 build): refresh today's
+        # cash-balance snapshot after an operator USDC<->USD conversion.
+        register_cash_recapture(
+            self._tree,
+            api_client=self._api_client,
             guild=self._guild,
         )
 

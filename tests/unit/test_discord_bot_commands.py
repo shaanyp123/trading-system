@@ -53,6 +53,7 @@ from services.discord_bot.commands.capital import (
     _validate_reason,
     register_capital_event_commands,
 )
+from services.discord_bot.commands.cash import register_cash_recapture
 from services.discord_bot.commands.cycle import register_cycle
 from services.discord_bot.commands.gates import register_gates
 from services.discord_bot.commands.halt import HaltConfirmView, register_halt
@@ -83,6 +84,7 @@ def _stub_api_client() -> ApiClient:
     client.invoke_capital_event = AsyncMock()  # type: ignore[method-assign]
     client.get_system_cycle = AsyncMock()  # type: ignore[method-assign]
     client.get_system_gates = AsyncMock()  # type: ignore[method-assign]
+    client.invoke_cash_recapture = AsyncMock()  # type: ignore[method-assign]
     return client
 
 
@@ -637,6 +639,80 @@ class TestGatesCommand:
         assert "SERVICE_UNAVAILABLE" in (embed.title or "")
 
 
+def _cash_recapture_payload() -> dict:
+    return {
+        "snapshot_date_utc": str(_FIXTURE_TODAY),
+        "captured_at_utc": f"{_FIXTURE_TODAY}T14:30:00Z",
+        "spot_usd": "2251.38",
+        "cbi_usdc": "3497.90",
+        "replaced": True,
+    }
+
+
+class TestCashRecaptureCommand:
+    async def test_happy_path_defers_then_followup_with_embed(self, stub_client: ApiClient) -> None:
+        stub_client.invoke_cash_recapture.return_value = _cash_recapture_payload()  # type: ignore[attr-defined]
+        tree = _build_tree()
+        register_cash_recapture(tree, api_client=stub_client)
+        callback = _command_callback(tree, "cash-recapture")
+        interaction = _build_mock_interaction()
+
+        await callback(interaction)
+
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+        stub_client.invoke_cash_recapture.assert_awaited_once()  # type: ignore[attr-defined]
+        embed = interaction.followup.send.await_args.kwargs["embed"]
+        assert "re-captured" in (embed.title or "")
+        assert "replaced today's snapshot" in (embed.description or "")
+        values = {f.name: f.value for f in embed.fields}
+        assert values["Spot USD"] == "$2251.38"
+        assert values["CBI USDC"] == "$3497.90"
+
+    async def test_first_capture_wording_and_missing_balance_dash(
+        self, stub_client: ApiClient
+    ) -> None:
+        payload = _cash_recapture_payload() | {"replaced": False, "cbi_usdc": None}
+        stub_client.invoke_cash_recapture.return_value = payload  # type: ignore[attr-defined]
+        tree = _build_tree()
+        register_cash_recapture(tree, api_client=stub_client)
+        callback = _command_callback(tree, "cash-recapture")
+        interaction = _build_mock_interaction()
+
+        await callback(interaction)
+
+        embed = interaction.followup.send.await_args.kwargs["embed"]
+        assert "FIRST snapshot" in (embed.description or "")
+        values = {f.name: f.value for f in embed.fields}
+        assert values["CBI USDC"] == "—"
+
+    async def test_announce_only_no_view_attached(self, stub_client: ApiClient) -> None:
+        stub_client.invoke_cash_recapture.return_value = _cash_recapture_payload()  # type: ignore[attr-defined]
+        tree = _build_tree()
+        register_cash_recapture(tree, api_client=stub_client)
+        callback = _command_callback(tree, "cash-recapture")
+        interaction = _build_mock_interaction()
+
+        await callback(interaction)
+
+        assert "view" not in interaction.followup.send.await_args.kwargs
+
+    async def test_api_error_renders_error_embed(self, stub_client: ApiClient) -> None:
+        stub_client.invoke_cash_recapture.side_effect = ApiClientHTTPError(  # type: ignore[attr-defined]
+            status_code=503,
+            error_code="CASH_CAPTURE_CREDENTIALS_MISSING",
+            message="credentials unset",
+        )
+        tree = _build_tree()
+        register_cash_recapture(tree, api_client=stub_client)
+        callback = _command_callback(tree, "cash-recapture")
+        interaction = _build_mock_interaction()
+
+        await callback(interaction)
+
+        embed = interaction.followup.send.await_args.kwargs["embed"]
+        assert "CASH_CAPTURE_CREDENTIALS_MISSING" in (embed.title or "")
+
+
 # ---------------------------------------------------------------------------
 # Registration sanity (crypto-pivot C0-B4: /approve RETIRED — announce-only)
 # ---------------------------------------------------------------------------
@@ -650,8 +726,9 @@ class TestRegistrationSanity:
         register_status(tree, api_client=stub_client)
         register_cycle(tree, api_client=stub_client)
         register_gates(tree, api_client=stub_client)
+        register_cash_recapture(tree, api_client=stub_client)
         names = {cmd.name for cmd in tree.get_commands()}
-        assert {"positions", "halt", "status", "cycle", "gates"}.issubset(names)
+        assert {"positions", "halt", "status", "cycle", "gates", "cash-recapture"}.issubset(names)
         assert "approve" not in names  # C0-B4: announce-only, /approve retired
 
     def test_all_commands_register_with_guild(self, stub_client: ApiClient) -> None:
@@ -662,9 +739,10 @@ class TestRegistrationSanity:
         register_status(tree, api_client=stub_client, guild=guild)
         register_cycle(tree, api_client=stub_client, guild=guild)
         register_gates(tree, api_client=stub_client, guild=guild)
+        register_cash_recapture(tree, api_client=stub_client, guild=guild)
         # Guild-scoped commands aren't returned by get_commands() with no guild arg
         names = {cmd.name for cmd in tree.get_commands(guild=guild)}
-        assert {"positions", "halt", "status", "cycle", "gates"}.issubset(names)
+        assert {"positions", "halt", "status", "cycle", "gates", "cash-recapture"}.issubset(names)
 
 
 # ---------------------------------------------------------------------------
@@ -698,6 +776,7 @@ class TestSlashCommandDescriptionLength:
         register_status(tree, api_client=stub_client)
         register_cycle(tree, api_client=stub_client)
         register_capital_event_commands(tree, api_client=stub_client, environment="paper")
+        register_cash_recapture(tree, api_client=stub_client)
 
         too_long: list[tuple[str, int]] = []
         for cmd in tree.get_commands():

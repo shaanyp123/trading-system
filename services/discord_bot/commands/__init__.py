@@ -28,6 +28,7 @@ module per spec §6.7 layout).
 """
 
 from services.discord_bot.commands.capital import register_capital_event_commands
+from services.discord_bot.commands.cash import register_cash_recapture
 from services.discord_bot.commands.cycle import register_cycle
 from services.discord_bot.commands.gates import register_gates
 from services.discord_bot.commands.halt import register_halt
@@ -36,6 +37,7 @@ from services.discord_bot.commands.status import register_status
 
 __all__ = [
     "register_capital_event_commands",
+    "register_cash_recapture",
     "register_cycle",
     "register_gates",
     "register_halt",

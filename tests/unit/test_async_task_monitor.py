@@ -89,12 +89,13 @@ class TestCollectTrackedTasks:
         # and usdc_rewards_capture (2026-07-10) are defaulted None so
         # lifespan callers that fail their startup still produce the
         # full tracked set.
-        assert len(result) == 4
+        assert len(result) == 5
         assert [t.name for t in result] == [
             "reconciliation_scheduler.run_forever",
             "heartbeat_probe.run_forever",
             "coinbase_market_data.run_forever",
             "usdc_rewards_capture.run_forever",
+            "binance_funding_proxy.run_forever",
         ]
         assert all(t.task is None for t in result)
         assert all(t.expected_alive is False for t in result)

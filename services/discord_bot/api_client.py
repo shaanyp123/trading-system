@@ -349,6 +349,33 @@ class ApiClient:
             )
         return body
 
+    async def invoke_cash_recapture(self) -> dict[str, Any]:
+        """``POST /api/system/cash-capture`` — Amendment C re-capture.
+
+        Refreshes today's CBI cash-balance snapshot after an operator
+        USDC↔USD conversion (closes the floor-basis double-count
+        window). Returns the parsed JSON dict (snapshot_date_utc /
+        captured_at_utc / spot_usd / cbi_usdc / replaced) for the
+        command's simple embed — no bot-side Pydantic mirror (same
+        rationale as :meth:`get_system_cycle`). Raises
+        :class:`ApiClientHTTPError` on non-2xx.
+        """
+        response = await self._client.post(
+            "/api/system/cash-capture",
+            json={"reason": "discord /cash-recapture"},
+        )
+        if response.status_code != 200:
+            self._raise_for_response(response)
+        body = response.json()
+        if not isinstance(body, dict):
+            raise ApiClientHTTPError(
+                status_code=response.status_code,
+                error_code="UNEXPECTED_SHAPE",
+                message="POST /api/system/cash-capture returned a non-object JSON body.",
+                raw_body=str(body)[:4096],
+            )
+        return body
+
     async def invoke_kill_switch(
         self,
         *,
