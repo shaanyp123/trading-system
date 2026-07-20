@@ -586,7 +586,16 @@ class CashManagerJob:
         async with self.session_factory() as session:
             row = (
                 await session.execute(
-                    text("SELECT id FROM accounts WHERE active IS TRUE ORDER BY created_at LIMIT 1")
+                    # canonical active-account predicate (accounts has
+                    # active_from/active_to, no `active` column) — matches
+                    # strategy_worker.fetch_active_account_id + phase1 repo;
+                    # the prior `active IS TRUE` was an UndefinedColumnError
+                    # waiting for C2 activation (caught by the integration
+                    # test on PR #406's CI; operator-approved in-PR fix)
+                    text(
+                        "SELECT id FROM accounts WHERE active_to IS NULL "
+                        "ORDER BY active_from DESC LIMIT 1"
+                    )
                 )
             ).fetchone()
         return row.id if row is not None else None

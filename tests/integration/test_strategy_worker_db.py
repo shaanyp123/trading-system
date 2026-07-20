@@ -230,6 +230,7 @@ class TestStoreRoundTrip:
             "marks_stale": False,
             "day_start_date": TODAY,
             "day_start_equity_usd": Decimal("6000.12345678"),
+            "day_start_captured_at_utc": NOW,
             "weekly_halved_until": None,
             "flatten_seq": 3,
             "engine_state": state,
@@ -295,9 +296,11 @@ class TestStoreRoundTrip:
         row2 = await store.fetch_decision(account_id, TODAY)
         assert row2 is not None and row2.status == "completed"
         # Equity-history reads used by the weekly / monthly-dd windows.
-        assert await store.fetch_equity_on_or_before(
-            account_id, TODAY + timedelta(days=1)
-        ) == Decimal("6000")
+        # (C1→C2 PR 2: fetch_equity_on_or_before returns EquityObservation —
+        # equity + the created_at sweep-netting window anchor.)
+        obs = await store.fetch_equity_on_or_before(account_id, TODAY + timedelta(days=1))
+        assert obs is not None and obs.equity_usd == Decimal("6000")
+        assert obs.observed_at_utc is not None
         assert await store.fetch_month_max_equity(
             account_id, date(TODAY.year, TODAY.month, 1)
         ) == Decimal("6000")
