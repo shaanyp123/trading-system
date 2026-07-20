@@ -192,6 +192,16 @@ services:
       API_LOG_LEVEL: ${API_LOG_LEVEL:-INFO}
       API_DB_HOST: postgres
       API_DB_NAME: trading
+      # Operator feature switches, passed through from deploy/.env.
+      # `--env-file deploy/.env` only feeds compose INTERPOLATION — a
+      # var reaches the container only via an explicit mapping here
+      # (env_file is deliberately not used; APISettings sets
+      # env_file=None). Discovered 2026-07-20: without these lines the
+      # documented kill-switch/enable ceremonies for the funding proxy
+      # and the cash manager were inert. Defaults mirror the config-code
+      # defaults (both OFF).
+      API_BINANCE_FUNDING_PROXY_ENABLED: ${API_BINANCE_FUNDING_PROXY_ENABLED:-false}
+      API_CASH_MANAGER_ENABLED: ${API_CASH_MANAGER_ENABLED:-false}
       # Crypto-pivot C0-B2b: the IBKR clientId + EOD position-source
       # passthroughs died with the IBKR execution layer. Coinbase
       # execution credentials arrive via the host secrets file

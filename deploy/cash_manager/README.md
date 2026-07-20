@@ -115,6 +115,13 @@ UNVERIFIED against the live venue. On the activation drill, with a
 API_CASH_MANAGER_ENABLED=true    # C2 decision only
 ```
 
+The var reaches the container via the explicit
+`API_CASH_MANAGER_ENABLED: ${API_CASH_MANAGER_ENABLED:-false}` mapping
+in `docker-compose.yml` (added 2026-07-20 — before that, setting it in
+`deploy/.env` was INERT: `--env-file` only feeds compose interpolation,
+and the api sets `env_file=None`). Verify the mapping exists before the
+activation drill.
+
 Redeploy the api container; look for `cash_manager_ENABLED_spawned`
 (WARNING level — deliberately loud) in the logs. Disable by removing
 the var (default false) and redeploying; `cash_manager_dormant_via_setting`

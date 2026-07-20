@@ -1,5 +1,20 @@
 # Binance funding-rate proxy logger — operator smoke runbook
 
+> **🛑 SIDELINED 2026-07-20 (operator decision, decisions-log).** The
+> first live capture attempt returned **HTTP 451** for both symbols and
+> a host-level `curl` confirmed it: `fapi.binance.com` geo-blocks US
+> IPs, and the VPS is in Ashburn. The build-time claim below that fapi
+> "currently answers from US IPs for public data" is empirically FALSE
+> from this host. The job's config default is now **OFF**
+> (`services/api/config.py`); gate B3 stays `insufficient_data` until a
+> proxy source that serves US IPs exists (the B3 classifier needs no
+> change — it accepts any non-`coinbase_advanced` source with rows).
+> The smoke steps below are retained for whenever a working
+> source/vantage exists. Note the enable/kill switch reaches the
+> container ONLY via the compose `environment:` passthrough added
+> 2026-07-20 — setting the var in `deploy/.env` alone did nothing
+> before that.
+
 A27 smoke fixture for `services/data/binance_funding_proxy.py` (gate-B3
 proxy funding series, C1→C2 build) and its one-shot companion
 `scripts/operator_tools/backfill_binance_funding.py`. The job runs
