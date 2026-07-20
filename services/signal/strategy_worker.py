@@ -998,6 +998,7 @@ class StrategyWorkerStore:
         if not product_ids:
             return {}
         cutoff = now_utc - timedelta(days=window_days)
+        out: dict[str, dict[str, Any]] = {}
         try:
             async with self._sf() as session:
                 rows = (
@@ -1013,25 +1014,28 @@ class StrategyWorkerStore:
                         {"pids": list(product_ids), "cutoff": cutoff},
                     )
                 ).fetchall()
+            # row shaping stays INSIDE the try (risk-review 2026-07-20):
+            # the never-raises contract must be structural, not incidental
+            for r in rows:
+                mean_rate = _dec(r.mean_rate)
+                interval_hours = _dec(r.interval_hours) or Decimal(1)
+                annualized = (
+                    mean_rate * (Decimal(24 * 365) / interval_hours)
+                    if mean_rate is not None
+                    else None
+                )
+                out[str(r.product_id)] = {
+                    "mean_rate_per_interval": str(mean_rate) if mean_rate is not None else None,
+                    "trailing_ann": str(annualized) if annualized is not None else None,
+                    "n_obs": int(r.n_obs),
+                    "latest_observed_at_utc": (
+                        r.latest_at.isoformat() if r.latest_at is not None else None
+                    ),
+                    "window_days": window_days,
+                }
         except Exception:
             self._log.exception("strategy_worker_recent_funding_read_failed")
             return {}
-        out: dict[str, dict[str, Any]] = {}
-        for r in rows:
-            mean_rate = _dec(r.mean_rate)
-            interval_hours = _dec(r.interval_hours) or Decimal(1)
-            annualized = (
-                mean_rate * (Decimal(24 * 365) / interval_hours) if mean_rate is not None else None
-            )
-            out[str(r.product_id)] = {
-                "mean_rate_per_interval": str(mean_rate) if mean_rate is not None else None,
-                "trailing_ann": str(annualized) if annualized is not None else None,
-                "n_obs": int(r.n_obs),
-                "latest_observed_at_utc": (
-                    r.latest_at.isoformat() if r.latest_at is not None else None
-                ),
-                "window_days": window_days,
-            }
         return out
 
     async def fetch_worker_status(self, account_id: UUID) -> WorkerStatusRow | None:
@@ -3449,6 +3453,28 @@ class StrategyWorker:
             [p.product_id for p in inputs.products.values()], now_utc=now
         )
 
+        # Top-of-book stamps, captured BEFORE any leg is computed (risk-
+        # review 2026-07-20): keeping every await out of the leg loop
+        # preserves the loop's event-loop atomicity, so both assets'
+        # legs derive from one state snapshot even if the 30 s risk
+        # loop absorbs a stop fill mid-decision. Best-effort per asset.
+        book_stamps: dict[str, dict[str, str] | None] = {}
+        for stamp_asset, stamp_product in inputs.products.items():
+            stamp: dict[str, str] | None = None
+            with contextlib.suppress(Exception):
+                book = await self._broker.get_best_bid_ask(stamp_product.product_id)
+                mid = (book.bid + book.ask) / 2
+                stamp = {
+                    "bid": str(book.bid),
+                    "ask": str(book.ask),
+                    "spread_bps": str(
+                        ((book.ask - book.bid) / mid * 10000).quantize(Decimal("0.01"))
+                    )
+                    if mid > 0
+                    else "0",
+                }
+            book_stamps[stamp_asset] = stamp
+
         # Dead-band + Amendment B band-edge on the FINAL targets.
         outcome_assets: dict[str, Any] = {}
         for asset in ASSETS:
@@ -3481,22 +3507,6 @@ class StrategyWorker:
                     hold_reason = "deadband_hold"
                 else:
                     hold_reason = "at_target"
-            # Top-of-book stamp at decision time (execution-quality
-            # context; best-effort — venue hiccup leaves it null).
-            book_stamp: dict[str, str] | None = None
-            if product is not None:
-                with contextlib.suppress(Exception):
-                    book = await self._broker.get_best_bid_ask(product.product_id)
-                    mid = (book.bid + book.ask) / 2
-                    book_stamp = {
-                        "bid": str(book.bid),
-                        "ask": str(book.ask),
-                        "spread_bps": str(
-                            ((book.ask - book.bid) / mid * 10000).quantize(Decimal("0.01"))
-                        )
-                        if mid > 0
-                        else "0",
-                    }
             outcome_assets[asset] = {
                 "row": {
                     "trend": None if math.isnan(row.trend) else round(row.trend, 6),
@@ -3508,7 +3518,7 @@ class StrategyWorker:
                 "indicators": inputs.indicator_snapshots.get(asset),
                 "gate_trace": gate_trace.get(asset),
                 "hold_reason": hold_reason,
-                "book": book_stamp,
+                "book": book_stamps.get(asset),
                 "engine_target": engine_targets[asset],
                 "sized_target": sizing.target_contracts.get(asset, 0),
                 "final_target": effective_target,
@@ -4515,6 +4525,9 @@ def _indicator_snapshot_from_bars(
     sma_fast = _f("sma_fast")
     sma_slow = _f("sma_slow")
     mom = _f("mom")
+    # window = params.mom_lb, which is FROZEN at 20 — the JSONB key name
+    # "rel_vol_20d_median" is tied to that value; if mom_lb ever moves
+    # (falsify-and-replace), rename the key with it (risk-review note)
     volumes = [float(b.volume) for b in bars[-params.mom_lb :]]
     rel_vol: float | None = None
     if len(volumes) >= params.mom_lb:

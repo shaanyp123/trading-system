@@ -42,7 +42,7 @@ class StrategyDecisionRow:
 
     Money/ratio columns surface as Decimal (None when the row is a skip —
     e.g. ``skipped_risk_state`` writes NULL equity). The ``outcome`` dict
-    is the worker's ``strategy_decision_v1`` JSONB verbatim.
+    is the worker's ``strategy_decision_v1``/``v2`` JSONB verbatim (v2 keys are additive).
     """
 
     decision_date: date

@@ -219,6 +219,7 @@ async def _run(args: argparse.Namespace) -> int:
             if p.base_asset in traded and p.product_id not in product_ids
         ]
 
+    engine = None
     session_factory: async_sessionmaker[Any] | None = None
     if args.execute:
         database_url = _database_url()
@@ -258,6 +259,8 @@ async def _run(args: argparse.Namespace) -> int:
             else:
                 print(f"{product_id} {granularity}: fetched={len(rows)} (dry-run)")
 
+    if engine is not None:
+        await engine.dispose()
     mode = "EXECUTED" if args.execute else "DRY-RUN"
     print(f"{mode}: products={len(product_ids)} fetched={total_fetched} inserted={total_inserted}")
     return 0
