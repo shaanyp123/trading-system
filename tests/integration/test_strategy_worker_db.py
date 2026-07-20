@@ -144,7 +144,14 @@ async def session_factory(
     pg: tuple[Engine, str],
 ) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
     _, sync_url = pg
-    _run_alembic(sync_url, "upgrade", _WORKER_REVISION)
+    # The STORE always speaks the current (head) schema — pinning this
+    # fixture to _WORKER_REVISION let the store's SQL drift past the
+    # fixture DB unnoticed (surfaced on PR #406 CI: upsert referenced
+    # the 20260719 day_start_captured_at_utc column the pinned schema
+    # lacked). The migration class above keeps its explicit-revision
+    # pin (DP-022); the round-trip runs at head, as its section comment
+    # always said.
+    _run_alembic(sync_url, "upgrade", "head")
     async_url = sync_url.replace("+psycopg2", "+asyncpg")
     engine: AsyncEngine = create_async_engine(async_url, pool_pre_ping=True)
     factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
