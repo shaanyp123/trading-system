@@ -441,14 +441,20 @@ class APISettings(BaseSettings):
     # settled Binance USDT-perp funding rates into ``funding_rates`` with
     # source='binance_proxy' so strategy §10 gate B3 (CDE vs proxy
     # funding within 2x) has its comparison series. Public endpoint —
-    # no credentials. Read-only telemetry: nothing in the decision/risk
-    # path consumes proxy rows, hence default ON.
+    # no credentials; nothing in the decision/risk path consumes proxy
+    # rows. SIDELINED 2026-07-20 (operator decision, decisions-log):
+    # fapi.binance.com answers HTTP 451 to US IPs and the VPS is in
+    # Ashburn — the job can never capture from this host, so the default
+    # is OFF. Re-enabling requires a non-geo-blocked vantage or an
+    # alternate proxy venue (the B3 classifier accepts any
+    # non-coinbase_advanced source).
     binance_funding_proxy_enabled: bool = Field(
-        default=True,
+        default=False,
         description=(
             "Start the daily Binance USDT-perp funding proxy logger in "
             "the api lifespan (00:40 UTC). Public endpoint, no key; "
-            "feeds gate B3 only."
+            "feeds gate B3 only. Default OFF — sidelined 2026-07-20 "
+            "(Binance geo-blocks US IPs; HTTP 451 from the Ashburn VPS)."
         ),
     )
     binance_fapi_base_url: str = Field(

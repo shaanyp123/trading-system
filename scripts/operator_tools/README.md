@@ -18,7 +18,7 @@ service-side write paths (never raw SQL).
 | `bootstrap_slippage_calibration.py` | Idempotent seed of the `slippage_calibration_versions` HEAD row (zero-prior bootstrap, `trigger='bootstrap'`) via the pure planner `services/calibration/calibration.py::plan_calibration_fit` + the audit-first `CalibrationPlan` persistence contract. Unblocks the strategy worker's `strategy_worker_no_slippage_head_fail_closed` gate on a fresh DB (`deploy/strategy_worker/README.md` prerequisite 3). Existing HEAD = no-op; `--force-new-version` appends a successor parented on the current HEAD. | Yes (when `--no-dry-run --confirm`) — writes one `slippage_calibration_recalibrated` audit event + one version row + the HEAD-pointer swap (swap transactional with the INSERT). **--dry-run default = ON; two-flag gate; idempotent re-runs are no-ops.** |
 | `apply_parameter_change.py` | Operator-driven **audited** change to an operator-only flag (`STRATEGY_DECOMMISSIONED` / `EXIT_AUTO_APPROVE`): audit-first `parameter_change_applied`/`_reverted` event → `parameters` history row (`prev == hash`, hash-stable) → in-place `parameter_sets` flip (PR-D, design §13). Replaces the raw decommission UPDATE. | Yes (when `--no-dry-run --confirm`) — writes the audit chain + `parameters` + `parameter_sets`. **--dry-run default = ON; two-flag gate; no-op when already at value.** |
 | `cancel_orphan_order.py` | Cancel a stuck/orphan `orders` row left at `status='pending'` with `broker_order_id IS NULL` — pre-inserted but never placed at IBKR (e.g. the 2026-06-04 /MYM Error-200 failure; exchange bug fixed in #327). Reuses the audit-first `process_terminal_status_event`. **Refuses** if `broker_order_id` is set (may be live at IBKR — use an IBKR cancel instead). | Yes (when `--execute`) — writes `ORDER_CANCELLED`/`ORDER_REJECTED` audit + UPDATEs the orders row via the tested terminal-status processor (no hand-rolled SQL). **--dry-run default = ON.** |
-| `reconcile_statement.py` | **READ-ONLY** §10 gate-A1 reconciliation: classify every line of an operator-supplied CFM statement CSV (trade P&L / fees / funding / capital events / subscription charges / rewards) and check per-trade P&L vs `trades.realized_pnl_usd` at A1 tolerance (±$1 or ±2%, whichever larger). Mechanizes the 2026-07-18 manual P&L verification. Unclassifiable lines land in UNATTRIBUTED loudly (the Jul-17 subscription-debit lesson). Exit 0 = clean, 2 = review needed. | **No** — SELECT-only + CSV read; no audit events, no venue calls. No dry-run gate needed. |
+| `reconcile_statement.py` | **READ-ONLY** §10 gate-A1 reconciliation: classify every line of an operator-supplied CFM statement CSV (trade P&L / fees / funding / capital events / sweeps / subscription charges / rewards) and check per-trade P&L vs `trades.realized_pnl_usd` at A1 tolerance (±$1 or ±2%, whichever larger). Mechanizes the 2026-07-18 manual P&L verification. **Sweep-aware (2026-07-20):** conversion/transfer/sweep lines matching a completed `cash_sweeps` row classify as `sweep`, not `capital_event`; a completed sweep with no statement line flips the verdict to REVIEW. Unclassifiable lines land in UNATTRIBUTED loudly (the Jul-17 subscription-debit lesson). Exit 0 = clean, 2 = review needed. | **No** — SELECT-only + CSV read; no audit events, no venue calls. No dry-run gate needed. |
 
 ---
 
@@ -1107,5 +1107,20 @@ docker compose exec api env DATABASE_URL="$DATABASE_URL" \
     --statement /tmp/cfm_statement.csv --since 2026-07-09
 ```
 
-Exit codes: 0 clean · 2 tolerance failure or unattributed lines · 4 no
-active account · 5 DB init failed · 6 bad args · 99 unexpected.
+Exit codes: 0 clean · 2 tolerance failure, unattributed lines, or a
+completed sweep with no statement line · 4 no active account · 5 DB
+init failed · 6 bad args · 99 unexpected.
+
+### Sweep awareness (pre-C2 item, landed 2026-07-20)
+
+The tool cross-references completed `cash_sweeps` rows (the §3.6
+cash-yield ledger): a conversion/transfer/sweep-shaped line whose
+|amount| equals a sweep's `amount_usd` completed within ±1 UTC day
+classifies as `sweep` — an internal transfer, never a `capital_event`.
+A `to_margin` reclaim may produce TWO such lines (convert + futures
+sweep) for one sweep row; both classify `sweep`. `deposit`/`withdrawal`
+lines are never reclassified on an amount coincidence. A completed
+sweep with NO matching line inside the statement's date coverage is
+listed under "COMPLETED SWEEPS WITH NO STATEMENT LINE" and forces
+REVIEW (exit 2). While the cash manager is dormant (zero `cash_sweeps`
+rows) the tool behaves exactly as before — pinned by test.

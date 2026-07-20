@@ -69,11 +69,13 @@ delta-spec open question #1: same-day reclaim) **and the C2 operator
 decision recorded in the decisions-log.** Do NOT flip the flag on the
 strength of the consumer PR alone.
 
-Also before C2: make `scripts/operator_tools/reconcile_statement.py`
-sweep-aware (its "conversion"/"transfer" keywords currently classify
-sweep lines as `capital_event` — cross-reference `cash_sweeps` so daily
-conversions don't pollute the A1 statement-match categories). Still
-OUTSTANDING — not part of the consumer-adjustment PR.
+`scripts/operator_tools/reconcile_statement.py` sweep-awareness LANDED
+(2026-07-20, decisions-log entry of the same date): conversion/transfer/
+sweep-shaped statement lines matching a completed `cash_sweeps` row
+(same |amount|, completed within ±1 UTC day) classify as `sweep`, not
+`capital_event`; a completed sweep with no statement line is reported
+loudly and flips the verdict to REVIEW. With zero `cash_sweeps` rows the
+tool is bit-identical to its sweep-blind behavior (test-pinned).
 
 ## A27 fact-check checklist (MUST complete before first enable)
 
@@ -112,6 +114,13 @@ UNVERIFIED against the live venue. On the activation drill, with a
 # VPS: /opt/trading/deploy/.env  (api container env)
 API_CASH_MANAGER_ENABLED=true    # C2 decision only
 ```
+
+The var reaches the container via the explicit
+`API_CASH_MANAGER_ENABLED: ${API_CASH_MANAGER_ENABLED:-false}` mapping
+in `docker-compose.yml` (added 2026-07-20 — before that, setting it in
+`deploy/.env` was INERT: `--env-file` only feeds compose interpolation,
+and the api sets `env_file=None`). Verify the mapping exists before the
+activation drill.
 
 Redeploy the api container; look for `cash_manager_ENABLED_spawned`
 (WARNING level — deliberately loud) in the logs. Disable by removing

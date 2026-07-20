@@ -28,12 +28,31 @@ description, modeled on the venue lines observed 2026-07-14 → 2026-07-18):
 * ``funding``                          → funding settlement
 * ``coinbase one`` / ``subscription``  → subscription charge
 * ``deposit`` / ``withdrawal`` / ``transfer`` / ``conversion`` / ``convert``
-                                       → capital / cash movement
+  / ``sweep``                          → capital / cash movement
 * ``reward``                           → USDC reward credit
 * ``fee`` / ``commission``             → standalone fee line
 * ``futures`` / ``trade`` / ``pnl`` / ``settlement``
                                        → trade P&L line (A1-checked)
 * anything else                        → UNATTRIBUTED (listed verbatim)
+
+Sweep awareness (pre-C2 item, deploy/cash_manager/README.md): cash-yield
+sweeps are INTERNAL transfers — the §3.6 cash manager converts USD↔USDC
+and (for reclaims) schedules a futures sweep, and each completed sweep
+is ledgered in ``cash_sweeps``. Statement lines for those movements must
+NOT read as capital events (they are not deposits/withdrawals of
+capital). After keyword classification, any conversion/transfer/sweep-
+shaped ``capital_event`` line whose |amount| equals a completed
+``cash_sweeps.amount_usd`` completed within ±1 UTC day is reclassified
+``sweep`` (a ``to_margin`` reclaim may legitimately produce TWO such
+lines — convert + futures sweep — so one sweep row can claim several
+lines). ``deposit``/``withdrawal``-keyword lines are deliberately NOT
+eligible — a genuine capital movement that happens to equal a sweep
+amount must stay in the capital bucket. A completed sweep with NO
+matching line inside the statement's own date coverage is reported
+loudly and flips the verdict to REVIEW (the ledger says money moved;
+the statement doesn't show it). With zero ``cash_sweeps`` rows — the
+dormant-cash-manager reality — classification is bit-identical to the
+pre-sweep-aware behavior.
 
 Usage::
 
@@ -42,10 +61,11 @@ Usage::
         --statement /path/to/cfm_statement.csv \
         --since 2026-07-09
 
-Exit codes: 0 = all matched trades within A1 tolerance and nothing
-unattributed; 2 = at least one tolerance failure or unattributed line
-(report printed either way); 4 = no active account; 5 = DB init failed;
-6 = bad arguments; 99 = unexpected error.
+Exit codes: 0 = all matched trades within A1 tolerance, nothing
+unattributed, and no completed sweep missing its statement line; 2 = at
+least one tolerance failure, unattributed line, or unmatched completed
+sweep (report printed either way); 4 = no active account; 5 = DB init
+failed; 6 = bad arguments; 99 = unexpected error.
 """
 
 from __future__ import annotations
@@ -87,6 +107,7 @@ LineClass = Literal[
     "fee",
     "funding",
     "capital_event",
+    "sweep",
     "subscription",
     "reward",
     "unattributed",
@@ -95,14 +116,37 @@ LineClass = Literal[
 #: Ordered (class, substrings) rules — first match wins. Funding before
 #: trade so "funding settlement" never lands in the trade bucket, and
 #: subscription before fee so "Coinbase One fee" stays a subscription.
+#: ``sweep`` sits in the capital rules so a "futures sweep" line never
+#: falls through to the ``futures`` needle and pollutes the A1 trade
+#: bucket; cross-referencing against ``cash_sweeps`` then decides
+#: capital_event vs sweep.
 _CLASS_RULES: Final[tuple[tuple[LineClass, tuple[str, ...]], ...]] = (
     ("funding", ("funding",)),
     ("subscription", ("coinbase one", "subscription")),
     ("reward", ("reward",)),
-    ("capital_event", ("deposit", "withdrawal", "transfer", "conversion", "convert")),
+    (
+        "capital_event",
+        ("deposit", "withdrawal", "transfer", "conversion", "convert", "sweep"),
+    ),
     ("fee", ("fee", "commission")),
     ("trade_pnl", ("futures", "trade", "pnl", "settlement")),
 )
+
+#: Substrings marking a capital_event line as sweep-SHAPED (eligible for
+#: ``cash_sweeps`` cross-reference). Deliberately excludes ``deposit`` /
+#: ``withdrawal`` — genuine capital movements must never be reclassified
+#: away from the capital bucket on an amount coincidence.
+_SWEEP_SHAPED_NEEDLES: Final[tuple[str, ...]] = (
+    "transfer",
+    "conversion",
+    "convert",
+    "sweep",
+)
+
+#: A statement line and a completed sweep match when the sweep completed
+#: within this many days of the line's UTC date (venue settlement /
+#: statement-timestamp skew margin; sweeps are same-day by design).
+_SWEEP_MATCH_DAY_SLACK: Final[int] = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +183,24 @@ class TradeMatch:
 
 
 @dataclass(frozen=True, slots=True)
+class DbCashSweep:
+    """A completed ``cash_sweeps`` row (the ledger side of sweep matching)."""
+
+    sweep_id: int
+    direction: str
+    amount_usd: Decimal
+    completed_at_utc: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class SweepMatch:
+    """One statement line reclassified ``capital_event`` → ``sweep``."""
+
+    line: StatementLine
+    sweep: DbCashSweep
+
+
+@dataclass(frozen=True, slots=True)
 class ReconcileReport:
     """The full reconciliation output (pure; rendered by ``_render``)."""
 
@@ -148,10 +210,16 @@ class ReconcileReport:
     unattributed: tuple[StatementLine, ...]
     db_realized_pnl_total: Decimal
     statement_net_total: Decimal
+    sweep_matches: tuple[SweepMatch, ...] = ()
+    unmatched_sweeps: tuple[DbCashSweep, ...] = ()
 
     @property
     def all_passed(self) -> bool:
-        return all(m.passed for m in self.matches) and not self.unattributed
+        return (
+            all(m.passed for m in self.matches)
+            and not self.unattributed
+            and not self.unmatched_sweeps
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +245,105 @@ def classify_line(raw_type: str, description: str) -> LineClass:
         if any(needle in haystack for needle in needles):
             return line_class
     return "unattributed"
+
+
+def _is_sweep_shaped(line: StatementLine) -> bool:
+    haystack = f"{line.raw_type} {line.description}".lower()
+    return any(needle in haystack for needle in _SWEEP_SHAPED_NEEDLES)
+
+
+def reclassify_sweep_lines(
+    lines: list[StatementLine],
+    sweeps: list[DbCashSweep],
+) -> tuple[list[StatementLine], tuple[SweepMatch, ...], tuple[DbCashSweep, ...]]:
+    """Cross-reference capital lines against completed sweeps (pure).
+
+    Returns ``(lines, sweep_matches, unmatched_sweeps)`` where matched
+    lines have been reclassified ``capital_event`` → ``sweep``.
+
+    Matching rule — a line matches a sweep when ALL of:
+
+    * the line classified ``capital_event`` AND is sweep-shaped
+      (conversion/transfer/sweep keywords; NOT deposit/withdrawal)
+    * the line has a timestamp (a dateless line stays capital_event —
+      conservative: never reclassify on amount alone)
+    * ``|line.amount_usd| == sweep.amount_usd`` (Decimal equality, so
+      trailing zeros don't matter)
+    * the line's UTC date is within ±``_SWEEP_MATCH_DAY_SLACK`` days of
+      the sweep's ``completed_at_utc`` date
+
+    One sweep may claim MULTIPLE lines (a ``to_margin`` reclaim produces
+    a convert line + a futures-sweep line, both for ``amount_usd``);
+    each line claims exactly one sweep (nearest completion date, sweep
+    id as the deterministic tiebreak).
+
+    ``unmatched_sweeps`` is limited to sweeps completed inside the
+    statement's own observed date coverage (±slack) — a sweep outside
+    the window the operator exported cannot be expected in the CSV. With
+    no dated lines at all, no sweep is flagged (nothing to anchor
+    coverage to).
+
+    With ``sweeps == []`` the output is the input — bit-identical to the
+    sweep-blind behavior (test-pinned).
+    """
+    if not sweeps:
+        return list(lines), (), ()
+
+    out_lines: list[StatementLine] = []
+    matches: list[SweepMatch] = []
+    matched_sweep_ids: set[int] = set()
+    for line in lines:
+        if (
+            line.line_class != "capital_event"
+            or line.occurred_at is None
+            or not _is_sweep_shaped(line)
+        ):
+            out_lines.append(line)
+            continue
+        line_day = line.occurred_at.astimezone(UTC).date()
+        best: DbCashSweep | None = None
+        best_rank: tuple[int, int] | None = None
+        for sweep in sweeps:
+            if abs(line.amount_usd) != sweep.amount_usd:
+                continue
+            day_delta = abs((sweep.completed_at_utc.astimezone(UTC).date() - line_day).days)
+            if day_delta > _SWEEP_MATCH_DAY_SLACK:
+                continue
+            rank = (day_delta, sweep.sweep_id)
+            if best_rank is None or rank < best_rank:
+                best = sweep
+                best_rank = rank
+        if best is None:
+            out_lines.append(line)
+            continue
+        reclassified = StatementLine(
+            occurred_at=line.occurred_at,
+            raw_type=line.raw_type,
+            description=line.description,
+            amount_usd=line.amount_usd,
+            line_class="sweep",
+        )
+        out_lines.append(reclassified)
+        matches.append(SweepMatch(line=reclassified, sweep=best))
+        matched_sweep_ids.add(best.sweep_id)
+
+    dated_days = [
+        line.occurred_at.astimezone(UTC).date() for line in lines if line.occurred_at is not None
+    ]
+    unmatched: list[DbCashSweep] = []
+    if dated_days:
+        coverage_start = min(dated_days)
+        coverage_end = max(dated_days)
+        for sweep in sweeps:
+            if sweep.sweep_id in matched_sweep_ids:
+                continue
+            sweep_day = sweep.completed_at_utc.astimezone(UTC).date()
+            inside = (coverage_start - sweep_day).days <= _SWEEP_MATCH_DAY_SLACK and (
+                sweep_day - coverage_end
+            ).days <= _SWEEP_MATCH_DAY_SLACK
+            if inside:
+                unmatched.append(sweep)
+    return out_lines, tuple(matches), tuple(unmatched)
 
 
 def _parse_amount(raw: str) -> Decimal | None:
@@ -304,8 +471,10 @@ def match_trades(
 def build_report(
     trades: list[DbTrade],
     lines: list[StatementLine],
+    sweeps: list[DbCashSweep] | None = None,
 ) -> ReconcileReport:
     """Assemble the full reconciliation (pure)."""
+    lines, sweep_matches, unmatched_sweeps = reclassify_sweep_lines(lines, sweeps or [])
     class_totals: dict[LineClass, Decimal] = {}
     class_counts: dict[LineClass, int] = {}
     for line in lines:
@@ -321,6 +490,8 @@ def build_report(
         unattributed=tuple(line for line in lines if line.line_class == "unattributed"),
         db_realized_pnl_total=sum((t.realized_pnl_usd for t in trades), start=Decimal(0)),
         statement_net_total=sum((line.amount_usd for line in lines), start=Decimal(0)),
+        sweep_matches=sweep_matches,
+        unmatched_sweeps=unmatched_sweeps,
     )
 
 
@@ -350,6 +521,29 @@ def _render(report: ReconcileReport, rejects: list[dict[str, str]]) -> str:
     out.append("")
     out.append(f"DB modeled realized P&L total: {report.db_realized_pnl_total}")
     out.append(f"Statement net total:           {report.statement_net_total}")
+    if report.sweep_matches:
+        out.append("")
+        out.append("Sweep-classified lines (cross-referenced against cash_sweeps):")
+        for sm in report.sweep_matches:
+            when = sm.line.occurred_at.isoformat() if sm.line.occurred_at else "?"
+            out.append(
+                f"  {when} · {sm.line.raw_type} · {sm.line.description} · "
+                f"{sm.line.amount_usd} → sweep id={sm.sweep.sweep_id} "
+                f"({sm.sweep.direction} {sm.sweep.amount_usd}, completed "
+                f"{sm.sweep.completed_at_utc.date().isoformat()})"
+            )
+    if report.unmatched_sweeps:
+        out.append("")
+        out.append(
+            "COMPLETED SWEEPS WITH NO STATEMENT LINE (ledger says money "
+            "moved; the statement doesn't show it — investigate):"
+        )
+        for sweep in report.unmatched_sweeps:
+            out.append(
+                f"  sweep id={sweep.sweep_id} · {sweep.direction} · "
+                f"{sweep.amount_usd} · completed "
+                f"{sweep.completed_at_utc.date().isoformat()}"
+            )
     if report.unattributed:
         out.append("")
         out.append("UNATTRIBUTED lines (classify manually — the Jul-17 lesson):")
@@ -415,6 +609,48 @@ async def _load_trades(
     return trades, EXIT_OK
 
 
+async def _load_cash_sweeps(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    since: date | None,
+    until: date | None,
+) -> list[DbCashSweep]:
+    """Completed sweeps overlapping the window (± the matching slack).
+
+    ``cash_sweeps`` is venue-scoped, not account-scoped (2026-07-08
+    migration rationale), so no account filter. The window is widened by
+    the day slack on both sides so an edge-of-window statement line can
+    still find its sweep.
+    """
+    async with session_factory() as session:
+        rows = (
+            await session.execute(
+                text(
+                    "SELECT id, direction, amount_usd, completed_at_utc "
+                    "FROM cash_sweeps "
+                    "WHERE status = 'completed' AND completed_at_utc IS NOT NULL "
+                    "  AND (CAST(:since AS DATE) IS NULL "
+                    "       OR completed_at_utc >= "
+                    "          CAST(:since AS DATE) - CAST(:slack_days || ' days' AS INTERVAL)) "
+                    "  AND (CAST(:until AS DATE) IS NULL "
+                    "       OR completed_at_utc < CAST(:until AS DATE) + INTERVAL '1 day' "
+                    "          + CAST(:slack_days || ' days' AS INTERVAL)) "
+                    "ORDER BY completed_at_utc"
+                ),
+                {"since": since, "until": until, "slack_days": _SWEEP_MATCH_DAY_SLACK},
+            )
+        ).fetchall()
+    return [
+        DbCashSweep(
+            sweep_id=int(row.id),
+            direction=str(row.direction),
+            amount_usd=Decimal(str(row.amount_usd)),
+            completed_at_utc=row.completed_at_utc,
+        )
+        for row in rows
+    ]
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="reconcile_statement",
@@ -471,15 +707,18 @@ async def _amain(args: ParsedArgs) -> int:
         if trades is None:
             log.error("reconcile_statement_no_active_account")
             return code
+        sweeps = await _load_cash_sweeps(session_factory, since=args.since, until=args.until)
     finally:
         await engine.dispose()
 
-    report = build_report(trades, lines)
+    report = build_report(trades, lines, sweeps)
     sys.stdout.write(_render(report, rejects) + "\n")
     log.info(
         "reconcile_statement_completed",
         trades=len(report.matches),
         passed=sum(1 for m in report.matches if m.passed),
+        sweep_lines=len(report.sweep_matches),
+        unmatched_sweeps=len(report.unmatched_sweeps),
         unattributed=len(report.unattributed),
         unparseable=len(rejects),
     )
@@ -509,10 +748,12 @@ if __name__ == "__main__":
 __all__ = [
     "A1_ABS_TOLERANCE_USD",
     "A1_REL_TOLERANCE",
+    "DbCashSweep",
     "DbTrade",
     "ParsedArgs",
     "ReconcileReport",
     "StatementLine",
+    "SweepMatch",
     "TradeMatch",
     "a1_tolerance",
     "build_report",
@@ -521,4 +762,5 @@ __all__ = [
     "match_trades",
     "parse_args",
     "parse_statement_rows",
+    "reclassify_sweep_lines",
 ]

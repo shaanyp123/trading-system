@@ -1087,9 +1087,11 @@ async def _start_binance_funding_proxy(
     funding rates persisted into ``funding_rates`` with
     ``source='binance_proxy'`` (``services/data/binance_funding_proxy.py``).
     Public endpoint — no credential gate; the only switch is
-    ``API_BINANCE_FUNDING_PROXY_ENABLED`` (default on — read-only
-    telemetry). Reuses the generic once-per-UTC-day scheduler primitive,
-    same shape as the USDC rewards capture.
+    ``API_BINANCE_FUNDING_PROXY_ENABLED`` (default OFF since 2026-07-20:
+    Binance answers HTTP 451 to US IPs, so the job is sidelined — see
+    the config field + decisions-log). Reuses the generic
+    once-per-UTC-day scheduler primitive, same shape as the USDC rewards
+    capture.
     """
     if not settings.binance_funding_proxy_enabled:
         log.warning("binance_funding_proxy_disabled_via_setting")
