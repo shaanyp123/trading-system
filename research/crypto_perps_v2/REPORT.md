@@ -73,6 +73,14 @@ cost load, drawdown, and recent-regime Sharpe — with an explicit no-degradatio
 full-sample Sharpe. Adoption would still require: spec amendment, full §9 falsification
 re-run, operator sign-off, `risk-review-approved` PR.
 
+## Follow-up exploration (2026-07-20, operator-directed)
+
+`EXPLORATION-vol-matrix.md` — a clearly-labeled NON-pre-registered threshold × size
+matrix sweep of the volume-confirmation lead. Headline: the threshold response curve is a
+spike at 1.50, not a plateau (weakens the "1.26 Sharpe" as evidence), but the cost/DD
+mechanics and post-2021 dominance hold across the whole threshold band — sharpening, not
+changing, the v2.1 recommendation above.
+
 ## Reproduce
 
 ```bash
