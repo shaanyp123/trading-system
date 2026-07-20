@@ -815,6 +815,112 @@ class TestDailyDecision:
         assert entry["stop"]["native_stop_order_id"] is not None
 
 
+class TestDecisionOutcomeV2:
+    """2026-07-20 agentic-refinement capture: the v2 outcome payload.
+
+    Additive keys only — the v1 shape assertions elsewhere in this file
+    still pass untouched, which is itself part of the contract.
+    """
+
+    async def test_outcome_carries_indicators_gate_trace_and_funding(self) -> None:
+        worker, store, _ = await _started_worker()
+        await worker.run_daily_decision(TODAY)
+        out = store.decisions[TODAY]["outcome"]
+        assert out["schema_version"] == "strategy_decision_v2"
+        btc = out["assets"]["BTC"]
+        snap = btc["indicators"]
+        assert snap is not None
+        assert {
+            "bar_date",
+            "close",
+            "sma_fast",
+            "sma_slow",
+            "mom_sum",
+            "sigma_ann_raw",
+            "vol_slow",
+            "atr",
+            "s_a",
+            "s_b",
+            "s_c",
+            "volume",
+            "rel_vol_20d_median",
+        } <= set(snap)
+        # sub-signal votes must reconcile with the composite the engine saw
+        row_trend = btc["row"]["trend"]
+        if None not in (snap["s_a"], snap["s_b"], snap["s_c"], row_trend):
+            assert (snap["s_a"] + snap["s_b"] + snap["s_c"]) / 3 == row_trend
+        assert isinstance(snap["volume"], str)  # [A05] Decimal-as-string
+        gate = btc["gate_trace"]
+        assert gate is not None and gate["gate"] == "sized"
+        assert gate["binding_constraint"] in {
+            "vol_target",
+            "per_trade_risk_cap",
+            "per_asset_cap",
+        }
+        # FakeStore has no funding_rates surface: the stamp degrades to {}
+        # without blocking the decision — the key must still be present.
+        assert out["observed_funding"] == {}
+        assert "gross_cap_scale" in out
+        # top-of-book stamp from the fake broker's get_best_bid_ask
+        assert btc["book"] is not None
+        assert set(btc["book"]) == {"bid", "ask", "spread_bps"}
+
+    async def test_hold_reason_labels_fresh_state_hold(self) -> None:
+        worker, store, _ = await _started_worker(confirmed_long=False)
+        await worker.run_daily_decision(TODAY)
+        btc = store.decisions[TODAY]["outcome"]["assets"]["BTC"]
+        assert btc["action"] == "hold"
+        assert btc["hold_reason"] == "at_target"
+        gate = btc["gate_trace"]
+        assert gate is not None and gate["gate"] == "hysteresis_pending"
+        assert gate["pending_count"] == 1
+
+    async def test_trading_asset_has_no_hold_reason(self) -> None:
+        worker, store, _ = await _started_worker()
+        await worker.run_daily_decision(TODAY)
+        btc = store.decisions[TODAY]["outcome"]["assets"]["BTC"]
+        assert btc["action"] in {"buy", "sell"}
+        assert btc["hold_reason"] is None
+
+    async def test_observed_funding_stamps_store_data(self) -> None:
+        store = FakeStore()
+        canned = {
+            "BIP-20DEC30-CDE": {
+                "mean_rate_per_interval": "0.0000125",
+                "trailing_ann": "0.1095",
+                "n_obs": 168,
+                "latest_observed_at_utc": "2026-07-09T11:00:00+00:00",
+                "window_days": 7,
+            }
+        }
+
+        async def _canned_funding(
+            product_ids: list[str], *, now_utc: datetime, window_days: int = 7
+        ) -> dict[str, dict[str, Any]]:
+            return {k: v for k, v in canned.items() if k in product_ids}
+
+        store.fetch_recent_funding = _canned_funding  # type: ignore[method-assign]
+        worker, _, _ = await _started_worker(store=store)
+        await worker.run_daily_decision(TODAY)
+        out = store.decisions[TODAY]["outcome"]
+        assert out["observed_funding"] == canned
+
+    async def test_book_stamp_degrades_on_venue_failure(self) -> None:
+        # no-trade day (fresh-state hysteresis hold) so the execution
+        # ladder — which also reads top-of-book — never runs: this
+        # isolates the STAMP's best-effort contract.
+        worker, store, broker = await _started_worker(confirmed_long=False)
+
+        async def _boom(product_id: str) -> Any:
+            raise RuntimeError("venue down")
+
+        broker.get_best_bid_ask = _boom  # type: ignore[method-assign]
+        await worker.run_daily_decision(TODAY)
+        row = store.decisions[TODAY]
+        assert row["status"] == "completed"  # stamp is best-effort, never blocking
+        assert row["outcome"]["assets"]["BTC"]["book"] is None
+
+
 class TestSizingIntegration:
     async def test_convalescent_m_combined_halves_targets(self) -> None:
         worker_n, store_n, _ = await _started_worker()

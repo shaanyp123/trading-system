@@ -46,6 +46,24 @@ Root-cause discipline per dev-guide §1.3.
    `... psql ... -c "SELECT product_id, captured_at_utc, tick_size, contract_size FROM product_metadata ORDER BY captured_at_utc DESC LIMIT 5;"`
    → one row per perp product for today, plus a
    `coinbase_daily_bar_sampled` log line per spot product.
+5b. **market_bars capture (2026-07-20, agentic-refinement data capture).**
+   Prereq: the `20260720_market_bars` migration is applied (`alembic
+   upgrade head` at deploy). After the next top-of-hour AND after the
+   next 00:00 UTC pass:
+   `... psql ... -c "SELECT product_id, granularity, bar_start_utc, close, volume FROM market_bars ORDER BY captured_at_utc DESC LIMIT 8;"`
+   → `ONE_HOUR` rows for the spot pair + critical perps each hour
+   (`coinbase_market_bars_hourly_persisted` log line), and `ONE_DAY`
+   rows after the daily pass (`coinbase_market_bars_daily_persisted`).
+   Capture is telemetry: failures log and continue, never alert, never
+   touch the decision path (the worker keeps fetching its own bars).
+   Persistence is default-on in code (`persist_bars`); there is
+   deliberately NO env knob — an inert-switch trap is worse than no
+   switch (decisions-log 2026-07-20 compose passthrough bug).
+   **One-time history backfill (operator, once after migration):**
+   `docker compose --env-file deploy/.env exec api python -m scripts.operator_tools.backfill_market_bars --start 2016-01-01 --execute`
+   (dry-run first by omitting `--execute`; add
+   `--granularity both --include-perps --start 2026-06-01` for the
+   hourly + venue-perp recent window. Idempotent — safe to re-run.)
 6. **Staleness watchdog drill (optional but recommended once):** block the
    WS egress (e.g. `iptables` drop to the WS host, or set
    `API_COINBASE_WS_URL=wss://invalid.invalid` and restart) → within

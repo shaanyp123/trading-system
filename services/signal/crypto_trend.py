@@ -268,6 +268,7 @@ def compute_targets(
     v_target: float,
     dd_mult: float,
     p: CryptoTrendParams,
+    trace: dict[str, Any] | None = None,
 ) -> dict[str, float]:
     """The S1-S4 + §6/§7 per-day target computation (integer contracts).
 
@@ -277,6 +278,15 @@ def compute_targets(
     applied direction). ``v_target`` already carries the weekly-loss
     halving; ``dd_mult`` carries the drawdown tier (≡ 1.0 under
     Amendment B). Returns signed integer-valued contract targets.
+
+    ``trace`` (optional, 2026-07-20 agentic-refinement capture): when a
+    dict is supplied, each asset's WHICH-RULE-DECIDED label is recorded
+    into it (``trace[asset] = {"gate": ..., ...}``; a portfolio-level
+    gross-cap rescale records ``trace["gross_cap_scale"]``). PURE
+    telemetry: the numeric path is byte-identical with or without it
+    (the parity gate runs with ``trace=None``), and every recorded
+    value is a JSON-serializable primitive so the strategy worker can
+    embed it in the ``strategy_decisions.outcome`` payload verbatim.
     """
     targets: dict[str, float] = {}
     for s in ASSETS:
@@ -285,6 +295,8 @@ def compute_targets(
         mult = CONTRACT_MULT[s]
         if math.isnan(row.trend):
             targets[s] = st.contracts  # no signal yet: hold
+            if trace is not None:
+                trace[s] = {"gate": "no_signal_yet"}
             continue
 
         # S3 vol-regime state machine
@@ -299,6 +311,8 @@ def compute_targets(
         raw_dir = 1 if row.trend > 0 else -1
         if st.stopped_today:
             targets[s] = 0.0
+            if trace is not None:
+                trace[s] = {"gate": "stopped_today_flat"}
             continue
         if raw_dir != st.applied_dir:
             if raw_dir == st.pending_dir:
@@ -312,6 +326,13 @@ def compute_targets(
                 st.pending_count = 0
             else:
                 targets[s] = st.contracts if p.hysteresis_hold else 0.0
+                if trace is not None:
+                    trace[s] = {
+                        "gate": "hysteresis_pending",
+                        "pending_dir": st.pending_dir,
+                        "pending_count": st.pending_count,
+                        "held_position": bool(p.hysteresis_hold),
+                    }
                 continue
         else:
             st.pending_dir = 0
@@ -321,16 +342,22 @@ def compute_targets(
         # S4 short gate: shorts only at full-strength bearish score
         if d < 0 and (row.trend > -0.99 or p.funding_ann < p.funding_short_gate):
             targets[s] = 0.0
+            if trace is not None:
+                trace[s] = {"gate": "short_gate_veto"}
             continue
         # funding long veto (parametric funding: fires only in high-funding scenarios)
         funding_mult = 0.5 if (d > 0 and p.funding_ann > p.funding_long_veto) else 1.0
         # ETH minimum-price rule
         if s == "ETH" and row.close < p.eth_min_price:
             targets[s] = 0.0
+            if trace is not None:
+                trace[s] = {"gate": "eth_min_price_veto"}
             continue
         # lockout after stop
         if bar_index < st.lockout_until and d == st.lockout_dir:
             targets[s] = st.contracts if (st.contracts != 0) else 0.0
+            if trace is not None:
+                trace[s] = {"gate": "lockout_hold"}
             continue
 
         strength = abs(row.trend)
@@ -345,6 +372,28 @@ def compute_targets(
             cur = st.contracts
             half = math.floor(abs(cur) / 2.0) * (1 if cur > 0 else -1)
             n = half if cur != 0 else 0.0
+            if trace is not None:
+                trace[s] = {"gate": "vol_blocked", "halved_from": cur}
+        elif trace is not None:
+            # Which of the three §6/§7 constraints set the notional
+            # (recomputed read-only from in-scope floats — no effect on
+            # the verbatim sizing lines above; ties label the stricter).
+            vol_target_notional = (
+                equity * v_target * w * strength / row.sigma_ann * dd_mult * funding_mult
+            )
+            asset_cap_notional = p.per_asset_cap * equity
+            if max_notional <= min(vol_target_notional, asset_cap_notional):
+                binding = "per_trade_risk_cap"
+            elif asset_cap_notional < min(vol_target_notional, max_notional):
+                binding = "per_asset_cap"
+            else:
+                binding = "vol_target"
+            trace[s] = {
+                "gate": "sized",
+                "strength": strength,
+                "funding_mult": funding_mult,
+                "binding_constraint": binding,
+            }
         targets[s] = float(n)
 
     # portfolio gross cap
@@ -358,6 +407,8 @@ def compute_targets(
         for s in ASSETS:
             t = targets[s] * scale
             targets[s] = float(math.floor(abs(t)) * (1 if t > 0 else -1))
+        if trace is not None:
+            trace["gross_cap_scale"] = scale
     return targets
 
 

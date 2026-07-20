@@ -90,6 +90,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
+from datetime import time as dt_time
 from decimal import Decimal, InvalidOperation
 from typing import Any, Final
 
@@ -163,6 +164,28 @@ class DailyBar:
     low: Decimal
     close: Decimal
     volume: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class CandleRow:
+    """One OHLCV bar destined for the ``market_bars`` table.
+
+    ``bar_start_utc`` is the venue's bar-START timestamp; ``granularity``
+    mirrors the venue enum (``ONE_DAY``/``ONE_HOUR``). ``volume`` is
+    optional — a venue payload with garbage volume should not cost us
+    the price columns (the table column is nullable to match). Spot
+    volume is base-asset units, perp volume is contracts; consumers key
+    off product_id and must never mix the two.
+    """
+
+    product_id: str
+    granularity: str
+    bar_start_utc: datetime
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: Decimal | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -373,6 +396,49 @@ def parse_daily_candle(product_id: str, raw: Mapping[str, Any]) -> DailyBar | No
     )
 
 
+def parse_candle_row(
+    product_id: str, raw: Mapping[str, Any], *, granularity: str
+) -> CandleRow | None:
+    """Parse one public-candles entry into a :class:`CandleRow`.
+
+    Price columns are required (None on any parse failure); volume is
+    best-effort (None keeps the bar). Same wire conventions as
+    :func:`parse_daily_candle` — bar-start unix seconds + string OHLCV.
+    """
+    try:
+        start_unix = int(str(raw["start"]))
+        o = Decimal(str(raw["open"]))
+        h = Decimal(str(raw["high"]))
+        lo = Decimal(str(raw["low"]))
+        c = Decimal(str(raw["close"]))
+    except (KeyError, ValueError, InvalidOperation):
+        return None
+    return CandleRow(
+        product_id=product_id,
+        granularity=granularity,
+        bar_start_utc=datetime.fromtimestamp(start_unix, tz=UTC),
+        open=o,
+        high=h,
+        low=lo,
+        close=c,
+        volume=_coerce_decimal(raw.get("volume")),
+    )
+
+
+def daily_bar_to_candle_row(bar: DailyBar) -> CandleRow:
+    """DailyBar → market_bars row (bar-start = session midnight UTC)."""
+    return CandleRow(
+        product_id=bar.product_id,
+        granularity="ONE_DAY",
+        bar_start_utc=datetime.combine(bar.session_date, dt_time(0, 0), tzinfo=UTC),
+        open=bar.open,
+        high=bar.high,
+        low=bar.low,
+        close=bar.close,
+        volume=bar.volume,
+    )
+
+
 def extract_ticker_updates(message: Mapping[str, Any]) -> list[tuple[str, Decimal]]:
     """Pull (product_id, price) pairs out of one WS ticker message.
 
@@ -514,22 +580,30 @@ class HttpxCoinbaseRestClient:
             raise CoinbaseRestError("products payload missing 'products' list")
         return [p for p in products if isinstance(p, dict)]
 
-    async def get_daily_candles(
-        self, product_id: str, *, start_unix: int, end_unix: int
+    async def get_candles(
+        self, product_id: str, *, start_unix: int, end_unix: int, granularity: str
     ) -> list[dict[str, Any]]:
-        """One page of ONE_DAY candles for ``product_id`` (max ~350)."""
+        """One page of candles for ``product_id`` at ``granularity`` (max ~350)."""
         body = await self._get(
             f"/api/v3/brokerage/market/products/{product_id}/candles",
             {
                 "start": str(start_unix),
                 "end": str(end_unix),
-                "granularity": "ONE_DAY",
+                "granularity": granularity,
             },
         )
         candles = body.get("candles")
         if not isinstance(candles, list):
             raise CoinbaseRestError(f"candles payload for {product_id} missing 'candles' list")
         return [c for c in candles if isinstance(c, dict)]
+
+    async def get_daily_candles(
+        self, product_id: str, *, start_unix: int, end_unix: int
+    ) -> list[dict[str, Any]]:
+        """One page of ONE_DAY candles (compat wrapper over :meth:`get_candles`)."""
+        return await self.get_candles(
+            product_id, start_unix=start_unix, end_unix=end_unix, granularity="ONE_DAY"
+        )
 
 
 #: Structural typing seam for tests + a future authenticated client.
@@ -586,6 +660,42 @@ async def fetch_daily_bars(
     return [by_date[d] for d in sorted(by_date)]
 
 
+async def fetch_hourly_candle_rows(
+    rest: Any,
+    product_id: str,
+    *,
+    hours: int,
+    now_utc: datetime,
+) -> list[CandleRow]:
+    """Fetch the last ``hours`` COMPLETED hourly bars for one product, ascending.
+
+    Single-page fetch (the endpoint caps ~350/request ≫ any sane
+    lookback here); the in-progress current hour is dropped (same
+    completed-sessions-only convention as :func:`fetch_daily_bars`).
+    Requires the rest client to expose ``get_candles`` — the daily-only
+    compat surface (`get_daily_candles`) is not enough for this path,
+    and callers degrade gracefully when it is absent.
+    """
+    if now_utc.tzinfo is None:
+        raise ValueError("now_utc must be tz-aware (dev-guide §3 / A06); got naive")
+    if hours <= 0 or not hasattr(rest, "get_candles"):
+        return []
+    end = current_utc_hour(now_utc)  # start of the in-progress hour
+    start = end - timedelta(hours=min(hours, CANDLES_PER_REQUEST))
+    raw_candles = await rest.get_candles(
+        product_id,
+        start_unix=int(start.timestamp()),
+        end_unix=int(end.timestamp()),
+        granularity="ONE_HOUR",
+    )
+    by_start: dict[datetime, CandleRow] = {}
+    for raw in raw_candles:
+        row = parse_candle_row(product_id, raw, granularity="ONE_HOUR")
+        if row is not None and row.bar_start_utc < end:
+            by_start[row.bar_start_utc] = row
+    return [by_start[k] for k in sorted(by_start)]
+
+
 # --------------------------------------------------------------------------
 # Config + worker
 # --------------------------------------------------------------------------
@@ -626,6 +736,13 @@ class CoinbaseMarketDataConfig:
     startup_grace_s: float = 180.0
     #: Days of daily bars retained in memory by the daily pass.
     daily_bars_prefetch_days: int = 5
+    #: market_bars persistence (operator directive 2026-07-20, agentic-
+    #: refinement data capture): daily + hourly OHLCV incl. VOLUME for
+    #: the spot signal products and the critical-tier perps. Trailing
+    #: windows re-write idempotently so outage gaps self-heal.
+    persist_bars: bool = True
+    bars_daily_window_days: int = 10
+    bars_hourly_lookback_hours: int = 30
     http_timeout_s: float = 30.0
     ws_reconnect_max_backoff_s: float = 60.0
 
@@ -649,6 +766,8 @@ class MarketDataStatus:
     last_metadata_snapshot_utc: datetime | None = None
     last_metadata_rows_written: int = 0
     latest_daily_bars: dict[str, DailyBar] = field(default_factory=dict)
+    last_bars_snapshot_utc: datetime | None = None
+    last_bars_rows_written: int = 0
     stale_since_utc: datetime | None = None
 
 
@@ -704,6 +823,7 @@ class CoinbaseMarketDataWorker:
         self._critical_perp_product_ids: tuple[str, ...] = ()
         self._last_fired_funding_hour_utc: datetime | None = initial_fired_funding_hour_utc
         self._last_fired_metadata_date_utc: date | None = initial_fired_metadata_date_utc
+        self._last_fired_bars_hour_utc: datetime | None = None
         self._last_funding_success_utc: datetime | None = None
         self._last_stale_alert_utc: datetime | None = None
         self._last_telemetry_stale_log_utc: datetime | None = None
@@ -770,6 +890,14 @@ class CoinbaseMarketDataWorker:
         ):
             self._last_fired_metadata_date_utc = now_utc.astimezone(UTC).date()
             await self.run_daily_snapshot_once(now_utc=now_utc)
+
+        if self._config.persist_bars and should_fire_hourly(
+            now_utc=now_utc, last_fired_hour_utc=self._last_fired_bars_hour_utc
+        ):
+            # Same fired-before-work semantics as the funding job: a
+            # failing hour must not retry-storm every 30 s tick.
+            self._last_fired_bars_hour_utc = current_utc_hour(now_utc)
+            await self.run_hourly_bars_once(now_utc=now_utc)
 
     # -- job: hourly funding snapshot ---------------------------------------
 
@@ -925,13 +1053,21 @@ class CoinbaseMarketDataWorker:
             perp_products=len(perps),
         )
 
-        # Sample the latest spot daily bars (signal input, strategy §4).
+        # Sample the latest spot daily bars (signal input, strategy §4) —
+        # and persist the trailing window to market_bars (operator
+        # directive 2026-07-20: durable OHLCV incl. volume; the fetch is
+        # widened to the persistence window so gaps self-heal).
+        fetch_days = max(
+            self._config.daily_bars_prefetch_days,
+            self._config.bars_daily_window_days if self._config.persist_bars else 0,
+        )
+        bar_rows_written = 0
         for product_id in self._config.spot_product_ids:
             try:
                 bars = await fetch_daily_bars(
                     self._rest,
                     product_id,
-                    days=self._config.daily_bars_prefetch_days,
+                    days=fetch_days,
                     now_utc=now_utc,
                 )
             except Exception:
@@ -943,6 +1079,10 @@ class CoinbaseMarketDataWorker:
             if not bars:
                 self._log.warning("coinbase_daily_bar_empty", product_id=product_id)
                 continue
+            if self._config.persist_bars:
+                bar_rows_written += await self._upsert_candle_rows(
+                    [daily_bar_to_candle_row(b) for b in bars], captured_at_utc=now_utc
+                )
             latest = bars[-1]
             self.status.latest_daily_bars[product_id] = latest
             expected_latest = (now_utc.astimezone(UTC) - timedelta(days=1)).date()
@@ -960,7 +1100,127 @@ class CoinbaseMarketDataWorker:
                     session_date=latest.session_date.isoformat(),
                     close=str(latest.close),
                 )
+
+        # Persist daily bars for the critical-tier perp products too —
+        # venue-native OHLCV + CONTRACT volume (the tradable-liquidity
+        # record spot volume cannot provide). Best-effort per product:
+        # a product the candles endpoint refuses logs and moves on.
+        if self._config.persist_bars:
+            for product_id in self._critical_perp_product_ids:
+                try:
+                    perp_bars = await fetch_daily_bars(
+                        self._rest,
+                        product_id,
+                        days=self._config.bars_daily_window_days,
+                        now_utc=now_utc,
+                    )
+                except Exception:
+                    self._log.exception("coinbase_daily_bar_fetch_failed", product_id=product_id)
+                    continue
+                if perp_bars:
+                    bar_rows_written += await self._upsert_candle_rows(
+                        [daily_bar_to_candle_row(b) for b in perp_bars],
+                        captured_at_utc=now_utc,
+                    )
+            self.status.last_bars_snapshot_utc = now_utc
+            self.status.last_bars_rows_written = bar_rows_written
+            self._log.info(
+                "coinbase_market_bars_daily_persisted",
+                rows_written=bar_rows_written,
+                window_days=self._config.bars_daily_window_days,
+            )
         return rows_written
+
+    # -- job: hourly market_bars capture --------------------------------------
+
+    async def run_hourly_bars_once(self, *, now_utc: datetime | None = None) -> int:
+        """Persist the trailing window of COMPLETED hourly bars.
+
+        Covers the spot signal products + the critical-tier perps (the
+        BTC/ETH products the system actually trades — [A13]: derived
+        set, never an ID whitelist). Returns rows written. Never raises
+        — per-product failures log and continue; a persistently failing
+        capture surfaces via the ``last_bars_snapshot_utc`` status age
+        on the cycle surface, not via a P2 (telemetry, not trading
+        input — the decision path still fetches its own bars).
+        """
+        if now_utc is None:
+            now_utc = self._clock()
+        rows_written = 0
+        product_ids = tuple(self._config.spot_product_ids) + self._critical_perp_product_ids
+        for product_id in product_ids:
+            try:
+                rows = await fetch_hourly_candle_rows(
+                    self._rest,
+                    product_id,
+                    hours=self._config.bars_hourly_lookback_hours,
+                    now_utc=now_utc,
+                )
+            except Exception:
+                self._log.exception("coinbase_hourly_bars_fetch_failed", product_id=product_id)
+                continue
+            if rows:
+                rows_written += await self._upsert_candle_rows(rows, captured_at_utc=now_utc)
+        self.status.last_bars_snapshot_utc = now_utc
+        self.status.last_bars_rows_written = rows_written
+        self._log.info(
+            "coinbase_market_bars_hourly_persisted",
+            rows_written=rows_written,
+            products=len(product_ids),
+            lookback_hours=self._config.bars_hourly_lookback_hours,
+        )
+        return rows_written
+
+    async def _upsert_candle_rows(self, rows: list[CandleRow], *, captured_at_utc: datetime) -> int:
+        """Idempotent batch insert into market_bars; returns NEW rows.
+
+        ``ON CONFLICT DO NOTHING`` — closed bars are immutable, first
+        capture wins, and trailing-window re-writes heal gaps without
+        churning existing rows. One transaction per batch; a failing
+        batch logs and reports 0 (capture is telemetry, never a trading
+        dependency).
+        """
+        if not rows:
+            return 0
+        inserted = 0
+        try:
+            async with self._session_factory() as session:
+                async with session.begin():
+                    for row in rows:
+                        result = await session.execute(
+                            text(
+                                "INSERT INTO market_bars ("
+                                "    product_id, granularity, bar_start_utc,"
+                                "    open, high, low, close, volume,"
+                                "    source, captured_at_utc"
+                                ") VALUES ("
+                                "    :product_id, :granularity, :bar_start,"
+                                "    :open, :high, :low, :close, :volume,"
+                                "    'coinbase_advanced', :captured_at"
+                                ") ON CONFLICT (product_id, granularity, bar_start_utc)"
+                                " DO NOTHING"
+                            ),
+                            {
+                                "product_id": row.product_id,
+                                "granularity": row.granularity,
+                                "bar_start": row.bar_start_utc,
+                                "open": row.open,
+                                "high": row.high,
+                                "low": row.low,
+                                "close": row.close,
+                                "volume": row.volume,
+                                "captured_at": captured_at_utc,
+                            },
+                        )
+                        inserted += int(getattr(result, "rowcount", 0) or 0)
+        except Exception:
+            self._log.exception(
+                "coinbase_market_bars_upsert_failed",
+                rows=len(rows),
+                product_id=rows[0].product_id,
+            )
+            return 0
+        return inserted
 
     # -- job: staleness watchdog ---------------------------------------------
 

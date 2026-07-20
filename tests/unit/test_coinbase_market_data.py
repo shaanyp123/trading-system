@@ -28,9 +28,12 @@ from services.data.coinbase_market_data import (
     CoinbaseMarketDataWorker,
     MarkStore,
     current_utc_hour,
+    daily_bar_to_candle_row,
     discover_perp_products,
     extract_ticker_updates,
     fetch_daily_bars,
+    fetch_hourly_candle_rows,
+    parse_candle_row,
     parse_daily_candle,
     parse_perp_product,
     should_fire_daily,
@@ -194,6 +197,20 @@ class _FakeRest:
         if self.fail_candles:
             raise RuntimeError("candles endpoint down")
         return self.candles
+
+    async def get_candles(
+        self, product_id: str, *, start_unix: int, end_unix: int, granularity: str
+    ) -> list[dict[str, Any]]:
+        # mirrors the real client: ONE_DAY == the daily surface; ONE_HOUR
+        # serves the separately-canned hourly list (default empty)
+        if granularity == "ONE_DAY":
+            return await self.get_daily_candles(
+                product_id, start_unix=start_unix, end_unix=end_unix
+            )
+        self.candle_calls.append((product_id, start_unix, end_unix))
+        if self.fail_candles:
+            raise RuntimeError("candles endpoint down")
+        return getattr(self, "hourly_candles", [])
 
 
 class _FakeBegin:
@@ -1005,6 +1022,111 @@ class TestStalenessTiers:
 # ---------------------------------------------------------------------------
 
 
+class TestMarketBarsCapture:
+    """2026-07-20 agentic-refinement capture: durable OHLCV incl. volume."""
+
+    def test_parse_candle_row_keeps_bar_on_missing_volume(self) -> None:
+        raw = _candle_raw(date(2026, 7, 8))
+        del raw["volume"]
+        row = parse_candle_row("BTC-USD", raw, granularity="ONE_DAY")
+        assert row is not None
+        assert row.volume is None
+        assert row.close == Decimal("100.5")
+
+    def test_parse_candle_row_requires_prices(self) -> None:
+        raw = _candle_raw(date(2026, 7, 8))
+        del raw["close"]
+        assert parse_candle_row("BTC-USD", raw, granularity="ONE_DAY") is None
+
+    def test_daily_bar_to_candle_row_midnight_start(self) -> None:
+        bar = parse_daily_candle("BTC-USD", _candle_raw(date(2026, 7, 8)))
+        assert bar is not None
+        row = daily_bar_to_candle_row(bar)
+        assert row.granularity == "ONE_DAY"
+        assert row.bar_start_utc == datetime(2026, 7, 8, tzinfo=UTC)
+        assert row.volume == Decimal("1234.5")
+
+    def test_fetch_hourly_drops_in_progress_hour(self) -> None:
+        rest = _FakeRest()
+        complete = int(datetime(2026, 7, 9, 11, 0, tzinfo=UTC).timestamp())
+        in_progress = int(datetime(2026, 7, 9, 12, 0, tzinfo=UTC).timestamp())
+        rest.hourly_candles = [
+            {**_candle_raw(date(2026, 7, 9)), "start": str(complete)},
+            {**_candle_raw(date(2026, 7, 9)), "start": str(in_progress)},
+        ]
+        rows = asyncio.run(fetch_hourly_candle_rows(rest, "BTC-USD", hours=6, now_utc=NOW))
+        assert [r.bar_start_utc.hour for r in rows] == [11]
+
+    def test_fetch_hourly_degrades_without_get_candles(self) -> None:
+        class _DailyOnlyRest:
+            async def get_daily_candles(self, *a: Any, **k: Any) -> list[dict[str, Any]]:
+                return []
+
+        rows = asyncio.run(
+            fetch_hourly_candle_rows(_DailyOnlyRest(), "BTC-USD", hours=6, now_utc=NOW)
+        )
+        assert rows == []
+
+    def test_daily_snapshot_persists_spot_and_perp_bars(self) -> None:
+        factory = _FakeSessionFactory()
+        yesterday = (NOW - timedelta(days=1)).date()
+        rest = _FakeRest(products=[_perp_raw()], candles=[_candle_raw(yesterday)])
+        worker = _worker(rest=rest, factory=factory)
+        asyncio.run(worker.run_funding_snapshot_once(now_utc=NOW))  # arms perp discovery
+        asyncio.run(worker.run_daily_snapshot_once(now_utc=NOW))
+        bar_inserts = [e for e in factory.executed if "market_bars" in e[0]]
+        products_written = {e[1]["product_id"] for e in bar_inserts}
+        # both spot signal products + the discovered critical perp
+        assert {"BTC-USD", "ETH-USD", "BIP-20DEC30-CDE"} <= products_written
+        assert all(e[1]["granularity"] == "ONE_DAY" for e in bar_inserts)
+        assert worker.status.last_bars_rows_written >= 0
+
+    def test_daily_snapshot_persist_disabled(self) -> None:
+        factory = _FakeSessionFactory()
+        yesterday = (NOW - timedelta(days=1)).date()
+        rest = _FakeRest(products=[_perp_raw()], candles=[_candle_raw(yesterday)])
+        worker = _worker(
+            rest=rest,
+            factory=factory,
+            config=CoinbaseMarketDataConfig(startup_grace_s=0.0, persist_bars=False),
+        )
+        asyncio.run(worker.run_daily_snapshot_once(now_utc=NOW))
+        assert [e for e in factory.executed if "market_bars" in e[0]] == []
+        # in-memory sampling still works with persistence off
+        assert "BTC-USD" in worker.status.latest_daily_bars
+
+    def test_hourly_bars_job_writes_completed_hours(self) -> None:
+        factory = _FakeSessionFactory()
+        rest = _FakeRest(products=[_perp_raw()])
+        complete = int(datetime(2026, 7, 9, 11, 0, tzinfo=UTC).timestamp())
+        rest.hourly_candles = [{**_candle_raw(date(2026, 7, 9)), "start": str(complete)}]
+        worker = _worker(rest=rest, factory=factory)
+        asyncio.run(worker.run_funding_snapshot_once(now_utc=NOW))
+        written = asyncio.run(worker.run_hourly_bars_once(now_utc=NOW))
+        bar_inserts = [e for e in factory.executed if "market_bars" in e[0]]
+        hourly = [e for e in bar_inserts if e[1]["granularity"] == "ONE_HOUR"]
+        # spot pair + discovered perp, one completed hour each
+        assert {e[1]["product_id"] for e in hourly} == {
+            "BTC-USD",
+            "ETH-USD",
+            "BIP-20DEC30-CDE",
+        }
+        # the fake session reports no rowcount, so the counter is 0 here;
+        # the INSERTs above are the load-bearing assertion
+        assert written == 0
+        assert worker.status.last_bars_snapshot_utc == NOW
+
+    def test_upsert_failure_logs_and_reports_zero(self) -> None:
+        factory = _FakeSessionFactory()
+        factory.execute_raises = True
+        rest = _FakeRest()
+        complete = int(datetime(2026, 7, 9, 11, 0, tzinfo=UTC).timestamp())
+        rest.hourly_candles = [{**_candle_raw(date(2026, 7, 9)), "start": str(complete)}]
+        worker = _worker(rest=rest, factory=factory)
+        written = asyncio.run(worker.run_hourly_bars_once(now_utc=NOW))
+        assert written == 0  # never raises — capture is telemetry
+
+
 class TestRunOnce:
     def test_fires_hourly_and_daily_jobs_once(self) -> None:
         factory = _FakeSessionFactory()
@@ -1014,11 +1136,16 @@ class TestRunOnce:
         asyncio.run(worker.run_once(now_utc=NOW))
         funding_rows = [e for e in factory.executed if "funding_rates" in e[0]]
         metadata_rows = [e for e in factory.executed if "product_metadata" in e[0]]
+        bar_rows = [e for e in factory.executed if "market_bars" in e[0]]
         assert len(funding_rows) == 1
         assert len(metadata_rows) == 1
+        # bars capture (2026-07-20): daily job persists the fetched spot
+        # daily bar + the hourly bars job fires on the same first tick.
+        assert len(bar_rows) >= 1
         # same tick again: nothing new fires
+        first_tick_count = len(factory.executed)
         asyncio.run(worker.run_once(now_utc=NOW + timedelta(seconds=30)))
-        assert len(factory.executed) == 2
+        assert len(factory.executed) == first_tick_count
 
     def test_next_hour_fires_funding_again_but_not_metadata(self) -> None:
         factory = _FakeSessionFactory()
