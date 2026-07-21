@@ -8112,3 +8112,9 @@ Deploy completed ~18:52 UTC, well inside the pre-23:30 UTC window (next cycle 20
 **Consequence for the day-45 evidence pack:** B3 will be presented as `insufficient_data` + this waiver, honestly labeled a §10 deviation — NOT as a green gate. The `/gates` display continues to report B3's mechanical truth (`insufficient_data`) unchanged; no code change accompanies this decision.
 
 **Risk impact:** none — governance record only; no code, no [A02] paths. **Backtest delta: N/A.** **Verification:** N/A (decision record).
+
+### 2026-07-21 — batch-deploy day-after checks CLEAN: #403 anchor minted at first rollover; deploy fully bedded in
+
+**Verified (operator-pasted, this session):** (1) `strategy_worker_status.day_start_captured_at_utc = 2026-07-21 00:00:23 UTC` with `day_start_date 2026-07-21`, `day_start_equity_usd 2251.38` — the `20260719_day_start_captured_at` column populated at the first UTC-day rollover after deploy, as designed. (2) `strategy_worker_sweep_netting_no_anchor_unadjusted` ABSENT post-rollover (the documented deploy-day WARNING healed). (3) `recon_backend_view_sweep_netting_applied` ABSENT from the normal 00:15 recon (venue balance refresh re-based normally). (4) No `binance_funding` activity beyond the boot-time `disabled_via_setting` line — proxy sidelining confirmed in steady state. This closes the "pending next-day checks" item from the 2026-07-20 batch-deploy entry; the #402/#403/#404/#405 chain is now fully deployed, verified, and observed clean through a full daily cycle.
+
+**Risk impact:** none — verification record only. **Backtest delta: N/A.** **Verification:** operator-pasted psql row + empty greps quoted above.
