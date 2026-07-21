@@ -47,23 +47,56 @@ Root-cause discipline per dev-guide §1.3.
    → one row per perp product for today, plus a
    `coinbase_daily_bar_sampled` log line per spot product.
 5b. **market_bars capture (2026-07-20, agentic-refinement data capture).**
-   Prereq: the `20260720_market_bars` migration is applied (`alembic
-   upgrade head` at deploy). After the next top-of-hour AND after the
-   next 00:00 UTC pass:
-   `... psql ... -c "SELECT product_id, granularity, bar_start_utc, close, volume FROM market_bars ORDER BY captured_at_utc DESC LIMIT 8;"`
+   Prereq: the `20260720_market_bars` migration is applied.
+   ⚠️ **`docker compose exec` does NOT work for the migration, the
+   backfill, or psql** (learned live 2026-07-20 first deploy): `exec`
+   skips the container ENTRYPOINT, and both `DATABASE_URL` (api) and
+   `PGPASSWORD` (postgres) are constructed/exported by the entrypoint
+   at boot — an exec'd process never sees them. Use the day5-bringup
+   Step-4 `run --rm -e` form; the alembic (sync) URL takes
+   `+psycopg2`, the backfill script's async engine takes `+asyncpg`:
+
+   ```bash
+   cd /opt/trading
+   set -a; source deploy/.env; set +a
+
+   # migration (sync driver):
+   docker compose --env-file deploy/.env run --rm \
+     -e DATABASE_URL="postgresql+psycopg2://postgres:${POSTGRES_SUPERUSER_PASSWORD}@postgres:5432/trading" \
+     --entrypoint sh api -c 'alembic upgrade head'
+
+   # one-time history backfill (async driver; dry-run first by
+   # omitting --execute; idempotent — safe to re-run):
+   docker compose --env-file deploy/.env run --rm \
+     -e DATABASE_URL="postgresql+asyncpg://postgres:${POSTGRES_SUPERUSER_PASSWORD}@postgres:5432/trading" \
+     --entrypoint sh api -c \
+     'python -m scripts.operator_tools.backfill_market_bars --start 2016-01-01 --execute'
+   # then the hourly + venue-perp recent window:
+   #   ... --start 2026-06-01 --granularity both --include-perps --execute
+   ```
+
+   Verify after the next top-of-hour AND after the next 00:00 UTC pass
+   (note `-e PGPASSWORD` — exec-env caveat again):
+
+   ```bash
+   docker compose --env-file deploy/.env exec \
+     -e PGPASSWORD="${POSTGRES_SUPERUSER_PASSWORD}" postgres \
+     psql -U postgres -d trading -c \
+     "SELECT product_id, granularity, COUNT(*), MIN(bar_start_utc)::date AS first, MAX(bar_start_utc)::date AS last FROM market_bars GROUP BY 1,2 ORDER BY 1,2;"
+   ```
+
    → `ONE_HOUR` rows for the spot pair + critical perps each hour
    (`coinbase_market_bars_hourly_persisted` log line), and `ONE_DAY`
    rows after the daily pass (`coinbase_market_bars_daily_persisted`).
+   First-deploy reference counts (2026-07-20): daily spot backfill
+   7,568 rows (BTC-USD 3,854 to ~2015, ETH-USD 3,714 to ~2016);
+   recent window added ~1,200 hourly rows per spot product + ~50
+   daily / ~1,193 hourly per discovered perp.
    Capture is telemetry: failures log and continue, never alert, never
    touch the decision path (the worker keeps fetching its own bars).
    Persistence is default-on in code (`persist_bars`); there is
    deliberately NO env knob — an inert-switch trap is worse than no
    switch (decisions-log 2026-07-20 compose passthrough bug).
-   **One-time history backfill (operator, once after migration):**
-   `docker compose --env-file deploy/.env exec api python -m scripts.operator_tools.backfill_market_bars --start 2016-01-01 --execute`
-   (dry-run first by omitting `--execute`; add
-   `--granularity both --include-perps --start 2026-06-01` for the
-   hourly + venue-perp recent window. Idempotent — safe to re-run.)
 6. **Staleness watchdog drill (optional but recommended once):** block the
    WS egress (e.g. `iptables` drop to the WS host, or set
    `API_COINBASE_WS_URL=wss://invalid.invalid` and restart) → within
