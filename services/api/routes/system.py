@@ -1477,7 +1477,7 @@ async def system_cycle(
 
       * **Last decision outcome** — latest ``strategy_decisions`` row for
         the active account: per-asset trend score → target → action →
-        est. costs from the worker's ``strategy_decision_v1`` outcome
+        est. costs from the worker's ``strategy_decision_v1``/``v2`` outcome
         JSONB. Skip/failed rows surface their ``skip_reason``.
       * **Last risk-loop heartbeat** — ``strategy_worker_status`` row +
         freshness classification (30 s loop; fresh ≤ 90 s).

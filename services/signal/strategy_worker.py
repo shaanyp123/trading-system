@@ -78,6 +78,7 @@ import asyncio
 import contextlib
 import json
 import math
+import statistics
 from collections.abc import Callable, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import asdict, dataclass, field, replace
@@ -89,7 +90,7 @@ from typing import Any, Final, Literal
 from uuid import UUID
 
 import structlog
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from services.audit.event_types import AuditEventType
@@ -172,7 +173,13 @@ DEFAULT_BARS_HISTORY_DAYS: Final[int] = 400
 DEFAULT_STALE_THRESHOLD_S: Final[float] = 180.0
 
 #: Decision-record JSONB schema tag.
-DECISION_SCHEMA_VERSION: Final[str] = "strategy_decision_v1"
+#: v2 (2026-07-20, agentic-refinement capture): ADDITIVE keys only —
+#: per-asset ``indicators`` (sub-signal votes, absolute SMA/mom/ATR/
+#: pre-clip sigma, decided-bar volume + rel_vol), ``gate_trace`` (which
+#: engine rule decided), ``hold_reason``, ``book`` (top-of-book stamp);
+#: top-level ``observed_funding`` + ``gross_cap_scale``. v1 consumers
+#: parse defensively and are unaffected.
+DECISION_SCHEMA_VERSION: Final[str] = "strategy_decision_v2"
 
 #: Consecutive risk-tick failures before the worker invokes the
 #: kill-switch with the UNHANDLED_EXCEPTION trigger (gate A4: the loop
@@ -971,6 +978,66 @@ class StrategyWorkerStore:
             ).fetchone()
         return _dec(row.m) if row is not None else None
 
+    async def fetch_recent_funding(
+        self,
+        product_ids: list[str],
+        *,
+        now_utc: datetime,
+        window_days: int = 7,
+    ) -> dict[str, dict[str, Any]]:
+        """Trailing observed-funding stats per product (telemetry stamp).
+
+        Reads the hourly ``funding_rates`` capture for the decision
+        outcome's ``observed_funding`` block (2026-07-20 agentic-
+        refinement capture). PURE TELEMETRY: the S4 gates still run on
+        the parametric ``funding_ann`` — this records what the live
+        gate WOULD have seen, the exact evidence gate B3 and a future
+        live-funding substitution need. Never raises; a failing read
+        returns ``{}`` and the decision proceeds unstamped.
+        """
+        if not product_ids:
+            return {}
+        cutoff = now_utc - timedelta(days=window_days)
+        out: dict[str, dict[str, Any]] = {}
+        try:
+            async with self._sf() as session:
+                rows = (
+                    await session.execute(
+                        text(
+                            "SELECT product_id, AVG(rate_per_interval) AS mean_rate, "
+                            "       COUNT(*) AS n_obs, MAX(observed_at_utc) AS latest_at, "
+                            "       MAX(interval_hours) AS interval_hours "
+                            "FROM funding_rates "
+                            "WHERE product_id IN :pids AND observed_at_utc >= :cutoff "
+                            "GROUP BY product_id"
+                        ).bindparams(bindparam("pids", expanding=True)),
+                        {"pids": list(product_ids), "cutoff": cutoff},
+                    )
+                ).fetchall()
+            # row shaping stays INSIDE the try (risk-review 2026-07-20):
+            # the never-raises contract must be structural, not incidental
+            for r in rows:
+                mean_rate = _dec(r.mean_rate)
+                interval_hours = _dec(r.interval_hours) or Decimal(1)
+                annualized = (
+                    mean_rate * (Decimal(24 * 365) / interval_hours)
+                    if mean_rate is not None
+                    else None
+                )
+                out[str(r.product_id)] = {
+                    "mean_rate_per_interval": str(mean_rate) if mean_rate is not None else None,
+                    "trailing_ann": str(annualized) if annualized is not None else None,
+                    "n_obs": int(r.n_obs),
+                    "latest_observed_at_utc": (
+                        r.latest_at.isoformat() if r.latest_at is not None else None
+                    ),
+                    "window_days": window_days,
+                }
+        except Exception:
+            self._log.exception("strategy_worker_recent_funding_read_failed")
+            return {}
+        return out
+
     async def fetch_worker_status(self, account_id: UUID) -> WorkerStatusRow | None:
         async with self._sf() as session:
             row = (
@@ -1757,6 +1824,10 @@ class _DecisionInputs:
     rows: dict[str, AssetDecisionRow]
     marks: dict[str, Decimal]
     slippage_head_id: UUID
+    #: Extended per-asset indicator snapshot for the outcome payload
+    #: (2026-07-20 agentic-refinement capture) — derived from the SAME
+    #: compute_indicators output ``rows`` came from; telemetry only.
+    indicator_snapshots: dict[str, dict[str, Any] | None] = field(default_factory=dict)
 
 
 class StrategyWorker:
@@ -3299,6 +3370,7 @@ class StrategyWorker:
         engine_states = {
             a: self.state[a].to_engine_state(decided_bar_date=decided_bar_date) for a in ASSETS
         }
+        gate_trace: dict[str, Any] = {}
         targets = compute_targets(
             bar_index=decided_bar_date.toordinal(),
             rows=inputs.rows,
@@ -3307,6 +3379,7 @@ class StrategyWorker:
             v_target=v_target_eff,
             dd_mult=1.0,  # Amendment B: dd tiers removed (DD_TIERS_REMOVED)
             p=inputs.params,
+            trace=gate_trace,
         )
         for asset in ASSETS:
             self.state[asset].absorb_engine_state(engine_states[asset])
@@ -3374,6 +3447,34 @@ class StrategyWorker:
                 target = clamped
             final_targets[asset] = target
 
+        # Observed-funding stamp (telemetry: what the live S4 gate WOULD
+        # have seen — the parametric gate is unchanged; B3 evidence).
+        observed_funding = await self._store.fetch_recent_funding(
+            [p.product_id for p in inputs.products.values()], now_utc=now
+        )
+
+        # Top-of-book stamps, captured BEFORE any leg is computed (risk-
+        # review 2026-07-20): keeping every await out of the leg loop
+        # preserves the loop's event-loop atomicity, so both assets'
+        # legs derive from one state snapshot even if the 30 s risk
+        # loop absorbs a stop fill mid-decision. Best-effort per asset.
+        book_stamps: dict[str, dict[str, str] | None] = {}
+        for stamp_asset, stamp_product in inputs.products.items():
+            stamp: dict[str, str] | None = None
+            with contextlib.suppress(Exception):
+                book = await self._broker.get_best_bid_ask(stamp_product.product_id)
+                mid = (book.bid + book.ask) / 2
+                stamp = {
+                    "bid": str(book.bid),
+                    "ask": str(book.ask),
+                    "spread_bps": str(
+                        ((book.ask - book.bid) / mid * 10000).quantize(Decimal("0.01"))
+                    )
+                    if mid > 0
+                    else "0",
+                }
+            book_stamps[stamp_asset] = stamp
+
         # Dead-band + Amendment B band-edge on the FINAL targets.
         outcome_assets: dict[str, Any] = {}
         for asset in ASSETS:
@@ -3392,6 +3493,20 @@ class StrategyWorker:
                 )
             effective_target = rt.contracts + int(delta)
             legs = split_delta_legs(prior=rt.contracts, target=effective_target)
+            # Explicit WHY-NOTHING-HAPPENED label (2026-07-20 agentic-
+            # refinement capture): plan_delta collapses several rules
+            # into delta == 0; the distinguishable cases are labeled
+            # here so analysis never has to re-infer them.
+            hold_reason: str | None = None
+            if not legs:
+                if product is None:
+                    hold_reason = "no_product"
+                elif math.isnan(row.close):
+                    hold_reason = "no_close"
+                elif final_targets[asset] != rt.contracts:
+                    hold_reason = "deadband_hold"
+                else:
+                    hold_reason = "at_target"
             outcome_assets[asset] = {
                 "row": {
                     "trend": None if math.isnan(row.trend) else round(row.trend, 6),
@@ -3400,6 +3515,10 @@ class StrategyWorker:
                     "atrp": None if math.isnan(row.atrp) else round(row.atrp, 6),
                     "close": None if math.isnan(row.close) else row.close,
                 },
+                "indicators": inputs.indicator_snapshots.get(asset),
+                "gate_trace": gate_trace.get(asset),
+                "hold_reason": hold_reason,
+                "book": book_stamps.get(asset),
                 "engine_target": engine_targets[asset],
                 "sized_target": sizing.target_contracts.get(asset, 0),
                 "final_target": effective_target,
@@ -3424,6 +3543,8 @@ class StrategyWorker:
             "weekly_halved": weekly_halved,
             "m_combined": str(m_comb),
             "capital_event_session_count": capital_event_sessions,
+            "observed_funding": observed_funding,
+            "gross_cap_scale": gate_trace.get("gross_cap_scale"),
         }
 
         await self._store.insert_decision(
@@ -4179,6 +4300,7 @@ class StrategyWorker:
 
         decided_bar_date = decision_date - timedelta(days=1)
         rows: dict[str, AssetDecisionRow] = {}
+        indicator_snapshots: dict[str, dict[str, Any] | None] = {}
         for asset in ASSETS:
             spot = ASSET_TO_SPOT_PRODUCT[asset]
             try:
@@ -4196,6 +4318,13 @@ class StrategyWorker:
             row = _decision_row_from_bars(
                 bars, params, decided_bar_date, allow_stale=allow_stale_bars
             )
+            try:
+                indicator_snapshots[asset] = _indicator_snapshot_from_bars(bars, params)
+            except Exception:
+                # Telemetry must never block a decision (§7 posture is
+                # about stale INPUT, and `row` above already gates that).
+                self._log.exception("strategy_worker_indicator_snapshot_failed", asset=asset)
+                indicator_snapshots[asset] = None
             if row is None:
                 self._log.warning(
                     "strategy_worker_decision_bars_not_ready",
@@ -4255,6 +4384,7 @@ class StrategyWorker:
             rows=rows,
             marks=marks,
             slippage_head_id=slippage_head_id,
+            indicator_snapshots=indicator_snapshots,
         )
 
     async def _monthly_dd(self, equity: Decimal, decision_date: date) -> Decimal:
@@ -4358,6 +4488,67 @@ def _decision_row_from_bars(
         atrp=float(last["atrp"]),
         close=float(last["close"]),
     )
+
+
+def _indicator_snapshot_from_bars(
+    bars: list[DailyBar], params: CryptoTrendParams
+) -> dict[str, Any] | None:
+    """Extended indicator snapshot for the decision outcome payload.
+
+    2026-07-20 agentic-refinement capture: the audit found the ensemble
+    sub-signal votes and the absolute indicator values were computed at
+    decision time and dropped — unrecoverable from the DB. This
+    persists them, derived from the SAME ``compute_indicators`` output
+    the decision row comes from (the vote derivations mirror the
+    engine's expressions exactly: strict ``close > sma`` / ``mom > 0``).
+
+    Bar-level VOLUME stats ride along (decided-bar volume + relative
+    volume vs the trailing 20-bar median, the v2-study definition):
+    spot volume is CAPTURE-ONLY — the engine deliberately does not
+    consume it; promoting it into the signal path is a falsify-and-
+    replace change (decisions-log 2026-07-20).
+
+    Telemetry only — returns None rather than raising; JSON-safe
+    primitives throughout (floats rounded 8dp, volume as str Decimal).
+    """
+    if not bars:
+        return None
+    frame = _bars_to_frame(bars)
+    ind = compute_indicators(frame, params)
+    last = ind.iloc[-1]
+
+    def _f(name: str) -> float | None:
+        v = float(last[name])
+        return None if math.isnan(v) else round(v, 8)
+
+    close = _f("close")
+    sma_fast = _f("sma_fast")
+    sma_slow = _f("sma_slow")
+    mom = _f("mom")
+    # window = params.mom_lb, which is FROZEN at 20 — the JSONB key name
+    # "rel_vol_20d_median" is tied to that value; if mom_lb ever moves
+    # (falsify-and-replace), rename the key with it (risk-review note)
+    volumes = [float(b.volume) for b in bars[-params.mom_lb :]]
+    rel_vol: float | None = None
+    if len(volumes) >= params.mom_lb:
+        med = statistics.median(volumes)
+        if med > 0:
+            rel_vol = round(volumes[-1] / med, 6)
+    return {
+        "bar_date": bars[-1].session_date.isoformat(),
+        "close": close,
+        "sma_fast": sma_fast,
+        "sma_slow": sma_slow,
+        "mom_sum": mom,
+        "sigma_ann_raw": _f("sigma_ann_raw"),
+        "vol_slow": _f("vol_slow"),
+        "atr": _f("atr"),
+        "s_a": None if close is None or sma_fast is None else (1 if close > sma_fast else -1),
+        "s_b": None if close is None or sma_slow is None else (1 if close > sma_slow else -1),
+        "s_c": None if mom is None else (1 if mom > 0 else -1),
+        "volume": str(bars[-1].volume),
+        "rel_vol_20d_median": rel_vol,
+    }
 
 
 __all__ = [

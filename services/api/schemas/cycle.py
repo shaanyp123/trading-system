@@ -6,7 +6,7 @@ bar-sync status): last decision outcome (per-asset trend score → target
 
 All numeric fields are Decimal-as-string per [A05] (Pydantic v2 emits
 ``Decimal`` fields as JSON strings). The per-asset numbers originate in
-the worker's ``strategy_decision_v1`` ``outcome`` JSONB — floats written
+the worker's ``strategy_decision_v1``/``v2`` ``outcome`` JSONB (v2 additive) — floats written
 by the parity-locked engine (see decisions-log 2026-07-09 C0-B3 decision
 2: float inside the engine, Decimal at every money boundary). This
 module IS such a boundary: values are re-anchored via ``Decimal(str(x))``

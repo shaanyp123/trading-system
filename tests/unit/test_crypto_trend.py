@@ -196,6 +196,115 @@ class TestSizing:
         assert gross <= p.gross_cap * equity * 1.10  # reference's own tolerance
 
 
+class TestComputeTargetsTrace:
+    """2026-07-20 agentic-refinement capture: the optional gate trace.
+
+    Two invariants: (1) trace labels the rule that decided each asset;
+    (2) supplying a trace NEVER changes targets or state mutations —
+    the numeric path is byte-identical with trace=None (the parity gate
+    runs trace-less; these tests pin the live-path equivalence).
+    """
+
+    def _traced(
+        self,
+        rows: dict[str, AssetDecisionRow],
+        states: dict[str, AssetState],
+        *,
+        bar_index: int = 100,
+        equity: float = 6_000.0,
+        p: CryptoTrendParams = P,
+    ) -> tuple[dict[str, float], dict[str, object]]:
+        trace: dict[str, object] = {}
+        targets = compute_targets(
+            bar_index=bar_index,
+            rows=rows,
+            states=states,
+            equity=equity,
+            v_target=p.v_target,
+            dd_mult=1.0,
+            p=p,
+            trace=trace,
+        )
+        return targets, trace
+
+    def test_trace_is_pure_telemetry_identical_targets_and_state(self) -> None:
+        import copy
+
+        rows = _rows(_row(trend=1 / 3), _row(trend=-1.0, close=3_500.0, sigma_ann=0.6))
+        states_a = _states(BTC=AssetState(applied_dir=1, contracts=1))
+        states_b = copy.deepcopy(states_a)
+        plain = _targets(rows, states_a)
+        traced, _ = self._traced(rows, states_b)
+        assert plain == traced
+        for s in ASSETS:
+            assert vars(states_a[s]) == vars(states_b[s])
+
+    def test_sized_gate_labels_binding_constraint(self) -> None:
+        states = _states(BTC=AssetState(applied_dir=1))
+        _, trace = self._traced(_rows(), states)
+        btc = trace["BTC"]
+        assert isinstance(btc, dict)
+        assert btc["gate"] == "sized"
+        assert btc["binding_constraint"] in {"vol_target", "per_trade_risk_cap", "per_asset_cap"}
+
+    def test_hysteresis_pending_labeled(self) -> None:
+        # fresh state, bullish trend: day one of the 2-day confirmation
+        states = _states()
+        _, trace = self._traced(_rows(), states)
+        btc = trace["BTC"]
+        assert isinstance(btc, dict)
+        assert btc["gate"] == "hysteresis_pending"
+        assert btc["pending_count"] == 1
+
+    def test_stopped_today_labeled(self) -> None:
+        states = _states(BTC=AssetState(stopped_today=True))
+        targets, trace = self._traced(_rows(), states)
+        assert targets["BTC"] == 0.0
+        btc = trace["BTC"]
+        assert isinstance(btc, dict)
+        assert btc["gate"] == "stopped_today_flat"
+
+    def test_short_gate_veto_labeled(self) -> None:
+        # applied short direction but trend only -1/3: veto
+        states = _states(BTC=AssetState(applied_dir=-1))
+        _, trace = self._traced(_rows(_row(trend=-1 / 3)), states)
+        btc = trace["BTC"]
+        assert isinstance(btc, dict)
+        assert btc["gate"] == "short_gate_veto"
+
+    def test_eth_min_price_veto_labeled(self) -> None:
+        states = _states(ETH=AssetState(applied_dir=1))
+        _, trace = self._traced(_rows(eth=_row(close=1_500.0, sigma_ann=0.6, atrp=0.035)), states)
+        eth = trace["ETH"]
+        assert isinstance(eth, dict)
+        assert eth["gate"] == "eth_min_price_veto"
+
+    def test_lockout_hold_labeled(self) -> None:
+        states = _states(BTC=AssetState(applied_dir=1, lockout_until=200, lockout_dir=1))
+        _, trace = self._traced(_rows(), states, bar_index=100)
+        btc = trace["BTC"]
+        assert isinstance(btc, dict)
+        assert btc["gate"] == "lockout_hold"
+
+    def test_vol_blocked_labeled(self) -> None:
+        # vol_ratio 1.8 sits between resume (1.5) and block (2.0): the
+        # pre-existing latch stays engaged through the decision
+        states = _states(BTC=AssetState(applied_dir=1, contracts=2, vol_blocked=True))
+        targets, trace = self._traced(_rows(_row(vol_ratio=1.8)), states)
+        btc = trace["BTC"]
+        assert isinstance(btc, dict)
+        assert btc["gate"] == "vol_blocked"
+        assert btc["halved_from"] == 2
+        assert targets["BTC"] == 1.0
+
+    def test_no_signal_yet_labeled(self) -> None:
+        states = _states()
+        _, trace = self._traced(_rows(_row(trend=float("nan"))), states)
+        btc = trace["BTC"]
+        assert isinstance(btc, dict)
+        assert btc["gate"] == "no_signal_yet"
+
+
 class TestPlanDelta:
     def test_deadband_suppresses_small_rebalance(self) -> None:
         # long 10, target 11 → delta notional 1*0.01*100000 = $1000 > band?

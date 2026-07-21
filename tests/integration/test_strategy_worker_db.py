@@ -144,7 +144,14 @@ async def session_factory(
     pg: tuple[Engine, str],
 ) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
     _, sync_url = pg
-    _run_alembic(sync_url, "upgrade", _WORKER_REVISION)
+    # The STORE always speaks the current (head) schema — pinning this
+    # fixture to _WORKER_REVISION let the store's SQL drift past the
+    # fixture DB unnoticed (surfaced on PR #406 CI: upsert referenced
+    # the 20260719 day_start_captured_at_utc column the pinned schema
+    # lacked). The migration class above keeps its explicit-revision
+    # pin (DP-022); the round-trip runs at head, as its section comment
+    # always said.
+    _run_alembic(sync_url, "upgrade", "head")
     async_url = sync_url.replace("+psycopg2", "+asyncpg")
     engine: AsyncEngine = create_async_engine(async_url, pool_pre_ping=True)
     factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -230,6 +237,7 @@ class TestStoreRoundTrip:
             "marks_stale": False,
             "day_start_date": TODAY,
             "day_start_equity_usd": Decimal("6000.12345678"),
+            "day_start_captured_at_utc": NOW,
             "weekly_halved_until": None,
             "flatten_seq": 3,
             "engine_state": state,
@@ -295,9 +303,11 @@ class TestStoreRoundTrip:
         row2 = await store.fetch_decision(account_id, TODAY)
         assert row2 is not None and row2.status == "completed"
         # Equity-history reads used by the weekly / monthly-dd windows.
-        assert await store.fetch_equity_on_or_before(
-            account_id, TODAY + timedelta(days=1)
-        ) == Decimal("6000")
+        # (C1→C2 PR 2: fetch_equity_on_or_before returns EquityObservation —
+        # equity + the created_at sweep-netting window anchor.)
+        obs = await store.fetch_equity_on_or_before(account_id, TODAY + timedelta(days=1))
+        assert obs is not None and obs.equity_usd == Decimal("6000")
+        assert obs.observed_at_utc is not None
         assert await store.fetch_month_max_equity(
             account_id, date(TODAY.year, TODAY.month, 1)
         ) == Decimal("6000")
