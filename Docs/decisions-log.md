@@ -8103,7 +8103,9 @@ Deploy completed ~18:52 UTC, well inside the pre-23:30 UTC window (next cycle 20
 
 **Risk impact:** none — deploy verification + docs/ops-script staging; no [A02] paths; running behavior change is the proxy job going dormant (telemetry-only, already non-functional from this host). **Backtest delta: N/A.** **Verification:** operator-pasted compose-config/api-log/webhook_pusher-log lines quoted above; branch changes: `bash -n` on the bringup script; DRILL.md is documentation.
 
-### 2026-07-20 (addendum 2) — operator decision: gate B3 → WAIVER path (formal recording deferred to the C2 decision)
+### 2026-07-20 (addendum 5) — operator decision: gate B3 → WAIVER path (formal recording deferred to the C2 decision)
+
+*(Renumbered from "addendum 2" on rebase: the parallel v2-research session's same-day entries already used addenda 2–4.)*
 
 **Operator decision (this session, explicit "confirm waiver" after the tradeoff was laid out):** of the two B3 dispositions named in the 2026-07-20 addendum, the operator chooses **(b) waiver** — no alternate proxy-source PR will be commissioned. Rationale accepted with eyes open: B3 was a display-only sanity band (realized CDE funding within 2× of an independent reference; nothing in the decision/risk path reads proxy rows), and the risk it covers is caught elsewhere — **A1 statement reconciliation verifies realized funding cost to ±$1/±2% (incl. ≥10 funding settlements)** and **CDE funding telemetry is surfaced in the monthly governance reports**. Drafted waiver text, to be recorded verbatim (or amended) as part of the C2 decision entry:
 
