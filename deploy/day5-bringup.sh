@@ -191,13 +191,16 @@ ok "postgres healthy"
 step "Step 4 — alembic upgrade head"
 
 PG_URL_SUPER="postgresql+psycopg2://postgres:${POSTGRES_SUPERUSER_PASSWORD}@postgres:5432/trading"
+# alembic logs to STDERR — merge it into the tee'd stream, or the grep
+# below never sees "Running upgrade" and misreports an applied migration
+# as a no-op (observed on the 2026-07-20 batch deploy).
 docker compose --env-file "${DEPLOY_ENV_PATH}" run --rm \
   -e DATABASE_URL="${PG_URL_SUPER}" \
   --entrypoint sh \
-  api -c 'alembic upgrade head' \
+  api -c 'alembic upgrade head' 2>&1 \
   | tee /tmp/alembic-upgrade.log
 grep -q "Running upgrade" /tmp/alembic-upgrade.log \
-  && ok "migrations applied (or no-op if already at head)" \
+  && ok "migrations applied — see Running-upgrade line(s) above" \
   || ok "no new migrations (already at head)"
 
 # ---------------------------------------------------------------------------
