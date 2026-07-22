@@ -38,6 +38,7 @@ import structlog
 
 from services.execution.coinbase_adapter import (
     CoinbaseExecutionAdapter,
+    LadderStageResult,
     deterministic_client_order_id,
 )
 from services.execution.types import (
@@ -179,6 +180,7 @@ class FakeBroker:
         status: str = "filled",
         kind: str = "limit_post_only",
         price: Decimal | None = None,
+        last_fill_time: datetime | None = None,
     ) -> BrokerOrderState:
         order_id = self._next_id()
         state = BrokerOrderState(
@@ -192,6 +194,7 @@ class FakeBroker:
             avg_fill_price=(price or self.marks[product_id]) if status == "filled" else None,
             total_fees_usd=Decimal("0.40") if status == "filled" else Decimal(0),
             kind=kind,  # type: ignore[arg-type]
+            last_fill_time_utc=last_fill_time if status == "filled" else None,
         )
         self.orders[order_id] = state
         self.by_cid[client_order_id] = order_id
@@ -814,6 +817,76 @@ class TestDailyDecision:
         await worker.run_daily_decision(TODAY)
         assert store.fills
         assert all(p.filled_at_utc == NOW for _, p in store.fills)
+
+    async def test_multi_stage_leg_uses_latest_venue_fill_time(self) -> None:
+        """Two filled stages with distinct venue times ⇒ the aggregate row
+        carries the LATEST (leg completion; risk-review 2026-07-22 note 3)."""
+        worker, store, _broker = await _started_worker()
+        t_early = NOW + timedelta(seconds=5)
+        t_late = NOW + timedelta(seconds=140)
+
+        def _stage(n: int, filled: int, t: datetime | None) -> LadderStageResult:
+            return LadderStageResult(
+                stage="post_only" if n == 0 else "market",
+                client_order_id=f"cid-multi-{n}",
+                order_id=f"venue-multi-{n}",
+                requested_contracts=Decimal(2),
+                filled_contracts=Decimal(filled),
+                avg_fill_price=Decimal("60000") if filled else None,
+                fees_usd=Decimal("0.40") if filled else Decimal(0),
+                last_fill_time_utc=t,
+            )
+
+        sig = await worker._store.insert_signal_row(  # reuse store fake
+            worker.account_id,
+            market="BTC",
+            contract_id=uuid4(),
+            now_utc=NOW,
+            session_date=TODAY,
+            direction="long",
+            signal_type="entry",
+            decision_price=Decimal("60000"),
+            target_contracts=2,
+            sizing_trace={},
+            strategy_hash="h" * 64,
+            parameter_set_hash="p" * 64,
+            slippage_calibration_version_id=None,
+            rationale={},
+        )
+        await worker._propagate_leg_result(
+            asset="BTC",
+            product=BTC_PRODUCT,
+            signal_id=sig,
+            leg_delta=2,
+            stage_results=[_stage(0, 1, t_early), _stage(1, 1, t_late)],
+            order_type="limit_marketable",
+            now_utc=NOW,
+            full_close=False,
+        )
+        assert store.fills
+        assert store.fills[-1][1].filled_at_utc == t_late
+
+    async def test_native_stop_fill_row_uses_venue_fill_time(self) -> None:
+        """The backstop-fired fill row carries the stop order's venue
+        ``last_fill_time``, not the detection-tick clock."""
+        venue_t = NOW - timedelta(seconds=11)
+        worker, store, broker = await _started_worker()
+        rt = _open_long(worker, broker, "BTC", contracts=2)
+        stop = broker.seed_order(
+            client_order_id="stop-cid-vt",
+            product_id=BTC_PID,
+            side="sell",
+            contracts=Decimal(2),
+            status="filled",
+            kind="stop_limit",
+            last_fill_time=venue_t,
+        )
+        rt.native_stop_order_id = stop.order_id
+        rt.native_stop_client_order_id = "stop-cid-vt"
+        broker.positions[BTC_PID] = Decimal(0)
+        await worker.run_risk_checks(now_utc=NOW)
+        stop_payloads = [p for cid, p in store.fills if cid == "stop-cid-vt"]
+        assert stop_payloads and stop_payloads[0].filled_at_utc == venue_t
 
     async def test_fresh_state_first_decision_holds_flat(self) -> None:
         """S1 hysteresis: a brand-new state needs 2 confirming closes

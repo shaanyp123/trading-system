@@ -295,6 +295,14 @@ class TestParseOrderState:
         assert parse_order_state(self._raw(last_fill_time="not-a-time")).last_fill_time_utc is None
         assert parse_order_state(self._raw(last_fill_time="")).last_fill_time_utc is None
 
+    def test_last_fill_time_go_zero_sentinel_is_none(self) -> None:
+        """Coinbase's Go zero-time sentinel on fill-less orders must read
+        as ABSENT — a year-1 filled_at_utc would sort a balances row to
+        the bottom of the snapshot_ts chain and silently drop its cash
+        delta (risk-review 2026-07-22 should-fix 1)."""
+        raw = self._raw(last_fill_time="0001-01-01T00:00:00Z")
+        assert parse_order_state(raw).last_fill_time_utc is None
+
     def test_market_and_stop_kinds(self) -> None:
         raw_m = self._raw(order_configuration={"market_market_ioc": {"base_size": "2"}})
         assert parse_order_state(raw_m).kind == "market"

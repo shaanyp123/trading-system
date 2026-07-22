@@ -140,10 +140,21 @@ def _ts(value: object, *, fallback: datetime | None = None) -> datetime:
     return fallback if fallback is not None else datetime.now(tz=UTC)
 
 
+#: Sanity floor for venue timestamps. Coinbase emits the Go zero-time
+#: sentinel ("0001-01-01T00:00:00Z") on orders it considers fill-less —
+#: and this venue's read surface can lag (2026-07-16 incident), so a
+#: filled order CAN briefly carry the sentinel. A year-1 timestamp
+#: entering fills.filled_at_utc would sort a balances row to the bottom
+#: of the snapshot_ts chain and silently drop its cash delta (risk-review
+#: 2026-07-22 should-fix 1). Anything implausibly old is "absent".
+_MIN_PLAUSIBLE_TS: Final = datetime(2020, 1, 1, tzinfo=UTC)
+
+
 def _ts_opt(value: object) -> datetime | None:
-    """Like :func:`_ts` but honest about absence: missing or unparseable
-    venue timestamps yield ``None``, never a substituted local clock
-    (``fills.filled_at_utc`` feeds gate A2's stop-latency measurement)."""
+    """Like :func:`_ts` but honest about absence: missing, unparseable, or
+    implausibly-old (zero-time sentinel) venue timestamps yield ``None``,
+    never a substituted local clock (``fills.filled_at_utc`` feeds gate
+    A2's stop-latency measurement)."""
     if not value:
         return None
     try:
@@ -152,7 +163,8 @@ def _ts_opt(value: object) -> datetime | None:
         return None
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=UTC)
-    return ts.astimezone(UTC)
+    ts = ts.astimezone(UTC)
+    return None if ts < _MIN_PLAUSIBLE_TS else ts
 
 
 def parse_order_state(raw: Mapping[str, Any]) -> BrokerOrderState:
