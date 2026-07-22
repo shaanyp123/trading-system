@@ -54,6 +54,8 @@ from services.execution.types import (
 
 NOW = datetime(2026, 7, 9, 12, 0, 0, tzinfo=UTC)
 D = date(2026, 7, 9)
+#: Venue-reported last_fill_time the fake stamps on every filled state.
+VENUE_FILL_T = datetime(2026, 7, 9, 12, 0, 7, tzinfo=UTC)
 
 BTC_PERP = PerpProductRef(
     product_id="BIP-20DEC30-CDE",
@@ -282,6 +284,25 @@ class TestParseOrderState:
         )
         assert parse_order_state(raw).kind == "limit_ioc"
 
+    def test_last_fill_time_parsed_tz_aware(self) -> None:
+        state = parse_order_state(self._raw(last_fill_time="2026-07-22T00:05:31.123Z"))
+        assert state.last_fill_time_utc == datetime(2026, 7, 22, 0, 5, 31, 123000, tzinfo=UTC)
+
+    def test_last_fill_time_missing_or_garbage_is_none(self) -> None:
+        """Honest absence: no local-clock substitution at the parse layer
+        (gate A2 measures fill→stop latency off this timestamp)."""
+        assert parse_order_state(self._raw()).last_fill_time_utc is None
+        assert parse_order_state(self._raw(last_fill_time="not-a-time")).last_fill_time_utc is None
+        assert parse_order_state(self._raw(last_fill_time="")).last_fill_time_utc is None
+
+    def test_last_fill_time_go_zero_sentinel_is_none(self) -> None:
+        """Coinbase's Go zero-time sentinel on fill-less orders must read
+        as ABSENT — a year-1 filled_at_utc would sort a balances row to
+        the bottom of the snapshot_ts chain and silently drop its cash
+        delta (risk-review 2026-07-22 should-fix 1)."""
+        raw = self._raw(last_fill_time="0001-01-01T00:00:00Z")
+        assert parse_order_state(raw).last_fill_time_utc is None
+
     def test_market_and_stop_kinds(self) -> None:
         raw_m = self._raw(order_configuration={"market_market_ioc": {"base_size": "2"}})
         assert parse_order_state(raw_m).kind == "market"
@@ -504,6 +525,7 @@ class _FakeOrder:
             total_fees_usd=Decimal("0.20") * filled,
             kind=kind,
             stop_trigger_price=req.stop_trigger_price,
+            last_fill_time_utc=VENUE_FILL_T if filled else None,
         )
 
 
@@ -643,6 +665,21 @@ class TestExecutionLadder:
         assert req.kind == "limit_post_only"
         assert req.side == "buy"
         assert req.limit_price == Decimal("100000")  # joined the bid
+
+    def test_stage_carries_venue_fill_time(self) -> None:
+        """Filled stages surface the venue's last_fill_time; unfilled stages
+        stay None (gate A2 measures fill→stop latency off this field)."""
+        tm = _TimeMachine()
+        broker = _FakeBroker(post_only="stay_open", ioc="fill")
+        adapter = _adapter(broker, tm)
+        result = asyncio.run(
+            adapter.execute_target_delta(
+                product=BTC_PERP, delta_contracts=Decimal(3), decision_date=D, decision_seq=1
+            )
+        )
+        by_stage = {s.stage: s for s in result.stages}
+        assert by_stage["ioc_cross"].last_fill_time_utc == VENUE_FILL_T
+        assert by_stage["post_only"].last_fill_time_utc is None  # cancelled unfilled
 
     def test_sell_joins_ask(self) -> None:
         tm = _TimeMachine()
