@@ -2865,7 +2865,9 @@ class StrategyWorker:
             fill_quantity=int(stop_state.filled_contracts),
             fill_price=stop_state.avg_fill_price or Decimal(0),
             commission_usd=stop_state.total_fees_usd,
-            filled_at_utc=now_utc,
+            # Venue truth when reported; detection-tick clock otherwise
+            # (same honesty rule as _propagate_leg_result, 2026-07-22).
+            filled_at_utc=stop_state.last_fill_time_utc or now_utc,
         )
         outcome = await self._store.process_fill(
             client_order_id=stop_state.client_order_id, payload=payload
@@ -4045,13 +4047,33 @@ class StrategyWorker:
             )
 
         if total_filled > 0:
+            # Venue truth for the fill instant: latest `last_fill_time` across
+            # the stages that actually filled (the aggregate row represents
+            # the whole leg; its completion is the last fill). Fallback to
+            # the leg-dispatch clock ONLY when the venue omitted the field —
+            # and say so, because gate A2's fill→stop measurement rides on
+            # this timestamp (2026-07-22 finding: the unconditional now_utc
+            # stamp made A2 structurally unmeasurable).
+            venue_fill_times = [
+                s.last_fill_time_utc
+                for s in stage_results
+                if s.filled_contracts > 0 and s.last_fill_time_utc is not None
+            ]
+            filled_at = max(venue_fill_times) if venue_fill_times else now_utc
+            if not venue_fill_times:
+                self._log.warning(
+                    "strategy_worker_fill_time_fallback_leg_start",
+                    asset=asset,
+                    client_order_id=cid,
+                    note="venue omitted last_fill_time; filled_at_utc is the leg-dispatch clock",
+                )
             payload = FillIngestPayload(
                 broker_fill_id=f"{cid}:agg",
                 cumulative_filled_quantity=int(total_filled),
                 fill_quantity=int(total_filled),
                 fill_price=avg_price or Decimal(0),
                 commission_usd=total_fees,
-                filled_at_utc=now_utc,
+                filled_at_utc=filled_at,
             )
             outcome = await self._store.process_fill(client_order_id=cid, payload=payload)
             if not outcome.propagated:

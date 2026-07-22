@@ -158,6 +158,9 @@ class FakeBroker:
         self.create_calls: list[BrokerOrderRequest] = []
         self.reject_kinds: set[str] = set()
         self.fill_orders = True
+        # Venue-reported last_fill_time on filled order states; None mirrors
+        # a venue that omits the field (worker must fall back to its clock).
+        self.venue_fill_time: datetime | None = None
         self._seq = 0
 
     # -- helpers --------------------------------------------------------------
@@ -250,6 +253,7 @@ class FakeBroker:
             total_fees_usd=Decimal("0.40") if filled > 0 else Decimal(0),
             kind=request.kind,
             stop_trigger_price=request.stop_trigger_price,
+            last_fill_time_utc=self.venue_fill_time if filled > 0 else None,
         )
         self.orders[order_id] = state
         self.by_cid[request.client_order_id] = order_id
@@ -791,6 +795,25 @@ class TestDailyDecision:
         # Engine target flowed through the Decimal re-check unclamped
         # (division-of-labor: normal operation is a no-op clamp).
         assert assets["BTC"]["engine_target"] == assets["BTC"]["sized_target"]
+
+    async def test_fill_rows_use_venue_fill_time_when_reported(self) -> None:
+        """Gate-A2 data honesty (2026-07-22 finding): the aggregate fill row
+        carries the venue's ``last_fill_time``, not the leg-dispatch clock."""
+        venue_t = NOW + timedelta(seconds=42)
+        broker = FakeBroker()
+        broker.venue_fill_time = venue_t
+        worker, store, _ = await _started_worker(broker=broker)
+        await worker.run_daily_decision(TODAY)
+        assert store.fills
+        assert all(p.filled_at_utc == venue_t for _, p in store.fills)
+
+    async def test_fill_rows_fall_back_to_leg_clock_without_venue_time(self) -> None:
+        """Venue omits ``last_fill_time`` ⇒ explicit fallback to the leg
+        clock (the pre-fix stamp, now deliberate + logged), never None."""
+        worker, store, _broker = await _started_worker()
+        await worker.run_daily_decision(TODAY)
+        assert store.fills
+        assert all(p.filled_at_utc == NOW for _, p in store.fills)
 
     async def test_fresh_state_first_decision_holds_flat(self) -> None:
         """S1 hysteresis: a brand-new state needs 2 confirming closes

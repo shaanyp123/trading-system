@@ -210,6 +210,11 @@ class LadderStageResult:
     filled_contracts: Decimal
     avg_fill_price: Decimal | None
     fees_usd: Decimal
+    # Venue-reported `last_fill_time` from the stage's final order state.
+    # None when the stage produced no fill or the venue omitted the field;
+    # the worker falls back explicitly (gate A2 measures fill→stop latency
+    # off this — never substitute a local clock here).
+    last_fill_time_utc: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -457,6 +462,7 @@ class CoinbaseExecutionAdapter:
                     filled_contracts=state.filled_contracts,
                     avg_fill_price=state.avg_fill_price,
                     fees_usd=state.total_fees_usd,
+                    last_fill_time_utc=state.last_fill_time_utc,
                 )
             )
             remaining -= state.filled_contracts
@@ -504,6 +510,7 @@ class CoinbaseExecutionAdapter:
             filled_2 = Decimal(0)
             avg_2: Decimal | None = None
             fees_2 = Decimal(0)
+            fill_time_2: datetime | None = None
             if order_id_2:
                 # IOC settles server-side immediately; one bounded poll.
                 state = await self._await_order_terminal_or_deadline(
@@ -512,6 +519,7 @@ class CoinbaseExecutionAdapter:
                 filled_2 = state.filled_contracts
                 avg_2 = state.avg_fill_price
                 fees_2 = state.total_fees_usd
+                fill_time_2 = state.last_fill_time_utc
             else:
                 log_bound.warning("coinbase_ladder_ioc_rejected", reason=rejection_2)
             stages.append(
@@ -523,6 +531,7 @@ class CoinbaseExecutionAdapter:
                     filled_contracts=filled_2,
                     avg_fill_price=avg_2,
                     fees_usd=fees_2,
+                    last_fill_time_utc=fill_time_2,
                 )
             )
             remaining -= filled_2
@@ -548,6 +557,7 @@ class CoinbaseExecutionAdapter:
             filled_3 = Decimal(0)
             avg_3: Decimal | None = None
             fees_3 = Decimal(0)
+            fill_time_3: datetime | None = None
             if order_id_3:
                 state = await self._await_order_terminal_or_deadline(
                     order_id_3, deadline_s=self._poll_interval_s * 4
@@ -555,6 +565,7 @@ class CoinbaseExecutionAdapter:
                 filled_3 = state.filled_contracts
                 avg_3 = state.avg_fill_price
                 fees_3 = state.total_fees_usd
+                fill_time_3 = state.last_fill_time_utc
             else:
                 log_bound.error("coinbase_ladder_market_rejected", reason=rejection_3)
             stages.append(
@@ -566,6 +577,7 @@ class CoinbaseExecutionAdapter:
                     filled_contracts=filled_3,
                     avg_fill_price=avg_3,
                     fees_usd=fees_3,
+                    last_fill_time_utc=fill_time_3,
                 )
             )
             remaining -= filled_3
@@ -783,6 +795,7 @@ class CoinbaseExecutionAdapter:
         filled = Decimal(0)
         avg_price: Decimal | None = None
         fees = Decimal(0)
+        fill_time: datetime | None = None
         if order_id:
             state = await self._await_order_terminal_or_deadline(
                 order_id, deadline_s=self._poll_interval_s * 4
@@ -790,6 +803,7 @@ class CoinbaseExecutionAdapter:
             filled = state.filled_contracts
             avg_price = state.avg_fill_price
             fees = state.total_fees_usd
+            fill_time = state.last_fill_time_utc
         result = LadderStageResult(
             stage="market",
             client_order_id=cid,
@@ -798,6 +812,7 @@ class CoinbaseExecutionAdapter:
             filled_contracts=filled,
             avg_fill_price=avg_price,
             fees_usd=fees,
+            last_fill_time_utc=fill_time,
         )
         self._log.info(
             "coinbase_market_flatten_executed",

@@ -140,6 +140,21 @@ def _ts(value: object, *, fallback: datetime | None = None) -> datetime:
     return fallback if fallback is not None else datetime.now(tz=UTC)
 
 
+def _ts_opt(value: object) -> datetime | None:
+    """Like :func:`_ts` but honest about absence: missing or unparseable
+    venue timestamps yield ``None``, never a substituted local clock
+    (``fills.filled_at_utc`` feeds gate A2's stop-latency measurement)."""
+    if not value:
+        return None
+    try:
+        ts = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=UTC)
+    return ts.astimezone(UTC)
+
+
 def parse_order_state(raw: Mapping[str, Any]) -> BrokerOrderState:
     """Parse one Get/List Orders entry into a :class:`BrokerOrderState`."""
     status_raw = str(raw.get("status") or "").upper()
@@ -182,6 +197,7 @@ def parse_order_state(raw: Mapping[str, Any]) -> BrokerOrderState:
         total_fees_usd=_dec0(raw.get("total_fees")),
         kind=kind,
         stop_trigger_price=_dec(limit_like.get("stop_price")),
+        last_fill_time_utc=_ts_opt(raw.get("last_fill_time")),
         raw=dict(raw),
     )
 

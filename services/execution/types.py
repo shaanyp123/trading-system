@@ -129,6 +129,10 @@ class BrokerOrderState:
     total_fees_usd: Decimal
     kind: OrderKind | None  # None when the venue config shape is unrecognized
     stop_trigger_price: Decimal | None = None
+    # Venue-reported time of the order's most recent fill (`last_fill_time`).
+    # None when the venue omits it — consumers must fall back explicitly
+    # rather than substitute a local clock here (gate A2 measures this).
+    last_fill_time_utc: datetime | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property
