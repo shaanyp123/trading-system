@@ -8196,3 +8196,18 @@ Four consecutive clean non-Fridays against two loaded Friday-close windows. This
 **Method + caveat:** computed by driving the repo's own engine (`compute_indicators` / `compute_targets` / `plan_delta` at `AMENDMENT_B_PARAMS`) over daily bars, with `E_effective` = $1,500 (Phase-A cap; visible equity ≈ $2,251 per the 2026-07-18 close-out) and `m_capital_event` = 1.0 (session ~12, past the 1–5 half-size window). **Bars are an FMP spot approximation, NOT the worker's Coinbase bar source** — the Coinbase API is unreachable from the dev environment (proxy policy) and the in-repo research CSVs stop at 2026-01-02. The worker's own `strategy_decisions` row is the authority on all of the above; BTC's momentum leg cleared its threshold by only ~1.5% at read time, so the sign is source-sensitive.
 
 **Risk impact:** none — analysis record only; no code, no [A02] paths, no parameter change. Signal parameters remain FROZEN. **Backtest delta: N/A.** **Verification:** engine-driven computation described above; the 2026-07-28 (c) prediction checked against actual closes ($63,847 on the bar it named); `applied_dir` latch history derived from the full 363-bar trend series.
+
+### 2026-08-14 — first monthly governance report (period 2026-07) DELIVERED + operator-verified; two cosmetic render findings queued
+
+**Operator-verified (screenshot of #reports, this session):** the first monthly governance report fired on schedule — embed timestamped 2026-07-31 8:30 PM local = **2026-08-01 00:30 UTC**, exactly the armed slot ("1st of month 00:30 UTC", #405 deploy verification 2026-07-20). This closes the "2026-08-01 monthly-report delivery check" item from the 2026-07-20 close-out queue. Delivered content, recorded here as the period-2026-07 governance record:
+
+- **Trades:** 2 closed (1W/1L) · realized P&L **−$50.7781** · commissions $5.1781
+- **Fees:** 4 fills · commission $5.17812 + exchange $0 (rendered "$0E-8" — see finding 2)
+- **Funding (telemetry):** coinbase_advanced mean |annualized| **18.76%** (14,980 obs) — observed-rate telemetry, not realized funding
+- **Cash sweeps:** none (cash manager dormant) · **Capital events:** 2026-07-18 deposit $802.1000 (threshold met)
+- **§10 gates:** 0 green / 1 red (B2) / 6 pending · **day 23/45** (consistent with C1 start 2026-07-09)
+- Refinement-loop reminder rendered as designed (announce-only)
+
+**Two cosmetic render findings (QUEUED, §2.3 lane — `services/discord_shared/governance_digest.py`, NOT [A02]):** (1) **Underscore-italics mangling:** `_funding_lines` wraps `funding_note` in `_…_` Discord italics, but the note text contains `reconcile_statement.py` — the filename's underscore terminates the italic span mid-word, rendering "reconcile*statement*.py"-style glitched text. Fix: backtick the filename in the note (api side, `funding_note` producer) or escape underscores in the digest. (2) **Decimal scientific notation:** `_fmt_usd` is a deliberate Decimal-as-string passthrough, so an exchange-fee of `0E-8` renders "$0E-8". Fix: quantize/normalize zero-magnitude values display-side (display-only; [A05] payloads unchanged). Neither affects data correctness; both land whenever the next §2.3 batch goes.
+
+**Risk impact:** none — verification + governance record; no code changed in this entry, no [A02] paths. **Backtest delta: N/A.** **Verification:** operator-supplied screenshot of the #reports embed quoted above; render findings pinned to `services/discord_shared/governance_digest.py::_funding_lines` / `_fmt_usd` by code read this session.
