@@ -93,6 +93,7 @@ from datetime import UTC, date, datetime, timedelta
 from datetime import time as dt_time
 from decimal import Decimal, InvalidOperation
 from typing import Any, Final
+from zoneinfo import ZoneInfo
 
 import httpx
 import structlog
@@ -697,6 +698,46 @@ async def fetch_hourly_candle_rows(
 
 
 # --------------------------------------------------------------------------
+# CDE weekly close (strategy §1.6/§7): trading halts Fridays 17:00-18:00
+# America/New_York. Decisions-log 2026-07-31 (Backlog-5): liquidity on the
+# traded nano perps collapses around the close — multi-minute tick gaps
+# cross the 180 s staleness threshold and page ~2 spurious P2s per Friday.
+# Inside this window the critical-tier staleness ALERT is muted; the
+# ``coinbase_marks_stale`` WARNING keeps logging so the journal dataset
+# keeps accumulating. Deliberately no env knob (2026-07-20 lesson: an
+# inert switch is worse than none).
+_CDE_ET = ZoneInfo("America/New_York")
+_CDE_CLOSE_WEEKDAY: Final[int] = 4  # Friday
+_CDE_CLOSE_HOUR_ET: Final[int] = 17
+_CDE_CLOSE_DURATION_S: Final[float] = 3600.0
+#: Post-reopen grace: a product that went quiet late in the close needs
+#: its first post-reopen tick to land before its age drops back under
+#: the threshold.
+WEEKLY_CLOSE_REOPEN_BUFFER_S: Final[float] = 600.0
+
+
+def in_cde_weekly_close_window(
+    now_utc: datetime, *, reopen_buffer_s: float = WEEKLY_CLOSE_REOPEN_BUFFER_S
+) -> bool:
+    """True inside the CDE weekly close (Fri 17:00-18:00 ET) + reopen buffer.
+
+    Same ET wall-clock definition as ``next_friday_cde_close_utc``
+    (services/api/routes/system.py) — the UTC instant shifts with DST
+    (21:00Z summer / 22:00Z winter), and the observed Friday liquidity
+    trough tracks the ET close (decisions-log 2026-07-31: stale checks
+    clustered 21:03-21:34 UTC in July/EDT). Naive input rejected per
+    [A06].
+    """
+    if now_utc.tzinfo is None:
+        raise ValueError("now_utc must be tz-aware UTC; got naive datetime")
+    et = now_utc.astimezone(_CDE_ET)
+    if et.weekday() != _CDE_CLOSE_WEEKDAY:
+        return False
+    start = et.replace(hour=_CDE_CLOSE_HOUR_ET, minute=0, second=0, microsecond=0)
+    return start <= et < start + timedelta(seconds=_CDE_CLOSE_DURATION_S + reopen_buffer_s)
+
+
+# --------------------------------------------------------------------------
 # Config + worker
 # --------------------------------------------------------------------------
 
@@ -1251,6 +1292,17 @@ class CoinbaseMarketDataWorker:
         Returns True when the CRITICAL tier is stale. Distinct surface
         from the strategy worker's held-positions ``marks_stale`` check
         in ``services/signal`` — that one is unaffected by this policy.
+
+        **Weekly-close alert mute** (decisions-log 2026-07-31,
+        Backlog-5): inside the CDE Friday close window (17:00-18:00 ET
+        + reopen buffer, ``in_cde_weekly_close_window``) a critically
+        stale tier still logs the ``coinbase_marks_stale`` WARNING —
+        with ``weekly_close_window=True`` so the journal dataset keeps
+        accumulating — but the P2 alert is NOT dispatched and the
+        cooldown timer is NOT consumed, so a real outage persisting
+        past the window pages on the first post-window check. The
+        risk-side policy is untouched: the worker's held-positions
+        check still sees stale marks and applies the outage policy.
         """
         if now_utc is None:
             now_utc = self._clock()
@@ -1314,6 +1366,7 @@ class CoinbaseMarketDataWorker:
 
         if self.status.stale_since_utc is None:
             self.status.stale_since_utc = now_utc
+        in_weekly_close = in_cde_weekly_close_window(now_utc)
         cooldown_ok = (
             self._last_stale_alert_utc is None
             or (now_utc - self._last_stale_alert_utc).total_seconds()
@@ -1324,9 +1377,10 @@ class CoinbaseMarketDataWorker:
             tier="critical",
             stale_products={pid: int(age) for pid, age in stale_critical.items()},
             stale_threshold_s=int(threshold),
-            alert_due=cooldown_ok,
+            alert_due=cooldown_ok and not in_weekly_close,
+            weekly_close_window=in_weekly_close,
         )
-        if cooldown_ok:
+        if cooldown_ok and not in_weekly_close:
             descriptor = build_marks_stale_alert(
                 stale_products=stale_critical,
                 stale_threshold_s=threshold,

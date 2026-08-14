@@ -68,24 +68,51 @@ def _fmt_et(iso_ts: str | None) -> str:
     return ts.astimezone(_ET).strftime("%Y-%m-%d %H:%M ET")
 
 
+def md_italic(text: str) -> str:
+    """Wrap in Discord italics, escaping inner underscores first.
+
+    A bare ``_note_`` wrapper breaks on notes containing snake_case
+    names — the filename's own underscore terminates the italic span
+    mid-word (the 2026-08-14 "reconcile*statement*.py" render defect).
+    """
+    return "_{}_".format(text.replace("_", "\\_"))
+
+
+def md_plain_decimal(raw: str) -> str:
+    """Decimal string → plain (non-scientific) notation, exact.
+
+    ``Decimal``-as-string payloads can arrive in scientific notation
+    ("0E-8" for a zero at 8-dp scale — the 2026-08-14 "$0E-8" render
+    defect); ``format(..., 'f')`` re-renders the same exact value as
+    "0.00000000". Display-only, no rounding ([A05]); an unparseable
+    string passes through exactly.
+    """
+    try:
+        return format(Decimal(raw), "f")
+    except InvalidOperation:
+        return raw
+
+
 def _fmt_usd(raw: Any, *, cents: bool = False) -> str:
     """Decimal-as-string passthrough with a $ prefix ('n/a' when absent).
 
     No float parsing — the api already serialized the exact Decimal
     ([A05]); ``decimal.Decimal`` (stdlib) is used ONLY to round for
     display when ``cents=True`` (e.g. equity arrives with the venue's
-    full 8-dp scale — "1549.10000000" must render "$1549.10", not raw).
+    full 8-dp scale — "1549.10000000" must render "$1549.10", not raw)
+    and to normalize scientific notation (``md_plain_decimal``).
     Display-only: nothing rounded here feeds computation.
     An unparseable string falls back to the exact passthrough.
     """
     if raw is None or not isinstance(raw, str) or not raw:
         return "n/a"
-    display = raw
     if cents:
         try:
             display = f"{Decimal(raw):.2f}"
         except InvalidOperation:
             display = raw
+    else:
+        display = md_plain_decimal(raw)
     return f"-${display[1:]}" if display.startswith("-") else f"${display}"
 
 
@@ -241,4 +268,6 @@ __all__ = [
     "COLOR_DIGEST_OK",
     "COLOR_DIGEST_WARN",
     "build_cycle_digest_embed",
+    "md_italic",
+    "md_plain_decimal",
 ]

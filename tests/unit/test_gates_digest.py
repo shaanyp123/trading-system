@@ -146,3 +146,20 @@ class TestNightlyDigestGatesField:
         )
         gates_field = next(f for f in embed["fields"] if f["name"] == "§10 gates")
         assert gates_field["value"] == "🟢A1 | 1 green"
+
+
+class TestEvidenceNoteUnderscoreEscape:
+    """Regression for the 2026-08-14 /gates render defect: snake_case
+    names inside the `_…_` evidence-note italics broke the span
+    ("reconcile*statement*.py"). Underscores must arrive escaped.
+    """
+
+    def test_note_underscores_escaped(self) -> None:
+        payload = _gates_payload()
+        payload["gates"][0]["evidence_note"] = (
+            "operator-run: scripts/operator_tools/reconcile_statement.py"
+        )
+        embed = build_gates_embed(payload, now_utc=NOW)
+        a1_field = next(f for f in embed["fields"] if "A1" in f["name"])
+        assert "reconcile\\_statement.py" in a1_field["value"]
+        assert "reconcile_statement.py" not in a1_field["value"]

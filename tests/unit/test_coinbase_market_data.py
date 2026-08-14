@@ -33,6 +33,7 @@ from services.data.coinbase_market_data import (
     extract_ticker_updates,
     fetch_daily_bars,
     fetch_hourly_candle_rows,
+    in_cde_weekly_close_window,
     parse_candle_row,
     parse_daily_candle,
     parse_perp_product,
@@ -854,6 +855,112 @@ class TestStalenessWatchdog:
             is False
         )
         assert worker.status.stale_since_utc is None
+
+
+# ---------------------------------------------------------------------------
+# CDE weekly-close alert mute (decisions-log 2026-07-31 "Backlog-5")
+# ---------------------------------------------------------------------------
+
+# 2026-07-31 was a Friday; EDT in force, so the close is 21:00-22:00 UTC.
+FRIDAY_CLOSE_EDT = datetime(2026, 7, 31, 21, 10, 0, tzinfo=UTC)  # 17:10 ET
+# 2026-01-09 was a Friday; EST in force, so the close is 22:00-23:00 UTC.
+FRIDAY_CLOSE_EST = datetime(2026, 1, 9, 22, 30, 0, tzinfo=UTC)  # 17:30 ET
+
+
+class TestWeeklyCloseWindow:
+    """Pure window predicate: ET wall-clock, DST-shifting, buffered end."""
+
+    def test_inside_close_edt(self) -> None:
+        assert in_cde_weekly_close_window(FRIDAY_CLOSE_EDT) is True
+
+    def test_inside_close_est(self) -> None:
+        assert in_cde_weekly_close_window(FRIDAY_CLOSE_EST) is True
+
+    def test_before_close_same_friday(self) -> None:
+        # 16:59 ET — one minute before the close starts.
+        assert in_cde_weekly_close_window(datetime(2026, 7, 31, 20, 59, 0, tzinfo=UTC)) is False
+
+    def test_est_utc_instant_of_edt_close_is_outside(self) -> None:
+        # 21:30 UTC in January is 16:30 ET — the summer UTC window must
+        # not leak into winter (the window is ET-anchored, not UTC).
+        assert in_cde_weekly_close_window(datetime(2026, 1, 9, 21, 30, 0, tzinfo=UTC)) is False
+
+    def test_reopen_buffer_included(self) -> None:
+        # 18:09 ET — reopened, but inside the 10-min first-tick buffer.
+        assert in_cde_weekly_close_window(datetime(2026, 7, 31, 22, 9, 0, tzinfo=UTC)) is True
+
+    def test_past_buffer_is_outside(self) -> None:
+        # 18:11 ET — past the buffer; staleness now pages again.
+        assert in_cde_weekly_close_window(datetime(2026, 7, 31, 22, 11, 0, tzinfo=UTC)) is False
+
+    def test_thursday_same_hour_is_outside(self) -> None:
+        assert in_cde_weekly_close_window(datetime(2026, 7, 30, 21, 10, 0, tzinfo=UTC)) is False
+
+    def test_naive_datetime_rejected(self) -> None:
+        with pytest.raises(ValueError, match="tz-aware"):
+            in_cde_weekly_close_window(datetime(2026, 7, 31, 21, 10, 0))
+
+
+class TestWeeklyCloseAlertMute:
+    """Critical staleness inside the Friday close window logs but never
+    pages, and does not consume the alert cooldown — a real outage
+    persisting past the window pages on the first post-window check.
+    """
+
+    def _stale_worker(self, *, alert_hook: Any, now: datetime) -> CoinbaseMarketDataWorker:
+        worker = _worker(alert_hook=alert_hook, clock_now=now)
+        worker._started_at_utc = now - timedelta(minutes=30)
+        for pid in SPOT_SIGNAL_PRODUCT_IDS:
+            worker.mark_store.record(
+                pid, Decimal("1"), observed_at_utc=now - timedelta(seconds=400)
+            )
+        return worker
+
+    def test_in_window_no_alert_but_warning_logged(self) -> None:
+        captured, hook = _hook_capture()
+        worker = self._stale_worker(alert_hook=hook, now=FRIDAY_CLOSE_EDT)
+        with capture_logs() as logs:
+            result = asyncio.run(worker.run_staleness_check_once(now_utc=FRIDAY_CLOSE_EDT))
+        assert result is True  # staleness itself still reported to callers
+        assert captured == []  # ...but no P2 dispatched
+        stale_logs = [e for e in logs if e["event"] == "coinbase_marks_stale"]
+        assert len(stale_logs) == 1
+        assert stale_logs[0]["weekly_close_window"] is True
+        assert stale_logs[0]["alert_due"] is False
+        # stale-since bookkeeping unchanged (recovery logging still works)
+        assert worker.status.stale_since_utc == FRIDAY_CLOSE_EDT
+
+    def test_in_window_est_no_alert(self) -> None:
+        captured, hook = _hook_capture()
+        worker = self._stale_worker(alert_hook=hook, now=FRIDAY_CLOSE_EST)
+        asyncio.run(worker.run_staleness_check_once(now_utc=FRIDAY_CLOSE_EST))
+        assert captured == []
+
+    def test_cooldown_not_consumed_pages_after_window(self) -> None:
+        captured, hook = _hook_capture()
+        worker = self._stale_worker(alert_hook=hook, now=FRIDAY_CLOSE_EDT)
+        # Several in-window checks: all muted.
+        for offset_s in (0, 300, 600):
+            asyncio.run(
+                worker.run_staleness_check_once(
+                    now_utc=FRIDAY_CLOSE_EDT + timedelta(seconds=offset_s)
+                )
+            )
+        assert captured == []
+        # First check past the buffered window (18:11 ET) pages
+        # immediately — the mute never touched _last_stale_alert_utc.
+        after_window = datetime(2026, 7, 31, 22, 11, 0, tzinfo=UTC)
+        assert asyncio.run(worker.run_staleness_check_once(now_utc=after_window)) is True
+        assert len(captured) == 1
+        assert captured[0].category == "broker_disconnect"
+
+    def test_outside_window_alert_unchanged(self) -> None:
+        # Friday well before the close: the pre-existing behavior.
+        before_close = datetime(2026, 7, 31, 15, 0, 0, tzinfo=UTC)
+        captured, hook = _hook_capture()
+        worker = self._stale_worker(alert_hook=hook, now=before_close)
+        assert asyncio.run(worker.run_staleness_check_once(now_utc=before_close)) is True
+        assert len(captured) == 1
 
 
 # ---------------------------------------------------------------------------
