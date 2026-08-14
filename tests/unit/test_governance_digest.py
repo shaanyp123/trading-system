@@ -159,3 +159,35 @@ class TestQuarterlyEmbed:
             build_quarterly_report_embed(
                 _report_payload(), now_utc=datetime(2026, 8, 1), quarter_label="2026-Q2"
             )
+
+
+class TestRenderDefects20260814:
+    """Regressions for the two 2026-08-14 monthly-report render defects
+    (decisions-log): "$0E-8" scientific-notation passthrough and the
+    underscore-italics mangling of snake_case names inside `_…_` spans.
+    """
+
+    def test_zero_exchange_fee_renders_plain_not_scientific(self) -> None:
+        payload = _report_payload()
+        payload["fees"] = dict(payload["fees"], exchange_fee_usd="0E-8")
+        fees = _field(build_monthly_report_embed(payload, now_utc=NOW), "Fees")
+        assert "$0.00000000" in fees
+        assert "0E-8" not in fees
+
+    def test_negative_scientific_notation_keeps_sign_prefix(self) -> None:
+        payload = _report_payload()
+        payload["trades"] = dict(payload["trades"], realized_pnl_usd="-5E-2")
+        trades = _field(build_monthly_report_embed(payload, now_utc=NOW), "Trades")
+        assert "-$0.05" in trades
+
+    def test_plain_decimal_money_passthrough_unchanged(self) -> None:
+        # [A05]: exact digits preserved — no rounding, no re-scaling.
+        fees = _field(build_monthly_report_embed(_report_payload(), now_utc=NOW), "Fees")
+        assert "$2.88" in fees and "$0.90" in fees and "$3.78" in fees
+
+    def test_funding_note_underscores_escaped_in_italics(self) -> None:
+        payload = _report_payload(funding_note="reconciled via reconcile_statement.py (gate A1)")
+        funding = _field(build_monthly_report_embed(payload, now_utc=NOW), "Funding (telemetry)")
+        assert "reconcile\\_statement.py" in funding
+        assert "_reconciled via" in funding  # still wrapped in italics
+        assert "reconcile_statement.py" not in funding  # no unescaped form

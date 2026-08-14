@@ -26,6 +26,8 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Final
 
+from services.discord_shared.cycle_digest import md_italic, md_plain_decimal
+
 # Embed colors (24-bit RGB ints; mirrors the cycle-digest palette).
 COLOR_REPORT_MONTHLY: Final[int] = 0x3498DB  # blue — informational
 COLOR_REPORT_QUARTERLY: Final[int] = 0x9B59B6  # purple — governance cadence
@@ -63,10 +65,17 @@ QUARTERLY_GOVERNANCE_CHECKLIST: Final[tuple[str, ...]] = (
 
 
 def _fmt_usd(raw: Any) -> str:
-    """Decimal-as-string passthrough with a $ prefix ('n/a' when absent)."""
+    """Decimal-as-string with a $ prefix ('n/a' when absent).
+
+    Scientific notation is normalized to plain digits — a zero
+    exchange fee arrives as "0E-8" and must render "$0.00000000",
+    not "$0E-8" (2026-08-14 monthly-report render defect). Exact,
+    display-only ([A05]); unparseable passes through.
+    """
     if not isinstance(raw, str) or not raw:
         return "n/a"
-    return f"-${raw[1:]}" if raw.startswith("-") else f"${raw}"
+    display = md_plain_decimal(raw)
+    return f"-${display[1:]}" if display.startswith("-") else f"${display}"
 
 
 def _fmt_pct_rate(raw: Any) -> str:
@@ -117,7 +126,7 @@ def _funding_lines(payload: Mapping[str, Any]) -> str:
         )
     note = payload.get("funding_note")
     if isinstance(note, str) and note:
-        lines.append(f"_{note}_")
+        lines.append(md_italic(note))
     return "\n".join(lines) if lines else "no funding observations recorded"
 
 

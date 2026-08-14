@@ -28,6 +28,7 @@ from services.discord_shared.cycle_digest import (
     COLOR_DIGEST_FAIL,
     COLOR_DIGEST_OK,
     COLOR_DIGEST_WARN,
+    md_italic,
 )
 
 _FOOTER_TEXT: Final[str] = "§10 gate tracker · announce-only"
@@ -115,7 +116,7 @@ def build_gates_embed(
         ]
         note = gate.get("evidence_note")
         if isinstance(note, str) and note:
-            lines.append(f"_{note}_")
+            lines.append(md_italic(note))
         fields.append(
             {
                 "name": f"{_status_emoji(gate.get('status'))} {key} — {title}"[:256],
