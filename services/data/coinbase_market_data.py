@@ -862,6 +862,10 @@ class CoinbaseMarketDataWorker:
         #: ``_set_perp_products`` alongside the subscription list, so
         #: critical-tier membership tracks the daily re-discovery.
         self._critical_perp_product_ids: tuple[str, ...] = ()
+        #: product_id → base asset for every discovered perp (refreshed
+        #: with the sets above); the staleness check's position-aware
+        #: demotion needs the reverse mapping.
+        self._perp_base_assets: dict[str, str] = {}
         self._last_fired_funding_hour_utc: datetime | None = initial_fired_funding_hour_utc
         self._last_fired_metadata_date_utc: date | None = initial_fired_metadata_date_utc
         self._last_fired_bars_hour_utc: datetime | None = None
@@ -1265,6 +1269,30 @@ class CoinbaseMarketDataWorker:
 
     # -- job: staleness watchdog ---------------------------------------------
 
+    async def _held_base_assets(self) -> frozenset[str] | None:
+        """Base assets with an open position, or None when the read fails.
+
+        Feeds the staleness check's position-aware demotion (decisions-log
+        2026-08-17: 13 weekend P2s, every one the UNHELD ETH perp barely
+        crossing the 180 s threshold). ``None`` → the caller fails OPEN and
+        demotes nothing (pre-position-aware behavior). Deliberately
+        env-unscoped: an open position under ANY env keeps its perp
+        page-worthy — the conservative direction.
+        """
+        try:
+            async with self._session_factory() as session:
+                result = await session.execute(
+                    text("SELECT DISTINCT market FROM trades WHERE state = 'open_position'")
+                )
+                return frozenset(str(row[0]) for row in result)
+        except Exception as exc:
+            self._log.warning(
+                "coinbase_held_positions_read_failed_fail_open",
+                error=repr(exc),
+                note="staleness tiering keeps all critical perps page-worthy this check",
+            )
+            return None
+
     async def run_staleness_check_once(self, *, now_utc: datetime | None = None) -> bool:
         """Classify mark freshness per tier; alert on CRITICAL staleness only.
 
@@ -1273,13 +1301,17 @@ class CoinbaseMarketDataWorker:
         threshold re-fired the P2 ``broker_disconnect`` every cooldown
         window all night):
 
-        * **Critical** — spot signal products + discovered perps on the
-          traded base assets. Stale → the existing P2 alert (same
-          category/payload, cooldown-throttled). The alert lists ONLY
-          critical products: mixing the expected-stale alt-perp list back
-          into the P2 body would bury the load-bearing products and
-          recreate the noise this tiering removes; telemetry ages remain
-          visible in the throttled info log below.
+        * **Critical** — spot signal products (always) + discovered perps
+          on the traded base assets **while that base asset has an open
+          position** (position-aware demotion, decisions-log 2026-08-17:
+          an unheld perp going quiet on a weekend is illiquidity, not an
+          incident — 13 of 13 observed false pages were the unheld ETH
+          perp). Stale → the existing P2 alert (same category/payload,
+          cooldown-throttled). The alert lists ONLY critical products:
+          mixing the expected-stale alt-perp list back into the P2 body
+          would bury the load-bearing products and recreate the noise
+          this tiering removes; telemetry ages remain visible in the
+          throttled info log below.
         * **Telemetry** — every other subscribed perp. Stale → info log
           ``coinbase_marks_stale_telemetry_tier`` (throttled to once per
           cooldown window, on its own timer), NEVER an alert. A real
@@ -1329,6 +1361,25 @@ class CoinbaseMarketDataWorker:
 
         stale_critical = stale_ages(critical_tracked)
         stale_telemetry = stale_ages(telemetry_tracked)
+
+        # Position-aware demotion (decisions-log 2026-08-17): a critical-
+        # tier PERP is only page-worthy while its base asset has an open
+        # position — an unheld perp going quiet on a dead weekend is
+        # illiquidity, not an incident. Spot products are never demoted:
+        # they share the WS connection, so a real venue/WS outage always
+        # stales the critical tier through them. Queried lazily (only when
+        # a critical perp is actually stale — no DB traffic on the healthy
+        # path); a failed read fails OPEN (no demotion). Demoted staleness
+        # moves to the telemetry tier so the journal keeps the data.
+        stale_critical_perps = [
+            pid for pid in stale_critical if pid in self._critical_perp_product_ids
+        ]
+        if stale_critical_perps:
+            held = await self._held_base_assets()
+            if held is not None:
+                for pid in stale_critical_perps:
+                    if self._perp_base_assets.get(pid) not in held:
+                        stale_telemetry[pid] = stale_critical.pop(pid)
 
         # Telemetry tier: log-only, throttled on its own per-tier timer.
         if stale_telemetry and not in_grace:
@@ -1501,6 +1552,9 @@ class CoinbaseMarketDataWorker:
         )
         self._perp_product_ids = product_ids
         self._critical_perp_product_ids = critical_perp_ids
+        self._perp_base_assets = {
+            p.product_id: p.base_asset for p in perps if p.base_asset is not None
+        }
         self.status.critical_product_ids = tuple(
             sorted(set(self._config.spot_product_ids) | set(critical_perp_ids))
         )
