@@ -222,6 +222,16 @@ class _FakeBegin:
         return False
 
 
+class _FakeResult:
+    """Iterable stand-in for a SQLAlchemy Result (SELECT rows)."""
+
+    def __init__(self, rows: list[tuple[Any, ...]]) -> None:
+        self._rows = rows
+
+    def __iter__(self) -> Any:
+        return iter(self._rows)
+
+
 class _FakeSession:
     def __init__(self, factory: _FakeSessionFactory) -> None:
         self._factory = factory
@@ -235,10 +245,11 @@ class _FakeSession:
     def begin(self) -> _FakeBegin:
         return _FakeBegin()
 
-    async def execute(self, stmt: Any, params: Any = None) -> None:
+    async def execute(self, stmt: Any, params: Any = None) -> _FakeResult:
         if self._factory.execute_raises:
             raise RuntimeError("insert failed")
         self._factory.executed.append((str(stmt), params))
+        return _FakeResult(self._factory.select_rows)
 
 
 class _FakeSessionFactory:
@@ -247,6 +258,8 @@ class _FakeSessionFactory:
     def __init__(self) -> None:
         self.executed: list[tuple[str, Any]] = []
         self.execute_raises = False
+        #: Rows any SELECT returns (e.g. held-positions markets).
+        self.select_rows: list[tuple[Any, ...]] = []
 
     def __call__(self) -> _FakeSession:
         return _FakeSession(self)
@@ -978,14 +991,22 @@ class TestStalenessTiers:
     CRITICAL_PERPS = ("BIP-20DEC30-CDE", "ETP-20DEC30-CDE")
     TELEMETRY_PERPS = ("CHP-20DEC30-CDE", "SHP-20DEC30-CDE")
 
-    def _tiered_worker(self, *, alert_hook: Any = None) -> CoinbaseMarketDataWorker:
+    def _tiered_worker(
+        self,
+        *,
+        alert_hook: Any = None,
+        held: tuple[str, ...] = ("BTC", "ETH"),
+        factory: _FakeSessionFactory | None = None,
+    ) -> CoinbaseMarketDataWorker:
         products = [
             _perp_raw("BIP-20DEC30-CDE", root_unit="BTC"),
             _perp_raw("ETP-20DEC30-CDE", root_unit="ETH"),
             _perp_raw("CHP-20DEC30-CDE", root_unit="CHN"),
             _perp_raw("SHP-20DEC30-CDE", root_unit="SHP"),
         ]
-        worker = _worker(rest=_FakeRest(products=products), alert_hook=alert_hook)
+        factory = factory or _FakeSessionFactory()
+        factory.select_rows = [(asset,) for asset in held]
+        worker = _worker(rest=_FakeRest(products=products), alert_hook=alert_hook, factory=factory)
         worker._started_at_utc = NOW - timedelta(minutes=30)
         asyncio.run(worker._refresh_products_for_subscription())
         return worker
@@ -1435,3 +1456,87 @@ class TestRunForever:
             assert worker.status.last_metadata_snapshot_utc is not None
 
         asyncio.run(scenario())
+
+
+class TestPositionAwareStalenessTier:
+    """Position-aware demotion (decisions-log 2026-08-17): 13 weekend P2s,
+    every one the UNHELD ETH perp barely crossing the 180 s threshold.
+    A critical-tier perp only pages while its base asset has an open
+    position; spot never demotes; a failed positions read fails open.
+    """
+
+    def _tiers(self) -> TestStalenessTiers:
+        return TestStalenessTiers()
+
+    def _fresh_except(
+        self, worker: CoinbaseMarketDataWorker, stale_pid: str, *, age_s: int = 200
+    ) -> None:
+        t = self._tiers()
+        for pid in (*SPOT_SIGNAL_PRODUCT_IDS, *t.CRITICAL_PERPS, *t.TELEMETRY_PERPS):
+            if pid != stale_pid:
+                worker.mark_store.record(pid, Decimal("1"), observed_at_utc=NOW)
+        worker.mark_store.record(
+            stale_pid, Decimal("1"), observed_at_utc=NOW - timedelta(seconds=age_s)
+        )
+
+    def test_unheld_perp_stale_demoted_to_telemetry_no_page(self) -> None:
+        # The weekend-of-2026-08-15 regression: ETP stale, no ETH position.
+        captured, hook = _hook_capture()
+        worker = self._tiers()._tiered_worker(alert_hook=hook, held=("BTC",))
+        self._fresh_except(worker, "ETP-20DEC30-CDE")
+        with capture_logs() as logs:
+            result = asyncio.run(worker.run_staleness_check_once(now_utc=NOW))
+        assert result is False  # critical tier not stale after demotion
+        assert captured == []
+        assert worker.status.stale_since_utc is None
+        telemetry = [e for e in logs if e["event"] == "coinbase_marks_stale_telemetry_tier"]
+        assert len(telemetry) == 1  # journal keeps the data
+        assert "ETP-20DEC30-CDE" in telemetry[0]["stale_products"]
+
+    def test_held_perp_stale_still_pages(self) -> None:
+        captured, hook = _hook_capture()
+        worker = self._tiers()._tiered_worker(alert_hook=hook, held=("BTC",))
+        self._fresh_except(worker, "BIP-20DEC30-CDE")
+        assert asyncio.run(worker.run_staleness_check_once(now_utc=NOW)) is True
+        assert len(captured) == 1
+        assert set(captured[0].payload["stale_products"]) == {"BIP-20DEC30-CDE"}
+
+    def test_spot_stale_never_demoted_flat_book(self) -> None:
+        # Flat book everywhere: spot staleness (the WS-outage canary)
+        # must still page.
+        captured, hook = _hook_capture()
+        worker = self._tiers()._tiered_worker(alert_hook=hook, held=())
+        for pid in (*self._tiers().CRITICAL_PERPS, *self._tiers().TELEMETRY_PERPS):
+            worker.mark_store.record(pid, Decimal("1"), observed_at_utc=NOW)
+        # both spot products left stale (never ticked marks would hit the
+        # same path; explicit stale ages keep the fixture obvious)
+        for pid in SPOT_SIGNAL_PRODUCT_IDS:
+            worker.mark_store.record(
+                pid, Decimal("1"), observed_at_utc=NOW - timedelta(seconds=400)
+            )
+        assert asyncio.run(worker.run_staleness_check_once(now_utc=NOW)) is True
+        assert len(captured) == 1
+        assert set(captured[0].payload["stale_products"]) == set(SPOT_SIGNAL_PRODUCT_IDS)
+
+    def test_positions_read_failure_fails_open_and_pages(self) -> None:
+        captured, hook = _hook_capture()
+        factory = _FakeSessionFactory()
+        worker = self._tiers()._tiered_worker(alert_hook=hook, held=(), factory=factory)
+        factory.execute_raises = True  # the held-positions SELECT raises
+        self._fresh_except(worker, "ETP-20DEC30-CDE")
+        with capture_logs() as logs:
+            result = asyncio.run(worker.run_staleness_check_once(now_utc=NOW))
+        assert result is True  # no demotion on a failed read
+        assert len(captured) == 1
+        assert any(e["event"] == "coinbase_held_positions_read_failed_fail_open" for e in logs)
+
+    def test_no_db_read_when_no_critical_perp_stale(self) -> None:
+        # Healthy path stays DB-free: the held-positions SELECT is lazy.
+        factory = _FakeSessionFactory()
+        worker = self._tiers()._tiered_worker(held=("BTC",), factory=factory)
+        t = self._tiers()
+        for pid in (*SPOT_SIGNAL_PRODUCT_IDS, *t.CRITICAL_PERPS, *t.TELEMETRY_PERPS):
+            worker.mark_store.record(pid, Decimal("1"), observed_at_utc=NOW)
+        executed_before = len(factory.executed)
+        assert asyncio.run(worker.run_staleness_check_once(now_utc=NOW)) is False
+        assert len(factory.executed) == executed_before
