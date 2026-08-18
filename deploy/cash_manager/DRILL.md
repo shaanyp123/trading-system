@@ -1,5 +1,19 @@
 # A27 cash-manager venue drill — paste-ready ceremony
 
+> **✅ EXECUTED 2026-08-18 (operator-run; full findings in
+> `Docs/decisions-log.md` "2026-08-18 — A27 CASH-MANAGER VENUE DRILL").**
+> Outcome: converts PROVEN both directions (currency-code accounts, $0
+> fee, settlement ≤ 30 s; **quote TTL is short — quote + commit must run
+> as ONE block**, which is why Steps 1+2 below must not be run minutes
+> apart); Amendment C smoke PASS ×2; equity round-trip exact (FC-6);
+> **Step 3's `schedule_futures_sweep` → HTTP 403 Missing Required
+> Scopes** (caveat 1 confirmed — View+Trade key). Sweep disposition
+> pending operator decision; the recorded recommendation is convert-only
+> reclaim (venue auto-margining is proven by the July CFM statement),
+> which would retire the sweep leg without widening key permissions.
+> The `-T` flags on the exec blocks below were added post-drill (the
+> heredoc form fails without them: "the input device is not a TTY").
+
 **Status: PREPARED 2026-07-20. DO NOT RUN until the operator explicitly
 triggers the drill.** Every step past Step 0 moves real (small) money.
 The drill is the `README.md` 7-item fact-check checklist made
@@ -66,7 +80,7 @@ docker compose --env-file deploy/.env exec postgres psql -U app_service -d tradi
 ```bash
 # 0d. venue baseline — futures balance summary (the equity_from_summary source)
 cd /opt/trading
-docker compose --env-file deploy/.env exec api python - <<'PY'
+docker compose --env-file deploy/.env exec -T api python - <<'PY'
 import json, yaml
 sec = yaml.safe_load(open("/run/secrets/secrets.yaml"))
 from coinbase.rest import RESTClient
@@ -86,7 +100,7 @@ anchor fact-check 6.
 
 ```bash
 cd /opt/trading
-DRILL_USD=25.00 docker compose --env-file deploy/.env exec -e DRILL_USD api python - <<'PY'
+DRILL_USD=25.00 docker compose --env-file deploy/.env exec -T -e DRILL_USD api python - <<'PY'
 import json, os, yaml
 sec = yaml.safe_load(open("/run/secrets/secrets.yaml"))
 from coinbase.rest import RESTClient
@@ -112,7 +126,7 @@ Paste the `trade.id` from Step 1 into `TRADE_ID`:
 
 ```bash
 cd /opt/trading
-TRADE_ID=PASTE_ME docker compose --env-file deploy/.env exec -e TRADE_ID api python - <<'PY'
+TRADE_ID=PASTE_ME docker compose --env-file deploy/.env exec -T -e TRADE_ID api python - <<'PY'
 import json, os, time, yaml
 sec = yaml.safe_load(open("/run/secrets/secrets.yaml"))
 from coinbase.rest import RESTClient
@@ -161,7 +175,7 @@ pattern, directions flipped — reuse Step 1 then Step 2 with
 
 ```bash
 cd /opt/trading
-DRILL_USD=25.00 docker compose --env-file deploy/.env exec -e DRILL_USD api python - <<'PY'
+DRILL_USD=25.00 docker compose --env-file deploy/.env exec -T -e DRILL_USD api python - <<'PY'
 import json, os, yaml
 sec = yaml.safe_load(open("/run/secrets/secrets.yaml"))
 from coinbase.rest import RESTClient
@@ -178,7 +192,7 @@ the sweep's DIRECTION is spot→CFM (caveat 3); then poll —
 ```bash
 # re-run every few minutes until the CFM side reflects the sweep; note elapsed time
 cd /opt/trading
-docker compose --env-file deploy/.env exec api python - <<'PY'
+docker compose --env-file deploy/.env exec -T api python - <<'PY'
 import json, yaml
 sec = yaml.safe_load(open("/run/secrets/secrets.yaml"))
 from coinbase.rest import RESTClient
